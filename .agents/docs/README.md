@@ -40,3 +40,16 @@ the promotion analysis — what graduates to `docs/` (production) and what stays
 - `plot_trace_scaling.py` — disposable example of the brand palette; AGENTS.md rule 15 is
   self-contained (the palette is the contract, not this script).
 - `examples/*/` capture/convert/run tooling — correctly placed per rule 6; not workspace material.
+
+## Known staleness (checked at migration, 2026-07-02)
+
+- Cross-cutting: docs reference `scripts/…` (now `.agents/scripts/…`) and old cross-doc filenames
+  (`./sim_real_agreement.md`, `./closed_loop.md`) — fix links when refreshing.
+- `gepa-optimization-research.md` is the most stale: references `scripts/run_seed_stability.py`
+  (gone), `examples/tau2-bench.otel.jsonl` (now `examples/tau-bench/traces.otel.jsonl`),
+  `world-models/tau-bench/` canonical model (now `examples/tau-bench/models/`), `ARCHITECTURE.md`
+  (never existed here).
+- `trace-scaling-law-notion.md` results table predates corpus growth (swe 40→255+).
+- `benchmarks-to-traces.md` swe count 87 → 255+ (overnight capture #53).
+- `architecture.md` references `docs/gepa_research.md` / `docs/research_directions.md` (Notion-era
+  names; content is now in this folder) and predates `wmh/env` + `wmh/telemetry`.

@@ -58,9 +58,7 @@ def test_committed_results_only_under_docs_experiment_results() -> None:
     offenders = [
         p
         for p in _tracked_files()
-        if p.startswith("docs/")
-        and p.endswith(".json")
-        and "_results/" not in p
+        if p.startswith("docs/") and p.endswith(".json") and "_results/" not in p
     ]
     assert not offenders, (
         f"result JSONs outside docs/<experiment>_results/: {offenders}; AGENTS.md rule 5 blesses "
