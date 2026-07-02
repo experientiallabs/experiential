@@ -1,0 +1,10 @@
+# GAIA is gated on HuggingFace and its terms forbid resharing the validation/test set in a
+# crawlable format. Nothing derived from the gated data is committed: the task/gold/attachment
+# tree is rebuilt locally by fetch_data.py, and the trace corpus (whose observations quote
+# attachment contents) is reproduced by capture.py. See README.md.
+data/
+datafiles/
+gold/
+traces.otel.jsonl
+runs/
+*.log

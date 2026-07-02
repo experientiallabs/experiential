@@ -72,4 +72,10 @@ python-version = "3.11"
 [tool.ty.src]
 # `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
 # (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
-exclude = ["examples/", "scripts/plot_trace_scaling.py"]
+# `gaia/fetch_data.py` reads GAIA's parquet metadata via pyarrow, a `fetch`-extra-only dependency
+# not present in the base type-check env — exclude it too.
+exclude = [
+    "examples/",
+    "scripts/plot_trace_scaling.py",
+    "environment-capture/gaia/fetch_data.py",
+]
