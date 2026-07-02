@@ -201,6 +201,43 @@ def test_build_val_frac_reserves_test_band_from_gepa(tmp_path, monkeypatch) -> N
     assert not (seen["val"] & test_ids)
 
 
+def test_build_falls_back_to_base_when_gepa_prompt_is_empty(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """An empty GEPA winner (weak reflection LM) must not be persisted; base is written instead."""
+    import sys
+
+    from wmh.engine.prompts import BASE_ENV_PROMPT
+    from wmh.optimize import OptimizeResult
+
+    build_mod = sys.modules["wmh.engine.build"]
+    traces_file = _multi_trace_file(tmp_path, 12)
+
+    class _EmptyOptimizer:
+        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def optimize(self, *a, **k) -> OptimizeResult:  # noqa: ANN002, ANN003
+            return OptimizeResult(prompt="   \n", frontier=[])  # blank winner
+
+    monkeypatch.setattr(build_mod, "GEPAOptimizer", _EmptyOptimizer)
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=2,
+        train_split=0.7,
+    )
+    result = build(
+        config,
+        file=traces_file,
+        root=str(tmp_path / ".wmh"),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    assert result.prompt == BASE_ENV_PROMPT
+    paths = ArtifactPaths(tmp_path / ".wmh")
+    assert paths.optimized_prompt.read_text(encoding="utf-8").strip()  # never empty
+
+
 def test_build_writes_a_loadable_artifact(tmp_path) -> None:  # noqa: ANN001 - pytest fixture
     # A tiny OTel JSONL with one tool-call step.
     span_llm = {
