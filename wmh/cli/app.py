@@ -56,6 +56,8 @@ from wmh.engine.eval_suites import (
     resolve_eval_suite,
     result_path,
 )
+from wmh.engine.grid import ModelSpec, run_grid
+from wmh.engine.grid_plot import plot_grid
 from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.ingest import VendorPull
@@ -475,6 +477,23 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
     ),
     limit: int = typer.Option(20, help="Rows to show for `wmh eval results`."),
+    models: str | None = typer.Option(
+        None,
+        help="`wmh eval grid`: comma-separated Label:provider:model cells "
+        "(e.g. 'Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,GPT-5.5:openai:gpt-5.5').",
+    ),
+    gepa_prompts: str | None = typer.Option(
+        None, help="`wmh eval grid`: dir of <label>.txt evolved prompts (enables +GEPA cells)."
+    ),
+    dataset_label: str | None = typer.Option(
+        None, help="`wmh eval grid`: dataset name for the chart subtitle (default: suite id)."
+    ),
+    limit_traces: int | None = typer.Option(
+        None, help="`wmh eval grid`: cap test traces (dry-run). Default: all."
+    ),
+    judge_model: str = typer.Option(
+        "us.anthropic.claude-opus-4-8", help="`wmh eval grid`: pinned judge model (Bedrock)."
+    ),
 ) -> None:
     """Score reconstruction fidelity, or run named example-local eval suites.
 
@@ -496,6 +515,28 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             raise typer.BadParameter("usage: wmh eval results [suite]")
         suite_filter = args[1] if len(args) == 2 else None
         _eval_results(results_root, suite_root, suite_filter, limit=limit)
+        return
+    if args and args[0] == "grid":
+        if len(args) != 2:
+            raise typer.BadParameter("usage: wmh eval grid <suite>")
+        _eval_run_grid(
+            args[1],
+            examples_root=suite_root,
+            results_root=results_root,
+            models=models,
+            gepa_prompts=gepa_prompts,
+            dataset_label=dataset_label,
+            limit_traces=limit_traces,
+            judge_model=judge_model,
+            region=region,
+            train_split=train_split,
+            seed=seed,
+            top_k=top_k,
+            embed_dim=embed_dim,
+            sample_turns=sample_turns,
+            judge=judge,
+            out=out,
+        )
         return
     if args and args[0] == "run":
         if len(args) != 2:
@@ -615,6 +656,100 @@ def _eval_results(
             str(summary.path),
         )
     _console.print(table)
+
+
+# Default grid: one bar family per serving model. Qwen-AgentWorld is self-hosted (openai-compatible
+# vLLM via OPENAI_BASE_URL); the rest are frontier models the registry builds directly.
+_DEFAULT_GRID_MODELS = (
+    "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8",
+    "Haiku 4.5:bedrock:us.anthropic.claude-haiku-4-5",
+    "GPT-5.5:openai:gpt-5.5",
+    "GPT-5.4 Mini:openai:gpt-5.4-mini",
+    "Qwen-AgentWorld:openai:Qwen/Qwen-AgentWorld-35B-A3B",
+)
+
+
+def _parse_model_specs(models: str | None) -> list[ModelSpec]:
+    """Parse "Label:provider:model[,...]" into ModelSpecs (default set when None)."""
+    raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
+    specs: list[ModelSpec] = []
+    for entry in raw:
+        parts = entry.split(":", 2)
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            raise typer.BadParameter(f"bad --models entry {entry!r}; want 'Label:provider:model'")
+        specs.append(ModelSpec(parts[0].strip(), parts[1].strip(), parts[2].strip()))
+    return specs
+
+
+def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each maps to one flag
+    selector: str,
+    *,
+    examples_root: str,
+    results_root: str,
+    models: str | None,
+    gepa_prompts: str | None,
+    dataset_label: str | None,
+    limit_traces: int | None,
+    judge_model: str,
+    region: str | None,
+    train_split: float | None,
+    seed: int | None,
+    top_k: int | None,
+    embed_dim: int | None,
+    sample_turns: str | None,
+    judge: str | None,
+    out: str | None,
+) -> None:
+    """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
+    suite = resolve_eval_suite(selector, examples_root)
+    specs = _parse_model_specs(models)
+    prompt_dir = Path(gepa_prompts) if gepa_prompts else None
+    prompt_map: dict[str, str] | None = None
+    if prompt_dir is not None:
+        prompt_map = {
+            s.label: str(prompt_dir / f"{s.label}.txt")
+            for s in specs
+            if (prompt_dir / f"{s.label}.txt").exists()
+        }
+    cfg = suite.config
+    result = run_grid(
+        suite_name=suite.id,
+        files=[str(p) for p in suite.resolve_files()],
+        models=specs,
+        gepa_prompts=prompt_map,
+        base_prompt=BASE_ENV_PROMPT,
+        judge_provider="bedrock",
+        judge_model=judge_model,
+        judge_region=region,
+        judge_kind=judge or cfg.judge,
+        train_split=train_split if train_split is not None else cfg.train_split,
+        top_k=top_k if top_k is not None else cfg.top_k,
+        seed=seed if seed is not None else cfg.seed,
+        sample_turns=sample_turns or cfg.sample_turns,
+        embed_dim=embed_dim if embed_dim is not None else cfg.embed_dim,
+        max_holdout_traces=limit_traces,
+    )
+    for cell in result.cells:
+        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
+        _console.print(
+            f"  {cell.model_label:16} {cell.condition_label:14} "
+            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
+            f"n={cell.n_steps}{cost}"
+        )
+    run_id = uuid4().hex
+    default_dest = Path(results_root) / "grid" / f"{suite.name}-{run_id}.json"
+    dest = Path(out).with_suffix(".json") if out else default_dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    _console.print(f"wrote grid result -> {dest}")
+    png = Path(out) if out else dest.with_suffix(".png")
+    plot_grid(
+        result,
+        png,
+        dataset_label=dataset_label or suite.id,
+        n_test_traces=result.total_test_traces,
+    )
+    _console.print(f"wrote grid chart  -> {png}")
 
 
 def _eval_run_suite(
