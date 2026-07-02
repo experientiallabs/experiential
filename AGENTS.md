@@ -121,8 +121,9 @@ uv run pytest -q
 
 14. **Run `/ready-for-merge` before every PR merge.** No PR is merged until the
     `ready-for-merge` skill (`.claude/skills/ready-for-merge/SKILL.md`) has been run and passes:
-    `/code-review xhigh --fix`, every review comment (Cursor, Greptile, humans) resolved, and a
-    full AGENTS.md compliance audit of the diff.
+    `/code-review --fix` at an effort level scaled to the PR's breadth (see the skill), every
+    review comment (Cursor, Greptile, humans) resolved, and a full AGENTS.md compliance audit
+    of the diff.
 
 15. **All visuals follow the brand system.** Research figures, README/docs images, frontends, and
     any UI must look clean and minimal — Vercel/Notion/Apple-like: white background, generous

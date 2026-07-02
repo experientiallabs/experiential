@@ -1,6 +1,6 @@
 ---
 name: ready-for-merge
-description: Mandatory pre-merge gate for every PR. Runs /code-review xhigh --fix, resolves every review comment (Cursor, Greptile, humans), and verifies the diff complies with AGENTS.md. Use whenever the user says a PR is ready to merge, asks to merge, or invokes /ready-for-merge.
+description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at an effort level scaled to the PR's breadth, resolves every review comment (Cursor, Greptile, humans), and verifies the diff complies with AGENTS.md. Use whenever the user says a PR is ready to merge, asks to merge, or invokes /ready-for-merge.
 ---
 
 # Ready for Merge
@@ -15,11 +15,22 @@ approved earlier in the conversation. The skill ends by handing the PR back to t
 Work against the PR for the current branch (`gh pr view --json number,url,headRefName`). If no
 PR exists, stop and tell the user.
 
-## Step 1 — Deep code review with fixes
+## Step 1 — Code review with fixes, scaled to the PR
 
-Invoke the code-review skill at the highest effort level with fixes applied:
+Look at the PR's diff (`gh pr diff <number> --stat` and the diff itself) and pick the
+code-review effort level that matches its breadth and risk — don't default to the maximum:
 
-- Run the `code-review` skill with args `xhigh --fix`.
+- **low** — mechanical or single-concern changes: a flag flip, a docstring/docs edit, a
+  dependency bump, a few-line fix with an obvious test.
+- **medium** — a small focused change: one behavior touched across a handful of files, new
+  code paths that are well covered by tests. Most small PRs land here.
+- **high** — a multi-file feature, changes to shared infrastructure, or anything where a
+  subtle interaction with existing callers is plausible.
+- **xhigh** — large or risky PRs: core engine/provider seams, data-loss or security surface,
+  broad refactors, anything hard to roll back once merged.
+
+State the level you chose and why in one sentence, then run the `code-review` skill with args
+`<level> --fix`.
 
 Let it finish and apply its fixes before moving on. If it applied changes, re-run the project
 gate afterwards (see Step 3).
@@ -87,7 +98,7 @@ code.
 
 Push any fixes made in Steps 1–3, then report a checklist to the user:
 
-- [ ] `/code-review xhigh --fix` completed (N findings, M fixed)
+- [ ] `/code-review <level> --fix` completed (state the level chosen and why; N findings, M fixed)
 - [ ] All review comments resolved (list each commenter and how their comments were handled)
 - [ ] AGENTS.md audit clean (note any rules that required fixes)
 - [ ] Full project gate green
