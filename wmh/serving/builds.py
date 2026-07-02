@@ -10,6 +10,7 @@ stream. On success it writes the model's `card.json` and hands the fresh artifac
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import threading
 import uuid
@@ -28,6 +29,8 @@ from wmh.engine.reporting import BuildReporter
 from wmh.providers import get_provider, verify_all
 from wmh.providers.base import EmbedderKind, ProviderKind
 from wmh.tracking import MeteredProvider, RunTracker, classify_build_call, save_run
+
+logger = logging.getLogger(__name__)
 
 # How often the SSE follower wakes to re-check for events / client disconnect (seconds). A finite
 # wait means a disconnected client's worker thread is freed on the next tick instead of parking
@@ -274,7 +277,24 @@ class BuildManager:
         # (it could be a real, previously-built model that just wasn't in the served set).
         preexisting = model_dir.exists()
         try:
+            # Only the pipeline itself can leave a partial/broken artifact worth cleaning up.
             self._build_fn(config, file=request.file, root=str(model_dir), reporter=reporter)
+        except Exception as exc:  # noqa: BLE001 - report any failure to the client, never a dead silent thread
+            # Remove the partial artifact so a failed build doesn't leave a model that `exists()`
+            # then treats as real (bricking retries with 409 and serving a broken model) — but
+            # only if this build created the dir, never a pre-existing model.
+            if not preexisting:
+                shutil.rmtree(model_dir, ignore_errors=True)
+            state.append(BuildEvent(type="error", error=str(exc)))
+            state.finish(BuildStatus.FAILED, error=str(exc))
+            return
+        finally:
+            with self._lock:
+                self._reserved.discard(request.name)
+        # The model artifact is complete on disk. Writing the card and joining the live serving
+        # set are best-effort: a failure here logs a warning but must NOT delete the finished
+        # build (the card is additive metadata; an un-registered model still serves on restart).
+        try:
             save_card(
                 make_build_card(
                     name=request.name,
@@ -291,18 +311,8 @@ class BuildManager:
                 model_dir,
             )
             self._register(request.name, model_dir)
-        except Exception as exc:  # noqa: BLE001 - report any failure to the client, never a dead silent thread
-            # Remove the partial artifact so a failed build doesn't leave a model that `exists()`
-            # then treats as real (bricking retries with 409 and serving a broken model) — but
-            # only if this build created the dir, never a pre-existing model.
-            if not preexisting:
-                shutil.rmtree(model_dir, ignore_errors=True)
-            state.append(BuildEvent(type="error", error=str(exc)))
-            state.finish(BuildStatus.FAILED, error=str(exc))
-            return
-        finally:
-            with self._lock:
-                self._reserved.discard(request.name)
+        except Exception:  # noqa: BLE001 - never destroy a completed build over card/register
+            logger.warning("post-build card/register failed for %s", request.name, exc_info=True)
         state.append(BuildEvent(type="done", name=request.name))
         state.finish(BuildStatus.SUCCEEDED)
 

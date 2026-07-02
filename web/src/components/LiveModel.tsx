@@ -11,40 +11,63 @@ import { listModels } from "@/lib/api";
 import type { ModelCard } from "@/lib/types";
 import { ModelView } from "./ModelView";
 
+type State =
+  | { status: "loading" }
+  | { status: "offline" } // backend unreachable
+  | { status: "notfound" } // backend up, no such model
+  | { status: "found"; card: ModelCard };
+
 export function LiveModel({ name, serveHint }: { name: string; serveHint: string }) {
-  const [card, setCard] = useState<ModelCard | null | undefined>(undefined);
+  const [state, setState] = useState<State>({ status: "loading" });
 
   useEffect(() => {
     listModels()
       .then((res) => {
         const entry = res.models.find((m) => m.name === name);
-        setCard(
-          entry?.card ??
-            (entry
-              ? {
-                  schema_version: 1,
-                  name,
-                  title: name,
-                  description: "",
-                  corpus: { traces: null, steps: 0 },
-                  provider: "unknown",
-                  model_id: "unknown",
-                  tags: [],
-                }
-              : null),
-        );
+        if (!entry) {
+          setState({ status: "notfound" });
+          return;
+        }
+        setState({
+          status: "found",
+          card: entry.card ?? {
+            schema_version: 1,
+            name,
+            title: name,
+            description: "",
+            corpus: { traces: null, steps: 0 },
+            provider: "unknown",
+            model_id: "unknown",
+            tags: [],
+          },
+        });
       })
-      .catch(() => setCard(null));
+      // A rejected fetch means the backend is unreachable — NOT that the model is missing.
+      .catch(() => setState({ status: "offline" }));
   }, [name]);
 
-  if (card === undefined) {
+  if (state.status === "loading") {
     return (
       <div className="rounded-lg border border-line p-5 text-center text-sm text-ink-faint">
         Looking up {name} on the local backend…
       </div>
     );
   }
-  if (card === null) {
+  if (state.status === "offline") {
+    return (
+      <div className="flex flex-col gap-3 rounded-lg border border-line bg-surface-sunk p-5">
+        <div className="mono-label">backend offline</div>
+        <p className="text-sm text-ink-soft">
+          Can&apos;t reach a local <code className="font-mono">wmh serve</code>. Start one, then
+          reload:
+        </p>
+        <pre className="overflow-x-auto rounded-md border border-line bg-surface p-3 font-mono text-xs">
+          {serveHint}
+        </pre>
+      </div>
+    );
+  }
+  if (state.status === "notfound") {
     return (
       <div className="flex flex-col items-center gap-3 rounded-lg border border-line p-5">
         <p className="text-sm text-ink-soft">
@@ -57,5 +80,6 @@ export function LiveModel({ name, serveHint }: { name: string; serveHint: string
       </div>
     );
   }
+  const { card } = state;
   return <ModelView card={card} heldOutAccuracy={null} serveHint={serveHint} />;
 }

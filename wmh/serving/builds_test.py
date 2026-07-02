@@ -168,6 +168,19 @@ def test_failed_build_keeps_a_preexisting_model(tmp_path: Path) -> None:
     assert (model_dir / "config.toml").read_text(encoding="utf-8") == "real model"
 
 
+def test_card_write_failure_keeps_completed_build(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    # A card-write failure (e.g. disk full) after a successful build must NOT delete the
+    # finished model artifact — the build still succeeds, card is just missing.
+    def _boom(card, model_dir) -> None:  # noqa: ANN001
+        raise OSError("disk full")
+
+    monkeypatch.setattr("wmh.serving.builds.save_card", _boom)
+    manager, _ = _manager(tmp_path)
+    snapshot = manager.wait(manager.start(_request(tmp_path)))
+    assert snapshot.status is BuildStatus.SUCCEEDED
+    assert (tmp_path / ".wmh" / "models" / "fresh" / "config.toml").exists()
+
+
 def test_verify_failure_aborts_start_before_thread(tmp_path: Path) -> None:
     def _bad_verify(config) -> None:  # noqa: ANN001
         raise ValueError("bad creds")
