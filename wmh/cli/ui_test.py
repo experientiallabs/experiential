@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+import typer
 from rich.console import Console
 
 from wmh.cli.ui import (
@@ -210,6 +212,28 @@ def test_build_wizard_reprompts_on_invalid_name() -> None:
     params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
     assert params.name == "tau-bench"
     assert "invalid world model name" in console.export_text()
+
+
+def test_build_wizard_drops_invalid_flag_name_from_default() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    # An invalid --name flag must not become the bracketed Enter-default (it could never be
+    # accepted); blank input then means "no name yet" and re-prompts until a valid one arrives.
+    reader = _scripted_reader(["", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    params = run_build_wizard(console, BuildParams(name="tau bench"), reader=reader)
+    assert params.name == "tau-bench"
+    assert "[tau bench]" not in console.export_text()
+
+
+def test_build_wizard_aborts_cleanly_on_eof() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100)
+
+    def eof_reader(_prompt: str) -> str:
+        raise EOFError
+
+    # Exhausted piped stdin (or Ctrl-D) must abort the wizard cleanly, not leak an EOFError
+    # traceback. typer.Abort is handled by click's runner ("Aborted.", exit 1).
+    with pytest.raises(typer.Abort):
+        run_build_wizard(console, BuildParams(name="default"), reader=eof_reader)
 
 
 def test_build_wizard_reprompts_on_blank_trace_source() -> None:

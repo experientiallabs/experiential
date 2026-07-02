@@ -415,7 +415,13 @@ def serve(
     `/world_models/{name}/sessions` and `.../step`.
     """
     names = list(name) if name else None
-    uvicorn.run(create_app(root, names=names), host="127.0.0.1", port=port)
+    # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
+    # not a traceback; load the models before uvicorn takes over the process.
+    try:
+        server_app = create_app(root, names=names)
+    except (ValueError, FileNotFoundError) as err:
+        raise typer.BadParameter(str(err)) from None
+    uvicorn.run(server_app, host="127.0.0.1", port=port)
 
 
 @app.command("eval")

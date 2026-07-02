@@ -148,6 +148,12 @@ def test_examples_run_rejects_invalid_name_with_friendly_error() -> None:
     assert "unknown example" in result.output
 
 
+def test_serve_rejects_invalid_name_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["serve", "--name", "tau bench", "--root", str(tmp_path / ".wmh")])
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "invalid world model name" in result.output
+
+
 def test_providers_subcommand_is_registered() -> None:
     group_names = {group.name for group in app.registered_groups}
     assert "providers" in group_names

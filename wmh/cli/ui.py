@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 
+import typer
 from pydantic import BaseModel
 from rich.console import Console
 from rich.markup import escape
@@ -97,7 +98,16 @@ def run_build_wizard(
     becomes the suggested default the user can accept with Enter. Raises `ValueError` if no trace
     source (file or vendor) is provided.
     """
-    ask = reader if reader is not None else (lambda text: console.input(text))
+    base_ask = reader if reader is not None else (lambda text: console.input(text))
+
+    def ask(text: str) -> str:
+        # Exhausted piped stdin (or Ctrl-D) aborts the wizard cleanly ("Aborted.", exit 1)
+        # instead of leaking an EOFError traceback from whichever prompt was being read.
+        try:
+            return base_ask(text)
+        except EOFError:
+            raise typer.Abort() from None
+
     console.print(
         Panel(
             "Let's create a world model. Press Enter to accept the [dim]default[/dim] in brackets.",
@@ -107,9 +117,14 @@ def run_build_wizard(
     )
 
     # An unsafe name (spaces, path separators, ...) re-prompts with the validation message
-    # rather than escaping as a ValueError traceback.
+    # rather than escaping as a ValueError traceback. An invalid name arriving via --name is
+    # dropped from the suggested default — otherwise Enter would re-offer it forever.
+    try:
+        name_default = validate_name(defaults.name)
+    except ValueError:
+        name_default = None
     while True:
-        name = _prompt_text(console, ask, "Name this world model", defaults.name)
+        name = _prompt_text(console, ask, "Name this world model", name_default)
         try:
             validate_name(name)
             break
