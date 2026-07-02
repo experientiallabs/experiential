@@ -44,7 +44,7 @@ def plot_grid(
     fig, ax = plt.subplots(figsize=(max(8, 1.6 * len(cells)), 6.5))
     bars = ax.bar(range(len(cells)), heights, color=palette, edgecolor="white", linewidth=0.8)
 
-    # Per-bar text: fidelity on top, target cost below it (omit the $ line when cost is None).
+    # Per-bar text: fidelity on top, target cost above it (omit the $ line when cost is None).
     for bar, cell in zip(bars, cells, strict=True):
         x = bar.get_x() + bar.get_width() / 2
         top = bar.get_height()
@@ -52,7 +52,7 @@ def plot_grid(
         if cell.cost_usd is not None and cell.cost_usd > 0:
             ax.text(
                 x,
-                top + 0.055,
+                top + 0.052,
                 f"${cell.cost_usd:.2f}",
                 ha="center",
                 va="bottom",
@@ -63,7 +63,9 @@ def plot_grid(
     ax.set_xticks(range(len(cells)))
     ax.set_xticklabels(labels, fontsize=10)
     ax.set_ylabel("Mean fidelity")
-    ax.set_ylim(0, 1.0)
+    # Headroom above the tallest bar so the fidelity + cost labels never collide with the subtitle
+    # (near-ceiling bars at ~0.97 would otherwise push the $ label past y=1.0).
+    ax.set_ylim(0, max(1.0, max(heights) + 0.14))
     ax.set_title(_TITLE, fontsize=17, fontweight="bold", pad=28)
     subtitle = (
         f"{dataset_label} | {n_test_traces} held-out test traces | "

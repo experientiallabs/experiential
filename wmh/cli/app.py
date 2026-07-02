@@ -662,7 +662,7 @@ def _eval_results(
 # vLLM via OPENAI_BASE_URL); the rest are frontier models the registry builds directly.
 _DEFAULT_GRID_MODELS = (
     "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8",
-    "Haiku 4.5:bedrock:us.anthropic.claude-haiku-4-5",
+    "Haiku 4.5:bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0",
     "GPT-5.5:openai:gpt-5.5",
     "GPT-5.4 Mini:openai:gpt-5.4-mini",
     "Qwen-AgentWorld:openai:Qwen/Qwen-AgentWorld-35B-A3B",
