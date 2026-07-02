@@ -17,7 +17,7 @@ is deterministic (numeric tolerance 0.01, normalized string/list match, accepted
   `merchant_category_codes.csv`, `merchant_data.json`, `payments-readme.md`.
 - `gold/<task_id>.json` — gold answers (`answer` + optional `numeric` + `accept` variants), never
   staged into the agent workspace.
-- `traces.otel.jsonl` — the trace corpus: **118 traces / 944 real transitions**, host-content-free
+- `traces.otel.jsonl` — the trace corpus: **136 traces / 1079 real transitions**, host-content-free
   (`environment_capture.scan_spans_jsonl` returns no findings; train split only, so the world model
   can't absorb the hidden test split's dynamics).
 - `fetch_data.py` — downloads the gitignored `payments.csv` (and, with `--all`, every context file)
