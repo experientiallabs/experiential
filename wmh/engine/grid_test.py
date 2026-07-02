@@ -5,8 +5,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wmh.engine.grid import CONDITIONS, ModelSpec, run_grid
+from wmh.engine.grid import (
+    CONDITIONS,
+    ModelSpec,
+    _make_judge,
+    _make_target,
+    run_grid,
+)
 from wmh.providers.base import Completion, Message, ProviderConfig
+from wmh.providers.fallback import FallbackProvider
 
 
 class _FakeProvider:
@@ -133,6 +140,37 @@ def test_grid_cost_is_none_for_unpriced_model(tmp_path) -> None:  # noqa: ANN001
     # Every cell yields a fidelity in [0, 1] and scores the (fallback) held-out step.
     assert 0.0 <= opus.fidelity <= 1.0
     assert opus.n_steps == 1
+
+
+def test_bedrock_judge_and_target_get_fallback_chains() -> None:
+    built: list[str] = []
+
+    def tracking_factory(config: ProviderConfig) -> _FakeProvider:
+        built.append(f"{config.model}@{config.region}")
+        return _FakeProvider(config)
+
+    # Bedrock judge -> a FallbackProvider (primary opus-4.8 + resilience models).
+    judge = _make_judge(
+        "bedrock", "us.anthropic.claude-opus-4-8", "us-west-1", "rubric", tracking_factory
+    )
+    assert isinstance(judge._provider, FallbackProvider)  # noqa: SLF001 - inspect wrapped provider
+    assert any("sonnet" in b for b in built)  # fell through to the resilience model config
+
+    # Bedrock target -> region-fallback chain (SAME model across regions).
+    built.clear()
+    target = _make_target(
+        ModelSpec("Opus", "bedrock", "us.anthropic.claude-opus-4-8", "us-west-1"), tracking_factory
+    )
+    assert isinstance(target, FallbackProvider)
+    assert built == [
+        "us.anthropic.claude-opus-4-8@us-west-1",
+        "us.anthropic.claude-opus-4-8@us-east-1",
+    ]
+
+    # Non-Bedrock target -> a single provider (no fallback).
+    built.clear()
+    single = _make_target(ModelSpec("GPT", "openai", "gpt-5.5"), tracking_factory)
+    assert not isinstance(single, FallbackProvider)
 
 
 def test_grid_bar_label_uses_lowercase_wmh(tmp_path) -> None:  # noqa: ANN001 - fixture

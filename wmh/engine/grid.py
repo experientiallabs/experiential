@@ -27,9 +27,22 @@ from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.optimize.judge import Judge, LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, get_provider
 from wmh.providers.base import Provider
+from wmh.providers.fallback import FallbackProvider
 from wmh.retrieval import HashingEmbedder
 from wmh.tracking import MeteredProvider, RunTracker
 from wmh.tracking.pricing import price_for
+
+# Judge fallback chain: the pinned judge is Opus 4.8, but on a capacity error it fails over to these
+# so long grids don't stall on judge throttling. (Model waterfall, not accounts — endflow/stackwise
+# lack Bedrock access; the `default` profile reaches all of these.)
+_JUDGE_FALLBACK_MODELS = (
+    "us.anthropic.claude-sonnet-4-6",
+    "us.anthropic.claude-opus-4-6-v1",
+)
+
+# Regions a Bedrock TARGET fails over across (same model, so what's measured is unchanged — this
+# only spreads throttling load, it does not switch models).
+_TARGET_FALLBACK_REGIONS = ("us-east-1",)
 
 # The four prompt/retrieval conditions each model is evaluated under. `gepa`/`gepa_rag` require a
 # per-(benchmark x model) evolved prompt; they are skipped for a model with no GEPA prompt.
@@ -88,6 +101,12 @@ class GridResult(BaseModel):
     cells: list[GridCell] = Field(default_factory=list)
 
 
+def _fallback(factory, configs: list[ProviderConfig]) -> Provider:  # noqa: ANN001 - factory injectable
+    """A FallbackProvider over `configs` (a single-element chain returns a plain provider)."""
+    chain = [factory(c) for c in configs]
+    return chain[0] if len(chain) == 1 else FallbackProvider(chain)
+
+
 def _make_judge(
     judge_provider: str,
     judge_model: str,
@@ -95,11 +114,29 @@ def _make_judge(
     kind: str,
     factory,  # noqa: ANN001 - a Provider builder (ProviderConfig) -> Provider, injectable for tests
 ) -> Judge:
-    """Build the pinned judge (its own provider, never metered as target cost)."""
-    llm = factory(
-        ProviderConfig(kind=ProviderKind(judge_provider), model=judge_model, region=region)
-    )
+    """Build the pinned judge as a FALLBACK chain (primary `judge_model`, then resilience models).
+
+    The judge is never metered as target cost. For a Bedrock judge it fails over across
+    `_JUDGE_FALLBACK_MODELS` on a capacity error so a throttled Opus doesn't stall the whole grid.
+    """
+    kind_enum = ProviderKind(judge_provider)
+    models = [judge_model]
+    if kind_enum is ProviderKind.BEDROCK:
+        models += [m for m in _JUDGE_FALLBACK_MODELS if m != judge_model]
+    configs = [ProviderConfig(kind=kind_enum, model=m, region=region) for m in models]
+    llm = _fallback(factory, configs)
     return RubricJudge(llm) if kind == "rubric" else LLMJudge(llm)
+
+
+def _make_target(spec: ModelSpec, factory) -> Provider:  # noqa: ANN001 - factory injectable for tests
+    """Build a target provider. A Bedrock target fails over across `_TARGET_FALLBACK_REGIONS` (SAME
+    model — spreads throttle without changing what's measured); other providers are single."""
+    kind = ProviderKind(spec.provider)
+    if kind is ProviderKind.BEDROCK:
+        regions = [spec.region] + [r for r in _TARGET_FALLBACK_REGIONS if r != spec.region]
+        configs = [ProviderConfig(kind=kind, model=spec.model, region=r) for r in regions]
+        return _fallback(factory, configs)
+    return factory(ProviderConfig(kind=kind, model=spec.model, region=spec.region))
 
 
 def _target_cost(model: str, tracker: RunTracker) -> float | None:
@@ -180,16 +217,10 @@ def run_grid(
             else:
                 prompt = base_prompt
             use_rag = condition in ("base_rag", "gepa_rag")
-            # Meter ONLY the target so cost is target-side, never judge cost.
+            # Meter ONLY the target so cost is target-side, never judge cost. The target itself may
+            # be a region-fallback chain (Bedrock); MeteredProvider records whichever entry served.
             tracker = RunTracker(run_id=uuid.uuid4().hex, kind="eval-grid")
-            target: Provider = MeteredProvider(
-                provider_factory(
-                    ProviderConfig(
-                        kind=ProviderKind(spec.provider), model=spec.model, region=spec.region
-                    )
-                ),
-                tracker,
-            )
+            target: Provider = MeteredProvider(_make_target(spec, provider_factory), tracker)
             embedder = HashingEmbedder(dim=embed_dim) if use_rag else None
             with tracker.timed():
                 report = evaluate_files(
