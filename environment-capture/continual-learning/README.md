@@ -15,7 +15,7 @@ else normalized text exact-match or containment — see
 - `gold/<task_id>.json` — gold answers (`answer`, `answer_type`, `tolerance`, optional `numeric`),
   never staged into the agent workspace.
 - `traces.otel.jsonl` — the trace corpus (train split only; the hidden test split is never captured
-  so the world model can't absorb its dynamics): **110 traces / 760 real transitions** (2 trajectories with host-escape content dropped whole by the hygiene audit — see `environment_capture/hygiene.py`) — 25
+  so the world model can't absorb its dynamics): **118 traces / 830 real transitions** (2 trajectories with host-escape content dropped whole by the hygiene audit — see `environment_capture/hygiene.py`) — 25
   converted real runs plus 25 fresh Bedrock captures, together covering every train task.
 - `fetch_data.py` — fetches the shared `products.db` from the upstream HuggingFace dataset (the
   ~400 MB db is gitignored; questions + gold are committed, so a fresh clone only needs this).
