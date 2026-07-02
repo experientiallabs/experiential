@@ -15,7 +15,7 @@ from wmh.engine.grid import (
     merge_results,
     run_grid,
 )
-from wmh.providers.base import Completion, Message, ProviderConfig
+from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.providers.fallback import FallbackProvider
 
 
@@ -187,6 +187,33 @@ def _cell(model: str, condition: str, fidelity: float) -> GridCell:
         error_flag_acc=1.0,
         n_steps=100,
     )
+
+
+def test_capped_provider_clamps_target_max_tokens() -> None:
+    from wmh.engine.grid import CappedProvider
+
+    seen: dict[str, int] = {}
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.config = ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5")
+
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192) -> Completion:  # noqa: ANN001
+            seen["max_tokens"] = max_tokens
+            return Completion(text="{}")
+
+        def embed(self, texts) -> list:  # noqa: ANN001
+            return [[0.0] for _ in texts]
+
+        def verify(self) -> None:
+            raise NotImplementedError
+
+    capped = CappedProvider(_Recorder(), 4096)
+    capped.complete("s", [Message(role="user", content="u")], max_tokens=8192)
+    assert seen["max_tokens"] == 4096  # clamped down
+    capped.complete("s", [Message(role="user", content="u")], max_tokens=512)
+    assert seen["max_tokens"] == 512  # smaller request left alone
+    assert capped.config.model == "gpt-5.5"  # config passthrough
 
 
 def test_merge_results_concatenates_cells_and_keeps_first_metadata() -> None:

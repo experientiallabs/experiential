@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.optimize.judge import Judge, LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, get_provider
-from wmh.providers.base import Provider
+from wmh.providers.base import Completion, Message, Provider
 from wmh.providers.fallback import FallbackProvider
 from wmh.retrieval import HashingEmbedder
 from wmh.tracking import MeteredProvider, RunTracker
@@ -55,6 +55,43 @@ _CONDITION_LABELS = {
     "gepa": "wmh/gepa",
     "gepa_rag": "wmh/gepa/rag",
 }
+
+# Cap on the TARGET's generation per step. A world-model observation is short JSON; a reasoning
+# target (GPT-5.5) otherwise spends the full 8192-token budget on reasoning, making each step
+# ~80s and a whole grid many hours. 4096 leaves ample room for reasoning + the observation while
+# roughly halving worst-case latency. The judge is never capped (it needs its full rubric budget).
+DEFAULT_TARGET_MAX_TOKENS = 4096
+
+
+class CappedProvider:
+    """Wraps a target provider, clamping each completion's `max_tokens` to a ceiling.
+
+    Only the eval TARGET is wrapped (not the judge): observation prediction needs a short output, so
+    a lower ceiling bounds a reasoning model's per-step latency without affecting judge scoring.
+    """
+
+    def __init__(self, inner: Provider, cap: int) -> None:
+        self._inner = inner
+        self._cap = cap
+        self.config = inner.config
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        return self._inner.complete(
+            system, messages, temperature=temperature, max_tokens=min(max_tokens, self._cap)
+        )
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._inner.embed(texts)
+
+    def verify(self):  # noqa: ANN201 - delegate; unused on the eval path
+        return self._inner.verify()
 
 
 @dataclass(frozen=True)
@@ -200,6 +237,7 @@ def run_grid(
     sample_turns: str,
     embed_dim: int,
     max_holdout_traces: int | None = None,
+    target_max_tokens: int = DEFAULT_TARGET_MAX_TOKENS,
     provider_factory=get_provider,  # noqa: ANN001 - injectable for tests (no network)
 ) -> GridResult:
     """Run every (model x condition) cell of the grid and return the rolled-up result.
@@ -248,7 +286,8 @@ def run_grid(
             # Meter ONLY the target so cost is target-side, never judge cost. The target itself may
             # be a region-fallback chain (Bedrock); MeteredProvider records whichever entry served.
             tracker = RunTracker(run_id=uuid.uuid4().hex, kind="eval-grid")
-            target: Provider = MeteredProvider(_make_target(spec, provider_factory), tracker)
+            capped = CappedProvider(_make_target(spec, provider_factory), target_max_tokens)
+            target: Provider = MeteredProvider(capped, tracker)
             embedder = HashingEmbedder(dim=embed_dim) if use_rag else None
             with tracker.timed():
                 report = evaluate_files(
