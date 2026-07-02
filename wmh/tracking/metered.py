@@ -76,7 +76,11 @@ class MeteredProvider:
             system, messages, temperature=temperature, max_tokens=max_tokens
         )
         phase = self._classify(system) if self._classify is not None else self._base_phase
-        self._tracker.record(phase, self._provider.config.model, completion.usage)
+        # Prefer the model the completion says actually served (failover chains set it); the
+        # configured model otherwise. Pricing a failed-over call at the primary's rate would
+        # silently mis-report cost.
+        model = completion.model or self._provider.config.model
+        self._tracker.record(phase, model, completion.usage)
         return completion
 
     def embed(self, texts: list[str]) -> list[list[float]]:

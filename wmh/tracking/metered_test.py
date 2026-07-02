@@ -97,3 +97,34 @@ def test_config_is_forwarded() -> None:
     provider = FakeProvider()
     metered = MeteredProvider(provider, RunTracker(run_id="r", kind="serve"))
     assert metered.config is provider.config
+
+
+class FakeFailoverProvider(FakeProvider):
+    """Mimics WaterfallProvider: config reports the primary, Completion reports who served."""
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        return Completion(
+            text="served by fallback",
+            usage=TokenUsage(input_tokens=100, output_tokens=20),
+            model="claude-haiku-4-5",  # a fallback served, not the primary opus
+        )
+
+
+def test_cost_attributed_to_serving_model_not_primary() -> None:
+    # Regression: a failed-over call must be priced at the serving model's rate, not the
+    # primary's (opus 5/25 vs haiku 1/5 per Mtok — a 5x over-report).
+    tracker = RunTracker(run_id="r", kind="serve")
+    metered = MeteredProvider(FakeFailoverProvider(), tracker, base_phase=Phase.SERVE)
+
+    metered.complete("anything", [Message(role="user", content="hi")])
+
+    (event,) = tracker._events
+    assert event.model == "claude-haiku-4-5"
+    assert event.cost_usd == (100 * 1.0 + 20 * 5.0) / 1_000_000

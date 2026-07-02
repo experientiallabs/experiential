@@ -116,6 +116,7 @@ class WaterfallProvider:
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
             ),
+            model=result.model_used,  # true attribution even when a fallback served
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
