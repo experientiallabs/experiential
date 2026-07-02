@@ -67,6 +67,31 @@ def _trace(tid: str, n: int = 2) -> Trace:
     )
 
 
+class _BoomProvider:
+    """A provider that raises on complete() — simulates a timeout/capacity error mid-eval."""
+
+    def __init__(self) -> None:
+        self.config = ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5")
+
+    def complete(self, *a, **k) -> Completion:  # noqa: ANN002, ANN003
+        raise TimeoutError("request timed out")
+
+    def embed(self, texts: list[str]) -> list[list[float]]:  # pragma: no cover
+        return [[0.0] for _ in texts]
+
+    def verify(self):  # noqa: ANN202
+        raise NotImplementedError
+
+
+def test_replay_scores_a_provider_error_as_zero_not_a_crash() -> None:
+    # A single stalled/failed request must not abort the whole eval; it scores 0.0 and continues.
+    report = replay("BASE", [_trace("h", n=2)], _BoomProvider(), FakeJudge(0.9))
+    assert report.n_steps == 2
+    assert report.mean_score == 0.0
+    assert all(r.score == 0.0 for r in report.results)
+    assert "failed" in report.results[0].critique
+
+
 def test_replay_scores_and_aggregates() -> None:
     provider = FakeProvider('{"output": "real-0", "is_error": false}')
     report = replay("BASE", [_trace("h", n=2)], provider, FakeJudge(0.8))

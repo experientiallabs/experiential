@@ -137,17 +137,35 @@ def _score_step(
     demos: DemoRetriever,
     history: list[Step],
 ) -> StepResult:
-    """Predict the observation for one step and score it against the recorded observation."""
-    predicted = predict_observation(
-        provider,
-        prompt,
-        step.task,
-        step.state_before,
-        step.action,
-        demos=demos.demos_for(trace_id, step),
-        history=history,
-    )
-    verdict = judge.score(predicted, step.observation, step)
+    """Predict the observation for one step and score it against the recorded observation.
+
+    A provider error (timeout, capacity, transient network) on this single step is scored as a
+    fidelity failure (0.0) rather than aborting the whole eval — one stalled request must not throw
+    away every other step's work. The failure is recorded in the critique for traceability.
+    """
+    try:
+        predicted = predict_observation(
+            provider,
+            prompt,
+            step.task,
+            step.state_before,
+            step.action,
+            demos=demos.demos_for(trace_id, step),
+            history=history,
+        )
+        verdict = judge.score(predicted, step.observation, step)
+    except Exception as exc:  # noqa: BLE001 - a step-level failure is a 0, not a crash
+        return StepResult(
+            trace_id=trace_id,
+            task=step.task,
+            action=render_action(step.action),
+            actual=step.observation.content,
+            predicted="",
+            score=0.0,
+            critique=f"prediction/scoring failed: {type(exc).__name__}: {str(exc)[:200]}",
+            is_error_actual=step.observation.is_error,
+            is_error_predicted=False,
+        )
     return StepResult(
         trace_id=trace_id,
         task=step.task,

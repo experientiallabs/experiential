@@ -37,6 +37,10 @@ class OpenAIProvider:
         if self._client is None:
             from openai import OpenAI
 
+            # Bound each request: a reasoning model (GPT-5.5) can leave a connection open with no
+            # output, hanging an eval/build indefinitely (Bedrock already caps this via botocore
+            # timeouts). A per-request timeout + one retry turns a stall into a bounded failure
+            # instead of a silent multi-hour hang. Key + OPENAI_BASE_URL still come from env.
             if self.config.endpoint:
                 # OpenAI-compatible server. Auth comes from WMH_ENDPOINT_API_KEY; NEVER send
                 # the real OPENAI_API_KEY to an arbitrary base_url. Most self-hosted servers
@@ -44,9 +48,11 @@ class OpenAIProvider:
                 self._client = OpenAI(
                     base_url=self.config.endpoint,
                     api_key=os.environ.get("WMH_ENDPOINT_API_KEY") or "not-needed",
+                    timeout=240.0,
+                    max_retries=1,
                 )
             else:
-                self._client = OpenAI()  # picks up OPENAI_API_KEY from the environment
+                self._client = OpenAI(timeout=240.0, max_retries=1)
         return self._client
 
     def complete(
