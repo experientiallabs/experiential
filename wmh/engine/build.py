@@ -160,7 +160,10 @@ def build(
 
     # Optimize against the SAME scorer we evaluate with (RubricJudge), so GEPA hill-climbs the
     # metric we actually report. The coarser LLMJudge here would let GEPA improve a proxy objective
-    # that doesn't move the reported rubric fidelity.
+    # that doesn't move the reported rubric fidelity. When `judge_provider` is given, GEPA is scored
+    # by it instead of the serve model — use a pinned judge (e.g. Bedrock Opus) so a weaker/self-
+    # judging serve model can't zero out the fitness signal, and so GEPA optimizes exactly the
+    # metric a pinned-judge eval later reports.
     optimizer = GEPAOptimizer(
         provider,
         RubricJudge(judge_provider),

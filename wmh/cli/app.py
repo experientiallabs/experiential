@@ -353,6 +353,7 @@ def build(
             serve_provider=metered,
             judge_provider=metered_judge,
             embedder=get_embedder(config),
+            judge_provider=judge_prov,
             reporter=TelemetryBuildReporter(reporter, build_stats),
         )
     record = tracker.record_summary()
