@@ -68,15 +68,17 @@ def test_no_bytecode_or_caches_are_tracked() -> None:
 
 
 def test_committed_results_only_under_docs_experiment_results() -> None:
-    """Generated result JSONs may only be committed as figure-backing summaries in docs/."""
+    """Result JSONs may only be committed as figure-backing summaries in docs/research/."""
     offenders = [
         p
         for p in _tracked_files()
-        if p.startswith("docs/") and p.endswith(".json") and "_results/" not in p
+        if p.startswith("docs/")
+        and p.endswith(".json")
+        and not (p.startswith("docs/research/") and "_results/" in p)
     ]
     assert not offenders, (
-        f"result JSONs outside docs/<experiment>_results/: {offenders}; AGENTS.md rule 5 blesses "
-        "only small summary JSONs that back a published figure"
+        f"result JSONs outside docs/research/<experiment>_results/: {offenders}; AGENTS.md rule 5 "
+        "blesses only small summary JSONs that back a published figure"
     )
 
 

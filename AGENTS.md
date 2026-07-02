@@ -45,10 +45,14 @@ uv run pytest -q
    `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`. Do not add others
    (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...). `wmh/repo_layout_test.py`
    enforces this. What each surface is for:
-   - `docs/` — **finished products only**: cleaned, production-ready research reports and their
-     figures, the final deliverable of a PR. A report may include the small summary JSONs that
-     back its published figures, under `docs/<experiment>_results/`. Nothing in `docs/` may
-     depend on `.agents/` staying around — quote reproduction commands in the report itself.
+   - `docs/` — **finished products only**: cleaned, production-ready documents, the final
+     deliverable of a PR, organized as `docs/research/` (completed reports + figures; a report
+     may include the small summary JSONs backing its published figures, under
+     `docs/research/<experiment>_results/`), `docs/design-decisions/` (the *why* behind
+     load-bearing mechanisms), and `docs/reference/` (how-to references verified against main).
+     `docs/README.md` indexes every doc with its justification — a doc that can't justify its
+     existence gets deleted. Nothing in `docs/` may depend on `.agents/` staying around — quote
+     reproduction commands in the report itself.
      Everything else that is "generated" stays out of git: eval results under the local
      `.wmh/evals/` artifact root, built models under `.wmh/models/` (intentional prebuilt
      example artifacts under `examples/<task>/models/`), eval suite definitions under
@@ -126,7 +130,7 @@ uv run pytest -q
     - Ink (text/titles): `#0a0a0a` · Grid/hairlines: `#ececec` · Background: white
     - Accents, in order of use: `#0070f3` (primary blue), `#7928ca` purple, `#f5a623` amber,
       `#ee0000` red, `#50e3c2` teal
-    The published figures under `docs/` (e.g. `docs/trace_scaling_law.png`) are the visual
+    The published figures under `docs/` (e.g. `docs/research/trace_scaling_law.png`) are the visual
     reference. (`.agents/scripts/plot_trace_scaling.py` shows one way to produce them, but
     `.agents/` contents are disposable — the palette above is the contract, not that script.)
 

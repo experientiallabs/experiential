@@ -50,7 +50,7 @@ AWS_REGION=us-east-1 uv run python .agents/scripts/run_trace_scaling.py terminal
 # render all three into the figure (matplotlib is ephemeral, not a project dep)
 uv run --with matplotlib python .agents/scripts/plot_trace_scaling.py \
   --report tau-bench=tau.json --report terminal-tasks=term.json --report swe-bench=swe.json \
-  --out docs/trace_scaling_law --title "Trace scaling law (RAG-only)"
+  --out docs/research/trace_scaling_law --title "Trace scaling law (RAG-only)"
 ```
 
 Each corpus was captured live from its real benchmark; see the capture tooling and READMEs under
