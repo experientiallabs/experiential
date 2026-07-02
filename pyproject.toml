@@ -72,4 +72,11 @@ python-version = "3.11"
 [tool.ty.src]
 # `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
 # (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
-exclude = ["examples/", "scripts/plot_trace_scaling.py"]
+# The appworld `backend/` scripts import the heavy `appworld` engine, which lives only in that
+# benchmark's local venv (not a project dependency) — exclude them like the figure script above.
+exclude = [
+    "examples/",
+    "scripts/plot_trace_scaling.py",
+    "environment-capture/appworld/backend/world_backend.py",
+    "environment-capture/appworld/backend/fetch_data.py",
+]
