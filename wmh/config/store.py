@@ -24,6 +24,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, JsonValue
 
+from wmh.config.card import ModelCard, load_card
 from wmh.config.config import ARTIFACT_DIR, ArtifactPaths, HarnessConfig
 
 # The implicit model name used when the user does not pass `--name`.
@@ -124,6 +125,13 @@ class WorldModelStore:
         resolved = self.dir_for(names[0])
         assert resolved is not None  # name came from list_names(), so it resolves
         return resolved
+
+    def card(self, name: str) -> ModelCard | None:
+        """The model's `card.json` metadata, or None when the model carries no card."""
+        model_dir = self.dir_for(name)
+        if model_dir is None:
+            raise FileNotFoundError(f"no world model named {name!r} under {self.models_dir}")
+        return load_card(model_dir)
 
     def info(self, name: str) -> ModelInfo:
         """Read a model's config + metrics into a summary (for `wmh list`)."""

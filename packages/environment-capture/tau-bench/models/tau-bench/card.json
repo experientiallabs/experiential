@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "tau-bench",
+  "title": "\u03c4\u00b2-bench customer service",
+  "description": "Customer-service tool environment (airline, retail, telecom) reconstructed from real \u03c4\u00b2-bench agent sessions. Step it with the benchmark's tool calls (look up users, book flights, modify orders), and it responds as the live backend would.",
+  "task": "tau-bench",
+  "corpus": {
+    "traces": 12,
+    "steps": 67,
+    "source": "traces.otel.jsonl"
+  },
+  "provider": "bedrock",
+  "model_id": "us.anthropic.claude-opus-4-8",
+  "fidelity": {
+    "suite": "trace-scaling (open-loop RAG)",
+    "score": 0.915,
+    "std": 0.003,
+    "run_id": "docs/trace_scaling_results/tau-bench.json#base@640"
+  },
+  "cost_per_step_usd": null,
+  "latency_per_step_s": null,
+  "built_at": "2026-06-29T15:21:47-07:00",
+  "license": null,
+  "tags": [
+    "tool-calls",
+    "customer-service"
+  ]
+}

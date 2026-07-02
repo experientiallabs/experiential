@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
 from fastapi.testclient import TestClient
 
+from wmh.config.card import CardCorpus, ModelCard
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
-from wmh.serving.server import create_app
+from wmh.serving.builds import BuildManager
+from wmh.serving.server import _load_card_or_none, create_app, resolve_model_dirs
 
 
 class FakeProvider:
@@ -63,7 +68,118 @@ def test_healthz() -> None:
 
 def test_lists_world_models_by_name() -> None:
     client = _client({"airline": _world_model(), "retail": _world_model()})
-    assert client.get("/world_models").json() == {"world_models": ["airline", "retail"]}
+    body = client.get("/world_models").json()
+    assert body["world_models"] == ["airline", "retail"]
+
+
+def test_lists_cards_alongside_names() -> None:
+    card = ModelCard(
+        name="airline",
+        title="Airline",
+        corpus=CardCorpus(traces=1, steps=2),
+        provider="bedrock",
+        model_id="m",
+    )
+    app = create_app(world_models={"airline": _world_model()}, cards={"airline": card})
+    body = TestClient(app).get("/world_models").json()
+    assert body["models"] == [{"name": "airline", "card": card.model_dump()}]
+
+
+def test_models_without_cards_list_null_cards() -> None:
+    body = _client().get("/world_models").json()
+    assert body["models"] == [{"name": "airline", "card": None}]
+
+
+def _fake_artifact(root: Path, name: str) -> None:
+    model_dir = root / "models" / name
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.toml").write_text("", encoding="utf-8")
+
+
+def test_resolve_model_dirs_merges_roots(tmp_path: Path) -> None:
+    _fake_artifact(tmp_path / "a", "m1")
+    _fake_artifact(tmp_path / "b", "m2")
+    resolved = resolve_model_dirs([str(tmp_path / "a"), str(tmp_path / "b")], None)
+    assert sorted(resolved) == ["m1", "m2"]
+
+
+def test_resolve_model_dirs_rejects_name_collision(tmp_path: Path) -> None:
+    _fake_artifact(tmp_path / "a", "m1")
+    _fake_artifact(tmp_path / "b", "m1")
+    with pytest.raises(ValueError, match="m1"):
+        resolve_model_dirs([str(tmp_path / "a"), str(tmp_path / "b")], None)
+
+
+def test_resolve_model_dirs_ignores_collision_outside_requested_names(tmp_path: Path) -> None:
+    _fake_artifact(tmp_path / "a", "dup")
+    _fake_artifact(tmp_path / "b", "dup")
+    _fake_artifact(tmp_path / "a", "wanted")
+    resolved = resolve_model_dirs([str(tmp_path / "a"), str(tmp_path / "b")], ["wanted"])
+    assert sorted(resolved) == ["wanted"]
+
+
+def test_load_card_or_none_degrades_malformed_card(tmp_path: Path) -> None:
+    (tmp_path / "card.json").write_text("{ broken", encoding="utf-8")
+    assert _load_card_or_none(tmp_path) is None
+
+
+def _ok_build_fn(config, *, file: str, root: str, reporter) -> None:  # noqa: ANN001 - test stub
+    reporter.ingest_done(1, 1)
+    Path(root).mkdir(parents=True, exist_ok=True)
+    (Path(root) / "config.toml").write_text("", encoding="utf-8")
+
+
+def _build_client(tmp_path: Path) -> TestClient:
+    manager = BuildManager(
+        store_root=tmp_path / ".wmh",
+        build_fn=_ok_build_fn,
+        verify_fn=lambda config: None,
+        register=lambda name, model_dir: None,
+    )
+    return TestClient(create_app(world_models={"airline": _world_model()}, build_manager=manager))
+
+
+def test_build_routes_run_a_build_and_stream_events(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+    traces = tmp_path / "t.jsonl"
+    traces.write_text("{}\n", encoding="utf-8")
+    started = client.post("/world_models/builds", json={"name": "fresh", "file": str(traces)})
+    assert started.status_code == 202
+    build_id = started.json()["build_id"]
+    # Poll until the background build reaches a terminal state.
+    import time
+
+    for _ in range(50):
+        if client.get(f"/world_models/builds/{build_id}").json()["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert client.get(f"/world_models/builds/{build_id}").json()["status"] == "succeeded"
+    with client.stream("GET", f"/world_models/builds/{build_id}/events") as stream:
+        assert stream.headers["content-type"].startswith("text/event-stream")
+        text = "".join(stream.iter_text())
+    assert '"type": "done"' in text
+
+
+def test_build_routes_unavailable_without_manager() -> None:
+    client = _client()
+    resp = client.post("/world_models/builds", json={"name": "x", "file": "/nope"})
+    assert resp.status_code == 503
+
+
+def test_upload_rejects_foreign_origin(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+    resp = client.post(
+        "/world_models/builds/uploads",
+        files={"file": ("t.jsonl", b"{}\n", "application/jsonl")},
+        headers={"Origin": "https://evil.example.com"},
+    )
+    assert resp.status_code == 403
+    ok = client.post(
+        "/world_models/builds/uploads",
+        files={"file": ("t.jsonl", b"{}\n", "application/jsonl")},
+        headers={"Origin": "http://localhost:6001"},
+    )
+    assert ok.status_code == 200
 
 
 def test_session_lifecycle_and_step_are_namespaced() -> None:

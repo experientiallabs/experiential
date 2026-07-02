@@ -137,6 +137,20 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
     assert result.exit_code == 0, result.output
 
 
+def test_build_writes_model_card(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    from wmh.config.card import load_card
+
+    root = tmp_path / ".wmh"
+    _build(root, "tau2-airline", tmp_path)
+    card = load_card(root / "models" / "tau2-airline")
+    assert card is not None
+    assert card.name == "tau2-airline"
+    assert card.corpus.traces is not None and card.corpus.traces > 0
+    assert card.corpus.steps > 0
+    assert card.provider == "bedrock"
+    assert card.built_at is not None
+
+
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
     core = {"build", "list", "serve", "demo", "eval", "play", "download"}

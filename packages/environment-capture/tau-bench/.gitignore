@@ -7,5 +7,5 @@ data/
 
 # the RL arms' pinned tool inventory is committed (see rl/pin_scenarios.py)
 !rl/tools.json
-# ...and the committed model artifacts are not capture scratch — keep them trackable.
+# ...and the committed model artifacts are not capture scratch, keep them trackable.
 !models/**/*.json
