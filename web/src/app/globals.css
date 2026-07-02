@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+/* Brand system (AGENTS.md rule 14): white background, ink text, hairline grids,
+   accents used sparingly and in order — blue, purple, amber, red, teal. */
+@theme {
+  --color-ink: #0a0a0a;
+  /* Secondary text derived from ink / the one established muted tone (#8a8a8a, as in
+     scripts/plot_trace_scaling.py) so the site's neutrals match the brand figures — no ad-hoc
+     grays. The sunk surface is a hairline-tinted off-white, not an accent. */
+  --color-ink-soft: color-mix(in srgb, var(--color-ink) 62%, #ffffff);
+  --color-ink-faint: #8a8a8a;
+  --color-line: #ececec;
+  --color-surface: #ffffff;
+  --color-surface-sunk: color-mix(in srgb, var(--color-line) 45%, #ffffff);
+  --color-accent: #0070f3;
+  --color-accent-purple: #7928ca;
+  --color-accent-amber: #f5a623;
+  --color-accent-red: #ee0000;
+  --color-accent-teal: #50e3c2;
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--color-surface);
+  color: var(--color-ink);
+}
+
+/* 10px uppercase tracked mono label — section eyebrows, stat labels, status chips. */
+.mono-label {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+}

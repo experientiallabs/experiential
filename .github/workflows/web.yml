@@ -1,0 +1,38 @@
+name: web
+
+on:
+  push:
+    branches: [main]
+    paths: ["web/**", "examples/**/models/**/card.json", "examples/**/models/**/metrics.json"]
+  pull_request:
+    # The committed src/data/index.json mirrors data outside web/ (model cards + metrics), so
+    # changes to those must also run this gate.
+    paths: ["web/**", "examples/**/models/**/card.json", "examples/**/models/**/metrics.json"]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      # The gallery renders from a committed index; fail if it is stale vs the cards on disk
+      # (compare ignoring the generated_at timestamp, which changes on every regeneration).
+      - name: check index is up to date
+        run: |
+          node scripts/build-index.mjs
+          if ! diff <(jq 'del(.generated_at)' src/data/index.json) \
+                    <(git show HEAD:web/src/data/index.json | jq 'del(.generated_at)'); then
+            echo "::error::src/data/index.json is stale — run 'npm run index' and commit the result"
+            exit 1
+          fi
+      - run: npm run build

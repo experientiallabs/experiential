@@ -1,0 +1,173 @@
+{
+  "generated_at": "2026-07-02T07:29:11.909Z",
+  "models": [
+    {
+      "card": {
+        "schema_version": 1,
+        "name": "swe-bench",
+        "title": "SWE-bench repo environment",
+        "description": "A software repository under test, rebuilt from live swe-agent runs on SWE-bench: run pytest, read tracebacks, apply patches — without standing up the multi-GB docker image.",
+        "task": "swe-bench",
+        "corpus": {
+          "traces": 21,
+          "steps": 317,
+          "source": "traces.otel.jsonl"
+        },
+        "provider": "bedrock",
+        "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "fidelity": {
+          "suite": "trace-scaling (open-loop RAG)",
+          "score": 0.8225,
+          "std": 0.0037,
+          "run_id": "docs/trace_scaling_results/swe-bench.json#base@24"
+        },
+        "cost_per_step_usd": null,
+        "latency_per_step_s": null,
+        "built_at": "2026-06-29T15:21:47-07:00",
+        "license": null,
+        "tags": [
+          "code",
+          "swe-bench"
+        ]
+      },
+      "dir": "examples/swe-bench/models/swe-bench",
+      "held_out_accuracy": 0.7947619047619047,
+      "serve_root": "examples/swe-bench",
+      "preview": [
+        {
+          "action": "bash {\"command\":\"cd /testbed && cat astropy/modeling/separable.py\"}",
+          "observation": "# Licensed under a 3-clause BSD style license - see LICENSE.rst \"\"\" Functions to determine if a model is sepa…"
+        },
+        {
+          "action": "bash {\"command\":\"cd /testbed && python -c \\\"\\nfrom astropy.modeling import …",
+          "observation": "[[ True True False False] [ True True False False] [False False True True] [False False True True]]"
+        }
+      ]
+    },
+    {
+      "card": {
+        "schema_version": 1,
+        "name": "tau-bench",
+        "title": "τ²-bench customer service",
+        "description": "Customer-service tool environment (airline, retail, telecom) reconstructed from real τ²-bench agent sessions. Step it with the benchmark's tool calls — look up users, book flights, modify orders — and it responds as the live backend would.",
+        "task": "tau-bench",
+        "corpus": {
+          "traces": 12,
+          "steps": 67,
+          "source": "traces.otel.jsonl"
+        },
+        "provider": "bedrock",
+        "model_id": "us.anthropic.claude-opus-4-8",
+        "fidelity": {
+          "suite": "trace-scaling (open-loop RAG)",
+          "score": 0.915,
+          "std": 0.003,
+          "run_id": "docs/trace_scaling_results/tau-bench.json#base@640"
+        },
+        "cost_per_step_usd": null,
+        "latency_per_step_s": null,
+        "built_at": "2026-06-29T15:21:47-07:00",
+        "license": null,
+        "tags": [
+          "tool-calls",
+          "customer-service"
+        ]
+      },
+      "dir": "examples/tau-bench/models/tau-bench",
+      "held_out_accuracy": 0.19285714285714284,
+      "serve_root": "examples/tau-bench",
+      "preview": [
+        {
+          "action": "get_user_details {\"user_id\":\"raj_sanchez_7340\"}",
+          "observation": "{\"user_id\": \"raj_sanchez_7340\", \"name\": {\"first_name\": \"Raj\", \"last_name\": \"Sanchez\"}, \"address\": {\"address1\"…"
+        },
+        {
+          "action": "get_reservation_details {\"reservation_id\":\"MZDDS4\"}",
+          "observation": "{\"reservation_id\": \"MZDDS4\", \"user_id\": \"raj_sanchez_7340\", \"origin\": \"MIA\", \"destination\": \"LAX\", \"flight_ty…"
+        }
+      ]
+    },
+    {
+      "card": {
+        "schema_version": 1,
+        "name": "tau-telecom",
+        "title": "τ²-bench telecom (GEPA-optimized)",
+        "description": "The telecom slice of τ²-bench with a GEPA-evolved environment prompt (317 optimization rollouts). Same customer-service tool surface as tau-bench, tuned for the telecom domain's device and plan workflows.",
+        "task": "tau-bench",
+        "corpus": {
+          "traces": 29,
+          "steps": 433,
+          "source": "traces.otel.jsonl"
+        },
+        "provider": "bedrock",
+        "model_id": "us.anthropic.claude-opus-4-8",
+        "fidelity": null,
+        "cost_per_step_usd": null,
+        "latency_per_step_s": null,
+        "built_at": "2026-06-29T15:21:47-07:00",
+        "license": null,
+        "tags": [
+          "tool-calls",
+          "customer-service",
+          "gepa"
+        ]
+      },
+      "dir": "examples/tau-bench/models/tau-telecom",
+      "held_out_accuracy": 0.6750769230769231,
+      "serve_root": "examples/tau-bench",
+      "preview": [
+        {
+          "action": "get_customer_by_phone {\"phone_number\":\"555-123-2002\"}",
+          "observation": "{\"customer_id\": \"C1001\", \"full_name\": \"John Smith\", \"date_of_birth\": \"1985-06-15\", \"email\": \"john.smith@examp…"
+        },
+        {
+          "action": "get_details_by_id {\"id\":\"L1001\"}",
+          "observation": "{\"line_id\": \"L1001\", \"phone_number\": \"555-123-2001\", \"status\": \"Active\", \"plan_id\": \"P1001\", \"device_id\": \"D1…"
+        }
+      ]
+    },
+    {
+      "card": {
+        "schema_version": 1,
+        "name": "terminal-tasks",
+        "title": "Terminal tasks",
+        "description": "A bash terminal reconstructed from real terminal-agent sessions: file operations, package queries, text processing. Send shell commands and read the output the real shell would have produced.",
+        "task": "terminal-tasks",
+        "corpus": {
+          "traces": 71,
+          "steps": 158,
+          "source": "traces.otel.jsonl"
+        },
+        "provider": "bedrock",
+        "model_id": "us.anthropic.claude-opus-4-8",
+        "fidelity": {
+          "suite": "trace-scaling (open-loop RAG)",
+          "score": 0.8663,
+          "std": 0.0025,
+          "run_id": "docs/trace_scaling_results/terminal-tasks.json#base@160"
+        },
+        "cost_per_step_usd": null,
+        "latency_per_step_s": null,
+        "built_at": "2026-06-29T15:21:47-07:00",
+        "license": null,
+        "tags": [
+          "bash",
+          "terminal"
+        ]
+      },
+      "dir": "examples/terminal-tasks/models/terminal-tasks",
+      "held_out_accuracy": 0.37214285714285705,
+      "serve_root": "examples/terminal-tasks",
+      "preview": [
+        {
+          "action": "bash {\"command\":\"curl -s \\\"https://api.coingecko.com/api/v3/simple/price?id…",
+          "observation": "{\"bitcoin\":{\"usd\":65781}}"
+        },
+        {
+          "action": "bash {\"command\":\"curl -s https://api.github.com/repos/rust-lang/rust/releas…",
+          "observation": "1.96.0"
+        }
+      ]
+    }
+  ]
+}
