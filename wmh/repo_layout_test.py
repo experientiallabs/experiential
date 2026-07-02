@@ -67,18 +67,15 @@ def test_no_bytecode_or_caches_are_tracked() -> None:
     )
 
 
-def test_committed_results_only_under_docs_experiment_results() -> None:
-    """Result JSONs may only be committed as figure-backing summaries in docs/research/."""
+def test_docs_holds_no_data_files() -> None:
+    """docs/ is writeups + rendered figures only; raw results/data live in .agents/docs/."""
+    allowed_suffixes = (".md", ".png")
     offenders = [
-        p
-        for p in _tracked_files()
-        if p.startswith("docs/")
-        and p.endswith(".json")
-        and not (p.startswith("docs/research/") and "_results/" in p)
+        p for p in _tracked_files() if p.startswith("docs/") and not p.endswith(allowed_suffixes)
     ]
     assert not offenders, (
-        f"result JSONs outside docs/research/<experiment>_results/: {offenders}; AGENTS.md rule 5 "
-        "blesses only small summary JSONs that back a published figure"
+        f"non-writeup files under docs/: {offenders}; move raw results/vector sources to "
+        ".agents/docs/research/ (AGENTS.md rule 5 keeps docs/ deliberately small)"
     )
 
 

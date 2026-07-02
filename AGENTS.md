@@ -45,14 +45,13 @@ uv run pytest -q
    `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`. Do not add others
    (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...). `wmh/repo_layout_test.py`
    enforces this. What each surface is for:
-   - `docs/` — **finished products only**: cleaned, production-ready documents, the final
-     deliverable of a PR, organized as `docs/research/` (completed reports + figures; a report
-     may include the small summary JSONs backing its published figures, under
-     `docs/research/<experiment>_results/`), `docs/design-decisions/` (the *why* behind
-     load-bearing mechanisms), and `docs/reference/` (how-to references verified against main).
-     `docs/README.md` indexes every doc with its justification — a doc that can't justify its
-     existence gets deleted. Nothing in `docs/` may depend on `.agents/` staying around — quote
-     reproduction commands in the report itself.
+   - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
+     (completed research writeups + the one figure each renders) and `docs/reference/` (how-to
+     references verified against main). Nothing else: raw result JSONs, vector sources, design
+     notes, drafts, and proposals all live in `.agents/docs/`. `docs/README.md` indexes every
+     doc with its justification — a doc that can't justify its existence gets deleted. Nothing
+     in `docs/` may depend on `.agents/` staying around — quote reproduction commands in the
+     report itself.
      Everything else that is "generated" stays out of git: eval results under the local
      `.wmh/evals/` artifact root, built models under `.wmh/models/` (intentional prebuilt
      example artifacts under `examples/<task>/models/`), eval suite definitions under
@@ -61,7 +60,9 @@ uv run pytest -q
      scratchpads, drafts — the unclean side of the work. Committed (so it transfers across
      worktrees and chats) but exempt from the gate, from review standards, and from any
      stability expectation: it is pruned periodically and nothing may import from it or link to
-     it as if it were permanent. When work matures, its product is promoted out (report → `docs/`,
+     it as if it were permanent. `.agents/docs/` is organized as `reference/`,
+     `design-decisions/`, `research/` (incl. raw results), `proposals/`. When work matures, its
+     product is promoted out (writeup → `docs/research/`, verified how-to → `docs/reference/`,
      reusable code → `wmh/`, dataset tooling → `examples/<task>/`) and the scraps die here.
    - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
      its own gate instead: `npm run lint` and `npx tsc --noEmit` from `web/` must be clean

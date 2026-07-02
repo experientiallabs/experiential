@@ -1,57 +1,63 @@
-# .agents/docs — working docs (migrated from Notion 2026-07-02)
+# .agents/docs — working docs
 
-The former Notion Eng Docs database, migrated per AGENTS.md's Docs policy: the repo is the
-single source of truth. Files keep their Notion `area`/`status` in frontmatter. This README is
-the promotion analysis — what graduates to `docs/` (production) and what stays here.
+The unclean side of the documentation (AGENTS.md rule 5): drafts, design notes, experiment logs,
+raw results, proposals. Committed so it transfers across worktrees and chats; pruned
+periodically; nothing outside `.agents/` may depend on it. When something matures, its cleaned
+product is promoted to `docs/` (writeups → `docs/research/`, verified how-tos →
+`docs/reference/`) and the working copy dies here. The Notion Eng Docs database was migrated
+here 2026-07-02; files keep their Notion `area`/`status` in frontmatter.
 
-## Promotion queue → `docs/` (worthy, but needs a refresh pass first)
+## Layout
+
+- **`reference/`** — system descriptions that become `docs/reference/` material after a
+  freshness pass: `architecture.md`, `embeddings.md`, `benchmarks-to-traces.md`,
+  `runbook-build-tau2-bedrock.md`.
+- **`design-decisions/`** — the why behind load-bearing mechanisms: `rag-aware-gepa.md`
+  (verified accurate 2026-07-02; lives here, not in public docs — design rationale is internal
+  material, per user direction).
+- **`research/`** — experiment logs, snapshots, and raw results: `gepa-optimization-research.md`,
+  `base-env-prompt-iteration.md`, `benchmark-results-reproducibility.md`, plus
+  `trace_scaling_law.svg` and `trace_scaling_results/` (the raw JSONs and vector source behind
+  the published `docs/research/trace_scaling_law.md` writeup).
+- **`proposals/`** — specced-but-not-built directions: `research-directions.md`,
+  `closed-loop-eval-spec.md`, `sim-real-policy-rank-agreement.md`.
+
+## Promotion queue → `docs/` (worthy, blocked on a refresh pass)
 
 | Doc | Blocking staleness |
 |---|---|
-| `architecture.md` | Predates `wmh/env` (PR #48: Env/WorldModelEnv/run_episode/scenarios) and `wmh/telemetry`; references `docs/gepa_research.md`, `docs/research_directions.md`, `scripts/` — paths that don't exist. Refresh after the current merge wave (BENCH-A grid, RL seam) settles, then promote — this is the flagship dev doc. |
-| `runbook-build-tau2-bedrock.md` | Verify every command against current CLI; sample outputs recorded on an older corpus (flagged inline). Promote as `docs/runbook.md` after a live re-run of the commands. |
-| `benchmarks-to-traces.md` | Corpus counts stale (swe-bench 87 → 255+, growing). Recipe + contract are the value; refresh numbers, promote. |
-| `embeddings.md` | Spot-check provider list (OpenAI Responses landed #46) + embed flags, then promote. |
-| `eval-suites.md` | Near-current; verify against post-#38/#48 CLI, then promote. |
-| `rag-aware-gepa-design-note.md` | Mechanism-level, low drift — strongest promote-as-is candidate; one read-through against `wmh/optimize/gepa.py` on current main. |
+| `reference/architecture.md` | Predates `wmh/env` (PR #48), `wmh/telemetry`, the RL seam (#58+); references Notion-era doc names and old `scripts/` paths. The flagship dev doc — refresh once the merge wave settles, promote to `docs/reference/`. |
+| `reference/runbook-build-tau2-bedrock.md` | Re-run every command live (rule 11), refresh sample outputs, promote as `docs/reference/runbook.md`. |
+| `reference/benchmarks-to-traces.md` | Corpus counts stale (swe 87 → 255+). The trace contract + add-a-benchmark recipe are the value. |
+| `reference/embeddings.md` | Spot-check provider list (post-#46/#67) and embed flags, then promote. |
 
-## Stays here (working material, not production docs)
+## Stays here (working material)
 
-- `research-directions.md` — backlog/plans (definitionally workspace).
-- `gepa-optimization-research.md` — half harness-description (fold into architecture on
-  promotion), half experiment log.
-- `base-env-prompt-iteration.md` — methodology + historical numbers; superseded numerically.
-- `benchmark-results-reproducibility.md` — June 2026 snapshot (base 0.74 vs GEPA 0.86) that
-  CONFLICTS with the #37 grid finding (GEPA ~0 lift on the current base — different base prompt
-  era). Keep for history; do not promote; the 80-cell grid (BENCH-A) supersedes it.
-- `closed-loop-eval-spec.md` — "future direction" spec being overtaken by events (PR #58 landed
-  session scoring + scenarios; BENCH-B is building closed-loop RL). BENCH-B should mine then
-  retire it.
-- `sim-real-policy-rank-agreement.md` — unclaimed-in-literature metric proposal
-  (Spearman/Kendall policy-rank agreement sim vs real). High-value idea for the full benchmark's
-  narrative — flagged to BENCH-A/B via DECISIONS.md.
-- (deleted at migration, rule 13 — one way to do each thing: `trace-scaling-law-notion.md` was a
-  dead duplicate of the already-promoted `docs/research/trace_scaling_law.md`; the promoted `eval-suites`
-  and `rag-aware-gepa` sources were removed once their `docs/` versions landed — git history
-  keeps the pre-promotion snapshots.)
-
-## Scripts analysis (same exercise, `.agents/scripts/`)
-
-- `run_trace_scaling.py` — stays here for now. If trace-scaling reruns become routine (BENCH-A's
-  data-efficiency axis), promote into the `wmh research` CLI group (rule 7) once PR #41 lands it.
-- `plot_trace_scaling.py` — disposable example of the brand palette; AGENTS.md rule 15 is
-  self-contained (the palette is the contract, not this script).
-- `examples/*/` capture/convert/run tooling — correctly placed per rule 6; not workspace material.
+- `design-decisions/rag-aware-gepa.md` — internal design rationale (user call: design decisions
+  are not public-docs material).
+- `research/benchmark-results-reproducibility.md` — June 2026 snapshot (base 0.74 vs GEPA 0.86)
+  that CONFLICTS with the #37 grid finding (GEPA ~0 lift, different base-prompt era). History
+  only; the 80-cell grid supersedes it.
+- `research/base-env-prompt-iteration.md` — methodology + superseded historical numbers.
+- `research/gepa-optimization-research.md` — half harness-description, half experiment log; most
+  stale doc (references `scripts/run_seed_stability.py` (gone), `examples/tau2-bench.otel.jsonl`
+  (now `examples/tau-bench/traces.otel.jsonl`), `world-models/tau-bench/` (now
+  `examples/tau-bench/models/`), `ARCHITECTURE.md` (never existed)).
+- `proposals/closed-loop-eval-spec.md` — being overtaken by the RL seam (#58+); BENCH-B should
+  mine then retire it.
+- `proposals/sim-real-policy-rank-agreement.md` — policy-rank-agreement metric proposal
+  (unclaimed in the literature) — flagged to the benchmark chats as narrative material.
+- `proposals/research-directions.md` — ablation backlog (references old `scripts/` paths).
 
 ## Known staleness (checked at migration, 2026-07-02)
 
-- Cross-cutting: docs reference `scripts/…` (now `.agents/scripts/…`) and old cross-doc filenames
-  (`./sim_real_agreement.md`, `./closed_loop.md`) — fix links when refreshing.
-- `gepa-optimization-research.md` is the most stale: references `scripts/run_seed_stability.py`
-  (gone), `examples/tau2-bench.otel.jsonl` (now `examples/tau-bench/traces.otel.jsonl`),
-  `world-models/tau-bench/` canonical model (now `examples/tau-bench/models/`), `ARCHITECTURE.md`
-  (never existed here).
-- `trace-scaling-law-notion.md` results table predates corpus growth (swe 40→255+).
-- `benchmarks-to-traces.md` swe count 87 → 255+ (overnight capture #53).
-- `architecture.md` references `docs/gepa_research.md` / `docs/research_directions.md` (Notion-era
-  names; content is now in this folder) and predates `wmh/env` + `wmh/telemetry`.
+Cross-cutting: migrated docs reference `scripts/…` (now `.agents/scripts/…`) and old cross-doc
+filenames (`./sim_real_agreement.md`, `./closed_loop.md`) — fix links when refreshing a doc.
+
+## Scripts (`.agents/scripts/`)
+
+- `run_trace_scaling.py` — stays here; promote into the `wmh research` CLI group (rule 7) only
+  if trace-scaling reruns become routine.
+- `plot_trace_scaling.py` — disposable brand-palette example (the palette in AGENTS.md rule 15
+  is the contract, not this script). Writes into `.agents/docs/research/`; the published PNG is
+  copied to `docs/research/` at promotion.

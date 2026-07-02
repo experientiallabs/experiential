@@ -39,7 +39,8 @@ The curves come from `run_trace_scaling.py` (RAG-only, `--modes base`) — a wor
 snapshotted below as of publication (`.agents/` contents are disposable; the commands quoted
 here are the record) — scored with the
 canonical `RubricJudge` on a fixed test split, parallelized (`--concurrency`) and cost-bounded
-(`--test-cap`). Raw `AblationReport` JSONs are under [`trace_scaling_results/`](./trace_scaling_results).
+(`--test-cap`). Raw `AblationReport` JSONs were archived to the workspace
+(`.agents/docs/research/trace_scaling_results/` as of publication).
 
 ```bash
 # one benchmark's curve (per-benchmark; adjust --counts to the corpus)
