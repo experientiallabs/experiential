@@ -1,0 +1,1 @@
+{"gold_sql": "SELECT t2.buildUpPlayPassingClass FROM Team AS t1 INNER JOIN Team_Attributes AS t2 ON t1.team_api_id = t2.team_api_id WHERE t1.team_long_name = 'FC Lorient' AND t2.`date` LIKE '2010-02-22%'"}
