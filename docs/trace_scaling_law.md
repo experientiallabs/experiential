@@ -35,7 +35,9 @@ count. Past a small buffer, collecting more traces of the same kind is not where
 
 ## Reproduce
 
-The curves come from `.agents/scripts/run_trace_scaling.py` (RAG-only, `--modes base`), scored with the
+The curves come from `run_trace_scaling.py` (RAG-only, `--modes base`) — a workspace script,
+snapshotted below as of publication (`.agents/` contents are disposable; the commands quoted
+here are the record) — scored with the
 canonical `RubricJudge` on a fixed test split, parallelized (`--concurrency`) and cost-bounded
 (`--test-cap`). Raw `AblationReport` JSONs are under [`trace_scaling_results/`](./trace_scaling_results).
 

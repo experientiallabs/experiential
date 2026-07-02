@@ -44,7 +44,11 @@ def test_conditions_are_mode_cross_count() -> None:
 def test_counts_capped_at_train_pool_and_deduped() -> None:
     # 20-trace corpus -> small pool; 1000/2000 collapse to the pool size and dedupe to one count.
     ab = TraceScalingAblation(
-        _corpus(20), "BASE", make_backends=_fake_backends, counts=[10, 1000, 2000], modes=[BASE],
+        _corpus(20),
+        "BASE",
+        make_backends=_fake_backends,
+        counts=[10, 1000, 2000],
+        modes=[BASE],
         budget=4,
     )
     pool = len(ab.split.train_pool)
@@ -70,7 +74,11 @@ def test_base_mode_scores_base_prompt_without_gepa(monkeypatch) -> None:  # noqa
     monkeypatch.setattr(ts, "optimize_prompt", fake_optimize)
 
     ab = TraceScalingAblation(
-        _corpus(200), "BASE_PROMPT", make_backends=_fake_backends, counts=[5], modes=[BASE],
+        _corpus(200),
+        "BASE_PROMPT",
+        make_backends=_fake_backends,
+        counts=[5],
+        modes=[BASE],
         budget=4,
     )
     score = ab.run(ab.conditions()[0], seed=0)
@@ -126,7 +134,11 @@ def test_run_ablation_end_to_end_with_fakes(monkeypatch) -> None:  # noqa: ANN00
         lambda prompt, held_out, **k: 0.3 + 0.001 * len(k["train"]),
     )
     ab = TraceScalingAblation(
-        _corpus(200), "BASE", make_backends=_fake_backends, counts=[10, 30], modes=[BASE],
+        _corpus(200),
+        "BASE",
+        make_backends=_fake_backends,
+        counts=[10, 30],
+        modes=[BASE],
         budget=4,
     )
     report = run_ablation(ab, seeds=[0, 1])

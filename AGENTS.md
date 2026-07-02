@@ -136,4 +136,5 @@ The repo is the single source of truth for project docs: finished, production-re
 `docs/` (rule 5); working docs, plans, and drafts in `.agents/docs/`. The former Notion docs
 database (Eng Docs → world-model-harness, page `38e0f8b3-f591-8087-b6b7-fc883178dc5e`) was
 migrated into `.agents/docs/` on 2026-07-02 and is deprecated — do not add new project docs to
-Notion.
+Notion. Working docs live in `.agents/docs/` only until they are promoted to `docs/` or pruned;
+pruning is deliberate (git history keeps everything), so promote what matters before it goes.

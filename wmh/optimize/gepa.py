@@ -140,7 +140,7 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
     RAG-aware: each step is evaluated with the SAME retrieved demos the serving world model would
     use (DreamGym top-k), so GEPA optimizes the prompt under serving conditions rather than a
     zero-shot one. Retrieval depends on (state, action) — not on the candidate prompt — so demos are
-    precomputed once (see `GEPAOptimizer._eval_steps`) and reused across every candidate.
+    precomputed once (see the module-level `_eval_steps`) and reused across every candidate.
     """
 
     def __init__(

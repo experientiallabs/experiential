@@ -18,9 +18,10 @@ GEPA now evaluates each step with the **same demos the serving model would retri
 
 Key realization that keeps this cheap and correct: retrieval depends only on `(state, action)`,
 not on the candidate prompt. So a step's demos are identical across every GEPA candidate. We
-therefore compute demos **once** (`GEPAOptimizer._eval_steps`) and bundle them with the step into the
-`_EvalStep` that GEPA carries as its DataInst — rather than re-retrieving inside each candidate
-evaluation.
+therefore compute demos **once** (the module-level `_eval_steps` in `wmh/optimize/gepa.py`) and
+bundle them — together with the step's within-trace history, so candidates are scored under the
+same open-loop conditions replay uses — into the `_EvalStep` that GEPA carries as its DataInst,
+rather than re-retrieving inside each candidate evaluation.
 
 This is *not* "RAG as an optimization mechanism." Retrieval isn't part of the search; it's part of
 faithfully reproducing the serving environment the prompt is scored against.

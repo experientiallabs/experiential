@@ -30,8 +30,10 @@ the promotion analysis — what graduates to `docs/` (production) and what stays
 - `sim-real-policy-rank-agreement.md` — unclaimed-in-literature metric proposal
   (Spearman/Kendall policy-rank agreement sim vs real). High-value idea for the full benchmark's
   narrative — flagged to BENCH-A/B via DECISIONS.md.
-- `trace-scaling-law-notion.md` — superseded by the promoted `docs/trace_scaling_law.md`
-  (already production). Kept only as the Notion-era copy; delete at next prune.
+- (deleted at migration, rule 13 — one way to do each thing: `trace-scaling-law-notion.md` was a
+  dead duplicate of the already-promoted `docs/trace_scaling_law.md`; the promoted `eval-suites`
+  and `rag-aware-gepa` sources were removed once their `docs/` versions landed — git history
+  keeps the pre-promotion snapshots.)
 
 ## Scripts analysis (same exercise, `.agents/scripts/`)
 
