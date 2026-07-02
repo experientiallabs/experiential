@@ -64,6 +64,7 @@ def test_open_env_stages_only_the_tasks_docs(data_root: Path) -> None:
         ("capex = 1577", 1.0),  # bare numeric match
         ("capex was 1580", 0.0),  # wrong number
         ("", 0.0),
+        ("a change of - 1577.00 million", 0.0),  # sign+space form must parse (as -1577), not crash
     ],
 )
 def test_grade_numeric(data_root: Path, submission: str, expected: float) -> None:

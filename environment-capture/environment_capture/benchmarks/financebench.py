@@ -18,7 +18,7 @@ from pathlib import Path
 from environment_capture.localexec import LocalBashEnv
 from environment_capture.trajectory import Task
 
-_NUMBER_RE = re.compile(r"\(?-?\$?\s*\d[\d,]*(?:\.\d+)?\)?%?")
+_NUMBER_RE = re.compile(r"\(?-?\s*\$?\s*\d[\d,]*(?:\.\d+)?\)?%?")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _REL_TOLERANCE = 1e-4
 
@@ -29,8 +29,9 @@ def _parse_numbers(text: str) -> list[float]:
     for raw in _NUMBER_RE.findall(text):
         cleaned = raw.replace("$", "").replace(",", "").replace("%", "").strip()
         negative = cleaned.startswith("(") and cleaned.endswith(")")
-        cleaned = cleaned.strip("()")
-        if not cleaned:
+        # A sign may be separated from the digits by whitespace ("- 1.500"); float() rejects that.
+        cleaned = re.sub(r"\s+", "", cleaned.strip("()"))
+        if not cleaned or cleaned == "-":
             continue
         value = float(cleaned)
         values.append(-value if negative else value)

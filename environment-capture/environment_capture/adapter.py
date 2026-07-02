@@ -107,6 +107,9 @@ def run_capture(
             env = adapter.open_env(task)
             try:
                 run = agent.run(task, env)
+                # grade() is part of the isolated unit: a grader edge case on one submission
+                # (e.g. an unparsable number) must not discard the rest of the wave.
+                reward = adapter.grade(task, run.final_answer)
             except Exception as error:  # noqa: BLE001 - isolation is the contract; error recorded
                 last_error = f"{type(error).__name__}: {error}"
                 continue
@@ -117,7 +120,7 @@ def run_capture(
                     task=task,
                     steps=run.steps,
                     final_answer=run.final_answer,
-                    reward=adapter.grade(task, run.final_answer),
+                    reward=reward,
                     model=run.model,
                     split=split,
                 )

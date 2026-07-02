@@ -105,6 +105,31 @@ def test_run_capture_retries_transient_failures() -> None:
     assert len(result.trajectories) == 1
 
 
+def test_run_capture_isolates_grader_failures() -> None:
+    """grade() runs outside the agent loop but its crash must ALSO be a recorded failure —
+    a grader edge case on one submission must never discard a whole capture wave."""
+    adapter = _FakeAdapter()
+
+    class _GraderBombAdapter:
+        name = adapter.name
+
+        def tasks(self, split: str) -> list[Task]:
+            return adapter.tasks(split)
+
+        def open_env(self, task: Task) -> CommandEnv:
+            return adapter.open_env(task)
+
+        def grade(self, task: Task, submission: str) -> float:
+            if task.task_id == "train-1":
+                raise ValueError("could not convert string to float: '- 1.500'")
+            return 1.0
+
+    result = run_capture(_GraderBombAdapter(), _OneShotAgent(), split="train")
+    assert [t.task.task_id for t in result.trajectories] == ["train-0", "train-2"]
+    assert [f.task_id for f in result.failures] == ["train-1"]
+    assert "could not convert" in result.failures[0].error
+
+
 def test_run_capture_limit() -> None:
     adapter = _FakeAdapter()
     result = run_capture(adapter, _OneShotAgent(), split="train", limit=2)
