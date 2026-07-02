@@ -106,6 +106,101 @@ def test_cap_gepa_valset_bounds_steps_and_keeps_at_least_one_trace() -> None:
     assert _cap_gepa_valset([huge]) == [huge]
 
 
+def _multi_trace_file(tmp_path, n: int) -> str:  # noqa: ANN001 - pytest fixture
+    """Write `n` one-step OTel traces with distinct 32-char trace ids."""
+    lines: list[str] = []
+    for i in range(n):
+        tid = f"{i:032d}"
+        lines.append(
+            json.dumps(
+                {
+                    "traceId": tid,
+                    "spanId": "s1",
+                    "name": "chat",
+                    "startTimeUnixNano": 1,
+                    "attributes": [
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                        {"key": "gen_ai.tool.name", "value": {"stringValue": "get_user"}},
+                        {
+                            "key": "gen_ai.tool.call.arguments",
+                            "value": {"stringValue": '{"id": "u"}'},
+                        },
+                        {"key": "gen_ai.prompt", "value": {"stringValue": "look up u"}},
+                    ],
+                }
+            )
+        )
+        lines.append(
+            json.dumps(
+                {
+                    "traceId": tid,
+                    "spanId": "s2",
+                    "name": "execute_tool",
+                    "startTimeUnixNano": 2,
+                    "attributes": [
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                        {"key": "gen_ai.tool.message", "value": {"stringValue": "found u"}},
+                    ],
+                }
+            )
+        )
+    p = tmp_path / "traces.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(p)
+
+
+def test_build_val_frac_reserves_test_band_from_gepa(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """With val_frac>0, GEPA trains/selects on train+val only; the test band is held out fully."""
+    import sys
+
+    from wmh.engine.build import split_traces_3way
+    from wmh.optimize import OptimizeResult
+
+    # The package re-exports `build`, so `import ... as` shadows the module; use sys.modules.
+    build_mod = sys.modules["wmh.engine.build"]
+
+    traces_file = _multi_trace_file(tmp_path, 40)
+
+    seen: dict[str, set[str]] = {}
+
+    class _SpyOptimizer:
+        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def optimize(self, train, val, *a, **k) -> OptimizeResult:  # noqa: ANN001, ANN002, ANN003
+            seen["train"] = {t.trace_id for t in train}
+            seen["val"] = {t.trace_id for t in val}
+            return OptimizeResult(prompt="EVOLVED", frontier=["EVOLVED"])
+
+    monkeypatch.setattr(build_mod, "GEPAOptimizer", _SpyOptimizer)
+
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=2,
+        train_split=0.7,
+        val_frac=0.15,
+    )
+    build(
+        config,
+        file=traces_file,
+        root=str(tmp_path / ".wmh"),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+
+    # Reconstruct the reserved test band and assert GEPA saw none of it.
+    from wmh.ingest import get_adapter
+
+    all_traces = get_adapter("otel-genai").from_file(traces_file)
+    _, _, test = split_traces_3way(all_traces, 0.7, 0.15)
+    test_ids = {t.trace_id for t in test}
+    assert test_ids, "test band must be non-empty for the assertion to mean anything"
+    assert not (seen["train"] & test_ids)
+    assert not (seen["val"] & test_ids)
+
+
 def test_build_writes_a_loadable_artifact(tmp_path) -> None:  # noqa: ANN001 - pytest fixture
     # A tiny OTel JSONL with one tool-call step.
     span_llm = {

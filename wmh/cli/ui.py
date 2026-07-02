@@ -120,6 +120,7 @@ class BuildParams(BaseModel):
     region: str | None = None
     gepa_budget: int = 10
     train_split: float = 0.8
+    val_frac: float = 0.0
     embed_provider: str = "hashing"
     embed_model: str | None = None
     embed_dim: int = 512

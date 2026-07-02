@@ -228,6 +228,11 @@ def build(
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
     ),
+    val_frac: float = typer.Option(
+        0.0,
+        help="If >0, 3-way split: GEPA selects on this val band and reserves the "
+        "[train_split+val_frac, 1) test band, so an eval reporting on it isn't tuned-on.",
+    ),
     embed_provider: str = typer.Option(
         "hashing", help="phi embedder: hashing (offline) | bedrock | openai | azure."
     ),
@@ -262,6 +267,7 @@ def build(
         gepa_budget=gepa_budget,
         train_split=train_split,
         judge_model=judge_model,
+        val_frac=val_frac,
         embed_provider=embed_provider,
         embed_model=embed_model,
         embed_dim=embed_dim,
@@ -313,6 +319,7 @@ def build(
         gepa_budget=params.gepa_budget,
         train_split=params.train_split,
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
+        val_frac=params.val_frac,
     )
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which

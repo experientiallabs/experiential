@@ -41,6 +41,10 @@ class HarnessConfig(BaseModel):
     gepa_budget: int = 10  # GEPA iterations; ~valset_cap calls each (see _cap_gepa_valset)
     # Model id the GEPA judge runs on (same provider kind as serve). None = the serve model.
     judge_model: str | None = None
+    # When > 0, GEPA uses a 3-way train/val/test split and selects candidates on `val` only, holding
+    # `test` (the [train_split+val_frac, 1) hash band) fully out — so an eval that reports on that
+    # same test band never scores a prompt tuned on it. 0 keeps the legacy 2-way behaviour.
+    val_frac: float = Field(default=0.0, ge=0.0, lt=1.0)
     trace_adapter: str = "otel-genai"
 
     def provider_config(self, kind: ProviderKind) -> ProviderConfig:
@@ -80,6 +84,7 @@ class HarnessConfig(BaseModel):
         gepa_budget: int,
         train_split: float = 0.8,
         judge_model: str | None = None,
+        val_frac: float = 0.0,
     ) -> HarnessConfig:
         """Assemble a build config from the choices `wmh build` collects.
 
@@ -112,6 +117,7 @@ class HarnessConfig(BaseModel):
             gepa_budget=gepa_budget,
             train_split=train_split,
             judge_model=judge_model,
+            val_frac=val_frac,
         )
 
 

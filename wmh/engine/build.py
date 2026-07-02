@@ -115,7 +115,14 @@ def build(
         raise ValueError("no traces ingested; nothing to build")
     report.ingest_done(len(traces), _count_steps(traces))
 
-    train, test = split_traces(traces, config.train_split)
+    # 2-way (legacy) selects GEPA candidates on the held-out `test` — which leaks if an eval later
+    # reports on that same band. With `val_frac > 0` we split 3 ways and select on `val`, holding
+    # `test` (the [train_split+val_frac, 1) hash band) fully out for an independent eval to report.
+    if config.val_frac > 0:
+        train, gepa_val, test = split_traces_3way(traces, config.train_split, config.val_frac)
+    else:
+        train, test = split_traces(traces, config.train_split)
+        gepa_val = test
     report.split_done(len(train), len(test))
 
     provider = serve_provider or get_provider(config.serve_provider_config())
@@ -165,8 +172,9 @@ def build(
     # Every GEPA iteration re-scores the whole valset, so an uncapped held-out split multiplies
     # wall-clock and spend by its step count for no selection benefit (fidelity saturates fast —
     # see docs/trace_scaling_law.md). Candidate selection only needs a stable sample; the full
-    # held-out split still backs `wmh eval`.
-    gepa_val = _cap_gepa_valset(test or train)
+    # held-out split still backs `wmh eval`. Cap whichever val band the split produced (the 3-way
+    # `val` when `val_frac > 0`, else the 2-way `test`).
+    gepa_val = _cap_gepa_valset(gepa_val or train)
     result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
     report.optimize_done(
         result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used
