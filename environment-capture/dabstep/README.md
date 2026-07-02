@@ -43,8 +43,8 @@ uv run python environment-capture/dabstep/capture.py \
 
 - **Open-loop fidelity** (suite `dabstep/default`, seed 0, Opus 4.8 target + rubric judge,
   run via `uv run wmh eval run dabstep/default --examples-root environment-capture`): mean
-  fidelity **0.886**, error-flag accuracy **0.976**, n=85 held-out steps (an independent rerun
-  scored 0.892 — the spread is judge noise). Structured pandas/JSON tool output reconstructs on
+  fidelity **0.884**, error-flag accuracy **0.964**, n=140 held-out steps (snapshot @80
+  traces; earlier @36: 0.886). Snapshot evals on multi-run corpora carry a caveat: tasks are resampled across capture waves, and the whole-trace split lets a held-out step retrieve the same task's other runs — fidelity partly reflects cross-run overlap, not pure generalization (DECISIONS.md D33). Structured pandas/JSON tool output reconstructs on
   par with the other structured-output corpora (bird-sql 0.864) and far above document-excerpt
   observations (financebench 0.586).
 

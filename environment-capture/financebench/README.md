@@ -30,8 +30,8 @@ fallback) — see `environment_capture/benchmarks/financebench.py`.
 ## Results (2026-07-02, corpus as committed)
 
 - **Open-loop fidelity** (suite `financebench/default`, seed 0, Opus 4.8 target + rubric
-  judge, on the committed post-hygiene corpus): mean fidelity **0.586**, error-flag accuracy
-  **0.778**, n=27 held-out steps. Notably below the
+  judge, on the committed post-hygiene corpus): mean fidelity **0.823**, error-flag accuracy
+  **0.964**, n=476 held-out steps (snapshot @305 traces). Snapshot evals on multi-run corpora carry a caveat: tasks are resampled across capture waves, and the whole-trace split lets a held-out step retrieve the same task's other runs — fidelity partly reflects cross-run overlap, not pure generalization (DECISIONS.md D33). Notably below the
   shell-like corpora (tau ~0.90, terminal ~0.86, swe ~0.82): observations here are long verbatim
   document excerpts, which are much harder to reconstruct than command output.
 - **WM-replacement demo** (5 test tasks, Opus 4.8 agent, Opus 4.8 WM): reward agreement 5/5 on

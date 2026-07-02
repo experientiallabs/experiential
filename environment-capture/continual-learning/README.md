@@ -34,7 +34,8 @@ in-process, which is all the offline suite uses.
 ## Results (2026-07-02, corpus as committed)
 
 - **Open-loop fidelity** (suite `continual-learning/default`, seed 0, Opus 4.8 target + rubric
-  judge): mean fidelity **0.763**, error-flag accuracy **0.955**, n=67 held-out steps.
+  judge): mean fidelity **0.894**, error-flag accuracy **0.975**, n=239 held-out steps (snapshot
+  @139 traces). Snapshot evals on multi-run corpora carry a caveat: tasks are resampled across capture waves, and the whole-trace split lets a held-out step retrieve the same task's other runs — fidelity partly reflects cross-run overlap, not pure generalization (DECISIONS.md D33).
 
 ## Provenance
 

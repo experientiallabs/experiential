@@ -34,8 +34,7 @@ seeded (seed 7), split ~70/30 into train/test.
 
 - **Open-loop fidelity** (suite `bird-sql/default`, seed 0, Opus 4.8 target + rubric judge, run
   via `uv run wmh eval run bird-sql/default --examples-root environment-capture`): mean fidelity
-  **0.864**, error-flag accuracy **1.000**, n=21 held-out steps (re-measured post-hygiene;
-  corpus unchanged, drift is judge noise). Structured sqlite output
+  **0.943**, error-flag accuracy **1.000**, n=235 held-out steps (snapshot @415 traces). Snapshot evals on multi-run corpora carry a caveat: tasks are resampled across capture waves, and the whole-trace split lets a held-out step retrieve the same task's other runs — fidelity partly reflects cross-run overlap, not pure generalization (DECISIONS.md D33). Structured sqlite output
   reconstructs far better than document-excerpt observations (financebench: 0.581).
 
 ## Provenance
