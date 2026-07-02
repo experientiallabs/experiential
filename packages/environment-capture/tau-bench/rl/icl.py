@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -180,21 +181,49 @@ class PolicyAgent:
         return _parse_action(completion.text)
 
 
+_QWEN_FUNCTION_RE = re.compile(r"<function=([\w.-]+)>(.*?)</function>", re.DOTALL)
+_QWEN_PARAMETER_RE = re.compile(r"<parameter=([\w.-]+)>(.*?)</parameter>", re.DOTALL)
+
+
 def _parse_action(text: str) -> Action | None:
-    """One of the two allowed reply shapes, or None if the reply matches neither."""
+    """One of the allowed reply shapes, or None if the reply matches none.
+
+    Accepts the prompted JSON shapes first, then falls back to Qwen3.5's native XML tool-call
+    format (`<function=...><parameter=...>` — see DECISIONS.md D31): the wake/sleep server
+    applies no tool parser, and the ICL rows must measure the policy, not the parser.
+    """
     raw = extract_json_object(text)
-    if raw is None:
+    if raw is not None:
+        try:
+            call = _ToolCall.model_validate_json(raw)
+            return Action(kind=ActionKind.TOOL_CALL, name=call.tool, arguments=call.arguments)
+        except ValidationError:
+            pass
+        try:
+            done = _Done.model_validate_json(raw)
+        except ValidationError:
+            done = None
+        if done is not None:
+            return Action(kind=ActionKind.MESSAGE, content=DONE_SIGNAL) if done.done else None
+    return _parse_qwen_xml(text)
+
+
+def _parse_qwen_xml(text: str) -> Action | None:
+    """Qwen3.5's XML tool-call format. Parameter values parse as JSON where possible."""
+    match = _QWEN_FUNCTION_RE.search(text)
+    if match is None:
         return None
-    try:
-        call = _ToolCall.model_validate_json(raw)
-        return Action(kind=ActionKind.TOOL_CALL, name=call.tool, arguments=call.arguments)
-    except ValidationError:
-        pass
-    try:
-        done = _Done.model_validate_json(raw)
-    except ValidationError:
-        return None
-    return Action(kind=ActionKind.MESSAGE, content=DONE_SIGNAL) if done.done else None
+    name, body = match.group(1), match.group(2)
+    arguments: JsonObject = {}
+    for key, value in _QWEN_PARAMETER_RE.findall(body):
+        value = value.strip()
+        try:
+            arguments[key] = json.loads(value)
+        except ValueError:
+            arguments[key] = value
+    if name.lower() == "done":
+        return Action(kind=ActionKind.MESSAGE, content=DONE_SIGNAL)
+    return Action(kind=ActionKind.TOOL_CALL, name=name, arguments=arguments)
 
 
 def _load_tools() -> dict[str, str]:
