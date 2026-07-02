@@ -82,6 +82,46 @@ def test_partition_contained_splits_and_preserves_order() -> None:
     assert flagged == [dirty]
 
 
+def test_generic_path_markers_false_allows_simulated_paths_in_observations() -> None:
+    """A benchmark whose OWN environment uses ~/ or /home paths as content (e.g. AppWorld's
+    simulated file system) can opt out of the generic path markers for observations."""
+    sim = _trajectory(
+        "print(apis.file_system.show_file(path='~/documents/report.txt'))",
+        "wrote 3 rows to ~/documents/report.txt (see /home/appuser/documents)",
+    )
+    # By default the simulated ~/ path is treated as a host marker and flagged...
+    assert host_escape_findings(sim)
+    # ...but with generic_path_markers=False the observation path markers are skipped.
+    assert host_escape_findings(sim, generic_path_markers=False) == []
+
+
+def test_generic_path_markers_false_still_flags_real_identity_leak() -> None:
+    """Opting out of GENERIC path markers must NOT disable the runtime identity markers: a real
+    username / home leak (e.g. os.path.expanduser echoing the account) is still caught."""
+    import getpass
+
+    user = getpass.getuser()
+    leak = _trajectory("print(os.path.expanduser('~'))", f"home is {str(Path.home())} for {user}")
+    findings = host_escape_findings(leak, generic_path_markers=False)
+    assert findings and findings[0].field == "output"
+    assert findings[0].marker in (user, str(Path.home()))
+
+
+def test_generic_path_markers_false_still_flags_commands() -> None:
+    """Command-level host targeting is checked unconditionally, regardless of the flag."""
+    dirty = _trajectory("cat /Users/someone/.ssh/config", "ok")
+    findings = host_escape_findings(dirty, generic_path_markers=False)
+    assert findings and findings[0].field == "command"
+
+
+def test_partition_contained_respects_generic_path_markers() -> None:
+    sim = _trajectory("print('save')", "saved to ~/documents/out.csv")
+    clean, flagged = partition_contained([sim])
+    assert flagged == [sim]  # default: flagged
+    clean, flagged = partition_contained([sim], generic_path_markers=False)
+    assert clean == [sim] and flagged == []
+
+
 def test_scan_spans_jsonl_maps_trace_ids_to_findings(tmp_path: Path) -> None:
     def span(trace_id: str, key: str, value: str) -> dict[str, object]:
         return {

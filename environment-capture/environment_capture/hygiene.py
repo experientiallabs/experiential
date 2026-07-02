@@ -74,7 +74,9 @@ class HygieneFinding:
     excerpt: str
 
 
-def _check_text(field: str, text: str) -> list[HygieneFinding]:
+def _check_text(
+    field: str, text: str, *, generic_path_markers: bool = True
+) -> list[HygieneFinding]:
     findings: list[HygieneFinding] = []
     if field == "command":
         match = _CMD_ESCAPE_RE.search(text)
@@ -83,7 +85,11 @@ def _check_text(field: str, text: str) -> list[HygieneFinding]:
                 HygieneFinding(field=field, marker=match.group(1).strip(), excerpt=text[:120])
             )
         return findings
-    for marker in _OBS_MARKERS + _RUNTIME_MARKERS:
+    # The generic path markers can be a false positive when the benchmark's OWN environment uses
+    # host-shaped paths as legitimate content; the runtime identity markers (real username + real
+    # home) always run so an actual account leak is never missed.
+    markers = (_OBS_MARKERS + _RUNTIME_MARKERS) if generic_path_markers else _RUNTIME_MARKERS
+    for marker in markers:
         index = text.find(marker)
         if index != -1:
             findings.append(
@@ -95,25 +101,43 @@ def _check_text(field: str, text: str) -> list[HygieneFinding]:
     return findings
 
 
-def host_escape_findings(trajectory: Trajectory) -> list[HygieneFinding]:
-    """Every host-escape signal in a trajectory's commands and observations."""
+def host_escape_findings(
+    trajectory: Trajectory, *, generic_path_markers: bool = True
+) -> list[HygieneFinding]:
+    """Every host-escape signal in a trajectory's commands and observations.
+
+    Command-level checks always run. Set ``generic_path_markers=False`` to skip the generic path
+    markers (``~/``, ``/home/``, ``/root``, ...) FOR OBSERVATIONS ONLY — for a benchmark whose own
+    environment legitimately emits such paths as content (e.g. AppWorld's simulated file system).
+    The runtime identity markers (real username + real home) still run unconditionally.
+    """
     findings: list[HygieneFinding] = []
     for step in trajectory.steps:
         for value in step.action.arguments.values():
             if isinstance(value, str):
                 findings.extend(_check_text("command", value))
-        findings.extend(_check_text("output", step.output))
+        findings.extend(
+            _check_text("output", step.output, generic_path_markers=generic_path_markers)
+        )
     return findings
 
 
 def partition_contained(
-    trajectories: list[Trajectory],
+    trajectories: list[Trajectory], *, generic_path_markers: bool = True
 ) -> tuple[list[Trajectory], list[Trajectory]]:
-    """Split trajectories into (workspace-contained, flagged), preserving order."""
+    """Split trajectories into (workspace-contained, flagged), preserving order.
+
+    ``generic_path_markers`` is forwarded to :func:`host_escape_findings`.
+    """
     clean: list[Trajectory] = []
     flagged: list[Trajectory] = []
     for trajectory in trajectories:
-        (flagged if host_escape_findings(trajectory) else clean).append(trajectory)
+        target = (
+            flagged
+            if host_escape_findings(trajectory, generic_path_markers=generic_path_markers)
+            else clean
+        )
+        target.append(trajectory)
     return clean, flagged
 
 
