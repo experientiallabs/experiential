@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import pytest
 from llm_waterfall import Backend, CompletionResult, EmbeddingResult
+from llm_waterfall import Message as WfMessage
 from llm_waterfall import TokenUsage as WfTokenUsage
 from llm_waterfall import VerifyResult as WfVerifyResult
 
@@ -21,7 +22,7 @@ class _FakeWaterfall:
     def complete(
         self,
         system: str = "",
-        messages: object = (),
+        messages: Sequence[WfMessage | Mapping[str, str]] = (),
         *,
         temperature: float | None = None,
         max_tokens: int = 4096,
@@ -29,7 +30,7 @@ class _FakeWaterfall:
         self.complete_calls.append(
             {
                 "system": system,
-                "messages": messages,
+                "messages": list(messages),
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }

@@ -83,8 +83,19 @@ def main() -> None:
             print(f"warning: no {args.mode} points in {path} ({label})")
             continue
         color = _COLORS[i % len(_COLORS)]
-        ax.plot(counts, means, "-o", color=color, label=label, linewidth=2.2, markersize=5,
-                markerfacecolor="white", markeredgecolor=color, markeredgewidth=1.6, zorder=3)
+        ax.plot(
+            counts,
+            means,
+            "-o",
+            color=color,
+            label=label,
+            linewidth=2.2,
+            markersize=5,
+            markerfacecolor="white",
+            markeredgecolor=color,
+            markeredgewidth=1.6,
+            zorder=3,
+        )
         lo = [m - s for m, s in zip(means, stds, strict=True)]
         hi = [m + s for m, s in zip(means, stds, strict=True)]
         ax.fill_between(counts, lo, hi, color=color, alpha=0.10, linewidth=0, zorder=2)
