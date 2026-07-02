@@ -258,7 +258,10 @@ def build(
     elif name is None and file is None and vendor is None:
         raise typer.BadParameter("provide --file (or --vendor), or run `wmh build` interactively")
 
-    validate_name(params.name)
+    try:
+        validate_name(params.name)
+    except ValueError as err:
+        raise typer.BadParameter(str(err)) from None
     try:
         serve_provider = ProviderKind(params.provider)
     except ValueError:
@@ -835,8 +838,13 @@ def _discover_examples() -> list[Path]:
 
 
 def _resolve_example(name: str) -> Path:
-    example_dir = _examples_root() / validate_name(name)
-    if example_dir.is_dir():
+    # An unsafe segment (spaces, path separators, ...) is simply not an example name; fall
+    # through to the same "unknown example" usage error instead of a ValueError traceback.
+    try:
+        example_dir = _examples_root() / validate_name(name)
+    except ValueError:
+        example_dir = None
+    if example_dir is not None and example_dir.is_dir():
         return example_dir
     available = ", ".join(path.name for path in _discover_examples())
     hint = f" (available: {available})" if available else ""

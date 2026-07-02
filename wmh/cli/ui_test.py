@@ -202,6 +202,16 @@ def test_build_wizard_accepts_defaults_with_blank_input() -> None:
     assert params.embed_provider == "hashing"  # default embedder, no embed-model prompt
 
 
+def test_build_wizard_reprompts_on_invalid_name() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    # An unsafe name ("tau bench" has a space) must re-prompt with the friendly validation
+    # message, not escape as a ValueError traceback; the retry answers the same prompt.
+    reader = _scripted_reader(["tau bench", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    assert params.name == "tau-bench"
+    assert "invalid world model name" in console.export_text()
+
+
 def test_build_wizard_reprompts_on_blank_trace_source() -> None:
     # A blank traces path must re-ask, not crash. After a name, blank the file once, then give a
     # real path; remaining prompts (provider/model/region/budget/embedder) take defaults.

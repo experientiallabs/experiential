@@ -106,8 +106,15 @@ def run_build_wizard(
         )
     )
 
-    name = _prompt_text(console, ask, "Name this world model", defaults.name)
-    validate_name(name)
+    # An unsafe name (spaces, path separators, ...) re-prompts with the validation message
+    # rather than escaping as a ValueError traceback.
+    while True:
+        name = _prompt_text(console, ask, "Name this world model", defaults.name)
+        try:
+            validate_name(name)
+            break
+        except ValueError as err:
+            console.print(f"[red]{escape(str(err))}[/red]")
 
     file = defaults.file
     vendor = defaults.vendor
