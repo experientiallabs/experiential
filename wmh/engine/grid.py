@@ -101,6 +101,34 @@ class GridResult(BaseModel):
     cells: list[GridCell] = Field(default_factory=list)
 
 
+def merge_results(results: list[GridResult]) -> GridResult:
+    """Combine several `GridResult`s (e.g. a 4-API-model grid + a separate Qwen grid) into one.
+
+    A self-hosted model runs in its own process (its OpenAI-compatible base URL is process-global
+    via `OPENAI_BASE_URL`), so its cells arrive in a separate result JSON. All results must be the
+    same suite/split — they score the same held-out set — so metadata is taken from the first and
+    cells are concatenated. `total_test_steps`/`total_test_traces` take the max across results
+    (equal in practice; max guards against a capped dry-run being merged with a full run).
+    """
+    if not results:
+        raise ValueError("merge_results requires at least one GridResult")
+    head = results[0]
+    merged = GridResult(
+        suite=head.suite,
+        judge_model=head.judge_model,
+        judge_provider=head.judge_provider,
+        train_split=head.train_split,
+        top_k=head.top_k,
+        seed=head.seed,
+        sample_turns=head.sample_turns,
+        total_test_steps=max(r.total_test_steps for r in results),
+        total_test_traces=max(r.total_test_traces for r in results),
+    )
+    for r in results:
+        merged.cells.extend(r.cells)
+    return merged
+
+
 def _fallback(factory, configs: list[ProviderConfig]) -> Provider:  # noqa: ANN001 - factory injectable
     """A FallbackProvider over `configs` (a single-element chain returns a plain provider)."""
     chain = [factory(c) for c in configs]

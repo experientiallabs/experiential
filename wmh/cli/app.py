@@ -56,7 +56,7 @@ from wmh.engine.eval_suites import (
     resolve_eval_suite,
     result_path,
 )
-from wmh.engine.grid import ModelSpec, run_grid
+from wmh.engine.grid import GridResult, ModelSpec, merge_results, run_grid
 from wmh.engine.grid_plot import plot_grid
 from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
@@ -538,6 +538,13 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             out=out,
         )
         return
+    if args and args[0] == "grid-plot":
+        if len(args) < 2:
+            raise typer.BadParameter(
+                "usage: wmh eval grid-plot <result.json> [<result.json>...]"
+            )
+        _eval_grid_plot(args[1:], out=out, dataset_label=dataset_label)
+        return
     if args and args[0] == "run":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval run <suite>")
@@ -750,6 +757,36 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
         n_test_traces=result.total_test_traces,
     )
     _console.print(f"wrote grid chart  -> {png}")
+
+
+def _eval_grid_plot(
+    paths: list[str], *, out: str | None, dataset_label: str | None
+) -> None:
+    """Merge one or more grid result JSONs and render a single combined fidelity chart.
+
+    Lets a self-hosted model's grid (run in its own process, since its OpenAI base URL is
+    process-global) be combined with the API-model grid into one chart — and re-plots any saved
+    result without re-running the eval.
+    """
+    results = [
+        GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths
+    ]
+    merged = merge_results(results)
+    for cell in merged.cells:
+        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
+        _console.print(
+            f"  {cell.model_label:16} {cell.condition_label:14} "
+            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
+            f"n={cell.n_steps}{cost}"
+        )
+    png = Path(out) if out else Path(paths[0]).with_suffix(".merged.png")
+    plot_grid(
+        merged,
+        png,
+        dataset_label=dataset_label or merged.suite,
+        n_test_traces=merged.total_test_traces,
+    )
+    _console.print(f"wrote merged grid chart -> {png}")
 
 
 def _eval_run_suite(

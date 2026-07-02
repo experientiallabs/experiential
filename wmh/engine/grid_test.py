@@ -7,9 +7,12 @@ from pathlib import Path
 
 from wmh.engine.grid import (
     CONDITIONS,
+    GridCell,
+    GridResult,
     ModelSpec,
     _make_judge,
     _make_target,
+    merge_results,
     run_grid,
 )
 from wmh.providers.base import Completion, Message, ProviderConfig
@@ -171,6 +174,51 @@ def test_bedrock_judge_and_target_get_fallback_chains() -> None:
     built.clear()
     single = _make_target(ModelSpec("GPT", "openai", "gpt-5.5"), tracking_factory)
     assert not isinstance(single, FallbackProvider)
+
+
+def _cell(model: str, condition: str, fidelity: float) -> GridCell:
+    return GridCell(
+        model_label=model,
+        provider="openai",
+        model=model,
+        condition=condition,
+        condition_label=condition,
+        fidelity=fidelity,
+        error_flag_acc=1.0,
+        n_steps=100,
+    )
+
+
+def test_merge_results_concatenates_cells_and_keeps_first_metadata() -> None:
+    api = GridResult(
+        suite="terminal-tasks",
+        judge_model="us.anthropic.claude-opus-4-8",
+        judge_provider="bedrock",
+        train_split=0.7,
+        top_k=5,
+        seed=0,
+        sample_turns="all",
+        total_test_steps=100,
+        total_test_traces=12,
+        cells=[_cell("GPT-5.5", "base", 0.6)],
+    )
+    qwen = GridResult(
+        suite="terminal-tasks",
+        judge_model="us.anthropic.claude-opus-4-8",
+        judge_provider="bedrock",
+        train_split=0.7,
+        top_k=5,
+        seed=0,
+        sample_turns="all",
+        total_test_steps=100,
+        total_test_traces=12,
+        cells=[_cell("Qwen-AgentWorld", "base", 0.4)],
+    )
+    merged = merge_results([api, qwen])
+    assert [c.model_label for c in merged.cells] == ["GPT-5.5", "Qwen-AgentWorld"]
+    assert merged.suite == "terminal-tasks"  # metadata from the first result
+    assert merged.total_test_steps == 100
+    assert merged.total_test_traces == 12
 
 
 def test_grid_bar_label_uses_lowercase_wmh(tmp_path) -> None:  # noqa: ANN001 - fixture
