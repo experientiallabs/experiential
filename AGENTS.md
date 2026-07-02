@@ -41,15 +41,30 @@ uv run pytest -q
    `engine`, `serving`, `cli`). The CLI is intentionally minimal; add commands only when they expose
    reusable harness behavior.
 
-5. **Do not reintroduce top-level benchmark or artifact surfaces.** Do not add top-level
-   `benchmarks/`, `docs/`, `scripts/`, `tools/`, or `world-models/` directories. Do not commit
-   benchmark definitions/results or generated model artifacts outside an example folder. Named eval
-   suite definitions belong under `examples/<task>/evals/`; generated eval results belong under the
-   local `.wmh/evals/` artifact root. Built models normally belong under `.wmh/models/`;
-   intentional prebuilt example artifacts belong under `examples/<task>/models/`.
-   Exception: `web/` — the project website (Next.js/TypeScript). It is excluded from the Python
-   gate (ruff/ty/pytest never touch it) and carries its own gate instead: `npm run lint` and
-   `npx tsc --noEmit` from `web/` must be clean before every commit that touches it.
+5. **The top level is an allowlist.** Tracked top-level directories are exactly: `wmh/`,
+   `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`. Do not add others
+   (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...). `wmh/repo_layout_test.py`
+   enforces this. What each surface is for:
+   - `docs/` — **finished products only**: cleaned, production-ready research reports and their
+     figures, the final deliverable of a PR. A report may include the small summary JSONs that
+     back its published figures, under `docs/<experiment>_results/`. Nothing in `docs/` may
+     depend on `.agents/` staying around — quote reproduction commands in the report itself.
+     Everything else that is "generated" stays out of git: eval results under the local
+     `.wmh/evals/` artifact root, built models under `.wmh/models/` (intentional prebuilt
+     example artifacts under `examples/<task>/models/`), eval suite definitions under
+     `examples/<task>/evals/`. Never commit local settings files (`settings.toml` anywhere).
+   - `.agents/` — **the agents' workspace**: one-off scripts, experiment runners, plans,
+     scratchpads, drafts — the unclean side of the work. Committed (so it transfers across
+     worktrees and chats) but exempt from the gate, from review standards, and from any
+     stability expectation: it is pruned periodically and nothing may import from it or link to
+     it as if it were permanent. When work matures, its product is promoted out (report → `docs/`,
+     reusable code → `wmh/`, dataset tooling → `examples/<task>/`) and the scraps die here.
+   - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
+     its own gate instead: `npm run lint` and `npx tsc --noEmit` from `web/` must be clean
+     before every commit that touches it.
+   - `assets/` — media referenced by README/docs (demo GIFs, logos).
+   - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
+     (`settings.local.json`, locks) stay gitignored.
 
 6. **Keep dataset-specific logic inside examples.** SWE-bench, tau-bench, terminal-task, and similar
    dataset-specific launch or conversion logic belongs under `examples/<task>/`. A standard example
@@ -111,4 +126,12 @@ uv run pytest -q
     - Ink (text/titles): `#0a0a0a` · Grid/hairlines: `#ececec` · Background: white
     - Accents, in order of use: `#0070f3` (primary blue), `#7928ca` purple, `#f5a623` amber,
       `#ee0000` red, `#50e3c2` teal
-    `scripts/plot_trace_scaling.py` is the reference implementation for matplotlib figures.
+    `.agents/scripts/plot_trace_scaling.py` is the reference implementation for matplotlib figures.
+
+## Docs
+
+Internal/project docs live in Notion under Eng Docs →
+[world-model-harness](https://app.notion.com/p/38e0f8b3f5918087b6b7fc883178dc5e)
+(page ID `38e0f8b3-f591-8087-b6b7-fc883178dc5e`), accessible via the Notion MCP server
+(`notion-search` / `notion-fetch`). Store new internal project docs there. The repo's `docs/`
+folder is for public, production-ready research reports only (rule 5).

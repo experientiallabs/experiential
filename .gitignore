@@ -27,3 +27,11 @@ logs/
 # dev-run artifacts of the RL arms (official rows are committed deliberately under results/)
 examples/tau-bench/rl/*.results.jsonl
 examples/tau-bench/rl/icl_memory.jsonl
+
+# Local per-project settings (telemetry ids etc.) — never committed, wherever the root is.
+settings.toml
+
+# Claude Code local state (skills ARE committed; local settings/locks are not).
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/projects/

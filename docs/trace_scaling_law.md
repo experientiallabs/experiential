@@ -35,18 +35,18 @@ count. Past a small buffer, collecting more traces of the same kind is not where
 
 ## Reproduce
 
-The curves come from `scripts/run_trace_scaling.py` (RAG-only, `--modes base`), scored with the
+The curves come from `.agents/scripts/run_trace_scaling.py` (RAG-only, `--modes base`), scored with the
 canonical `RubricJudge` on a fixed test split, parallelized (`--concurrency`) and cost-bounded
 (`--test-cap`). Raw `AblationReport` JSONs are under [`trace_scaling_results/`](./trace_scaling_results).
 
 ```bash
 # one benchmark's curve (per-benchmark; adjust --counts to the corpus)
-AWS_REGION=us-east-1 uv run python scripts/run_trace_scaling.py terminal-tasks \
+AWS_REGION=us-east-1 uv run python .agents/scripts/run_trace_scaling.py terminal-tasks \
   --counts 10,20,40,80,160 --modes base --seeds 0,1 \
   --sample-turns sampled --test-cap 40 --concurrency 8 --out term.json
 
 # render all three into the figure (matplotlib is ephemeral, not a project dep)
-uv run --with matplotlib python scripts/plot_trace_scaling.py \
+uv run --with matplotlib python .agents/scripts/plot_trace_scaling.py \
   --report tau-bench=tau.json --report terminal-tasks=term.json --report swe-bench=swe.json \
   --out docs/trace_scaling_law --title "Trace scaling law (RAG-only)"
 ```
