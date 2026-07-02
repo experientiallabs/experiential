@@ -126,12 +126,14 @@ uv run pytest -q
     - Ink (text/titles): `#0a0a0a` · Grid/hairlines: `#ececec` · Background: white
     - Accents, in order of use: `#0070f3` (primary blue), `#7928ca` purple, `#f5a623` amber,
       `#ee0000` red, `#50e3c2` teal
-    `.agents/scripts/plot_trace_scaling.py` is the reference implementation for matplotlib figures.
+    The published figures under `docs/` (e.g. `docs/trace_scaling_law.png`) are the visual
+    reference. (`.agents/scripts/plot_trace_scaling.py` shows one way to produce them, but
+    `.agents/` contents are disposable — the palette above is the contract, not that script.)
 
 ## Docs
 
-Internal/project docs live in Notion under Eng Docs →
-[world-model-harness](https://app.notion.com/p/38e0f8b3f5918087b6b7fc883178dc5e)
-(page ID `38e0f8b3-f591-8087-b6b7-fc883178dc5e`), accessible via the Notion MCP server
-(`notion-search` / `notion-fetch`). Store new internal project docs there. The repo's `docs/`
-folder is for public, production-ready research reports only (rule 5).
+The repo is the single source of truth for project docs: finished, production-ready reports in
+`docs/` (rule 5); working docs, plans, and drafts in `.agents/docs/`. The former Notion docs
+database (Eng Docs → world-model-harness, page `38e0f8b3-f591-8087-b6b7-fc883178dc5e`) was
+migrated into `.agents/docs/` on 2026-07-02 and is deprecated — do not add new project docs to
+Notion.

@@ -23,7 +23,7 @@ anthropic = ["anthropic>=0.39"]
 openai = ["openai>=1.40"]
 bedrock = ["boto3>=1.34"]
 otel = ["opentelemetry-proto>=1.24"]
-# Plotting the benchmark grid (scripts/plot_baseline_grid.py); kept out of the core install.
+# Plotting/figures for research runs; kept out of the core install.
 viz = ["seaborn>=0.13", "matplotlib>=3.8"]
 # dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
 # project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
