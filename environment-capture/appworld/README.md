@@ -70,25 +70,31 @@ dynamics.
 
 ## Results (2026-07-02, corpus as captured)
 
-- **Corpus**: 74 fresh real Bedrock runs over the train split (40 on
-  `us.anthropic.claude-opus-4-8`, 34 on `-4-7`), covering 74 of the 90 train tasks, 827 recorded
-  `execute_python` transitions, mean reward **0.981** (93% of tasks fully solved by AppWorld's own
-  tests). Hygiene audit `scan_spans_jsonl(...) == {}` (clean).
-  - The 16 uncaptured train tasks are the split's **file-system** tasks (e.g. *"export … into
-    `~/backups/spotify_library.csv`"*): AppWorld's *simulated* file system uses `~/`-rooted paths,
-    which trip the shared hygiene detector's `~/` observation marker, so `partition_contained` drops
-    those (legitimate) trajectories. This is a benchmark-specific false positive — AppWorld's own
-    execution sandbox (SafetyGuard) blocks `os.listdir` / `subprocess` / `open`, so real host escape
-    is not possible through `world.execute` (though `os.path.expanduser("~")` still echoes the real
-    home, which the hygiene runtime markers correctly catch). Kept as the safe default rather than
-    weakening the shared gate; a benchmark-specific containment keyed on real host identity would
-    recover them.
+- **Corpus**: 90 fresh real Bedrock runs over the train split (50 on
+  `us.anthropic.claude-opus-4-8`, 40 on `-4-7`), covering all 90 train tasks, 1,058 recorded
+  `execute_python` transitions, mean reward **0.983** (93% of tasks fully solved by AppWorld's own
+  tests). Real-host-identity audit is clean (0 trajectories).
 - **Open-loop fidelity** (suite `appworld/default`, seed 0, Opus 4.8 target + rubric judge, run via
   `uv run wmh eval run appworld/default --examples-root environment-capture`): mean fidelity
-  **0.793 ± 0.209**, error-flag accuracy **0.962**, n=210 held-out steps. AppWorld's structured JSON
-  API observations reconstruct better than financebench's document excerpts (0.581) but below
-  bird-sql's fully structured sqlite rows (0.864) — the residual is opaque per-world identifiers and
-  values (song ids, tokens, amounts) the model cannot infer from the request alone.
+  **0.802 ± 0.208**, error-flag accuracy **0.957**, n=280 held-out steps. AppWorld's structured JSON API
+  observations reconstruct better than financebench's document excerpts (0.581) but below bird-sql's
+  fully structured sqlite rows (0.864) — the residual is opaque per-world identifiers and values
+  (song ids, tokens, amounts) the model cannot infer from the request alone.
+
+### Hygiene: benchmark-scoped host-escape checks
+
+AppWorld executes agent code in its OWN sandbox (SafetyGuard blocks `os.listdir` / `subprocess` /
+`open`), and its *simulated* file system legitimately uses `~/`- and `/home/`-rooted paths as
+environment content (e.g. *"export … into `~/backups/spotify_library.csv`"*). The shared hygiene
+detector's generic path markers (`~/`, `/home/`, …) would drop those legitimate file-system
+trajectories as false host-escapes. So capture passes `partition_contained(...,
+generic_path_markers=False)`: the generic path markers are skipped **for observations only**, while
+(a) all command-level checks and (b) the runtime IDENTITY markers (this machine's real username and
+home path) stay active unconditionally. That still catches a genuine leak — `os.path.expanduser("~")`
+does echo the real home through AppWorld's sandbox — so a trajectory that touches the real account is
+dropped whole (this happens occasionally; the corpus above is the retained, identity-clean set). The
+emitted corpus therefore contains simulated `~/` paths by design; a strict `scan_spans_jsonl` (which
+uses the generic markers) flags exactly those, but the identity audit is empty.
 
 ## License — read before redistributing
 

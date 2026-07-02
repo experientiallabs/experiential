@@ -68,7 +68,12 @@ def _capture_shard(
     result = run_capture(adapter, agent, split=split, tasks=tasks)
     for failure in result.failures:
         print(f"[skip] {failure.task_id} on {model_id}: {failure.error}", file=sys.stderr)
-    contained, flagged = partition_contained(result.trajectories)
+    # generic_path_markers=False: AppWorld executes in its own sandbox (SafetyGuard blocks
+    # os.listdir/subprocess/open), and its SIMULATED file system legitimately uses ~/ and /home
+    # paths as environment content — the generic path markers would drop those (real) trajectories
+    # as false positives. The runtime identity markers (real username + home) still catch a genuine
+    # leak (e.g. os.path.expanduser echoing the account), and command-level checks stay active.
+    contained, flagged = partition_contained(result.trajectories, generic_path_markers=False)
     for trajectory in flagged:
         print(f"[drop] {trajectory.task.task_id}: host-escape content", file=sys.stderr)
     originals = {t.task_id: t for t in tasks}
