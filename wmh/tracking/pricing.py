@@ -43,6 +43,7 @@ _PRICES: dict[str, ModelPrice] = {
     "claude-opus-4-6": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-opus-4-5": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-opus-4-1": ModelPrice(input_per_mtok=15.0, output_per_mtok=75.0),
+    "claude-sonnet-5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-sonnet-4-6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0),
     # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
@@ -66,7 +67,7 @@ def _normalize(model: str) -> str:
     `amazon.titan-...` (its `amazon.` is part of the canonical model id, not a routing prefix).
     """
     normalized = model.strip()
-    region_prefixes = ("us.", "eu.", "apac.", "us-gov.")
+    region_prefixes = ("us.", "eu.", "apac.", "us-gov.", "global.", "jp.", "au.", "ca.")
     for prefix in region_prefixes:
         if normalized.startswith(prefix):
             normalized = normalized[len(prefix) :]

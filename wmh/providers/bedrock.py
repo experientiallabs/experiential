@@ -93,7 +93,8 @@ class BedrockProvider:
             # `max_tokens` (a mid-generation cutoff wastes the whole call and, under a fallback
             # chain, silently substitutes a different model into an eval).
             #
-            # `max_attempts=1` disables botocore's OWN retries on purpose: throttling / 5xx /
+            # `total_max_attempts=1` disables botocore's OWN retries on purpose (it counts the
+            # initial request; botocore's `max_attempts` counts retries AFTER it): throttling/5xx/
             # timeouts should surface IMMEDIATELY to the caller, where FallbackProvider owns retry
             # policy (fail over to the next model). Leaving botocore's adaptive retries on would
             # stack 3 internal attempts per model UNDER our 4-model failover — up to 12 backend

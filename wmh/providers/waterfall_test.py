@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import pytest
 from llm_waterfall import Backend, CompletionResult, EmbeddingResult
 from llm_waterfall import TokenUsage as WfTokenUsage
+from llm_waterfall import VerifyResult as WfVerifyResult
 
 from wmh.providers.base import Message, ProviderConfig, ProviderKind
 from wmh.providers.waterfall import WaterfallProvider, to_backend
@@ -49,6 +50,12 @@ class _FakeWaterfall:
             provider_used="bedrock",
         )
 
+    def verify(self) -> list[WfVerifyResult]:
+        return [
+            WfVerifyResult(ok=True, provider="bedrock", model="opus"),
+            WfVerifyResult(ok=False, provider="bedrock", model="sonnet", detail="expired creds"),
+        ]
+
 
 def _configs() -> list[ProviderConfig]:
     return [
@@ -63,30 +70,28 @@ def _configs() -> list[ProviderConfig]:
 
 def test_to_backend_maps_config_fields() -> None:
     config = ProviderConfig(
-        kind=ProviderKind.AZURE_OPENAI,
+        kind=ProviderKind.OPENAI,
         model="gpt-5.5",
-        endpoint="https://x.openai.azure.com",
-        deployment="gpt-55",
-        api_version="2024-12-01-preview",
-        embed_model="embed-dep",
+        endpoint="https://proxy.example.com/v1",
+        embed_model="text-embedding-3-large",
         embed_dim=512,
     )
-    backend = to_backend(config)
+    backend = to_backend(config, profile=None)
     assert backend == Backend(
-        "azure_openai",
+        "openai",
         "gpt-5.5",
-        endpoint="https://x.openai.azure.com",
-        deployment="gpt-55",
-        api_version="2024-12-01-preview",
-        embed_model="embed-dep",
+        endpoint="https://proxy.example.com/v1",
+        embed_model="text-embedding-3-large",
         embed_dim=512,
     )
 
 
-def test_to_backend_rejects_openai_responses() -> None:
-    config = ProviderConfig(kind=ProviderKind.OPENAI_RESPONSES, model="gpt-5.5")
-    with pytest.raises(ValueError, match="openai_responses"):
-        to_backend(config)
+def test_to_backend_rejects_kinds_without_real_adapters() -> None:
+    # openai_responses has no package equivalent; azure_openai is a construction-time stub
+    # upstream — advertising it here would turn a fallback rung into a mid-run landmine.
+    for kind in (ProviderKind.OPENAI_RESPONSES, ProviderKind.AZURE_OPENAI):
+        with pytest.raises(ValueError, match="no llm-waterfall backend"):
+            to_backend(ProviderConfig(kind=kind, model="m"))
 
 
 def test_complete_maps_to_wmh_completion() -> None:
@@ -119,3 +124,30 @@ def test_embed_delegates_to_waterfall() -> None:
 def test_empty_chain_rejected() -> None:
     with pytest.raises(ValueError, match="at least one"):
         WaterfallProvider([], waterfall=_FakeWaterfall())
+
+
+def test_profiles_pin_rungs_to_named_aws_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Multi-account chains are the headline use case: profiles zip 1:1 onto configs.
+    captured: list[Backend] = []
+
+    def capture(backends: list[Backend], retry: object) -> _FakeWaterfall:
+        captured.extend(backends)
+        return _FakeWaterfall()
+
+    monkeypatch.setattr("wmh.providers.waterfall.Waterfall", capture)
+    WaterfallProvider(_configs(), profiles=["endflow", "stackwise"])
+    assert [b.profile for b in captured] == ["endflow", "stackwise"]
+
+
+def test_profiles_length_mismatch_rejected() -> None:
+    with pytest.raises(ValueError, match="one-to-one"):
+        WaterfallProvider(_configs(), profiles=["endflow"], waterfall=_FakeWaterfall())
+
+
+def test_verify_checks_every_rung_and_names_failures() -> None:
+    # A ping through the chain would let a fallback answer for a dead primary; per-rung
+    # verification must fail the chain and say which rung is broken.
+    provider = WaterfallProvider(_configs(), waterfall=_FakeWaterfall())
+    result = provider.verify()
+    assert result.ok is False
+    assert "bedrock/sonnet: expired creds" in result.detail
