@@ -5,8 +5,12 @@ description: Mandatory pre-merge gate for every PR. Runs /code-review xhigh --fi
 
 # Ready for Merge
 
-This is the **mandatory gate before merging any PR** in this repository. Do not merge, and do
-not tell the user a PR is ready to merge, until every step below has been completed and passes.
+This is the **mandatory gate before merging any PR** in this repository. Do not tell the user
+a PR is ready to merge until every step below has been completed and passes.
+
+**This skill never merges the PR.** Merging is the user's decision alone — do not run
+`gh pr merge` (or click-through equivalents) even if everything passes, and even if merging was
+approved earlier in the conversation. The skill ends by handing the PR back to the user.
 
 Work against the PR for the current branch (`gh pr view --json number,url,headRefName`). If no
 PR exists, stop and tell the user.
@@ -79,7 +83,7 @@ rule. In particular verify:
 Fix any violation found. Do not rationalize a violation as pre-existing if the PR touches that
 code.
 
-## Step 4 — Report
+## Step 4 — Report back and hand off — do NOT merge
 
 Push any fixes made in Steps 1–3, then report a checklist to the user:
 
@@ -89,5 +93,9 @@ Push any fixes made in Steps 1–3, then report a checklist to the user:
 - [ ] Full project gate green
 - [ ] Final 3-minute wait after the last push produced zero new comments
 
-Only after all four boxes are checked may the PR be merged. If anything cannot be resolved,
-report it as a blocker instead of merging.
+If every box is checked, end by telling the user:
+
+> Hey — everything is done, ready for you to merge: <PR URL>
+
+then stop. Do not merge the PR yourself under any circumstances; the merge button belongs to
+the user. If anything cannot be resolved, report it as a blocker instead.
