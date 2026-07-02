@@ -1,0 +1,8 @@
+# AppWorld's engine and protected dataset (Apache 2.0 with an encrypted-redistribution restriction
+# on the data and its derivatives — see README). NONE of it, nor any capture derived from it, may be
+# committed in plain text.
+.venv/
+data/
+experiments/
+runs/
+traces.otel.jsonl
