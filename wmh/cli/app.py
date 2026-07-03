@@ -397,7 +397,7 @@ def build(
     # the optimizer. `classify_build_call` splits judge vs GEPA by system prompt.
     tracker = RunTracker(run_id=uuid.uuid4().hex, kind="build")
     metered = MeteredProvider(
-        providers.get_provider(config.serve_provider_config()),
+        providers.provider_or_chain(config.serve_provider_config()),
         tracker,
         classify=classify_build_call,
     )
@@ -468,8 +468,19 @@ def _verify_or_abort(config: HarnessConfig) -> None:
     failed = False
     for cfg, is_embed in checks:
         label = f"embed:{cfg.kind.value}" if is_embed else cfg.kind.value
-        _console.print(f"verifying {label}…")
-        result = verify_embedder(cfg) if is_embed else verify_all([cfg])[0]
+        serve_provider = None if is_embed else providers.provider_or_chain(cfg)
+        if is_embed:
+            _console.print(f"verifying {label}…")
+            result = verify_embedder(cfg)
+        elif isinstance(serve_provider, providers.WaterfallProvider):
+            # Verify the provider the build will actually use — with a chain active, that means
+            # pinging every rung (a broken fallback must fail here, not hours into the build).
+            label = f"{label} chain (.wmh/fallback.toml)"
+            _console.print(f"verifying {label}…")
+            result = serve_provider.verify()
+        else:
+            _console.print(f"verifying {label}…")
+            result = verify_all([cfg])[0]
         if result.ok:
             _console.print(f"  {_CHECK} {label} ({result.model}) reachable")
             continue
@@ -958,7 +969,11 @@ def _run_eval_files(
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    llm = providers.get_provider(ProviderConfig(kind=serve_provider, model=model, region=region))
+    llm = providers.provider_or_chain(
+        ProviderConfig(kind=serve_provider, model=model, region=region)
+    )
+    if isinstance(llm, providers.WaterfallProvider):
+        _console.print("failover chain active (.wmh/fallback.toml)")
     prompt = (
         Path(options.prompt_file).read_text(encoding="utf-8")
         if options.prompt_file

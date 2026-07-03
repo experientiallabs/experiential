@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import pytest
-from llm_waterfall import Backend, CompletionResult, EmbeddingResult
+from llm_waterfall import Backend, CompletionResult, EmbeddingResult, Waterfall
 from llm_waterfall import Message as WfMessage
 from llm_waterfall import TokenUsage as WfTokenUsage
 from llm_waterfall import VerifyResult as WfVerifyResult
 
 from wmh.providers.base import Message, ProviderConfig, ProviderKind
-from wmh.providers.waterfall import WaterfallProvider, to_backend
+from wmh.providers.waterfall import WaterfallProvider, provider_or_chain, to_backend
 
 
 class _FakeWaterfall:
@@ -152,3 +153,80 @@ def test_verify_checks_every_rung_and_names_failures() -> None:
     result = provider.verify()
     assert result.ok is False
     assert "bedrock/sonnet: expired creds" in result.detail
+
+
+_CHAIN_TOML = """
+[[backend]]
+kind = "bedrock"
+model = "us.anthropic.claude-opus-4-6-v1"
+profile = "endflow"
+region = "us-west-2"
+
+[[backend]]
+kind = "bedrock"
+model = "us.anthropic.claude-opus-4-8"
+profile = "stackwise-agent"
+region = "us-west-2"
+
+[[backend]]
+kind = "openai"
+model = "gpt-5.5"
+api_key = "sk-test-not-real"
+"""
+
+
+def test_fallback_config_parses_chain_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    path = tmp_path / "fallback.toml"
+    path.write_text(_CHAIN_TOML)
+    requested = ProviderConfig(
+        kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-6-v1", region="us-west-2"
+    )
+    provider = provider_or_chain(requested, path=path)
+    assert isinstance(provider, WaterfallProvider)
+    assert isinstance(provider._waterfall, Waterfall)
+    backends = provider._waterfall.backends
+    assert [b.model for b in backends] == [
+        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-opus-4-8",
+        "gpt-5.5",
+    ]
+    assert [b.profile for b in backends] == ["endflow", "stackwise-agent", None]
+    # The gitignored file seeds the OpenAI key so the chain is self-contained.
+    import os
+
+    assert os.environ["OPENAI_API_KEY"] == "sk-test-not-real"
+
+
+def test_requested_model_leads_when_not_heading_chain(tmp_path: Path) -> None:
+    path = tmp_path / "fallback.toml"
+    path.write_text(_CHAIN_TOML)
+    requested = ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-haiku-4-5")
+    provider = provider_or_chain(requested, path=path)
+    assert isinstance(provider, WaterfallProvider)
+    assert isinstance(provider._waterfall, Waterfall)
+    assert provider._waterfall.backends[0].model == "us.anthropic.claude-haiku-4-5"
+    assert len(provider._waterfall.backends) == 4  # requested + 3 rungs
+    assert provider.config is requested  # metering still labels the intended primary
+
+
+def test_no_chain_file_falls_back_to_single_provider(tmp_path: Path) -> None:
+    requested = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+    provider = provider_or_chain(requested, path=tmp_path / "absent.toml")
+    assert not isinstance(provider, WaterfallProvider)
+    assert provider.config.model == "m"
+
+
+def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
+    path = tmp_path / "fallback.toml"
+    path.write_text('[[backend]]\nkind = "bedrock"\nmodel = "m"\ntypo_key = 1\n')
+    with pytest.raises(ValueError, match="unknown key"):
+        provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
+    path.write_text('[[backend]]\nkind = "azure_openai"\nmodel = "m"\n')
+    with pytest.raises(ValueError, match="no llm-waterfall backend"):
+        provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
+    path.write_text('[[backend]]\nkind = "bedrock"\nmodel = "m"\napi_key = "sk-x"\n')
+    with pytest.raises(ValueError, match="api_key only applies"):
+        provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)

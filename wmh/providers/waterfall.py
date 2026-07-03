@@ -17,7 +17,10 @@ consistent across rungs (see the llm-waterfall README).
 
 from __future__ import annotations
 
+import os
+import tomllib
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Protocol
 
 from llm_waterfall import Backend, CompletionResult, EmbeddingResult, RetryPolicy, Waterfall
@@ -28,11 +31,13 @@ from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
     Completion,
     Message,
+    Provider,
     ProviderConfig,
     ProviderKind,
     TokenUsage,
     VerifyResult,
 )
+from wmh.providers.registry import get_provider
 
 # ProviderKinds with a REAL llm-waterfall adapter. AZURE_OPENAI is excluded until the package
 # implements it (its adapter is a construction-time stub); OPENAI_RESPONSES has no equivalent —
@@ -153,3 +158,90 @@ class WaterfallProvider:
             model=self.config.model,
             detail=detail or f"all {len(results)} backends verified",
         )
+
+
+# The default failover chain lives in a gitignored file (`.wmh/` is ignored wholesale): profile
+# names identify AWS accounts and the file may carry an OpenAI key, none of which belong in git.
+FALLBACK_CONFIG_PATH = Path(".wmh/fallback.toml")
+
+_ALLOWED_KEYS = frozenset(
+    {"kind", "model", "profile", "region", "api_key", "embed_model", "embed_dim"}
+)
+
+
+def _parse_fallback_config(path: Path) -> tuple[list[ProviderConfig], list[str | None]]:
+    """Parse `[[backend]]` entries into (configs, profiles), validating loudly."""
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    entries = data.get("backend")
+    if not entries:
+        raise ValueError(
+            f"{path}: no [[backend]] entries; each rung needs at least kind + model "
+            "(kind/model/profile/region/api_key/embed_model/embed_dim)"
+        )
+    configs: list[ProviderConfig] = []
+    profiles: list[str | None] = []
+    for index, entry in enumerate(entries):
+        unknown = set(entry) - _ALLOWED_KEYS
+        if unknown:
+            raise ValueError(
+                f"{path}: backend #{index + 1} has unknown key(s) {sorted(unknown)}; "
+                f"allowed: {sorted(_ALLOWED_KEYS)}"
+            )
+        try:
+            kind = ProviderKind(entry["kind"])
+        except (KeyError, ValueError):
+            raise ValueError(
+                f"{path}: backend #{index + 1} needs kind ∈ "
+                f"{sorted(k.value for k in _SUPPORTED_KINDS)} (got {entry.get('kind')!r})"
+            ) from None
+        if kind not in _SUPPORTED_KINDS:
+            raise ValueError(
+                f"{path}: backend #{index + 1} kind {kind.value!r} has no llm-waterfall "
+                f"backend; supported: {sorted(k.value for k in _SUPPORTED_KINDS)}"
+            )
+        if "model" not in entry:
+            raise ValueError(f"{path}: backend #{index + 1} is missing required key 'model'")
+        api_key = entry.get("api_key")
+        if api_key is not None:
+            if kind is not ProviderKind.OPENAI:
+                raise ValueError(
+                    f"{path}: backend #{index + 1}: api_key only applies to kind='openai' "
+                    "(bedrock uses AWS profiles; anthropic reads ANTHROPIC_API_KEY)"
+                )
+            # The env var is the adapter's credential channel; the file only seeds it so the
+            # gitignored config is self-contained. A real env var always wins.
+            os.environ.setdefault("OPENAI_API_KEY", api_key)
+        configs.append(
+            ProviderConfig(
+                kind=kind,
+                model=entry["model"],
+                region=entry.get("region"),
+                embed_model=entry.get("embed_model"),
+                embed_dim=entry.get("embed_dim"),
+            )
+        )
+        profiles.append(entry.get("profile"))
+    return configs, profiles
+
+
+def provider_or_chain(config: ProviderConfig, *, path: Path | None = None) -> Provider:
+    """The default provider-construction seam: single backend, or the local failover chain.
+
+    When `.wmh/fallback.toml` exists, the requested provider is served by the whole chain —
+    the requested (kind, model) leads as the primary unless it already heads the chain, and the
+    file's rungs back it up. Without the file this is exactly `get_provider(config)`.
+    """
+    chain_path = path if path is not None else FALLBACK_CONFIG_PATH
+    if not chain_path.exists():
+        return get_provider(config)
+    configs, profiles = _parse_fallback_config(chain_path)
+    heads_chain = configs[0].kind is config.kind and configs[0].model == config.model
+    if not heads_chain:
+        keep = [
+            (c, p)
+            for c, p in zip(configs, profiles, strict=True)
+            if not (c.kind is config.kind and c.model == config.model and p is None)
+        ]
+        configs = [config, *(c for c, _ in keep)]
+        profiles = [None, *(p for _, p in keep)]
+    return WaterfallProvider(configs, profiles=profiles)

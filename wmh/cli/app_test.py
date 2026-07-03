@@ -91,16 +91,23 @@ def patched_provider(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
 
     import wmh.providers as providers_pkg
     import wmh.providers.registry as registry
+    import wmh.providers.waterfall as waterfall_mod
 
     fake = FakeProvider()
     # `wmh.engine.__init__` rebinds the name `build` to the function, shadowing the submodule
     # attribute, so reach module objects through sys.modules rather than attribute access.
-    for module_name in ("wmh.engine.build", "wmh.engine.loader"):
-        monkeypatch.setattr(sys.modules[module_name], "get_provider", lambda config: fake)
+    monkeypatch.setattr(sys.modules["wmh.engine.build"], "get_provider", lambda config: fake)
+    # loader.py (serve/demo/play) and the CLI construct through the chain-aware seam.
+    monkeypatch.setattr(
+        sys.modules["wmh.engine.loader"], "provider_or_chain", lambda config, **kw: fake
+    )
     monkeypatch.setattr(providers_pkg, "get_provider", lambda config: fake)
+    monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: fake)
     # The pre-build verify guard pings via verify_all/verify_embedder, which construct providers
-    # through the registry's own get_provider — patch that too so the guard sees the fake.
+    # through the registry's own get_provider — patch that too so the guard sees the fake, and
+    # patch the name waterfall.py bound at import for its no-chain-file passthrough.
     monkeypatch.setattr(registry, "get_provider", lambda config: fake)
+    monkeypatch.setattr(waterfall_mod, "get_provider", lambda config: fake)
 
 
 def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture paths
