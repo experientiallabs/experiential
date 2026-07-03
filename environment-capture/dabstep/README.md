@@ -10,18 +10,25 @@ is deterministic (numeric tolerance 0.01, normalized string/list match, accepted
 
 ## Contents
 
-- `data/train.jsonl` (5 tasks) / `data/test.jsonl` (5 tasks) — agent-visible tasks
-  (prompt + `file_ids` + difficulty level). Train and test ids are disjoint.
+- `data/train.jsonl` (130 tasks) / `data/test.jsonl` (5 tasks) — agent-visible tasks
+  (prompt + `file_ids` + difficulty level). Train and test are disjoint and no two tasks share a
+  question. The 5 test + original 5 train come from DABstep's public-gold `dev` split; the other
+  125 train tasks are drawn from the 450-task upstream pool with gold recovered from the leaderboard
+  (see Provenance).
 - `datafiles/<file_id>` — the shared context files, committed **except** `payments.csv`
   (~23 MB, gitignored): `manual.md`, `fees.json`, `acquirer_countries.csv`,
   `merchant_category_codes.csv`, `merchant_data.json`, `payments-readme.md`.
-- `gold/<task_id>.json` — gold answers (`answer` + optional `numeric` + `accept` variants), never
-  staged into the agent workspace.
-- `traces.otel.jsonl` — the trace corpus: **211 traces / 1651 real transitions**, host-content-free
+- `gold/<task_id>.json` — gold answers (`answer` + optional `numeric` + `accept` variants, plus an
+  `upstream_task_id` for recovered tasks), never staged into the agent workspace.
+- `traces.otel.jsonl` — the trace corpus: **455 traces / 3315 real transitions**, host-content-free
   (`environment_capture.scan_spans_jsonl` returns no findings; train split only, so the world model
   can't absorb the hidden test split's dynamics).
 - `fetch_data.py` — downloads the gitignored `payments.csv` (and, with `--all`, every context file)
-  from the upstream HuggingFace dataset, so a fresh clone is runnable.
+  from the upstream HuggingFace dataset; `--expand` appends new train tasks with gold recovered
+  from the leaderboard (see Provenance), leaving the test split untouched.
+- `leaderboard_gold.py` — recovers a clean gold answer per task from the dataset's published
+  `task_scores` (a majority vote over officially-verified-correct submissions) and drops tasks with
+  no confident answer (the answerability filter).
 - `convert_cache.py` — the converter that seeded the corpus from a frozen baseline cache of real
   runs (see provenance).
 - `capture.py` — fresh real-run capture against this adapter (Bedrock agent), used to grow the
@@ -33,7 +40,11 @@ is deterministic (numeric tolerance 0.01, normalized string/list match, accepted
 # 1. pull the large context file (payments.csv is gitignored)
 uv run python environment-capture/dabstep/fetch_data.py
 
-# 2. capture fresh real runs on Bedrock (each model runs the full train split)
+# 2. (optional) re-derive the expanded train split: recover gold from the leaderboard and append
+#    new tasks whose question is not already committed (test split untouched). Needs the fetch extra.
+uv run python environment-capture/dabstep/fetch_data.py --expand
+
+# 3. capture fresh real runs on Bedrock (each model runs the full train split)
 uv run python environment-capture/dabstep/capture.py \
     --models us.anthropic.claude-opus-4-8,us.anthropic.claude-opus-4-7 --runs 1 \
     --out environment-capture/dabstep/traces.otel.jsonl --append
@@ -44,18 +55,29 @@ uv run python environment-capture/dabstep/capture.py \
 - **Open-loop fidelity** (suite `dabstep/default`, seed 0, Opus 4.8 target + rubric judge,
   run via `uv run wmh eval run dabstep/default --examples-root environment-capture`): mean
   fidelity **0.884**, error-flag accuracy **0.964**, n=140 held-out steps (snapshot @80
-  traces; earlier @36: 0.886). Snapshot evals on multi-run corpora carry a caveat: tasks are resampled across capture waves, and the whole-trace split lets a held-out step retrieve the same task's other runs — fidelity partly reflects cross-run overlap, not pure generalization (DECISIONS.md D33). Structured pandas/JSON tool output reconstructs on
+  traces; earlier @36: 0.886) — measured **before** the task-set expansion below; re-run the suite
+  to re-measure on the grown corpus. Snapshot evals on multi-run corpora carry a caveat: tasks are resampled across capture waves, and the whole-trace split lets a held-out step retrieve the same task's other runs — fidelity partly reflects cross-run overlap, not pure generalization (DECISIONS.md D33). Structured pandas/JSON tool output reconstructs on
   par with the other structured-output corpora (bird-sql 0.864) and far above document-excerpt
   observations (financebench 0.586).
 
 ## Provenance
 
-- **Dataset**: [adyen/DABstep](https://huggingface.co/datasets/adyen/DABstep). The committed
-  `data/*.jsonl` + `gold/*.json` are the real DABstep `dev` set (the 10 gradeable questions —
-  the `default` split is server-scored with no local gold), split disjointly into 5 train + 5 test.
-  Task ids, `file_ids`, the train/test split, and the context files come from a prior
-  materialization of the upstream dataset, reused as data; all adapter/grader code here is fresh
-  (the documented thresholds are not inherited from anywhere).
+- **Dataset**: [adyen/DABstep](https://huggingface.co/datasets/adyen/DABstep). The 5 test + first 5
+  train tasks are the real DABstep `dev` set (the 10 gradeable questions — the `default` split is
+  server-scored with no local gold), split disjointly. Task ids, `file_ids`, the train/test split,
+  and the context files come from a prior materialization of the upstream dataset, reused as data;
+  all adapter/grader code here is fresh (the documented thresholds are not inherited from anywhere).
+- **Task-set expansion (recovered gold)**: DABstep's 450-task pool (`data/tasks/all.jsonl`) ships
+  with empty answers, but the dataset repo also publishes `data/task_scores/*.jsonl` — per
+  leaderboard submission, whether the official grader scored each `agent_answer` correct. An
+  `agent_answer` on a `score == true` row is thus a ground-truth-verified correct answer straight
+  from the benchmark's own scorer. `leaderboard_gold.py` aggregates these per task and takes the
+  value a confident plurality of agents agree on (after dropping reasoning-trace answers), numeric
+  answers carrying a `numeric` field for the tolerant match; tasks with no confident clean answer
+  are dropped (the answerability filter). `fetch_data.py --expand` (seed 7, target 130) appended
+  125 such tasks (`dab-train-5`…) whose question is not already committed. Every recovered gold
+  self-grades to 1.0. Because the leaderboard grows over time, re-running `--expand` may recover a
+  slightly different set; the committed sidecars are the frozen snapshot.
 - **Traces**: seeded with `convert_cache.py` from a frozen baseline cache of REAL runs over the
   same materialization (**3 traces**, model `gpt-5.4`, mean reward 0.0 — the bare baseline agent's
   heredoc quoting failed before it could submit; 2 zero-transition trajectories skipped at
