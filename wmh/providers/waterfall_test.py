@@ -89,11 +89,9 @@ def test_to_backend_maps_config_fields() -> None:
 
 
 def test_to_backend_rejects_kinds_without_real_adapters() -> None:
-    # openai_responses has no package equivalent; azure_openai is a construction-time stub
-    # upstream — advertising it here would turn a fallback rung into a mid-run landmine.
-    for kind in (ProviderKind.OPENAI_RESPONSES, ProviderKind.AZURE_OPENAI):
-        with pytest.raises(ValueError, match="no llm-waterfall backend"):
-            to_backend(ProviderConfig(kind=kind, model="m"))
+    # openai_responses has no package equivalent (the package speaks chat-completions).
+    with pytest.raises(ValueError, match="no llm-waterfall backend"):
+        to_backend(ProviderConfig(kind=ProviderKind.OPENAI_RESPONSES, model="m"))
 
 
 def test_complete_maps_to_wmh_completion() -> None:
@@ -237,9 +235,42 @@ def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
     path.write_text('[[chain.c]]\nkind = "not-a-kind"\nmodel = "m"\n')
     with pytest.raises(ValueError, match="is invalid"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
-    path.write_text('[[chain.c]]\nkind = "azure"\nmodel = "m"\n')
+    path.write_text('[[chain.c]]\nkind = "openai_responses"\nmodel = "m"\n')
     with pytest.raises(ValueError, match="no llm-waterfall backend"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
     path.write_text('[[chain.c]]\nkind = "bedrock"\nmodel = "m"\napi_key = "sk-x"\n')
     with pytest.raises(ValueError, match="api_key only applies"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
+
+
+def test_azure_rung_maps_endpoint_deployment_and_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    path = tmp_path / "fallback.toml"
+    path.write_text(
+        "[[chain.az]]\n"
+        'kind = "azure"\n'
+        'model = "gpt-5.4"\n'
+        'endpoint = "https://x.openai.azure.com"\n'
+        'deployment = "gpt-54-deploy"\n'
+        'api_version = "2024-12-01-preview"\n'
+        'api_key = "az-test-key"\n'
+    )
+    requested = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.4",
+        endpoint="https://x.openai.azure.com",
+        api_version="2024-12-01-preview",
+    )
+    provider = provider_or_chain(requested, chain="az", path=path)
+    assert isinstance(provider, WaterfallProvider)
+    assert isinstance(provider._waterfall, Waterfall)
+    backend = provider._waterfall.backends[0]
+    # wmh's kind value is "azure"; the package spells the provider "azure_openai".
+    assert backend.provider == "azure_openai"
+    assert backend.deployment == "gpt-54-deploy"
+    assert backend.api_version == "2024-12-01-preview"
+    assert os.environ["AZURE_OPENAI_API_KEY"] == "az-test-key"

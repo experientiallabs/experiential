@@ -40,10 +40,16 @@ from wmh.providers.base import (
 )
 from wmh.providers.registry import get_provider
 
-# ProviderKinds with a REAL llm-waterfall adapter. AZURE_OPENAI is excluded until the package
-# implements it (its adapter is a construction-time stub); OPENAI_RESPONSES has no equivalent —
-# the package speaks chat-completions. Keep using wmh's native providers for both.
-_SUPPORTED_KINDS = frozenset({ProviderKind.ANTHROPIC, ProviderKind.BEDROCK, ProviderKind.OPENAI})
+# ProviderKinds with a REAL llm-waterfall adapter, mapped to the package's provider names
+# (wmh's azure value is "azure"; the package spells it "azure_openai"). OPENAI_RESPONSES has no
+# equivalent — the package speaks chat-completions; keep wmh's native provider for it.
+_KIND_TO_PROVIDER = {
+    ProviderKind.ANTHROPIC: "anthropic",
+    ProviderKind.BEDROCK: "bedrock",
+    ProviderKind.OPENAI: "openai",
+    ProviderKind.AZURE_OPENAI: "azure_openai",
+}
+_SUPPORTED_KINDS = frozenset(_KIND_TO_PROVIDER)
 
 
 def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend:
@@ -52,13 +58,14 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
     `profile` selects a named AWS profile (Bedrock), letting one chain span multiple accounts —
     wmh configs don't model that, so it's a separate argument (see `WaterfallProvider(profiles=)`).
     """
-    if config.kind not in _SUPPORTED_KINDS:
+    provider = _KIND_TO_PROVIDER.get(config.kind)
+    if provider is None:
         raise ValueError(
             f"provider kind {config.kind.value!r} has no llm-waterfall backend; supported: "
             f"{', '.join(sorted(k.value for k in _SUPPORTED_KINDS))}"
         )
     return Backend(
-        config.kind.value,
+        provider,
         config.model,
         profile=profile,
         region=config.region,
@@ -181,7 +188,11 @@ FALLBACK_CONFIG_PATH = Path(".wmh/fallback.toml")
 
 # The env var each kind's adapter reads; `api_key` in the file only seeds it (env wins), so the
 # gitignored config is self-contained.
-_API_KEY_ENV = {ProviderKind.OPENAI: "OPENAI_API_KEY", ProviderKind.ANTHROPIC: "ANTHROPIC_API_KEY"}
+_API_KEY_ENV = {
+    ProviderKind.OPENAI: "OPENAI_API_KEY",
+    ProviderKind.ANTHROPIC: "ANTHROPIC_API_KEY",
+    ProviderKind.AZURE_OPENAI: "AZURE_OPENAI_API_KEY",
+}
 
 Chain = tuple[list[ProviderConfig], list[str | None]]
 
@@ -195,6 +206,9 @@ class _Rung(BaseModel):
     model: str
     profile: str | None = None
     region: str | None = None
+    endpoint: str | None = None  # azure resource URL / custom OpenAI base URL
+    deployment: str | None = None  # azure deployment name (defaults to model)
+    api_version: str | None = None  # azure api version
     api_key: str | None = None
     embed_model: str | None = None
     embed_dim: int | None = None
@@ -219,7 +233,7 @@ def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Cha
             env_var = _API_KEY_ENV.get(rung.kind)
             if env_var is None:
                 raise ValueError(
-                    f"{where}: api_key only applies to kind='openai'/'anthropic' "
+                    f"{where}: api_key only applies to kind='openai'/'anthropic'/'azure' "
                     "(bedrock uses AWS profiles)"
                 )
             os.environ.setdefault(env_var, rung.api_key)
@@ -228,6 +242,9 @@ def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Cha
                 kind=rung.kind,
                 model=rung.model,
                 region=rung.region,
+                endpoint=rung.endpoint,
+                deployment=rung.deployment,
+                api_version=rung.api_version,
                 embed_model=rung.embed_model,
                 embed_dim=rung.embed_dim,
             )
