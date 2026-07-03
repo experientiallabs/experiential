@@ -34,6 +34,47 @@ at this eval size.** The paired per-scenario view is more informative:
   booking past the 24h window) — it imitates action patterns and, trained without think
   blocks, no longer deliberates.
 
+## Per-domain breakdown (D35 caveat applies)
+
+| arm | airline (14 eps) | retail (16 eps) | telecom (10 eps) | excl. telecom |
+|---|---|---|---|---|
+| base | 29% (r 0.31) | 50% (r 0.53) | **100%** (r 1.00) | 40% |
+| SFT | **50%** (r 0.46) | 56% (r 0.57) | 80% (r 0.78) | **53%** |
+| PPO ckpt-0096 | 25% (r 0.30) | 50% (r 0.56) | **100%** (r 0.98) | 39% |
+| R++ ckpt-0096 | 29% (r 0.29) | 44% (r 0.54) | **100%** (r 0.99) | 37% |
+
+**Telecom saturates (10/10) for base/PPO/R++ and is familiarity, not generalization
+headroom (D35):** the 5 telecom eval tasks have ~725 near-duplicate captures in the WM's
+retrieval buffer (the same traces the D32 leakage rule dropped from the RL scenario
+lists), so the env simulates them with near-recorded fidelity. Identical for every arm
+(still apples-to-apples), but read the non-telecom columns for signal. There, the story
+sharpens: **SFT's lift concentrates in airline (29% → 50%)** — the domain with the most
+surviving demonstrations — while both RL arms stay flat everywhere. SFT is also the only
+arm that *drops* telecom (100% → 80%): it trained on zero telecom demonstrations and
+un-learned some of the base model's saturated behavior.
+
+## Training dynamics (wandb) — why no RL lift, empirically
+
+Nothing in the loop is broken; the runs were **cold and short**:
+
+- **Learning rate**: both arms inherited the algorithm groups' `lr 5e-6`. The proven IH
+  GRPO recipe (adopted by the B3 arm, D36) uses **3e-5 — 6× hotter**. At 5e-6 × 75–86
+  steps with grad norms ~0.3, total LoRA movement tops out at |Δw| ≈ 1.5e-4 — the flat
+  eval rows are the arithmetic consequence.
+- **The policy did move, slowly**: R++ `actor/kl_loss` grows monotonically
+  4.8e-4 → 1.8e-2 across the run (ref-model path verified working); entropy healthy
+  (0.26 → 0.31, no collapse); grad norms stable.
+- **PPO's clipping and IS were identity operations**: `ppo_kl = 0`, `pg_clipfrac = 0`
+  for all 75 steps, and R++ rollout-IS ratios exactly 1.0 ± 0.0 — with
+  `recompute_old_log_probs=false` and low buffer age, both arms trained as plain
+  on-policy policy gradient.
+- **PPO's critic never converged**: `critic/vf_explained_var` stayed negative through
+  all 75 steps (final quartile −0.20), so GAE advantages were mostly noise — PPO was
+  effectively REINFORCE with an uncooked baseline for this run length.
+
+**Queued follow-up (next 2-GPU window):** rerun PPO/R++ at lr 3e-5 with 2–3 epochs
+(~250+ steps) and critic warmup — a config change, not a code change.
+
 ## Training runs (97 pinned train scenarios × 1 epoch, n=1 rollout/scenario)
 
 | arm | reward | train steps | episodes clean | WM cost (serve/judge) |
