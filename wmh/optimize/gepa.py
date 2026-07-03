@@ -144,11 +144,16 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
     """
 
     def __init__(
-        self, provider: Provider, judge: Judge, on_rollout: RolloutCallback | None = None
+        self,
+        provider: Provider,
+        judge: Judge,
+        on_rollout: RolloutCallback | None = None,
+        on_activity: Callable[[str], None] | None = None,
     ) -> None:
         self._provider = provider
         self._judge = judge
         self._on_rollout = on_rollout
+        self._on_activity = on_activity
         self._rollouts = 0
         self._score_sum = 0.0
 
@@ -162,6 +167,7 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
         outputs: list[Observation] = []
         scores: list[float] = []
         trajectories: list[_StepTrajectory] | None = [] if capture_traces else None
+        last_critique = ""
         for item in batch:
             step = item.step
             try:
@@ -186,6 +192,11 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
                 trajectories.append(
                     _StepTrajectory(step=step, predicted=predicted, score=score, critique=critique)
                 )
+            last_critique = critique
+        if self._on_activity is not None and scores:
+            avg = sum(scores) / len(scores)
+            note = f" — {last_critique.strip()}" if last_critique and last_critique.strip() else ""
+            self._on_activity(f"judge: avg {avg:.2f} over {len(scores)} steps{note}")
         return EvaluationBatch(outputs=outputs, scores=scores, trajectories=trajectories)
 
     def make_reflective_dataset(
@@ -317,6 +328,23 @@ def _flatten_chat(messages: list[dict[str, JsonValue]]) -> str:
 # --- the optimizer -------------------------------------------------------------------------------
 
 
+class _ActivityLogger:
+    """gepa `LoggerProtocol` sink that forwards headline narration lines to `on_activity`.
+
+    Only the first line of each message is kept ("Iteration ...", "Base program ..."): the
+    proposed-prompt message continues with the full multi-line prompt body, which would flood a
+    fixed-height activity window.
+    """
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+
+    def log(self, message: str) -> None:
+        line = message.split("\n", 1)[0].strip()
+        if line.startswith(("Iteration", "Base program")):
+            self._emit(line[:240])
+
+
 class GEPAOptimizer:
     """Reflective prompt evolution against the held-out trace split (drives the `gepa` engine)."""
 
@@ -328,6 +356,7 @@ class GEPAOptimizer:
         on_rollout: RolloutCallback | None = None,
         *,
         on_budget: Callable[[int], None] | None = None,
+        on_activity: Callable[[str], None] | None = None,
         seed: int = 0,
     ) -> None:
         self._provider = provider
@@ -336,6 +365,7 @@ class GEPAOptimizer:
         # callers reporting progress must size their bar with it, not with `budget` (iterations),
         # or the bar finishes while GEPA is still burning valset calls.
         self._on_budget = on_budget
+        self._on_activity = on_activity
         # Optional retriever for RAG-aware evaluation. When None, GEPA evaluates zero-shot.
         self._retriever = retriever
         self._on_rollout = on_rollout
@@ -411,7 +441,12 @@ class GEPAOptimizer:
             hard_val = [es for es in valset if hard_step_filter(es.step)]
             if hard_val:
                 valset = hard_val
-        adapter = WorldModelGEPAAdapter(self._provider, self._judge, self._on_rollout)
+        adapter = WorldModelGEPAAdapter(
+            self._provider, self._judge, self._on_rollout, on_activity=self._on_activity
+        )
+        # Route gepa's own narration (iteration selections, proposed prompt edits, subsample
+        # scores) into the activity stream; the default StdOutLogger would fight a live display.
+        logger = _ActivityLogger(self._on_activity) if self._on_activity is not None else None
         minibatch = min(3, len(trainset))
         metric_calls = _metric_call_budget(budget, len(valset), minibatch)
         if self._on_budget is not None:
@@ -433,6 +468,7 @@ class GEPAOptimizer:
             reflection_minibatch_size=minibatch,
             display_progress_bar=False,
             raise_on_exception=False,
+            logger=logger,
             seed=self._seed,
         )
 

@@ -218,7 +218,7 @@ def build(
     ),
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Serve provider model id."),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
-    gepa_budget: int = typer.Option(50, help="GEPA rollout budget."),
+    gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
     ),

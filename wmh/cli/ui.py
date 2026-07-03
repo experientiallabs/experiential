@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import os
 import sys
+from collections import deque
 from collections.abc import Callable
 
 import click
 import typer
 from pydantic import BaseModel
-from rich.console import Console
+from rich.console import Console, Group
 from rich.control import Control
+from rich.live import Live
 from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
@@ -38,6 +40,7 @@ from rich.progress import (
 )
 from rich.segment import ControlType
 from rich.table import Table
+from rich.text import Text
 
 from wmh.config import (
     PROVIDER_ENV_VARS,
@@ -57,6 +60,9 @@ PromptReader = Callable[[str], str]
 
 # Stage glyphs reused by the animated and plain reporters.
 _CHECK = "[green]✓[/green]"
+
+# Rows in the GEPA activity window (the fixed-height inner-loop stream under the progress bar).
+_ACTIVITY_WINDOW_LINES = 8
 
 # Serve providers offered in the wizard picker, with the model ids each supports. The first model
 # in each list is the suggested default. Keep these in sync with the provider backends.
@@ -96,7 +102,7 @@ class BuildParams(BaseModel):
     provider: str | None = None
     model: str = "us.anthropic.claude-opus-4-8"
     region: str | None = None
-    gepa_budget: int = 50
+    gepa_budget: int = 10
     train_split: float = 0.8
     embed_provider: str = "hashing"
     embed_model: str | None = None
@@ -231,7 +237,7 @@ def run_build_wizard(
     gepa_budget = _prompt_int(
         console,
         ask,
-        "GEPA rollout budget (more rollouts = better prompt, higher cost/time)",
+        "GEPA iterations (each ~1 valset pass; more = better prompt, higher cost/time)",
         defaults.gepa_budget,
     )
 
@@ -550,6 +556,8 @@ class RichBuildReporter:
         self._tty = console.is_terminal
         self._progress: Progress | None = None
         self._task_id: TaskID | None = None
+        self._live: Live | None = None
+        self._activity: deque[str] = deque(maxlen=_ACTIVITY_WINDOW_LINES)
 
     def ingest_done(self, traces: int, steps: int) -> None:
         self._stage(f"ingested {traces} traces → normalized {steps} steps")
@@ -571,14 +579,43 @@ class RichBuildReporter:
                 TextColumn("{task.fields[score]}"),
                 TimeElapsedColumn(),
                 console=self._console,
-                # Not transient: the finished bar stays in scrollback, snapped to 100% with the
-                # true final call count and elapsed time (see optimize_done).
-                transient=False,
             )
-            self._progress.start()
             self._task_id = self._progress.add_task(
                 "GEPA metric calls", total=budget, score="score n/a"
             )
+            # One Live region holding the fixed-height activity window + the bar: GEPA's inner
+            # loop (proposals, selections, judge notes) streams inside the window instead of
+            # scrolling the terminal. Not transient: the last frame (bar at 100% + final
+            # activity) stays in scrollback above the GEPA-done stage line.
+            self._live = Live(
+                self._render_optimize(),
+                console=self._console,
+                refresh_per_second=8,
+                transient=False,
+            )
+            self._live.start()
+
+    def _render_optimize(self) -> Group:
+        lines = list(self._activity)
+        pad = [""] * (_ACTIVITY_WINDOW_LINES - len(lines))
+        body = Text("\n".join(lines + pad), style="dim", no_wrap=True, overflow="ellipsis")
+        window = Panel(
+            body,
+            title="[dim]GEPA activity[/dim]",
+            border_style="bright_black",
+            height=_ACTIVITY_WINDOW_LINES + 2,
+        )
+        assert self._progress is not None
+        return Group(window, self._progress)
+
+    def activity(self, line: str) -> None:
+        text = line.strip()
+        if not text:
+            return
+        if self._live is not None:
+            self._activity.append(text)
+            self._live.update(self._render_optimize())
+        # Non-TTY logs keep their sparse heartbeat; streaming every inner-loop line would flood.
 
     def rollout(self, done: int, budget: int, score: float | None) -> None:
         label = f"avg fidelity {score:.3f}" if score is not None else "score n/a"
@@ -603,7 +640,10 @@ class RichBuildReporter:
                 # cap + per-iteration costs decided at runtime), so the bar snaps to the ACTUAL
                 # final call count on the completion event instead of guessing during the run.
                 self._progress.update(self._task_id, completed=rollouts, total=rollouts)
-            self._progress.stop()
+            if self._live is not None:
+                self._live.update(self._render_optimize())
+                self._live.stop()
+                self._live = None
             self._progress = None
             self._task_id = None
         self._stage(
@@ -615,7 +655,13 @@ class RichBuildReporter:
         self._console.print(f"{_CHECK} {message}")
 
     def close(self) -> None:
-        """Stop the live progress bar if it is still running (e.g. the build raised mid-GEPA)."""
+        """Stop the live display if it is still running (e.g. the build raised mid-GEPA)."""
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+            self._progress = None
+            self._task_id = None
+            return
         if self._progress is not None:
             self._progress.stop()
             self._progress = None

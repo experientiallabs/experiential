@@ -149,6 +149,7 @@ def build(
         retriever=EmbeddingRetriever(embed),
         on_rollout=_on_rollout,
         on_budget=_on_budget,
+        on_activity=report.activity,
     )
     # Every GEPA iteration re-scores the whole valset, so an uncapped held-out split multiplies
     # wall-clock and spend by its step count for no selection benefit (fidelity saturates fast —

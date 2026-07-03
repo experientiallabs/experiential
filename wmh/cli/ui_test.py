@@ -304,6 +304,29 @@ def test_build_reporter_bar_never_pins_at_100_while_running() -> None:
     assert (task.completed, task.total) == (14, 14)
 
 
+def test_build_reporter_activity_window_streams_within_fixed_height() -> None:
+    console = Console(force_terminal=True, no_color=True, width=100, file=io.StringIO())
+    reporter = RichBuildReporter(console, "demo")
+    reporter.optimize_start(10)
+    for i in range(20):
+        reporter.activity(f"Iteration {i}: note")
+    # The window keeps only the newest lines (fixed height, no terminal scroll).
+    assert len(reporter._activity) == 8
+    assert reporter._activity[-1] == "Iteration 19: note"
+    assert reporter._activity[0] == "Iteration 12: note"
+    reporter.optimize_done(0.5, 1, 12)
+    assert reporter._live is None  # display released on completion
+
+
+def test_build_reporter_activity_is_quiet_when_piped() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100)
+    reporter = RichBuildReporter(console, "demo")
+    reporter.optimize_start(10)
+    with console.capture() as cap:
+        reporter.activity("Iteration 1: noisy inner-loop line")
+    assert cap.get() == ""  # non-TTY logs keep the sparse heartbeat only
+
+
 def test_build_wizard_dashes_spaces_in_name() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # Whitespace is dash-joined rather than rejected: typing "tau bench" quietly becomes

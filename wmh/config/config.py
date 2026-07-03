@@ -38,7 +38,7 @@ class HarnessConfig(BaseModel):
     top_k: int = 5  # demos retrieved per step (DreamGym k)
     # train/held-out ratio for GEPA; a proper fraction so both splits can be non-empty
     train_split: float = Field(default=0.8, gt=0.0, lt=1.0)
-    gepa_budget: int = 50  # rollout budget for prompt evolution
+    gepa_budget: int = 10  # GEPA iterations; ~valset_cap calls each (see _cap_gepa_valset)
     trace_adapter: str = "otel-genai"
 
     def provider_config(self, kind: ProviderKind) -> ProviderConfig:

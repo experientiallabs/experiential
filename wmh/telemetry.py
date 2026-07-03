@@ -58,6 +58,9 @@ class TelemetryBuildReporter:
     def optimize_start(self, budget: int) -> None:
         self._inner.optimize_start(budget)
 
+    def activity(self, line: str) -> None:
+        self._inner.activity(line)
+
     def rollout(self, done: int, budget: int, score: float | None) -> None:
         self._inner.rollout(done, budget, score)
 
