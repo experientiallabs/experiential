@@ -35,7 +35,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from wmh.config import PROVIDER_ENV_VARS, ModelInfo, validate_name
+from wmh.config import PROVIDER_ENV_VARS, ModelInfo, normalize_name, validate_name
 from wmh.core.types import Action, ActionKind, Session
 from wmh.engine.play import PlayTurn, parse_action, play_turn
 from wmh.engine.world_model import WorldModel
@@ -116,20 +116,25 @@ def run_build_wizard(
         )
     )
 
-    # An unsafe name (spaces, path separators, ...) re-prompts with the validation message
-    # rather than escaping as a ValueError traceback. An invalid name arriving via --name is
+    # Whitespace is dash-joined ('tau bench' -> 'tau-bench') rather than rejected; a name
+    # that is still unsafe (path separators, ...) re-prompts with the validation message
+    # instead of escaping as a ValueError traceback. An invalid name arriving via --name is
     # dropped from the suggested default — otherwise Enter would re-offer it forever.
     try:
-        name_default = validate_name(defaults.name)
+        name_default = validate_name(normalize_name(defaults.name))
     except ValueError:
         name_default = None
     while True:
-        name = _prompt_text(console, ask, "Name this world model", name_default)
+        raw_name = _prompt_text(console, ask, "Name this world model", name_default)
+        name = normalize_name(raw_name)
         try:
             validate_name(name)
-            break
         except ValueError as err:
             console.print(f"[red]{escape(str(err))}[/red]")
+            continue
+        if name != raw_name:
+            console.print(f"  [dim]using[/dim] {escape(name)}")
+        break
 
     file = defaults.file
     vendor = defaults.vendor

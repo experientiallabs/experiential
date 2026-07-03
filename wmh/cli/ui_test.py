@@ -204,24 +204,44 @@ def test_build_wizard_accepts_defaults_with_blank_input() -> None:
     assert params.embed_provider == "hashing"  # default embedder, no embed-model prompt
 
 
+def test_build_wizard_dashes_spaces_in_name() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    # Whitespace is dash-joined rather than rejected: typing "tau bench" quietly becomes
+    # "tau-bench", with a dim note showing the name actually used.
+    reader = _scripted_reader(["tau bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    assert params.name == "tau-bench"
+    assert "using tau-bench" in console.export_text()
+
+
 def test_build_wizard_reprompts_on_invalid_name() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    # An unsafe name ("tau bench" has a space) must re-prompt with the friendly validation
-    # message, not escape as a ValueError traceback; the retry answers the same prompt.
-    reader = _scripted_reader(["tau bench", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    # A name normalization can't rescue ("tau/bench" has a path separator) must re-prompt with
+    # the friendly validation message, not escape as a ValueError traceback.
+    reader = _scripted_reader(["tau/bench", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
     assert params.name == "tau-bench"
     assert "invalid world model name" in console.export_text()
 
 
-def test_build_wizard_drops_invalid_flag_name_from_default() -> None:
+def test_build_wizard_normalizes_flag_name_in_default() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    # An invalid --name flag must not become the bracketed Enter-default (it could never be
-    # accepted); blank input then means "no name yet" and re-prompts until a valid one arrives.
-    reader = _scripted_reader(["", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    # A whitespace-y --name flag becomes the normalized bracketed default, acceptable via Enter
+    # on the first prompt (no validation error, no re-prompt).
+    reader = _scripted_reader(["", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(console, BuildParams(name="tau bench"), reader=reader)
     assert params.name == "tau-bench"
-    assert "[tau bench]" not in console.export_text()
+    assert "invalid world model name" not in console.export_text()
+
+
+def test_build_wizard_drops_invalid_flag_name_from_default() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    # An unrescuable --name flag must not become the bracketed Enter-default (it could never be
+    # accepted); blank input then means "no name yet" and re-prompts until a valid one arrives.
+    reader = _scripted_reader(["", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    params = run_build_wizard(console, BuildParams(name="tau/bench"), reader=reader)
+    assert params.name == "tau-bench"
+    assert "[tau/bench]" not in console.export_text()
 
 
 def test_build_wizard_aborts_cleanly_on_eof() -> None:

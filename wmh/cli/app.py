@@ -40,6 +40,7 @@ from wmh.config import (
     WorldModelStore,
     load_config,
     load_settings,
+    normalize_name,
     set_telemetry_enabled,
     settings_path,
     validate_name,
@@ -258,6 +259,8 @@ def build(
     elif name is None and file is None and vendor is None:
         raise typer.BadParameter("provide --file (or --vendor), or run `wmh build` interactively")
 
+    # Flag-supplied names get the same whitespace-to-dash normalization as the wizard.
+    params.name = normalize_name(params.name)
     try:
         validate_name(params.name)
     except ValueError as err:

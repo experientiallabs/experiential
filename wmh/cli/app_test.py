@@ -141,7 +141,7 @@ def test_bare_invocation_shows_help(args: list[str]) -> None:
 def test_build_rejects_invalid_name_flag_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(
         app,
-        ["build", "--name", "tau bench", "--file", _traces_file(tmp_path), "--no-interactive"],
+        ["build", "--name", "tau/bench", "--file", _traces_file(tmp_path), "--no-interactive"],
     )
     assert result.exit_code == 2  # usage error, not a ValueError traceback
     assert "invalid world model name" in result.output

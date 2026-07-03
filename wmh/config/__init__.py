@@ -21,6 +21,7 @@ from wmh.config.store import (
     DEFAULT_MODEL_NAME,
     ModelInfo,
     WorldModelStore,
+    normalize_name,
     validate_name,
 )
 
@@ -37,6 +38,7 @@ __all__ = [
     "ensure_telemetry_anonymous_id",
     "load_config",
     "load_settings",
+    "normalize_name",
     "save_config",
     "save_settings",
     "set_telemetry_enabled",

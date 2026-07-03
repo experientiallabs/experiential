@@ -43,6 +43,11 @@ def validate_name(name: str) -> str:
     return name
 
 
+def normalize_name(name: str) -> str:
+    """Dash-join whitespace: 'tau bench' -> 'tau-bench'. Validity stays validate_name's call."""
+    return re.sub(r"\s+", "-", name.strip())
+
+
 class ModelInfo(BaseModel):
     """A one-line summary of a built world model, for `wmh list`."""
 
