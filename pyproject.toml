@@ -79,4 +79,6 @@ exclude = [
     "scripts/plot_trace_scaling.py",
     "environment-capture/appworld/backend/world_backend.py",
     "environment-capture/appworld/backend/fetch_data.py",
+    "environment-capture/gaia2/backend/world_backend.py",
+    "environment-capture/gaia2/backend/fetch_data.py",
 ]
