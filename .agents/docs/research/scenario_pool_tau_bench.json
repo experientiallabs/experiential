@@ -1,0 +1,728 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "scenario-1f0ca0031cd4",
+      "task": "Your name is Aarav Ahmed. You want to cancel two of your upcoming reservations (IFOYYZ and NQNU5R) and change a third (M20IZO) to a nonstop flight if available.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Aarav Ahmed has three reservations: IFOYYZ for a round trip from CLT to EWR, NQNU5R for a one-way trip from MCO to SEA, and M20IZO for a one-way trip from JFK to MCO. There are no nonstop flights available for the M20IZO reservation on the requested date."
+      },
+      "checklist": [
+        "Reservation IFOYYZ is successfully canceled.",
+        "Reservation NQNU5R is successfully canceled.",
+        "A notification is provided that no nonstop flights are available for the M20IZO reservation on the requested date."
+      ],
+      "provenance": [
+        "1f0ca0031cd4c9a69a1109f85d10fbd3"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "failure",
+      "failure_category": "no_nonstop_flight_available"
+    },
+    {
+      "scenario_id": "scenario-000d3ffa1250",
+      "task": "Book a one-way flight from ORD to PHL on May 26, matching the exact flight details of the May 10 flight from ORD to PHL.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The airline system has available flights from ORD to PHL on May 26. Sophia Silva's previous reservation details for a May 10 flight from ORD to PHL are known. The system can access user details and reservation history."
+      },
+      "checklist": [
+        "The new reservation matches the origin, destination, and date of the May 10 flight.",
+        "The new reservation is a one-way trip from ORD to PHL.",
+        "The cabin class for the new reservation is the same as the May 10 flight.",
+        "The flight number for the new reservation is the same as the May 10 flight."
+      ],
+      "provenance": [
+        "000d3ffa1250db0c21b7e8865e3145ec"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-0af7f822768b",
+      "task": "As Mei Brown, a valued Gold member, you need to contact the airline to complain about the delay of your flight HAT045 from PHX to SEA on 2024-05-15. Ensure to express your dissatisfaction due to the delay and inquire about any compensation or assistance that can be provided.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Mei Brown, a Gold member, has a confirmed reservation for flight HAT045 from PHX to SEA on 2024-05-15. The flight is currently delayed. Mei's contact information includes her name, address, email, and phone number. The airline has a policy for compensating delayed flights to Gold members."
+      },
+      "checklist": [
+        "The agent acknowledges Mei's Gold member status.",
+        "The agent confirms the delay of flight HAT045 on 2024-05-15.",
+        "The agent expresses empathy for the inconvenience caused by the delay.",
+        "The agent inquires about or offers compensation or assistance for the delay."
+      ],
+      "provenance": [
+        "0af7f822768bf314067aa0f043c204b0"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-3635177f0858",
+      "task": "Remove passenger Sophia from the round trip flights from LAS to DEN, departure May 19, return is May 20, for the reservation with ID GV1N64.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The reservation GV1N64 for James Patel is confirmed for a round trip from LAS to DEN on May 19 and May 20. The flights are in business class. The reservation is paid for with a gift card with ID gift_card_1642017."
+      },
+      "checklist": [
+        "The reservation GV1N64 no longer includes passenger Sophia.",
+        "The flights for the reservation GV1N64 have been updated to basic economy.",
+        "The reservation GV1N64 is still valid and shows the updated flights and cabin class."
+      ],
+      "provenance": [
+        "3635177f0858a25b553b7f3e9f33cf46"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-afc18051a709",
+      "task": "Liam Khan wants to reschedule his upcoming flight from IAH to SEA on May 23 to May 24 and upgrade the class to business for all passengers.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Liam Khan has a reservation with ID 4NQLHD for a round-trip flight from IAH to SEA on May 23. The flight is currently booked in economy class. Liam also has other unrelated reservations for different dates and destinations."
+      },
+      "checklist": [
+        "The reservation ID 4NQLHD has been successfully rescheduled to May 24.",
+        "The cabin class for reservation ID 4NQLHD has been upgraded to business for all passengers.",
+        "Confirmation of the rescheduled flight and upgraded class is provided to Liam."
+      ],
+      "provenance": [
+        "afc18051a70908036d8cbd18027bbef8"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-63961f879827",
+      "task": "Downgrade all business class flights to economy class for Omar Davis, without changing the flights or passengers. Omar is fine with receiving a refund for the price difference.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Omar Davis has five upcoming flights booked in business class. The flights are for a one-way trip from MCO to CLT, a round-trip from DEN to PHL, a one-way trip from MIA to EWR, a one-way trip from DEN to IAH, and a one-way trip from SEA to IAH. Economy class flights are available for all these routes on the same dates."
+      },
+      "checklist": [
+        "All five flights have been downgraded to economy class.",
+        "The total refund amount for the price difference has been calculated and communicated to Omar.",
+        "Confirmation messages for the flight downgrades have been sent to Omar."
+      ],
+      "provenance": [
+        "63961f879827e289e47d4dff0bfca10a"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-16e5f88274b8",
+      "task": "Determine if Sophia Silva is eligible for compensation due to a canceled flight and provide her with the appropriate compensation details if eligible.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Sophia Silva has a reservation with flight number HAT271 from ORD to PHL on 2024-05-10, which has already landed. She claims to have had a business flight canceled earlier this month, and she is requesting compensation for it."
+      },
+      "checklist": [
+        "Verify the status of the flight HAT271 on 2024-05-10 to confirm it has landed.",
+        "Check if there is a record of a canceled business flight for Sophia Silva earlier this month.",
+        "If a canceled flight is confirmed, determine if compensation is applicable based on the airline's policy.",
+        "Communicate the eligibility for compensation to Sophia Silva, including any applicable policy details."
+      ],
+      "provenance": [
+        "16e5f88274b89eb32563a7706625d44d"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "failure",
+      "failure_category": "unauthorized_request"
+    },
+    {
+      "scenario_id": "scenario-efec6ac80ec3",
+      "task": "Cancel the reservation EHGLP3 for Emma Kim, who has the user ID emma_kim_9957. Ensure that the cancellation is processed successfully and confirm the cancellation details to Emma.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Emma Kim has a reservation with the ID EHGLP3 for a one-way flight from PHX to JFK. The reservation is in the basic economy cabin and includes two flights: HAT156 from PHX to SEA and HAT021 from SEA to JFK. Emma's personal details and payment methods are on file."
+      },
+      "checklist": [
+        "The reservation EHGLP3 is successfully canceled.",
+        "Confirmation of the cancellation is communicated to Emma Kim.",
+        "The cancellation details, including the affected flights and any applicable fees, are accurately provided to Emma."
+      ],
+      "provenance": [
+        "efec6ac80ec302b2539752de1d58d7d3"
+      ],
+      "cluster_name": "Flight Management Tasks",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-83c3b8c68dab",
+      "task": "Mia Garcia, a new gamer, wants to cancel or return all items from her recent orders except for a gaming mouse and keyboard. She has already placed orders for various items, and you need to assist her in returning the unwanted items. Ensure that the items related to gaming are not returned.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Mia Garcia has two recent orders: #W5490111 and #W7387996. Order #W5490111 includes a Water Bottle, a Gaming Headset, and a Gaming Chair. Order #W7387996 includes a Gaming Mouse and a Gaming Keyboard. All items in both orders have been delivered."
+      },
+      "checklist": [
+        "All items in order #W5490111 except the Gaming Mouse and Gaming Keyboard have been successfully returned.",
+        "No items in order #W7387996 have been returned.",
+        "Confirmation of the return process has been communicated to Mia Garcia."
+      ],
+      "provenance": [
+        "83c3b8c68dab638695cd3a953a26f378"
+      ],
+      "cluster_name": "Item Return/Exchange",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-182d0811b7d0",
+      "task": "As Mei Kovacs, you want to exchange the water bottle in your order #W8065207 for a larger one and the desk lamp in your order #W6390527 for a less bright one, prioritizing an AC adapter power source over battery or USB. Ensure the exchanges are processed correctly.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Mei Kovacs has an order #W8065207 with a water bottle and an order #W6390527 with a desk lamp. The water bottle is currently 750ml and the desk lamp is high brightness powered by USB. Larger water bottle options and less bright desk lamps with preferred power sources are available."
+      },
+      "checklist": [
+        "The water bottle in order #W8065207 has been exchanged for a larger one.",
+        "The desk lamp in order #W6390527 has been exchanged for a less bright one with an AC adapter power source.",
+        "Confirmation of the exchanges has been communicated to Mei Kovacs."
+      ],
+      "provenance": [
+        "182d0811b7d08de20d90bc1a3f8595fb"
+      ],
+      "cluster_name": "Item Return/Exchange",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-d4d8cdfa7319",
+      "task": "Isabella Johansson, a resident of zipcode 32286, has an order sent to Texas by mistake. She needs to know the tracking number of the order and return all items in it except the pet bed. She wants the refund to be processed to her American Express credit card.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Isabella Johansson has an order (#W5565470) with items 'Electric Kettle', 'Garden Hose', and 'Pet Bed'. The order was mistakenly sent to Houston, TX. The user's American Express credit card is available for refunds."
+      },
+      "checklist": [
+        "The tracking number for order #W5565470 is provided to Isabella.",
+        "All items except the 'Pet Bed' from order #W5565470 are successfully returned.",
+        "A refund for the returned items is processed to Isabella's American Express credit card."
+      ],
+      "provenance": [
+        "d4d8cdfa7319a1c6f87438529c261560"
+      ],
+      "cluster_name": "Item Return/Exchange",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-12ab3bdaea78",
+      "task": "As Mei Davis in zipcode 80217, you want to exchange the office chair from order #W1267569 for a different item due to it arriving with broken pieces. If the agent asks for confirmation, initially say you want to rethink, but ultimately decide to proceed with the exchange.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Mei Davis has an order #W1267569 with an office chair that has arrived with broken pieces. The office chair is from a product with ID 4794339885. Mei's payment method is a credit card with ID credit_card_1061405. Mei's address is 698 Maple Drive, Suite 465, Denver, CO, 80217, USA."
+      },
+      "checklist": [
+        "The agent successfully identifies Mei Davis using her name and zip code.",
+        "The agent retrieves the order details for order #W1267569 and confirms the presence of the office chair with broken pieces.",
+        "The agent initiates the exchange process for the office chair from order #W1267569, using Mei's credit card with ID credit_card_1061405 for payment."
+      ],
+      "provenance": [
+        "12ab3bdaea78458c889941bd90ef8f55"
+      ],
+      "cluster_name": "Item Return/Exchange",
+      "weight": 0.0375,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-f3bad4bd68e6",
+      "task": "Mia Garcia wants to return all items from her orders #W5490111 and #W7387996. She has requested refunds to the payment methods associated with the other order. If this is not possible, escalate the issue to a human agent.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Mia Garcia has two orders: #W5490111 for a Water Bottle and #W7387996 for a Gaming Mouse. Order #W5490111 was paid with a credit card, and order #W7387996 was paid with PayPal. Mia Garcia's email is mia.garcia2723@example.com."
+      },
+      "checklist": [
+        "Verify that Mia Garcia has two orders (#W5490111 and #W7387996) and their respective payment methods.",
+        "Confirm that the system cannot process refunds to non-original payment methods.",
+        "Ensure that the issue is escalated to a human agent with a clear summary of the situation."
+      ],
+      "provenance": [
+        "f3bad4bd68e63428898578e062ff5b22"
+      ],
+      "cluster_name": "Item Return/Exchange",
+      "weight": 0.0375,
+      "source_outcome": "failure",
+      "failure_category": "policy_violation"
+    },
+    {
+      "scenario_id": "scenario-b46200d83bb2",
+      "task": "Mia Garcia, with email mia.garcia2723@example.com, has quit gaming and wants to cancel or return all items associated with it. The items include a gaming mouse and a water bottle. Ensure the returns are processed and any refunds or credits are applied appropriately.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Mia Garcia has two orders: #W5490111 for a water bottle and #W7387996 for a gaming mouse. Both orders have been delivered to her address at 537 Main Street, Suite 572, Indianapolis, IN, 46229. Mia's payment methods include PayPal (ID: paypal_9497703) and a credit card (ID: credit_card_3124723)."
+      },
+      "checklist": [
+        "The gaming mouse from order #W7387996 has been successfully returned.",
+        "The water bottle from order #W5490111 has been successfully returned.",
+        "A refund or credit has been issued for the returned items."
+      ],
+      "provenance": [
+        "b46200d83bb28c6d2bd1ae518ba21a4e"
+      ],
+      "cluster_name": "Item Return/Exchange",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-e6a8d69b70ec",
+      "task": "As Yusuf Rossi in zip code 19122, you received your order #W2378156 and wish to exchange the mechanical keyboard for the same one but with clicky switches and the smart thermostat for one compatible with Google Home. Ensure the exchange is processed correctly and confirm the new items are in stock before completing the exchange.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Yusuf Rossi has an order #W2378156 with items including a mechanical keyboard and a smart thermostat. The mechanical keyboard is currently in stock with clicky switch variants, and the smart thermostat has variants compatible with Google Home."
+      },
+      "checklist": [
+        "The mechanical keyboard in the order has been successfully exchanged for one with clicky switches.",
+        "The smart thermostat in the order has been successfully exchanged for one compatible with Google Home.",
+        "The exchange has been processed and confirmed by the system."
+      ],
+      "provenance": [
+        "e6a8d69b70ec045f59f431d0e0ab7ae0"
+      ],
+      "cluster_name": "Order Modification Requests",
+      "weight": 0.0375,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-e0ef4e652603",
+      "task": "Update the user's address and all pending order addresses to 101 Highway, New York, 10001 for Ethan Garcia, who lives in Denver, 80280.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Ethan Garcia's current address is 667 Highland Drive, Suite 865, Denver, CO, 80280. He has three pending orders with the address 667 Highland Drive, Suite 865, Denver, CO, 80280."
+      },
+      "checklist": [
+        "Ethan Garcia's user profile address is updated to 101 Highway, New York, NY, 10001.",
+        "All pending orders for Ethan Garcia have their address updated to 101 Highway, New York, NY, 10001.",
+        "Confirmation of address change is communicated to Ethan Garcia."
+      ],
+      "provenance": [
+        "e0ef4e652603417c925aa71417f0f0a6"
+      ],
+      "cluster_name": "Order Modification Requests",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-4b46be4db947",
+      "task": "Upgrade all items in the order #W9911714 to the most expensive available variants, ensuring the total cost increase does not exceed $72.90.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Ethan Garcia, living in Denver, 80280, has an order #W9911714 with items including a Water Bottle, a Mechanical Keyboard, a Running Shoe, and a Makeup Kit. The current total cost of the order is $54.04 for the Water Bottle, $235.13 for the Mechanical Keyboard, $147.05 for the Running Shoe, and $235.44 for the Makeup Kit."
+      },
+      "checklist": [
+        "The order #W9911714 has been successfully modified to include the most expensive variants of each item.",
+        "The total cost increase for the order does not exceed $72.90.",
+        "The new items in the order are available and the order reflects the updated prices."
+      ],
+      "provenance": [
+        "4b46be4db9478cce60ba03e2e8539609"
+      ],
+      "cluster_name": "Order Modification Requests",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-762d144f936a",
+      "task": "Modify the pending order for hiking boots to size 8, using the material specified, and ensure the payment method is PayPal.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Fatima Johnson has a pending order for hiking boots in size 10. The boots are currently priced at $253.89. The available sizes include 8 and 9. The preferred payment method is PayPal."
+      },
+      "checklist": [
+        "The order for hiking boots has been modified to size 8.",
+        "The material of the hiking boots remains unchanged.",
+        "The payment method for the order is PayPal."
+      ],
+      "provenance": [
+        "762d144f936adf2f35c86c406d71f0ab"
+      ],
+      "cluster_name": "Order Modification Requests",
+      "weight": 0.0375,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-0726c51e5c96",
+      "task": "Book a flight from San Francisco (SFO) to New York (JFK) for three passengers. Midway through the booking process, inform the agent that you would like to discuss another matter.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The airline system is operational. There are available flights from San Francisco (SFO) to New York (JFK). The user, Noah Muller, has a user ID of noah_muller_9847 and is located in Denver, CO."
+      },
+      "checklist": [
+        "A flight from SFO to JFK has been successfully booked for three passengers.",
+        "The agent acknowledges Noah's intention to discuss another matter.",
+        "Noah's personal details, including name, address, and email, are correctly retrieved and used in the booking process."
+      ],
+      "provenance": [
+        "0726c51e5c9687fbc9c12c48bd7fb49d"
+      ],
+      "cluster_name": "Flight booking tasks",
+      "weight": 0.03333333333333333,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-f9203b81c47f",
+      "task": "Determine the total number of suitcases allowed for Anya Garcia's upcoming flight from Denver to Miami on May 16, 2024, using her reservation number JMO1MG.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Anya Garcia has a confirmed reservation for a one-way flight from Denver to Miami on May 16, 2024, with a flight number HAT255. Anya's user ID is anya_garcia_5901, and her email is anya.garcia8816@example.com. The reservation details are available, and the airline's baggage policy is accessible."
+      },
+      "checklist": [
+        "The agent confirms the total number of suitcases allowed for the flight.",
+        "The confirmation number JMO1MG is used to retrieve the reservation details.",
+        "The agent provides the correct number of suitcases based on the airline's baggage policy for the specified flight."
+      ],
+      "provenance": [
+        "f9203b81c47f226a6b3090ce0be1aa40"
+      ],
+      "cluster_name": "Flight booking tasks",
+      "weight": 0.03333333333333333,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-44d1be579665",
+      "task": "Mia Li wants to fly from New York to Seattle on May 20 (one way). She does not want to fly before 11am EST and prefers direct flights but will consider one-stop options if necessary. She wants to fly in economy.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The airline system has available flights from New York to Seattle on May 20. There are direct flights available from JFK to SEA, but they depart before 11am EST. One-stop flights are available from JFK to SEA with a layover in ATL and from EWR to SEA with a layover in DFW."
+      },
+      "checklist": [
+        "Mia Li's flight departs at or after 11am EST.",
+        "Mia Li's flight is in economy class.",
+        "Mia Li's flight is either direct or a one-stop flight with a reasonable layover time."
+      ],
+      "provenance": [
+        "44d1be579665de454ecad59ddb12326e"
+      ],
+      "cluster_name": "Flight booking tasks",
+      "weight": 0.03333333333333333,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-9607ecaeb266",
+      "task": "John Smith, currently abroad in France, is experiencing issues with his mobile data, which either stops working or is very slow. He wants to resolve this issue and ensure he gets excellent internet speed while abroad.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith's account is active with a phone number 555-123-2002. He has a line with ID L1002, which is active, and a plan P1002 with roaming enabled. His device ID is D1002, and he has used 8.7 GB of data with no data refueling. His contract ends on 2026-12-31."
+      },
+      "checklist": [
+        "The agent confirms that John's mobile data issues have been resolved.",
+        "The agent ensures that John's data plan supports excellent internet speed while abroad.",
+        "The agent communicates any necessary steps or changes to John's plan to ensure optimal performance."
+      ],
+      "provenance": [
+        "9607ecaeb266bf2661f210a24f9295f7"
+      ],
+      "cluster_name": "Mobile Data Abroad",
+      "weight": 0.024999999999999998,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-8fb0686ede3a",
+      "task": "John Smith, with phone number 555-123-2002, is experiencing issues with his mobile data being either slow or non-functional. He needs to resolve this issue and ensure his mobile data is working properly.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith's mobile data line L1002 is active with a Premium Plan that includes 15 GB of data. The line has used 15.1 GB of data, and there is no additional data refueling. Roaming is enabled on this line."
+      },
+      "checklist": [
+        "John Smith's mobile data is functioning properly and not experiencing slowdowns or disconnections.",
+        "The mobile data line L1002 has additional data refueling to ensure it meets John's needs.",
+        "John Smith is informed about the status of his mobile data and any actions taken to resolve the issue."
+      ],
+      "provenance": [
+        "8fb0686ede3a2eab2503447cbf66b3b5"
+      ],
+      "cluster_name": "Mobile Data Abroad",
+      "weight": 0.024999999999999998,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-de54486e1d0a",
+      "task": "John Smith, currently abroad in France, is experiencing issues with his mobile data. He needs to ensure his mobile data is working properly and has excellent internet speed. He should verify his current data plan, check if roaming is enabled, and if necessary, add more data to his plan.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith's phone number is 555-123-2002. He has an active account with a Premium Plan that includes 15 GB of data. His current data usage is 15.1 GB, and roaming is enabled. He is abroad in France."
+      },
+      "checklist": [
+        "The agent confirms that John Smith's current data plan is the Premium Plan with 15 GB of data.",
+        "The agent verifies that roaming is enabled on John Smith's account.",
+        "The agent successfully adds at least 2 GB of data to John Smith's plan to ensure he has sufficient data for his needs."
+      ],
+      "provenance": [
+        "de54486e1d0a90fe39f43ab500ef913a"
+      ],
+      "cluster_name": "Mobile Data Abroad",
+      "weight": 0.024999999999999998,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b696f39e8529",
+      "task": "John Smith, currently abroad in France, is experiencing issues with his mobile data. He wants to ensure that his mobile data works properly and at excellent speed while abroad. He has already identified that his roaming is not enabled. Your goal is to enable roaming for John's mobile line and confirm that the roaming has been successfully enabled.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith's mobile line L1002 is currently active but roaming is not enabled. His phone number is 555-123-2002. John is abroad in France and needs his mobile data to work properly and at excellent speed."
+      },
+      "checklist": [
+        "Roaming has been successfully enabled for John's mobile line L1002.",
+        "John has been informed that roaming has been successfully enabled.",
+        "John's mobile data should now work properly and at excellent speed while abroad."
+      ],
+      "provenance": [
+        "b696f39e85291407ed6b814c6ca4158e"
+      ],
+      "cluster_name": "Mobile Data Roaming",
+      "weight": 0.024999999999999998,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b6c66a75ed17",
+      "task": "As John Smith, you need to resolve an issue with your mobile data that is either stopping or working very slowly. You want to ensure that your mobile data functions properly and you are willing to follow through with any necessary steps to achieve this.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is a customer with an active account. His phone number is 555-123-2002, and he is located at 123 Main St, Anytown, CA, 90210. His email is john.smith@example.com. The mobile data service associated with his account is currently experiencing issues."
+      },
+      "checklist": [
+        "Verify that John Smith's account status is confirmed as active.",
+        "Ensure that the mobile data issue is acknowledged and steps to resolve it are communicated to John Smith.",
+        "Confirm that John Smith is provided with a resolution or a timeline for when the issue will be resolved."
+      ],
+      "provenance": [
+        "b6c66a75ed1709b118e0c86622b267cf"
+      ],
+      "cluster_name": "Mobile Data Roaming",
+      "weight": 0.024999999999999998,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-0ca7d944afa1",
+      "task": "John Smith, currently abroad in France, is experiencing issues with his mobile data connectivity. He wants to ensure that his mobile data is working properly and at excellent speed. The agent should identify the issue, provide a solution, and ensure John's mobile data is functioning optimally.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith's mobile data is either not working or is very slow. He is on the Premium Plan with 15 GB of data limit. He has used 15.1 GB of data and has no data refueling. He is currently abroad in France."
+      },
+      "checklist": [
+        "The agent confirms John's mobile data issue and provides a solution.",
+        "The agent ensures John's mobile data is working properly and at excellent speed.",
+        "The agent communicates the solution clearly to John."
+      ],
+      "provenance": [
+        "0ca7d944afa147cd83b21dc001fb0a88"
+      ],
+      "cluster_name": "Mobile Data Roaming",
+      "weight": 0.024999999999999998,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b333941ccdeb",
+      "task": "Verify if insurance has been added to the flight reservation with the reservation number PEP4E0 for the user with ID sophia_taylor_9065. If insurance is not added, ensure it is added for the upcoming flight from CLT to PHX on 2024-05-20.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The airline system has a reservation with the number PEP4E0 for a user with ID sophia_taylor_9065. The reservation is for a one-way flight from CLT to PHX in basic economy. The user believes insurance has been added but it is not showing up online."
+      },
+      "checklist": [
+        "The agent confirms whether insurance is added to the reservation PEP4E0.",
+        "If insurance is not added, the agent successfully adds insurance to the reservation PEP4E0.",
+        "The agent communicates the status of the insurance addition to the user."
+      ],
+      "provenance": [
+        "b333941ccdeb37c9a78375fbaf15b436"
+      ],
+      "cluster_name": "Flight reservation modifications",
+      "weight": 0.025,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-0af7ead05d57",
+      "task": "For your upcoming trip from New York to Chicago, you want to: add 3 checked bags, change the passenger to yourself, and upgrade it to economy class.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The user has a reservation with ID FQ8APE for a one-way trip from EWR to ORD on 2024-05-25 in basic economy. The user's name is Omar Rossi, and the user ID is omar_rossi_1241. There are available flights and seats for the requested changes."
+      },
+      "checklist": [
+        "The reservation has been upgraded to economy class.",
+        "The passenger information has been changed to Omar Rossi.",
+        "Three checked bags have been added to the reservation."
+      ],
+      "provenance": [
+        "0af7ead05d57180d4e0ba7c05576918d"
+      ],
+      "cluster_name": "Flight reservation modifications",
+      "weight": 0.025,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-fc65e7425224",
+      "task": "John Smith, with phone number 555-123-2002, is experiencing issues with his mobile data. He needs assistance to diagnose and resolve the problem, ensuring his mobile data works properly and efficiently.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith's mobile data service is experiencing intermittent connectivity issues. His account is active, and he is subscribed to the 'Premium Plan' with a data limit of 15.0 GB. His device ID is D1002, and he has used 8.7 GB of data. The last plan change was on 2024-12-15."
+      },
+      "checklist": [
+        "The agent confirms John Smith's identity and the issue with his mobile data.",
+        "The agent provides a diagnosis or explanation for the mobile data issues.",
+        "The agent offers a solution or next steps to resolve the mobile data issues."
+      ],
+      "provenance": [
+        "fc65e74252249b9d96ac9bc467ab8765"
+      ],
+      "cluster_name": "Mobile Data Issue Resolution",
+      "weight": 0.025,
+      "source_outcome": "success",
+      "failure_category": null
+    }
+  ],
+  "clusters": [
+    {
+      "cluster_id": 1,
+      "name": "Flight Management Tasks",
+      "description": "These tasks involve managing and modifying flight reservations and complaints about flight services.",
+      "member_trace_ids": [
+        "efec6ac80ec302b2539752de1d58d7d3",
+        "003e2c577b20f0a9bb38ef9e065f6fd6",
+        "0af7f822768bf314067aa0f043c204b0",
+        "16e5f88274b89eb32563a7706625d44d",
+        "1eb1909a370a47b5129ac11adcc69d19",
+        "000d3ffa1250db0c21b7e8865e3145ec",
+        "1f0ca0031cd4c9a69a1109f85d10fbd3",
+        "3635177f0858a25b553b7f3e9f33cf46",
+        "651ec5d7d0b6acf2ae775fa5a3b0c793",
+        "f1934cb15a0a711cb281c74d6d3b02ec",
+        "4758e094a8dc28ed7d96feb9b909913c",
+        "63961f879827e289e47d4dff0bfca10a",
+        "afc18051a70908036d8cbd18027bbef8"
+      ]
+    },
+    {
+      "cluster_id": 6,
+      "name": "Item Return/Exchange",
+      "description": "These tasks involve returning or exchanging items from orders.",
+      "member_trace_ids": [
+        "182d0811b7d08de20d90bc1a3f8595fb",
+        "96571b713e8d7538d4ac7718ae59e3e3",
+        "29612d15e6d0105a5eb3825d0ff4cdf6",
+        "f3bad4bd68e63428898578e062ff5b22",
+        "833fcb9fb230b74ed2adf8b52a76c636",
+        "0378552fcb2b784d1272e569aa5f9625",
+        "3c1b004d31ebd843ee3de1ca8a6f6352",
+        "831aa5412b5eba52d94718f6662b5a9e",
+        "83c3b8c68dab638695cd3a953a26f378",
+        "b46200d83bb28c6d2bd1ae518ba21a4e",
+        "12ab3bdaea78458c889941bd90ef8f55",
+        "d4d8cdfa7319a1c6f87438529c261560",
+        "4d9898835477d00b609c7f2f95ff44f6"
+      ]
+    },
+    {
+      "cluster_id": 5,
+      "name": "Mobile Data Roaming",
+      "description": "Tasks related to enabling or fixing mobile data roaming for John Smith while abroad.",
+      "member_trace_ids": [
+        "b696f39e85291407ed6b814c6ca4158e",
+        "b6c66a75ed1709b118e0c86622b267cf",
+        "78829b09da726f06a9f7c5cec72a85ec",
+        "687df893630e7e8f7a7e5343bd0c5d01",
+        "52a6a48513d2234b69db5dd00cf140c8",
+        "0ca7d944afa147cd83b21dc001fb0a88",
+        "ca406458c3cf62c621b91fe37884bee3",
+        "b3784a91163a012b1436090a9c478912"
+      ]
+    },
+    {
+      "cluster_id": 7,
+      "name": "Order Modification Requests",
+      "description": "These tasks all involve making changes to an existing order, such as exchanging items, changing addresses, or upgrading items.",
+      "member_trace_ids": [
+        "e6a8d69b70ec045f59f431d0e0ab7ae0",
+        "b9da380f0d268bdcf9d42973364d4744",
+        "a561a8c60215f4af6714fed4a50e04fd",
+        "762d144f936adf2f35c86c406d71f0ab",
+        "4b46be4db9478cce60ba03e2e8539609",
+        "e0ef4e652603417c925aa71417f0f0a6",
+        "fae25fe34e4909b1f8366644d4a5b2dd"
+      ]
+    },
+    {
+      "cluster_id": 0,
+      "name": "Mobile Data Issue Resolution",
+      "description": "Tasks involve fixing or resolving mobile data issues for a specific phone number.",
+      "member_trace_ids": [
+        "fc65e74252249b9d96ac9bc467ab8765",
+        "303d0479e6c9d7bb304acc44b7dc6620",
+        "027113fbed346948147920fd3f76f3d1",
+        "7261881df3f5be6686f56585295bc1b2",
+        "1d1fd9c8be89a509c6578a2375336423",
+        "69095e52c910946d7704aa3f6a2c6514"
+      ]
+    },
+    {
+      "cluster_id": 4,
+      "name": "Mobile Data Abroad",
+      "description": "Tasks involve resolving mobile data issues while traveling abroad in France.",
+      "member_trace_ids": [
+        "9607ecaeb266bf2661f210a24f9295f7",
+        "8fb0686ede3a2eab2503447cbf66b3b5",
+        "5d74bbfbd2821ba3f52a54f6ba18aaa1",
+        "e14edc73da6dd02a49afb8bd3796da8c",
+        "de54486e1d0a90fe39f43ab500ef913a",
+        "a288cf2fd0ccb1c8b83f9f25948a6804"
+      ]
+    },
+    {
+      "cluster_id": 3,
+      "name": "Flight booking tasks",
+      "description": "These tasks all involve making or modifying flight reservations.",
+      "member_trace_ids": [
+        "f9203b81c47f226a6b3090ce0be1aa40",
+        "0726c51e5c9687fbc9c12c48bd7fb49d",
+        "041936340729fbfb33d3b1b6e6f799c8",
+        "44d1be579665de454ecad59ddb12326e"
+      ]
+    },
+    {
+      "cluster_id": 2,
+      "name": "Flight reservation modifications",
+      "description": "These tasks all involve making changes to an existing flight reservation.",
+      "member_trace_ids": [
+        "b333941ccdeb37c9a78375fbaf15b436",
+        "0af7ead05d57180d4e0ba7c05576918d",
+        "56917256da22ca30bddb2da69adf75dd"
+      ]
+    }
+  ],
+  "corpus_traces": 60,
+  "corpus_coverage": 0.8666666666666667,
+  "coverage_tau": 0.7
+}
