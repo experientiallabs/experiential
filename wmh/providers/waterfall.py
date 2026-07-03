@@ -26,6 +26,7 @@ from typing import Protocol
 from llm_waterfall import Backend, CompletionResult, EmbeddingResult, RetryPolicy, Waterfall
 from llm_waterfall import Message as WfMessage
 from llm_waterfall import VerifyResult as WfVerifyResult
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -160,81 +161,132 @@ class WaterfallProvider:
         )
 
 
-# The default failover chain lives in a gitignored file (`.wmh/` is ignored wholesale): profile
-# names identify AWS accounts and the file may carry an OpenAI key, none of which belong in git.
+# Failover chains live in a gitignored file (`.wmh/` is ignored wholesale): profile names
+# identify AWS accounts and the file may carry API keys, none of which belong in git. Format —
+# one or more named chains, each an array of rungs, plus an optional default:
+#
+#     default = "main"
+#
+#     [[chain.main]]
+#     kind = "bedrock"                 # bedrock | openai | anthropic
+#     model = "us.anthropic.claude-opus-4-6-v1"
+#     profile = "endflow"              # optional: named AWS profile (bedrock)
+#     region = "us-west-2"             # optional
+#     # api_key = "sk-..."             # optional: openai/anthropic key, seeded into the env
+#     # embed_model / embed_dim        # optional: embeddings attribution
+#
+#     [[chain.opus-48]]
+#     ...
 FALLBACK_CONFIG_PATH = Path(".wmh/fallback.toml")
 
-_ALLOWED_KEYS = frozenset(
-    {"kind", "model", "profile", "region", "api_key", "embed_model", "embed_dim"}
-)
+# The env var each kind's adapter reads; `api_key` in the file only seeds it (env wins), so the
+# gitignored config is self-contained.
+_API_KEY_ENV = {ProviderKind.OPENAI: "OPENAI_API_KEY", ProviderKind.ANTHROPIC: "ANTHROPIC_API_KEY"}
+
+Chain = tuple[list[ProviderConfig], list[str | None]]
 
 
-def _parse_fallback_config(path: Path) -> tuple[list[ProviderConfig], list[str | None]]:
-    """Parse `[[backend]]` entries into (configs, profiles), validating loudly."""
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
-    entries = data.get("backend")
-    if not entries:
-        raise ValueError(
-            f"{path}: no [[backend]] entries; each rung needs at least kind + model "
-            "(kind/model/profile/region/api_key/embed_model/embed_dim)"
-        )
+class _Rung(BaseModel):
+    """One `[[chain.<name>]]` entry; `extra="forbid"` turns typos into loud errors."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ProviderKind
+    model: str
+    profile: str | None = None
+    region: str | None = None
+    api_key: str | None = None
+    embed_model: str | None = None
+    embed_dim: int | None = None
+
+
+def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Chain:
+    """Parse one chain's rung entries into (configs, profiles), validating loudly."""
     configs: list[ProviderConfig] = []
     profiles: list[str | None] = []
     for index, entry in enumerate(entries):
-        unknown = set(entry) - _ALLOWED_KEYS
-        if unknown:
-            raise ValueError(
-                f"{path}: backend #{index + 1} has unknown key(s) {sorted(unknown)}; "
-                f"allowed: {sorted(_ALLOWED_KEYS)}"
-            )
+        where = f"{path}: chain {name!r} rung #{index + 1}"
         try:
-            kind = ProviderKind(entry["kind"])
-        except (KeyError, ValueError):
+            rung = _Rung.model_validate(entry)
+        except ValidationError as exc:
+            raise ValueError(f"{where} is invalid (unknown key or bad value): {exc}") from None
+        if rung.kind not in _SUPPORTED_KINDS:
             raise ValueError(
-                f"{path}: backend #{index + 1} needs kind ∈ "
-                f"{sorted(k.value for k in _SUPPORTED_KINDS)} (got {entry.get('kind')!r})"
-            ) from None
-        if kind not in _SUPPORTED_KINDS:
-            raise ValueError(
-                f"{path}: backend #{index + 1} kind {kind.value!r} has no llm-waterfall "
-                f"backend; supported: {sorted(k.value for k in _SUPPORTED_KINDS)}"
+                f"{where}: kind {rung.kind.value!r} has no llm-waterfall backend; "
+                f"supported: {sorted(k.value for k in _SUPPORTED_KINDS)}"
             )
-        if "model" not in entry:
-            raise ValueError(f"{path}: backend #{index + 1} is missing required key 'model'")
-        api_key = entry.get("api_key")
-        if api_key is not None:
-            if kind is not ProviderKind.OPENAI:
+        if rung.api_key is not None:
+            env_var = _API_KEY_ENV.get(rung.kind)
+            if env_var is None:
                 raise ValueError(
-                    f"{path}: backend #{index + 1}: api_key only applies to kind='openai' "
-                    "(bedrock uses AWS profiles; anthropic reads ANTHROPIC_API_KEY)"
+                    f"{where}: api_key only applies to kind='openai'/'anthropic' "
+                    "(bedrock uses AWS profiles)"
                 )
-            # The env var is the adapter's credential channel; the file only seeds it so the
-            # gitignored config is self-contained. A real env var always wins.
-            os.environ.setdefault("OPENAI_API_KEY", api_key)
+            os.environ.setdefault(env_var, rung.api_key)
         configs.append(
             ProviderConfig(
-                kind=kind,
-                model=entry["model"],
-                region=entry.get("region"),
-                embed_model=entry.get("embed_model"),
-                embed_dim=entry.get("embed_dim"),
+                kind=rung.kind,
+                model=rung.model,
+                region=rung.region,
+                embed_model=rung.embed_model,
+                embed_dim=rung.embed_dim,
             )
         )
-        profiles.append(entry.get("profile"))
+        profiles.append(rung.profile)
     return configs, profiles
 
 
-def provider_or_chain(config: ProviderConfig, *, path: Path | None = None) -> Provider:
-    """The default provider-construction seam: single backend, or the local failover chain.
+def _parse_fallback_config(path: Path) -> tuple[dict[str, Chain], str | None]:
+    """Parse the named chains and the optional `default` selector."""
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    unknown_top = set(data) - {"chain", "default"}
+    if unknown_top:
+        raise ValueError(
+            f"{path}: unknown top-level key(s) {sorted(unknown_top)}; expected "
+            '`default = "<name>"` and [[chain.<name>]] rung entries'
+        )
+    chains_raw = data.get("chain")
+    if not isinstance(chains_raw, dict) or not chains_raw:
+        raise ValueError(
+            f"{path}: no chains found; define rungs as [[chain.<name>]] entries "
+            "(kind/model/profile/region/api_key/embed_model/embed_dim per rung)"
+        )
+    chains = {name: _parse_rungs(path, name, entries) for name, entries in chains_raw.items()}
+    default = data.get("default")
+    if default is not None and default not in chains:
+        raise ValueError(
+            f"{path}: default = {default!r} names no chain; available: {sorted(chains)}"
+        )
+    return chains, default
 
-    When `.wmh/fallback.toml` exists, the requested provider is served by the whole chain —
-    the requested (kind, model) leads as the primary unless it already heads the chain, and the
-    file's rungs back it up. Without the file this is exactly `get_provider(config)`.
+
+def provider_or_chain(
+    config: ProviderConfig, *, chain: str | None = None, path: Path | None = None
+) -> Provider:
+    """The default provider-construction seam: single backend, or a local failover chain.
+
+    When `.wmh/fallback.toml` exists, the requested provider is served by the selected chain —
+    `chain` names one of the file's chains (falling back to its `default`, or its only chain);
+    the requested (kind, model) leads as the primary unless it already heads the chain. Without
+    the file this is exactly `get_provider(config)`.
     """
     chain_path = path if path is not None else FALLBACK_CONFIG_PATH
     if not chain_path.exists():
+        if chain is not None:
+            raise ValueError(f"chain {chain!r} requested but {chain_path} does not exist")
         return get_provider(config)
-    configs, profiles = _parse_fallback_config(chain_path)
+    chains, default = _parse_fallback_config(chain_path)
+    name = chain if chain is not None else default
+    if name is None:
+        if len(chains) > 1:
+            raise ValueError(
+                f"{chain_path} defines {sorted(chains)} but no `default`; pass a chain name "
+                'or set `default = "<name>"` in the file'
+            )
+        name = next(iter(chains))
+    if name not in chains:
+        raise ValueError(f"chain {name!r} not in {chain_path}; available: {sorted(chains)}")
+    configs, profiles = chains[name]
     heads_chain = configs[0].kind is config.kind and configs[0].model == config.model
     if not heads_chain:
         keep = [

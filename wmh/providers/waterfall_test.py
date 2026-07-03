@@ -156,22 +156,32 @@ def test_verify_checks_every_rung_and_names_failures() -> None:
 
 
 _CHAIN_TOML = """
-[[backend]]
+default = "main"
+
+[[chain.main]]
 kind = "bedrock"
 model = "us.anthropic.claude-opus-4-6-v1"
 profile = "endflow"
 region = "us-west-2"
 
-[[backend]]
+[[chain.main]]
 kind = "bedrock"
 model = "us.anthropic.claude-opus-4-8"
-profile = "stackwise-agent"
 region = "us-west-2"
 
-[[backend]]
+[[chain.main]]
 kind = "openai"
 model = "gpt-5.5"
 api_key = "sk-test-not-real"
+
+[[chain.opus-48]]
+kind = "bedrock"
+model = "us.anthropic.claude-opus-4-8"
+region = "us-west-2"
+
+[[chain.opus-48]]
+kind = "anthropic"
+model = "claude-opus-4-8"
 """
 
 
@@ -193,7 +203,7 @@ def test_fallback_config_parses_chain_in_order(
         "us.anthropic.claude-opus-4-8",
         "gpt-5.5",
     ]
-    assert [b.profile for b in backends] == ["endflow", "stackwise-agent", None]
+    assert [b.profile for b in backends] == ["endflow", None, None]
     # The gitignored file seeds the OpenAI key so the chain is self-contained.
     import os
 
@@ -208,7 +218,7 @@ def test_requested_model_leads_when_not_heading_chain(tmp_path: Path) -> None:
     assert isinstance(provider, WaterfallProvider)
     assert isinstance(provider._waterfall, Waterfall)
     assert provider._waterfall.backends[0].model == "us.anthropic.claude-haiku-4-5"
-    assert len(provider._waterfall.backends) == 4  # requested + 3 rungs
+    assert len(provider._waterfall.backends) == 4  # requested + main's 3 rungs
     assert provider.config is requested  # metering still labels the intended primary
 
 
@@ -221,12 +231,15 @@ def test_no_chain_file_falls_back_to_single_provider(tmp_path: Path) -> None:
 
 def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
     path = tmp_path / "fallback.toml"
-    path.write_text('[[backend]]\nkind = "bedrock"\nmodel = "m"\ntypo_key = 1\n')
+    path.write_text('[[chain.c]]\nkind = "bedrock"\nmodel = "m"\ntypo_key = 1\n')
     with pytest.raises(ValueError, match="unknown key"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
-    path.write_text('[[backend]]\nkind = "azure_openai"\nmodel = "m"\n')
-    with pytest.raises(ValueError, match="needs kind"):
+    path.write_text('[[chain.c]]\nkind = "not-a-kind"\nmodel = "m"\n')
+    with pytest.raises(ValueError, match="is invalid"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
-    path.write_text('[[backend]]\nkind = "bedrock"\nmodel = "m"\napi_key = "sk-x"\n')
+    path.write_text('[[chain.c]]\nkind = "azure"\nmodel = "m"\n')
+    with pytest.raises(ValueError, match="no llm-waterfall backend"):
+        provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
+    path.write_text('[[chain.c]]\nkind = "bedrock"\nmodel = "m"\napi_key = "sk-x"\n')
     with pytest.raises(ValueError, match="api_key only applies"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)

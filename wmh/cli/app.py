@@ -275,6 +275,9 @@ def build(
         None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    chain: str = typer.Option(
+        None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
+    ),
     gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
@@ -390,7 +393,7 @@ def build(
     # silently swallows it and "succeeds" with a useless held-out-0.0 model.
     if not use_wizard:
         # The wizard already live-pinged the serve provider and embedder inline.
-        _verify_or_abort(config)
+        _verify_or_abort(config, chain=chain)
 
     # Meter the build at the provider boundary; `classify_build_call` splits judge vs GEPA by
     # system prompt. Rollouts/reflection may ride the failover chain, but the judge (GEPA's
@@ -399,7 +402,7 @@ def build(
     # so cost/tokens still land in a single run record.
     tracker = RunTracker(run_id=uuid.uuid4().hex, kind="build")
     metered = MeteredProvider(
-        providers.provider_or_chain(config.serve_provider_config()),
+        providers.provider_or_chain(config.serve_provider_config(), chain=chain),
         tracker,
         classify=classify_build_call,
     )
@@ -456,7 +459,7 @@ def build(
             )
 
 
-def _verify_or_abort(config: HarnessConfig) -> None:
+def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
     """Ping the serve provider (and any provider-backed embedder) and abort on failure.
 
     Runs before any rollouts so a missing SDK or bad creds fails loudly and immediately, instead of
@@ -470,7 +473,7 @@ def _verify_or_abort(config: HarnessConfig) -> None:
     failed = False
     for cfg, is_embed in checks:
         label = f"embed:{cfg.kind.value}" if is_embed else cfg.kind.value
-        serve_provider = None if is_embed else providers.provider_or_chain(cfg)
+        serve_provider = None if is_embed else providers.provider_or_chain(cfg, chain=chain)
         if is_embed:
             _console.print(f"verifying {label}…")
             result = verify_embedder(cfg)
@@ -624,6 +627,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
+    chain: str | None = typer.Option(
+        None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
+    ),
     train_split: float | None = typer.Option(
         None, help="Train/holdout ratio per file (default: 0.7, or suite config)."
     ),
@@ -762,6 +768,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         options,
         provider=provider,
         model=model,
+        chain=chain,
         region=region,
     )
     _print_eval_report(report)
@@ -962,6 +969,7 @@ def _run_eval_files(
     provider: str,
     model: str,
     region: str | None,
+    chain: str | None = None,
 ) -> EvalReport:
     for path in files:
         if not path.exists():
