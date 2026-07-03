@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import io
+import os
+
 import pytest
 import typer
 from rich.console import Console
@@ -9,16 +12,27 @@ from rich.console import Console
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
+    _read_key,
+    _step_selection,
     models_table,
     run_build_wizard,
     run_play_repl,
     select_model,
 )
-from wmh.config import ModelInfo
+from wmh.config import PROVIDER_ENV_VARS, ModelInfo
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
+
+
+@pytest.fixture(autouse=True)
+def _all_provider_creds(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
+    """Deterministic creds baseline: every provider env var set, so wizard tests never hit the
+    interactive missing-credential prompts unless a test clears vars explicitly."""
+    for env_vars in PROVIDER_ENV_VARS.values():
+        for var in env_vars:
+            monkeypatch.setenv(var, "test-cred")
 
 
 def _scripted_reader(answers: list[str]):  # noqa: ANN202 - returns a PromptReader
@@ -138,6 +152,26 @@ def test_play_repl_exits_cleanly_on_eof() -> None:
 
 
 # --- creation wizard -----------------------------------------------------------------------------
+
+
+def test_read_key_decodes_arrows_and_plain_chars() -> None:
+    assert _read_key(io.StringIO("\x1b[A")) == "up"
+    assert _read_key(io.StringIO("\x1b[B")) == "down"
+    assert _read_key(io.StringIO("\x1b[C")) == "esc"  # unhandled escape sequences are inert
+    assert _read_key(io.StringIO("j")) == "j"
+    assert _read_key(io.StringIO("\r")) == "\r"
+
+
+def test_step_selection_navigates_wraps_and_accepts() -> None:
+    assert _step_selection("down", 0, 3) == (1, False)
+    assert _step_selection("j", 1, 3) == (2, False)
+    assert _step_selection("down", 2, 3) == (0, False)  # wraps
+    assert _step_selection("up", 0, 3) == (2, False)  # wraps backwards
+    assert _step_selection("k", 2, 3) == (1, False)
+    assert _step_selection("\r", 1, 3) == (1, True)  # Enter accepts the highlight
+    assert _step_selection("2", 0, 3) == (1, True)  # digits jump-select
+    assert _step_selection("9", 0, 3) == (0, False)  # out-of-range digit is inert
+    assert _step_selection("x", 1, 3) == (1, False)  # unknown keys are inert
 
 
 def test_build_wizard_collects_all_inputs() -> None:
@@ -266,17 +300,52 @@ def test_build_wizard_reprompts_on_blank_trace_source() -> None:
     assert params.file == "/tmp/t.jsonl"
 
 
-def test_build_wizard_reports_missing_credentials(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
-    # The wizard flags an unset provider env var (offline presence check) so the user sees it
-    # before the build. With AWS creds cleared, bedrock should warn for each.
+def test_build_wizard_prompts_for_missing_credentials_and_saves(
+    tmp_path,  # noqa: ANN001 - pytest fixture
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+) -> None:
+    # Picking a provider with unset creds prompts for each env var; entered values land in
+    # os.environ AND .env (so the next session has them), Enter skips a var with a warning.
     for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.chdir(tmp_path)
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    reader = _scripted_reader(
+        # name, file, provider, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (skip),
+        # model, region, budget, embedder
+        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "8", "1"]
+    )
+    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    out = console.export_text()
+    assert params.provider == "bedrock"
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "test-key-id"
+    env_file = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "AWS_REGION=us-east-1" in env_file
+    assert "AWS_ACCESS_KEY_ID=test-key-id" in env_file
+    assert "AWS_SECRET_ACCESS_KEY" not in env_file  # skipped with Enter
+    assert "AWS_SECRET_ACCESS_KEY still unset" in out
+
+
+def test_build_wizard_defaults_to_first_provider_with_creds(monkeypatch) -> None:  # noqa: ANN001
+    # No --provider flag: the suggested default is the first provider (in openai, anthropic,
+    # bedrock, azure order) whose creds are present — here anthropic, once openai's key is gone.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100)
-    with console.capture() as cap:
-        reader = _scripted_reader(["m", "/tmp/t.jsonl", "bedrock", "", "us-east-1", "8", "hashing"])
-        run_build_wizard(console, BuildParams(name="default"), reader=reader)
-    out = cap.get()
-    assert "make sure AWS_ACCESS_KEY_ID is set" in out
+    reader = _scripted_reader(["m", "/tmp/t.jsonl", "", "", "", ""])
+    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    assert params.provider == "anthropic"
+    assert params.model == "claude-opus-4-8"  # model default follows the provider
+
+
+def test_build_wizard_annotates_providers_that_have_keys(monkeypatch) -> None:  # noqa: ANN001
+    # Providers whose creds are present are labeled in the picker; cleared ones are not.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "", ""])
+    run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    out = console.export_text()
+    assert "openai  (api key exists)" in out
+    assert "anthropic  (api key exists)" not in out
 
 
 # --- selection picker ----------------------------------------------------------------------------
@@ -323,9 +392,9 @@ def test_select_model_survives_unicode_digit_input() -> None:
 
 def test_build_wizard_reprompts_on_unicode_digit_budget() -> None:
     # Same unicode-digit footgun in the int prompt: must re-ask, not crash. With file provided the
-    # prompts are name/provider/model/region/budget/embedder; blanks accept defaults, '²' is a bad
-    # budget that must be rejected and re-asked.
+    # prompts are name/provider/model/budget/embedder (no region: the creds-default provider is
+    # openai); blanks accept defaults, '²' is a bad budget that must be rejected and re-asked.
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["", "", "", "", "²", "7", ""])
+    reader = _scripted_reader(["", "", "", "²", "7", ""])
     params = run_build_wizard(console, BuildParams(name="m", file="/tmp/t.jsonl"), reader=reader)
     assert params.gepa_budget == 7

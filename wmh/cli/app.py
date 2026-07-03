@@ -39,6 +39,7 @@ from wmh.config import (
     HarnessConfig,
     WorldModelStore,
     load_config,
+    load_env_file,
     load_settings,
     normalize_name,
     set_telemetry_enabled,
@@ -71,10 +72,16 @@ from wmh.telemetry import (
 )
 from wmh.tracking import MeteredProvider, Phase, RunTracker, classify_build_call, save_run
 
+# Load .env from the working directory at import so wizard-saved provider keys persist across
+# sessions (a typer callback would flip help rendering under CliRunner; import-time is simpler).
+load_env_file()
+
 app = typer.Typer(
     help="World Model Harness: a frontier LLM acts as your agent's environment.",
     no_args_is_help=True,
 )
+
+
 providers_app = typer.Typer(help="Manage and verify LLM providers.", no_args_is_help=True)
 examples_app = typer.Typer(
     help="List and launch self-contained task examples.", no_args_is_help=True
@@ -210,7 +217,9 @@ def build(
     file: str = typer.Option(None, "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
     vendor: str = typer.Option(None, "--vendor", help="Vendor name to pull traces via SDK."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
-    provider: str = typer.Option("bedrock", "--provider", help="Provider that serves the model."),
+    provider: str = typer.Option(
+        None, "--provider", help="Provider that serves the model (default: bedrock)."
+    ),
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Serve provider model id."),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     gepa_budget: int = typer.Option(50, help="GEPA rollout budget."),
@@ -218,7 +227,7 @@ def build(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
     ),
     embed_provider: str = typer.Option(
-        "hashing", help="phi embedder: hashing (offline) | bedrock | openai | azure_openai."
+        "hashing", help="phi embedder: hashing (offline) | bedrock | openai | azure."
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure embedding deployment."),
     embed_dim: int = typer.Option(512, help="phi dimensionality (index + query must agree)."),
@@ -258,6 +267,8 @@ def build(
         params = run_build_wizard(_console, params)
     elif name is None and file is None and vendor is None:
         raise typer.BadParameter("provide --file (or --vendor), or run `wmh build` interactively")
+    # The wizard always resolves a provider; the flag path keeps its historical default.
+    params.provider = params.provider or "bedrock"
 
     # Flag-supplied names get the same whitespace-to-dash normalization as the wizard.
     params.name = normalize_name(params.name)

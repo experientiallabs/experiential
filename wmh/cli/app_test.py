@@ -338,8 +338,14 @@ def test_play_repl_steps_and_quits(patched_provider, tmp_path) -> None:  # noqa:
     assert "user u1 found" in result.output
 
 
-def test_build_interactive_wizard_creates_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
+def test_build_interactive_wizard_creates_model(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+) -> None:
     root = tmp_path / ".wmh"
+    for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(var, "test-cred")  # creds present: no interactive key prompts
     # --interactive forces the wizard even under CliRunner (non-TTY); feed each answer line in
     # prompt order: name, file, provider (select), model (select), region (bedrock only), budget,
     # embedder (select). The offline 'hashing' embedder skips the embed-model prompt; phi dim isn't
@@ -348,7 +354,7 @@ def test_build_interactive_wizard_creates_model(patched_provider, tmp_path) -> N
         [
             "wizard-built",
             _traces_file(tmp_path),
-            "1",  # provider: bedrock
+            "3",  # provider: bedrock (order: openai, anthropic, bedrock, azure, ...)
             "1",  # model: us.anthropic.claude-opus-4-8
             "us-east-1",
             "4",  # gepa budget

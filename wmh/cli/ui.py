@@ -17,6 +17,9 @@ Everything that talks to `rich` lives here so the engine stays headless. Respons
 from __future__ import annotations
 
 import os
+import sys
+import termios
+import tty
 from collections.abc import Callable
 
 import typer
@@ -35,7 +38,13 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from wmh.config import PROVIDER_ENV_VARS, ModelInfo, normalize_name, validate_name
+from wmh.config import (
+    PROVIDER_ENV_VARS,
+    ModelInfo,
+    normalize_name,
+    upsert_env_var,
+    validate_name,
+)
 from wmh.core.types import Action, ActionKind, Session
 from wmh.engine.play import PlayTurn, parse_action, play_turn
 from wmh.engine.world_model import WorldModel
@@ -50,16 +59,16 @@ _CHECK = "[green]✓[/green]"
 # Serve providers offered in the wizard picker, with the model ids each supports. The first model
 # in each list is the suggested default. Keep these in sync with the provider backends.
 _PROVIDER_MODELS: dict[str, list[str]] = {
+    "openai": ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4"],
+    "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
     "bedrock": [
         "us.anthropic.claude-opus-4-8",
         "us.anthropic.claude-opus-4-7",
         # haiku needs the dated inference-profile id; the undated alias is rejected by Bedrock
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     ],
-    "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
-    "openai": ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4"],
+    "azure": ["gpt-5.5", "gpt-5.4"],
     "openai_responses": ["gpt-5.5", "gpt-5.4-mini", "gpt-5.4"],
-    "azure_openai": ["gpt-5.5", "gpt-5.4"],
 }
 _DEFAULT_REGIONS: dict[str, str] = {"bedrock": "us-east-1"}
 
@@ -69,7 +78,7 @@ _EMBEDDERS: dict[str, list[str] | None] = {
     "hashing": None,
     "bedrock": ["amazon.titan-embed-text-v2:0"],
     "openai": ["text-embedding-3-small", "text-embedding-3-large"],
-    "azure_openai": ["text-embedding-3-small", "text-embedding-3-large"],
+    "azure": ["text-embedding-3-small", "text-embedding-3-large"],
 }
 
 
@@ -79,7 +88,9 @@ class BuildParams(BaseModel):
     name: str
     file: str | None = None
     vendor: str | None = None
-    provider: str = "bedrock"
+    # None = not chosen yet: the wizard suggests the first provider with credentials present,
+    # and the non-interactive path falls back to bedrock.
+    provider: str | None = None
     model: str = "us.anthropic.claude-opus-4-8"
     region: str | None = None
     gepa_budget: int = 50
@@ -98,15 +109,25 @@ def run_build_wizard(
     becomes the suggested default the user can accept with Enter. Raises `ValueError` if no trace
     source (file or vendor) is provided.
     """
+    interactive = reader is None
     base_ask = reader if reader is not None else (lambda text: console.input(text))
+    base_secret = (
+        reader if reader is not None else (lambda text: console.input(text, password=True))
+    )
 
-    def ask(text: str) -> str:
+    def _eof_aborts(read: PromptReader) -> PromptReader:
         # Exhausted piped stdin (or Ctrl-D) aborts the wizard cleanly ("Aborted.", exit 1)
         # instead of leaking an EOFError traceback from whichever prompt was being read.
-        try:
-            return base_ask(text)
-        except EOFError:
-            raise typer.Abort() from None
+        def wrapped(text: str) -> str:
+            try:
+                return read(text)
+            except EOFError:
+                raise typer.Abort() from None
+
+        return wrapped
+
+    ask = _eof_aborts(base_ask)
+    ask_secret = _eof_aborts(base_secret)
 
     console.print(
         Panel(
@@ -151,11 +172,31 @@ def run_build_wizard(
             if not file:
                 console.print("[red]a traces path is required (or pass --vendor)[/red]")
 
-    # Serve provider: pick from the list, then show which credentials it expects so a missing one
-    # is surfaced here (an offline check) rather than as an opaque failure mid-build.
-    provider = _select(console, ask, "Serve provider", list(_PROVIDER_MODELS), defaults.provider)
-    _report_credentials(console, provider)
-    model = _select(console, ask, "Serve model id", _PROVIDER_MODELS[provider], defaults.model)
+    # Serve provider: providers with credentials already present are annotated, and the first
+    # of them is the suggested default (no default when none have creds). After the pick, any
+    # missing credential is prompted for and persisted to .env rather than failing mid-build.
+    providers = list(_PROVIDER_MODELS)
+    notes = {p: "api key exists" for p in providers if _has_credentials(p)}
+    provider_default = defaults.provider or next((p for p in providers if p in notes), None)
+    provider = _select(
+        console,
+        ask,
+        "Serve provider",
+        providers,
+        provider_default,
+        interactive=interactive,
+        notes=notes,
+        fallback_to_first=False,
+    )
+    _ensure_credentials(console, ask_secret, provider)
+    model = _select(
+        console,
+        ask,
+        "Serve model id",
+        _PROVIDER_MODELS[provider],
+        defaults.model,
+        interactive=interactive,
+    )
 
     region = None
     if provider == "bedrock":
@@ -172,13 +213,22 @@ def run_build_wizard(
     # Retrieval phi embedder: default offline hashing (no creds). A provider-backed embedder is
     # picked from the list and prompts for its embeddings-model id; phi dimensionality keeps its
     # default (the index and query embedders must agree, so it is not a wizard knob).
-    embed_provider = _select(console, ask, "Embedder", list(_EMBEDDERS), defaults.embed_provider)
+    embed_provider = _select(
+        console,
+        ask,
+        "Embedder",
+        list(_EMBEDDERS),
+        defaults.embed_provider,
+        interactive=interactive,
+    )
     embed_model = defaults.embed_model
     embed_models = _EMBEDDERS[embed_provider]
     if embed_models is not None:
         if embed_provider != provider:
-            _report_credentials(console, embed_provider)
-        embed_model = _select(console, ask, "Embeddings model id", embed_models, embed_model)
+            _ensure_credentials(console, ask_secret, embed_provider)
+        embed_model = _select(
+            console, ask, "Embeddings model id", embed_models, embed_model, interactive=interactive
+        )
 
     return BuildParams(
         name=name,
@@ -195,22 +245,110 @@ def run_build_wizard(
     )
 
 
-def _select(
-    console: Console, ask: PromptReader, label: str, options: list[str], default: str | None
-) -> str:
-    """Prompt the user to pick one of `options` by number (or name), defaulting to `default`.
+def _stdin_is_tty(console: Console) -> bool:
+    """Whether the arrow-key picker can run: rich sees a terminal and stdin is a real TTY."""
+    return console.is_terminal and sys.stdin.isatty()
 
-    The default is whichever of `default`/`options[0]` is present in `options`; Enter accepts it.
-    Re-prompts on invalid input. Returns the chosen option string.
+
+def _read_key(stream) -> str:  # noqa: ANN001 - any .read(n) text stream (stdin, StringIO in tests)
+    """Read one keypress; arrow escape sequences decode to 'up'/'down', other ESC input to 'esc'."""
+    ch = stream.read(1)
+    if ch != "\x1b":
+        return ch
+    if stream.read(1) != "[":
+        return "esc"
+    return {"A": "up", "B": "down"}.get(stream.read(1), "esc")
+
+
+def _step_selection(key: str, index: int, count: int) -> tuple[int, bool]:
+    """Picker key reducer: next highlighted index and whether the selection was accepted.
+
+    Arrows (and vi j/k) move with wraparound, Enter accepts the highlight, a digit jump-selects
+    that option; anything else is inert.
     """
-    chosen_default = default if default in options else options[0]
+    if key in ("up", "k"):
+        return (index - 1) % count, False
+    if key in ("down", "j"):
+        return (index + 1) % count, False
+    if key in ("\r", "\n"):
+        return index, True
+    if key.isdigit() and 1 <= int(key) <= count:
+        return int(key) - 1, True
+    return index, False
+
+
+def _arrow_select(console: Console, rows: list[str], index: int) -> int:
+    """Drive an up/down picker over pre-rendered `rows` on the raw-mode TTY; return chosen index.
+
+    Caller guarantees a real TTY (`_stdin_is_tty`). cbreak keeps ISIG, so Ctrl-C still raises
+    KeyboardInterrupt and click renders its usual clean abort.
+    """
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    painted = False
+
+    def paint(current: int) -> None:
+        nonlocal painted
+        if painted:
+            console.file.write(f"\x1b[{len(rows)}A")
+        for i, row in enumerate(rows):
+            console.file.write("\x1b[2K")
+            pointer = "[bold cyan]\u276f[/bold cyan]" if i == current else " "
+            console.print(f" {pointer} {row}", highlight=False)
+        painted = True
+
+    try:
+        tty.setcbreak(fd)
+        while True:
+            paint(index)
+            index, accepted = _step_selection(_read_key(sys.stdin), index, len(rows))
+            if accepted:
+                paint(index)
+                return index
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def _select(
+    console: Console,
+    ask: PromptReader,
+    label: str,
+    options: list[str],
+    default: str | None,
+    *,
+    interactive: bool = False,
+    notes: dict[str, str] | None = None,
+    fallback_to_first: bool = True,
+) -> str:
+    """Pick one of `options`: an arrow-key picker on a real TTY, else a numbered prompt.
+
+    The Enter-default is `default` when present in `options`, else the first option — unless
+    `fallback_to_first` is off (the provider picker: a default exists only when creds do).
+    `notes` adds a dim annotation after an option's name (e.g. "api key exists").
+    """
+    if default in options:
+        chosen_default = default
+    else:
+        chosen_default = options[0] if fallback_to_first else None
+    notes = notes or {}
+
+    def row(opt: str) -> str:
+        note = f"  [dim]({notes[opt]})[/dim]" if opt in notes else ""
+        marker = "  [dim](default)[/dim]" if opt == chosen_default else ""
+        return f"{escape(opt)}{note}{marker}"
+
+    if interactive and _stdin_is_tty(console):
+        console.print(f"[bold]{label}[/bold] [dim](up/down + Enter)[/dim]:")
+        start = options.index(chosen_default) if chosen_default is not None else 0
+        return options[_arrow_select(console, [row(opt) for opt in options], start)]
+
     console.print(f"[bold]{label}[/bold]:")
     for i, opt in enumerate(options, start=1):
-        marker = "  [dim](default)[/dim]" if opt == chosen_default else ""
-        console.print(f"  [cyan]{i}[/cyan]. {escape(opt)}{marker}")
+        console.print(f"  [cyan]{i}[/cyan]. {row(opt)}")
+    prompt = f"[dim]\\[{escape(chosen_default)}][/dim] > " if chosen_default is not None else "> "
     while True:
-        raw = ask(f"[dim]\\[{escape(chosen_default)}][/dim] > ").strip()
-        if not raw:
+        raw = ask(prompt).strip()
+        if not raw and chosen_default is not None:
             return chosen_default
         choice = _parse_int(raw)
         if choice is not None and 1 <= choice <= len(options):
@@ -220,21 +358,37 @@ def _select(
         console.print(f"[red]pick 1-{len(options)} or an option name[/red]")
 
 
-def _report_credentials(console: Console, provider: str) -> None:
-    """Print which env vars the chosen provider reads, flagging any that are unset.
-
-    An offline presence check only — it does not validate the value. The live ping that confirms
-    the creds actually work happens once before the build (see `wmh build`).
-    """
+def _provider_env_vars(provider: str) -> list[str]:
+    """The env vars `provider` reads its credentials from ([] for unknown/offline kinds)."""
     try:
-        env_vars = PROVIDER_ENV_VARS[ProviderKind(provider)]
+        return PROVIDER_ENV_VARS[ProviderKind(provider)]
     except (ValueError, KeyError):
-        return
-    for var in env_vars:
+        return []
+
+
+def _has_credentials(provider: str) -> bool:
+    """Offline presence check: every credential env var for `provider` is set (not validated)."""
+    env_vars = _provider_env_vars(provider)
+    return bool(env_vars) and all(os.environ.get(var) for var in env_vars)
+
+
+def _ensure_credentials(console: Console, ask_secret: PromptReader, provider: str) -> None:
+    """Prompt for any missing credential env vars and persist entered values to `.env`.
+
+    Presence only — the live ping that confirms the creds actually work happens once before
+    the build (see `wmh build`). Enter skips a var, leaving it to the shell environment.
+    """
+    for var in _provider_env_vars(provider):
         if os.environ.get(var):
             console.print(f"  {_CHECK} {var} is set")
+            continue
+        prompt = f"  [bold]{var}[/bold] [dim](saved to .env; Enter to skip)[/dim]: "
+        value = ask_secret(prompt).strip()
+        if value:
+            upsert_env_var(var, value)
+            console.print(f"  {_CHECK} {var} saved to .env")
         else:
-            console.print(f"  [yellow]make sure {var} is set[/yellow]")
+            console.print(f"  [yellow]{var} still unset[/yellow]")
 
 
 def select_model(
@@ -246,12 +400,20 @@ def select_model(
     """
     if len(infos) == 1:
         return infos[0].name
+
+    def score(info: ModelInfo) -> str:
+        acc = info.held_out_accuracy
+        return "" if acc is None else f"  [dim](held-out {acc:.2f})[/dim]"
+
+    if reader is None and _stdin_is_tty(console):
+        console.print("[bold]Select a world model:[/bold] [dim](up/down + Enter)[/dim]")
+        rows = [f"{escape(info.name)}{score(info)}" for info in infos]
+        return infos[_arrow_select(console, rows, 0)].name
+
     ask = reader if reader is not None else (lambda text: console.input(text))
     console.print("[bold]Select a world model:[/bold]")
     for i, info in enumerate(infos, start=1):
-        acc = info.held_out_accuracy
-        score = "" if acc is None else f"  [dim](held-out {acc:.2f})[/dim]"
-        console.print(f"  [cyan]{i}[/cyan]. {info.name}{score}")
+        console.print(f"  [cyan]{i}[/cyan]. {info.name}{score(info)}")
     while True:
         raw = ask("> ").strip()
         choice = _parse_int(raw)

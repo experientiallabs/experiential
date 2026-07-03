@@ -32,7 +32,7 @@ class HarnessConfig(BaseModel):
     providers: list[ProviderConfig] = Field(default_factory=list)
     serve_provider: ProviderKind = ProviderKind.ANTHROPIC  # serves the live world model
     # Which embedder supplies phi for retrieval. Defaults to the offline HashingEmbedder (no creds);
-    # set to a provider-backed kind (bedrock/openai/azure_openai) for semantic phi.
+    # set to a provider-backed kind (bedrock/openai/azure) for semantic phi.
     embed_provider: EmbedderKind = EmbedderKind.HASHING
     embed_dim: int = 512  # phi dimensionality; index + query embedder must agree on this
     top_k: int = 5  # demos retrieved per step (DreamGym k)

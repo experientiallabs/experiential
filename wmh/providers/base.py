@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 class ProviderKind(StrEnum):
     ANTHROPIC = "anthropic"  # Opus 4.8 direct
     BEDROCK = "bedrock"  # Claude 4.8 via AWS
-    AZURE_OPENAI = "azure_openai"  # GPT 5.5 via Azure
+    AZURE_OPENAI = "azure"  # GPT 5.5 via the Azure OpenAI service
     OPENAI = "openai"  # GPT 5.5 direct
     OPENAI_RESPONSES = "openai_responses"  # GPT 5.x direct via the Responses API
 
@@ -27,7 +27,7 @@ class EmbedderKind(StrEnum):
     HASHING = "hashing"  # offline HashingEmbedder (default)
     BEDROCK = "bedrock"  # Titan on AWS Bedrock
     OPENAI = "openai"  # OpenAI embeddings
-    AZURE_OPENAI = "azure_openai"  # Azure OpenAI embedding deployment
+    AZURE_OPENAI = "azure"  # Azure OpenAI embedding deployment
 
     def provider_kind(self) -> ProviderKind:
         """The ProviderKind backing this embedder. Raises for `HASHING` (no provider)."""
