@@ -101,14 +101,12 @@ enters the world model).
     a hair short of the ~40+ target because tail tasks kept getting skipped on Bedrock
     `ServiceUnavailableException` (the endpoint flaps under load). `capture.py` emits each trajectory
     durably (a hang never discards completed work) and re-runs with `--append`/`--run-start` grow it.
-- **Open-loop fidelity** (suite `gaia2/default`, seed 0, Opus 4.8 target + rubric judge, run via
-  `uv run wmh eval run gaia2/default --examples-root environment-capture`): last successful
-  measurement **0.652 ± 0.238**, error-flag accuracy **0.906**, n=32 held-out steps — measured on
-  the initial 10-run corpus. **Re-measurement on the current 37-run corpus is still pending**: across
-  several finalization windows (including via `.agents/scripts/eval_with_fallback.py`, the resilient
-  fallback+retry runner) the Bedrock endpoint returned `ServiceUnavailableException` on both the
-  Converse and InvokeModel paths for both opus models — re-run the command above once the endpoint is
-  stable. For context it sat mid-family: above financebench's document excerpts (0.581), below
+- **Open-loop fidelity** (Opus 4.8 target + rubric judge, seed 0; final 37-trace corpus):
+  mean fidelity **0.773**, error-flag accuracy **0.939**, n=196 held-out steps (the earlier
+  0.652 @10 traces was a noisy small-n measurement). Measured via the cross-provider failover
+  runner (`.agents/scripts/eval_with_fallback.py`: bedrock-4.8 → anthropic-direct-4.8 →
+  bedrock-4.7 — same Opus 4.8 weights on the first two links, so the judge stays comparable).
+  Sits mid-family: above financebench's document excerpts (0.586), below
   appworld's structured API observations (0.793); the residual is opaque per-universe identifiers
   (contact/message ids) the model cannot infer from the request alone.
 
