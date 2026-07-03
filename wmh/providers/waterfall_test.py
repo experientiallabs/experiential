@@ -225,7 +225,7 @@ def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown key"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
     path.write_text('[[backend]]\nkind = "azure_openai"\nmodel = "m"\n')
-    with pytest.raises(ValueError, match="no llm-waterfall backend"):
+    with pytest.raises(ValueError, match="needs kind"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
     path.write_text('[[backend]]\nkind = "bedrock"\nmodel = "m"\napi_key = "sk-x"\n')
     with pytest.raises(ValueError, match="api_key only applies"):
