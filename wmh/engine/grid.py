@@ -18,6 +18,7 @@ with `OPENAI_BASE_URL` in the environment.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -166,6 +167,24 @@ def merge_results(results: list[GridResult]) -> GridResult:
     return merged
 
 
+def _anthropic_equiv(bedrock_model: str) -> str | None:
+    """The direct-Anthropic-API model id equivalent to a Bedrock Anthropic model id, or None.
+
+    A capacity-throttled Bedrock target/judge fails over to the SAME model on the direct Anthropic
+    API (whose key is not Bedrock-rate-limited), so what's measured stays identical — only the
+    endpoint changes. Strips the `us.anthropic.`/`anthropic.` prefix and any dated/versioned tail:
+    `us.anthropic.claude-opus-4-8` -> `claude-opus-4-8`;
+    `us.anthropic.claude-haiku-4-5-20251001-v1:0` -> `claude-haiku-4-5`.
+    """
+    for prefix in ("us.anthropic.", "anthropic."):
+        if bedrock_model.startswith(prefix):
+            m = bedrock_model[len(prefix) :]
+            m = re.sub(r"-\d{8}.*$", "", m)  # drop a -YYYYMMDD... date+version tail
+            m = re.sub(r"-v\d+(:\d+)?$", "", m)  # drop a -v1 / -v1:0 tail
+            return m
+    return None
+
+
 def _fallback(factory, configs: list[ProviderConfig]) -> Provider:  # noqa: ANN001 - factory injectable
     """A FallbackProvider over `configs` (a single-element chain returns a plain provider)."""
     chain = [factory(c) for c in configs]
@@ -185,10 +204,19 @@ def _make_judge(
     `_JUDGE_FALLBACK_MODELS` on a capacity error so a throttled Opus doesn't stall the whole grid.
     """
     kind_enum = ProviderKind(judge_provider)
-    models = [judge_model]
+    configs = [ProviderConfig(kind=kind_enum, model=judge_model, region=region)]
     if kind_enum is ProviderKind.BEDROCK:
-        models += [m for m in _JUDGE_FALLBACK_MODELS if m != judge_model]
-    configs = [ProviderConfig(kind=kind_enum, model=m, region=region) for m in models]
+        # Fail over first to the SAME judge model on the direct Anthropic API (unlimited key), so a
+        # throttled Bedrock Opus judge stays Opus rather than dropping to a different Bedrock model;
+        # only then to the Bedrock resilience models.
+        direct = _anthropic_equiv(judge_model)
+        if direct is not None:
+            configs.append(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
+        configs += [
+            ProviderConfig(kind=kind_enum, model=m, region=region)
+            for m in _JUDGE_FALLBACK_MODELS
+            if m != judge_model
+        ]
     llm = _fallback(factory, configs)
     return RubricJudge(llm) if kind == "rubric" else LLMJudge(llm)
 
@@ -200,6 +228,12 @@ def _make_target(spec: ModelSpec, factory) -> Provider:  # noqa: ANN001 - factor
     if kind is ProviderKind.BEDROCK:
         regions = [spec.region] + [r for r in _TARGET_FALLBACK_REGIONS if r != spec.region]
         configs = [ProviderConfig(kind=kind, model=spec.model, region=r) for r in regions]
+        # Then fail over to the SAME model on the direct Anthropic API (unlimited key), so a target
+        # throttled across all Bedrock regions still produces real predictions on the identical
+        # model instead of scoring the step 0 — critical for Opus 4.8 under Bedrock load.
+        direct = _anthropic_equiv(spec.model)
+        if direct is not None:
+            configs.append(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
         return _fallback(factory, configs)
     return factory(ProviderConfig(kind=kind, model=spec.model, region=spec.region))
 

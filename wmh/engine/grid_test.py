@@ -152,14 +152,16 @@ def test_bedrock_judge_and_target_get_fallback_chains() -> None:
         built.append(f"{config.model}@{config.region}")
         return _FakeProvider(config)
 
-    # Bedrock judge -> a FallbackProvider (primary opus-4.8 + resilience models).
+    # Bedrock judge -> FallbackProvider: primary opus-4.8, then direct-Anthropic opus, then Bedrock
+    # resilience models.
     judge = _make_judge(
         "bedrock", "us.anthropic.claude-opus-4-8", "us-west-1", "rubric", tracking_factory
     )
     assert isinstance(judge._provider, FallbackProvider)  # noqa: SLF001 - inspect wrapped provider
-    assert any("sonnet" in b for b in built)  # fell through to the resilience model config
+    assert "claude-opus-4-8@None" in built  # same model, direct Anthropic API (unlimited key)
+    assert any("sonnet" in b for b in built)  # then the Bedrock resilience model
 
-    # Bedrock target -> region-fallback chain (SAME model across regions).
+    # Bedrock target -> region fallback (SAME model), then direct-Anthropic on the SAME model.
     built.clear()
     target = _make_target(
         ModelSpec("Opus", "bedrock", "us.anthropic.claude-opus-4-8", "us-west-1"), tracking_factory
@@ -168,12 +170,22 @@ def test_bedrock_judge_and_target_get_fallback_chains() -> None:
     assert built == [
         "us.anthropic.claude-opus-4-8@us-west-1",
         "us.anthropic.claude-opus-4-8@us-east-1",
+        "claude-opus-4-8@None",
     ]
 
     # Non-Bedrock target -> a single provider (no fallback).
     built.clear()
     single = _make_target(ModelSpec("GPT", "openai", "gpt-5.5"), tracking_factory)
     assert not isinstance(single, FallbackProvider)
+
+
+def test_anthropic_equiv_maps_bedrock_ids_to_direct_api() -> None:
+    from wmh.engine.grid import _anthropic_equiv
+
+    assert _anthropic_equiv("us.anthropic.claude-opus-4-8") == "claude-opus-4-8"
+    assert _anthropic_equiv("us.anthropic.claude-haiku-4-5-20251001-v1:0") == "claude-haiku-4-5"
+    assert _anthropic_equiv("us.anthropic.claude-opus-4-6-v1") == "claude-opus-4-6"
+    assert _anthropic_equiv("gpt-5.5") is None  # non-Anthropic -> no direct equivalent
 
 
 def _cell(model: str, condition: str, fidelity: float) -> GridCell:
