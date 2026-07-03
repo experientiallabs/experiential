@@ -26,13 +26,12 @@ dependencies = [
     "anthropic>=0.39",
     "openai>=1.40",
     "boto3>=1.34",
+    # Failover chains across backends/accounts (wmh.providers.waterfall wraps llm-waterfall);
+    # core for the same reason as the SDKs above: `wmh.providers` imports it unconditionally.
+    "llm-waterfall[anthropic,bedrock,openai] @ git+https://github.com/experientiallabs/llm-waterfall@v0.1.1",
 ]
 
 [project.optional-dependencies]
-# Failover chains across backends/accounts (wmh.providers.waterfall wraps llm-waterfall).
-waterfall = [
-    "llm-waterfall[anthropic,bedrock,openai] @ git+https://github.com/experientiallabs/llm-waterfall@v0.1.1",
-]
 otel = ["opentelemetry-proto>=1.24"]
 # Plotting/figures for research runs; kept out of the core install.
 viz = ["seaborn>=0.13", "matplotlib>=3.8"]
@@ -40,7 +39,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz,waterfall]",
+    "world-model-harness[otel,viz]",
 ]
 
 [dependency-groups]
@@ -58,7 +57,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.metadata]
-# The `waterfall` extra pins llm-waterfall to a git tag until it is published to PyPI.
+# llm-waterfall is pinned to a git tag until it is published to PyPI.
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
