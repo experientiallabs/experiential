@@ -41,6 +41,10 @@ at this eval size.** The paired per-scenario view is more informative:
 | REINFORCE++ (binary success) | mean 0.793, success 70.1% | 86 | 96/97 | $3.75 / $0.39 |
 | PPO (scalar EpisodeScore.reward) | mean 0.803, success 71.1% | 75 | 97/97 | $4.52 / $0.43 |
 
+Raw per-episode records (actions, step rewards, judge critiques, WM costs) are committed
+under `eval_results/{base_v3,sft_v3,ppo96,rpp96}.jsonl`; regenerate the paired table with
+`.agents/scripts/paired_eval_analysis.py`.
+
 wandb project: `wmh-rl-transfer` (server runs `qwen3_5_9b_wm_tau_reinforce_real`,
 `qwen3_5_9b_wm_tau_ppo_real_v2`; eval runs listed above).
 
