@@ -227,6 +227,9 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
         eval_batch: EvaluationBatch[_StepTrajectory, Observation],
         components_to_update: list[str],
     ) -> Mapping[str, Sequence[Mapping[str, JsonValue]]]:
+        if self._on_activity is not None:
+            count = len(eval_batch.trajectories or [])
+            self._on_activity(f"distilling {count} scored steps into reflection examples…")
         records: list[Mapping[str, JsonValue]] = []
         for traj in eval_batch.trajectories or []:
             # The same canonical (state, action) text the model saw at prediction time.
@@ -322,17 +325,27 @@ memorizing that example.
 Provide the full improved prompt (existing prompt + your additions) within ``` blocks."""
 
 
-def _reflection_lm(provider: Provider):  # noqa: ANN202 - returns gepa's LanguageModel callable
-    """Wrap a Provider as GEPA's reflection LM: `(str | list[dict]) -> str`."""
+def _reflection_lm(  # noqa: ANN202 - returns gepa's LanguageModel callable
+    provider: Provider, on_activity: Callable[[str], None] | None = None
+):
+    """Wrap a Provider as GEPA's reflection LM: `(str | list[dict]) -> str`.
+
+    The reflection call is the longest silent gap in an iteration, so it brackets itself in the
+    activity stream ("proposing…" / "proposal ready").
+    """
 
     def call(prompt: str | list[dict[str, JsonValue]]) -> str:
         text = prompt if isinstance(prompt, str) else _flatten_chat(prompt)
+        if on_activity is not None:
+            on_activity("reflection: proposing an improved env prompt…")
         completion = provider.complete(
             _REFLECTION_SYSTEM,
             [Message(role="user", content=text)],
             temperature=1.0,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
+        if on_activity is not None:
+            on_activity(f"reflection: proposal ready ({len(completion.text)} chars)")
         return completion.text
 
     return call
@@ -351,11 +364,11 @@ def _flatten_chat(messages: list[dict[str, JsonValue]]) -> str:
 
 
 class _ActivityLogger:
-    """gepa `LoggerProtocol` sink that forwards headline narration lines to `on_activity`.
+    """gepa `LoggerProtocol` sink that forwards narration to `on_activity`.
 
-    Only the first line of each message is kept ("Iteration ...", "Base program ..."): the
-    proposed-prompt message continues with the full multi-line prompt body, which would flood a
-    fixed-height activity window.
+    Every message contributes its FIRST line (selection, proposal, subsample verdicts, pareto
+    and merge updates all narrate this way); the proposed-prompt message continues with the full
+    multi-line prompt body, which would flood a fixed-height window, so continuations drop.
     """
 
     def __init__(self, emit: Callable[[str], None]) -> None:
@@ -363,7 +376,7 @@ class _ActivityLogger:
 
     def log(self, message: str) -> None:
         line = message.split("\n", 1)[0].strip()
-        if line.startswith(("Iteration", "Base program")):
+        if line:
             self._emit(line[:240])
 
 
@@ -485,7 +498,7 @@ class GEPAOptimizer:
             trainset=trainset,
             valset=valset,
             adapter=adapter,
-            reflection_lm=_reflection_lm(self._provider),
+            reflection_lm=_reflection_lm(self._provider, self._on_activity),
             reflection_prompt_template=_REFLECTION_PROMPT_TEMPLATE,
             candidate_selection_strategy="pareto",
             # Merge is a headline GEPA feature: combine complementary lessons from two Pareto-front

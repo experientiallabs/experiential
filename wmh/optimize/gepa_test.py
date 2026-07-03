@@ -258,20 +258,30 @@ def test_predict_observation_runs_deterministically() -> None:
     assert provider.rollout_temps == [0.0]
 
 
-def test_activity_logger_forwards_headlines_and_drops_prompt_bodies() -> None:
+def test_activity_logger_forwards_first_lines_and_drops_prompt_bodies() -> None:
     from wmh.optimize.gepa import _ActivityLogger
 
     seen: list[str] = []
     logger = _ActivityLogger(seen.append)
     logger.log("Iteration 1: Selected program 0 score: 0.5")
     logger.log("Iteration 1: Proposed new text for env_prompt: You are an env\nbody line\nmore")
-    logger.log("Base program full valset score: 0.5")
-    logger.log("Linear pareto front program index: 0")  # non-headline chatter is dropped
+    logger.log("Linear pareto front program index: 0")  # every message's first line streams
+    logger.log("   \n")  # blank messages drop
     assert seen == [
         "Iteration 1: Selected program 0 score: 0.5",
         "Iteration 1: Proposed new text for env_prompt: You are an env",
-        "Base program full valset score: 0.5",
+        "Linear pareto front program index: 0",
     ]
+
+
+def test_reflection_lm_brackets_the_call_in_activity() -> None:
+    from wmh.optimize.gepa import _reflection_lm
+
+    lines: list[str] = []
+    call = _reflection_lm(FakeProvider(), lines.append)
+    call("improve this prompt")
+    assert lines[0] == "reflection: proposing an improved env prompt…"
+    assert lines[1].startswith("reflection: proposal ready (")
 
 
 def test_adapter_evaluate_streams_per_step_activity() -> None:
