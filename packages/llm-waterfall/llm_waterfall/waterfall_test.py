@@ -263,3 +263,24 @@ def test_verify_ping_budget_fits_reasoning_models() -> None:
     wf = Waterfall([backend], adapter_factory=lambda b: _Recorder(b, []))
     assert wf.verify()[0].ok
     assert captured == [256]
+
+
+def test_jitter_survives_at_the_backoff_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: jitter used to be applied and then re-capped, so once exponential backoff hit
+    # backoff_max_s every concurrent caller slept exactly the cap — synchronized retries defeat
+    # the whole point of jitter. At the cap, sleeps must still spread (within the cap).
+    sleeps: list[float] = []
+    monkeypatch.setattr("llm_waterfall.waterfall._sleep", sleeps.append)
+    draws = iter([0.0, 1.0])  # first capped round draws low jitter, second draws high
+    monkeypatch.setattr(
+        "llm_waterfall.waterfall.random.uniform", lambda a, b: a + (b - a) * next(draws)
+    )
+    wf, _ = _waterfall(
+        {"a": [_Throttle()] * 3},
+        retry=RetryPolicy(rounds=3, backoff_base_s=60.0, backoff_max_s=60.0),  # capped from round 2
+    )
+    with pytest.raises(WaterfallExhausted):
+        wf.complete(system="", messages=MSGS)
+    assert len(sleeps) == 2
+    assert sleeps[0] != sleeps[1], "sleeps at the cap must not be identical"
+    assert all(s <= 60.0 for s in sleeps)
