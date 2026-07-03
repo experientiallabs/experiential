@@ -115,8 +115,11 @@ def build(
         raise ValueError("no traces ingested; nothing to build")
     report.ingest_done(len(traces), _count_steps(traces))
 
-    train, test = split_traces(traces, config.train_split)
-    report.split_done(len(train), len(test))
+    # Three disjoint sets: train seeds GEPA's reflection minibatches, val (capped) selects
+    # among candidate prompts, and test is never seen by GEPA — `wmh eval` grades on it without
+    # selection overfitting. The remainder after train splits evenly into val/test.
+    train, val, test = split_traces_3way(traces, config.train_split, (1.0 - config.train_split) / 2)
+    report.split_done(len(train), len(val), len(test))
 
     provider = serve_provider or get_provider(config.serve_provider_config())
     # The GEPA judge can run on a cheaper model (config.judge_model) of the same provider kind;
@@ -166,7 +169,7 @@ def build(
     # wall-clock and spend by its step count for no selection benefit (fidelity saturates fast —
     # see docs/trace_scaling_law.md). Candidate selection only needs a stable sample; the full
     # held-out split still backs `wmh eval`.
-    gepa_val = _cap_gepa_valset(test or train)
+    gepa_val = _cap_gepa_valset(val or train)
     result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
     report.optimize_done(
         result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used

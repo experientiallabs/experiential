@@ -95,7 +95,7 @@ def test_reporter_degrades_to_plain_lines_when_not_a_tty() -> None:
     reporter = RichBuildReporter(console, "airline")
     with console.capture() as cap:
         reporter.ingest_done(3, 9)
-        reporter.split_done(2, 1)
+        reporter.split_done(2, 1, 1)
         reporter.index_done(9)
         reporter.optimize_start(20)
         reporter.rollout(1, 20, 0.4)
@@ -104,10 +104,10 @@ def test_reporter_degrades_to_plain_lines_when_not_a_tty() -> None:
     out = cap.get()
     assert "ingested 3 traces" in out
     assert "normalized 9 steps" in out
-    assert "2 train / 1 held-out" in out
+    assert "2 train / 1 val / 1 test" in out
     assert "GEPA metric call 1/20" in out  # non-TTY heartbeat
     assert "GEPA metric call 10/20" in out
-    assert "held-out 0.600" in out
+    assert "val 0.600" in out
 
 
 def test_reporter_does_not_show_impossible_progress_denominator() -> None:
@@ -356,6 +356,20 @@ def test_build_reporter_activity_window_streams_within_fixed_height() -> None:
     assert reporter._activity[0] == "Iteration 12: note"
     reporter.optimize_done(0.5, 1, 12)
     assert reporter._live is None  # display released on completion
+
+
+def test_build_reporter_activity_lines_are_width_safe() -> None:
+    # Judge critiques can contain combining marks / double-width glyphs whose cell width the
+    # terminal and rich disagree on; one such line in the live region desyncs every repaint
+    # (orphaned frame headers). Lines are reduced to printable ASCII before rendering.
+    console = Console(force_terminal=True, no_color=True, width=100, file=io.StringIO())
+    reporter = RichBuildReporter(console, "demo")
+    reporter.optimize_start(10)
+    reporter.activity("matches the \u0935\u093e\u0938\u094d\u0924\u0935\u093f\u0915 obs\te\u0301")
+    line = reporter._activity[-1]
+    assert all(" " <= ch <= "~" for ch in line)
+    assert line.startswith("matches the ")
+    reporter.optimize_done(0.5, 1, 10)
 
 
 def test_build_reporter_activity_is_quiet_when_piped() -> None:

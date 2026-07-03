@@ -32,6 +32,7 @@ class BuildTelemetryStats:
     input_trace_count: int = 0
     input_step_count: int = 0
     train_trace_count: int = 0
+    val_trace_count: int = 0
     heldout_trace_count: int = 0
     indexed_step_count: int = 0
 
@@ -46,10 +47,11 @@ class TelemetryBuildReporter:
         self._stats.input_step_count = steps
         self._inner.ingest_done(traces, steps)
 
-    def split_done(self, train: int, test: int) -> None:
+    def split_done(self, train: int, val: int, test: int) -> None:
         self._stats.train_trace_count = train
+        self._stats.val_trace_count = val
         self._stats.heldout_trace_count = test
-        self._inner.split_done(train, test)
+        self._inner.split_done(train, val, test)
 
     def index_done(self, steps: int) -> None:
         self._stats.indexed_step_count = steps
@@ -116,6 +118,7 @@ def capture_build_completed(
             "input_trace_count": stats.input_trace_count,
             "input_step_count": stats.input_step_count,
             "train_trace_count": stats.train_trace_count,
+            "val_trace_count": stats.val_trace_count,
             "heldout_trace_count": stats.heldout_trace_count,
             "indexed_step_count": stats.indexed_step_count,
             "gepa_budget": gepa_budget,

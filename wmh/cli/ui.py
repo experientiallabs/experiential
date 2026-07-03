@@ -663,8 +663,8 @@ class RichBuildReporter:
     def ingest_done(self, traces: int, steps: int) -> None:
         self._stage(f"ingested {traces} traces → normalized {steps} steps")
 
-    def split_done(self, train: int, test: int) -> None:
-        self._stage(f"split {train} train / {test} held-out traces")
+    def split_done(self, train: int, val: int, test: int) -> None:
+        self._stage(f"split {train} train / {val} val / {test} test traces")
 
     def index_done(self, steps: int) -> None:
         self._stage(f"indexed {steps} steps into the replay buffer")
@@ -715,7 +715,10 @@ class RichBuildReporter:
         return Group(window, self._progress)
 
     def activity(self, line: str) -> None:
-        text = line.strip()
+        # Width-safe: judge critiques can contain combining marks / double-width glyphs whose
+        # cell width the terminal and rich disagree on; one such line in the live region makes
+        # every repaint's cursor math drift, shedding an orphaned frame header per refresh.
+        text = "".join(ch if " " <= ch <= "~" else "?" for ch in line.strip())
         if not text:
             return
         if self._live is not None:
@@ -752,7 +755,7 @@ class RichBuildReporter:
             self._progress = None
             self._task_id = None
         self._stage(
-            f"GEPA done: held-out {held_out_accuracy:.3f}, "
+            f"GEPA done: val {held_out_accuracy:.3f} (selection sample), "
             f"{frontier_size} frontier candidates, {rollouts} rollouts used"
         )
 
