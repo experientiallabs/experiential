@@ -9,6 +9,7 @@ models are named (`--name`), stored under `<root>/models/<name>/`, and listed wi
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -901,9 +902,21 @@ if __name__ == "__main__":
     app()
 
 
+def _quiet_http_logs() -> None:
+    """Cap noisy per-request loggers at WARNING.
+
+    The openai SDK (via httpx) logs one INFO line per API call; logging handlers write to the
+    real stderr and bypass the live display's redirection, so during a build each request would
+    scroll the GEPA activity region and litter orphaned frame headers across the terminal.
+    """
+    for name in ("httpx", "httpcore", "openai", "botocore", "urllib3", "anthropic"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main() -> None:
     """CLI entry point: load `.env` from the working directory (so wizard-saved provider keys
     persist across sessions), then dispatch. Kept out of import time so importing the module
     never mutates os.environ."""
     load_env_file()
+    _quiet_http_logs()
     app()

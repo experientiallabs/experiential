@@ -631,12 +631,17 @@ class RichBuildReporter:
             # One Live region holding the fixed-height activity window + the bar: GEPA's inner
             # loop (proposals, selections, judge notes) streams inside the window instead of
             # scrolling the terminal. Not transient: the last frame (bar at 100% + final
-            # activity) stays in scrollback above the GEPA-done stage line.
+            # activity) stays in scrollback above the GEPA-done stage line. get_renderable (not
+            # per-event update()) so only the refresh thread repaints, and stray prints are
+            # redirected through the region — anything written straight to the terminal mid-Live
+            # scrolls the region and leaves orphaned frame headers behind.
             self._live = Live(
-                self._render_optimize(),
+                get_renderable=self._render_optimize,
                 console=self._console,
-                refresh_per_second=8,
+                refresh_per_second=4,
                 transient=False,
+                redirect_stdout=True,
+                redirect_stderr=True,
             )
             self._live.start()
 
@@ -658,8 +663,7 @@ class RichBuildReporter:
         if not text:
             return
         if self._live is not None:
-            self._activity.append(text)
-            self._live.update(self._render_optimize())
+            self._activity.append(text)  # the Live's refresh thread picks this up
         # Non-TTY logs keep their sparse heartbeat; streaming every inner-loop line would flood.
 
     def rollout(self, done: int, budget: int, score: float | None) -> None:
@@ -686,7 +690,7 @@ class RichBuildReporter:
                 # final call count on the completion event instead of guessing during the run.
                 self._progress.update(self._task_id, completed=rollouts, total=rollouts)
             if self._live is not None:
-                self._live.update(self._render_optimize())
+                self._live.refresh()  # final frame: bar snapped to 100%
                 self._live.stop()
                 self._live = None
             self._progress = None

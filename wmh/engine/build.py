@@ -177,7 +177,8 @@ def build(
 
 
 # Ceiling on GEPA's candidate-selection valset, in steps (~one full-val pass per iteration).
-_GEPA_VAL_STEP_CAP = 64
+# Small on purpose: selection only needs a stable ranking signal, and fidelity saturates fast.
+_GEPA_VAL_STEP_CAP = 16
 
 
 def _cap_gepa_valset(traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP) -> list[Trace]:
