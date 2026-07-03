@@ -91,25 +91,26 @@ enters the world model).
 
 - **In-scope**: 320 `execution` + `search` validation scenarios (224 train / 96 test, seed-7 split;
   test never captured).
-- **Corpus**: 32 fresh real Bedrock runs (13 on `us.anthropic.claude-opus-4-7`, 19 on `-4-8`), 483
-  `execute_python` transitions, mean reward **0.226** (our strict structural approximation, NOT the
-  official score — 1 full solve, 15 partial; the tasks are hard multi-step reasoning and the grader
-  is strict on free-text answers). Hygiene audit `scan_spans_jsonl(...) == {}` (clean). The 32 runs
-  cover 19 distinct scenarios resampled across models and passes (run tags r1-r4), so treat the
+- **Corpus**: 37 fresh real Bedrock runs (16 on `us.anthropic.claude-opus-4-7`, 21 on `-4-8`), 563
+  `execute_python` transitions, mean reward **0.253** (our strict structural approximation, NOT the
+  official score — 2 full solves, 18 partial; the tasks are hard multi-step reasoning and the grader
+  is strict on free-text answers). Hygiene audit `scan_spans_jsonl(...) == {}` (clean). The 37 runs
+  cover 19 distinct scenarios resampled across models and passes (run tags r1-r5), so treat the
   effective task diversity accordingly (the D33 cross-run-overlap caveat applies to fidelity).
-  - Grown across four `--append` waves (10 → 19 → 32) and rebalanced toward opus-4-8; still a touch
-    short of the ~40+ target because several tail tasks were skipped on Bedrock
-    `ServiceUnavailableException` even at low contention. `capture.py` emits each trajectory durably
-    (a hang never discards completed work) and re-runs with `--append`/`--run-start` grow it further.
+  - Grown across five `--append` waves (10 → 19 → 32 → 37) and rebalanced to opus-4-8 majority;
+    a hair short of the ~40+ target because tail tasks kept getting skipped on Bedrock
+    `ServiceUnavailableException` (the endpoint flaps under load). `capture.py` emits each trajectory
+    durably (a hang never discards completed work) and re-runs with `--append`/`--run-start` grow it.
 - **Open-loop fidelity** (suite `gaia2/default`, seed 0, Opus 4.8 target + rubric judge, run via
   `uv run wmh eval run gaia2/default --examples-root environment-capture`): last successful
   measurement **0.652 ± 0.238**, error-flag accuracy **0.906**, n=32 held-out steps — measured on
-  the initial 10-run corpus. **Re-measurement on the current 32-run corpus is still pending**: the
-  eval (which drives the served WM + rubric judge harder than capture) returned Bedrock
-  `ServiceUnavailableException` on every attempt across two finalization windows — re-run the command
-  above once the endpoint frees. For context it sat mid-family: above financebench's document
-  excerpts (0.581), below appworld's structured API observations (0.793); the residual is opaque
-  per-universe identifiers (contact/message ids) the model cannot infer from the request alone.
+  the initial 10-run corpus. **Re-measurement on the current 37-run corpus is still pending**: across
+  several finalization windows (including via `.agents/scripts/eval_with_fallback.py`, the resilient
+  fallback+retry runner) the Bedrock endpoint returned `ServiceUnavailableException` on both the
+  Converse and InvokeModel paths for both opus models — re-run the command above once the endpoint is
+  stable. For context it sat mid-family: above financebench's document excerpts (0.581), below
+  appworld's structured API observations (0.793); the residual is opaque per-universe identifiers
+  (contact/message ids) the model cannot infer from the request alone.
 
 ## ⚠ Please do not train on this evaluation data (maintainers' request)
 
