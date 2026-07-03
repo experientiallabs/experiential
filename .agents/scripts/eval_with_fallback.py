@@ -29,7 +29,7 @@ class RetryingProvider:
     """Retry ANY provider error with backoff — outer loop around the fallback chain, for nights
     when every Bedrock model flaps at once. Complete() only; config passthrough for metering."""
 
-    def __init__(self, inner, attempts: int = 12, backoff_s: float = 30.0) -> None:
+    def __init__(self, inner, attempts: int = 8, backoff_s: float = 10.0) -> None:
         self._inner = inner
         self._attempts = attempts
         self._backoff_s = backoff_s
@@ -50,10 +50,23 @@ def main() -> None:
     root, bench = Path(sys.argv[1]), sys.argv[2]
     chain = FallbackProvider(
         [
+            # Same Opus 4.8 weights via two transports first (judge comparability),
+            # Bedrock 4-7 only as the last resort.
             get_provider(
-                ProviderConfig(kind=ProviderKind.BEDROCK, model=model, region="us-east-1")
-            )
-            for model in ("us.anthropic.claude-opus-4-8", "us.anthropic.claude-opus-4-7")
+                ProviderConfig(
+                    kind=ProviderKind.BEDROCK,
+                    model="us.anthropic.claude-opus-4-8",
+                    region="us-east-1",
+                )
+            ),
+            get_provider(ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-opus-4-8")),
+            get_provider(
+                ProviderConfig(
+                    kind=ProviderKind.BEDROCK,
+                    model="us.anthropic.claude-opus-4-7",
+                    region="us-east-1",
+                )
+            ),
         ]
     )
     resilient = RetryingProvider(chain)
