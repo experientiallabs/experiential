@@ -404,9 +404,11 @@ def _ensure_credentials(console: Console, ask_secret: PromptReader, provider: st
         if value:
             try:
                 upsert_env_var(var, value)
-            except ValueError as err:  # e.g. .env is a symlink: keep the session working
+            except (ValueError, OSError) as err:
+                # Persistence refused (symlinked .env, O_NOFOLLOW's ELOOP on a swapped link,
+                # unwritable dir, ...): the session still gets the credential.
                 os.environ[var] = value
-                console.print(f"  [yellow]{escape(str(err))}[/yellow]")
+                console.print(f"  [yellow]{var} not saved: {escape(str(err))}[/yellow]")
             else:
                 console.print(f"  {_CHECK} {var} saved to .env")
         else:

@@ -346,6 +346,28 @@ def test_build_wizard_prompts_for_missing_credentials_and_saves(
     assert "AWS_SECRET_ACCESS_KEY still unset" in out
 
 
+def test_build_wizard_keeps_session_creds_when_persistence_fails(
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+) -> None:
+    # A refused .env write (symlink, ELOOP, read-only dir) must not crash the wizard: the
+    # credential still applies to the running session, with a visible warning.
+    for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    def refuse(var: str, value: str) -> None:
+        raise OSError("too many levels of symbolic links")
+
+    monkeypatch.setattr(ui_module, "upsert_env_var", refuse)
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    reader = _scripted_reader(
+        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "8", "1"]
+    )
+    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    assert params.provider == "bedrock"
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "key-id"  # session env applied anyway
+    assert "not saved" in console.export_text()
+
+
 def test_build_wizard_defaults_to_first_provider_with_creds(monkeypatch) -> None:  # noqa: ANN001
     # No --provider flag: the suggested default is the first provider (in openai, anthropic,
     # bedrock, azure order) whose creds are present — here anthropic, once openai's key is gone.
