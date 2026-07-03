@@ -44,6 +44,9 @@ def upsert_env_var(var: str, value: str, path: str | Path = ENV_FILE) -> None:
             break
     else:
         lines.append(rendered)
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    # Credentials file: owner-only, whatever the umask or pre-existing mode said.
-    env_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    # Credentials file: owner-only from birth (no umask window) and tightened before the
+    # secret is written if the file pre-existed with a looser mode.
+    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        fh.write("\n".join(lines) + "\n")
