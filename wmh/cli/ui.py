@@ -402,8 +402,13 @@ def _ensure_credentials(console: Console, ask_secret: PromptReader, provider: st
         prompt = f"  [bold]{var}[/bold] [dim](saved to .env; Enter to skip)[/dim]: "
         value = ask_secret(prompt).strip()
         if value:
-            upsert_env_var(var, value)
-            console.print(f"  {_CHECK} {var} saved to .env")
+            try:
+                upsert_env_var(var, value)
+            except ValueError as err:  # e.g. .env is a symlink: keep the session working
+                os.environ[var] = value
+                console.print(f"  [yellow]{escape(str(err))}[/yellow]")
+            else:
+                console.print(f"  {_CHECK} {var} saved to .env")
         else:
             console.print(f"  [yellow]{var} still unset[/yellow]")
 

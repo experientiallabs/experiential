@@ -33,9 +33,18 @@ def load_env_file(path: str | Path = ENV_FILE) -> None:
 
 
 def upsert_env_var(var: str, value: str, path: str | Path = ENV_FILE) -> None:
-    """Set `var` in os.environ and persist it to `path`, replacing any existing line for it."""
-    os.environ[var] = value
+    """Set `var` in os.environ and persist it to `path`, replacing any existing line for it.
+
+    Raises ValueError if `path` is a symlink: a credential rewrite must never truncate or
+    chmod whatever file the link happens to point at.
+    """
     env_path = Path(path)
+    if env_path.is_symlink():
+        raise ValueError(
+            f"refusing to write credentials through the symlink {env_path}; "
+            f"set {var} in the link target or your shell instead"
+        )
+    os.environ[var] = value
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     rendered = f"{var}={value}"
     for i, line in enumerate(lines):
@@ -46,7 +55,9 @@ def upsert_env_var(var: str, value: str, path: str | Path = ENV_FILE) -> None:
         lines.append(rendered)
     # Credentials file: owner-only from birth (no umask window) and tightened before the
     # secret is written if the file pre-existed with a looser mode.
-    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    # O_NOFOLLOW backstops the symlink check against a swap between check and open.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(env_path, flags, stat.S_IRUSR | stat.S_IWUSR)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
         fh.write("\n".join(lines) + "\n")

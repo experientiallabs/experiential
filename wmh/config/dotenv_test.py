@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from wmh.config.dotenv import load_env_file, upsert_env_var
 
 
@@ -43,3 +45,16 @@ def test_upsert_env_var_appends_and_replaces(tmp_path, monkeypatch) -> None:  # 
     assert env.stat().st_mode & 0o777 == 0o600  # owner-only, even for a pre-existing file
     monkeypatch.delenv("WMH_TEST_UPSERT")
     monkeypatch.delenv("WMH_TEST_ADDED")
+
+
+def test_upsert_env_var_refuses_symlinked_env(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    target = tmp_path / "victim"
+    target.write_text("do not clobber\n", encoding="utf-8")
+    env = tmp_path / ".env"
+    env.symlink_to(target)
+    monkeypatch.delenv("WMH_TEST_SYMLINK", raising=False)
+
+    with pytest.raises(ValueError, match="symlink"):
+        upsert_env_var("WMH_TEST_SYMLINK", "secret", env)
+    assert target.read_text(encoding="utf-8") == "do not clobber\n"  # untouched
+    assert "WMH_TEST_SYMLINK" not in os.environ  # nothing half-applied
