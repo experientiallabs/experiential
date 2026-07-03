@@ -97,6 +97,7 @@ def build(
     vendor: VendorPull | None = None,
     root: str = ".wmh",
     serve_provider: Provider | None = None,
+    judge_provider: Provider | None = None,
     embedder: Embedder | None = None,
     reporter: BuildReporter | None = None,
 ) -> OptimizeResult:
@@ -118,6 +119,16 @@ def build(
     report.split_done(len(train), len(test))
 
     provider = serve_provider or get_provider(config.serve_provider_config())
+    # The GEPA judge can run on a cheaper model (config.judge_model) of the same provider kind;
+    # with no judge_model it shares the serve provider.
+    if judge_provider is None:
+        serve_cfg = config.serve_provider_config()
+        if config.judge_model and config.judge_model != serve_cfg.model:
+            judge_provider = get_provider(
+                serve_cfg.model_copy(update={"model": config.judge_model})
+            )
+        else:
+            judge_provider = provider
     embed = embedder or HashingEmbedder(dim=config.embed_dim)
 
     # Serving index over the full corpus: at serve time we retrieve from everything we have seen.
@@ -145,7 +156,7 @@ def build(
     # that doesn't move the reported rubric fidelity.
     optimizer = GEPAOptimizer(
         provider,
-        RubricJudge(provider),
+        RubricJudge(judge_provider),
         retriever=EmbeddingRetriever(embed),
         on_rollout=_on_rollout,
         on_budget=_on_budget,

@@ -67,7 +67,7 @@ _ACTIVITY_WINDOW_LINES = 8
 # Serve providers offered in the wizard picker, with the model ids each supports. The first model
 # in each list is the suggested default. Keep these in sync with the provider backends.
 _PROVIDER_MODELS: dict[str, list[str]] = {
-    "openai": ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4"],
+    "openai": ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini"],
     "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
     "bedrock": [
         "us.anthropic.claude-opus-4-8",
@@ -80,6 +80,20 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "azure": ["gpt-5.5", "gpt-5.4"],
 }
 _DEFAULT_REGIONS: dict[str, str] = {"bedrock": "us-east-1"}
+
+# Default GEPA judge model per provider: a cheap, fast model of the same backend. Providers
+# without an entry judge on the serve model itself.
+_JUDGE_MODEL_DEFAULTS: dict[str, str] = {
+    "anthropic": "claude-haiku-4-5",
+    "openai": "gpt-5.4-mini",
+    "bedrock": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+}
+
+
+def judge_model_default(provider: str | None, serve_model: str) -> str:
+    """The GEPA judge model when none was chosen: cheap per-provider, else the serve model."""
+    return _JUDGE_MODEL_DEFAULTS.get(provider or "", serve_model)
+
 
 # Embedders offered in the wizard, with the embeddings-model ids each provider-backed one supports
 # (None = the offline hashing embedder, no model). First entry is the suggested default.
@@ -101,6 +115,8 @@ class BuildParams(BaseModel):
     # and the non-interactive path falls back to bedrock.
     provider: str | None = None
     model: str = "us.anthropic.claude-opus-4-8"
+    # GEPA judge model id; None = pick the cheap per-provider default in the wizard/build.
+    judge_model: str | None = None
     region: str | None = None
     gepa_budget: int = 10
     train_split: float = 0.8
@@ -234,6 +250,34 @@ def run_build_wizard(
         console.print("  [yellow]fix the credentials or pick a different provider/model[/yellow]")
         provider_default = provider
 
+    # GEPA judge model: defaults to a cheap model of the same provider (haiku / gpt-5.4-mini);
+    # picking the serve model itself is always on the list. Same inline verify + retry.
+    judge_default = defaults.judge_model or judge_model_default(provider, model)
+    judge_options = list(dict.fromkeys([judge_default, model, *_PROVIDER_MODELS[provider]]))
+    judge_notes = {model: "same as serve"} if model != judge_default else {}
+    while True:
+        judge_model = _select(
+            console,
+            ask,
+            "GEPA judge model id",
+            judge_options,
+            judge_default,
+            interactive=interactive,
+            notes=judge_notes,
+        )
+        if judge_model == model:
+            break  # the serve model was just verified
+        console.print(f"verifying {provider} (judge)…")
+        ping = check(ProviderConfig(kind=ProviderKind(provider), model=judge_model, region=region))
+        if ping.ok:
+            console.print(f"  {_CHECK} {provider} ({escape(judge_model)}) reachable")
+            break
+        console.print(
+            f"  [red]✗ {provider} ({escape(judge_model)}) failed[/red]: {escape(ping.detail or '')}"
+        )
+        console.print("  [yellow]pick a different judge model[/yellow]")
+        judge_default = judge_model
+
     gepa_budget = _prompt_int(
         console,
         ask,
@@ -296,6 +340,7 @@ def run_build_wizard(
         vendor=vendor,
         provider=provider,
         model=model,
+        judge_model=judge_model,
         region=region,
         gepa_budget=gepa_budget,
         train_split=defaults.train_split,

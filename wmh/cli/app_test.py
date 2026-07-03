@@ -359,9 +359,9 @@ def test_build_interactive_wizard_creates_model(
     for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(var, "test-cred")  # creds present: no interactive key prompts
     # --interactive forces the wizard even under CliRunner (non-TTY); feed each answer line in
-    # prompt order: name, file, provider (select), model (select), region (bedrock only), budget,
-    # embedder (select). The offline 'hashing' embedder skips the embed-model prompt; phi dim isn't
-    # prompted. Provider/model/embedder are picked by index against their option lists.
+    # prompt order: name, file, provider (select), model (select), region (bedrock only),
+    # judge model (select), budget, embedder (select). The offline 'hashing' embedder skips
+    # the embed-model prompt; phi dim isn't prompted. Provider/model/embedder pick by index.
     answers = "\n".join(
         [
             "wizard-built",
@@ -369,6 +369,7 @@ def test_build_interactive_wizard_creates_model(
             "3",  # provider: bedrock (order: openai, anthropic, bedrock, azure, ...)
             "1",  # model: us.anthropic.claude-opus-4-8
             "us-east-1",
+            "",  # judge model: accept the bedrock default (dated haiku)
             "4",  # gepa budget
             "1",  # embedder: hashing
         ]

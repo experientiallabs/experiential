@@ -211,6 +211,7 @@ def test_build_wizard_collects_all_inputs() -> None:
             "bedrock",
             "us.anthropic.claude-opus-4-8",
             "us-east-1",
+            "",  # judge model: accept the bedrock default (dated haiku)
             "8",
             "hashing",
         ]
@@ -227,6 +228,7 @@ def test_build_wizard_collects_all_inputs() -> None:
     assert params.file == "/tmp/traces.jsonl"
     assert params.provider == "bedrock"
     assert params.region == "us-east-1"
+    assert params.judge_model == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     assert params.gepa_budget == 8
     assert params.embed_provider == "hashing"
     assert params.train_split == 0.5
@@ -236,7 +238,7 @@ def test_build_wizard_select_by_number() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # Provider/model/embedder are numbered pickers; choosing by index must work. Pick anthropic (2),
     # its second model, no region prompt (not bedrock), budget 8, hashing embedder (1).
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "2", "2", "8", "1"])
+    reader = _scripted_reader(["m", "/tmp/t.jsonl", "2", "2", "", "8", "1"])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -246,6 +248,7 @@ def test_build_wizard_select_by_number() -> None:
     )
     assert params.provider == "anthropic"
     assert params.model == "claude-opus-4-7"  # second anthropic model
+    assert params.judge_model == "claude-haiku-4-5"  # blank accepted the anthropic judge default
     assert params.region is None  # region only prompted for bedrock
     assert params.embed_provider == "hashing"
 
@@ -254,7 +257,7 @@ def test_build_wizard_collects_provider_embedder() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # A provider-backed embedder adds an embeddings-model picker; phi dim keeps its default.
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "openai", "gpt-5.5", "8", "openai", "text-embedding-3-large"]
+        ["m", "/tmp/t.jsonl", "openai", "gpt-5.5", "", "8", "openai", "text-embedding-3-large"]
     )
     params = run_build_wizard(
         console,
@@ -272,7 +275,7 @@ def test_build_wizard_accepts_defaults_with_blank_input() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # File provided (so that prompt is skipped); press Enter (blank) for every remaining prompt
     # (name/provider/model/region/budget/embedder) to accept the suggested defaults.
-    reader = _scripted_reader(["", "", "", "", "", ""])
+    reader = _scripted_reader(["", "", "", "", "", "", ""])
     defaults = BuildParams(name="seeded", file="/tmp/t.jsonl", provider="bedrock", gepa_budget=50)
     params = run_build_wizard(
         console, defaults, reader=reader, verify=_ok_verify, verify_embed=_ok_verify
@@ -432,7 +435,7 @@ def test_build_wizard_prompts_for_missing_credentials_and_saves(
     reader = _scripted_reader(
         # name, file, provider, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (skip),
         # model, region, budget, embedder
-        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "8", "1"]
+        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "", "8", "1"]
     )
     params = run_build_wizard(
         console,
@@ -465,7 +468,7 @@ def test_build_wizard_keeps_session_creds_when_persistence_fails(
     monkeypatch.setattr(ui_module, "upsert_env_var", refuse)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "8", "1"]
+        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "", "8", "1"]
     )
     params = run_build_wizard(
         console,
@@ -490,12 +493,13 @@ def test_build_wizard_verifies_provider_and_retries_on_failure() -> None:
         return VerifyResult(ok=ok, kind=cfg.kind, model=cfg.model, detail="" if ok else "bad key")
 
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "anthropic", "", "", ""])
+    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "anthropic", "", "", "", ""])
     params = run_build_wizard(
         console, BuildParams(name="default"), reader=reader, verify=flaky, verify_embed=_ok_verify
     )
     assert params.provider == "anthropic"
-    assert calls == ["openai", "anthropic"]
+    # openai fails, anthropic serve verifies, then the judge default (haiku) verifies too.
+    assert calls == ["openai", "anthropic", "anthropic"]
     assert "bad key" in console.export_text()
 
 
@@ -510,7 +514,7 @@ def test_build_wizard_verifies_embedder_with_embed_config() -> None:
 
     console = Console(force_terminal=False, no_color=True, width=100)
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "openai", "", "", "openai", "text-embedding-3-large"]
+        ["m", "/tmp/t.jsonl", "openai", "", "", "", "openai", "text-embedding-3-large"]
     )
     run_build_wizard(
         console,
@@ -529,7 +533,7 @@ def test_build_wizard_defaults_to_first_provider_with_creds(monkeypatch) -> None
     # bedrock, azure order) whose creds are present — here anthropic, once openai's key is gone.
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "", "", "", ""])
+    reader = _scripted_reader(["m", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -545,7 +549,7 @@ def test_build_wizard_annotates_providers_that_have_keys(monkeypatch) -> None:  
     # Providers whose creds are present are labeled in the picker; cleared ones are not.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "", ""])
+    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "", "", ""])
     run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -606,7 +610,7 @@ def test_build_wizard_reprompts_on_unicode_digit_budget() -> None:
     # prompts are name/provider/model/budget/embedder (no region: the creds-default provider is
     # openai); blanks accept defaults, '²' is a bad budget that must be rejected and re-asked.
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["", "", "", "²", "7", ""])
+    reader = _scripted_reader(["", "", "", "", "²", "7", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="m", file="/tmp/t.jsonl"),

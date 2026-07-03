@@ -26,6 +26,7 @@ from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
     build_summary_panel,
+    judge_model_default,
     models_table,
     run_build_wizard,
     run_play_repl,
@@ -217,6 +218,9 @@ def build(
         None, "--provider", help="Provider that serves the model (default: bedrock)."
     ),
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Serve provider model id."),
+    judge_model: str = typer.Option(
+        None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
+    ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
@@ -255,6 +259,7 @@ def build(
         region=region,
         gepa_budget=gepa_budget,
         train_split=train_split,
+        judge_model=judge_model,
         embed_provider=embed_provider,
         embed_model=embed_model,
         embed_dim=embed_dim,
@@ -305,6 +310,7 @@ def build(
         embed_dim=params.embed_dim,
         gepa_budget=params.gepa_budget,
         train_split=params.train_split,
+        judge_model=params.judge_model or judge_model_default(params.provider, params.model),
     )
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
@@ -322,6 +328,12 @@ def build(
         tracker,
         classify=classify_build_call,
     )
+    metered_judge = metered
+    if config.judge_model and config.judge_model != config.serve_provider_config().model:
+        judge_cfg = config.serve_provider_config().model_copy(update={"model": config.judge_model})
+        metered_judge = MeteredProvider(
+            providers.get_provider(judge_cfg), tracker, classify=classify_build_call
+        )
     build_stats = BuildTelemetryStats()
     with tracker.timed(), RichBuildReporter(_console, params.name) as reporter:
         result = run_build(
@@ -330,6 +342,7 @@ def build(
             vendor=VendorPull() if params.vendor else None,
             root=model_dir,
             serve_provider=metered,
+            judge_provider=metered_judge,
             embedder=get_embedder(config),
             reporter=TelemetryBuildReporter(reporter, build_stats),
         )
