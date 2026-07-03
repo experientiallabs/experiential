@@ -86,6 +86,7 @@ class ProviderConfig(BaseModel):
     # Backend knobs (only some apply per kind):
     endpoint: str | None = None  # Azure OpenAI / custom base URL
     region: str | None = None  # AWS Bedrock region
+    aws_profile: str | None = None  # AWS Bedrock named profile (multi-account quota waterfalls)
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
     reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort

@@ -111,7 +111,11 @@ class BedrockProvider:
                 read_timeout=600,
                 retries={"max_attempts": 1, "mode": "standard"},
             )
-            self._client = boto3.client(
+            # A named profile selects a different AWS ACCOUNT (its own quota pool) — the lever
+            # that actually relieves throttling when a `us.` inference profile saturates, since
+            # those already spread across regions within one account.
+            session = boto3.Session(profile_name=self.config.aws_profile)
+            self._client = session.client(
                 "bedrock-runtime", region_name=self.config.region, config=client_config
             )
         return self._client

@@ -49,6 +49,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.env import DONE_SIGNAL, Scenario, WorldModelEnv, run_episode
 from wmh.optimize.reward import EpisodeScore
 from wmh.providers.base import Message, Provider, ProviderConfig, ProviderKind
+from wmh.providers.fallback import FallbackProvider
 from wmh.providers.registry import get_provider
 
 _HERE = Path(__file__).resolve().parent
@@ -59,6 +60,13 @@ _TOOLS_PATH = _HERE / "tools.json"
 HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # dated profile id (undated is rejected)
 OPUS = "us.anthropic.claude-opus-4-8"  # eval reward judge: third family vs both WM backends
 REGION = "us-east-1"
+# The judge fails over with the SAME Opus id in every link (identical judgement). Lessons from
+# a saturated afternoon: (1) `us.` profile capacity (ServiceUnavailable) is shared across an
+# account's regions, but per-region API quotas differ, so same-account region hops still help
+# on bursts; (2) the endflow account has NO Opus access — AccessDenied is a non-capacity error
+# that propagates immediately and kills the cascade, so only Opus-capable pools belong in the
+# chain; (3) saturation is bursty — --retry-errors sweeps converge in 1-2 passes.
+JUDGE_POOLS = ((None, "us-east-1"), (None, "us-west-2"), (None, "us-east-2"))
 MAX_STEPS = 20  # shared eval protocol (DECISIONS.md D30)
 POLICY_MAX_TOKENS = 6000  # room for Qwen3.5 reasoning + tool call (D30/D31)
 OBS_CHARS = 800  # observation excerpt per history line in the policy prompt
@@ -269,7 +277,16 @@ def _build_wm(kind: str) -> WorldModel:
         judge = env_provider  # cheap critiques while collecting memory / dev
     elif kind == "gpt-5.5":
         env_provider = get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5"))
-        judge = get_provider(ProviderConfig(kind=ProviderKind.BEDROCK, model=OPUS, region=REGION))
+        judge = FallbackProvider(
+            [
+                get_provider(
+                    ProviderConfig(
+                        kind=ProviderKind.BEDROCK, model=OPUS, region=region, aws_profile=profile
+                    )
+                )
+                for profile, region in JUDGE_POOLS
+            ]
+        )
     else:
         raise SystemExit(f"unknown --wm {kind!r}; use haiku or gpt-5.5")
     return WorldModel.load(str(_MODEL_DIR), env_provider, reward_provider=judge)
@@ -385,6 +402,11 @@ def main() -> int:
     parser.add_argument("--memory", type=Path, default=_HERE / "icl_memory.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="results JSONL (default: derived)")
     parser.add_argument("--wandb", action="store_true", help="log rows to wandb wmh-rl-transfer")
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="re-run ONLY the scenarios whose rows in --out carry an infra error, keep good rows",
+    )
     args = parser.parse_args()
     if args.attempts < 1:
         parser.error("--attempts must be >= 1")
@@ -435,10 +457,37 @@ def main() -> int:
         ]
 
     out = args.out or _HERE / f"icl_{args.mode}_{args.scenarios}_wm-{args.wm}.results.jsonl"
+    kept_rows: list[RowResult] = []
+    if args.retry_errors:
+        # Failed rows only ever lost their JUDGE call (or env error) — the fix is to redo those
+        # scenarios and splice, not re-pay for the rows that scored.
+        if not out.exists():
+            raise SystemExit(f"--retry-errors needs an existing results file at {out}")
+        prior_rows = [
+            RowResult.model_validate_json(line)
+            for line in out.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        kept_rows = [r for r in prior_rows if r.error is None]
+        retry_counts: dict[str, int] = {}
+        for r in prior_rows:
+            if r.error is not None:
+                retry_counts[r.scenario_id] = retry_counts.get(r.scenario_id, 0) + 1
+        retry_list: list[PinnedScenario] = []
+        for scenario in scenarios:
+            key = scenario.provenance[0]
+            if retry_counts.get(key, 0) > 0:
+                retry_counts[key] -= 1
+                retry_list.append(scenario)
+        scenarios = retry_list
+        print(f"retry-errors: {len(kept_rows)} rows kept, {len(scenarios)} scenarios to re-run")
     attempts = args.attempts if args.mode == "single" else 1
-    rows: list[RowResult] = []
+    rows: list[RowResult] = list(kept_rows)
     collected: list[MemoryRecord] = []
     with out.open("w", encoding="utf-8") as sink:  # rows land as they finish, not at the end
+        for row in kept_rows:
+            sink.write(row.model_dump_json() + "\n")
+        sink.flush()
         for i, scenario in enumerate(scenarios, start=1):
             prior: list[RowResult] = []
             for attempt in range(1, attempts + 1):
