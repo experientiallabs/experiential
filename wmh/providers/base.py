@@ -130,8 +130,8 @@ _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 PING_MAX_TOKENS = 2048
 
 # Belt-and-suspenders for the above: if a reasoning model spends even the larger ping budget on
-# reasoning before emitting output, the resulting error still PROVES the model is reachable (auth ok,
-# model exists). Treat these markers as reachable so `verify` passes rather than reporting failure.
+# reasoning before emitting output, the resulting error still PROVES the model is reachable (auth
+# ok, model exists). Treat these markers as reachable so `verify` passes instead of reporting fail.
 _REACHABLE_ERROR_MARKERS = (
     "max_tokens",
     "max_output_tokens",
