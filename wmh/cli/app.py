@@ -839,8 +839,19 @@ def _discover_examples() -> list[Path]:
     return sorted(
         path
         for path in root.iterdir()
-        if path.is_dir() and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
+        if path.is_dir()
+        and _is_safe_example_name(path.name)
+        and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
     )
+
+
+def _is_safe_example_name(name: str) -> bool:
+    """Whether `name` would resolve via `wmh examples run` — keeps list/hint/run in agreement."""
+    try:
+        validate_name(name)
+    except ValueError:
+        return False
+    return True
 
 
 def _resolve_example(name: str) -> Path:
