@@ -62,9 +62,11 @@ class BedrockProvider:
             # Bound each request so a stalled connection RAISES instead of blocking forever. Without
             # this, a single hung InvokeModel wedges the whole run (long GEPA/eval jobs never
             # finish) and a FallbackProvider can't fail over — it only reacts to raised errors.
-            # `read_timeout` is generous because reasoning models can generate for a while at up to
-            # `max_tokens` (a mid-generation cutoff wastes the whole call and, under a fallback
-            # chain, silently substitutes a different model into an eval).
+            # `read_timeout` covers a full generation at `max_tokens` (~2-3 min on Bedrock) with
+            # headroom, but is deliberately NOT huge: under capacity pressure Bedrock QUEUES rather
+            # than rejecting, so an over-long timeout makes a queued call block for many minutes
+            # before the FallbackProvider can react — turning graceful failover into a stall. 240s
+            # lets a genuinely slow/queued call fail over to the next model quickly.
             #
             # `max_attempts=1` disables botocore's OWN retries on purpose: throttling / 5xx /
             # timeouts should surface IMMEDIATELY to the caller, where FallbackProvider owns retry
@@ -74,7 +76,7 @@ class BedrockProvider:
             # slow crawl.
             client_config = Config(
                 connect_timeout=15,
-                read_timeout=600,
+                read_timeout=240,
                 retries={"max_attempts": 1},
             )
             self._client = boto3.client(
