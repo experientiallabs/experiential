@@ -38,6 +38,25 @@ uv run wmh serve                  # local HTTP backend on :8000
 
 Example-local prebuilt models live under `examples/<task>/models/`; pass `--root examples/<task>` to `wmh list`, `wmh demo`, `wmh play`, or `wmh serve` to use one without rebuilding.
 
+## Auto-harness: collect, evaluate, evolve
+
+`wmh agent` is a **managed agent runtime** that closes the loop: it *produces* the traces `wmh build`
+consumes and *consumes* the world model those traces build, using it as a cheap simulator to score and
+evolve the agent's own harness. A pi-style minimal agent (four env tools + a skill library it writes
+itself) runs tasks either for real in an E2B sandbox (to collect traces) or against the world model
+(closed-loop eval), and an evolutionary manager mutates harness variants steered by the eval deltas.
+
+```bash
+uv sync --extra e2b && export E2B_API_KEY=...
+wmh agent collect examples/agent_tasks.jsonl --out .wmh/traces/agent.otel.jsonl  # real E2B runs
+wmh build --name shell --file .wmh/traces/agent.otel.jsonl                       # world model from them
+wmh agent eval examples/agent_tasks.jsonl --name shell                          # closed-loop, k=3
+wmh agent evolve examples/agent_tasks.jsonl --name shell --generations 8         # evolve the harness
+```
+
+The design and its prior art (ADAS, DGM, AlphaEvolve/GEPA, Voyager, pi, WMA) are in
+[`docs/autoharness.md`](./docs/autoharness.md).
+
 ## Use it as an API
 
 ```python

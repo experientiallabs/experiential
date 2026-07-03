@@ -27,11 +27,15 @@ dependencies = [
 otel = ["opentelemetry-proto>=1.24"]
 # Plotting/figures for research runs; kept out of the core install.
 viz = ["seaborn>=0.13", "matplotlib>=3.8"]
+# The managed agent runtime (`wmh agent`) runs real trace-collection rollouts in E2B microVMs. Only
+# collection needs it — closed-loop eval + evolution run against the world model with no sandbox — so
+# it stays an optional extra the runtime imports lazily.
+e2b = ["e2b>=2.0"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz]",
+    "world-model-harness[otel,viz,e2b]",
 ]
 
 [dependency-groups]
