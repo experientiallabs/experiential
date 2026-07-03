@@ -95,9 +95,32 @@ The early-stopped ckpt-0072 held-out row is being measured (partial: tracking th
 flat band as the cold run). PPO at the safe profile (ratio clipping as the remaining
 single-rollout stabilizer) is the last cell of this sweep.
 
-Ops note from the run: a us-east-1 Bedrock `ServiceUnavailableException` storm stalled
-judge calls twice — the serve script's failover chains now end in a us-west-2 link,
-which absorbed the third flare live (episodes progressed through 10+ 503s).
+### n=4 group-baseline cell (Silen unconstrained the n=1 setting)
+
+`reinforce_plus_plus_baseline` (verl-native, uid-grouped), 4 rollouts/scenario in one
+advantage group, lr 1e-5, KL 0.05, 2 epochs (776 episodes, 304 clean training steps,
+zero failures — the most stable run of the sweep: entropy 0.23–0.37 throughout, KL
+anchored ~0.02–0.03):
+
+- **Stability solved, lift still absent on-WM**: paired epoch-2 vs epoch-1 on the
+  twice-trained scenarios = **+0.002** (13W/14L, n=54). Epochs 1 and 2 both ≈ 0.80
+  mean reward.
+- **Why — the signal-density ceiling**: 57% of rollout groups were UNIFORM (46%
+  all-success, 12% all-fail) → zero group advantage, zero gradient. The base policy
+  already scores ~0.80 / ~70–80% success on the training scenarios against the WM+judge,
+  so most of the compute samples from a region with no reward headroom. The ~55%
+  held-out number reflects a scenario-difficulty distribution shift that on-train RL
+  cannot cross by construction.
+- **Implication**: the binding constraint is now the *training scenario distribution*,
+  not the estimator — exactly the deferred ScenarioSuite v2 work (difficulty
+  calibration / harder generated scenarios, D19): train where the policy fails at
+  informative rates (uniform-failure and mixed groups), not where it already succeeds.
+  Scalar rewards would raise informative-group density only modestly (49% vs 43%).
+
+Ops notes from the runs: us-east-1 Bedrock `ServiceUnavailableException` storms stalled
+judge calls repeatedly — the serve script's failover chains now end in a us-west-2 link
+(absorbed several flares live); the scaffold retries `new_session` connect failures with
+backoff (a ~60s WM restart once burned 45 scenarios' rollout groups as instant errors).
 
 ## Training runs (97 pinned train scenarios × 1 epoch, n=1 rollout/scenario)
 
