@@ -12,6 +12,7 @@ import json
 import logging
 import random
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -837,7 +838,19 @@ def demo(
         _console.print(f"[dim]task: {escape(trace.steps[0].task[:200])}[/dim]")
     while True:
         try:
-            result = run_demo(wm, trace, max_steps=steps)
+            busy = "[dim]world model predicting…[/dim]"
+            with _console.status(busy, spinner="dots") as status:
+                _NARRATOR.attach(status, busy)
+
+                def _on_step(i: int, total: int) -> None:
+                    text = f"[dim]world model predicting step {i}/{total}…[/dim]"
+                    _NARRATOR.busy = text
+                    status.update(text)
+
+                try:
+                    result = run_demo(wm, trace, max_steps=steps, on_step=_on_step)
+                finally:
+                    _NARRATOR.detach()
             break
         except Exception as exc:  # noqa: BLE001 - classified below
             if not _is_capacity_error(exc) or not _console.is_terminal:
@@ -859,7 +872,9 @@ def demo(
             switched = ProviderConfig(
                 kind=ProviderKind(provider_name), model=model_id, region=region
             )
-            provider = RetryingProvider(providers.get_provider(switched), on_retry=_print_retry)
+            provider = RetryingProvider(
+                providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
+            )
             wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
             _console.print(f"[dim]replaying with {provider_name} ({model_id})…[/dim]")
     if show_prompt:
@@ -1041,11 +1056,68 @@ def _resolve_example(name: str) -> Path:
     raise typer.BadParameter(f"unknown example {name!r}{hint}")
 
 
-def _print_retry(attempt: int, total: int, delay: float, exc: Exception) -> None:
-    detail = str(exc).splitlines()[0][:120]
-    _console.print(
-        f"  [yellow]provider hiccup ({detail}) — retry {attempt}/{total} in {delay:.0f}s…[/yellow]"
-    )
+def _short_error(exc: Exception) -> str:
+    """The error's code + service message, without transport chatter.
+
+    botocore's text ("... (reached max retries: 1) ...") reads as OUR retry state and confuses
+    the narration; the structured code + message is what the user needs.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error", {})
+        code, message = error.get("Code"), error.get("Message") or ""
+        if code:
+            return f"{code}: {message}".rstrip(": ")[:110]
+    return str(exc).splitlines()[0][:110]
+
+
+class _RetryNarrator:
+    """Console narration for RetryingProvider: hiccup lines + an inline countdown.
+
+    The hiccup line prints only when the failure CHANGES (a stream of identical throttles says
+    it once); while a rich status is attached (demo), the wait counts down in place as
+    "retry k/3 — waiting Ns…" and then hands the spinner back to the busy text.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._status = None  # rich Status while a spinner context is active
+        self.busy = ""
+        self._last_error: str | None = None
+        self._attempt = 0
+        self._total = 0
+
+    def attach(self, status, busy: str) -> None:  # noqa: ANN001 - rich Status
+        self._status = status
+        self.busy = busy
+
+    def detach(self) -> None:
+        self._status = None
+        self._last_error = None
+
+    def on_retry(self, attempt: int, total: int, delay: float, exc: Exception) -> None:
+        detail = _short_error(exc)
+        if detail != self._last_error:
+            self._console.print(f"  [yellow]provider hiccup: {escape(detail)}[/yellow]")
+            self._last_error = detail
+        self._attempt, self._total = attempt, total
+        if self._status is None:
+            self._console.print(f"  [yellow]retry {attempt}/{total} in {delay:.0f}s…[/yellow]")
+
+    def sleep(self, delay: float) -> None:
+        remaining = int(delay)
+        while remaining > 0:
+            if self._status is not None:
+                self._status.update(
+                    f"[yellow]retry {self._attempt}/{self._total} — waiting {remaining}s…[/yellow]"
+                )
+            time.sleep(1)
+            remaining -= 1
+        if self._status is not None:
+            self._status.update(self.busy)
+
+
+_NARRATOR = _RetryNarrator(_console)
 
 
 def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider)
@@ -1060,7 +1132,9 @@ def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, nam
     model_dir = store.resolve(resolved_name)
     config = load_config(model_dir)
     provider = RetryingProvider(
-        providers.get_provider(config.serve_provider_config()), on_retry=_print_retry
+        providers.get_provider(config.serve_provider_config()),
+        on_retry=_NARRATOR.on_retry,
+        sleep=_NARRATOR.sleep,
     )
     world_model = WorldModel.load(str(model_dir), provider, telemetry_root=store.root)
     return world_model, resolved_name, provider

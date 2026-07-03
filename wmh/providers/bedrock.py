@@ -72,10 +72,13 @@ class BedrockProvider:
             # stack 3 internal attempts per model UNDER our 4-model failover — up to 12 backend
             # calls with back-off for one throttled request — turning graceful degradation into a
             # slow crawl.
+            # "standard" mode makes max_attempts mean TOTAL attempts (legacy mode still
+            # sneaks in one internal retry, which showed up as a long silent stall before the
+            # CLI's own narrated backoff could react).
             client_config = Config(
                 connect_timeout=15,
                 read_timeout=600,
-                retries={"max_attempts": 1},
+                retries={"max_attempts": 1, "mode": "standard"},
             )
             self._client = boto3.client(
                 "bedrock-runtime", region_name=self.config.region, config=client_config

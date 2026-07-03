@@ -8,6 +8,8 @@ predicted vs. actual side by side — the harness working end-to-end without nee
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from pydantic import BaseModel
 
 from wmh.core.types import Action, Observation, Trace
@@ -35,16 +37,27 @@ class DemoReplay(BaseModel):
     first_env_prompt: str  # the exact prompt the world model saw for the first step
 
 
-def run_demo(world_model: WorldModel, trace: Trace, max_steps: int = 5) -> DemoReplay:
-    """Replay up to `max_steps` of `trace` open-loop and collect predicted vs. actual."""
+def run_demo(
+    world_model: WorldModel,
+    trace: Trace,
+    max_steps: int = 5,
+    on_step: Callable[[int, int], None] | None = None,
+) -> DemoReplay:
+    """Replay up to `max_steps` of `trace` open-loop and collect predicted vs. actual.
+
+    `on_step(i, total)` fires before each prediction so a caller can narrate progress.
+    """
     if not trace.steps:
         raise ValueError(f"trace {trace.trace_id!r} has no steps to replay")
     task = trace.steps[0].task
     session = world_model.new_session(task=task)
     first_env_prompt = world_model.render_step_prompt(session.id, trace.steps[0].action)
 
+    replayed = trace.steps[:max_steps]
     steps: list[DemoStep] = []
-    for step in trace.steps[:max_steps]:
+    for i, step in enumerate(replayed, start=1):
+        if on_step is not None:
+            on_step(i, len(replayed))
         predicted = world_model.step_open_loop(session.id, step.action, step.observation)
         steps.append(DemoStep(action=step.action, predicted=predicted, actual=step.observation))
     return DemoReplay(

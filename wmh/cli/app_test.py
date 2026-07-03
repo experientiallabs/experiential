@@ -216,6 +216,43 @@ def test_demo_replays_a_sampled_scenario_open_loop(patched_provider, tmp_path) -
     assert "exact matches" in result.output
 
 
+def test_retry_narrator_dedupes_identical_failures_and_counts_down(monkeypatch) -> None:  # noqa: ANN001
+    from rich.console import Console as RichConsole
+
+    _RetryNarrator = cli_app_module._RetryNarrator
+
+    console = RichConsole(force_terminal=False, no_color=True, width=100)
+
+    class Boto(Exception):
+        def __init__(self, code: str) -> None:
+            super().__init__("An error occurred (reached max retries: 1)")
+            self.response = {"Error": {"Code": code, "Message": "Bedrock is unable"}}
+
+    class FakeStatus:
+        def __init__(self) -> None:
+            self.updates: list[str] = []
+
+        def update(self, text: str) -> None:
+            self.updates.append(text)
+
+    monkeypatch.setattr(cli_app_module.time, "sleep", lambda _s: None)
+    narrator = _RetryNarrator(console)
+    status = FakeStatus()
+    narrator.attach(status, "busy")
+    with console.capture() as cap:
+        narrator.on_retry(1, 3, 1.0, Boto("ServiceUnavailableException"))
+        narrator.sleep(1.0)
+        narrator.on_retry(2, 3, 3.0, Boto("ServiceUnavailableException"))  # same failure: silent
+        narrator.sleep(3.0)
+        narrator.on_retry(3, 3, 9.0, Boto("ThrottlingException"))  # different: printed
+    out = cap.get()
+    assert out.count("provider hiccup") == 2  # deduped consecutive identical failures
+    assert "ServiceUnavailableException: Bedrock is unable" in out
+    assert "reached max retries" not in out  # transport chatter stripped
+    assert "retry 2/3 — waiting 3s…" in " ".join(status.updates)  # inline countdown
+    assert status.updates[-1] == "busy"  # spinner text restored after the wait
+
+
 def test_providers_subcommand_is_registered() -> None:
     group_names = {group.name for group in app.registered_groups}
     assert "providers" in group_names

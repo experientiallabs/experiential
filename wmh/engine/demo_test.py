@@ -78,6 +78,14 @@ def test_run_demo_open_loop_pins_history_to_recorded_observations() -> None:
     assert [s.observation.content for s in session.history] == ["RECORDED-1", "RECORDED-2"]
 
 
+def test_run_demo_narrates_each_step() -> None:
+    wm = _world_model(ScriptedProvider())
+    trace = Trace(trace_id="s", steps=[_step("a", "x"), _step("b", "y")])
+    seen: list[tuple[int, int]] = []
+    run_demo(wm, trace, max_steps=5, on_step=lambda i, n: seen.append((i, n)))
+    assert seen == [(1, 2), (2, 2)]
+
+
 def test_run_demo_caps_steps() -> None:
     wm = _world_model(ScriptedProvider())
     trace = Trace(trace_id="long", steps=[_step(f"t{i}", "x") for i in range(9)])
