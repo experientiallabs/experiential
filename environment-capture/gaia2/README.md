@@ -87,31 +87,29 @@ time-driven events or clarification dialogue and are out of scope. The in-scope 
 seeded-split (seed 7) ~70/30 into train/test; **only train is captured** (the test split never
 enters the world model).
 
-## Results (2026-07-02, corpus as committed)
+## Results (2026-07-03, corpus as committed)
 
 - **In-scope**: 320 `execution` + `search` validation scenarios (224 train / 96 test, seed-7 split;
   test never captured).
-- **Corpus**: 19 fresh real Bedrock runs (11 on `us.anthropic.claude-opus-4-7`, 8 on `-4-8`), 296
-  `execute_python` transitions, mean reward **0.208** (our strict structural approximation, NOT the
-  official score — 10 partial, 0 full solves; the tasks are hard multi-step reasoning and the grader
-  is strict on free-text answers). Hygiene audit `scan_spans_jsonl(...) == {}` (clean). The 19 runs
-  cover ~11 distinct scenarios resampled across models and passes (run tags r1-r3), so treat the
+- **Corpus**: 32 fresh real Bedrock runs (13 on `us.anthropic.claude-opus-4-7`, 19 on `-4-8`), 483
+  `execute_python` transitions, mean reward **0.226** (our strict structural approximation, NOT the
+  official score — 1 full solve, 15 partial; the tasks are hard multi-step reasoning and the grader
+  is strict on free-text answers). Hygiene audit `scan_spans_jsonl(...) == {}` (clean). The 32 runs
+  cover 19 distinct scenarios resampled across models and passes (run tags r1-r4), so treat the
   effective task diversity accordingly (the D33 cross-run-overlap caveat applies to fidelity).
-  - This is still **short of the ~40+ target**, and grown across three `--append` waves rather than
-    one: every wave ran while Bedrock was under heavy multi-capture contention (repeated multi-minute
-    connection hangs and `ServiceUnavailableException`), so most attempted tasks never completed.
-    `capture.py` emits each trajectory durably (a hang never discards completed work) and is built to
-    be re-run with `--append`/`--run-start` to grow and rebalance further once Bedrock frees up — the
-    integration and grader are complete; corpus size is the only shortfall.
+  - Grown across four `--append` waves (10 → 19 → 32) and rebalanced toward opus-4-8; still a touch
+    short of the ~40+ target because several tail tasks were skipped on Bedrock
+    `ServiceUnavailableException` even at low contention. `capture.py` emits each trajectory durably
+    (a hang never discards completed work) and re-runs with `--append`/`--run-start` grow it further.
 - **Open-loop fidelity** (suite `gaia2/default`, seed 0, Opus 4.8 target + rubric judge, run via
   `uv run wmh eval run gaia2/default --examples-root environment-capture`): last successful
   measurement **0.652 ± 0.238**, error-flag accuracy **0.906**, n=32 held-out steps — measured on
-  the initial 10-run corpus. **Re-measurement on the current 19-run corpus is pending**: the eval
-  returned Bedrock `ServiceUnavailableException` on every attempt during finalization (the same
-  multi-wave contention), so this number has not yet been refreshed for the larger corpus — re-run
-  the command above when the endpoint frees. For context it sat mid-family: above financebench's
-  document excerpts (0.581), below appworld's structured API observations (0.793); the residual is
-  opaque per-universe identifiers (contact/message ids) the model cannot infer from the request.
+  the initial 10-run corpus. **Re-measurement on the current 32-run corpus is still pending**: the
+  eval (which drives the served WM + rubric judge harder than capture) returned Bedrock
+  `ServiceUnavailableException` on every attempt across two finalization windows — re-run the command
+  above once the endpoint frees. For context it sat mid-family: above financebench's document
+  excerpts (0.581), below appworld's structured API observations (0.793); the residual is opaque
+  per-universe identifiers (contact/message ids) the model cannot infer from the request alone.
 
 ## ⚠ Please do not train on this evaluation data (maintainers' request)
 
