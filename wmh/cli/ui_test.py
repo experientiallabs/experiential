@@ -95,7 +95,7 @@ def test_reporter_degrades_to_plain_lines_when_not_a_tty() -> None:
     reporter = RichBuildReporter(console, "airline")
     with console.capture() as cap:
         reporter.ingest_done(3, 9)
-        reporter.split_done(2, 1)
+        reporter.split_done(2, 1, 1)
         reporter.index_done(9)
         reporter.optimize_start(20)
         reporter.rollout(1, 20, 0.4)
@@ -104,10 +104,10 @@ def test_reporter_degrades_to_plain_lines_when_not_a_tty() -> None:
     out = cap.get()
     assert "ingested 3 traces" in out
     assert "normalized 9 steps" in out
-    assert "2 train / 1 held-out" in out
+    assert "2 train / 1 val / 1 test" in out
     assert "GEPA metric call 1/20" in out  # non-TTY heartbeat
     assert "GEPA metric call 10/20" in out
-    assert "held-out 0.600" in out
+    assert "val 0.600" in out
 
 
 def test_reporter_does_not_show_impossible_progress_denominator() -> None:
@@ -179,6 +179,43 @@ def test_arrow_select_moves_pointer_and_accepts(monkeypatch) -> None:  # noqa: A
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     assert ui_module._arrow_select(console, ["a", "b", "c"], 0) == 1
     assert "\u276f b" in console.export_text()  # pointer painted on the accepted row
+
+
+def test_split_keys_separates_batched_sequences() -> None:
+    assert ui_module._split_keys("\x1b[B\x1b[B") == ["\x1b[B", "\x1b[B"]
+    assert ui_module._split_keys("\x1b[1;5A") == ["\x1b[1;5A"]
+    assert ui_module._split_keys("jk\r") == ["j", "k", "\r"]
+    assert ui_module._split_keys("\x1bOA5") == ["\x1bOA", "5"]
+    assert ui_module._split_keys("\x1b") == ["\x1b"]
+
+
+def test_arrow_select_reveals_hidden_rows_on_navigation(monkeypatch) -> None:  # noqa: ANN001
+    # Collapsed picker: two rows + a "… N more" row; arrowing down onto it expands in place
+    # and the highlight lands on the first revealed option.
+    keys = iter(["\x1b[B", "\x1b[B", "\x1b[B", "\r"])  # down to "more", auto-expand, down, Enter
+    monkeypatch.setattr(ui_module.click, "getchar", lambda: next(keys))
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    chosen = ui_module._arrow_select(console, ["a", "b"], 0, ["c", "d"])
+    assert chosen == 3  # a -> b -> (more: expands, highlight on c) -> d -> Enter
+    out = console.export_text()
+    assert "… 2 more" in out  # the collapsed affordance rendered
+    assert "\u276f d" in out  # and the final highlight reached a previously hidden row
+
+
+def test_select_collapsed_keeps_numbered_fallback_complete() -> None:
+    # Non-TTY: collapsed is an arrow-picker affordance only; scripted input sees every option.
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    chosen = ui_module._select(
+        console,
+        _scripted_reader(["4"]),
+        "Pick",
+        ["a", "b", "c", "d"],
+        "a",
+        interactive=False,
+        collapsed=2,
+    )
+    assert chosen == "d"
+    assert "4." in console.export_text()  # all four options listed
 
 
 def test_arrow_select_aborts_on_eof(monkeypatch) -> None:  # noqa: ANN001
@@ -319,6 +356,20 @@ def test_build_reporter_activity_window_streams_within_fixed_height() -> None:
     assert reporter._activity[0] == "Iteration 12: note"
     reporter.optimize_done(0.5, 1, 12)
     assert reporter._live is None  # display released on completion
+
+
+def test_build_reporter_activity_lines_are_width_safe() -> None:
+    # Judge critiques can contain combining marks / double-width glyphs whose cell width the
+    # terminal and rich disagree on; one such line in the live region desyncs every repaint
+    # (orphaned frame headers). Lines are reduced to printable ASCII before rendering.
+    console = Console(force_terminal=True, no_color=True, width=100, file=io.StringIO())
+    reporter = RichBuildReporter(console, "demo")
+    reporter.optimize_start(10)
+    reporter.activity("matches the \u0935\u093e\u0938\u094d\u0924\u0935\u093f\u0915 obs\te\u0301")
+    line = reporter._activity[-1]
+    assert all(" " <= ch <= "~" for ch in line)
+    assert line.startswith("matches the ")
+    reporter.optimize_done(0.5, 1, 10)
 
 
 def test_build_reporter_activity_is_quiet_when_piped() -> None:

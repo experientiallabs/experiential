@@ -99,8 +99,8 @@ def judge_model_default(provider: str | None, serve_model: str) -> str:
 # (None = the offline hashing embedder, no model). First entry is the suggested default.
 _EMBEDDERS: dict[str, list[str] | None] = {
     "hashing": None,
-    "bedrock": ["amazon.titan-embed-text-v2:0"],
     "openai": ["text-embedding-3-small", "text-embedding-3-large"],
+    "bedrock": ["amazon.titan-embed-text-v2:0"],
     "azure": ["text-embedding-3-small", "text-embedding-3-large"],
 }
 
@@ -232,6 +232,7 @@ def run_build_wizard(
             _PROVIDER_MODELS[provider],
             defaults.model,
             interactive=interactive,
+            collapsed=2,
         )
         region = None
         if provider == "bedrock":
@@ -264,6 +265,7 @@ def run_build_wizard(
             judge_default,
             interactive=interactive,
             notes=judge_notes,
+            collapsed=2,
         )
         if judge_model == model:
             break  # the serve model was just verified
@@ -297,6 +299,7 @@ def run_build_wizard(
             list(_EMBEDDERS),
             embed_default,
             interactive=interactive,
+            collapsed=2,
         )
         embed_model = defaults.embed_model
         embed_models = _EMBEDDERS[embed_provider]
@@ -356,6 +359,34 @@ def _picker_fits(console: Console, row_count: int) -> bool:
     return console.is_terminal and sys.stdin.isatty() and row_count + 2 <= console.size.height
 
 
+def _split_keys(raw: str) -> list[str]:
+    """Split one getchar() read into individual key sequences.
+
+    Fast key repeat (holding an arrow) can deliver several escape sequences in a single raw
+    read; treating the batch as one unknown sequence would drop them all as inert.
+    """
+    keys: list[str] = []
+    i = 0
+    while i < len(raw):
+        if raw[i] != "\x1b":
+            keys.append(raw[i])
+            i += 1
+            continue
+        if raw[i : i + 2] == "\x1b[":
+            j = i + 2
+            while j < len(raw) and not ("@" <= raw[j] <= "~"):
+                j += 1
+            keys.append(raw[i : j + 1])
+            i = j + 1
+        elif raw[i : i + 2] == "\x1bO":
+            keys.append(raw[i : i + 3])
+            i += 3
+        else:
+            keys.append("\x1b")
+            i += 1
+    return keys
+
+
 def _decode_key(seq: str) -> str:
     """Map one click.getchar() sequence to a picker key.
 
@@ -390,24 +421,36 @@ def _step_selection(key: str, index: int, count: int) -> tuple[int, bool]:
     return index, False
 
 
-def _arrow_select(console: Console, rows: list[str], index: int) -> int:
+def _arrow_select(
+    console: Console, rows: list[str], index: int, hidden_rows: list[str] | None = None
+) -> int:
     """Drive an up/down picker over pre-rendered `rows`; return the chosen index.
 
     Keys come from click.getchar(): raw mode handled portably (termios on Unix, msvcrt on
     Windows), one whole escape sequence per call, Ctrl-C raised as KeyboardInterrupt for
     click's usual clean abort. EOF (closed stdin) aborts rather than spinning.
+
+    `hidden_rows` collapse behind a dim "… N more" row; navigating (or jump-selecting) onto it
+    reveals the rest in place. The returned index is into rows + hidden_rows.
     """
-    painted = False
+    visible = list(rows)
+    hidden = list(hidden_rows or [])
+    painted_height = 0
+
+    def current_rows() -> list[str]:
+        more = [f"[dim]… {len(hidden)} more[/dim]"] if hidden else []
+        return visible + more
 
     def paint(current: int) -> None:
-        nonlocal painted
-        if painted:
-            console.control(Control.move(y=-len(rows)))
-        for i, row in enumerate(rows):
+        nonlocal painted_height
+        shown = current_rows()
+        if painted_height:
+            console.control(Control.move(y=-painted_height))
+        for i, row in enumerate(shown):
             console.control(Control((ControlType.ERASE_IN_LINE, 2)))
             pointer = "[bold cyan]\u276f[/bold cyan]" if i == current else " "
             console.print(f" {pointer} {row}", highlight=False, no_wrap=True, overflow="ellipsis")
-        painted = True
+        painted_height = len(shown)
 
     while True:
         paint(index)
@@ -417,10 +460,17 @@ def _arrow_select(console: Console, rows: list[str], index: int) -> int:
             raise typer.Abort() from None
         if seq == "":
             raise typer.Abort()
-        index, accepted = _step_selection(_decode_key(seq), index, len(rows))
-        if accepted:
-            paint(index)
-            return index
+        for key in _split_keys(seq):
+            index, accepted = _step_selection(_decode_key(key), index, len(current_rows()))
+            if hidden and index == len(visible):
+                # Landed on the "more" row: reveal the rest in place; the highlight stays
+                # put, now on the first revealed option.
+                visible.extend(hidden)
+                hidden = []
+                accepted = False
+            if accepted:
+                paint(index)
+                return index
 
 
 def _select(
@@ -432,13 +482,16 @@ def _select(
     *,
     interactive: bool = False,
     notes: dict[str, str] | None = None,
+    collapsed: int | None = None,
 ) -> str:
     """Pick one of `options`: an arrow-key picker on a real TTY, else a numbered prompt.
 
     The Enter-default is `default` when present in `options`; a non-matching default falls
     back to the first option, and None means no Enter-default at all (the provider picker: a
     default exists only when creds do; the model picker: the choice is always explicit).
-    `notes` adds a dim annotation after an option's name (e.g. "api key exists").
+    `notes` adds a dim annotation after an option's name (e.g. "api key exists"). `collapsed`
+    shows only the first N options in the arrow picker behind a "… more" row (the numbered
+    fallback always lists everything, so scripted input is unaffected).
     """
     if default in options:
         chosen_default = default
@@ -456,7 +509,10 @@ def _select(
     if interactive and _picker_fits(console, len(options)):
         console.print(f"[bold]{label}[/bold] [dim](up/down + Enter)[/dim]:")
         start = options.index(chosen_default) if chosen_default is not None else 0
-        return options[_arrow_select(console, [row(opt) for opt in options], start)]
+        rows = [row(opt) for opt in options]
+        if collapsed is not None and start < collapsed < len(options):
+            return options[_arrow_select(console, rows[:collapsed], start, rows[collapsed:])]
+        return options[_arrow_select(console, rows, start)]
 
     console.print(f"[bold]{label}[/bold]:")
     for i, opt in enumerate(options, start=1):
@@ -607,8 +663,8 @@ class RichBuildReporter:
     def ingest_done(self, traces: int, steps: int) -> None:
         self._stage(f"ingested {traces} traces → normalized {steps} steps")
 
-    def split_done(self, train: int, test: int) -> None:
-        self._stage(f"split {train} train / {test} held-out traces")
+    def split_done(self, train: int, val: int, test: int) -> None:
+        self._stage(f"split {train} train / {val} val / {test} test traces")
 
     def index_done(self, steps: int) -> None:
         self._stage(f"indexed {steps} steps into the replay buffer")
@@ -631,12 +687,17 @@ class RichBuildReporter:
             # One Live region holding the fixed-height activity window + the bar: GEPA's inner
             # loop (proposals, selections, judge notes) streams inside the window instead of
             # scrolling the terminal. Not transient: the last frame (bar at 100% + final
-            # activity) stays in scrollback above the GEPA-done stage line.
+            # activity) stays in scrollback above the GEPA-done stage line. get_renderable (not
+            # per-event update()) so only the refresh thread repaints, and stray prints are
+            # redirected through the region — anything written straight to the terminal mid-Live
+            # scrolls the region and leaves orphaned frame headers behind.
             self._live = Live(
-                self._render_optimize(),
+                get_renderable=self._render_optimize,
                 console=self._console,
-                refresh_per_second=8,
+                refresh_per_second=4,
                 transient=False,
+                redirect_stdout=True,
+                redirect_stderr=True,
             )
             self._live.start()
 
@@ -654,12 +715,14 @@ class RichBuildReporter:
         return Group(window, self._progress)
 
     def activity(self, line: str) -> None:
-        text = line.strip()
+        # Width-safe: judge critiques can contain combining marks / double-width glyphs whose
+        # cell width the terminal and rich disagree on; one such line in the live region makes
+        # every repaint's cursor math drift, shedding an orphaned frame header per refresh.
+        text = "".join(ch if " " <= ch <= "~" else "?" for ch in line.strip())
         if not text:
             return
         if self._live is not None:
-            self._activity.append(text)
-            self._live.update(self._render_optimize())
+            self._activity.append(text)  # the Live's refresh thread picks this up
         # Non-TTY logs keep their sparse heartbeat; streaming every inner-loop line would flood.
 
     def rollout(self, done: int, budget: int, score: float | None) -> None:
@@ -686,13 +749,13 @@ class RichBuildReporter:
                 # final call count on the completion event instead of guessing during the run.
                 self._progress.update(self._task_id, completed=rollouts, total=rollouts)
             if self._live is not None:
-                self._live.update(self._render_optimize())
+                self._live.refresh()  # final frame: bar snapped to 100%
                 self._live.stop()
                 self._live = None
             self._progress = None
             self._task_id = None
         self._stage(
-            f"GEPA done: held-out {held_out_accuracy:.3f}, "
+            f"GEPA done: val {held_out_accuracy:.3f} (selection sample), "
             f"{frontier_size} frontier candidates, {rollouts} rollouts used"
         )
 

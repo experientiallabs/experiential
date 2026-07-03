@@ -42,8 +42,10 @@ uv run pytest -q
    reusable harness behavior.
 
 5. **The top level is an allowlist.** Tracked top-level directories are exactly: `wmh/`,
-   `examples/`, `docs/`, `assets/`, `web/`, `environment-capture/`, `.agents/`, `.claude/`,
-   `.github/`. Do not add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
+   `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`, plus the
+   monorepo workspace member `llm-waterfall/` and the pre-authorized future member
+   `environment-capture/` (see § Monorepo). Do not
+   add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
    `wmh/repo_layout_test.py` enforces this. What each surface is for:
    - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
      (completed research writeups + the one figure each renders) and `docs/reference/` (how-to
@@ -67,21 +69,20 @@ uv run pytest -q
    - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
      its own gate instead: `npm run lint` and `npx tsc --noEmit` from `web/` must be clean
      before every commit that touches it.
-   - `environment-capture/` — a uv workspace member that runs benchmarks for real and records
-     agent-environment transitions as OTel GenAI JSONL (extraction-ready: its
-     `environment_capture` package never imports `wmh`, except the one round-trip test pinning
-     the wire format). It IS part of the Python gate. Per-benchmark data dirs inside it
-     (`environment-capture/<benchmark>/`) follow the examples/ pattern: committed
-     `traces.otel.jsonl` + provenance README + thin scripts; heavy deps and cloned upstreams
-     stay in local, gitignored venvs (their out-of-process `backend/` scripts are ty-excluded,
-     and the three pre-contract benchmark dirs — tau-bench, terminal-tasks, swe-bench — keep
-     their examples-era ruff/ty exemption for legacy capture tooling).
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
+   - `llm-waterfall/` — workspace member: stateless LLM failover (own PyPI package).
+   - `environment-capture/` — workspace member: benchmark adapters + real-run trace capture
+     emitting OTel GenAI JSONL (own PyPI package). Per-benchmark data dirs
+     (`environment-capture/<benchmark>/`) follow the examples/ discipline: committed
+     `traces.otel.jsonl` + provenance/license README + thin scripts; heavy deps and cloned
+     upstreams in local gitignored venvs (out-of-process `backend/` scripts ty-excluded; the
+     three pre-contract dirs — tau-bench, terminal-tasks, swe-bench — keep their examples-era
+     ruff/ty exemption).
 
 6. **Keep dataset-specific logic inside its benchmark dir.** Benchmark launch/capture/conversion
-   logic belongs under `environment-capture/<benchmark>/` (ALL ten benchmark integrations live
+   logic belongs under `environment-capture/<benchmark>/` (all ten benchmark integrations live
    there — tau-bench, terminal-tasks, swe-bench included); non-benchmark task examples belong
    under `examples/<task>/`. Either way a dir is self-contained: `traces.otel.jsonl`, optional
    `evals/*.toml`, task-local helpers. Launch helpers through `wmh examples run <task> -- <args>`
@@ -89,7 +90,9 @@ uv run pytest -q
 
 7. **Route reusable workflows through `wmh`.** Avoid parallel top-level scripts for harness actions.
    If a workflow is generally useful outside one example dataset, implement it in `wmh/` and expose
-   it through the CLI.
+   it through the CLI — unless the capability already exists as (or deserves to be) a workspace
+   member, in which case depend on the member instead of growing a copy inside `wmh/`
+   (§ Monorepo, rule 13).
 
 8. **Keep imports explicit and fail-fast.** Put imports at module scope unless moving them is
    required to break a real circular dependency. Do not use lazy imports for optional convenience,
@@ -146,6 +149,31 @@ uv run pytest -q
     The published figures under `docs/` (e.g. `docs/research/trace_scaling_law.png`) are the visual
     reference. (`.agents/scripts/plot_trace_scaling.py` shows one way to produce them, but
     `.agents/` contents are disposable — the palette above is the contract, not that script.)
+
+## Monorepo
+
+This repo is a **uv workspace** monorepo. The root `pyproject.toml` is the `wmh` flagship
+package (its quickstart is unchanged: clone → `uv sync` → `uv run wmh ...`), and each member is
+a top-level directory with its own `pyproject.toml`, its own version, and its own PyPI release.
+Rules of the road:
+
+- **Membership**: `[tool.uv.workspace].members` in the root pyproject; anything inside the
+  workspace that depends on a member resolves it from source via `[tool.uv.sources]`
+  (`{ workspace = true }`), never from PyPI.
+- **Dependency arrows**: members never import `wmh`, and `wmh` depends on members only through
+  their public, published APIs. Members must be installable and usable standalone. Consuming a
+  member takes BOTH halves: declare it in `[project.dependencies]` (so installs outside the
+  workspace resolve it) AND rely on `[tool.uv.sources]` for in-workspace source resolution —
+  the sources entry alone wires nothing.
+- **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
+  `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
+  `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in
+  its own `[tool.ruff]`/`[tool.ty]` tables (ruff resolves the closest config). `web/` keeps its
+  own separate JS gate (rule 5).
+- **Publishing**: each member releases to PyPI independently (`uv build`/`uv publish` from the
+  member dir); version bumps are per-member commits.
+- **One way to do each thing** (rule 13) applies across the workspace: if a capability exists in
+  a member, `wmh` consumes it rather than growing a parallel copy.
 
 ## Docs
 

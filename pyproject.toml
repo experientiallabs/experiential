@@ -28,13 +28,18 @@ otel = ["opentelemetry-proto>=1.24"]
 # Plotting/figures for research runs; kept out of the core install.
 viz = ["seaborn>=0.13", "matplotlib>=3.8"]
 dev = [
-    # Workspace member: benchmark adapters + real-run trace capture (environment-capture/).
-    "environment-capture[bedrock,fetch]",
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
     "world-model-harness[otel,viz]",
 ]
+
+[dependency-groups]
+# Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
+# gate covers their tests — WITHOUT entering wmh's published metadata: members aren't on PyPI,
+# so a published extra requiring them would make `pip install world-model-harness[dev]`
+# unresolvable outside the workspace.
+dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]
 wmh = "wmh.cli:main"
@@ -46,27 +51,34 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["wmh"]
 
+[tool.hatch.build.targets.sdist]
+# The flagship sdist ships the flagship only — not workspace members (independently packaged),
+# not the agents' workspace, not the website.
+include = ["/wmh", "/README.md", "/pyproject.toml", "/conftest.py"]
+
 [tool.uv.workspace]
-members = ["environment-capture"]
+# The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members are
+# top-level dirs, each independently published to PyPI. `uv sync` resolves the whole workspace.
+members = ["llm-waterfall", "environment-capture"]
 
 [tool.uv.sources]
+# Inside the workspace, anything that depends on a member resolves it from source, not PyPI.
+llm-waterfall = { workspace = true }
 environment-capture = { workspace = true }
 
 [tool.pytest.ini_options]
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
-testpaths = ["wmh", "environment-capture"]
+# One root gate covers the flagship and every Python member (same inline-test convention).
+testpaths = ["wmh", "llm-waterfall", "environment-capture"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 # `examples/` holds isolated, self-contained task launch/capture helpers that can depend on their
 # own benchmark environments. They are not part of the reusable `wmh` package.
-# The three pre-contract benchmark dirs keep their examples-era exemption: their capture
-# tooling is battle-tested stdlib scripting that predates the environment_capture package.
-extend-exclude = [
-    "examples/",
-    ".agents/",
+extend-exclude = ["examples/", ".agents/",
+    # Pre-contract benchmark dirs keep their examples-era exemption (legacy capture tooling).
     "environment-capture/tau-bench/",
     "environment-capture/terminal-tasks/",
     "environment-capture/swe-bench/",
@@ -79,11 +91,9 @@ select = ["E", "F", "I", "UP", "B", "ANN", "BLE"]
 python-version = "3.11"
 
 [tool.ty.src]
-# The appworld/gaia2 `backend/` scripts import heavy engines that live only in those
-# benchmarks' local venvs (not project dependencies) — excluded like examples/.
-exclude = [
-    "examples/",
-    ".agents/",
+# `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
+# (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
+exclude = ["examples/", ".agents/",
     "environment-capture/appworld/backend/",
     "environment-capture/gaia2/backend/",
     "environment-capture/tau-bench/",

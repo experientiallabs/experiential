@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -23,10 +24,12 @@ ALLOWED_TOP_DIRS = {
     "docs",
     "assets",
     "web",
-    "environment-capture",
     ".agents",
     ".claude",
     ".github",
+    # Monorepo workspace members (AGENTS.md § Monorepo):
+    "llm-waterfall",
+    "environment-capture",
 }
 
 
@@ -107,4 +110,61 @@ def test_no_tracked_file_is_matched_by_ignore_rules() -> None:
     assert not offenders, (
         f"tracked files matched by ignore rules: {offenders[:5]}; fix the .gitignore pattern "
         "(add a ! negation or narrow the glob) so tracked artifacts stay re-addable"
+    )
+
+
+def _workspace_member_dirs() -> list[Path]:
+    """Existing member directories from [tool.uv.workspace].members (glob-aware)."""
+    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        root = tomllib.load(fh)
+    members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members", [])
+    assert members, "the workspace must declare its members (AGENTS.md § Monorepo)"
+    dirs: list[Path] = []
+    for member in members:
+        dirs.extend(p for p in REPO_ROOT.glob(member) if p.is_dir())
+    return dirs
+
+
+def test_workspace_members_are_real_packages() -> None:
+    """Every existing [tool.uv.workspace] member dir must carry its own pyproject.toml."""
+    for member_dir in _workspace_member_dirs():
+        assert (member_dir / "pyproject.toml").is_file(), (
+            f"workspace member {member_dir.name!r} has no pyproject.toml; every member is an "
+            "independently packaged, publishable unit (AGENTS.md § Monorepo)"
+        )
+
+
+def test_root_gate_covers_every_python_member() -> None:
+    """AGENTS.md § Monorepo promises one root gate: testpaths must include every member."""
+    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        root = tomllib.load(fh)
+    testpaths = set(root["tool"]["pytest"]["ini_options"]["testpaths"])
+    missing = [d.name for d in _workspace_member_dirs() if d.name not in testpaths]
+    assert not missing, (
+        f"workspace members {missing} are not in [tool.pytest.ini_options].testpaths; the root "
+        "gate must cover every Python member (AGENTS.md § Monorepo)"
+    )
+
+
+ALLOWED_TOP_FILES = {
+    ".env.example",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "LICENSE",  # not yet present; allowlisted so adding one never fights the gate
+    "README.md",
+    "conftest.py",
+    "justfile",
+    "pyproject.toml",
+    "uv.lock",
+}
+
+
+def test_top_level_files_are_allowlisted() -> None:
+    """Root files are an allowlist too — no Makefile/tox.ini/setup.cfg sprawl (rule 5)."""
+    tracked_root_files = {p for p in _tracked_files() if "/" not in p}
+    unexpected = tracked_root_files - ALLOWED_TOP_FILES
+    assert not unexpected, (
+        f"top-level files {sorted(unexpected)} are not allowlisted; config belongs in "
+        "pyproject.toml, tasks in the justfile, and everything else under an allowlisted dir"
     )
