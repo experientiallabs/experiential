@@ -181,6 +181,43 @@ def test_arrow_select_moves_pointer_and_accepts(monkeypatch) -> None:  # noqa: A
     assert "\u276f b" in console.export_text()  # pointer painted on the accepted row
 
 
+def test_split_keys_separates_batched_sequences() -> None:
+    assert ui_module._split_keys("\x1b[B\x1b[B") == ["\x1b[B", "\x1b[B"]
+    assert ui_module._split_keys("\x1b[1;5A") == ["\x1b[1;5A"]
+    assert ui_module._split_keys("jk\r") == ["j", "k", "\r"]
+    assert ui_module._split_keys("\x1bOA5") == ["\x1bOA", "5"]
+    assert ui_module._split_keys("\x1b") == ["\x1b"]
+
+
+def test_arrow_select_reveals_hidden_rows_on_navigation(monkeypatch) -> None:  # noqa: ANN001
+    # Collapsed picker: two rows + a "… N more" row; arrowing down onto it expands in place
+    # and the highlight lands on the first revealed option.
+    keys = iter(["\x1b[B", "\x1b[B", "\x1b[B", "\r"])  # down to "more", auto-expand, down, Enter
+    monkeypatch.setattr(ui_module.click, "getchar", lambda: next(keys))
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    chosen = ui_module._arrow_select(console, ["a", "b"], 0, ["c", "d"])
+    assert chosen == 3  # a -> b -> (more: expands, highlight on c) -> d -> Enter
+    out = console.export_text()
+    assert "… 2 more" in out  # the collapsed affordance rendered
+    assert "\u276f d" in out  # and the final highlight reached a previously hidden row
+
+
+def test_select_collapsed_keeps_numbered_fallback_complete() -> None:
+    # Non-TTY: collapsed is an arrow-picker affordance only; scripted input sees every option.
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    chosen = ui_module._select(
+        console,
+        _scripted_reader(["4"]),
+        "Pick",
+        ["a", "b", "c", "d"],
+        "a",
+        interactive=False,
+        collapsed=2,
+    )
+    assert chosen == "d"
+    assert "4." in console.export_text()  # all four options listed
+
+
 def test_arrow_select_aborts_on_eof(monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setattr(ui_module.click, "getchar", lambda: "")
     console = Console(force_terminal=False, no_color=True, width=100)
