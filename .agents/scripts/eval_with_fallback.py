@@ -27,7 +27,7 @@ class RetryingProvider:
     """Retry ANY provider error with backoff — outer loop around the fallback chain, for nights
     when every Bedrock model flaps at once. Complete() only; config passthrough for metering."""
 
-    def __init__(self, inner, attempts: int = 6, backoff_s: float = 15.0) -> None:
+    def __init__(self, inner, attempts: int = 12, backoff_s: float = 30.0) -> None:
         self._inner = inner
         self._attempts = attempts
         self._backoff_s = backoff_s
