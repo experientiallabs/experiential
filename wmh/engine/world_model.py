@@ -222,6 +222,16 @@ class WorldModel:
         session.history[-1] = session.history[-1].model_copy(update={"observation": actual})
         return prediction
 
+    def seed_session(self, session_id: str, steps: list[Step]) -> None:
+        """Advance a session with already-recorded steps, no prediction (open-loop resume).
+
+        Used when a replay continues on a fresh WorldModel (e.g. after a provider switch):
+        teacher-forced history is the recorded trajectory, so seeding is just advancing.
+        """
+        session = self._sessions[session_id]
+        for step in steps:
+            self._advance(session, step.action, step.observation)
+
     def _advance(self, session: Session, action: Action, observation: Observation) -> None:
         """Append the step, fold its state note into the scratchpad, and enrich the buffer.
 

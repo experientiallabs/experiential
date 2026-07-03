@@ -86,6 +86,33 @@ def test_run_demo_narrates_each_step() -> None:
     assert seen == [(1, 2), (2, 2)]
 
 
+def test_run_demo_streams_results_and_resumes_with_skip() -> None:
+    wm = _world_model(ScriptedProvider())
+    trace = Trace(
+        trace_id="s",
+        steps=[_step("a", "found u1"), _step("b", "RECORDED-2"), _step("c", "RECORDED-3")],
+    )
+    streamed: list[tuple[int, int, str]] = []
+    result = run_demo(
+        wm,
+        trace,
+        max_steps=5,
+        skip=1,
+        on_result=lambda i, n, d: streamed.append((i, n, d.actual.content)),
+    )
+    # skip=1 resumes at step 2: only two predictions, streamed as they landed.
+    assert [(i, n) for i, n, _ in streamed] == [(2, 3), (3, 3)]
+    assert [c for _, _, c in streamed] == ["RECORDED-2", "RECORDED-3"]
+    assert len(result.steps) == 2
+    # The skipped prefix seeded the session, so history covers the WHOLE recorded trajectory.
+    session = next(iter(wm._sessions.values()))
+    assert [s.observation.content for s in session.history] == [
+        "found u1",
+        "RECORDED-2",
+        "RECORDED-3",
+    ]
+
+
 def test_run_demo_caps_steps() -> None:
     wm = _world_model(ScriptedProvider())
     trace = Trace(trace_id="long", steps=[_step(f"t{i}", "x") for i in range(9)])

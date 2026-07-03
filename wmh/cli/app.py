@@ -23,6 +23,7 @@ import typer
 import uvicorn
 from rich.console import Console
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 
 import wmh.providers as providers
@@ -813,7 +814,9 @@ def demo(
     ),
     seed: int = typer.Option(None, help="Seed for the scenario sample (default: random)."),
     show_prompt: bool = typer.Option(
-        False, "--show-prompt", help="Also print the exact env prompt of the first step."
+        True,
+        "--show-prompt/--no-prompt",
+        help="Print the exact env prompt the world model sees for the first step.",
     ),
 ) -> None:
     """Replay a randomly sampled recorded scenario against the world model, open loop."""
@@ -830,25 +833,62 @@ def demo(
         raise typer.BadParameter(f"{traces_file} contains no replayable traces")
     trace = random.Random(seed).choice(candidates)
 
+    total = min(steps, len(trace.steps))
     _console.print(
         f"replaying scenario [bold]{trace.trace_id}[/bold] against [bold]{resolved_name}[/bold] "
-        f"(open loop, {min(steps, len(trace.steps))} of {len(trace.steps)} steps)…"
+        f"(open loop, {total} of {len(trace.steps)} steps)…"
     )
     if trace.steps[0].task:
-        _console.print(f"[dim]task: {escape(trace.steps[0].task[:200])}[/dim]")
+        _console.print(f"[dim]task: {escape(trace.steps[0].task)}[/dim]")
+    if show_prompt:
+        _console.print(
+            Panel(
+                escape(_first_prompt(wm, trace)),
+                title="[dim]env prompt (step 1) — what the world model sees[/dim]",
+                border_style="bright_black",
+            )
+        )
+
+    done: list = []  # DemoStep results stream in as each prediction lands
+
+    def _print_result(i: int, n: int, demo_step) -> None:  # noqa: ANN001 - engine DemoStep
+        done.append(demo_step)
+        action = demo_step.action
+        call = (
+            f"{action.name} {json.dumps(action.arguments)}"
+            if action.name
+            else (action.content or "")[:120]
+        )
+        verdict = (
+            "[green]exact match[/green]" if demo_step.exact_match else "[yellow]differs[/yellow]"
+        )
+        _console.print(f"\n[bold]step {i}/{n}[/bold]  [cyan]{escape(call)}[/cyan]  {verdict}")
+        _console.print(f"  [green]predicted[/green]: {escape(demo_step.predicted.content)}")
+        _console.print(f"  [dim]actual[/dim]:    {escape(demo_step.actual.content)}")
+        note = demo_step.predicted.metadata.get("state_note")
+        if isinstance(note, str) and note.strip():
+            _console.print(f"  [dim]model note: {escape(note.strip())}[/dim]")
+
     while True:
         try:
             busy = "[dim]world model predicting…[/dim]"
             with _console.status(busy, spinner="dots") as status:
                 _NARRATOR.attach(status, busy)
 
-                def _on_step(i: int, total: int) -> None:
-                    text = f"[dim]world model predicting step {i}/{total}…[/dim]"
+                def _on_step(i: int, n: int) -> None:
+                    text = f"[dim]world model predicting step {i}/{n}…[/dim]"
                     _NARRATOR.busy = text
                     status.update(text)
 
                 try:
-                    result = run_demo(wm, trace, max_steps=steps, on_step=_on_step)
+                    run_demo(
+                        wm,
+                        trace,
+                        max_steps=steps,
+                        on_step=_on_step,
+                        on_result=_print_result,
+                        skip=len(done),
+                    )
                 finally:
                     _NARRATOR.detach()
             break
@@ -856,8 +896,9 @@ def demo(
             if not _is_capacity_error(exc) or not _console.is_terminal:
                 raise
             # Retries are exhausted and the backend is still down: offer to re-point the model
-            # at a different provider (same picker as the build wizard) and replay.
-            _console.print(f"\n[red]serve provider is still failing[/red]: {exc}")
+            # at a different provider (same picker as the build wizard) and RESUME from the
+            # failed step — completed steps stay done.
+            _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
             _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
             provider_name, model_id, region = select_provider_and_model(
                 _console,
@@ -876,26 +917,20 @@ def demo(
                 providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
             )
             wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
-            _console.print(f"[dim]replaying with {provider_name} ({model_id})…[/dim]")
-    if show_prompt:
-        _console.print(f"[bold]env prompt (step 1)[/bold]:\n{escape(result.first_env_prompt)}")
-    for i, demo_step in enumerate(result.steps, start=1):
-        action = demo_step.action
-        call = (
-            f"{action.name} {json.dumps(action.arguments)}"
-            if action.name
-            else (action.content or "")[:120]
-        )
-        verdict = (
-            "[green]exact match[/green]" if demo_step.exact_match else "[yellow]differs[/yellow]"
-        )
-        _console.print(f"\n[bold]step {i}[/bold]  [cyan]{escape(call)}[/cyan]  {verdict}")
-        _console.print(f"  [green]predicted[/green]: {escape(demo_step.predicted.content[:300])}")
-        _console.print(f"  [dim]actual[/dim]:    {escape(demo_step.actual.content[:300])}")
-    matches = sum(1 for d in result.steps if d.exact_match)
-    _console.print(
-        f"\n{matches}/{len(result.steps)} exact matches (run `wmh eval` for judged fidelity)"
-    )
+            _console.print(
+                f"[dim]resuming from step {len(done) + 1} with {provider_name} ({model_id})…[/dim]"
+            )
+    matches = sum(1 for d in done if d.exact_match)
+    _console.print(f"\n{matches}/{len(done)} exact matches (run `wmh eval` for judged fidelity)")
+
+
+def _first_prompt(wm: WorldModel, trace) -> str:  # noqa: ANN001 - core Trace
+    """Render the first step's env prompt on a throwaway session (display only)."""
+    probe = wm.new_session(task=trace.steps[0].task)
+    try:
+        return wm.render_step_prompt(probe.id, trace.steps[0].action)
+    finally:
+        wm.end_session(probe.id)
 
 
 @app.command("play")

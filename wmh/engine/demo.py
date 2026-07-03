@@ -42,24 +42,36 @@ def run_demo(
     trace: Trace,
     max_steps: int = 5,
     on_step: Callable[[int, int], None] | None = None,
+    on_result: Callable[[int, int, DemoStep], None] | None = None,
+    skip: int = 0,
 ) -> DemoReplay:
     """Replay up to `max_steps` of `trace` open-loop and collect predicted vs. actual.
 
-    `on_step(i, total)` fires before each prediction so a caller can narrate progress.
+    `on_step(i, total)` fires before each prediction and `on_result(i, total, step)` right
+    after it, so callers can stream the interaction as it happens. `skip` resumes a replay
+    mid-scenario (e.g. after a provider switch): the skipped prefix seeds the session from the
+    recorded trajectory without any predictions, and the returned steps cover only the rest.
     """
     if not trace.steps:
         raise ValueError(f"trace {trace.trace_id!r} has no steps to replay")
     task = trace.steps[0].task
     session = world_model.new_session(task=task)
-    first_env_prompt = world_model.render_step_prompt(session.id, trace.steps[0].action)
-
     replayed = trace.steps[:max_steps]
+    if skip:
+        world_model.seed_session(session.id, replayed[:skip])
+    first_env_prompt = world_model.render_step_prompt(
+        session.id, replayed[min(skip, len(replayed) - 1)].action
+    )
+
     steps: list[DemoStep] = []
-    for i, step in enumerate(replayed, start=1):
+    for i, step in enumerate(replayed[skip:], start=skip + 1):
         if on_step is not None:
             on_step(i, len(replayed))
         predicted = world_model.step_open_loop(session.id, step.action, step.observation)
-        steps.append(DemoStep(action=step.action, predicted=predicted, actual=step.observation))
+        result = DemoStep(action=step.action, predicted=predicted, actual=step.observation)
+        steps.append(result)
+        if on_result is not None:
+            on_result(i, len(replayed), result)
     return DemoReplay(
         trace_id=trace.trace_id, task=task, steps=steps, first_env_prompt=first_env_prompt
     )
