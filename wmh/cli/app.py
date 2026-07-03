@@ -357,9 +357,6 @@ def build(
             )
 
 
-# The `uv sync` extra that installs each provider's SDK, surfaced when a verify ping fails with a
-# missing module so the fix is one copy-paste away.
-
 
 def _verify_or_abort(config: HarnessConfig) -> None:
     """Ping the serve provider (and any provider-backed embedder) and abort on failure.
