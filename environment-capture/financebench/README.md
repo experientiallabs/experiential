@@ -12,7 +12,7 @@ fallback) — see `environment_capture/benchmarks/financebench.py`.
 - `corpus/<doc_id>.txt` — 164 evidence excerpts (verbatim upstream `evidence_text`).
 - `gold/<task_id>.json` — gold answers (`answer` text + parsed `numeric`), never staged into the
   agent workspace.
-- `traces.otel.jsonl` — the trace corpus: **1177 traces / 6926 real transitions** (72 converted
+- `traces.otel.jsonl` — the trace corpus: **1254 traces / 7402 real transitions** (72 converted
   + 154 fresh Bedrock across waves r1-r2, opus-4-8/-4-7, run-suffixed ids, fresh mean reward
   ~0.74; train split
   only; the hidden test split is never captured so the world model can't absorb its dynamics;
