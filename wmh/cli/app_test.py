@@ -190,6 +190,32 @@ def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:
     assert os.environ["WMH_TEST_MAIN_VAR"] == "loaded"
 
 
+def test_demo_replays_a_sampled_scenario_open_loop(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    _build(root, "demo-model", tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--seed",
+            "0",
+            "--steps",
+            "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "replaying scenario" in result.output
+    assert "predicted" in result.output
+    assert "actual" in result.output
+    assert "exact matches" in result.output
+
+
 def test_providers_subcommand_is_registered() -> None:
     group_names = {group.name for group in app.registered_groups}
     assert "providers" in group_names

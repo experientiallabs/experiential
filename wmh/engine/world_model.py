@@ -193,19 +193,7 @@ class WorldModel:
             usage_event = tracker.record(Phase.SERVE, self._provider.config.model, completion.usage)
             usage_cost_usd = usage_event.cost_usd
 
-        # (4) advance session: append step, update structured state + scratchpad, enrich buffer.
-        # state_before is a deep copy: _update_state mutates session.state in place, and an aliased
-        # reference would rewrite every recorded step (and the text the retriever embeds in add())
-        # to the post-mutation state.
-        step = Step(
-            action=action,
-            observation=observation,
-            state_before=session.state.model_copy(deep=True),
-            task=session.task,
-        )
-        session.history.append(step)
-        self._update_state(session, step)
-        self._retriever.add(step)
+        self._advance(session, action, observation)
         capture(
             "wmh generated step completed",
             {
@@ -220,6 +208,36 @@ class WorldModel:
             root=self._telemetry_root,
         )
         return observation
+
+    def step_open_loop(self, session_id: str, action: Action, actual: Observation) -> Observation:
+        """Predict like `step`, but advance the session with the RECORDED observation.
+
+        Teacher-forced replay: the prediction is returned for display/scoring while the session
+        continues from ground truth, so later predictions are conditioned on the real trajectory
+        (the open-loop protocol used by `wmh demo` and the replay eval).
+        """
+        prediction = self.step(session_id, action)
+        session = self._sessions[session_id]
+        # Re-pin the just-appended step to the actual observation (history + scratchpad note).
+        session.history[-1] = session.history[-1].model_copy(update={"observation": actual})
+        return prediction
+
+    def _advance(self, session: Session, action: Action, observation: Observation) -> None:
+        """Append the step, fold its state note into the scratchpad, and enrich the buffer.
+
+        `state_before` is a deep copy: `_update_state` mutates `session.state` in place, and an
+        aliased reference would rewrite every recorded step (and the text the retriever embeds)
+        to the post-mutation state.
+        """
+        step = Step(
+            action=action,
+            observation=observation,
+            state_before=session.state.model_copy(deep=True),
+            task=session.task,
+        )
+        session.history.append(step)
+        self._update_state(session, step)
+        self._retriever.add(step)
 
     def _update_state(self, session: Session, step: Step) -> None:
         """Fold the step's effect into session.state (the env's free-text scratchpad "database").

@@ -633,6 +633,22 @@ def test_select_model_picks_by_number() -> None:
     assert select_model(console, infos, reader=_scripted_reader(["2"])) == "retail"
 
 
+def test_play_repl_shows_sampled_action_suggestions() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100)
+    with console.capture() as cap:
+        run_play_repl(
+            console,
+            _world_model(),
+            "airline",
+            task=None,
+            reader=_scripted_reader([":quit"]),
+            suggestions=['get_user {"id": "u1"}', "list_flights"],
+        )
+    out = cap.get()
+    assert "Real actions from this model's traces" in out
+    assert 'get_user {"id": "u1"}' in out
+
+
 def test_select_model_reprompts_then_accepts_name() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     infos = [

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from uuid import uuid4
 import typer
 import uvicorn
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 import wmh.providers as providers
@@ -49,6 +51,7 @@ from wmh.config import (
     validate_name,
 )
 from wmh.engine.build import build as run_build
+from wmh.engine.build import ingest
 from wmh.engine.demo import run_demo
 from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.engine.eval_suites import (
@@ -59,6 +62,7 @@ from wmh.engine.eval_suites import (
 )
 from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
+from wmh.engine.world_model import WorldModel
 from wmh.ingest import VendorPull
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
@@ -798,28 +802,153 @@ def _eval_report_payload(report: EvalReport) -> dict[str, object]:
 
 @app.command("demo")
 def demo(
-    name: str = typer.Option(None, "--name", help="World model to demo (default: the only one)."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    name: str = typer.Option(None, "--name", help="World model to demo (default: pick one)."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    steps: int = typer.Option(5, help="Max scenario steps to replay."),
+    traces: str = typer.Option(
+        None, "--traces", help="Trace file to sample the scenario from (default: the model's)."
+    ),
+    seed: int = typer.Option(None, help="Seed for the scenario sample (default: random)."),
+    show_prompt: bool = typer.Option(
+        False, "--show-prompt", help="Also print the exact env prompt of the first step."
+    ),
 ) -> None:
-    """Demo the harness: an LLM agent makes a tool call vs the world model; show prompt+output."""
-    wm, _resolved_name, provider = _load_model(name, root)
-    # Seed the demo agent from whatever steps the index holds.
-    examples = wm.sample_steps(3)
-    result = run_demo(wm, provider, examples)
-    _console.print(f"[bold]agent action[/bold]: {result.agent_action.model_dump()}")
-    _console.print(f"[bold]env prompt[/bold]:\n{result.env_prompt}")
-    _console.print(f"[bold]observation[/bold]: {result.observation.model_dump()}")
+    """Replay a randomly sampled recorded scenario against the world model, open loop."""
+    wm, resolved_name, _provider, model_root = _load_model_any(name, root)
+    traces_file = Path(traces) if traces else _traces_for_root(model_root)
+    if traces_file is None or not traces_file.exists():
+        raise typer.BadParameter(
+            f"no trace file found for {resolved_name!r} under {model_root}; pass --traces"
+        )
+    model_dir = WorldModelStore(str(model_root)).resolve(resolved_name)
+    config = load_config(model_dir)  # the model dir holds its own HarnessConfig
+    candidates = [t for t in ingest(config, file=str(traces_file)) if t.steps]
+    if not candidates:
+        raise typer.BadParameter(f"{traces_file} contains no replayable traces")
+    trace = random.Random(seed).choice(candidates)
+
+    _console.print(
+        f"replaying scenario [bold]{trace.trace_id}[/bold] against [bold]{resolved_name}[/bold] "
+        f"(open loop, {min(steps, len(trace.steps))} of {len(trace.steps)} steps)…"
+    )
+    if trace.steps[0].task:
+        _console.print(f"[dim]task: {escape(trace.steps[0].task[:200])}[/dim]")
+    result = run_demo(wm, trace, max_steps=steps)
+    if show_prompt:
+        _console.print(f"[bold]env prompt (step 1)[/bold]:\n{escape(result.first_env_prompt)}")
+    for i, demo_step in enumerate(result.steps, start=1):
+        action = demo_step.action
+        call = (
+            f"{action.name} {json.dumps(action.arguments)}"
+            if action.name
+            else (action.content or "")[:120]
+        )
+        verdict = (
+            "[green]exact match[/green]" if demo_step.exact_match else "[yellow]differs[/yellow]"
+        )
+        _console.print(f"\n[bold]step {i}[/bold]  [cyan]{escape(call)}[/cyan]  {verdict}")
+        _console.print(f"  [green]predicted[/green]: {escape(demo_step.predicted.content[:300])}")
+        _console.print(f"  [dim]actual[/dim]:    {escape(demo_step.actual.content[:300])}")
+    matches = sum(1 for d in result.steps if d.exact_match)
+    _console.print(
+        f"\n{matches}/{len(result.steps)} exact matches (run `wmh eval` for judged fidelity)"
+    )
 
 
 @app.command("play")
 def play(
-    name: str = typer.Option(None, "--name", help="World model to play (default: the only one)."),
+    name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
 ) -> None:
     """Step into the environment yourself: type actions, the world model returns observations."""
-    wm, resolved_name, _provider = _load_model(name, root)
-    run_play_repl(_console, wm, resolved_name, task)
+    wm, resolved_name, _provider, _model_root = _load_model_any(name, root)
+    suggestions = _action_suggestions(wm)
+    run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
+
+
+def _traces_for_root(model_root: Path) -> Path | None:
+    """The trace corpus that built the models under `model_root`, when it ships alongside."""
+    candidate = model_root / "traces.otel.jsonl"
+    return candidate if candidate.exists() else None
+
+
+def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
+    """Real action lines sampled from the model's corpus, to seed the play prompt."""
+    suggestions: list[str] = []
+    for step in wm.sample_steps(8):
+        action = step.action
+        if action.name:
+            args = json.dumps(action.arguments) if action.arguments else ""
+            line = f"{action.name} {args}".strip()
+        elif action.content:
+            line = f"say {action.content[:60]}"
+        else:
+            continue
+        if line not in suggestions:
+            suggestions.append(line)
+        if len(suggestions) >= n:
+            break
+    return suggestions
+
+
+def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider, Path)
+    """Resolve a model across the project dir AND shipped examples, then load it.
+
+    An explicit non-default `--root` keeps the old single-root behavior. Otherwise the picker
+    spans `<root>/models/*` plus `examples/*/models/*`, labeling each with its source.
+    """
+    if root != ARTIFACT_DIR:
+        wm, resolved, provider = _load_model(name, root)
+        return wm, resolved, provider, Path(root)
+
+    candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
+    local = WorldModelStore(root)
+    candidates.extend((f"{n}  [dim](local)[/dim]", Path(root), n) for n in local.list_names())
+    for example_dir in _discover_examples():
+        example_store = WorldModelStore(example_dir)
+        candidates.extend(
+            (f"{n}  [dim]({example_dir.name} example)[/dim]", example_dir, n)
+            for n in example_store.list_names()
+        )
+
+    if name is not None:
+        matched = [c for c in candidates if c[2] == name]
+        if not matched:
+            have = ", ".join(c[2] for c in candidates) or "none built"
+            raise typer.BadParameter(f"no world model named {name!r} (have: {have})")
+        # Prefer the local build over a same-named example artifact.
+        label, store_root, resolved = matched[0]
+    elif not candidates:
+        raise typer.BadParameter(
+            "no world models found; run `wmh build` or try an example (examples/tau-bench)"
+        )
+    elif len(candidates) == 1:
+        label, store_root, resolved = candidates[0]
+    elif _console.is_terminal:
+        labels = [c[0] for c in candidates]
+        chosen = _select_from(labels)
+        label, store_root, resolved = candidates[labels.index(chosen)]
+    else:
+        have = ", ".join(c[2] for c in candidates)
+        raise typer.BadParameter(f"multiple world models ({have}); pass --name")
+
+    wm, resolved, provider = _load_model(resolved, str(store_root))
+    return wm, resolved, provider, store_root
+
+
+def _select_from(labels: list[str]) -> str:
+    """Interactive picker over pre-rendered labels (arrow keys on a TTY)."""
+    from wmh.cli import ui as _ui  # package-internal: reuse the wizard's picker machinery
+
+    return _ui._select(
+        _console,
+        lambda text: _console.input(text),
+        "Select a world model",
+        labels,
+        None,
+        interactive=True,
+    )
 
 
 def _resolve_name(store: WorldModelStore, name: str | None) -> str:

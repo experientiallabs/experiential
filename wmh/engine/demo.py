@@ -1,61 +1,52 @@
-"""`wmh demo`: show the harness working end-to-end.
+"""`wmh demo`: replay a real recorded scenario against the world model, open loop.
 
-A throwaway LLM-as-agent (base prompt + a few sampled trace examples, NO GEPA) is asked to emit one
-tool call. We feed that to the WorldModel and print (1) the exact env prompt sent and (2) the
-predicted observation — demonstrating the loop without needing the user's real agent.
+A randomly sampled trace supplies the task and the agent's recorded actions; the world model
+predicts each observation while the session is teacher-forced with the recorded one
+(`step_open_loop`), so every prediction is conditioned on the real trajectory. The result shows
+predicted vs. actual side by side — the harness working end-to-end without needing a live agent.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
-from wmh.core.parsing import extract_json_object
-from wmh.core.types import Action, ActionKind, JsonObject, Observation, Step
-from wmh.engine.prompts import build_demo_agent_prompt
+from wmh.core.types import Action, Observation, Trace
 from wmh.engine.world_model import WorldModel
-from wmh.providers.base import Message, Provider
 
 
-class DemoResult(BaseModel):
-    agent_action: Action  # what the demo agent chose to do
-    env_prompt: str  # the exact prompt the world model received
-    observation: Observation  # what the environment returned
+class DemoStep(BaseModel):
+    """One replayed step: the recorded action with the predicted and recorded observations."""
+
+    action: Action
+    predicted: Observation
+    actual: Observation
+
+    @property
+    def exact_match(self) -> bool:
+        return self.predicted.content.strip() == self.actual.content.strip()
 
 
-class _AgentToolCall(BaseModel):
-    name: str
-    arguments: JsonObject = {}
+class DemoReplay(BaseModel):
+    """The rendered scenario replay for `wmh demo`."""
+
+    trace_id: str
+    task: str | None
+    steps: list[DemoStep]
+    first_env_prompt: str  # the exact prompt the world model saw for the first step
 
 
-def run_demo(world_model: WorldModel, agent_provider: Provider, examples: list[Step]) -> DemoResult:
-    """Drive one agent->env round-trip for demonstration.
-
-    A throwaway agent (base prompt + sampled examples, no GEPA) proposes one tool call; the world
-    model predicts the environment's response. We capture the exact env prompt for display.
-    """
-    task = examples[0].task if examples and examples[0].task else "complete the task"
-    action = _propose_action(agent_provider, task, examples)
-
+def run_demo(world_model: WorldModel, trace: Trace, max_steps: int = 5) -> DemoReplay:
+    """Replay up to `max_steps` of `trace` open-loop and collect predicted vs. actual."""
+    if not trace.steps:
+        raise ValueError(f"trace {trace.trace_id!r} has no steps to replay")
+    task = trace.steps[0].task
     session = world_model.new_session(task=task)
-    # Capture the exact prompt the world model will send (same retrieval + assembly as step()).
-    env_prompt = world_model.render_step_prompt(session.id, action)
-    observation = world_model.step(session.id, action)
-    return DemoResult(agent_action=action, env_prompt=env_prompt, observation=observation)
+    first_env_prompt = world_model.render_step_prompt(session.id, trace.steps[0].action)
 
-
-def _propose_action(agent_provider: Provider, task: str, examples: list[Step]) -> Action:
-    """Ask the demo agent for one tool call; fall back to a message action if it's free-form."""
-    prompt = build_demo_agent_prompt(task, examples)
-    completion = agent_provider.complete(
-        "You role-play an agent. Reply with one tool call as JSON only.",
-        [Message(role="user", content=prompt)],
-        temperature=0.0,
+    steps: list[DemoStep] = []
+    for step in trace.steps[:max_steps]:
+        predicted = world_model.step_open_loop(session.id, step.action, step.observation)
+        steps.append(DemoStep(action=step.action, predicted=predicted, actual=step.observation))
+    return DemoReplay(
+        trace_id=trace.trace_id, task=task, steps=steps, first_env_prompt=first_env_prompt
     )
-    raw = extract_json_object(completion.text)
-    if raw is not None:
-        try:
-            call = _AgentToolCall.model_validate_json(raw)
-            return Action(kind=ActionKind.TOOL_CALL, name=call.name, arguments=call.arguments)
-        except ValidationError:
-            pass
-    return Action(kind=ActionKind.MESSAGE, content=completion.text.strip())

@@ -846,6 +846,7 @@ def run_play_repl(
     model_name: str,
     task: str | None,
     reader: PromptReader | None = None,
+    suggestions: list[str] | None = None,
 ) -> None:
     """Run the human-in-the-loop demo against `world_model`.
 
@@ -854,9 +855,18 @@ def run_play_repl(
     """
     ask = reader if reader is not None else console.input
     session = world_model.new_session(task=task)
+    body = _PLAY_HELP
+    if suggestions:
+        sampled = "\n".join(f"  [cyan]{escape(line)}[/cyan]" for line in suggestions)
+        body = (
+            "You are the agent. Type an action and the world model answers.\n"
+            "Real actions from this model's traces to try:\n"
+            f"{sampled}\n"
+            "Commands: :state show session state  \u00b7  :help  \u00b7  :quit (or Ctrl-D) to exit"
+        )
     console.print(
         Panel(
-            _PLAY_HELP,
+            body,
             title=f"[bold]playing[/bold] {model_name}",
             subtitle=f"task: {task}" if task else "no task set",
             border_style="cyan",
