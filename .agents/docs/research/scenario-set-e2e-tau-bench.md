@@ -80,10 +80,45 @@ split judge error from checklist error.
    labeled ~all subsampled episodes success/unknown — no failure categories to pin).
 4. Rank-correlation metrics need a wider agent capability spread to be meaningful.
 
+## Correction (2026-07-03): selection vs random, properly powered
+
+The 3-seed random baseline above is misleading. Recomputed offline on the saved score matrix
+(`.agents/scripts/analyze_selection_vs_random.py`, results in
+`selection_vs_random_correction.json`):
+
+| selection | MAE | percentile vs 2000 random draws | clusters covered |
+|---|---|---|---|
+| uniform random K=8 (2000 draws) | 0.045 mean / 0.040 median | — | ~5.2/8 mean |
+| ours as run (**script bug**: pool re-clustered at k≈5) | 0.035 | beats 61% (random-equivalent) | 4/8 |
+| ours corrected (true 8 clusters) | **0.100** | beats 3% (**worse than random**) | **7/8** |
+| stratified-random (our allocation + weights, random within cluster) | 0.054 | ≈ random | 7/8 |
+
+Two findings:
+
+1. **Script bug** — `run_scenario_e2e.py` re-clustered the pool at default k (≈5) when selecting
+   K=8 instead of reusing the pool's 8 build clusters, so the shipped selection covered only 4/8
+   intents. (`build_scenario_set` itself is correct; only the experiment script diverged.)
+2. **Medoid bias, the real lesson** — for estimating the *pool-mean score*, the corrected,
+   coverage-respecting selection is *worse* than random. The stratified-random control isolates
+   the cause: the coverage allocation is neutral; deterministic intent-space **medoids are biased
+   in score space** (per-scenario scores span 0.33–1.00, std 0.15), and 8 deterministic picks
+   can't average that bias away, while uniform random is unbiased by construction. This matches
+   the benchmark-compression literature — item-space representativeness ≠ score-space
+   representativeness, which is exactly why IRT/model-aware selection (Design C) exists.
+
+**Honest positioning:** this selection buys *coverage* (7/8 intent clusters vs ~5/8 random — a
+regression in an untested intent is undetectable at any score) and *auditability* (provenance,
+named clusters, pinned failures), not mean-score calibration. If mean-score prediction is the
+goal: use random-within-cluster picks with the same allocation (unbiased, keeps coverage) or the
+Design-C IRT pass. Follow-ups: fix the script; consider a `pick="medoid"|"random"` knob on
+`hybrid_select` so the estimation use-case has an unbiased mode.
+
 ## Verdict
 
 The pipeline runs end-to-end on real traces with a small model: construction produces named,
-weighted, checklisted scenarios with provenance; the verification loop produces actionable
-per-scenario verdicts; predictive-fidelity MAE beats mean random-K at equal budget. The
-discriminative-power gaps are experiment-design issues (corpus multiplicity, agent spread), not
-pipeline defects — both have concrete follow-ups listed above.
+weighted, checklisted scenarios with provenance, and the verification loop produces actionable
+per-scenario verdicts. Per the 2026-07-03 correction, the selection's measurable win is
+**coverage and auditability, not mean-score calibration** — at K=8 it is random-equivalent (or
+worse, when medoids bias the estimate) for predicting the pool-mean score. The concrete next
+steps: unbiased within-cluster picking for the estimation use-case, a wider agent capability
+spread for rank metrics, and a multi-rollout corpus for task-identity recovery.
