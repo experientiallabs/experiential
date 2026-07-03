@@ -1520,12 +1520,15 @@ name = "world-model-harness"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anthropic" },
+    { name = "boto3" },
     { name = "click" },
     { name = "fastapi" },
     { name = "gepa" },
     { name = "httpx" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "openai" },
     { name = "posthog" },
     { name = "pydantic" },
     { name = "rich" },
@@ -1535,25 +1538,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-anthropic = [
-    { name = "anthropic" },
-]
-bedrock = [
-    { name = "boto3" },
-]
 dev = [
-    { name = "anthropic" },
-    { name = "boto3" },
     { name = "matplotlib" },
-    { name = "openai" },
     { name = "opentelemetry-proto" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "seaborn" },
     { name = "ty" },
-]
-openai = [
-    { name = "openai" },
 ]
 otel = [
     { name = "opentelemetry-proto" },
@@ -1565,15 +1556,15 @@ viz = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.39" },
-    { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.34" },
+    { name = "anthropic", specifier = ">=0.39" },
+    { name = "boto3", specifier = ">=1.34" },
     { name = "click", specifier = ">=8.2" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "gepa", specifier = ">=0.1.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40" },
+    { name = "openai", specifier = ">=1.40" },
     { name = "opentelemetry-proto", marker = "extra == 'otel'", specifier = ">=1.24" },
     { name = "posthog", specifier = ">=7.0" },
     { name = "pydantic", specifier = ">=2.6" },
@@ -1585,6 +1576,6 @@ requires-dist = [
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
     { name = "typer", specifier = ">=0.12" },
     { name = "uvicorn", specifier = ">=0.29" },
-    { name = "world-model-harness", extras = ["anthropic", "openai", "bedrock", "otel", "viz"], marker = "extra == 'dev'" },
+    { name = "world-model-harness", extras = ["otel", "viz"], marker = "extra == 'dev'" },
 ]
-provides-extras = ["anthropic", "openai", "bedrock", "otel", "viz", "dev"]
+provides-extras = ["otel", "viz", "dev"]

@@ -359,12 +359,6 @@ def build(
 
 # The `uv sync` extra that installs each provider's SDK, surfaced when a verify ping fails with a
 # missing module so the fix is one copy-paste away.
-_PROVIDER_EXTRA: dict[ProviderKind, str] = {
-    ProviderKind.ANTHROPIC: "anthropic",
-    ProviderKind.BEDROCK: "bedrock",
-    ProviderKind.OPENAI: "openai",
-    ProviderKind.AZURE_OPENAI: "openai",
-}
 
 
 def _verify_or_abort(config: HarnessConfig) -> None:
@@ -372,7 +366,7 @@ def _verify_or_abort(config: HarnessConfig) -> None:
 
     Runs before any rollouts so a missing SDK or bad creds fails loudly and immediately, instead of
     being swallowed inside GEPA and yielding a useless model. Raises `typer.Exit(1)` with an
-    actionable hint (the `uv sync` extra for a missing SDK; "check creds / model id" otherwise).
+    actionable hint (`uv sync` for a missing SDK; "check creds / model id" otherwise).
     """
     checks = [(config.serve_provider_config(), False)]
     if config.embed_provider is not EmbedderKind.HASHING:
@@ -389,8 +383,8 @@ def _verify_or_abort(config: HarnessConfig) -> None:
         failed = True
         _console.print(f"  [red]✗ {label} ({result.model}) failed[/red]: {result.detail}")
         if "No module named" in result.detail:
-            extra = _PROVIDER_EXTRA.get(cfg.kind, cfg.kind.value)
-            _console.print(f"    [yellow]run `uv sync --extra {extra}` to install the SDK[/yellow]")
+            # SDKs are core deps; a missing module means the env is stale or hand-rolled.
+            _console.print("    [yellow]run `uv sync` to install the provider SDKs[/yellow]")
         else:
             envs = ", ".join(PROVIDER_ENV_VARS.get(cfg.kind, []))
             hint = f" ({envs})" if envs else ""

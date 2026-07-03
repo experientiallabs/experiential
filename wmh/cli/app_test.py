@@ -414,7 +414,7 @@ def test_build_aborts_when_provider_sdk_missing(monkeypatch, tmp_path) -> None: 
         app, ["build", "--name", "x", "--file", _traces_file(tmp_path), "--root", str(root)]
     )
     assert result.exit_code == 1
-    assert "uv sync --extra bedrock" in result.output
+    assert "run `uv sync` to install the provider SDKs" in result.output
     # Aborted before building: no artifact written.
     assert not (root / "models" / "x" / "config.toml").exists()
 

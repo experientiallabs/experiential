@@ -68,8 +68,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # haiku needs the dated inference-profile id; the undated alias is rejected by Bedrock
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     ],
+    # openai_responses (the Responses API) stays flag-only (`wmh build --provider
+    # openai_responses`); the wizard list keeps to the four everyday backends.
     "azure": ["gpt-5.5", "gpt-5.4"],
-    "openai_responses": ["gpt-5.5", "gpt-5.4-mini", "gpt-5.4"],
 }
 _DEFAULT_REGIONS: dict[str, str] = {"bedrock": "us-east-1"}
 
