@@ -34,6 +34,7 @@ from wmh.cli.ui import (
     run_build_wizard,
     run_play_repl,
     select_model,
+    select_provider_and_model,
 )
 from wmh.config import (
     ARTIFACT_DIR,
@@ -60,13 +61,14 @@ from wmh.engine.eval_suites import (
     resolve_eval_suite,
     result_path,
 )
-from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
 from wmh.ingest import VendorPull
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import EmbedderKind
+from wmh.providers.fallback import _is_capacity_error
+from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
 from wmh.serving.server import create_app
 from wmh.telemetry import (
@@ -833,7 +835,33 @@ def demo(
     )
     if trace.steps[0].task:
         _console.print(f"[dim]task: {escape(trace.steps[0].task[:200])}[/dim]")
-    result = run_demo(wm, trace, max_steps=steps)
+    while True:
+        try:
+            result = run_demo(wm, trace, max_steps=steps)
+            break
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not _is_capacity_error(exc) or not _console.is_terminal:
+                raise
+            # Retries are exhausted and the backend is still down: offer to re-point the model
+            # at a different provider (same picker as the build wizard) and replay.
+            _console.print(f"\n[red]serve provider is still failing[/red]: {exc}")
+            _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
+            provider_name, model_id, region = select_provider_and_model(
+                _console,
+                lambda text: _console.input(text),
+                lambda text: _console.input(text, password=True),
+                default_provider=None,
+                default_model=None,
+                default_region=None,
+                interactive=True,
+                check=lambda cfg: verify_all([cfg])[0],
+            )
+            switched = ProviderConfig(
+                kind=ProviderKind(provider_name), model=model_id, region=region
+            )
+            provider = RetryingProvider(providers.get_provider(switched), on_retry=_print_retry)
+            wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
+            _console.print(f"[dim]replaying with {provider_name} ({model_id})…[/dim]")
     if show_prompt:
         _console.print(f"[bold]env prompt (step 1)[/bold]:\n{escape(result.first_env_prompt)}")
     for i, demo_step in enumerate(result.steps, start=1):
@@ -904,11 +932,11 @@ def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel,
 
     candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
     local = WorldModelStore(root)
-    candidates.extend((f"{n}  [dim](local)[/dim]", Path(root), n) for n in local.list_names())
+    candidates.extend((f"{n} (local)", Path(root), n) for n in local.list_names())
     for example_dir in _discover_examples():
         example_store = WorldModelStore(example_dir)
         candidates.extend(
-            (f"{n}  [dim]({example_dir.name} example)[/dim]", example_dir, n)
+            (f"{n} ({example_dir.name} example)", example_dir, n)
             for n in example_store.list_names()
         )
 
@@ -1013,17 +1041,28 @@ def _resolve_example(name: str) -> Path:
     raise typer.BadParameter(f"unknown example {name!r}{hint}")
 
 
+def _print_retry(attempt: int, total: int, delay: float, exc: Exception) -> None:
+    detail = str(exc).splitlines()[0][:120]
+    _console.print(
+        f"  [yellow]provider hiccup ({detail}) — retry {attempt}/{total} in {delay:.0f}s…[/yellow]"
+    )
+
+
 def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider)
     """Resolve + load a named world model (or the single built one) with its serve provider.
 
-    Returns `(world_model, resolved_name, provider)` so callers can reuse the provider without
-    re-reading config / reconstructing it.
+    The serve provider comes from the MODEL'S OWN config (the one it was built to serve on),
+    wrapped so transient capacity errors retry with narrated exponential backoff instead of
+    dying. Returns `(world_model, resolved_name, provider)`.
     """
     store = WorldModelStore(root)
     resolved_name = _resolve_name(store, name)
-    world_model, provider = load_world_model(
-        store.resolve(resolved_name), telemetry_root=store.root
+    model_dir = store.resolve(resolved_name)
+    config = load_config(model_dir)
+    provider = RetryingProvider(
+        providers.get_provider(config.serve_provider_config()), on_retry=_print_retry
     )
+    world_model = WorldModel.load(str(model_dir), provider, telemetry_root=store.root)
     return world_model, resolved_name, provider
 
 

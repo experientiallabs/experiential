@@ -125,6 +125,68 @@ class BuildParams(BaseModel):
     embed_dim: int = 512
 
 
+def select_provider_and_model(
+    console: Console,
+    ask: PromptReader,
+    ask_secret: PromptReader,
+    *,
+    default_provider: str | None,
+    default_model: str | None,
+    default_region: str | None,
+    interactive: bool,
+    check: Callable[[ProviderConfig], VerifyResult],
+) -> tuple[str, str, str | None]:
+    """The wizard's serve-provider block: pick provider + model (+ region), creds, live verify.
+
+    Providers with credentials present are annotated and the first becomes the suggested default
+    (none otherwise); a failed live ping loops back to the picker with the failed pick as the
+    retry default. Also reused by `wmh demo`'s switch-provider flow. Returns
+    (provider, model, region).
+    """
+    providers = list(_PROVIDER_MODELS)
+    with_creds = [p for p in providers if _has_credentials(p)]
+    # Name the actual variable so a key inherited from the shell (e.g. exported in ~/.zshrc)
+    # is traceable — "api key exists" alone reads as a mystery when .env doesn't have it.
+    notes = {p: _creds_note(p) for p in with_creds}
+    provider_default = default_provider or (with_creds[0] if with_creds else None)
+    while True:
+        provider = _select(
+            console,
+            ask,
+            "Serve provider",
+            providers,
+            provider_default,
+            interactive=interactive,
+            notes=notes,
+        )
+        _ensure_credentials(console, ask_secret, provider)
+        model = _select(
+            console,
+            ask,
+            "Serve model id",
+            _PROVIDER_MODELS[provider],
+            default_model,
+            interactive=interactive,
+            collapsed=2,
+        )
+        region = None
+        if provider == "bedrock":
+            region_default = default_region or _DEFAULT_REGIONS.get(provider)
+            region = _prompt_text(console, ask, "AWS region", region_default) or None
+        # Live ping now, not at the end: a bad key or model id loops straight back to the
+        # picker (the failed pick becomes the suggested retry default).
+        console.print(f"verifying {provider}…")
+        ping = check(ProviderConfig(kind=ProviderKind(provider), model=model, region=region))
+        if ping.ok:
+            console.print(f"  {_CHECK} {provider} ({escape(model)}) reachable")
+            return provider, model, region
+        console.print(
+            f"  [red]✗ {provider} ({escape(model)}) failed[/red]: {escape(ping.detail or '')}"
+        )
+        console.print("  [yellow]fix the credentials or pick a different provider/model[/yellow]")
+        provider_default = provider
+
+
 def run_build_wizard(
     console: Console,
     defaults: BuildParams,
@@ -205,51 +267,16 @@ def run_build_wizard(
             if not file:
                 console.print("[red]a traces path is required (or pass --vendor)[/red]")
 
-    # Serve provider: providers with credentials already present are annotated, and the first
-    # of them is the suggested default (no default when none have creds). After the pick, any
-    # missing credential is prompted for and persisted to .env rather than failing mid-build.
-    providers = list(_PROVIDER_MODELS)
-    with_creds = [p for p in providers if _has_credentials(p)]
-    # Name the actual variable so a key inherited from the shell (e.g. exported in ~/.zshrc)
-    # is traceable — "api key exists" alone reads as a mystery when .env doesn't have it.
-    notes = {p: _creds_note(p) for p in with_creds}
-    provider_default = defaults.provider or (with_creds[0] if with_creds else None)
-    while True:
-        provider = _select(
-            console,
-            ask,
-            "Serve provider",
-            providers,
-            provider_default,
-            interactive=interactive,
-            notes=notes,
-        )
-        _ensure_credentials(console, ask_secret, provider)
-        model = _select(
-            console,
-            ask,
-            "Serve model id",
-            _PROVIDER_MODELS[provider],
-            defaults.model,
-            interactive=interactive,
-            collapsed=2,
-        )
-        region = None
-        if provider == "bedrock":
-            region_default = defaults.region or _DEFAULT_REGIONS.get(provider)
-            region = _prompt_text(console, ask, "AWS region", region_default) or None
-        # Live ping now, not after the whole wizard: a bad key or model id loops straight
-        # back to the picker (the failed pick becomes the suggested retry default).
-        console.print(f"verifying {provider}…")
-        ping = check(ProviderConfig(kind=ProviderKind(provider), model=model, region=region))
-        if ping.ok:
-            console.print(f"  {_CHECK} {provider} ({escape(model)}) reachable")
-            break
-        console.print(
-            f"  [red]✗ {provider} ({escape(model)}) failed[/red]: {escape(ping.detail or '')}"
-        )
-        console.print("  [yellow]fix the credentials or pick a different provider/model[/yellow]")
-        provider_default = provider
+    provider, model, region = select_provider_and_model(
+        console,
+        ask,
+        ask_secret,
+        default_provider=defaults.provider,
+        default_model=defaults.model,
+        default_region=defaults.region,
+        interactive=interactive,
+        check=check,
+    )
 
     # GEPA judge model: defaults to a cheap model of the same provider (haiku / gpt-5.4-mini);
     # picking the serve model itself is always on the list. Same inline verify + retry.
