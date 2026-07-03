@@ -1,0 +1,1 @@
+{"gold_sql": "SELECT player_name FROM Player ORDER BY height DESC LIMIT 1"}
