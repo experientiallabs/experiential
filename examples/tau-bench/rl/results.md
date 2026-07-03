@@ -75,6 +75,30 @@ Nothing in the loop is broken; the runs were **cold and short**:
 **Queued follow-up (next 2-GPU window):** rerun PPO/R++ at lr 3e-5 with 2–3 epochs
 (~250+ steps) and critic warmup — a config change, not a code change.
 
+## Lift experiment (box-6): the REINFORCE++ learning-rate window is empty
+
+The queued follow-up ran. Single-variable LR sweep on R++, everything else identical:
+
+| lr | KL anchor | outcome |
+|---|---|---|
+| 5e-6 (original) | 0.01 | flat — policy barely moves (max Δw ≈ 1.6e-4) |
+| 1e-5 | 0.05 | epoch 1 healthy and rising (0.64 → 0.91 within-epoch), then a **slow slide**: paired epoch-2 vs epoch-1 on the *same scenarios* −0.131 (14W/24L, n=56), entropy 0.37 → 0.21, KL accelerating — stopped at ep. ~151, early-stop checkpoint 0072 kept |
+| 3e-5 (proven IH-GRPO rate) | 0.01 | **collapse**: rewards 0.81 → 0.00 by episode ~70, entropy 0.31 → 0.08, KL 2.2 by step 45; degenerate fixed point = immediate `done()` every episode |
+
+**Reading:** the pipeline's training signal is strong — it moves the policy hard in every
+regime — but n=1 binary-reward REINFORCE++ has no productive LR window on this task:
+below ~1e-5 it under-drives, at 1e-5 it drifts toward reward-destroying policies after
+~1 epoch, at 3e-5 it collapses outright. This is the variance problem group-relative
+baselines exist to solve: the failure *predicts* GRPO (n=8 group advantages — the arm the
+WM uniquely enables, running as chat 3's cell) rather than more single-rollout tuning.
+The early-stopped ckpt-0072 held-out row is being measured (partial: tracking the same
+flat band as the cold run). PPO at the safe profile (ratio clipping as the remaining
+single-rollout stabilizer) is the last cell of this sweep.
+
+Ops note from the run: a us-east-1 Bedrock `ServiceUnavailableException` storm stalled
+judge calls twice — the serve script's failover chains now end in a us-west-2 link,
+which absorbed the third flare live (episodes progressed through 10+ 503s).
+
 ## Training runs (97 pinned train scenarios × 1 epoch, n=1 rollout/scenario)
 
 | arm | reward | train steps | episodes clean | WM cost (serve/judge) |
