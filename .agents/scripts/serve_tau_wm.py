@@ -44,8 +44,16 @@ JUDGE_MODEL = "us.anthropic.claude-opus-4-8"  # the artifact's own serve model i
 
 
 def _fallback_chain(config: ProviderConfig) -> Provider:
-    """Two independent provider instances (each owns its boto/http client), same model."""
-    return FallbackProvider([get_provider(config), get_provider(config)])
+    """Same-model failover: a second same-region instance, then us-west-2 for Bedrock.
+
+    The cross-region link rides through regional brownouts (observed live:
+    us-east-1 ServiceUnavailableException storms on the Opus judge stall whole evals —
+    both same-region links 503 together).
+    """
+    chain = [get_provider(config), get_provider(config)]
+    if config.kind is ProviderKind.BEDROCK and config.region != "us-west-2":
+        chain.append(get_provider(config.model_copy(update={"region": "us-west-2"})))
+    return FallbackProvider(chain)
 
 
 def _load_dotenv() -> None:
