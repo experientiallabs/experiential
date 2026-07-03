@@ -1,0 +1,159 @@
+Table of Contents
+The Boeing Company and Subsidiaries
+Consolidated Statements of Financial Position 
+(Dollarsinmillions,exceptpersharedata)
+
+ 
+December 31,
+2018
+
+2017
+Assets
+
+ 
+Cash and cash equivalents
+$7,637
+
+$8,813
+Short-term and other investments
+927
+
+1,179
+Accounts receivable, net
+3,879
+
+2,894
+Unbilled receivables, net
+10,025
+
+8,194
+Current portion of customer financing, net
+460
+
+309
+Inventories
+62,567
+
+61,388
+Other current assets
+2,335
+
+2,417
+Total current assets
+87,830
+
+85,194
+Customer financing, net
+2,418
+
+2,756
+Property, plant and equipment, net
+12,645
+
+12,672
+Goodwill
+7,840
+
+5,559
+Acquired intangible assets, net
+3,429
+
+2,573
+Deferred income taxes
+284
+
+321
+Investments
+1,087
+
+1,260
+Other assets, net of accumulated amortization of $503 and $482
+1,826
+
+2,027
+Total assets
+$117,359
+
+$112,362
+Liabilities and equity
+
+ 
+Accounts payable
+$12,916
+
+$12,202
+Accrued liabilities
+14,808
+
+13,069
+Advances and progress billings
+50,676
+
+48,042
+Short-term debt and current portion of long-term debt
+3,190
+
+1,335
+Total current liabilities
+81,590
+
+74,648
+Deferred income taxes
+1,736
+
+2,188
+Accrued retiree health care
+4,584
+
+5,545
+Accrued pension plan liability, net
+15,323
+
+16,471
+Other long-term liabilities
+3,059
+
+2,015
+Long-term debt
+10,657
+
+9,782
+Shareholders equity:
+
+ 
+Common stock, par value $5.00 1,200,000,000 shares authorized; 1,012,261,159 shares issued
+5,061
+
+5,061
+Additional paid-in capital
+6,768
+
+6,804
+Treasury stock, at cost
+(52,348) 
+(43,454)
+Retained earnings
+55,941
+
+49,618
+Accumulated other comprehensive loss
+(15,083) 
+(16,373)
+Total shareholders equity
+339
+
+1,656
+Noncontrolling interests
+71
+
+57
+Total equity
+410
+
+1,713
+Total liabilities and equity
+$117,359
+
+$112,362
+See Notes to the Consolidated Financial Statements on pages 54 113 .
+50

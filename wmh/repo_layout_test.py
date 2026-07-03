@@ -17,7 +17,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # AGENTS.md rule 5: tracked top-level directories must be within this set. The allowlist may
 # exceed the current tree (web/ and .github/ are decided-but-not-yet-landed surfaces): it bounds
 # what MAY exist, it does not require existence.
-ALLOWED_TOP_DIRS = {"wmh", "examples", "docs", "assets", "web", ".agents", ".claude", ".github"}
+ALLOWED_TOP_DIRS = {
+    "wmh",
+    "examples",
+    "docs",
+    "assets",
+    "web",
+    "environment-capture",
+    ".agents",
+    ".claude",
+    ".github",
+}
 
 
 @functools.lru_cache(maxsize=1)

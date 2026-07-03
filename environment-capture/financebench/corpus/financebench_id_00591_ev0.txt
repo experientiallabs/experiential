@@ -1,0 +1,159 @@
+ADOBE INC.
+ CONSOLIDATED STATEMENTS OF CASH FLOWS
+(In millions)
+ 
+Years Ended
+ 
+December 2,
+2022
+December 3,
+2021
+November 27,
+2020
+Cash flows from operating activities:
+ 
+ 
+Net income
+$ 
+4,756 
+$ 
+4,822 
+$ 
+5,260 
+Adjustments to reconcile net income to net cash provided by operating activities:
+Depreciation, amortization and accretion
+ 
+856 
+ 
+788 
+ 
+757 
+Stock-based compensation
+ 
+1,440 
+ 
+1,069 
+ 
+909 
+Reduction of operating lease right-of-use assets
+ 
+83 
+ 
+73 
+ 
+87 
+Deferred income taxes
+ 
+328 
+ 
+183 
+ 
+(1,501) 
+Unrealized losses (gains) on investments, net
+ 
+29 
+ 
+(4) 
+(11) 
+Other non-cash items
+ 
+10 
+ 
+7 
+ 
+40 
+Changes in operating assets and liabilities, net of acquired assets and 
+ assumed liabilities:
+Trade receivables, net
+ 
+(198) 
+(430) 
+106 
+Prepaid expenses and other assets
+ 
+(94) 
+(475) 
+(288) 
+Trade payables
+ 
+66 
+ 
+(20) 
+96 
+Accrued expenses and other liabilities
+ 
+7 
+ 
+162 
+ 
+86 
+Income taxes payable
+ 
+19 
+ 
+2 
+ 
+(72) 
+Deferred revenue
+ 
+536 
+ 
+1,053 
+ 
+258 
+Net cash provided by operating activities
+ 
+7,838 
+ 
+7,230 
+ 
+5,727 
+Cash flows from investing activities:
+ 
+ 
+Purchases of short-term investments
+ 
+(909) 
+(1,533) 
+(1,071) 
+Maturities of short-term investments
+ 
+683 
+ 
+877 
+ 
+915 
+Proceeds from sales of short-term investments
+ 
+270 
+ 
+191 
+ 
+167 
+Acquisitions, net of cash acquired
+ 
+(126) 
+(2,682) 
+ 
+Purchases of property and equipment
+ 
+(442) 
+(348) 
+(419) 
+Purchases of long-term investments, intangibles and other assets
+ 
+(46) 
+(42) 
+(15) 
+Proceeds from sales of long-term investments and other assets
+ 
+ 
+ 
+ 
+ 
+9 
+Net cash used for investing activities
+ 
+(570) 
+(3,537) 
+(414)

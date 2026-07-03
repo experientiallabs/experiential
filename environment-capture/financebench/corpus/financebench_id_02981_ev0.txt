@@ -1,0 +1,208 @@
+TableofContents
+
+
+Consolidated Statements of Income 
+Corning Incorporated and Subsidiary Companies
+
+
+
+
+YearendedDecember31,
+
+(Inmillions,exceptpershareamounts)
+
+2021
+ 
+2020
+ 
+2019
+
+Netsales
+ $
+14,082 $
+11,303 $
+11,503
+Costofsales
+ 
+9,019 
+7,772 
+7,468
+
+ 
+ 
+ 
+
+Grossmargin
+ 
+5,063 
+3,531 
+4,035
+
+ 
+ 
+ 
+
+Operatingexpenses:
+ 
+ 
+ 
+
+Selling,generalandadministrativeexpenses
+ 
+1,827 
+1,747 
+1,585
+Research,developmentandengineeringexpenses
+ 
+995 
+1,154 
+1,031
+Amortizationofpurchasedintangibles
+ 
+129 
+121 
+113
+
+ 
+ 
+ 
+
+Operatingincome
+ 
+2,112 
+509 
+1,306
+
+ 
+ 
+ 
+
+Equityinearnings(losses)ofaffiliatedcompanies(Note3)
+ 
+35 
+(25) 
+17
+Interestincome
+ 
+11 
+15 
+21
+Interestexpense
+ 
+(300) 
+(276) 
+(221)
+Translatedearningscontractgain(loss),net(Note15)
+ 
+354 
+(38) 
+248
+Transaction-relatedgain,net(Note4)
+ 
+ 
+498 
+
+Otherincome(expense),net
+ 
+185 
+(60) 
+(155)
+
+ 
+ 
+ 
+
+Incomebeforeincometaxes
+ 
+2,397 
+623 
+1,216
+Provisionforincometaxes(Note8)
+ 
+(491) 
+(111) 
+(256)
+
+ 
+ 
+ 
+
+NetincomeattributabletoCorningIncorporated
+ $
+1,906 $
+512 $
+960
+
+ 
+ 
+ 
+
+EarningspercommonshareattributabletoCorningIncorporated:
+ 
+ 
+ 
+
+Basic(Note18)
+ $
+1.30 $
+0.54 $
+1.11
+Diluted(Note18)
+ $
+1.28 $
+0.54 $
+1.07
+
+ 
+ 
+ 
+
+ReconciliationofnetincomeattributabletoCorningIncorporatedversusnetincomeavailabletocommon
+shareholders:
+ 
+ 
+ 
+
+
+ 
+ 
+ 
+
+NetincomeattributabletoCorningIncorporated
+ $
+1,906 $
+512 $
+960
+
+ 
+ 
+ 
+
+SeriesAconvertiblepreferredstockdividend
+ 
+(24) 
+(98) 
+(98)
+Excessconsiderationpaidforredemptionofpreferredstock(1)
+ 
+(803) 
+ 
+ 
+
+ 
+ 
+ 
+
+Netincomeavailabletocommonshareholders
+ $
+1,079 $
+414 $
+862
+
+
+(1)
+RefertoNote17(Shareholders'Equity)andNote18(EarningsperCommonShare)totheconsolidatedfinancialstatementsforadditionalinformation.
+
+Theaccompanyingnotesareanintegralpartoftheseconsolidatedfinancialstatements.
+
+65

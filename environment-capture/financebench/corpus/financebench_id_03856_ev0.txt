@@ -1,0 +1,123 @@
+Table of Contents
+57
+ ADOBE SYSTEMS INCORPORATED
+ CONSOLIDATED BALANCE SHEETS
+(In thousands, except par value)
+ 
+December 1,
+2017
+December 2,
+2016
+ASSETS
+Current assets:
+ 
+ 
+Cash and cash equivalents
+$
+2,306,072
+$
+1,011,315
+Short-term investments
+3,513,702
+3,749,985
+Trade receivables, net of allowances for doubtful accounts of $9,151 and $6,214, respectively
+1,217,968
+833,033
+Prepaid expenses and other current assets
+210,071
+245,441
+Total current assets
+7,247,813
+5,839,774
+Property and equipment, net
+936,976
+816,264
+Goodwill
+5,821,561
+5,406,474
+Purchased and other intangibles, net
+385,658
+414,405
+Investment in lease receivable
+
+80,439
+Other assets
+143,548
+139,890
+Total assets
+$
+14,535,556
+$
+12,697,246
+LIABILITIES AND STOCKHOLDERS EQUITY
+Current liabilities:
+ 
+ 
+Trade payables
+$
+113,538
+$
+88,024
+Accrued expenses
+993,773
+739,630
+Income taxes payable
+14,196
+38,362
+Deferred revenue
+2,405,950
+1,945,619
+Total current liabilities
+3,527,457
+2,811,635
+Long-term liabilities:
+Debt and capital lease obligations
+1,881,421
+1,892,200
+Deferred revenue
+88,592
+69,131
+Income taxes payable
+173,088
+184,381
+Deferred income taxes
+279,941
+217,660
+Other liabilities
+125,188
+97,404
+Total liabilities
+6,075,687
+5,272,411
+Commitments and contingencies
+Stockholders equity:
+ 
+ 
+Preferred stock, $0.0001 par value; 2,000 shares authorized; none issued
+
+
+Common stock, $0.0001 par value; 900,000 shares authorized; 600,834 shares issued; 
+ 491,262 and 494,254 shares outstanding, respectively
+61
+61
+Additional paid-in-capital
+5,082,195
+4,616,331
+Retained earnings
+9,573,870
+8,114,517
+Accumulated other comprehensive income (loss)
+(111,821)
+(173,602)
+Treasury stock, at cost (109,572 and 106,580 shares, respectively), net of reissuances
+(6,084,436)
+(5,132,472)
+Total stockholders equity
+8,459,869
+7,424,835
+Total liabilities and stockholders equity
+$
+14,535,556
+$
+12,697,246
+See accompanying Notes to Consolidated Financial Statements.

@@ -1,0 +1,154 @@
+NIKE, INC.
+CONSOLIDATED STATEMENTS OF CASH FLOWS
+YEAR ENDED MAY 31,
+(Dollars in millions)
+2023
+2022
+2021
+Cash provided (used) by operations:
+Net income
+$ 
+5,070 $ 
+6,046 $ 
+5,727 
+Adjustments to reconcile net income to net cash provided (used) by operations:
+Depreciation
+ 
+703 
+717 
+744 
+Deferred income taxes
+ 
+(117) 
+(650) 
+(385) 
+Stock-based compensation
+ 
+755 
+638 
+611 
+Amortization, impairment and other
+ 
+156 
+123 
+53 
+Net foreign currency adjustments
+ 
+(213) 
+(26) 
+(138) 
+Changes in certain working capital components and other assets and liabilities:
+(Increase) decrease in accounts receivable
+ 
+489 
+(504) 
+(1,606) 
+(Increase) decrease in inventories
+ 
+(133) 
+(1,676) 
+507 
+(Increase) decrease in prepaid expenses, operating lease right-of-use assets and 
+other current and non-current assets
+ 
+(644) 
+(845) 
+(182) 
+Increase (decrease) in accounts payable, accrued liabilities, operating lease liabilities 
+and other current and non-current liabilities
+ 
+(225) 
+1,365 
+1,326 
+Cash provided (used) by operations
+ 
+5,841 
+5,188 
+6,657 
+Cash provided (used) by investing activities:
+Purchases of short-term investments
+ 
+(6,059) 
+(12,913) 
+(9,961) 
+Maturities of short-term investments
+ 
+3,356 
+8,199 
+4,236 
+Sales of short-term investments
+ 
+4,184 
+3,967 
+2,449 
+Additions to property, plant and equipment
+ 
+(969) 
+(758) 
+(695) 
+Other investing activities
+ 
+52 
+(19) 
+171 
+Cash provided (used) by investing activities
+ 
+564 
+(1,524) 
+(3,800) 
+Cash provided (used) by financing activities:
+Increase (decrease) in notes payable, net
+ 
+(4) 
+15 
+(52) 
+Repayment of borrowings
+ 
+(500) 
+ 
+(197) 
+Proceeds from exercise of stock options and other stock issuances
+ 
+651 
+1,151 
+1,172 
+Repurchase of common stock
+ 
+(5,480) 
+(4,014) 
+(608) 
+Dividends common and preferred
+ 
+(2,012) 
+(1,837) 
+(1,638) 
+Other financing activities
+ 
+(102) 
+(151) 
+(136) 
+Cash provided (used) by financing activities
+ 
+(7,447) 
+(4,836) 
+(1,459) 
+Effect of exchange rate changes on cash and equivalents
+ 
+(91) 
+(143) 
+143 
+Net increase (decrease) in cash and equivalents
+ 
+(1,133) 
+(1,315) 
+1,541 
+Cash and equivalents, beginning of year
+ 
+8,574 
+9,889 
+8,348 
+CASH AND EQUIVALENTS, END OF YEAR
+$ 
+7,441 $ 
+8,574 $ 
+9,889

@@ -1,0 +1,1 @@
+{"gold_sql": "SELECT GSoffered FROM schools ORDER BY ABS(longitude) DESC LIMIT 1"}

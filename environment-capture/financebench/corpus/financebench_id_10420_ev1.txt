@@ -1,0 +1,177 @@
+129 
+Consolidated Statements of Operations
+Years ended December 31, 2022, 2021, and 2020
+2022
+2021
+2020
+(in millions, except per share amounts)
+Revenue:
+Regulated
+$
+3,538 
+$
+2,868 
+$
+2,661 
+Non-Regulated
+9,079 
+8,273 
+6,999 
+Total revenue
+12,617 
+11,141 
+9,660 
+Cost of Sales:
+Regulated
+(3,162)
+(2,448)
+(2,235)
+Non-Regulated
+(6,907)
+(5,982)
+(4,732)
+Total cost of sales
+(10,069)
+(8,430)
+(6,967)
+Operating margin
+2,548 
+2,711 
+2,693 
+General and administrative expenses
+(207)
+(166)
+(165)
+Interest expense
+(1,117)
+(911)
+(1,038)
+Interest income
+389 
+298 
+268 
+Loss on extinguishment of debt
+(15)
+(78)
+(186)
+Other expense
+(68)
+(60)
+(53)
+Other income
+102 
+410 
+75 
+Loss on disposal and sale of business interests
+(9)
+(1,683)
+(95)
+Goodwill impairment expense
+(777)
+ 
+ 
+Asset impairment expense
+(763)
+(1,575)
+(864)
+Foreign currency transaction gains (losses)
+(77)
+(10)
+55 
+Other non-operating expense
+(175)
+ 
+(202)
+INCOME (LOSS) FROM CONTINUING OPERATIONS BEFORE TAXES AND EQUITY IN EARNINGS OF AFFILIATES
+(169)
+(1,064)
+488 
+Income tax benefit (expense)
+(265)
+133 
+(216)
+Net equity in losses of affiliates
+(71)
+(24)
+(123)
+INCOME (LOSS) FROM CONTINUING OPERATIONS
+(505)
+(955)
+149 
+Gain from disposal of discontinued businesses, net of income tax expense of $0, $1, and $0, respectively
+ 
+4 
+3 
+NET INCOME (LOSS)
+(505)
+(951)
+152 
+Less: Net loss (income) attributable to noncontrolling interests and redeemable stock of subsidiaries
+(41)
+542 
+(106)
+NET INCOME (LOSS) ATTRIBUTABLE TO THE AES CORPORATION
+$
+(546)
+$
+(409)
+$
+46 
+AMOUNTS ATTRIBUTABLE TO THE AES CORPORATION COMMON STOCKHOLDERS:
+Income (loss) from continuing operations, net of tax
+$
+(546)
+$
+(413)
+$
+43 
+Income from discontinued operations, net of tax
+ 
+4 
+3 
+NET INCOME (LOSS) ATTRIBUTABLE TO THE AES CORPORATION
+$
+(546)
+$
+(409)
+$
+46 
+BASIC EARNINGS PER SHARE:
+Income (loss) from continuing operations attributable to The AES Corporation common stockholders, net of tax
+$
+(0.82)
+$
+(0.62)
+$
+0.06 
+Income from discontinued operations attributable to The AES Corporation common stockholders, net of tax
+ 
+0.01 
+0.01 
+NET INCOME (LOSS) ATTRIBUTABLE TO THE AES CORPORATION COMMON STOCKHOLDERS
+$
+(0.82)
+$
+(0.61)
+$
+0.07 
+DILUTED EARNINGS PER SHARE:
+Income (loss) from continuing operations attributable to The AES Corporation common stockholders, net of tax
+$
+(0.82)
+$
+(0.62)
+$
+0.06 
+Income from discontinued operations attributable to The AES Corporation common stockholders, net of tax
+ 
+0.01 
+0.01 
+NET INCOME (LOSS) ATTRIBUTABLE TO THE AES CORPORATION COMMON STOCKHOLDERS
+$
+(0.82)
+$
+(0.61)
+$
+0.07 
+See Accompanying Notes to Consolidated Financial Statements.

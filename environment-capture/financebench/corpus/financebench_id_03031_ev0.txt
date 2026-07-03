@@ -1,0 +1,114 @@
+Table of Contents
+Lockheed Martin Corporation
+Consolidated Balance Sheets
+(in millions, except par value)
+ 
+ 
+December 31,
+2021
+2020
+Assets
+Current assets
+Cash and cash equivalents
+$
+3,604 
+$
+3,160 
+Receivables, net
+1,963 
+1,978 
+Contract assets
+10,579 
+9,545 
+Inventories
+2,981 
+3,545 
+Other current assets
+688 
+1,150 
+Total current assets
+19,815 
+19,378 
+Property, plant and equipment, net
+7,597 
+7,213 
+Goodwill
+10,813 
+10,806 
+Intangible assets, net
+2,706 
+3,012 
+Deferred income taxes
+2,290 
+3,475 
+Other noncurrent assets
+7,652 
+6,826 
+Total assets
+$
+50,873 
+$
+50,710 
+Liabilities and equity
+Current liabilities
+Accounts payable
+$
+780 
+$
+880 
+Salaries, benefits and payroll taxes
+3,108 
+3,163 
+Contract liabilities
+8,107 
+7,545 
+Current maturities of long-term debt
+6 
+500 
+Other current liabilities
+1,996 
+1,845 
+Total current liabilities
+13,997 
+13,933 
+Long-term debt, net
+11,670 
+11,669 
+Accrued pension liabilities
+8,319 
+12,874 
+Other noncurrent liabilities
+5,928 
+6,196 
+Total liabilities
+39,914 
+44,672 
+Stockholders equity
+Common stock, $1 par value per share
+271 
+279 
+Additional paid-in capital
+94 
+221 
+Retained earnings
+21,600 
+21,636 
+Accumulated other comprehensive loss
+(11,006)
+(16,121)
+Total stockholders equity
+10,959 
+6,015 
+Noncontrolling interests in subsidiary
+ 
+23 
+Total equity
+10,959 
+6,038 
+Total liabilities and equity
+$
+50,873 
+$
+50,710 
+The accompanying notes are an integral part of these consolidated financial statements.
+68

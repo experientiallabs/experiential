@@ -1,0 +1,187 @@
+49
+Consolidated Statements of Cash Flows
+GENERAL MILLS, INC. AND SUBSIDIARIES
+(In Millions)
+Fiscal Year
+2022
+2021 
+2020 
+Cash Flows - Operating Activities
+Net earnings, including earnings attributable to redeemable and noncontrolling interests
+$
+2,735.0
+$
+2,346.0
+$
+2,210.8
+Adjustments to reconcile net earnings to net cash provided by operating activities:
+Depreciation and amortization
+570.3
+601.3
+594.7
+After-tax earnings from joint ventures
+(111.7)
+(117.7)
+(91.1)
+Distributions of earnings from joint ventures
+107.5
+95.2
+76.5
+Stock-based compensation
+98.7
+89.9
+94.9
+Deferred income taxes
+62.2
+118.8
+(29.6)
+Pension and other postretirement benefit plan contributions
+(31.3)
+(33.4)
+(31.1)
+Pension and other postretirement benefit plan costs
+(30.1)
+(33.6)
+(32.3)
+Divestitures (gain) loss
+(194.1)
+53.5
+-
+Restructuring, impairment, and other exit (recoveries) costs
+(117.1)
+150.9
+43.6
+Changes in current assets and liabilities, excluding the effects of acquisition and divestitures
+277.4
+(155.9)
+793.9
+Other, net
+(50.7)
+(131.8)
+45.9
+Net cash provided by operating activities
+3,316.1
+2,983.2
+3,676.2
+Cash Flows - Investing Activities
+Purchases of land, buildings, and equipment
+(568.7)
+(530.8)
+(460.8)
+Acquisition
+(1,201.3)
+-
+-
+Investments in affiliates, net
+15.4
+15.5
+(48.0)
+Proceeds from disposal of land, buildings, and equipment
+3.3
+2.7
+1.7
+Proceeds from divestitures, net of cash divested
+74.1
+2.9
+-
+Other, net
+(13.5)
+(3.1)
+20.9
+Net cash used by investing activities
+(1,690.7)
+(512.8)
+(486.2)
+Cash Flows - Financing Activities
+Change in notes payable
+551.4
+71.7
+(1,158.6)
+Issuance of long-term debt
+2,203.7
+1,576.5
+1,638.1
+Payment of long-term debt
+(3,140.9)
+(2,609.0)
+(1,396.7)
+Debt exchange participation incentive cash payment
+-
+(201.4)
+-
+Proceeds from common stock issued on exercised options
+161.7
+74.3
+263.4
+Purchases of common stock for treasury
+(876.8)
+(301.4)
+(3.4)
+Dividends paid
+(1,244.5)
+(1,246.4)
+(1,195.8)
+Distributions to noncontrolling and redeemable interest holders
+(129.8)
+(48.9)
+(72.5)
+Other, net
+(28.0)
+(30.9)
+(16.0)
+Net cash used by financing activities
+(2,503.2)
+(2,715.5)
+(1,941.5)
+Effect of exchange rate changes on cash and cash equivalents
+(58.0)
+72.5
+(20.7)
+(Decrease) increase in cash and cash equivalents
+(935.8)
+(172.6)
+1,227.8
+Cash and cash equivalents - beginning of year
+1,505.2
+1,677.8
+450.0
+Cash and cash equivalents - end of year
+$
+569.4
+$
+1,505.2
+$
+1,677.8
+Cash flow from changes in current assets and liabilities, excluding the effects of acquisition and
+ divestitures:
+Receivables
+$
+(166.3)
+$
+27.9
+$
+37.9
+Inventories
+(85.8)
+(354.7)
+103.1
+Prepaid expenses and other current assets
+(35.3)
+(42.7)
+94.2
+Accounts payable
+456.7
+343.1
+392.5
+Other current liabilities
+108.1
+(129.5)
+166.2
+Changes in current assets and liabilities
+$
+277.4
+$
+(155.9)
+$
+793.9
+See accompanying notes to consolidated financial statements.

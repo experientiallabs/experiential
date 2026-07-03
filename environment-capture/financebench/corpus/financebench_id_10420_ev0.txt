@@ -1,0 +1,172 @@
+128 
+Consolidated Balance Sheets
+December 31, 2022 and 2021
+2022
+2021
+(in millions, except share and per share data)
+ASSETS
+CURRENT ASSETS
+Cash and cash equivalents
+$
+1,374 
+$
+943 
+Restricted cash
+536 
+304 
+Short-term investments
+730 
+232 
+Accounts receivable, net of allowance for doubtful accounts of $5 and $5, respectively
+1,799 
+1,418 
+Inventory
+1,055 
+604 
+Prepaid expenses
+98 
+142 
+Other current assets, net of CECL allowance of $2 and $0, respectively
+1,533 
+897 
+Current held-for-sale assets
+518 
+816 
+Total current assets
+7,643 
+5,356 
+NONCURRENT ASSETS
+Property, Plant and Equipment:
+Land
+470 
+426 
+Electric generation, distribution assets and other
+26,599 
+25,552 
+Accumulated depreciation
+(8,651)
+(8,486)
+Construction in progress
+4,621 
+2,414 
+Property, plant and equipment, net
+23,039 
+19,906 
+Other Assets:
+Investments in and advances to affiliates
+952 
+1,080 
+Debt service reserves and other deposits
+177 
+237 
+Goodwill
+362 
+1,177 
+Other intangible assets, net of accumulated amortization of $434 and $385, respectively
+1,841 
+1,450 
+Deferred income taxes
+319 
+409 
+Loan receivable, net of allowance of $26
+1,051 
+ 
+Other noncurrent assets, net of allowance of $51 and $23, respectively
+2,979 
+2,188 
+Noncurrent held-for-sale assets
+ 
+1,160 
+Total other assets
+7,681 
+7,701 
+TOTAL ASSETS
+$
+38,363 
+$
+32,963 
+LIABILITIES AND EQUITY
+CURRENT LIABILITIES
+Accounts payable
+$
+1,730 
+$
+1,153 
+Accrued interest
+249 
+182 
+Accrued non-income taxes
+249 
+266 
+Accrued and other liabilities
+2,151 
+1,205 
+Non-recourse debt, including $416 and $302, respectively, related to variable interest entities
+1,758 
+1,367 
+Current held-for-sale liabilities
+354 
+559 
+Total current liabilities
+6,491 
+4,732 
+NONCURRENT LIABILITIES
+Recourse debt
+3,894 
+3,729 
+Non-recourse debt, including $2,295 and $2,223, respectively, related to variable interest entities
+17,846 
+13,603 
+Deferred income taxes
+1,139 
+977 
+Other noncurrent liabilities
+3,168 
+3,358 
+Noncurrent held-for-sale liabilities
+ 
+740 
+Total noncurrent liabilities
+26,047 
+22,407 
+Commitments and Contingencies (see Notes 12 and 13)
+Redeemable stock of subsidiaries
+1,321 
+1,257 
+EQUITY
+THE AES CORPORATION STOCKHOLDERS EQUITY
+Preferred stock (without par value, 50,000,000 shares authorized; 1,043,050 issued and outstanding at December 31, 2022 and
+December 31, 2021)
+838 
+838 
+Common stock ($0.01 par value, 1,200,000,000 shares authorized; 818,790,001 issued and 668,743,464 outstanding at December
+31, 2022 and 818,717,043 issued and 666,793,625 outstanding at December 31, 2021)
+8 
+8 
+Additional paid-in capital
+6,688 
+7,106 
+Accumulated deficit
+(1,635)
+(1,089)
+Accumulated other comprehensive loss
+(1,640)
+(2,220)
+Treasury stock, at cost (150,046,537 and 151,923,418 shares at December 31, 2022 and December 31, 2021, respectively)
+(1,822)
+(1,845)
+Total AES Corporation stockholders equity
+2,437 
+2,798 
+NONCONTROLLING INTERESTS
+2,067 
+1,769 
+Total equity
+4,504 
+4,567 
+TOTAL LIABILITIES AND EQUITY
+$
+38,363 
+$
+32,963 
+See Accompanying Notes to Consolidated Financial Statements.

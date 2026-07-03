@@ -1,0 +1,77 @@
+3M Company and Subsidiaries
+Consolidated Statement of Cash Flows
+Years ended December 31
+(Millions)
+2022
+2021
+2020
+Cash Flows from Operating Activities
+Net income including noncontrolling interest
+$
+5,791 $
+5,929 $
+5,453 
+Adjustments to reconcile net income including noncontrolling interest to net cash provided by operating
+activities
+Depreciation and amortization
+1,831 
+1,915 
+1,911 
+Long-lived and indefinite-lived asset impairment expense
+618 
+ 
+6 
+Goodwill impairment expense
+271 
+ 
+ 
+Company pension and postretirement contributions
+(158)
+(180)
+(156)
+Company pension and postretirement expense
+178 
+206 
+322 
+Stock-based compensation expense
+263 
+274 
+262 
+Gain on business divestitures
+(2,724)
+ 
+(389)
+Deferred income taxes
+(663)
+(166)
+(165)
+Changes in assets and liabilities
+Accounts receivable
+(105)
+(122)
+165 
+Inventories
+(629)
+(903)
+(91)
+Accounts payable
+111 
+518 
+252 
+Accrued income taxes (current and long-term)
+(47)
+(244)
+132 
+Other net
+854 
+227 
+411 
+Net cash provided by (used in) operating activities
+5,591 
+7,454 
+8,113 
+Cash Flows from Investing Activities
+Purchases of property, plant and equipment (PP&E)
+(1,749)
+(1,603)
+(1,501)

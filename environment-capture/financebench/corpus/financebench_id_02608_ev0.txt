@@ -1,0 +1,211 @@
+Table of Contents
+Consolidated Statements of Earnings
+$ and shares in millions, except per share amounts
+Fiscal Years Ended
+
+January 28, 2017 
+January 30, 2016 
+January 31, 2015
+Revenue
+ $
+39,403
+ $
+39,528
+ $
+40,339
+Costofgoodssold
+
+29,963
+
+30,334
+
+31,292
+Restructuringchargescostofgoodssold
+
+
+
+3
+
+
+Grossprofit
+
+9,440
+
+9,191
+
+9,047
+Selling,generalandadministrativeexpenses
+
+7,547
+
+7,618
+
+7,592
+Restructuringcharges
+
+39
+
+198
+
+5
+Operatingincome
+
+1,854
+
+1,375
+
+1,450
+Otherincome(expense)
+ 
+ 
+ 
+Gainonsaleofinvestments
+
+3
+
+2
+
+13
+Investmentincomeandother
+
+31
+
+13
+
+14
+Interestexpense
+
+(72) 
+(80) 
+(90)
+Earningsfromcontinuingoperationsbeforeincometaxexpense
+
+1,816
+
+1,310
+
+1,387
+Incometaxexpense
+
+609
+
+503
+
+141
+Netearningsfromcontinuingoperations
+
+1,207
+
+807
+
+1,246
+Gain(loss)fromdiscontinuedoperations(Note2),netoftaxexpenseof$7,$1and$0
+
+21
+
+90
+
+(11)
+Netearningsincludingnoncontrollinginterests
+
+1,228
+
+897
+
+1,235
+Netearningsfromdiscontinuedoperationsattributabletononcontrollinginterests
+
+
+
+
+
+(2)
+NetearningsattributabletoBestBuyCo.,Inc.shareholders
+ $
+1,228
+ $
+897
+ $
+1,233
+
+ 
+ 
+ 
+Basicearnings(loss)pershareattributabletoBestBuyCo.,Inc.shareholders
+ 
+ 
+ 
+Continuingoperations
+ $
+3.79
+ $
+2.33
+ $
+3.57
+Discontinuedoperations
+
+0.07
+
+0.26
+
+(0.04)
+Basicearningspershare
+ $
+3.86
+ $
+2.59
+ $
+3.53
+
+ 
+ 
+ 
+Dilutedearnings(loss)pershareattributabletoBestBuyCo.,Inc.shareholders
+ 
+ 
+ 
+Continuingoperations
+ $
+3.74
+ $
+2.30
+ $
+3.53
+Discontinuedoperations
+
+0.07
+
+0.26
+
+(0.04)
+Dilutedearningspershare
+ $
+3.81
+ $
+2.56
+ $
+3.49
+
+ 
+ 
+ 
+Weighted-averagecommonsharesoutstanding
+ 
+ 
+ 
+Basic
+
+318.5
+
+346.5
+
+349.5
+Diluted
+
+322.6
+
+350.7
+
+353.6
+SeeNotestoConsolidatedFinancialStatements.
+54

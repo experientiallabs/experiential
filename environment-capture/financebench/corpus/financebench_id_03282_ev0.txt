@@ -1,0 +1,132 @@
+Table of Contents
+NETFLIX, INC.
+CONSOLIDATED BALANCE SHEETS
+(in thousands, except share and per share data)
+ 
+ 
+ 
+As of December 31,
+ 
+ 
+2017
+ 
+2016
+Assets
+ 
+ 
+Current assets:
+ 
+ 
+Cash and cash equivalents
+ $
+2,822,795 $
+1,467,576
+Short-term investments
+ 
+ 
+266,206
+Current content assets, net
+ 
+4,310,934 
+3,726,307
+Other current assets
+ 
+536,245 
+260,202
+Total current assets
+ 
+7,669,974 
+5,720,291
+Non-current content assets, net
+ 
+10,371,055 
+7,274,501
+Property and equipment, net
+ 
+319,404 
+250,395
+Other non-current assets
+ 
+652,309 
+341,423
+Total assets
+ $
+19,012,742 $
+13,586,610
+Liabilities and Stockholders Equity
+ 
+ 
+Current liabilities:
+ 
+ 
+Current content liabilities
+ $
+4,173,041 $
+3,632,711
+Accounts payable
+ 
+359,555 
+312,842
+Accrued expenses
+ 
+315,094 
+197,632
+Deferred revenue
+ 
+618,622 
+443,472
+Total current liabilities
+ 
+5,466,312 
+4,586,657
+Non-current content liabilities
+ 
+3,329,796 
+2,894,654
+Long-term debt
+ 
+6,499,432 
+3,364,311
+Other non-current liabilities
+ 
+135,246 
+61,188
+Total liabilities
+ 
+15,430,786 
+10,906,810
+Commitments and contingencies (Note 5)
+ 
+ 
+Stockholders equity:
+ 
+ 
+Preferred stock, $0.001 par value; 10,000,000 shares authorized at December 31, 2017 and 2016; no shares
+issued and outstanding at December 31, 2017 and 2016
+ 
+ 
+
+Common stock, $0.001 par value; 4,990,000,000 shares authorized at December 31, 2017 and December 31,
+2016, respectively; 433,392,686 and 430,054,212 issued and outstanding at December 31, 2017 and
+December 31, 2016, respectively
+ 
+1,871,396 
+1,599,762
+Accumulated other comprehensive loss
+ 
+(20,557) 
+(48,565)
+Retained earnings
+ 
+1,731,117 
+1,128,603
+Total stockholders equity
+ 
+3,581,956 
+2,679,800
+Total liabilities and stockholders equity
+ $
+19,012,742 $
+13,586,610
+See accompanying notes to consolidated financial statements.
+43

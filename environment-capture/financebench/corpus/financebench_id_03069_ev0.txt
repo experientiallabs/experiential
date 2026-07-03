@@ -1,0 +1,112 @@
+ITEM 8.
+FINANCIAL STATEMENTS AND SUPPLEMENTARY DATA
+Advanced Micro Devices, Inc.
+Consolidated Statements of Operations
+ 
+ 
+Year Ended
+ 
+December 26,
+ 
+2015
+ 
+December 27,
+ 
+2014
+ 
+December 28,
+ 
+2013
+ 
+(In millions, except per share amounts)
+Net revenue
+$
+3,991 $
+5,506 $
+5,299 
+Cost of sales
+2,911 
+3,667 
+3,321 
+Gross margin
+1,080 
+1,839 
+1,978 
+Research and development
+947 
+1,072 
+1,201 
+Marketing, general and administrative
+482 
+604 
+674 
+Amortization of acquired intangible assets
+3 
+14 
+18 
+Restructuring and other special charges, net
+129 
+71 
+30 
+Goodwill impairment charge
+ 
+233 
+ 
+Legal settlements, net
+ 
+ 
+(48)
+Operating income (loss)
+(481) 
+(155) 
+103 
+Interest expense
+(160) 
+(177) 
+(177)
+Other expense, net
+(5) 
+(66) 
+ 
+Loss before income taxes
+(646) 
+(398) 
+(74)
+Provision for income taxes
+14 
+5 
+9 
+Net loss
+$
+(660) $
+(403) $
+(83)
+Net loss per share
+ 
+ 
+ 
+Basic
+$
+(0.84) $
+(0.53) $
+(0.11)
+Diluted
+$
+(0.84) $
+(0.53) $
+(0.11)
+Shares used in per share calculation
+ 
+ 
+ 
+Basic
+783 
+768 
+754 
+Diluted
+783 
+768 
+754 
+See accompanying notes to consolidated financial statements.
+ 
+54

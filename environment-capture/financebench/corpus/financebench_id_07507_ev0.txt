@@ -1,0 +1,145 @@
+Table of Contents
+62
+ADOBE SYSTEMS INCORPORATED
+CONSOLIDATED STATEMENTS OF INCOME
+(In thousands, except per share data)
+ 
+Years Ended
+ 
+December 2,
+2016
+November 27,
+2015
+November 28,
+2014
+Revenue:
+ 
+Subscription
+$
+4,584,833
+$
+3,223,904
+$
+2,076,584
+Product
+800,498
+1,125,146
+1,627,803
+Services and support
+469,099
+446,461
+442,678
+Total revenue
+5,854,430
+4,795,511
+4,147,065
+ 
+Cost of revenue:
+Subscription
+461,860
+409,194
+335,432
+Product
+68,917
+90,035
+97,099
+Services and support
+289,131
+245,088
+189,549
+Total cost of revenue
+819,908
+744,317
+622,080
+ 
+Gross profit
+5,034,522
+4,051,194
+3,524,985
+ 
+Operating expenses:
+Research and development
+975,987
+862,730
+844,353
+Sales and marketing
+1,910,197
+1,683,242
+1,652,308
+General and administrative
+577,710
+531,919
+543,332
+Restructuring and other charges
+(1,508)
+1,559
+19,883
+Amortization of purchased intangibles
+78,534
+68,649
+52,424
+Total operating expenses
+3,540,920
+3,148,099
+3,112,300
+ 
+Operating income
+1,493,602
+903,095
+412,685
+ 
+Non-operating income (expense):
+Interest and other income (expense), net
+13,548
+33,909
+7,267
+Interest expense
+(70,442)
+(64,184)
+(59,732)
+Investment gains (losses), net
+(1,570)
+961
+1,156
+Total non-operating income (expense), net
+(58,464)
+(29,314)
+(51,309)
+Income before income taxes
+1,435,138
+873,781
+361,376
+Provision for income taxes
+266,356
+244,230
+92,981
+Net income
+$
+1,168,782
+$
+629,551
+$
+268,395
+Basic net income per share
+$
+2.35
+$
+1.26
+$
+0.54
+Shares used to compute basic net income per share
+498,345
+498,764
+497,867
+Diluted net income per share
+$
+2.32
+$
+1.24
+$
+0.53
+Shares used to compute diluted net income per share
+504,299
+507,164
+508,480
+ See accompanying Notes to Consolidated Financial Statements.

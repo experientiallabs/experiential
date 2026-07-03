@@ -1,0 +1,166 @@
+Table of Contents
+Consolidated Balance Sheets
+$ in millions, except per share and share amounts
+
+
+February 2, 2019
+
+February 3, 2018
+Assets
+ 
+ 
+Current assets
+ 
+ 
+Cashandcashequivalents
+ $
+1,980 $
+1,101
+Short-terminvestments
+
+ 
+2,032
+Receivables,net
+
+1,015 
+1,049
+Merchandiseinventories
+
+5,409 
+5,209
+Othercurrentassets
+
+466 
+438
+Totalcurrentassets
+
+8,870 
+9,829
+Property and equipment
+ 
+ 
+Landandbuildings
+
+637 
+623
+Leaseholdimprovements
+
+2,119 
+2,327
+Fixturesandequipment
+
+5,865 
+5,410
+Propertyundercapitalandfinancingleases
+
+579 
+340
+Grosspropertyandequipment
+
+9,200 
+8,700
+Lessaccumulateddepreciation
+
+6,690 
+6,279
+Netpropertyandequipment
+
+2,510 
+2,421
+Goodwill
+
+915 
+425
+Other assets
+
+606 
+374
+Total assets
+ $
+12,901 $
+13,049
+
+ 
+ 
+Liabilities and equity
+ 
+ 
+Current liabilities
+ 
+ 
+Accountspayable
+ $
+5,257 $
+4,873
+Unredeemedgiftcardliabilities
+
+290 
+385
+Deferredrevenue
+
+446 
+453
+Accruedcompensationandrelatedexpenses
+
+482 
+561
+Accruedliabilities
+
+982 
+1,001
+Currentportionoflong-termdebt
+
+56 
+544
+Totalcurrentliabilities
+
+7,513 
+7,817
+Long-term liabilities
+
+750 
+809
+Long-term debt
+
+1,332 
+811
+Contingencies and commitments (Note 13)
+
+
+Equity
+ 
+ 
+BestBuyCo.,Inc.Shareholders'Equity
+ 
+ 
+Preferredstock,$1.00parvalue:Authorized400,000shares;Issuedandoutstandingnone
+
+ 
+
+Commonstock,$0.10parvalue:Authorized1.0billionshares;Issuedandoutstanding265,703,000and
+282,988,000shares,respectively
+
+27 
+28
+Additionalpaid-incapital
+
+ 
+
+Retainedearnings
+
+2,985 
+3,270
+Accumulatedothercomprehensiveincome
+
+294 
+314
+Totalequity
+
+3,306 
+3,612
+Total liabilities and equity
+ $
+12,901 $
+13,049
+SeeNotestoConsolidatedFinancialStatements.
+50

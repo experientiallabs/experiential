@@ -42,9 +42,9 @@ uv run pytest -q
    reusable harness behavior.
 
 5. **The top level is an allowlist.** Tracked top-level directories are exactly: `wmh/`,
-   `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`. Do not add others
-   (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...). `wmh/repo_layout_test.py`
-   enforces this. What each surface is for:
+   `examples/`, `docs/`, `assets/`, `web/`, `environment-capture/`, `.agents/`, `.claude/`,
+   `.github/`. Do not add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
+   `wmh/repo_layout_test.py` enforces this. What each surface is for:
    - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
      (completed research writeups + the one figure each renders) and `docs/reference/` (how-to
      references verified against main). Nothing else: raw result JSONs, vector sources, design
@@ -67,6 +67,13 @@ uv run pytest -q
    - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
      its own gate instead: `npm run lint` and `npx tsc --noEmit` from `web/` must be clean
      before every commit that touches it.
+   - `environment-capture/` — a uv workspace member that runs benchmarks for real and records
+     agent-environment transitions as OTel GenAI JSONL (extraction-ready: its
+     `environment_capture` package never imports `wmh`, except the one round-trip test pinning
+     the wire format). It IS part of the Python gate. Per-benchmark data dirs inside it
+     (`environment-capture/<benchmark>/`) follow the examples/ pattern: committed
+     `traces.otel.jsonl` + provenance README + thin scripts; heavy deps and cloned upstreams
+     stay in local, gitignored venvs (their out-of-process `backend/` scripts are ty-excluded).
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.

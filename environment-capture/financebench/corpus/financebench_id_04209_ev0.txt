@@ -1,0 +1,118 @@
+Table of Contents
+COSTCO WHOLESALE CORPORATION
+CONSOLIDATED BALANCE SHEETS
+(amounts in millions, except par value and share data)
+August 29,
+2021
+August 30,
+2020
+ASSETS
+CURRENT ASSETS
+Cash and cash equivalents
+$
+11,258 
+$
+12,277 
+Short-term investments
+917 
+1,028 
+Receivables, net
+1,803 
+1,550 
+Merchandise inventories
+14,215 
+12,242 
+Other current assets
+1,312 
+1,023 
+Total current assets
+29,505 
+28,120 
+OTHER ASSETS
+Property and equipment, net
+23,492 
+21,807 
+Operating lease right-of-use assets
+2,890 
+2,788 
+Other long-term assets
+3,381 
+2,841 
+TOTAL ASSETS
+$
+59,268 
+$
+55,556 
+LIABILITIES AND EQUITY
+CURRENT LIABILITIES
+Accounts payable
+$
+16,278 
+$
+14,172 
+Accrued salaries and benefits
+4,090 
+3,605 
+Accrued member rewards
+1,671 
+1,393 
+Deferred membership fees
+2,042 
+1,851 
+Current portion of long-term debt
+799 
+95 
+Other current liabilities
+4,561 
+3,728 
+Total current liabilities
+29,441 
+24,844 
+OTHER LIABILITIES
+Long-term debt, excluding current portion
+6,692 
+7,514 
+Long-term operating lease liabilities
+2,642 
+2,558 
+Other long-term liabilities
+2,415 
+1,935 
+TOTAL LIABILITIES
+41,190 
+36,851 
+COMMITMENTS AND CONTINGENCIES
+EQUITY
+Preferred stock $0.01 par value; 100,000,000 shares authorized; no shares issued and
+outstanding
+ 
+ 
+Common stock $0.01 par value; 900,000,000 shares authorized; 441,825,000 and
+441,255,000 shares issued and outstanding
+4 
+4 
+Additional paid-in capital
+7,031 
+6,698 
+Accumulated other comprehensive loss
+(1,137)
+(1,297)
+Retained earnings
+11,666 
+12,879 
+Total Costco stockholders equity
+17,564 
+18,284 
+Noncontrolling interests
+514 
+421 
+TOTAL EQUITY
+18,078 
+18,705 
+TOTAL LIABILITIES AND EQUITY
+$
+59,268 
+$
+55,556 
+The accompanying notes are an integral part of these consolidated financial statements.
+38

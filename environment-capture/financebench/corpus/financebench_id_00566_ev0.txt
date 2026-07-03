@@ -1,0 +1,103 @@
+At December 31,
+Maturities 
+Interest 
+Rates %
+2022
+2021 
+Verizon Communications
+< 5 Years
+0.75 - 5.82
+$ 
+23,929 
+$ 
+18,406 
+5-10 Years
+1.50 - 7.88
+42,637 
+43,225 
+> 10 Years
+1.13 - 8.95
+60,134 
+73,520 
+< 5 Years
+Floating
+(1) 
+2,992 
+4,086 
+5-10 Years
+Floating
+(1) 
+3,029 
+824 
+Alltel Corporation
+5-10 Years
+6.80 - 7.88
+94 
+38 
+> 10 Years
+N/A
+N/A 
+58 
+Operating telephone company subsidiariesdebentures
+< 5 Years
+N/A
+N/A 
+141 
+5-10 Years
+6.00 - 8.75
+475 
+375 
+> 10 Years
+5.13 - 7.38
+139 
+250 
+Other subsidiariesasset-backed debt
+< 5 Years
+0.41 - 5.72
+9,767 
+9,620 
+< 5 Years
+Floating
+(2) 
+10,271 
+4,610 
+Finance lease obligations (average rate of 2.5% and 2.2% in 
+2022 and 2021, respectively)
+1,732 
+1,325 
+Unamortized discount, net of premium
+(4,039) 
+(4,922) 
+Unamortized debt issuance costs
+(671) 
+(688) 
+Total long-term debt, including current maturities
+150,489 
+150,868 
+Less long-term debt maturing within one year
+9,813 
+7,443 
+Total long-term debt
+$ 
+140,676 
+$ 
+143,425 
+Long-term debt maturing within one year
+$ 
+9,813 
+$ 
+7,443 
+Add commercial paper
+150 
+ 
+Debt maturing within one year
+9,963 
+7,443 
+Add long-term debt
+140,676 
+143,425 
+Total debt
+$ 
+150,639 
+$ 
+150,868

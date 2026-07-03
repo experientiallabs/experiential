@@ -1,0 +1,1 @@
+{"gold_sql": "SELECT COUNT(id) FROM superhero WHERE full_name IS NULL"}

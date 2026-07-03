@@ -1,0 +1,1 @@
+{"gold_sql": "SELECT COUNT(Id) FROM users WHERE date(LastAccessDate) > '2014-09-01'"}

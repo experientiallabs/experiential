@@ -1,0 +1,135 @@
+Table of Contents
+Consolidated Statement of Cash Flows
+PepsiCo, Inc. and Subsidiaries
+Fiscal years ended December 25, 2021, December 26, 2020 and December 28, 2019
+(in millions)
+2021
+2020
+2019
+Operating Activities
+Net income
+$
+7,679 $
+7,175 $
+7,353 
+Depreciation and amortization
+2,710 
+2,548 
+2,432 
+Operating lease right-of-use asset amortization
+505 
+478 
+412 
+Share-based compensation expense
+301 
+264 
+237 
+Restructuring and impairment charges
+247 
+289 
+370 
+Cash payments for restructuring charges
+(256)
+(255)
+(350)
+Acquisition and divestiture-related charges
+(4)
+255 
+55 
+Cash payments for acquisition and divestiture-related charges
+(176)
+(131)
+(10)
+Pension and retiree medical plan expenses
+123 
+408 
+519 
+Pension and retiree medical plan contributions
+(785)
+(562)
+(716)
+Deferred income taxes and other tax charges and credits
+298 
+361 
+453 
+Tax expense/(benefit) related to the TCJ Act
+190 
+ 
+(8)
+Tax payments related to the TCJ Act
+(309)
+(78)
+(423)
+Change in assets and liabilities:
+Accounts and notes receivable
+(651)
+(420)
+(650)
+Inventories
+(582)
+(516)
+(190)
+Prepaid expenses and other current assets
+159 
+26 
+(87)
+Accounts payable and other current liabilities
+1,762 
+766 
+735 
+Income taxes payable
+30 
+(159)
+(287)
+Other, net
+375 
+164 
+(196)
+Net Cash Provided by Operating Activities
+11,616 
+10,613 
+9,649 
+Investing Activities
+Capital spending
+(4,625)
+(4,240)
+(4,232)
+Sales of property, plant and equipment
+166 
+55 
+170 
+Acquisitions, net of cash acquired, and investments in noncontrolled affiliates
+(61)
+(6,372)
+(2,717)
+Divestitures and sales of investments in noncontrolled affiliates
+169 
+6 
+253 
+Short-term investments, by original maturity:
+More than three months - purchases
+ 
+(1,135)
+ 
+More than three months - maturities
+1,135 
+ 
+16 
+More than three months - sales
+ 
+ 
+62 
+Three months or less, net
+(58)
+27 
+19 
+Other investing, net
+5 
+40 
+(8)
+Net Cash Used for Investing Activities
+(3,269)
+(11,619)
+(6,437)
+(Continued on following page)
+61

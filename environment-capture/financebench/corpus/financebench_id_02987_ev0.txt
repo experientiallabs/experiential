@@ -1,0 +1,146 @@
+Table of Contents
+ACTIVISION BLIZZARD, INC. AND SUBSIDIARIES
+CONSOLIDATED BALANCE SHEETS
+(Amounts in millions, except share data)
+ 
+At December 31, 2019
+ 
+At December 31, 2018
+Assets
+ 
+ 
+Current assets:
+ 
+ 
+Cash and cash equivalents
+$
+5,794
+ $
+4,225
+Accounts receivable, net of allowances of $132 and $190, at December 31, 2019 and December 31, 2018, respectively
+848
+ 
+1,035
+Inventories, net
+32
+ 
+43
+Software development
+322
+ 
+264
+Other current assets
+296
+ 
+539
+Total current assets
+7,292
+ 
+6,106
+Software development
+54
+ 
+65
+Property and equipment, net
+253
+ 
+282
+Deferred income taxes, net
+1,293
+ 
+458
+Other assets
+658
+ 
+482
+Intangible assets, net
+531
+ 
+735
+Goodwill
+9,764
+ 
+9,762
+Total assets
+$
+19,845
+ $
+17,890
+ 
+ 
+ 
+Liabilities and Shareholders Equity
+ 
+ 
+Current liabilities:
+ 
+ 
+Accounts payable
+$
+292
+ $
+253
+Deferred revenues
+1,375
+ 
+1,493
+Accrued expenses and other liabilities
+1,248
+ 
+896
+Total current liabilities
+2,915
+ 
+2,642
+Long-term debt, net
+2,675
+ 
+2,671
+Deferred income taxes, net
+505
+ 
+18
+Other liabilities
+945
+ 
+1,167
+Total liabilities
+7,040
+ 
+6,498
+Commitments and contingencies (Note 23)
+ 
+Shareholders equity:
+ 
+ 
+ 
+Common stock, $0.000001 par value, 2,400,000,000 shares authorized, 1,197,436,644 and 1,192,093,991 shares issued at
+December 31, 2019 and December 31, 2018, respectively
+
+ 
+
+Additional paid-in capital
+11,174
+ 
+10,963
+Less: Treasury stock, at cost, 428,676,471 shares at December 31, 2019 and December 31, 2018
+(5,563) 
+(5,563)
+Retained earnings
+7,813
+ 
+6,593
+Accumulated other comprehensive loss
+(619) 
+(601)
+Total shareholders equity
+12,805
+ 
+11,392
+Total liabilities and shareholders equity
+$
+19,845
+ $
+17,890
+The accompanying notes are an integral part of these Consolidated Financial Statements.
+F-4

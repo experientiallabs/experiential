@@ -28,6 +28,8 @@ otel = ["opentelemetry-proto>=1.24"]
 # Plotting/figures for research runs; kept out of the core install.
 viz = ["seaborn>=0.13", "matplotlib>=3.8"]
 dev = [
+    # Workspace member: benchmark adapters + real-run trace capture (environment-capture/).
+    "environment-capture[bedrock,fetch]",
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
@@ -44,10 +46,16 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["wmh"]
 
+[tool.uv.workspace]
+members = ["environment-capture"]
+
+[tool.uv.sources]
+environment-capture = { workspace = true }
+
 [tool.pytest.ini_options]
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
-testpaths = ["wmh"]
+testpaths = ["wmh", "environment-capture"]
 
 [tool.ruff]
 line-length = 100
@@ -63,6 +71,11 @@ select = ["E", "F", "I", "UP", "B", "ANN", "BLE"]
 python-version = "3.11"
 
 [tool.ty.src]
-# `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
-# (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
-exclude = ["examples/", ".agents/"]
+# The appworld/gaia2 `backend/` scripts import heavy engines that live only in those
+# benchmarks' local venvs (not project dependencies) — excluded like examples/.
+exclude = [
+    "examples/",
+    ".agents/",
+    "environment-capture/appworld/backend/",
+    "environment-capture/gaia2/backend/",
+]

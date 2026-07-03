@@ -1,0 +1,30 @@
+Exhibit 99.1
+Johnson & Johnson Announces Updated Financials and 2023 Guidance Following Completion of the Kenvue
+Separation
+
+Company expects increased 2023 Reported Sales Growth of 7.0% - 8.0%, Operational Sales Growth of 7.5% - 8.5%, and
+Adjusted Operational Sales Growth of 6.2% - 7.2%; Figures exclude the COVID-19 Vaccine
+
+Company expects 2023 Adjusted Reported Earnings Per Share (EPS) of $10.00 - $10.10, reflecting increased growth of
+12.5% at the mid-point and Adjusted Operational EPS of $9.90 - $10.00, reflecting increased growth of 11.5% at the mid-
+point
+
+Company reduced outstanding share count by approximately 191 million; 2023 guidance reflects only a partial-year benefit
+of approximately 73.5 million shares or $0.28 benefit to EPS
+
+Company secured $13.2 billion in cash proceeds from the Kenvue debt offering and initial public offering and maintains 9.5%
+of equity stake in Kenvue
+
+Company maintains its quarterly dividend of $1.19 per share
+New Brunswick, N.J. (August 30, 2023) Johnson & Johnson (NYSE: JNJ) (the Company) today announced updates to its financials and
+2023 guidance which reflect its operations as a company focused on transformational innovation in Pharmaceutical and MedTech. The
+Company has published a recorded webinar for investors to provide additional context behind the updated financials and 2023 guidance
+found in this release, which may be accessed by visiting the Investors section of the Company's website at webcasts & presentations.
+The completion of this transaction uniquely positions Johnson & Johnson as a Pharmaceutical and MedTech company focused on delivering
+transformative healthcare solutions to patients, said Joaquin Duato, Chairman of the Board and Chief Executive Officer. We are incredibly
+proud of the focus and dedication of our employees worldwide to achieve this milestone, which we are confident will unlock near- and long-
+term value for all of our stakeholders.
+As previously announced, the Company recently completed an exchange offer to finalize the separation of Kenvue Inc., formerly Johnson &
+Johnsons Consumer Health business. As a result of the completion of the exchange offer, Johnson & Johnson will now present its
+Consumer Health business financial results as discontinued operations, including a gain of approximately $20 billion in the third quarter of
+2023.

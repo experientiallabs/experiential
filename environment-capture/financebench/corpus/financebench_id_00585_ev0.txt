@@ -1,0 +1,77 @@
+The Boeing Company and Subsidiaries
+Consolidated Statements of Operations
+(Dollars in millions, except per share data)
+ 
+ 
+ 
+Years ended December 31,
+2022
+2021
+2020
+Sales of products
+$55,893 
+$51,386 
+$47,142 
+Sales of services
+10,715 
+10,900 
+11,016 
+Total revenues
+66,608 
+62,286 
+58,158 
+Cost of products
+(53,969)
+(49,954)
+(54,568)
+Cost of services
+(9,109)
+(9,283)
+(9,232)
+Boeing Capital interest expense
+(28)
+(32)
+(43)
+Total costs and expenses
+(63,106)
+(59,269)
+(63,843)
+3,502 
+3,017 
+(5,685)
+(Loss)/income from operating investments, net
+(16)
+210 
+9 
+General and administrative expense
+(4,187)
+(4,157)
+(4,817)
+Research and development expense, net
+(2,852)
+(2,249)
+(2,476)
+Gain on dispositions, net
+6 
+277 
+202 
+Loss from operations
+(3,547)
+(2,902)
+(12,767)
+Other income, net
+1,058 
+551 
+447 
+Interest and debt expense
+(2,533)
+(2,682)
+(2,156)
+Loss before income taxes
+(5,022)
+(5,033)
+(14,476)
+Income tax (expense)/benefit
+(31)
+743 
+2,535

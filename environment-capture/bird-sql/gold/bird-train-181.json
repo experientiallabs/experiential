@@ -1,0 +1,1 @@
+{"gold_sql": "SELECT CAST(SUM(status = 'C') AS REAL) * 100 / COUNT(account_id) FROM loan WHERE amount < 100000"}

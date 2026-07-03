@@ -1,0 +1,20 @@
+[project]
+name = "environment-capture"
+version = "0.1.0"
+description = "Run benchmarks for real and record agent-environment transitions as OTel GenAI JSONL."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+bedrock = ["boto3>=1.34"]
+# Fetching a benchmark's heavy shared dataset from HuggingFace (e.g. continual-learning's ~400 MB
+# products.db); kept out of the core install so CI never pulls it.
+fetch = ["huggingface_hub>=0.23"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["environment_capture"]

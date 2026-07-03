@@ -1,0 +1,65 @@
+3M Company and Subsidiaries
+Consolidated Balance Sheet
+At December 31
+(Dollars in millions, except per share amount)
+2022
+2021
+Assets
+Current assets
+Cash and cash equivalents
+$
+3,655 $
+4,564 
+Marketable securities current
+238 
+201 
+Accounts receivable net of allowances of $174 and $189
+4,532 
+4,660 
+Inventories
+Finished goods
+2,497 
+2,196 
+Work in process
+1,606 
+1,577 
+Raw materials and supplies
+1,269 
+1,212 
+Total inventories
+5,372 
+4,985 
+Prepaids
+435 
+654 
+Other current assets
+456 
+339 
+Total current assets
+14,688 
+15,403 
+Property, plant and equipment
+25,998 
+27,213 
+Less: Accumulated depreciation
+(16,820)
+(17,784)
+Property, plant and equipment net
+9,178 
+9,429 
+Operating lease right of use assets
+829 
+858 
+Goodwill
+12,790 
+13,486 
+Intangible assets net
+4,699 
+5,288 
+Other assets
+4,271 
+2,608 
+Total assets
+$
+46,455 $
+47,072

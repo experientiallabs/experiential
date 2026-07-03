@@ -1,0 +1,24 @@
+Derivative Instruments 
+We enter into derivative transactions primarily to manage our exposure to fluctuations in foreign currency exchange rates and interest rates. 
+We employ risk management strategies, which may include the use of a variety of derivatives including interest rate swaps, cross currency 
+swaps, forward starting interest rate swaps, treasury rate locks, interest rate caps, swaptions and foreign exchange forwards. We do not hold 
+derivatives for trading purposes. 
+The following table sets forth the notional amounts of our outstanding derivative instruments: 
+(dollars in millions) 
+At December 31,
+2021
+2020 
+Interest rate swaps
+$ 
+19,779 
+$ 
+17,768 
+Cross currency swaps
+32,502 
+26,288 
+Forward starting interest rate swaps
+1,000 
+2,000 
+Foreign exchange forwards
+932 
+1,405

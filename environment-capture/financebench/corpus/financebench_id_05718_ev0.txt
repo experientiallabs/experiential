@@ -1,0 +1,201 @@
+Table of Contents
+American Water Works Company, Inc. and Subsidiary Companies
+Consolidated Statements of Cash Flows
+(In millions)
+ 
+For the Years Ended December 31,
+ 
+2020
+2019
+2018
+CASH FLOWS FROM OPERATING ACTIVITIES
+ 
+ 
+ 
+Net income
+$
+709 
+$
+621 
+$
+565 
+Adjustments to reconcile to net cash flows provided by operating activities:
+ 
+ 
+ 
+Depreciation and amortization
+604 
+582 
+545 
+Deferred income taxes and amortization of investment tax credits
+207 
+208 
+195 
+Provision for losses on accounts receivable
+34 
+28 
+33 
+Loss (gain) on asset dispositions and purchases
+ 
+34 
+(20)
+Impairment charge
+ 
+ 
+57 
+Pension and non-pension postretirement benefits
+(14)
+17 
+23 
+Other non-cash, net
+(20)
+(41)
+20 
+Changes in assets and liabilities:
+ 
+ 
+ 
+Receivables and unbilled revenues
+(97)
+(25)
+(17)
+Pension and non-pension postretirement benefit contributions
+(39)
+(31)
+(22)
+Accounts payable and accrued liabilities
+(2)
+66 
+25 
+Other assets and liabilities, net
+44 
+(72)
+22 
+Impact of Freedom Industries settlement activities
+ 
+(4)
+(40)
+Net cash provided by operating activities
+1,426 
+1,383 
+1,386 
+CASH FLOWS FROM INVESTING ACTIVITIES
+ 
+ 
+ 
+Capital expenditures
+(1,822)
+(1,654)
+(1,586)
+Acquisitions, net of cash acquired
+(135)
+(235)
+(398)
+Proceeds from sale of assets
+2 
+48 
+35 
+Removal costs from property, plant and equipment retirements, net
+(106)
+(104)
+(87)
+Net cash used in investing activities
+(2,061)
+(1,945)
+(2,036)
+CASH FLOWS FROM FINANCING ACTIVITIES
+ 
+ 
+ 
+Proceeds from long-term debt
+1,334 
+1,530 
+1,358 
+Repayments of long-term debt
+(342)
+(495)
+(526)
+Proceeds from term loan
+500 
+ 
+ 
+Net short-term borrowings with maturities less than three months
+(5)
+(178)
+60 
+Issuance of common stock
+ 
+ 
+183 
+Proceeds from issuances of employee stock plans and direct stock purchase plan, net of taxes paid of $17, $11
+and $8 in 2020, 2019 and 2018, respectively
+9 
+15 
+16 
+Advances and contributions in aid of construction, net of refunds of $24, $30 and $22 in 2020, 2019
+and 2018, respectively
+28 
+26 
+21 
+Debt issuance costs and make-whole premium on early debt redemption
+(15)
+(15)
+(22)
+Dividends paid
+(389)
+(353)
+(319)
+Anti-dilutive share repurchases
+ 
+(36)
+(45)
+Net cash provided by financing activities
+1,120 
+494 
+726 
+Net increase (decrease) in cash, cash equivalents and restricted funds
+485 
+(68)
+76 
+Cash, cash equivalents and restricted funds at beginning of period
+91 
+159 
+83 
+Cash, cash equivalents and restricted funds at end of period
+$
+576 
+$
+91 
+$
+159 
+Cash paid during the year for:
+ 
+ 
+ 
+Interest, net of capitalized amount
+$
+382 
+$
+383 
+$
+332 
+Income taxes, net of refunds of $2, $4 and $0 in 2020, 2019 and 2018, respectively
+$
+7 
+$
+12 
+$
+38 
+Non-cash investing activity:
+ 
+ 
+ 
+Capital expenditures acquired on account but unpaid as of year end
+$
+221 
+$
+235 
+$
+181 
+The accompanying notes are an integral part of these Consolidated Financial Statements.
+84

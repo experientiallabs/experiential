@@ -1,0 +1,143 @@
+Lockheed Martin Corporation
+Consolidated Statements of Earnings
+(in millions, except per share data)
+ 
+ 
+Years Ended December 31,
+2022
+2021
+2020
+Net sales
+Products
+$ 
+55,466 $ 
+56,435 $ 
+54,928 
+Services
+ 
+10,518 
+10,609 
+10,470 
+Total net sales
+ 
+65,984 
+67,044 
+65,398 
+Cost of sales
+Products
+ 
+(49,577) 
+(50,273) 
+(48,996) 
+Services
+ 
+(9,280) 
+(9,463) 
+(9,371) 
+Severance and other charges
+ 
+(100) 
+(36) 
+(27) 
+Other unallocated, net
+ 
+1,260 
+1,789 
+1,650 
+Total cost of sales
+ 
+(57,697) 
+(57,983) 
+(56,744) 
+Gross profit
+ 
+8,287 
+9,061 
+8,654 
+Other income (expense), net
+ 
+61 
+62 
+(10) 
+Operating profit
+ 
+8,348 
+9,123 
+8,644 
+Interest expense
+ 
+(623) 
+(569) 
+(591) 
+Non-service FAS pension (expense) income
+ 
+(971) 
+(1,292) 
+219 
+Other non-operating (expense) income, net
+ 
+(74) 
+288 
+(37) 
+Earnings from continuing operations before income taxes
+ 
+6,680 
+7,550 
+8,235 
+Income tax expense
+ 
+(948) 
+(1,235) 
+(1,347) 
+Net earnings from continuing operations
+ 
+5,732 
+6,315 
+6,888 
+Net loss from discontinued operations
+ 
+ 
+ 
+(55) 
+Net earnings
+$ 
+5,732 $ 
+6,315 $ 
+6,833 
+ 
+Earnings (loss) per common share
+Basic
+Continuing operations
+$ 
+21.74 $ 
+22.85 $ 
+24.60 
+Discontinued operations
+ 
+ 
+ 
+(0.20) 
+Basic earnings per common share
+$ 
+21.74 $ 
+22.85 $ 
+24.40 
+Diluted
+Continuing operations
+$ 
+21.66 $ 
+22.76 $ 
+24.50 
+Discontinued operations
+ 
+ 
+ 
+(0.20) 
+Diluted earnings per common share
+$ 
+21.66 $ 
+22.76 $ 
+24.30 
+The accompanying notes are an integral part of these consolidated financial statements.
+Table of Contents 
+63

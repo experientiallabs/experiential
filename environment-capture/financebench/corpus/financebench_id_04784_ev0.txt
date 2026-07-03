@@ -1,0 +1,196 @@
+WalmartInc.
+ConsolidatedStatementsofIncome
+ 
+ 
+FiscalYearsEndedJanuary31,
+(Amounts in millions, except per share data)
+ 
+2019
+ 
+2018
+ 
+2017
+Revenues:
+ 
+ 
+ 
+Net sales
+ $
+510,329
+ $
+495,761
+ $
+481,317
+Membership and other income
+ 
+4,076
+ 
+4,582
+ 
+4,556
+Total revenues
+ 
+514,405
+ 
+500,343
+ 
+485,873
+Costsandexpenses:
+ 
+ 
+ 
+Cost of sales
+ 
+385,301
+ 
+373,396
+ 
+361,256
+Operating, selling, general and administrative expenses
+ 
+107,147
+ 
+106,510
+ 
+101,853
+Operatingincome
+ 
+21,957
+ 
+20,437
+ 
+22,764
+Interest:
+ 
+ 
+ 
+Debt
+ 
+1,975
+ 
+1,978
+ 
+2,044
+Capital lease and financing obligations
+ 
+371
+ 
+352
+ 
+323
+Interest income
+ 
+(217) 
+(152) 
+(100)
+Interest, net
+ 
+2,129
+ 
+2,178
+ 
+2,267
+Loss on extinguishment of debt
+ 
+
+ 
+3,136
+ 
+
+Other (gains) and losses
+ 
+8,368
+ 
+
+ 
+
+Incomebeforeincometaxes
+ 
+11,460
+ 
+15,123
+ 
+20,497
+Provision for income taxes
+ 
+4,281
+ 
+4,600
+ 
+6,204
+Consolidatednetincome
+ 
+7,179
+ 
+10,523
+ 
+14,293
+Consolidatednetincomeattributabletononcontrollinginterest
+ 
+(509) 
+(661) 
+(650)
+ConsolidatednetincomeattributabletoWalmart
+ $
+6,670
+ $
+9,862
+ $
+13,643
+ 
+ 
+ 
+ 
+Netincomepercommonshare:
+ 
+ 
+ 
+BasicnetincomepercommonshareattributabletoWalmart
+ $
+2.28
+ $
+3.29
+ $
+4.40
+DilutednetincomepercommonshareattributabletoWalmart
+ 
+2.26
+ 
+3.28
+ 
+4.38
+ 
+ 
+ 
+ 
+Weighted-averagecommonsharesoutstanding:
+ 
+ 
+ 
+Basic
+ 
+2,929
+ 
+2,995
+ 
+3,101
+Diluted
+ 
+2,945
+ 
+3,010
+ 
+3,112
+ 
+ 
+ 
+ 
+Dividendsdeclaredpercommonshare
+ $
+2.08
+ $
+2.04
+ $
+2.00
+See accompanying notes.
+48

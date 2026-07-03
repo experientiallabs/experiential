@@ -1,0 +1,131 @@
+The Kraft Heinz Company
+Consolidated Balance Sheets
+(in millions, except per share data)
+ 
+December 28, 2019 December 29, 2018
+ASSETS
+ 
+ 
+Cash and cash equivalents
+$
+2,279 $
+1,130
+Trade receivables (net of allowances of $33 at December 28, 2019 and $24 at December 29, 2018)
+1,973 
+2,129
+Income taxes receivable
+173 
+152
+Inventories
+2,721 
+2,667
+Prepaid expenses
+384 
+400
+Other current assets
+445 
+1,221
+Assets held for sale
+122 
+1,376
+Total current assets
+8,097 
+9,075
+Property, plant and equipment, net
+7,055 
+7,078
+Goodwill
+35,546 
+36,503
+Intangible assets, net
+48,652 
+49,468
+Other non-current assets
+2,100 
+1,337
+TOTAL ASSETS
+$
+101,450 $
+103,461
+LIABILITIES AND EQUITY
+ 
+ 
+Commercial paper and other short-term debt
+$
+6 $
+21
+Current portion of long-term debt
+1,022 
+377
+Trade payables
+4,003 
+4,153
+Accrued marketing
+647 
+722
+Interest payable
+384 
+408
+Other current liabilities
+1,804 
+1,767
+Liabilities held for sale
+9 
+55
+Total current liabilities
+7,875 
+7,503
+Long-term debt
+28,216 
+30,770
+Deferred income taxes
+11,878 
+12,202
+Accrued postemployment costs
+273 
+306
+Other non-current liabilities
+1,459 
+902
+TOTAL LIABILITIES
+49,701 
+51,683
+Commitments and Contingencies (Note 17)
+ 
+Redeemable noncontrolling interest
+ 
+3
+Equity:
+ 
+ 
+Common stock, $0.01 par value (5,000 shares authorized; 1,224 shares issued and 1,221 shares outstanding at December 28, 2019;
+1,224 shares issued and 1,220 shares outstanding at December 29, 2018)
+12 
+12
+Additional paid-in capital
+56,828 
+58,723
+Retained earnings/(deficit)
+(3,060) 
+(4,853)
+Accumulated other comprehensive income/(losses)
+(1,886) 
+(1,943)
+Treasury stock, at cost (3 shares at December 28, 2019 and 4 shares at December 29, 2018)
+(271) 
+(282)
+Total shareholders' equity
+51,623 
+51,657
+Noncontrolling interest
+126 
+118
+TOTAL EQUITY
+51,749 
+51,775
+TOTAL LIABILITIES AND EQUITY
+$
+101,450 $
+103,461
+See accompanying notes to the consolidated financial statements.
+47

@@ -1,0 +1,97 @@
+THE COCA-COLA COMPANY AND SUBSIDIARIES
+CONSOLIDATED STATEMENTS OF INCOME
+(In millions except per share data)
+Year Ended December 31,
+2021
+2020
+2019
+Net Operating Revenues
+$
+38,655 $
+33,014 $
+37,266 
+Cost of goods sold
+15,357 
+13,433 
+14,619 
+Gross Profit
+23,298 
+19,581 
+22,647 
+Selling, general and administrative expenses
+12,144 
+9,731 
+12,103 
+Other operating charges
+846 
+853 
+458 
+Operating Income
+10,308 
+8,997 
+10,086 
+Interest income
+276 
+370 
+563 
+Interest expense
+1,597 
+1,437 
+946 
+Equity income (loss) net
+1,438 
+978 
+1,049 
+Other income (loss) net
+2,000 
+841 
+34 
+Income Before Income Taxes
+12,425 
+9,749 
+10,786 
+Income taxes
+2,621 
+1,981 
+1,801 
+Consolidated Net Income
+9,804 
+7,768 
+8,985 
+Less: Net income (loss) attributable to noncontrolling interests
+33 
+21 
+65 
+Net Income Attributable to Shareowners of The Coca-Cola Company
+$
+9,771 $
+7,747 $
+8,920 
+Basic Net Income Per Share
+$
+2.26 $
+1.80 $
+2.09 
+Diluted Net Income Per Share
+$
+2.25 $
+1.79 $
+2.07 
+Average Shares Outstanding Basic
+4,315 
+4,295 
+4,276 
+Effect of dilutive securities
+25 
+28 
+38 
+Average Shares Outstanding Diluted
+4,340 
+4,323 
+4,314 
+Calculated based on net income attributable to shareowners of The Coca-Cola Company.
+Refer to Notes to Consolidated Financial Statements.
+1
+1
+1 
+60

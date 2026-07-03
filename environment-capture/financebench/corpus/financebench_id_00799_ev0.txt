@@ -1,0 +1,149 @@
+Amcor plc and Subsidiaries
+Consolidated Balance Sheets
+($ in millions, except share and per share data)
+As of June 30,
+2023
+2022
+Assets
+Current assets:
+Cash and cash equivalents
+$
+689 
+$
+775 
+Trade receivables, net of allowance for credit losses of $21 and $25, respectively
+1,875 
+1,935 
+Inventories, net
+Raw materials and supplies
+992 
+1,114 
+Work in process and finished goods
+1,221 
+1,325 
+Prepaid expenses and other current assets
+531 
+512 
+Assets held for sale, net
+ 
+192 
+Total current assets
+5,308 
+5,853 
+Non-current assets:
+Property, plant, and equipment, net
+3,762 
+3,646 
+Operating lease assets
+533 
+560 
+Deferred tax assets
+134 
+130 
+Other intangible assets, net
+1,524 
+1,657 
+Goodwill
+5,366 
+5,285 
+Employee benefit assets
+67 
+89 
+Other non-current assets
+309 
+206 
+Total non-current assets
+11,695 
+11,573 
+Total assets
+$
+17,003 
+$
+17,426 
+Liabilities
+Current liabilities:
+Current portion of long-term debt
+$
+13 
+$
+14 
+Short-term debt
+80 
+136 
+Trade payables
+2,690 
+3,073 
+Accrued employee costs
+396 
+471 
+Other current liabilities
+1,297 
+1,344 
+Liabilities held for sale
+ 
+65 
+Total current liabilities
+4,476 
+5,103 
+Non-current liabilities:
+Long-term debt, less current portion
+6,653 
+6,340 
+Operating lease liabilities
+463 
+493 
+Deferred tax liabilities
+616 
+677 
+Employee benefit obligations
+224 
+201 
+Other non-current liabilities
+481 
+471 
+Total non-current liabilities
+8,437 
+8,182 
+Total liabilities
+$
+12,913 
+$
+13,285 
+Commitments and contingencies (See Note 20)
+Shareholders' Equity
+Amcor plc shareholders equity:
+Ordinary shares ($0.01 par value):
+Authorized (9,000 million shares)
+Issued (1,448 and 1,489 million shares, respectively)
+$
+14 
+$
+15 
+Additional paid-in capital
+4,021 
+4,431 
+Retained earnings
+865 
+534 
+Accumulated other comprehensive loss
+(862)
+(880)
+Treasury shares (1 and 2 million shares, respectively)
+(12)
+(18)
+Total Amcor plc shareholders' equity
+4,026 
+4,082 
+Non-controlling interests
+64 
+59 
+Total shareholders' equity
+4,090 
+4,141 
+Total liabilities and shareholders' equity
+$
+17,003 
+$
+17,426 
+See accompanying notes to consolidated financial statements.
+5

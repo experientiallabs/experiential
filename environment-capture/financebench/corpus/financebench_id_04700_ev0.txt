@@ -1,0 +1,236 @@
+Table of Contents
+ 
+PART II
+Item 8
+ 
+ITEM 8. FINANCIAL STATEMENTS AND SUPPLEMENTARY DATA
+INCOME STATEMENTS
+ 
+(In millions, except per share amounts)
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Year Ended June 30,
+ 
+2016 
+2015 
+2014 
+Revenue:
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Product
+ 
+$ 61,502 
+$ 75,956 
+$ 72,948 
+Service and other
+ 
+ 
+23,818 
+ 
+17,624 
+ 
+13,885 
+ 
+ 
+Total revenue
+ 
+ 
+85,320 
+ 
+93,580 
+ 
+86,833 
+ 
+ 
+Cost of revenue:
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Product
+ 
+ 
+17,880 
+ 
+21,410 
+ 
+16,681 
+Service and other
+ 
+ 
+14,900 
+ 
+11,628 
+ 
+10,397 
+ 
+ 
+Total cost of revenue
+ 
+ 
+32,780 
+ 
+33,038 
+ 
+27,078 
+ 
+ 
+Gross margin
+ 
+ 
+52,540 
+ 
+60,542 
+ 
+59,755 
+Research and development
+ 
+ 
+11,988 
+ 
+12,046 
+ 
+11,381 
+Sales and marketing
+ 
+ 
+14,697 
+ 
+15,713 
+ 
+15,811 
+General and administrative
+ 
+ 
+4,563 
+ 
+4,611 
+ 
+4,677 
+Impairment, integration, and restructuring
+ 
+ 
+1,110 
+ 
+10,011 
+ 
+127 
+ 
+ 
+Operating income
+ 
+ 
+20,182 
+ 
+18,161 
+ 
+27,759 
+Other income (expense), net
+ 
+ 
+(431) 
+ 
+346 
+ 
+61 
+ 
+ 
+Income before income taxes
+ 
+ 
+19,751 
+ 
+18,507 
+ 
+27,820 
+Provision for income taxes
+ 
+ 
+2,953 
+ 
+6,314 
+ 
+5,746 
+ 
+ 
+Net income
+ 
+$ 16,798 
+$ 12,193 
+$ 22,074 
+ 
+ 
+ 
+ 
+Earnings per share:
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Basic
+ 
+$
+2.12 
+$
+1.49 
+$
+2.66 
+Diluted
+ 
+$
+2.10 
+$
+1.48 
+$
+2.63 
+Weighted average shares outstanding:
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Basic
+ 
+ 
+7,925 
+ 
+8,177 
+ 
+8,299 
+Diluted
+ 
+ 
+8,013 
+ 
+8,254 
+ 
+8,399 
+Cash dividends declared per common share
+ 
+$
+1.44 
+$
+1.24 
+$
+1.12 
+See accompanying notes.
+ 
+52

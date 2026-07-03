@@ -1,0 +1,165 @@
+Advanced Micro Devices, Inc.
+Consolidated Statements of Cash Flows
+Year Ended
+December 31,
+2022
+December 25,
+2021
+December 26,
+2020
+(In millions)
+Cash flows from operating activities:
+Net income
+$
+1,320 
+$
+3,162 
+$
+2,490 
+Adjustments to reconcile net income to net cash provided by operating activities:
+Depreciation and amortization
+4,174 
+407 
+312 
+Stock-based compensation
+1,081 
+379 
+274 
+Amortization of debt discount and issuance costs
+ 
+5 
+14 
+Amortization of operating lease right-of-use assets
+88 
+56 
+42 
+Amortization of inventory fair value adjustment
+189 
+ 
+ 
+Loss on debt redemption, repurchase and conversion
+ 
+7 
+54 
+Loss on sale or disposal of property and equipment
+16 
+34 
+33 
+Deferred income taxes
+(1,505)
+308 
+(1,223)
+(Gains) losses on equity investments, net
+62 
+(56)
+(2)
+Other
+(14)
+(7)
+8 
+Changes in operating assets and liabilities:
+Accounts receivable, net
+(1,091)
+(640)
+(219)
+Inventories
+(1,401)
+(556)
+(417)
+Receivables from related parties
+(13)
+8 
+10 
+Prepaid expenses and other assets
+(1,197)
+(920)
+(231)
+Payables to related parties
+379 
+7 
+(135)
+Accounts payable
+931 
+801 
+(513)
+Accrued liabilities and other
+546 
+526 
+574 
+Net cash provided by operating activities
+3,565 
+3,521 
+1,071 
+Cash flows from investing activities:
+Purchases of property and equipment
+(450)
+(301)
+(294)
+Purchases of short-term investments
+(2,667)
+(2,056)
+(850)
+Proceeds from maturity of short-term investments
+4,310 
+1,678 
+192 
+Cash received from acquisition of Xilinx
+2,366 
+ 
+ 
+Acquisition of Pensando, net of cash acquired
+(1,544)
+ 
+ 
+Other
+(16)
+(7)
+ 
+Net cash provided by (used in) investing activities
+1,999 
+(686)
+(952)
+Cash flows from financing activities:
+Proceeds from debt, net of issuance costs
+991 
+ 
+200 
+Repayment of debt
+(312)
+ 
+(200)
+Proceeds from sales of common stock through employee equity plans
+167 
+104 
+85 
+Repurchases of common stock
+(3,702)
+(1,762)
+ 
+Common stock repurchases for tax withholding on employee equity plans
+(406)
+(237)
+(78)
+Other
+(2)
+ 
+(1)
+Net cash (used in) provided by financing activities
+(3,264)
+(1,895)
+6 
+Net increase in cash and cash equivalents
+2,300 
+940 
+125 
+Cash and cash equivalents at beginning of year
+2,535 
+1,595 
+1,470 
+Cash and cash equivalents at end of year
+$
+4,835 
+$
+2,535 
+$
+1,595

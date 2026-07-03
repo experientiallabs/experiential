@@ -1,0 +1,120 @@
+Consolidated Balance Sheets
+ 
+December 31,
+2022
+December 25,
+2021
+ 
+(In millions, except par value amounts)
+ASSETS
+Current assets:
+Cash and cash equivalents
+$
+4,835 
+$
+2,535 
+Short-term investments
+1,020 
+1,073 
+Accounts receivable, net
+4,126 
+2,706 
+Inventories
+3,771 
+1,955 
+Receivables from related parties
+2 
+2 
+Prepaid expenses and other current assets
+1,265 
+312 
+Total current assets
+15,019 
+8,583 
+Property and equipment, net
+1,513 
+702 
+Operating lease right-of-use assets
+460 
+367 
+Goodwill
+24,177 
+289 
+Acquisition-related intangibles
+24,118 
+ 
+Investment: equity method
+83 
+69 
+Deferred tax assets
+58 
+931 
+Other non-current assets
+2,152 
+1,478 
+Total assets
+$
+67,580 
+$
+12,419 
+LIABILITIES AND STOCKHOLDERS EQUITY
+Current liabilities:
+Accounts payable
+$
+2,493 
+$
+1,321 
+Payables to related parties
+463 
+85 
+Accrued liabilities
+3,077 
+2,424 
+Current portion of long-term debt, net
+ 
+312 
+Other current liabilities
+336 
+98 
+Total current liabilities
+6,369 
+4,240 
+Long-term debt, net of current portion
+2,467 
+1 
+Long-term operating lease liabilities
+396 
+348 
+Deferred tax liabilities
+1,934 
+12 
+Other long-term liabilities
+1,664 
+321 
+Commitments and Contingencies (see Notes 16 and 17)
+Stockholders equity:
+Capital stock:
+Common stock, par value $0.01; shares authorized: 2,250; shares issued: 1,645 and 1,232; shares
+outstanding: 1,612 and 1,207
+16 
+12 
+Additional paid-in capital
+58,005 
+11,069 
+Treasury stock, at cost (shares held: 33 and 25)
+(3,099)
+(2,130)
+Accumulated deficit
+(131)
+(1,451)
+Accumulated other comprehensive loss
+(41)
+(3)
+Total stockholders equity
+54,750 
+7,497 
+Total liabilities and stockholders equity
+$
+67,580 
+$
+12,419

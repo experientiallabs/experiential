@@ -1,0 +1,5 @@
+{
+  "answer": "CO",
+  "reward_metric": "exact_match",
+  "task_type": "best_region_identification"
+}

@@ -1,0 +1,178 @@
+Advanced Micro Devices, Inc.
+Consolidated Statements of Cash Flows 
+ 
+Year Ended
+ 
+December 26,
+ 
+2015
+ 
+December 27,
+ 
+2014
+ 
+December 28,
+ 
+2013
+ 
+(In millions)
+Cash flows from operating activities:
+ 
+ 
+ 
+Net loss
+$
+(660) $
+(403) $
+(83)
+Adjustments to reconcile net loss to net cash used in operating activities:
+ 
+ 
+ 
+Depreciation and amortization
+167 
+203 
+236 
+Net loss on disposal of property, plant and equipment
+ 
+ 
+31 
+Stock-based compensation expense
+63 
+81 
+91 
+Non-cash interest expense
+11 
+17 
+25 
+Goodwill impairment charge
+ 
+233 
+ 
+Restructuring and other special charges, net
+83 
+14 
+ 
+Net loss on debt redemptions
+ 
+61 
+1 
+Other
+(3) 
+(13) 
+(1)
+Changes in operating assets and liabilities:
+ 
+ 
+ 
+Accounts receivable
+280 
+7 
+(200)
+Inventories
+(11) 
+199 
+(322)
+Prepayments and other - GLOBALFOUNDRIES
+84 
+(113) 
+ 
+Prepaid expenses and other assets
+(111) 
+(7) 
+(103)
+Accounts payables, accrued liabilities and other
+(156) 
+(231) 
+266 
+Payable to GLOBALFOUNDRIES
+27 
+(146) 
+(89)
+Net cash used in operating activities
+(226) 
+(98) 
+(148)
+Cash flows from investing activities:
+ 
+ 
+ 
+Purchases of available-for-sale securities
+(227) 
+(790) 
+(1,043)
+Purchases of property, plant and equipment
+(96) 
+(95) 
+(84)
+Proceeds from sales and maturities of available-for-sale securities
+462 
+873 
+1,344 
+Proceeds from sale of property, plant and equipment
+8 
+ 
+238 
+Net cash provided by (used in) investing activities
+147 
+(12) 
+455 
+Cash flows from financing activities:
+ 
+ 
+ 
+Proceeds from borrowings, net
+100 
+1,155 
+55 
+Proceeds from issuance of common stock
+5 
+4 
+3 
+Repayments of long-term debt and capital lease obligations
+(44) 
+(1,115) 
+(55)
+Other
+(2) 
+2 
+10 
+Net cash provided by financing activities
+59 
+46 
+13 
+Net increase (decrease) in cash and cash equivalents
+(20) 
+(64) 
+320 
+Cash and cash equivalents at beginning of year
+805 
+869 
+549 
+Cash and cash equivalents at end of year
+$
+785 $
+805 $
+869 
+Supplemental disclosures of cash flow information:
+ 
+ 
+ 
+Cash paid during the year for:
+ 
+ 
+ 
+Interest
+$
+149 $
+138 $
+152 
+Income taxes
+$
+3 $
+7 $
+9 
+See accompanying notes to consolidated financial statements.
+ 
+ 
+58

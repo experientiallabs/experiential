@@ -1,0 +1,43 @@
+Fair value level
+June 30, 2023
+December 31, 2022
+(In thousands)
+Cash and cash equivalents:
+Money market funds
+Level 1
+$
+2,195 
+$
+12,009 
+Commercial paper and certificates of deposit
+Level 2
+ 
+5,992 
+Cash and cash equivalents
+2,195 
+18,001 
+Short-term investments:
+U.S. government securities
+Level 1
+57,696 
+56,835 
+U.S. agency securities
+Level 2
+29,049 
+9,530 
+Commercial paper and certificates of deposit
+Level 2
+4,561 
+4,466 
+Corporate bonds
+Level 2
+416,420 
+213,875 
+Short-term investments
+507,726 
+284,706 
+Total debt investments
+$
+509,921 
+$
+302,707
