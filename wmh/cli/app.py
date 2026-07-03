@@ -357,7 +357,6 @@ def build(
             )
 
 
-
 def _verify_or_abort(config: HarnessConfig) -> None:
     """Ping the serve provider (and any provider-backed embedder) and abort on failure.
 
