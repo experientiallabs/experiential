@@ -42,9 +42,10 @@ uv run pytest -q
    reusable harness behavior.
 
 5. **The top level is an allowlist.** Tracked top-level directories are exactly: `wmh/`,
-   `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`. Do not add others
-   (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...). `wmh/repo_layout_test.py`
-   enforces this. What each surface is for:
+   `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`, plus the
+   monorepo package members `llm-waterfall/` and `environment-capture/` (see § Monorepo). Do not
+   add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
+   `wmh/repo_layout_test.py` enforces this. What each surface is for:
    - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
      (completed research writeups + the one figure each renders) and `docs/reference/` (how-to
      references verified against main). Nothing else: raw result JSONs, vector sources, design
@@ -70,6 +71,9 @@ uv run pytest -q
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
+   - `llm-waterfall/` — workspace member: stateless LLM failover (own PyPI package).
+   - `environment-capture/` — workspace member (pre-authorized; lands via its own PR):
+     benchmark adapters + real-run trace capture emitting OTel GenAI JSONL (own PyPI package).
 
 6. **Keep dataset-specific logic inside examples.** SWE-bench, tau-bench, terminal-task, and similar
    dataset-specific launch or conversion logic belongs under `examples/<task>/`. A standard example
@@ -135,6 +139,28 @@ uv run pytest -q
     The published figures under `docs/` (e.g. `docs/research/trace_scaling_law.png`) are the visual
     reference. (`.agents/scripts/plot_trace_scaling.py` shows one way to produce them, but
     `.agents/` contents are disposable — the palette above is the contract, not that script.)
+
+## Monorepo
+
+This repo is a **uv workspace** monorepo. The root `pyproject.toml` is the `wmh` flagship
+package (its quickstart is unchanged: clone → `uv sync` → `uv run wmh ...`), and each member is
+a top-level directory with its own `pyproject.toml`, its own version, and its own PyPI release.
+Rules of the road:
+
+- **Membership**: `[tool.uv.workspace].members` in the root pyproject; anything inside the
+  workspace that depends on a member resolves it from source via `[tool.uv.sources]`
+  (`{ workspace = true }`), never from PyPI.
+- **Dependency arrows**: members never import `wmh`, and `wmh` depends on members only through
+  their public, published APIs. Members must be installable and usable standalone.
+- **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
+  `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
+  `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in
+  its own `[tool.ruff]`/`[tool.ty]` tables (ruff resolves the closest config). `web/` keeps its
+  own separate JS gate (rule 5).
+- **Publishing**: each member releases to PyPI independently (`uv build`/`uv publish` from the
+  member dir); version bumps are per-member commits.
+- **One way to do each thing** (rule 13) applies across the workspace: if a capability exists in
+  a member, `wmh` consumes it rather than growing a parallel copy.
 
 ## Docs
 

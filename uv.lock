@@ -13,6 +13,12 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "llm-waterfall",
+    "world-model-harness",
+]
+
 [[package]]
 name = "annotated-doc"
 version = "0.0.4"
@@ -662,6 +668,56 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/52/7d/7157f9bba6b455cfb4632ed411e199fc8b8977642c2b12082e1bd9e6d173/kiwisolver-1.5.0-pp311-pypy311_pp73-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:daae526907e262de627d8f70058a0f64acc9e2641c164c99c8f594b34a799a16", size = 77603, upload-time = "2026-03-09T13:15:50.945Z" },
     { url = "https://files.pythonhosted.org/packages/0a/dd/8050c947d435c8d4bc94e3252f4d8bb8a76cfb424f043a8680be637a57f1/kiwisolver-1.5.0-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:59cd8683f575d96df5bb48f6add94afc055012c29e28124fcae2b63661b9efb1", size = 73558, upload-time = "2026-03-09T13:15:52.112Z" },
 ]
+
+[[package]]
+name = "llm-waterfall"
+version = "0.1.3"
+source = { editable = "llm-waterfall" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.optional-dependencies]
+all = [
+    { name = "anthropic" },
+    { name = "boto3" },
+    { name = "openai" },
+]
+anthropic = [
+    { name = "anthropic" },
+]
+azure = [
+    { name = "openai" },
+]
+bedrock = [
+    { name = "boto3" },
+]
+dev = [
+    { name = "anthropic" },
+    { name = "boto3" },
+    { name = "openai" },
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "ty" },
+]
+openai = [
+    { name = "openai" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.39" },
+    { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.34" },
+    { name = "llm-waterfall", extras = ["all"], marker = "extra == 'dev'", editable = "llm-waterfall" },
+    { name = "llm-waterfall", extras = ["openai", "anthropic", "bedrock", "azure"], marker = "extra == 'all'", editable = "llm-waterfall" },
+    { name = "openai", marker = "extra == 'azure'", specifier = ">=1.40" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40" },
+    { name = "pydantic", specifier = ">=2.6" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
+]
+provides-extras = ["openai", "anthropic", "bedrock", "azure", "all", "dev"]
 
 [[package]]
 name = "markdown-it-py"
@@ -1539,6 +1595,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "llm-waterfall", extra = ["all"] },
     { name = "matplotlib" },
     { name = "opentelemetry-proto" },
     { name = "pytest" },
@@ -1562,6 +1619,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "gepa", specifier = ">=0.1.1" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "llm-waterfall", extras = ["all"], marker = "extra == 'dev'", editable = "llm-waterfall" },
     { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "openai", specifier = ">=1.40" },

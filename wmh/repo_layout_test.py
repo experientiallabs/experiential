@@ -17,7 +17,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # AGENTS.md rule 5: tracked top-level directories must be within this set. The allowlist may
 # exceed the current tree (web/ and .github/ are decided-but-not-yet-landed surfaces): it bounds
 # what MAY exist, it does not require existence.
-ALLOWED_TOP_DIRS = {"wmh", "examples", "docs", "assets", "web", ".agents", ".claude", ".github"}
+ALLOWED_TOP_DIRS = {
+    "wmh",
+    "examples",
+    "docs",
+    "assets",
+    "web",
+    ".agents",
+    ".claude",
+    ".github",
+    # Monorepo workspace members (AGENTS.md § Monorepo):
+    "llm-waterfall",
+    "environment-capture",
+}
 
 
 @functools.lru_cache(maxsize=1)
@@ -98,3 +110,20 @@ def test_no_tracked_file_is_matched_by_ignore_rules() -> None:
         f"tracked files matched by ignore rules: {offenders[:5]}; fix the .gitignore pattern "
         "(add a ! negation or narrow the glob) so tracked artifacts stay re-addable"
     )
+
+
+def test_workspace_members_are_real_packages() -> None:
+    """Every [tool.uv.workspace] member dir that exists must carry its own pyproject.toml."""
+    import tomllib
+
+    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        root = tomllib.load(fh)
+    members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members", [])
+    assert members, "the workspace must declare its members (AGENTS.md § Monorepo)"
+    for member in members:
+        member_dir = REPO_ROOT / member
+        if member_dir.exists():
+            assert (member_dir / "pyproject.toml").is_file(), (
+                f"workspace member {member!r} has no pyproject.toml; every member is an "
+                "independently packaged, publishable unit (AGENTS.md § Monorepo)"
+            )
