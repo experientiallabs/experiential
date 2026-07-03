@@ -894,17 +894,16 @@ def scenarios_verify(
     """
     scenario_set = ScenarioSet.load(scenarios_file)
     traces = get_adapter("otel-genai").from_file(file)
-    store = WorldModelStore(root)
-    resolved_name = _resolve_name(store, name)
-    model_dir = store.resolve(resolved_name)
     if provider is not None or model is not None:
+        store = WorldModelStore(root)
+        model_dir = store.resolve(_resolve_name(store, name))
         override = _provider_config(
             provider or "bedrock", model or "us.anthropic.claude-opus-4-8", region
         )
-        llm = providers.get_provider(override)
+        llm = RetryingProvider(providers.get_provider(override))
         world_model = WorldModel.load(str(model_dir), llm)
     else:
-        world_model, llm = load_world_model(model_dir)
+        world_model, _resolved_name, llm = _load_model(name, root)
 
     report = verify_scenarios(
         scenario_set,
