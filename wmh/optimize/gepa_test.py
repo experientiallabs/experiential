@@ -157,6 +157,22 @@ def test_optimize_runs_bounded_loop_and_returns_valid_frontier() -> None:
     assert judge.calls > 0
 
 
+def test_optimize_reports_real_metric_call_budget_via_on_budget() -> None:
+    # Progress bars must be sized by the TRANSLATED metric-call budget, not the iteration count:
+    # sizing by iterations made `wmh build` show 100% while GEPA was still burning valset calls.
+    from wmh.optimize.gepa import _metric_call_budget
+
+    seen: list[int] = []
+    opt = GEPAOptimizer(FakeProvider(), FakeJudge(score=0.5), on_budget=seen.append)
+    budget = 5
+
+    opt.optimize([_trace("tr1"), _trace("tr2")], [_trace("te1")], "BASE", budget)
+
+    # trainset = 2 traces x 2 steps -> minibatch 3; valset = 1 trace x 2 steps.
+    assert seen == [_metric_call_budget(budget, valset_size=2, minibatch=3)]
+    assert seen[0] > budget  # the whole point: the real total exceeds the iteration count
+
+
 def test_optimize_can_retrieve_from_separate_rag_corpus() -> None:
     from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 

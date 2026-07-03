@@ -128,11 +128,17 @@ def build(
     # GEPA evolves the env prompt under serving conditions: it retrieves demos the same way the
     # world model will, but from a SEPARATE retriever it re-indexes over train-only (so held-out
     # steps never retrieve themselves). The embedder is stateless, so it's safe to share.
-    report.optimize_start(config.gepa_budget)
-    budget = config.gepa_budget
+    # The progress total is GEPA's REAL translated metric-call budget (reported via on_budget),
+    # not the iteration count — sizing the bar with iterations made it hit 100% while thousands
+    # of valset calls were still running.
+    metric_total = {"calls": config.gepa_budget}
+
+    def _on_budget(total: int) -> None:
+        metric_total["calls"] = total
+        report.optimize_start(total)
 
     def _on_rollout(done: int, score: float | None) -> None:
-        report.rollout(done, budget, score)
+        report.rollout(done, metric_total["calls"], score)
 
     # Optimize against the SAME scorer we evaluate with (RubricJudge), so GEPA hill-climbs the
     # metric we actually report. The coarser LLMJudge here would let GEPA improve a proxy objective
@@ -142,14 +148,40 @@ def build(
         RubricJudge(provider),
         retriever=EmbeddingRetriever(embed),
         on_rollout=_on_rollout,
+        on_budget=_on_budget,
     )
-    result = optimizer.optimize(train, test or train, BASE_ENV_PROMPT, config.gepa_budget)
+    # Every GEPA iteration re-scores the whole valset, so an uncapped held-out split multiplies
+    # wall-clock and spend by its step count for no selection benefit (fidelity saturates fast —
+    # see docs/trace_scaling_law.md). Candidate selection only needs a stable sample; the full
+    # held-out split still backs `wmh eval`.
+    gepa_val = _cap_gepa_valset(test or train)
+    result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
     report.optimize_done(
         result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used
     )
 
     _persist(paths, config, retriever, result)
     return result
+
+
+# Ceiling on GEPA's candidate-selection valset, in steps (~one full-val pass per iteration).
+_GEPA_VAL_STEP_CAP = 64
+
+
+def _cap_gepa_valset(traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP) -> list[Trace]:
+    """A prefix of `traces` totalling at most `max_steps` steps (always at least one trace).
+
+    `split_traces` already shuffles deterministically, so the prefix is an unbiased, stable
+    sample of the held-out split.
+    """
+    capped: list[Trace] = []
+    steps = 0
+    for trace in traces:
+        if capped and steps + len(trace.steps) > max_steps:
+            break
+        capped.append(trace)
+        steps += len(trace.steps)
+    return capped
 
 
 def _persist(

@@ -327,10 +327,15 @@ class GEPAOptimizer:
         retriever: Retriever | None = None,
         on_rollout: RolloutCallback | None = None,
         *,
+        on_budget: Callable[[int], None] | None = None,
         seed: int = 0,
     ) -> None:
         self._provider = provider
         self._judge = judge
+        # `on_budget` receives the REAL translated max_metric_calls right before the run starts —
+        # callers reporting progress must size their bar with it, not with `budget` (iterations),
+        # or the bar finishes while GEPA is still burning valset calls.
+        self._on_budget = on_budget
         # Optional retriever for RAG-aware evaluation. When None, GEPA evaluates zero-shot.
         self._retriever = retriever
         self._on_rollout = on_rollout
@@ -408,6 +413,9 @@ class GEPAOptimizer:
                 valset = hard_val
         adapter = WorldModelGEPAAdapter(self._provider, self._judge, self._on_rollout)
         minibatch = min(3, len(trainset))
+        metric_calls = _metric_call_budget(budget, len(valset), minibatch)
+        if self._on_budget is not None:
+            self._on_budget(metric_calls)
         result = gepa.optimize(
             seed_candidate={ENV_PROMPT_COMPONENT: base_prompt},
             trainset=trainset,
@@ -421,7 +429,7 @@ class GEPAOptimizer:
             # in the library; we enable it so knowledge accumulated on different failure modes
             # composes instead of competing.
             use_merge=True,
-            max_metric_calls=_metric_call_budget(budget, len(valset), minibatch),
+            max_metric_calls=metric_calls,
             reflection_minibatch_size=minibatch,
             display_progress_bar=False,
             raise_on_exception=False,
