@@ -49,7 +49,8 @@ from wmh.config import (
 from wmh.core.types import Action, ActionKind, Session
 from wmh.engine.play import PlayTurn, parse_action, play_turn
 from wmh.engine.world_model import WorldModel
-from wmh.providers.base import ProviderKind
+from wmh.providers import verify_all, verify_embedder
+from wmh.providers.base import ProviderConfig, ProviderKind, VerifyResult
 
 # A reader takes a fully-rendered prompt string and returns the user's typed line.
 PromptReader = Callable[[str], str]
@@ -103,15 +104,23 @@ class BuildParams(BaseModel):
 
 
 def run_build_wizard(
-    console: Console, defaults: BuildParams, reader: PromptReader | None = None
+    console: Console,
+    defaults: BuildParams,
+    reader: PromptReader | None = None,
+    verify: Callable[[ProviderConfig], VerifyResult] | None = None,
+    verify_embed: Callable[[ProviderConfig], VerifyResult] | None = None,
 ) -> BuildParams:
     """Guided creation flow: prompt for each build input, pre-filled with `defaults`.
 
     Returns a resolved `BuildParams`. Any value already set in `defaults` (i.e. passed as a flag)
-    becomes the suggested default the user can accept with Enter. Raises `ValueError` if no trace
-    source (file or vendor) is provided.
+    becomes the suggested default the user can accept with Enter. The serve provider and any
+    provider-backed embedder are live-pinged right after their model pick — a failure loops back
+    to the picker instead of surfacing after the wizard. `verify`/`verify_embed` exist so tests
+    can stub the pings. Raises `ValueError` if no trace source (file or vendor) is provided.
     """
     interactive = reader is None
+    check = verify if verify is not None else (lambda cfg: verify_all([cfg])[0])
+    check_embed = verify_embed if verify_embed is not None else verify_embedder
     base_ask = reader if reader is not None else (lambda text: console.input(text))
     base_secret = (
         reader if reader is not None else (lambda text: console.input(text, password=True))
@@ -181,29 +190,41 @@ def run_build_wizard(
     with_creds = [p for p in providers if _has_credentials(p)]
     notes = {p: "api key exists" for p in with_creds}
     provider_default = defaults.provider or (with_creds[0] if with_creds else None)
-    provider = _select(
-        console,
-        ask,
-        "Serve provider",
-        providers,
-        provider_default,
-        interactive=interactive,
-        notes=notes,
-    )
-    _ensure_credentials(console, ask_secret, provider)
-    model = _select(
-        console,
-        ask,
-        "Serve model id",
-        _PROVIDER_MODELS[provider],
-        defaults.model,
-        interactive=interactive,
-    )
-
-    region = None
-    if provider == "bedrock":
-        region_default = defaults.region or _DEFAULT_REGIONS.get(provider)
-        region = _prompt_text(console, ask, "AWS region", region_default) or None
+    while True:
+        provider = _select(
+            console,
+            ask,
+            "Serve provider",
+            providers,
+            provider_default,
+            interactive=interactive,
+            notes=notes,
+        )
+        _ensure_credentials(console, ask_secret, provider)
+        model = _select(
+            console,
+            ask,
+            "Serve model id",
+            _PROVIDER_MODELS[provider],
+            defaults.model,
+            interactive=interactive,
+        )
+        region = None
+        if provider == "bedrock":
+            region_default = defaults.region or _DEFAULT_REGIONS.get(provider)
+            region = _prompt_text(console, ask, "AWS region", region_default) or None
+        # Live ping now, not after the whole wizard: a bad key or model id loops straight
+        # back to the picker (the failed pick becomes the suggested retry default).
+        console.print(f"verifying {provider}…")
+        ping = check(ProviderConfig(kind=ProviderKind(provider), model=model, region=region))
+        if ping.ok:
+            console.print(f"  {_CHECK} {provider} ({escape(model)}) reachable")
+            break
+        console.print(
+            f"  [red]✗ {provider} ({escape(model)}) failed[/red]: {escape(ping.detail or '')}"
+        )
+        console.print("  [yellow]fix the credentials or pick a different provider/model[/yellow]")
+        provider_default = provider
 
     gepa_budget = _prompt_int(
         console,
@@ -215,17 +236,20 @@ def run_build_wizard(
     # Retrieval phi embedder: default offline hashing (no creds). A provider-backed embedder is
     # picked from the list and prompts for its embeddings-model id; phi dimensionality keeps its
     # default (the index and query embedders must agree, so it is not a wizard knob).
-    embed_provider = _select(
-        console,
-        ask,
-        "Embedder",
-        list(_EMBEDDERS),
-        defaults.embed_provider,
-        interactive=interactive,
-    )
-    embed_model = defaults.embed_model
-    embed_models = _EMBEDDERS[embed_provider]
-    if embed_models is not None:
+    embed_default = defaults.embed_provider
+    while True:
+        embed_provider = _select(
+            console,
+            ask,
+            "Embedder",
+            list(_EMBEDDERS),
+            embed_default,
+            interactive=interactive,
+        )
+        embed_model = defaults.embed_model
+        embed_models = _EMBEDDERS[embed_provider]
+        if embed_models is None:
+            break  # offline hashing embedder: nothing to verify
         if embed_provider != provider:
             _ensure_credentials(console, ask_secret, embed_provider)
         embed_model = _select(
@@ -236,6 +260,27 @@ def run_build_wizard(
             embed_model or embed_models[0],
             interactive=interactive,
         )
+        # Same inline ping for the embed path, with the embeddings model and phi dimension
+        # stamped on (mirrors HarnessConfig.embed_provider_config).
+        console.print(f"verifying embed:{embed_provider}…")
+        ping = check_embed(
+            ProviderConfig(
+                kind=ProviderKind(embed_provider),
+                model=embed_model,
+                embed_model=embed_model,
+                embed_dim=defaults.embed_dim,
+                region=region if embed_provider == "bedrock" else None,
+            )
+        )
+        if ping.ok:
+            console.print(f"  {_CHECK} embed:{embed_provider} ({escape(embed_model)}) reachable")
+            break
+        console.print(
+            f"  [red]✗ embed:{embed_provider} ({escape(embed_model)}) failed[/red]: "
+            f"{escape(ping.detail or '')}"
+        )
+        console.print("  [yellow]fix the credentials or pick a different embedder[/yellow]")
+        embed_default = embed_provider
 
     return BuildParams(
         name=name,

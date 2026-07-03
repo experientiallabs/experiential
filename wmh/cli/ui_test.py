@@ -22,10 +22,15 @@ from wmh.cli.ui import (
 from wmh.config import PROVIDER_ENV_VARS, ModelInfo
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.engine.world_model import WorldModel
-from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, VerifyResult
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
 ui_module = importlib.import_module("wmh.cli.ui")
+
+
+def _ok_verify(cfg: ProviderConfig) -> VerifyResult:
+    """Stub inline-wizard verifier: every provider/embedder pings ok, no network."""
+    return VerifyResult(ok=True, kind=cfg.kind, model=cfg.model)
 
 
 @pytest.fixture(autouse=True)
@@ -210,7 +215,13 @@ def test_build_wizard_collects_all_inputs() -> None:
         ]
     )
     # train_split has no wizard prompt; it must carry through from the flag-supplied defaults.
-    params = run_build_wizard(console, BuildParams(name="default", train_split=0.5), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default", train_split=0.5),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.name == "tau2-airline"
     assert params.file == "/tmp/traces.jsonl"
     assert params.provider == "bedrock"
@@ -225,7 +236,13 @@ def test_build_wizard_select_by_number() -> None:
     # Provider/model/embedder are numbered pickers; choosing by index must work. Pick anthropic (2),
     # its second model, no region prompt (not bedrock), budget 8, hashing embedder (1).
     reader = _scripted_reader(["m", "/tmp/t.jsonl", "2", "2", "8", "1"])
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.provider == "anthropic"
     assert params.model == "claude-opus-4-7"  # second anthropic model
     assert params.region is None  # region only prompted for bedrock
@@ -238,7 +255,13 @@ def test_build_wizard_collects_provider_embedder() -> None:
     reader = _scripted_reader(
         ["m", "/tmp/t.jsonl", "openai", "gpt-5.5", "8", "openai", "text-embedding-3-large"]
     )
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.embed_provider == "openai"
     assert params.embed_model == "text-embedding-3-large"
     assert params.embed_dim == 512  # default, no longer prompted
@@ -250,7 +273,9 @@ def test_build_wizard_accepts_defaults_with_blank_input() -> None:
     # (name/provider/model/region/budget/embedder) to accept the suggested defaults.
     reader = _scripted_reader(["", "", "", "", "", ""])
     defaults = BuildParams(name="seeded", file="/tmp/t.jsonl", provider="bedrock", gepa_budget=50)
-    params = run_build_wizard(console, defaults, reader=reader)
+    params = run_build_wizard(
+        console, defaults, reader=reader, verify=_ok_verify, verify_embed=_ok_verify
+    )
     assert params.name == "seeded"  # blank kept the default
     assert params.provider == "bedrock"
     assert params.gepa_budget == 50
@@ -263,7 +288,13 @@ def test_build_wizard_dashes_spaces_in_name() -> None:
     # Whitespace is dash-joined rather than rejected: typing "tau bench" quietly becomes
     # "tau-bench", with a dim note showing the name actually used.
     reader = _scripted_reader(["tau bench", "/tmp/t.jsonl", "", "", "", "", ""])
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.name == "tau-bench"
     assert "using tau-bench" in console.export_text()
 
@@ -273,7 +304,13 @@ def test_build_wizard_reprompts_on_invalid_name() -> None:
     # A name normalization can't rescue ("tau/bench" has a path separator) must re-prompt with
     # the friendly validation message, not escape as a ValueError traceback.
     reader = _scripted_reader(["tau/bench", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.name == "tau-bench"
     assert "invalid world model name" in console.export_text()
 
@@ -283,7 +320,13 @@ def test_build_wizard_normalizes_flag_name_in_default() -> None:
     # A whitespace-y --name flag becomes the normalized bracketed default, acceptable via Enter
     # on the first prompt (no validation error, no re-prompt).
     reader = _scripted_reader(["", "/tmp/t.jsonl", "", "", "", "", ""])
-    params = run_build_wizard(console, BuildParams(name="tau bench"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="tau bench"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.name == "tau-bench"
     assert "invalid world model name" not in console.export_text()
 
@@ -293,7 +336,13 @@ def test_build_wizard_drops_invalid_flag_name_from_default() -> None:
     # An unrescuable --name flag must not become the bracketed Enter-default (it could never be
     # accepted); blank input then means "no name yet" and re-prompts until a valid one arrives.
     reader = _scripted_reader(["", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
-    params = run_build_wizard(console, BuildParams(name="tau/bench"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="tau/bench"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.name == "tau-bench"
     assert "[tau/bench]" not in console.export_text()
 
@@ -307,7 +356,7 @@ def test_build_wizard_aborts_cleanly_on_eof() -> None:
     # Exhausted piped stdin (or Ctrl-D) must abort the wizard cleanly, not leak an EOFError
     # traceback. typer.Abort is handled by click's runner ("Aborted.", exit 1).
     with pytest.raises(typer.Abort):
-        run_build_wizard(console, BuildParams(name="default"), reader=eof_reader)
+        run_build_wizard(console, BuildParams(name="default"), reader=eof_reader, verify=_ok_verify)
 
 
 def test_build_wizard_reprompts_on_blank_trace_source() -> None:
@@ -315,7 +364,13 @@ def test_build_wizard_reprompts_on_blank_trace_source() -> None:
     # real path; remaining prompts (provider/model/region/budget/embedder) take defaults.
     console = Console(force_terminal=False, no_color=True, width=100)
     reader = _scripted_reader(["mymodel", "", "/tmp/t.jsonl", "", "", "", "", ""])
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.name == "mymodel"
     assert params.file == "/tmp/t.jsonl"
 
@@ -335,7 +390,13 @@ def test_build_wizard_prompts_for_missing_credentials_and_saves(
         # model, region, budget, embedder
         ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "8", "1"]
     )
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     out = console.export_text()
     assert params.provider == "bedrock"
     assert os.environ["AWS_ACCESS_KEY_ID"] == "test-key-id"
@@ -362,10 +423,61 @@ def test_build_wizard_keeps_session_creds_when_persistence_fails(
     reader = _scripted_reader(
         ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "8", "1"]
     )
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.provider == "bedrock"
     assert os.environ["AWS_ACCESS_KEY_ID"] == "key-id"  # session env applied anyway
     assert "not saved" in console.export_text()
+
+
+def test_build_wizard_verifies_provider_and_retries_on_failure() -> None:
+    # The live ping runs right after the model id (and region) is chosen; a failure loops back
+    # to the provider picker instead of surfacing at the end of the wizard.
+    calls: list[str] = []
+
+    def flaky(cfg: ProviderConfig) -> VerifyResult:
+        calls.append(cfg.kind.value)
+        ok = len(calls) > 1
+        return VerifyResult(ok=ok, kind=cfg.kind, model=cfg.model, detail="" if ok else "bad key")
+
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "anthropic", "", "", ""])
+    params = run_build_wizard(
+        console, BuildParams(name="default"), reader=reader, verify=flaky, verify_embed=_ok_verify
+    )
+    assert params.provider == "anthropic"
+    assert calls == ["openai", "anthropic"]
+    assert "bad key" in console.export_text()
+
+
+def test_build_wizard_verifies_embedder_with_embed_config() -> None:
+    # A provider-backed embedder is pinged right after its model pick, with the embeddings model
+    # and phi dimension stamped on the config (mirroring HarnessConfig.embed_provider_config).
+    seen: dict[str, ProviderConfig] = {}
+
+    def embed_check(cfg: ProviderConfig) -> VerifyResult:
+        seen["cfg"] = cfg
+        return VerifyResult(ok=True, kind=cfg.kind, model=cfg.embed_model or cfg.model)
+
+    console = Console(force_terminal=False, no_color=True, width=100)
+    reader = _scripted_reader(
+        ["m", "/tmp/t.jsonl", "openai", "", "", "openai", "text-embedding-3-large"]
+    )
+    run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=embed_check,
+    )
+    assert seen["cfg"].kind is ProviderKind.OPENAI
+    assert seen["cfg"].embed_model == "text-embedding-3-large"
+    assert seen["cfg"].embed_dim == 512
 
 
 def test_build_wizard_defaults_to_first_provider_with_creds(monkeypatch) -> None:  # noqa: ANN001
@@ -374,7 +486,13 @@ def test_build_wizard_defaults_to_first_provider_with_creds(monkeypatch) -> None
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100)
     reader = _scripted_reader(["m", "/tmp/t.jsonl", "", "", "", ""])
-    params = run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.provider == "anthropic"
     assert params.model == "claude-opus-4-8"  # model default follows the provider
 
@@ -384,7 +502,13 @@ def test_build_wizard_annotates_providers_that_have_keys(monkeypatch) -> None:  
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "", ""])
-    run_build_wizard(console, BuildParams(name="default"), reader=reader)
+    run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     out = console.export_text()
     assert "openai  (api key exists)" in out
     assert "anthropic  (api key exists)" not in out
@@ -438,5 +562,11 @@ def test_build_wizard_reprompts_on_unicode_digit_budget() -> None:
     # openai); blanks accept defaults, '²' is a bad budget that must be rejected and re-asked.
     console = Console(force_terminal=False, no_color=True, width=100)
     reader = _scripted_reader(["", "", "", "²", "7", ""])
-    params = run_build_wizard(console, BuildParams(name="m", file="/tmp/t.jsonl"), reader=reader)
+    params = run_build_wizard(
+        console,
+        BuildParams(name="m", file="/tmp/t.jsonl"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
     assert params.gepa_budget == 7

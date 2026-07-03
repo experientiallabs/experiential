@@ -309,7 +309,9 @@ def build(
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
     # silently swallows it and "succeeds" with a useless held-out-0.0 model.
-    _verify_or_abort(config)
+    if not use_wizard:
+        # The wizard already live-pinged the serve provider and embedder inline.
+        _verify_or_abort(config)
 
     # Meter the build at the provider boundary: the one serve provider drives GEPA rollouts,
     # reflection, and the judge, so wrapping it captures all build LLM cost/tokens without touching
