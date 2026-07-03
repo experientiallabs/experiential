@@ -111,6 +111,13 @@ anchored ~0.02–0.03):
   so most of the compute samples from a region with no reward headroom. The ~55%
   held-out number reflects a scenario-difficulty distribution shift that on-train RL
   cannot cross by construction.
+- **Held-out row (the sweep's best)**: the n=4 final checkpoint scores **57.5% / 0.629**
+  (40/40 clean) — paired vs base **+0.061** (6W/4L, median 0.000). Within noise at n=40,
+  but the first RL configuration to land above base on both metrics, and it is exactly
+  the stable-training one. Raw records: `rpp_n4_0192.jsonl` alongside the other rows.
+- **PPO-hot cell skipped with rationale**: with the signal-density ceiling identified,
+  a hotter PPO would sample the same headroom-free distribution; the estimator ladder
+  is closed.
 - **Implication**: the binding constraint is now the *training scenario distribution*,
   not the estimator — exactly the deferred ScenarioSuite v2 work (difficulty
   calibration / harder generated scenarios, D19): train where the policy fails at
