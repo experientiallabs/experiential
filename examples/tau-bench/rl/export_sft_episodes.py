@@ -7,10 +7,11 @@ the SFT row and the RL rows see byte-compatible prompts.
 
 Leakage rule (same as pin_scenarios.py, D26): any train trace whose task text appears in
 the pinned eval scenario set is dropped entirely — the policy must never train on an eval
-prompt, whether as a scenario or as a recorded demonstration.
+prompt, whether as a scenario or as a recorded demonstration. Task identity comes from
+`wmh.env.scenarios.trace_task`, the same helper pin_scenarios.py uses (via
+`scenarios_from_traces`), so the two filters cannot drift apart.
 
-Output (~gitignored artifact root): .wmh/rl/sft_episodes.jsonl, one episode per line:
-    {"trace_id", "task", "domain", "steps": [{"name", "arguments", "observation", "is_error"}]}
+Output (gitignored artifact root): .wmh/rl/sft_episodes.jsonl, one `SftEpisode` per line.
 
 Run from the repo root:  uv run python examples/tau-bench/rl/export_sft_episodes.py [out.jsonl]
 """
@@ -21,9 +22,12 @@ import json
 import sys
 from pathlib import Path
 
+from pydantic import BaseModel, Field
+
 from wmh.config import load_config
-from wmh.core.types import Trace
+from wmh.core.types import JsonObject, Trace
 from wmh.engine import ingest, split_traces_3way
+from wmh.env.scenarios import trace_task
 
 _HERE = Path(__file__).resolve().parent
 _MODEL_DIR = _HERE.parent / "models" / "tau-bench"
@@ -32,27 +36,38 @@ _EVAL_SCENARIOS = _HERE / "scenarios_eval.jsonl"
 _DEFAULT_OUT = _HERE.parents[2] / ".wmh" / "rl" / "sft_episodes.jsonl"
 
 
-def _trace_task(trace: Trace) -> str | None:
-    for step in trace.steps:
-        if step.task and step.task.strip():
-            return step.task.strip()
-    return None
+class SftStep(BaseModel):
+    """One recorded tool call and the environment's observation."""
+
+    name: str
+    arguments: JsonObject = Field(default_factory=dict)
+    observation: str
+    is_error: bool = False
 
 
-def episodes_from_traces(traces: list[Trace], eval_tasks: set[str]) -> list[dict]:
+class SftEpisode(BaseModel):
+    """One recorded tau episode: the unit the SFT dataset builder consumes."""
+
+    trace_id: str
+    task: str
+    domain: str = "unknown"
+    steps: list[SftStep] = Field(default_factory=list)
+
+
+def episodes_from_traces(traces: list[Trace], eval_tasks: set[str]) -> list[SftEpisode]:
     """Neutral episode records for SFT, dropping any trace whose task is in the eval set."""
-    episodes: list[dict] = []
+    episodes: list[SftEpisode] = []
     for trace in traces:
-        task = _trace_task(trace)
+        task = trace_task(trace)
         if task is None or task in eval_tasks:
             continue
         steps = [
-            {
-                "name": step.action.name,
-                "arguments": step.action.arguments,
-                "observation": step.observation.content,
-                "is_error": step.observation.is_error,
-            }
+            SftStep(
+                name=step.action.name,
+                arguments=step.action.arguments,
+                observation=step.observation.content,
+                is_error=step.observation.is_error,
+            )
             for step in trace.steps
             if step.action.name is not None
         ]
@@ -60,12 +75,12 @@ def episodes_from_traces(traces: list[Trace], eval_tasks: set[str]) -> list[dict
             continue
         domain = trace.metadata.get("domain")
         episodes.append(
-            {
-                "trace_id": trace.trace_id,
-                "task": task,
-                "domain": domain if isinstance(domain, str) else "unknown",
-                "steps": steps,
-            }
+            SftEpisode(
+                trace_id=trace.trace_id,
+                task=task,
+                domain=domain if isinstance(domain, str) else "unknown",
+                steps=steps,
+            )
         )
     return episodes
 
@@ -76,15 +91,17 @@ def main() -> int:
     traces = ingest(config, file=str(_TRACES_PATH))
     train, _val, _test = split_traces_3way(traces, 0.8, 0.1)
     eval_tasks = {
-        json.loads(line)["task"] for line in _EVAL_SCENARIOS.read_text().splitlines() if line.strip()
+        json.loads(line)["task"]
+        for line in _EVAL_SCENARIOS.read_text().splitlines()
+        if line.strip()
     }
     episodes = episodes_from_traces(train, eval_tasks)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w") as f:
         for episode in episodes:
-            f.write(json.dumps(episode, ensure_ascii=False) + "\n")
-    n_steps = sum(len(e["steps"]) for e in episodes)
+            f.write(episode.model_dump_json() + "\n")
+    n_steps = sum(len(e.steps) for e in episodes)
     dropped = len(train) - len(episodes)
     print(
         f"wrote {out}: {len(episodes)} episodes / {n_steps} steps "

@@ -18,7 +18,8 @@ def main() -> None:
     parser.add_argument("--full", action="store_true", help="print full critiques/actions")
     args = parser.parse_args()
 
-    rows = [json.loads(line) for line in open(args.path) if line.strip()]
+    with open(args.path) as f:
+        rows = [json.loads(line) for line in f if line.strip()]
     clean = [r for r in rows if not r["errors"]]
     errored = len(rows) - len(clean)
     if not clean:
@@ -44,7 +45,8 @@ def main() -> None:
     print(f"  per-scenario rewards: {line}")
 
     cap = None if args.full else 240
-    for r in clean[-args.last :]:
+    tail = clean[-args.last :] if args.last > 0 else []
+    for r in tail:
         print("=" * 72)
         actions = [a for turn in r["actions"] for a in turn]
         print(

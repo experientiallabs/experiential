@@ -1,4 +1,4 @@
-"""Turn a wake/sleep LoRA checkpoint into a vLLM-servable full Qwen3.5-9B checkpoint.
+"""Turn a LoRA checkpoint into a vLLM-servable full Qwen3.5-9B checkpoint.
 
 Applies the LoRA deltas DIRECTLY onto the base snapshot tensors (W += alpha/r * B @ A),
 because every indirect route fails on Qwen3.5:
@@ -8,9 +8,14 @@ because every indirect route fails on Qwen3.5:
     (the full multimodal wrapper), the text model has no `language_model.` segment,
     and peft only WARNS about the missing keys (the "merged" model equals base).
 
-Adapter key -> base key: strip `base_model.model.` and `.lora_{A,B}.weight`, append
-`.weight`; e.g. `base_model.model.model.language_model.layers.0.mlp.down_proj.lora_A.weight`
--> `model.language_model.layers.0.mlp.down_proj.weight` (1:1 with the snapshot index).
+Handles both adapter namespaces:
+  - wake/sleep (verl):   base_model.model.model.language_model.layers...  (direct match)
+  - text-model (peft SFT): base_model.model.model.layers...  (remapped via the
+    `model.` -> `model.language_model.` fallback against the snapshot index)
+
+Refuses configs it cannot honor (use_rslora, modules_to_save, lora bias) instead of
+silently producing wrong weights, and hard-fails if any delta goes unapplied or all
+deltas are zero (a base-identical output must never look like success).
 
 Usage:
     python merge_adapter_and_splice.py <adapter_dir> <out_dir> [--base-snapshot DIR]
@@ -23,45 +28,49 @@ import json
 import shutil
 from pathlib import Path
 
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("adapter_dir")
     parser.add_argument("out_dir")
     parser.add_argument("--base", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--base-snapshot", default=None,
-                        help="local HF snapshot dir of the base (auto-resolved if omitted)")
+    parser.add_argument(
+        "--base-snapshot",
+        default=None,
+        help="local HF snapshot dir of the base (auto-resolved if omitted)",
+    )
     args = parser.parse_args()
-
-    import torch
-    from safetensors import safe_open
-    from safetensors.torch import save_file
 
     adapter_dir = Path(args.adapter_dir)
     config = json.loads((adapter_dir / "adapter_config.json").read_text())
+    if config.get("use_rslora"):
+        raise SystemExit("adapter uses rsLoRA (scaling alpha/sqrt(r)) — not supported here")
+    if config.get("modules_to_save"):
+        raise SystemExit(f"adapter has modules_to_save={config['modules_to_save']} — not supported")
+    if config.get("bias", "none") != "none":
+        raise SystemExit(f"adapter trains bias={config['bias']!r} — not supported")
     scaling = config["lora_alpha"] / config["r"]
     print(f"lora r={config['r']} alpha={config['lora_alpha']} scaling={scaling}")
 
     lora_a: dict[str, torch.Tensor] = {}
     lora_b: dict[str, torch.Tensor] = {}
+    unrecognized: list[str] = []
     with safe_open(str(adapter_dir / "adapter_model.safetensors"), framework="pt") as f:
         for key in f.keys():
             if key.endswith(".lora_A.weight"):
                 lora_a[key[: -len(".lora_A.weight")]] = f.get_tensor(key)
             elif key.endswith(".lora_B.weight"):
                 lora_b[key[: -len(".lora_B.weight")]] = f.get_tensor(key)
+            else:
+                unrecognized.append(key)
+    if unrecognized:
+        raise SystemExit(f"adapter has non-lora_A/B tensors, refusing: {unrecognized[:5]}")
     assert set(lora_a) == set(lora_b), "unpaired lora_A/lora_B keys"
     print(f"adapter modules: {len(lora_a)}")
-
-    def to_base_key(module: str) -> str:
-        prefix = "base_model.model."
-        assert module.startswith(prefix), module
-        return module[len(prefix):] + ".weight"
-
-    deltas = {
-        to_base_key(module): (lora_b[module].float() @ lora_a[module].float()) * scaling
-        for module in lora_a
-    }
 
     snapshot_dir = args.base_snapshot
     if snapshot_dir is None:
@@ -71,11 +80,23 @@ def main() -> None:
     snapshot = Path(snapshot_dir)
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())
     weight_map: dict[str, str] = index["weight_map"]
-    hits = sum(1 for k in deltas if k in weight_map)
-    print(f"delta keys matching base: {hits}/{len(deltas)}")
-    if hits != len(deltas):
-        missing = [k for k in deltas if k not in weight_map][:5]
-        raise SystemExit(f"unmatched delta keys, sample: {missing}")
+
+    def to_base_key(module: str) -> str:
+        prefix = "base_model.model."
+        assert module.startswith(prefix), module
+        key = module[len(prefix) :] + ".weight"
+        if key in weight_map:
+            return key  # wake/sleep namespace: model.language_model.*
+        if key.startswith("model."):
+            remapped = "model.language_model." + key[len("model.") :]
+            if remapped in weight_map:
+                return remapped  # text-model adapter (e.g. the SFT LoRA)
+        raise SystemExit(f"adapter module maps to no base tensor: {module} -> {key}")
+
+    deltas = {
+        to_base_key(module): (lora_b[module].float() @ lora_a[module].float()) * scaling
+        for module in lora_a
+    }
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)

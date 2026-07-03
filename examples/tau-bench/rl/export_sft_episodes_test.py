@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from export_sft_episodes import episodes_from_traces
+from export_sft_episodes import SftStep, episodes_from_traces
 
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 
@@ -24,17 +24,17 @@ def _trace(trace_id: str, task: str, tool: str = "get_user_details") -> Trace:
 def test_drops_eval_task_traces_and_keeps_shape() -> None:
     traces = [_trace("t1", "train task"), _trace("t2", "eval task"), _trace("t3", "train task")]
     episodes = episodes_from_traces(traces, eval_tasks={"eval task"})
-    assert [e["trace_id"] for e in episodes] == ["t1", "t3"]
+    assert [e.trace_id for e in episodes] == ["t1", "t3"]
     episode = episodes[0]
-    assert episode["task"] == "train task"
-    assert episode["domain"] == "airline"
-    assert episode["steps"] == [
-        {
-            "name": "get_user_details",
-            "arguments": {"user_id": "u1"},
-            "observation": "ok",
-            "is_error": False,
-        }
+    assert episode.task == "train task"
+    assert episode.domain == "airline"
+    assert episode.steps == [
+        SftStep(
+            name="get_user_details",
+            arguments={"user_id": "u1"},
+            observation="ok",
+            is_error=False,
+        )
     ]
 
 

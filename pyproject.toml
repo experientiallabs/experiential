@@ -47,7 +47,9 @@ packages = ["wmh"]
 [tool.pytest.ini_options]
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
-testpaths = ["wmh"]
+# examples/ tests guard committed data contracts (pinned scenario sets, exporters) and
+# must fail the same gate that guards wmh/ — they are hermetic (no creds, no network).
+testpaths = ["wmh", "examples"]
 
 [tool.ruff]
 line-length = 100

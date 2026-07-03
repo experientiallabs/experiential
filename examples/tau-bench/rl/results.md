@@ -83,8 +83,17 @@ Nothing in the loop is broken; the runs were **cold and short**:
 | PPO (scalar EpisodeScore.reward) | mean 0.803, success 71.1% | 75 | 97/97 | $4.52 / $0.43 |
 
 Raw per-episode records (actions, step rewards, judge critiques, WM costs) are committed
-under `eval_results/{base_v3,sft_v3,ppo96,rpp96}.jsonl`; regenerate the paired table with
-`.agents/scripts/paired_eval_analysis.py`.
+under the agents workspace at `.agents/docs/research/wm_tau_eval_results/` (raw run
+outputs stay out of `examples/` per the repo layout rules). The paired table reproduces
+from those records with any per-scenario mean comparison, e.g.:
+
+```python
+import json
+rows = [json.loads(l) for l in open("base_v3.jsonl") if not json.loads(l)["errors"]]
+by = {}
+for r in rows: by.setdefault(r["scenario_id"][:8], []).append(r["reward"])
+means = {k: sum(v)/len(v) for k, v in by.items()}  # repeat per arm, subtract vs base
+```
 
 wandb project: `wmh-rl-transfer` (server runs `qwen3_5_9b_wm_tau_reinforce_real`,
 `qwen3_5_9b_wm_tau_ppo_real_v2`; eval runs listed above).
