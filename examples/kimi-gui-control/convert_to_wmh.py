@@ -56,7 +56,7 @@ def _attr(key: str, value: str) -> dict[str, Any]:
 
 
 def _trace_id(trajectory_id: str) -> str:
-    return hashlib.sha256(f"qwen-pi|{trajectory_id}".encode()).hexdigest()[:32]
+    return hashlib.sha256(f"kimi-gui-control|{trajectory_id}".encode()).hexdigest()[:32]
 
 
 def _spans_for_trajectory(record: dict[str, Any], *, trace_id: str) -> list[dict[str, Any]]:
@@ -64,7 +64,7 @@ def _spans_for_trajectory(record: dict[str, Any], *, trace_id: str) -> list[dict
     tool_calls = record.get("tool_calls") or []
     task_text = _as_text(record.get("task", ""))
     metadata = {
-        "benchmark": "qwen-pi",
+        "benchmark": "kimi-gui-control",
         "task_category": record.get("task_category"),
         "task_url": record.get("task_url"),
         "model": record.get("model"),
@@ -81,7 +81,7 @@ def _spans_for_trajectory(record: dict[str, Any], *, trace_id: str) -> list[dict
 
         action_attrs = [
             _attr("gen_ai.operation.name", "chat"),
-            _attr("gen_ai.request.model", "qwen-pi-agent"),
+            _attr("gen_ai.request.model", "kimi-gui-control-agent"),
             _attr("gen_ai.tool.name", str(name)),
             _attr("gen_ai.tool.call.arguments", json.dumps(args)),
         ]
@@ -94,7 +94,7 @@ def _spans_for_trajectory(record: dict[str, Any], *, trace_id: str) -> list[dict
             "traceId": trace_id,
             "spanId": f"{trace_id[:12]}{ordinal:04x}a",
             "parentSpanId": "",
-            "name": "chat qwen-pi",
+            "name": "chat kimi-gui-control",
             "startTimeUnixNano": ordinal * 10,
             "endTimeUnixNano": ordinal * 10 + 1,
             "status": {"code": "STATUS_CODE_OK"},
@@ -104,7 +104,7 @@ def _spans_for_trajectory(record: dict[str, Any], *, trace_id: str) -> list[dict
             "traceId": trace_id,
             "spanId": f"{trace_id[:12]}{ordinal:04x}b",
             "parentSpanId": "",
-            "name": "execute_tool qwen-pi",
+            "name": "execute_tool kimi-gui-control",
             "startTimeUnixNano": ordinal * 10 + 2,
             "endTimeUnixNano": ordinal * 10 + 3,
             "status": {"code": "STATUS_CODE_ERROR" if obs_error else "STATUS_CODE_OK"},

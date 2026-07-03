@@ -1,5 +1,5 @@
-title = "qwen-pi GUI-control default replay"
-description = "Open-loop reconstruction fidelity over the bundled qwen-pi screenpipe GUI-control trace corpus."
+title = "kimi-gui-control default replay"
+description = "Open-loop reconstruction fidelity over the bundled Kimi-K2.6 screenpipe GUI-control trace corpus (macOS Accessibility API + shell)."
 files = ["../traces.otel.jsonl"]
 train_split = 0.7
 sample_turns = "all"

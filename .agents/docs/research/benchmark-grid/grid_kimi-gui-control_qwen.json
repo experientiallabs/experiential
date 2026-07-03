@@ -1,5 +1,5 @@
 {
-  "suite": "qwen-pi/default",
+  "suite": "kimi-gui-control/default",
   "judge_model": "us.anthropic.claude-opus-4-8",
   "judge_provider": "bedrock",
   "train_split": 0.85,
@@ -15,7 +15,7 @@
       "model": "Qwen/Qwen-AgentWorld-35B-A3B",
       "condition": "base",
       "condition_label": "base",
-      "fidelity": 0.39333333333333337,
+      "fidelity": 0.4026666666666667,
       "error_flag_acc": 0.9333333333333333,
       "n_steps": 15,
       "cost_usd": 0.0
@@ -26,8 +26,8 @@
       "model": "Qwen/Qwen-AgentWorld-35B-A3B",
       "condition": "base_rag",
       "condition_label": "wmh/rag",
-      "fidelity": 0.45733333333333337,
-      "error_flag_acc": 1.0,
+      "fidelity": 0.39333333333333337,
+      "error_flag_acc": 0.9333333333333333,
       "n_steps": 15,
       "cost_usd": 0.0
     },
@@ -48,7 +48,7 @@
       "model": "Qwen/Qwen-AgentWorld-35B-A3B",
       "condition": "gepa_rag",
       "condition_label": "wmh/gepa/rag",
-      "fidelity": 0.45733333333333337,
+      "fidelity": 0.44666666666666666,
       "error_flag_acc": 1.0,
       "n_steps": 15,
       "cost_usd": 0.0
