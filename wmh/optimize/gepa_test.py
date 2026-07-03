@@ -274,15 +274,17 @@ def test_activity_logger_forwards_headlines_and_drops_prompt_bodies() -> None:
     ]
 
 
-def test_adapter_evaluate_emits_judge_summary_via_on_activity() -> None:
+def test_adapter_evaluate_streams_per_step_activity() -> None:
     lines: list[str] = []
     adapter = WorldModelGEPAAdapter(FakeProvider(), FakeJudge(score=0.5), on_activity=lines.append)
     from wmh.retrieval.leakfree import DemoRetriever
 
     steps = _eval_steps([_trace("t1")], DemoRetriever(None, []))
     adapter.evaluate(steps, {ENV_PROMPT_COMPONENT: "BASE"})
-    assert len(lines) == 1
-    assert lines[0].startswith("judge: avg 0.50 over 2 steps")
+    # A batch-start line, then one line per step as each rollout+judge lands.
+    assert lines[0] == "evaluating candidate on 2 steps…"
+    assert len(lines) == 3
+    assert all("fidelity 0.50" in line for line in lines[1:])
 
 
 def test_adapter_evaluate_scores_and_captures_traces() -> None:

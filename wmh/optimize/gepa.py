@@ -19,6 +19,7 @@ against what is actually deployed.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -36,6 +37,9 @@ from wmh.retrieval.leakfree import DemoRetriever
 
 # The single named component GEPA evolves: the specialized env (system) prompt.
 ENV_PROMPT_COMPONENT = "env_prompt"
+
+# Concurrent rollout+judge calls per GEPA evaluation batch (I/O bound; modest for rate limits).
+_EVAL_CONCURRENCY = 4
 
 # Called once per judged rollout: (rollouts_done, mean_score_so_far). Used to drive build progress.
 RolloutCallback = Callable[[int, float | None], None]
@@ -164,11 +168,14 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
         capture_traces: bool = False,
     ) -> EvaluationBatch[_StepTrajectory, Observation]:
         prompt = candidate[ENV_PROMPT_COMPONENT]
-        outputs: list[Observation] = []
-        scores: list[float] = []
-        trajectories: list[_StepTrajectory] | None = [] if capture_traces else None
-        last_critique = ""
-        for item in batch:
+        if not batch:
+            return EvaluationBatch(
+                outputs=[], scores=[], trajectories=[] if capture_traces else None
+            )
+        if self._on_activity is not None:
+            self._on_activity(f"evaluating candidate on {len(batch)} steps…")
+
+        def eval_one(item: _EvalStep) -> tuple[Observation, float, str]:
             step = item.step
             try:
                 predicted = predict_observation(
@@ -181,22 +188,37 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
                     history=item.history,
                 )
                 result = self._judge.score(predicted, step.observation, step)
-                score, critique = result.score, result.critique
+                return predicted, result.score, result.critique
             except Exception as exc:  # noqa: BLE001 - per-example failure must not abort the run
-                predicted = Observation(content="", is_error=True)
-                score, critique = 0.0, f"Rollout failed: {exc}"
-            outputs.append(predicted)
-            scores.append(score)
-            self._note_rollout(score)
-            if trajectories is not None:
-                trajectories.append(
-                    _StepTrajectory(step=step, predicted=predicted, score=score, critique=critique)
-                )
-            last_critique = critique
-        if self._on_activity is not None and scores:
-            avg = sum(scores) / len(scores)
-            note = f" — {last_critique.strip()}" if last_critique and last_critique.strip() else ""
-            self._on_activity(f"judge: avg {avg:.2f} over {len(scores)} steps{note}")
+                return Observation(content="", is_error=True), 0.0, f"Rollout failed: {exc}"
+
+        # Rollout+judge calls are I/O bound; evaluate the batch concurrently (order preserved by
+        # index) and emit callbacks from THIS thread as results land — the live display and the
+        # run tracker see a serial stream.
+        results: list[tuple[Observation, float, str] | None] = [None] * len(batch)
+        with ThreadPoolExecutor(max_workers=min(_EVAL_CONCURRENCY, len(batch))) as pool:
+            futures = {pool.submit(eval_one, item): i for i, item in enumerate(batch)}
+            landed = 0
+            for future in as_completed(futures):
+                index = futures[future]
+                outcome = future.result()
+                results[index] = outcome
+                landed += 1
+                _, score, critique = outcome
+                self._note_rollout(score)
+                if self._on_activity is not None:
+                    note = f" — {critique.strip()[:110]}" if critique.strip() else ""
+                    self._on_activity(f"[{landed}/{len(batch)}] fidelity {score:.2f}{note}")
+
+        outputs = [r[0] for r in results if r is not None]
+        scores = [r[1] for r in results if r is not None]
+        trajectories: list[_StepTrajectory] | None = None
+        if capture_traces:
+            trajectories = [
+                _StepTrajectory(step=item.step, predicted=r[0], score=r[1], critique=r[2])
+                for item, r in zip(batch, results, strict=True)
+                if r is not None
+            ]
         return EvaluationBatch(outputs=outputs, scores=scores, trajectories=trajectories)
 
     def make_reflective_dataset(
@@ -451,6 +473,13 @@ class GEPAOptimizer:
         metric_calls = _metric_call_budget(budget, len(valset), minibatch)
         if self._on_budget is not None:
             self._on_budget(metric_calls)
+        if self._on_activity is not None:
+            # First line lands before any LLM call: the activity window must never sit empty
+            # while the (long) seed valset evaluation runs.
+            self._on_activity(
+                f"scoring the seed prompt on {len(valset)} valset steps "
+                f"({metric_calls} metric calls budgeted)…"
+            )
         result = gepa.optimize(
             seed_candidate={ENV_PROMPT_COMPONENT: base_prompt},
             trainset=trainset,

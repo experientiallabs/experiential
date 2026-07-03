@@ -12,6 +12,7 @@ model's serve `step`.
 
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -85,6 +86,7 @@ class RunTracker:
         self._kind = kind
         self._clock = clock or SystemClock()
         self._events: list[UsageEvent] = []
+        self._lock = threading.Lock()
         self._started_at: float | None = None
         self._elapsed: float = 0.0
 
@@ -106,9 +108,13 @@ class RunTracker:
             self.stop()
 
     def record(self, phase: Phase, model: str, usage: TokenUsage) -> UsageEvent:
-        """Record one metered LLM call, pricing it via the model pricing table."""
+        """Record one metered LLM call, pricing it via the model pricing table.
+
+        Thread-safe: GEPA evaluates batches concurrently, so metered calls land in parallel.
+        """
         event = UsageEvent(phase=phase, model=model, usage=usage, cost_usd=cost_usd(model, usage))
-        self._events.append(event)
+        with self._lock:
+            self._events.append(event)
         return event
 
     @property
