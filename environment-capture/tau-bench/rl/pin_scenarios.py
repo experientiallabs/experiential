@@ -16,7 +16,7 @@ re-derive (a corpus append would silently shift a re-derived list).
   split only, pinned for the same reason the scenarios are — every arm's agent must see the
   same tool list, and a corpus append must not silently change it
 
-Run from the repo root:  uv run python examples/tau-bench/rl/pin_scenarios.py
+Run from the repo root:  uv run python environment-capture/tau-bench/rl/pin_scenarios.py
 Idempotent: re-running on the same corpus rewrites byte-identical files.
 """
 

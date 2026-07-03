@@ -28,10 +28,10 @@ Six paths, each independently PASS/FAIL:
 ## Run
 
 ```bash
-uv run python examples/tau-bench/rl/smoke.py   # from repo root; AWS default profile, us-east-1
+uv run python environment-capture/tau-bench/rl/smoke.py   # from repo root; AWS default profile, us-east-1
 ```
 
-The script loads `examples/tau-bench/models/tau-bench/` (built config + retrieval index + optimized
+The script loads `environment-capture/tau-bench/models/tau-bench/` (built config + retrieval index + optimized
 prompt) but overrides the runtime provider to Bedrock haiku
 (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) for BOTH the serve model and the reward judge, so a
 smoke doesn't cost Opus money. All 6 paths must PASS.

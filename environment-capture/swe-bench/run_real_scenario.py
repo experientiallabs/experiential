@@ -485,7 +485,7 @@ def main() -> None:
     except ImportError as exc:  # pragma: no cover - depends on the isolated venv
         raise SystemExit(
             "swebench is not importable; run via ./run.sh (it sets up the .venv) or install "
-            "swebench in examples/swe-bench/.venv. Docker must be running."
+            "swebench in environment-capture/swe-bench/.venv. Docker must be running."
         ) from exc
 
     ds = load_swebench_dataset(args.dataset, "test", instance_ids=[instance_id])

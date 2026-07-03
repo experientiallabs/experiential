@@ -2,7 +2,7 @@
 
 This directory is a **self-contained, local-only capture tool**. It runs the *real*
 [tau²-bench](https://github.com/sierra-research/tau2-bench) benchmark and converts its trajectories
-into the world-model-harness trace corpus (`examples/tau-bench/traces.otel.jsonl`).
+into the world-model-harness trace corpus (`environment-capture/tau-bench/traces.otel.jsonl`).
 
 It is deliberately isolated:
 
@@ -20,16 +20,16 @@ It is deliberately isolated:
 This example includes the old committed tau world models under:
 
 ```text
-examples/tau-bench/models/tau-bench/
-examples/tau-bench/models/tau-telecom/
+environment-capture/tau-bench/models/tau-bench/
+environment-capture/tau-bench/models/tau-telecom/
 ```
 
 Use them as a local model root:
 
 ```bash
-uv run wmh list --root examples/tau-bench
-uv run wmh demo --root examples/tau-bench --name tau-telecom
-uv run wmh play --root examples/tau-bench --name tau-telecom
+uv run wmh list --root environment-capture/tau-bench
+uv run wmh demo --root environment-capture/tau-bench --name tau-telecom
+uv run wmh play --root environment-capture/tau-bench --name tau-telecom
 ```
 
 ## Why capture from the REAL benchmark
@@ -42,7 +42,7 @@ environment actually returned.
 ## Setup
 
 ```bash
-cd examples/tau-bench
+cd environment-capture/tau-bench
 git clone --depth 1 https://github.com/sierra-research/tau2-bench.git
 uv venv --python 3.13 .venv
 uv pip install --python .venv ./tau2-bench audioop-lts boto3

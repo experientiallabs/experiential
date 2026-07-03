@@ -62,7 +62,15 @@ line-length = 100
 target-version = "py311"
 # `examples/` holds isolated, self-contained task launch/capture helpers that can depend on their
 # own benchmark environments. They are not part of the reusable `wmh` package.
-extend-exclude = ["examples/", ".agents/"]
+# The three pre-contract benchmark dirs keep their examples-era exemption: their capture
+# tooling is battle-tested stdlib scripting that predates the environment_capture package.
+extend-exclude = [
+    "examples/",
+    ".agents/",
+    "environment-capture/tau-bench/",
+    "environment-capture/terminal-tasks/",
+    "environment-capture/swe-bench/",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ANN", "BLE"]
@@ -78,4 +86,7 @@ exclude = [
     ".agents/",
     "environment-capture/appworld/backend/",
     "environment-capture/gaia2/backend/",
+    "environment-capture/tau-bench/",
+    "environment-capture/terminal-tasks/",
+    "environment-capture/swe-bench/",
 ]

@@ -18,7 +18,7 @@ This runs in the ISOLATED tau2 venv (Python 3.13, `tau2` installed); it imports 
       .venv/bin/python capture_telecom_multimodel.py --total 980 --concurrency 3
 
 -> data/simulations/capture_telecom_<modeltag>/results.json  (one per model)
-Convert each like any other domain shard, then cat into examples/tau-bench/traces.otel.jsonl.
+Convert each like any other domain shard, then cat into environment-capture/tau-bench/traces.otel.jsonl.
 """
 
 from __future__ import annotations

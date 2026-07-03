@@ -51,9 +51,10 @@ from wmh.engine.build import build as run_build
 from wmh.engine.demo import run_demo
 from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.engine.eval_suites import (
+    EvalSuite,
     discover_eval_suites,
     list_eval_results,
-    resolve_eval_suite,
+    load_eval_suite,
     result_path,
 )
 from wmh.engine.loader import load_world_model
@@ -485,24 +486,28 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmh eval results optional-suite`: summarize local suite results.
     """
     args = tokens or []
-    suite_root = str(_examples_root()) if examples_root is None else examples_root
+    suite_roots = (
+        [str(root) for root in _benchmark_roots()]
+        if examples_root is None
+        else [examples_root]
+    )
     if args and args[0] == "list":
         if len(args) != 1:
             raise typer.BadParameter("usage: wmh eval list")
-        _eval_list(suite_root)
+        _eval_list(suite_roots)
         return
     if args and args[0] == "results":
         if len(args) > 2:
             raise typer.BadParameter("usage: wmh eval results [suite]")
         suite_filter = args[1] if len(args) == 2 else None
-        _eval_results(results_root, suite_root, suite_filter, limit=limit)
+        _eval_results(results_root, suite_roots, suite_filter, limit=limit)
         return
     if args and args[0] == "run":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval run <suite>")
         _eval_run_suite(
             args[1],
-            examples_root=suite_root,
+            examples_roots=suite_roots,
             results_root=results_root,
             prompt_file=prompt_file,
             provider=provider,
@@ -557,8 +562,32 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
 
 
-def _eval_list(examples_root: str) -> None:
-    suites = discover_eval_suites(examples_root)
+def _resolve_suite(selector: str, examples_roots: list[str]) -> EvalSuite:
+    """Resolve a suite selector across every benchmark root (first exact id, then alias)."""
+    direct = Path(selector)
+    if direct.suffix == ".toml" and direct.exists():
+        return load_eval_suite(direct)
+    suites: list[EvalSuite] = []
+    for root in examples_roots:
+        suites.extend(discover_eval_suites(root))
+    exact = [suite for suite in suites if suite.id == selector]
+    if exact:
+        return exact[0]
+    aliased = [suite for suite in suites if selector in suite.aliases]
+    if len(aliased) == 1:
+        return aliased[0]
+    if len(aliased) > 1:
+        choices = ", ".join(suite.id for suite in aliased)
+        raise ValueError(f"ambiguous eval suite {selector!r}; choose one of: {choices}")
+    available = ", ".join(suite.id for suite in suites)
+    hint = f" (available: {available})" if available else ""
+    raise ValueError(f"unknown eval suite {selector!r}{hint}")
+
+
+def _eval_list(examples_roots: list[str]) -> None:
+    suites = [
+        suite for root in examples_roots for suite in discover_eval_suites(root)
+    ]
     if not suites:
         _console.print("[yellow]no eval suites found[/yellow]")
         return
@@ -581,7 +610,7 @@ def _eval_list(examples_root: str) -> None:
 
 def _eval_results(
     results_root: str,
-    examples_root: str,
+    examples_roots: list[str],
     suite_filter: str | None,
     *,
     limit: int,
@@ -589,7 +618,7 @@ def _eval_results(
     resolved_suite = suite_filter
     if suite_filter is not None:
         try:
-            resolved_suite = resolve_eval_suite(suite_filter, examples_root).id
+            resolved_suite = _resolve_suite(suite_filter, examples_roots).id
         except ValueError:
             resolved_suite = suite_filter
     summaries = list_eval_results(results_root, resolved_suite, limit=limit)
@@ -620,7 +649,7 @@ def _eval_results(
 def _eval_run_suite(
     selector: str,
     *,
-    examples_root: str,
+    examples_roots: list[str],
     results_root: str,
     prompt_file: str | None,
     provider: str,
@@ -635,7 +664,7 @@ def _eval_run_suite(
     top_k: int | None,
     out: str | None,
 ) -> None:
-    suite = resolve_eval_suite(selector, examples_root)
+    suite = _resolve_suite(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -847,17 +876,25 @@ def _examples_root() -> Path:
     return Path(__file__).resolve().parents[2] / "examples"
 
 
+def _benchmark_roots() -> tuple[Path, ...]:
+    """Every root holding self-contained task dirs: examples/ + environment-capture/."""
+    repo = Path(__file__).resolve().parents[2]
+    return (repo / "examples", repo / "environment-capture")
+
+
 def _discover_examples() -> list[Path]:
-    root = _examples_root()
-    if not root.exists():
-        return []
-    return sorted(
-        path
-        for path in root.iterdir()
-        if path.is_dir()
-        and _is_safe_example_name(path.name)
-        and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
-    )
+    found: list[Path] = []
+    for root in _benchmark_roots():
+        if not root.exists():
+            continue
+        found.extend(
+            path
+            for path in root.iterdir()
+            if path.is_dir()
+            and _is_safe_example_name(path.name)
+            and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
+        )
+    return sorted(found)
 
 
 def _is_safe_example_name(name: str) -> bool:
@@ -873,11 +910,14 @@ def _resolve_example(name: str) -> Path:
     # An unsafe segment (spaces, path separators, ...) is simply not an example name; fall
     # through to the same "unknown example" usage error instead of a ValueError traceback.
     try:
-        example_dir = _examples_root() / validate_name(name)
+        safe = validate_name(name)
     except ValueError:
-        example_dir = None
-    if example_dir is not None and example_dir.is_dir():
-        return example_dir
+        safe = None
+    if safe is not None:
+        for root in _benchmark_roots():
+            example_dir = root / safe
+            if example_dir.is_dir():
+                return example_dir
     available = ", ".join(path.name for path in _discover_examples())
     hint = f" (available: {available})" if available else ""
     raise typer.BadParameter(f"unknown example {name!r}{hint}")

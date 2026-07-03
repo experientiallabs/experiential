@@ -12,7 +12,7 @@ Isolated exactly like the other capture tools: stdlib + boto3 only, never import
 trajectory JSONL in the shape `convert_to_wmh.py` already reads
 (`{task, task_category, tool_calls:[{name, arguments:{command}, output, isError}]}`), so:
 
-    AWS_REGION=us-east-1 examples/terminal-tasks/.venv/bin/python capture_terminal.py \
+    AWS_REGION=us-east-1 environment-capture/terminal-tasks/.venv/bin/python capture_terminal.py \
         --per-category 60 --out trajectories.jsonl
     # then, with the committed converter:
     python convert_to_wmh.py trajectories.jsonl --out traces.otel.jsonl --benchmark terminal-tasks

@@ -25,9 +25,9 @@ no effect there) or `vllm:<model>@<base-url>` (Qwen3.5-9B on the wake/sleep serv
 which does honor --temperature).
 
 Examples:
-    uv run python examples/tau-bench/rl/icl.py --mode base --scenarios eval --limit 2
-    uv run python examples/tau-bench/rl/icl.py --mode collect --scenarios train --wm haiku
-    uv run python examples/tau-bench/rl/icl.py --mode multi --scenarios eval --wm gpt-5.5 \
+    uv run python environment-capture/tau-bench/rl/icl.py --mode base --scenarios eval --limit 2
+    uv run python environment-capture/tau-bench/rl/icl.py --mode collect --scenarios train --wm haiku
+    uv run python environment-capture/tau-bench/rl/icl.py --mode multi --scenarios eval --wm gpt-5.5 \
         --policy vllm:Qwen/Qwen3.5-9B@http://localhost:8001/v1
 """
 

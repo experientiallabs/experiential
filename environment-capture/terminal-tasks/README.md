@@ -1,7 +1,7 @@
 # terminal-tasks trace capture (isolated)
 
 Converts terminal-task computer-use-agent trajectories into the world-model-harness trace corpus
-(`examples/terminal-tasks/traces.otel.jsonl`). These are real agent runs on a terminal/bash
+(`environment-capture/terminal-tasks/traces.otel.jsonl`). These are real agent runs on a terminal/bash
 environment —
 an LLM agent issues `bash` tool calls and the **real command output** is recorded per call (including
 real failures: tracebacks, HTTP 301s, retries). The environment being reconstructed is a Unix shell:
@@ -19,15 +19,15 @@ Like the other task examples, this is isolated from `wmh`:
 This example includes the old committed terminal-tasks world model under:
 
 ```text
-examples/terminal-tasks/models/terminal-tasks/
+environment-capture/terminal-tasks/models/terminal-tasks/
 ```
 
 Use it as a local model root:
 
 ```bash
-uv run wmh list --root examples/terminal-tasks
-uv run wmh demo --root examples/terminal-tasks --name terminal-tasks
-uv run wmh play --root examples/terminal-tasks --name terminal-tasks
+uv run wmh list --root environment-capture/terminal-tasks
+uv run wmh demo --root environment-capture/terminal-tasks --name terminal-tasks
+uv run wmh play --root environment-capture/terminal-tasks --name terminal-tasks
 ```
 
 ## Source data
@@ -43,7 +43,7 @@ each tool call has `name`, `arguments`, `output`, and an `isError` flag:
 ## Convert
 
 ```bash
-cd examples/terminal-tasks
+cd environment-capture/terminal-tasks
 python convert_to_wmh.py \
   <path/to/trajectories.jsonl> \
   --out traces.otel.jsonl --benchmark terminal-tasks \

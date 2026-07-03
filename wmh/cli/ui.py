@@ -200,7 +200,7 @@ def run_build_wizard(
                 ask,
                 "Path to exported traces (OTLP-JSON / JSONL)",
                 None,
-                example="examples/tau-bench/traces.otel.jsonl",
+                example="environment-capture/tau-bench/traces.otel.jsonl",
             )
             if not file:
                 console.print("[red]a traces path is required (or pass --vendor)[/red]")

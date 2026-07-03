@@ -111,7 +111,7 @@ def main() -> None:
         from tau2.registry import registry
     except ImportError as exc:  # pragma: no cover - depends on the isolated venv
         raise SystemExit(
-            "tau2 is not importable; run this from examples/tau-bench/ in the tau2 .venv "
+            "tau2 is not importable; run this from environment-capture/tau-bench/ in the tau2 .venv "
             "(see this directory's README), with TAU2_DATA_DIR set."
         ) from exc
     env = registry.get_env_constructor(domain)()  # loads the real domain DB

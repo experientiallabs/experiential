@@ -73,15 +73,19 @@ uv run pytest -q
      the wire format). It IS part of the Python gate. Per-benchmark data dirs inside it
      (`environment-capture/<benchmark>/`) follow the examples/ pattern: committed
      `traces.otel.jsonl` + provenance README + thin scripts; heavy deps and cloned upstreams
-     stay in local, gitignored venvs (their out-of-process `backend/` scripts are ty-excluded).
+     stay in local, gitignored venvs (their out-of-process `backend/` scripts are ty-excluded,
+     and the three pre-contract benchmark dirs — tau-bench, terminal-tasks, swe-bench — keep
+     their examples-era ruff/ty exemption for legacy capture tooling).
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
 
-6. **Keep dataset-specific logic inside examples.** SWE-bench, tau-bench, terminal-task, and similar
-   dataset-specific launch or conversion logic belongs under `examples/<task>/`. A standard example
-   folder should be self-contained, with `traces.otel.jsonl`, optional `evals/*.toml` definitions,
-   and task-local helpers if needed. Launch task helpers through `wmh examples run <task> -- <args>`.
+6. **Keep dataset-specific logic inside its benchmark dir.** Benchmark launch/capture/conversion
+   logic belongs under `environment-capture/<benchmark>/` (ALL ten benchmark integrations live
+   there — tau-bench, terminal-tasks, swe-bench included); non-benchmark task examples belong
+   under `examples/<task>/`. Either way a dir is self-contained: `traces.otel.jsonl`, optional
+   `evals/*.toml`, task-local helpers. Launch helpers through `wmh examples run <task> -- <args>`
+   (discovery spans both roots).
 
 7. **Route reusable workflows through `wmh`.** Avoid parallel top-level scripts for harness actions.
    If a workflow is generally useful outside one example dataset, implement it in `wmh/` and expose

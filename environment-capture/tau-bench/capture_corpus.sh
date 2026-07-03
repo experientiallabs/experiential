@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Capture a multi-domain tau2-bench trace corpus across airline + retail + telecom, then convert and
-# merge into one wmh OTel corpus. This is how `examples/tau-bench/traces.otel.jsonl` was grown to
+# merge into one wmh OTel corpus. This is how `environment-capture/tau-bench/traces.otel.jsonl` was grown to
 # ~1000 traces for the trace-scaling-law experiment (docs/trace_scaling.md).
 #
-#   examples/tau-bench/capture_corpus.sh
+#   environment-capture/tau-bench/capture_corpus.sh
 #
 # Distinct-task budget per domain (1 trial each, so every trace is a different task — no repeats):
 #   airline   50  (all tasks)

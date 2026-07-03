@@ -21,7 +21,7 @@ talk to that HTTP surface, not the Python objects.
 Budget: <~30 Bedrock haiku calls, max_steps=3, 2 scenarios. Under `examples/` so it's
 excluded from the ruff/ty gate but we keep it clean. Run with:
 
-    uv run python examples/tau-bench/rl/smoke.py
+    uv run python environment-capture/tau-bench/rl/smoke.py
 
 from the repo root. AWS creds come from `~/.aws` (default profile), region us-east-1.
 """

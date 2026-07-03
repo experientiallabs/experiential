@@ -167,7 +167,7 @@ def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> N
         example = tmp_path / dirname
         example.mkdir()
         (example / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setattr(cli_app_module, "_examples_root", lambda: tmp_path)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
 
     listed = runner.invoke(app, ["examples", "list"])
     assert listed.exit_code == 0, listed.output
@@ -237,9 +237,9 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
 
     assert result.exit_code == 0, result.output
     command = cast(list[str], seen["command"])
-    assert command[0].endswith("examples/tau-bench/run.sh")
+    assert command[0].endswith("environment-capture/tau-bench/run.sh")
     assert command[1:] == ["--trace", "0"]
-    assert str(seen["cwd"]).endswith("examples/tau-bench")
+    assert str(seen["cwd"]).endswith("environment-capture/tau-bench")
     assert seen["check"] is False
 
 

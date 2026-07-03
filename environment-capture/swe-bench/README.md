@@ -4,10 +4,10 @@ This directory is a **self-contained, local-only capture tool**. It runs the *re
 [SWE-bench Verified](https://www.swebench.com/) benchmark with the standard
 [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) harness and converts the recorded
 agent trajectories into the world-model-harness trace corpus
-(`examples/swe-bench/traces.otel.jsonl`).
+(`environment-capture/swe-bench/traces.otel.jsonl`).
 
-It is deliberately isolated, exactly like `examples/tau-bench/` and
-`examples/terminal-tasks/`:
+It is deliberately isolated, exactly like `environment-capture/tau-bench/` and
+`environment-capture/terminal-tasks/`:
 
 - **`wmh` never imports SWE-bench or mini-swe-agent.** SWE-bench Verified runs each instance in its
   own per-instance Docker image (the buggy repo at a pinned commit + its full test env); the agent
@@ -24,15 +24,15 @@ It is deliberately isolated, exactly like `examples/tau-bench/` and
 This example includes the old committed SWE-bench world model under:
 
 ```text
-examples/swe-bench/models/swe-bench/
+environment-capture/swe-bench/models/swe-bench/
 ```
 
 Use it as a local model root:
 
 ```bash
-uv run wmh list --root examples/swe-bench
-uv run wmh demo --root examples/swe-bench --name swe-bench
-uv run wmh play --root examples/swe-bench --name swe-bench
+uv run wmh list --root environment-capture/swe-bench
+uv run wmh demo --root environment-capture/swe-bench --name swe-bench
+uv run wmh play --root environment-capture/swe-bench --name swe-bench
 ```
 
 ## Why capture from the REAL benchmark
@@ -48,7 +48,7 @@ design, so the harness is honest about where it's hard.)
 ## Setup
 
 ```bash
-cd examples/swe-bench
+cd environment-capture/swe-bench
 git clone --depth 1 https://github.com/SWE-agent/mini-swe-agent.git
 uv venv --python 3.12 .venv
 uv pip install --python .venv ./mini-swe-agent 'swebench' boto3

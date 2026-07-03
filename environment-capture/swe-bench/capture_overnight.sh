@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Overnight SWE-bench Verified capture: grow the trace corpus with a large slice, resiliently.
 #
-#   examples/swe-bench/capture_overnight.sh
+#   environment-capture/swe-bench/capture_overnight.sh
 #
 # Runs the real mini-swe-agent harness over a wide slice of SWE-bench Verified, live on Bedrock.
 # Resilient by design for an unattended overnight run:
