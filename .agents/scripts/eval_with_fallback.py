@@ -14,7 +14,9 @@ import sys
 import time
 from pathlib import Path
 
-from wmh.engine.eval import evaluate_files
+from wmh.engine.build import split_traces
+from wmh.engine.replay import replay
+from wmh.ingest import get_adapter
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.optimize.judge import RubricJudge
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -55,18 +57,25 @@ def main() -> None:
         ]
     )
     resilient = RetryingProvider(chain)
-    report = evaluate_files(
-        [root / bench / "traces.otel.jsonl"],
+    # Mirrors evaluate_files' per-file body, adding replay's concurrency (steps are independent).
+    traces = get_adapter("otel-genai").from_file(str(root / bench / "traces.otel.jsonl"))
+    train, holdout = split_traces(traces, 0.7)
+    if not holdout:
+        train, holdout = traces, traces
+    from wmh.retrieval.retriever import EmbeddingRetriever
+
+    entry = replay(
         BASE_ENV_PROMPT,
+        holdout,
         resilient,
         RubricJudge(resilient),
-        embedder=HashingEmbedder(dim=512),
-        train_split=0.7,
+        retriever=EmbeddingRetriever(HashingEmbedder(dim=512)),
+        train=train,
         top_k=5,
         sample_turns="all",
         seed=0,
+        concurrency=8,
     )
-    entry = next(iter(report.per_file.values()))
     flagged = [
         r
         for r in entry.results
@@ -77,11 +86,14 @@ def main() -> None:
         if flagged
         else None
     )
+    scores = [r.score for r in entry.results]
+    mean = sum(scores) / len(scores) if scores else 0.0
+    var = sum((s - mean) ** 2 for s in scores) / len(scores) if scores else 0.0
     out = {
         "benchmark": bench,
-        "fidelity": round(report.overall_fidelity, 4),
-        "std": round(report.overall_std, 4),
-        "n_steps": report.total_steps,
+        "fidelity": round(mean, 4),
+        "std": round(var ** 0.5, 4),
+        "n_steps": len(scores),
         "error_flag_accuracy": round(err_acc, 4) if err_acc is not None else None,
     }
     print(json.dumps(out))
