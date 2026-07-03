@@ -563,7 +563,9 @@ class RichBuildReporter:
                 TextColumn("{task.fields[score]}"),
                 TimeElapsedColumn(),
                 console=self._console,
-                transient=True,
+                # Not transient: the finished bar stays in scrollback, snapped to 100% with the
+                # true final call count and elapsed time (see optimize_done).
+                transient=False,
             )
             self._progress.start()
             self._task_id = self._progress.add_task(
@@ -588,6 +590,11 @@ class RichBuildReporter:
 
     def optimize_done(self, held_out_accuracy: float, frontier_size: int, rollouts: int) -> None:
         if self._progress is not None:
+            if self._task_id is not None and rollouts > 0:
+                # 100% exactly when GEPA is actually done: the endpoint can't be predicted (soft
+                # cap + per-iteration costs decided at runtime), so the bar snaps to the ACTUAL
+                # final call count on the completion event instead of guessing during the run.
+                self._progress.update(self._task_id, completed=rollouts, total=rollouts)
             self._progress.stop()
             self._progress = None
             self._task_id = None

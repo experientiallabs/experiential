@@ -299,7 +299,9 @@ def test_build_reporter_bar_never_pins_at_100_while_running() -> None:
     assert task.total is not None and task.completed < task.total
     reporter.rollout(14, 10, 0.6)  # overshoot: the total grows with reality
     assert (task.completed, task.total) == (14, 15)
-    reporter.optimize_done(0.6, 1, 14)  # completion is signaled by the done stage, not the bar
+    reporter.optimize_done(0.6, 1, 14)
+    # 100% happens exactly at completion: the bar snaps to the actual final call count.
+    assert (task.completed, task.total) == (14, 14)
 
 
 def test_build_wizard_dashes_spaces_in_name() -> None:
