@@ -20,6 +20,6 @@ lint:
 pkg member task:
     uv run --package {{member}} {{task}}
 
-# web/ carries its own JS gate (AGENTS.md rule 5)
+# web/ carries its own JS gate (AGENTS.md rule 5); no-op until web/ lands
 web-gate:
-    cd web && npm run lint && npx tsc --noEmit
+    @test -d web && (cd web && npm run lint && npx tsc --noEmit) || echo 'web/ not landed yet'

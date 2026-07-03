@@ -1595,7 +1595,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "llm-waterfall", extra = ["all"] },
     { name = "matplotlib" },
     { name = "opentelemetry-proto" },
     { name = "pytest" },
@@ -1611,6 +1610,11 @@ viz = [
     { name = "seaborn" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "llm-waterfall", extra = ["all"] },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.39" },
@@ -1619,7 +1623,6 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "gepa", specifier = ">=0.1.1" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "llm-waterfall", extras = ["all"], marker = "extra == 'dev'", editable = "llm-waterfall" },
     { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "openai", specifier = ">=1.40" },
@@ -1637,3 +1640,6 @@ requires-dist = [
     { name = "world-model-harness", extras = ["otel", "viz"], marker = "extra == 'dev'" },
 ]
 provides-extras = ["otel", "viz", "dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "llm-waterfall", extras = ["all"], editable = "llm-waterfall" }]

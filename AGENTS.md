@@ -43,7 +43,8 @@ uv run pytest -q
 
 5. **The top level is an allowlist.** Tracked top-level directories are exactly: `wmh/`,
    `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`, plus the
-   monorepo package members `llm-waterfall/` and `environment-capture/` (see § Monorepo). Do not
+   monorepo workspace member `llm-waterfall/` and the pre-authorized future member
+   `environment-capture/` (see § Monorepo). Do not
    add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
    `wmh/repo_layout_test.py` enforces this. What each surface is for:
    - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
@@ -82,7 +83,9 @@ uv run pytest -q
 
 7. **Route reusable workflows through `wmh`.** Avoid parallel top-level scripts for harness actions.
    If a workflow is generally useful outside one example dataset, implement it in `wmh/` and expose
-   it through the CLI.
+   it through the CLI — unless the capability already exists as (or deserves to be) a workspace
+   member, in which case depend on the member instead of growing a copy inside `wmh/`
+   (§ Monorepo, rule 13).
 
 8. **Keep imports explicit and fail-fast.** Put imports at module scope unless moving them is
    required to break a real circular dependency. Do not use lazy imports for optional convenience,
@@ -151,7 +154,10 @@ Rules of the road:
   workspace that depends on a member resolves it from source via `[tool.uv.sources]`
   (`{ workspace = true }`), never from PyPI.
 - **Dependency arrows**: members never import `wmh`, and `wmh` depends on members only through
-  their public, published APIs. Members must be installable and usable standalone.
+  their public, published APIs. Members must be installable and usable standalone. Consuming a
+  member takes BOTH halves: declare it in `[project.dependencies]` (so installs outside the
+  workspace resolve it) AND rely on `[tool.uv.sources]` for in-workspace source resolution —
+  the sources entry alone wires nothing.
 - **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
   `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
   `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in

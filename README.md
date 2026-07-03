@@ -73,13 +73,13 @@ This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/
 `wmh` is the flagship package at the root (the quickstart above), and sibling packages live as
 top-level directories, each installable on its own:
 
-| Package | What it does | Install |
+| Package | What it does | Get it |
 |---|---|---|
-| **wmh** (root) | Agent traces → a faithful world model of your environment | `pip install wmh` *(or the quickstart above)* |
-| [`llm-waterfall/`](./llm-waterfall) | Pool LLM quota across models, providers, and AWS accounts: stateless failover that spills only on capacity errors, returning cost + the full attempt trail | `pip install llm-waterfall` |
+| **wmh** (root) | Agent traces → a faithful world model of your environment | the quickstart above |
+| [`llm-waterfall/`](./llm-waterfall) | Pool LLM quota across models, providers, and AWS accounts: stateless failover that spills only on capacity errors, returning cost + the full attempt trail | `pip install "llm-waterfall @ git+https://github.com/experientiallabs/world-model-harness#subdirectory=llm-waterfall"` *(PyPI release pending)* |
 | `environment-capture/` *(in progress)* | Point it at any agent benchmark: integrate via a small adapter, smoke-test it, capture real-run traces as OTel GenAI JSONL | — |
 
-One clone, one `uv sync`, one gate (`just gate`); each package publishes to PyPI independently.
+One clone, one `uv sync`, one gate (`just gate`); each package is built and released independently.
 
 ## Development
 
