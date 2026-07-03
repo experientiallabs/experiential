@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import io
 import os
 
 import pytest
@@ -281,6 +282,24 @@ def test_build_wizard_accepts_defaults_with_blank_input() -> None:
     assert params.gepa_budget == 50
     assert params.region == "us-east-1"  # bedrock default suggested + accepted
     assert params.embed_provider == "hashing"  # default embedder, no embed-model prompt
+
+
+def test_build_reporter_bar_never_pins_at_100_while_running() -> None:
+    # The metric-call budget is a soft cap GEPA can overshoot; a live run must never read
+    # completed == total (rich freezes the elapsed clock and the bar looks stuck at 100%).
+    console = Console(force_terminal=True, no_color=True, width=100, file=io.StringIO())
+    reporter = RichBuildReporter(console, "demo")
+    reporter.optimize_start(10)
+    assert reporter._progress is not None
+    task = reporter._progress.tasks[0]
+
+    reporter.rollout(9, 10, 0.5)
+    assert (task.completed, task.total) == (9, 10)
+    reporter.rollout(10, 10, 0.5)  # reaching the estimate: still not "finished"
+    assert task.total is not None and task.completed < task.total
+    reporter.rollout(14, 10, 0.6)  # overshoot: the total grows with reality
+    assert (task.completed, task.total) == (14, 15)
+    reporter.optimize_done(0.6, 1, 14)  # completion is signaled by the done stage, not the bar
 
 
 def test_build_wizard_dashes_spaces_in_name() -> None:

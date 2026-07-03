@@ -573,7 +573,11 @@ class RichBuildReporter:
     def rollout(self, done: int, budget: int, score: float | None) -> None:
         label = f"avg fidelity {score:.3f}" if score is not None else "score n/a"
         if self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, completed=min(done, budget), score=label)
+            # The budget is an estimate (GEPA treats max_metric_calls as a soft cap and can
+            # overshoot). Never pin a live run at 100% — rich freezes the elapsed clock once
+            # completed == total, which reads as "stuck". Grow the total instead.
+            total = budget if done < budget else done + 1
+            self._progress.update(self._task_id, completed=done, total=total, score=label)
         elif not self._tty:
             # Non-TTY: emit a sparse heartbeat so long runs still show life without flooding logs.
             if done == 1 or done % 10 == 0 or done >= budget:
