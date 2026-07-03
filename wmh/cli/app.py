@@ -65,13 +65,22 @@ from wmh.engine.eval_suites import (
 )
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
-from wmh.ingest import VendorPull
+from wmh.env.llm_agent import LLMAgent
+from wmh.ingest import VendorPull, get_adapter
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
-from wmh.providers.base import EmbedderKind
+from wmh.providers.base import Embedder, EmbedderKind
 from wmh.providers.fallback import _is_capacity_error
 from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
+from wmh.scenarios import (
+    ChecklistJudge,
+    FacetExtractor,
+    ScenarioBuildConfig,
+    ScenarioSet,
+    build_scenario_set,
+    verify_scenarios,
+)
 from wmh.serving.server import create_app
 from wmh.telemetry import (
     BuildTelemetryStats,
@@ -93,9 +102,14 @@ examples_app = typer.Typer(
     help="List and launch self-contained task examples.", no_args_is_help=True
 )
 config_app = typer.Typer(help="Manage local harness config.", no_args_is_help=True)
+scenarios_app = typer.Typer(
+    help="Construct and verify representative eval scenario sets from traces.",
+    no_args_is_help=True,
+)
 app.add_typer(providers_app, name="providers")
 app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
+app.add_typer(scenarios_app, name="scenarios")
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
@@ -802,6 +816,162 @@ def _eval_report_payload(report: EvalReport) -> dict[str, object]:
         "total_steps": report.total_steps,
         "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
     }
+
+
+@scenarios_app.command("build")
+def scenarios_build(
+    file: str = typer.Option(..., "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
+    out: str = typer.Option("scenarios.json", "--out", help="Where to write the scenario set."),
+    budget: int = typer.Option(20, help="Number of scenarios to construct."),
+    k: int = typer.Option(None, help="Cluster count (default: sqrt(corpus size))."),
+    limit: int = typer.Option(None, help="Only use the first N ingested traces (cost control)."),
+    provider: str = typer.Option("bedrock", "--provider", help="LLM for facets/naming/synthesis."),
+    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    embed_provider: str = typer.Option(
+        "hashing", help="Facet embedder: hashing (offline) | bedrock | openai | azure_openai."
+    ),
+    embed_model: str = typer.Option(None, help="Embeddings model id / Azure deployment."),
+    embed_dim: int = typer.Option(512, help="Embedding dimensionality."),
+    seed: int = typer.Option(0, help="Clustering seed."),
+) -> None:
+    """Distill a trace corpus into a representative scenario set (facets -> cluster -> select).
+
+    Writes a `ScenarioSet` JSON: scenarios (task, seed state, checklist, weight, provenance),
+    the named clusters they came from, and the corpus-coverage number that justifies them.
+    """
+    traces = get_adapter("otel-genai").from_file(file)
+    if limit is not None:
+        traces = traces[:limit]
+    if not traces:
+        raise typer.BadParameter(f"no traces ingested from {file}")
+    llm = providers.get_provider(_provider_config(provider, model, region))
+    embedder = _resolve_scenario_embedder(embed_provider, embed_model, embed_dim, region)
+
+    _console.print(f"extracting facets for {len(traces)} traces…")
+    facets = FacetExtractor(llm).extract_all(traces)
+    config = ScenarioBuildConfig(budget=budget, k=k, seed=seed)
+    scenario_set = build_scenario_set(traces, facets, llm, embedder, config)
+    scenario_set.save(out)
+
+    table = Table(title="Scenario set")
+    table.add_column("Cluster", no_wrap=True)
+    table.add_column("Scenario task")
+    table.add_column("Weight", justify="right")
+    table.add_column("Source", no_wrap=True)
+    for scenario in scenario_set.scenarios:
+        source = scenario.failure_category or scenario.source_outcome.value
+        table.add_row(scenario.cluster_name, scenario.task[:80], f"{scenario.weight:.3f}", source)
+    _console.print(table)
+    _console.print(
+        f"{len(scenario_set.scenarios)} scenarios from {scenario_set.corpus_traces} traces; "
+        f"coverage {scenario_set.corpus_coverage:.0%} at tau={scenario_set.coverage_tau} -> {out}"
+    )
+
+
+@scenarios_app.command("verify")
+def scenarios_verify(
+    scenarios_file: str = typer.Argument(..., help="Scenario set JSON from `wmh scenarios build`."),
+    file: str = typer.Option(..., "--file", help="Source trace corpus (for back-agreement)."),
+    name: str = typer.Option(None, "--name", help="World model to roll against."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models."),
+    provider: str = typer.Option(None, "--provider", help="Override serve provider kind."),
+    model: str = typer.Option(None, help="Override serve model id (e.g. a small/cheap model)."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    max_steps: int = typer.Option(12, help="Rollout step budget per scenario."),
+    drop: bool = typer.Option(False, "--drop", help="Write back only verified scenarios."),
+) -> None:
+    """Closed-loop verification: back-agreement on source traces + solvability rollouts.
+
+    Loads the world model (optionally overriding its serve provider with a cheaper model), rolls a
+    baseline LLM agent on every scenario, and grades episodes against each scenario's checklist.
+    With `--drop`, unverified scenarios are removed from the set in place.
+    """
+    scenario_set = ScenarioSet.load(scenarios_file)
+    traces = get_adapter("otel-genai").from_file(file)
+    store = WorldModelStore(root)
+    resolved_name = _resolve_name(store, name)
+    model_dir = store.resolve(resolved_name)
+    if provider is not None or model is not None:
+        override = _provider_config(
+            provider or "bedrock", model or "us.anthropic.claude-opus-4-8", region
+        )
+        llm = providers.get_provider(override)
+        world_model = WorldModel.load(str(model_dir), llm)
+    else:
+        world_model, llm = load_world_model(model_dir)
+
+    report = verify_scenarios(
+        scenario_set,
+        traces,
+        world_model,
+        LLMAgent(llm),
+        ChecklistJudge(llm),
+        max_steps=max_steps,
+    )
+    table = Table(title="Scenario verification")
+    table.add_column("Scenario", no_wrap=True)
+    table.add_column("Back-agree")
+    table.add_column("Solvable")
+    table.add_column("Pass rate", justify="right")
+    for verdict in report.verdicts:
+        if verdict.back_agreement is None:
+            agree = "-"
+        else:
+            agree = "yes" if verdict.back_agreement else "NO"
+        table.add_row(
+            verdict.scenario_id,
+            agree,
+            "yes" if verdict.solvable else "NO",
+            f"{verdict.rollout_pass_rate:.2f}",
+        )
+    _console.print(table)
+    _console.print(
+        f"back-agreement {report.back_agreement_rate:.0%}, solvable {report.solvable_rate:.0%} "
+        f"over {len(report.verdicts)} scenarios"
+    )
+    if drop:
+        verified = {v.scenario_id for v in report.verdicts if v.ok}
+        scenario_set.scenarios = [s for s in scenario_set.scenarios if s.scenario_id in verified]
+        scenario_set.save(scenarios_file)
+        _console.print(f"kept {len(scenario_set.scenarios)} verified scenarios -> {scenarios_file}")
+
+
+def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
+    try:
+        kind = ProviderKind(provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in ProviderKind)
+        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+    return ProviderConfig(kind=kind, model=model, region=region)
+
+
+def _resolve_scenario_embedder(
+    embed_provider: str, embed_model: str | None, embed_dim: int, region: str | None
+) -> Embedder:
+    try:
+        kind = EmbedderKind(embed_provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in EmbedderKind)
+        raise typer.BadParameter(
+            f"unknown embed provider {embed_provider!r}; choose one of: {kinds}"
+        ) from None
+    if kind is EmbedderKind.HASHING:
+        return HashingEmbedder(dim=embed_dim)
+    if not embed_model:
+        raise typer.BadParameter(
+            f"--embed-provider {kind.value} requires --embed-model "
+            "(the embeddings model id / Azure embedding deployment)"
+        )
+    return providers.get_provider(
+        ProviderConfig(
+            kind=kind.provider_kind(),
+            model=embed_model,
+            embed_model=embed_model,
+            embed_dim=embed_dim,
+            region=region,
+        )
+    )
 
 
 @app.command("demo")
