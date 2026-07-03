@@ -392,9 +392,11 @@ def build(
         # The wizard already live-pinged the serve provider and embedder inline.
         _verify_or_abort(config)
 
-    # Meter the build at the provider boundary: the one serve provider drives GEPA rollouts,
-    # reflection, and the judge, so wrapping it captures all build LLM cost/tokens without touching
-    # the optimizer. `classify_build_call` splits judge vs GEPA by system prompt.
+    # Meter the build at the provider boundary; `classify_build_call` splits judge vs GEPA by
+    # system prompt. Rollouts/reflection may ride the failover chain, but the judge (GEPA's
+    # fitness metric) is PINNED to the single configured backend — a judge that silently switches
+    # models mid-build scores candidates on different scales. Both wrappers share one tracker,
+    # so cost/tokens still land in a single run record.
     tracker = RunTracker(run_id=uuid.uuid4().hex, kind="build")
     metered = MeteredProvider(
         providers.provider_or_chain(config.serve_provider_config()),
@@ -969,18 +971,21 @@ def _run_eval_files(
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    llm = providers.provider_or_chain(
-        ProviderConfig(kind=serve_provider, model=model, region=region)
-    )
+    provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
+    llm = providers.provider_or_chain(provider_config)
     if isinstance(llm, providers.WaterfallProvider):
-        _console.print("failover chain active (.wmh/fallback.toml)")
+        _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
     prompt = (
         Path(options.prompt_file).read_text(encoding="utf-8")
         if options.prompt_file
         else BASE_ENV_PROMPT
     )
     embedder = HashingEmbedder(dim=options.embed_dim) if options.use_rag else None
-    scorer = RubricJudge(llm) if options.judge == "rubric" else LLMJudge(llm)
+    # The judge is the metric: it stays PINNED to the single requested backend and never rides
+    # the failover chain — a judge that silently switches models mid-run makes fidelity numbers
+    # incomparable across steps. World-model prediction calls (above) may fail over freely.
+    judge_llm = providers.get_provider(provider_config)
+    scorer = RubricJudge(judge_llm) if options.judge == "rubric" else LLMJudge(judge_llm)
     evaluation = OpenLoopEval(
         files,
         prompt,

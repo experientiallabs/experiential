@@ -27,6 +27,7 @@ class FakeProvider:
 
     def __init__(self) -> None:
         self.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="opus")
+        self.systems: list[str] = []  # system prompt of every complete() call, for assertions
 
     def complete(
         self,
@@ -36,6 +37,7 @@ class FakeProvider:
         temperature: float = 0.7,
         max_tokens: int = 8192,
     ) -> Completion:
+        self.systems.append(system)
         if "improve the system prompt" in system:
             return Completion(text="IMPROVED ENV PROMPT")
         if "grade a world model" in system:
@@ -322,6 +324,28 @@ def test_eval_trace_file_command_still_scores(patched_provider, tmp_path) -> Non
     assert result.exit_code == 0, result.output
     assert "OVERALL" in result.output
     assert "fidelity=0.500" in result.output
+
+
+def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    # World-model calls may fail over (provider_or_chain); the judge is the metric and must stay
+    # pinned to the single requested backend — a judge that silently switches models mid-run
+    # makes fidelity numbers incomparable.
+    import wmh.providers as providers_pkg
+
+    chain = FakeProvider()
+    pinned = FakeProvider()
+    monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: chain)
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: pinned)
+
+    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--no-rag"])
+
+    assert result.exit_code == 0, result.output
+    judge_systems_chain = [s for s in chain.systems if "grade a world model" in s]
+    judge_systems_pinned = [s for s in pinned.systems if "grade a world model" in s]
+    assert judge_systems_chain == []  # the chain never judges
+    assert judge_systems_pinned  # every judge call went to the pinned backend
+    prediction_systems = [s for s in chain.systems if "grade a world model" not in s]
+    assert prediction_systems  # predictions went through the chain
 
 
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
