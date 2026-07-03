@@ -66,7 +66,8 @@ def score_matrix(
     """Roll every agent over every pool scenario `passes` times; cell = mean checklist pass rate.
 
     Rollouts run on a small thread pool (provider calls are I/O bound); each rollout opens its own
-    world-model session so episodes never share state.
+    world-model session so episodes never share state, and the world model is frozen for the whole
+    matrix so no cell's generated steps become another cell's retrieved demos.
     """
 
     def one_rollout(agent: Agent, scenario: EvalScenario) -> float:
@@ -82,7 +83,7 @@ def score_matrix(
         for scenario in pool
         for _ in range(passes)
     ]
-    with ThreadPoolExecutor(max_workers=workers) as pool_executor:
+    with world_model.frozen(), ThreadPoolExecutor(max_workers=workers) as pool_executor:
         results = list(pool_executor.map(lambda cell: one_rollout(cell[1], cell[2]), cells))
 
     sums: dict[str, dict[str, float]] = {name: {} for name in agents}

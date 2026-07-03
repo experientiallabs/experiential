@@ -43,14 +43,18 @@ class ScriptedProvider:
 
 
 class EmptyRetriever:
-    """Retriever stub: nothing indexed, nothing retrieved."""
+    """Retriever stub: nothing indexed, nothing retrieved; records enrichment attempts."""
+
+    def __init__(self) -> None:
+        self.added: list[Step] = []
 
     def index(self, traces: list[Trace]) -> None: ...
 
     def topk(self, state: EnvState, action: Action, k: int) -> list[Step]:
         return []
 
-    def add(self, step: Step) -> None: ...
+    def add(self, step: Step) -> None:
+        self.added.append(step)
 
     def sample(self, n: int) -> list[Step]:
         return []
@@ -107,8 +111,9 @@ def _source_trace(*, reward: float) -> Trace:
     return Trace(trace_id="t1", steps=[step], metadata={"reward": reward})
 
 
-def _world_model(provider: ScriptedProvider) -> WorldModel:
-    return WorldModel(provider, EmptyRetriever(), telemetry_root="/tmp/wmh-test-telemetry")
+def _world_model(provider: ScriptedProvider) -> tuple[WorldModel, EmptyRetriever]:
+    retriever = EmptyRetriever()
+    return WorldModel(provider, retriever, telemetry_root="/tmp/wmh-test-telemetry"), retriever
 
 
 def test_verify_scenarios_agreeing_and_solvable() -> None:
@@ -120,14 +125,17 @@ def test_verify_scenarios_agreeing_and_solvable() -> None:
             _judge_reply(success=True, passed=[True]),  # rollout grade
         ]
     )
+    world_model, retriever = _world_model(provider)
     report = verify_scenarios(
         ScenarioSet(scenarios=[_scenario()]),
         [_source_trace(reward=1.0)],
-        _world_model(provider),
+        world_model,
         OneShotAgent(),
         ChecklistJudge(provider),
         max_steps=3,
     )
+    # Evaluation rollouts must never enrich the retrieval index (order-dependence leak).
+    assert retriever.added == []
     verdict = report.verdicts[0]
     assert verdict.back_agreement is True
     assert verdict.solvable is True
@@ -148,7 +156,7 @@ def test_verify_scenarios_flags_disagreement_with_recorded_failure() -> None:
     report = verify_scenarios(
         ScenarioSet(scenarios=[_scenario()]),
         [_source_trace(reward=0.0)],
-        _world_model(provider),
+        _world_model(provider)[0],
         OneShotAgent(),
         ChecklistJudge(provider),
         max_steps=3,
@@ -169,13 +177,31 @@ def test_verify_scenarios_without_source_trace_skips_back_agreement() -> None:
     report = verify_scenarios(
         ScenarioSet(scenarios=[_scenario()]),
         [],  # no source corpus
-        _world_model(provider),
+        _world_model(provider)[0],
         OneShotAgent(),
         ChecklistJudge(provider),
         max_steps=3,
     )
     assert report.verdicts[0].back_agreement is None
     assert report.verdicts[0].solvable is True
+
+
+def test_world_model_enrichment_resumes_after_verification() -> None:
+    provider = ScriptedProvider(['{"output": "ok", "is_error": false}'])
+    world_model, retriever = _world_model(provider)
+    verify_scenarios(
+        ScenarioSet(scenarios=[_scenario()]),
+        [],
+        world_model,
+        OneShotAgent(),
+        ChecklistJudge(provider),
+        max_steps=2,
+    )
+    assert retriever.added == []
+    # `frozen` is scoped to the verification run: serving sessions must enrich again afterwards.
+    session = world_model.new_session(task="t")
+    world_model.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="do_it", arguments={}))
+    assert len(retriever.added) == 1
 
 
 def test_verification_report_rates_handle_empty() -> None:

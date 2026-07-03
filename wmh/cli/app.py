@@ -829,7 +829,12 @@ def scenarios_build(
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     embed_provider: str = typer.Option(
-        "hashing", help="Facet embedder: hashing (offline) | bedrock | openai | azure_openai."
+        "hashing",
+        help=(
+            "Facet embedder: hashing (offline but lexical-only — clusters by wording, not "
+            "meaning; prefer a semantic embedder for real corpora) | bedrock | openai | "
+            "azure_openai."
+        ),
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure deployment."),
     embed_dim: int = typer.Option(512, help="Embedding dimensionality."),
@@ -932,9 +937,12 @@ def scenarios_verify(
     )
     if drop:
         verified = {v.scenario_id for v in report.verdicts if v.ok}
-        scenario_set.scenarios = [s for s in scenario_set.scenarios if s.scenario_id in verified]
+        scenario_set.retain(verified)
         scenario_set.save(scenarios_file)
-        _console.print(f"kept {len(scenario_set.scenarios)} verified scenarios -> {scenarios_file}")
+        _console.print(
+            f"kept {len(scenario_set.scenarios)} verified scenarios "
+            f"(weights renormalized, coverage reset) -> {scenarios_file}"
+        )
 
 
 def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:

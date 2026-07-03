@@ -48,6 +48,22 @@ class ScenarioSet(BaseModel):
     corpus_coverage: float = 0.0  # fraction of corpus facets within tau of a selected facet
     coverage_tau: float = 0.0
 
+    def retain(self, scenario_ids: set[str]) -> None:
+        """Keep only `scenario_ids`, renormalizing weights and invalidating coverage.
+
+        Dropping scenarios (e.g. `wmh scenarios verify --drop`) breaks two invariants the artifact
+        promises: weights sum to 1 over the set, and `corpus_coverage` describes the current
+        scenarios. Weights are renormalized over the survivors; coverage needs the facet
+        embeddings (gone by verify time), so it is zeroed rather than left stale.
+        """
+        self.scenarios = [s for s in self.scenarios if s.scenario_id in scenario_ids]
+        total_weight = sum(s.weight for s in self.scenarios)
+        if total_weight > 0:
+            for scenario in self.scenarios:
+                scenario.weight /= total_weight
+        self.corpus_coverage = 0.0
+        self.coverage_tau = 0.0
+
     def save(self, path: str | Path) -> None:
         Path(path).write_text(self.model_dump_json(indent=2), encoding="utf-8")
 
@@ -114,7 +130,7 @@ class ScenarioSynthesizer:
             seed_state = EnvState()
             checklist = []
         return EvalScenario(
-            scenario_id=f"scenario-{trace.trace_id[:12]}",
+            scenario_id=f"scenario-{trace.trace_id}",
             task=task,
             seed_state=seed_state,
             checklist=checklist,

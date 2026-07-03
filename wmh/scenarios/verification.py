@@ -162,13 +162,15 @@ def verify_scenarios(
 
     `traces` is the source corpus (provenance lookups for back-agreement); scenarios whose source
     trace is absent skip the back-agreement half. Solvability rolls `agent` against `world_model`
-    seeded with the scenario's task and initial state.
+    seeded with the scenario's task and initial state. The world model is frozen for the whole
+    run: rollout steps are never indexed, so verdicts don't depend on verification order.
     """
     by_id = {trace.trace_id: trace for trace in traces}
-    verdicts = [
-        _verify_one(scenario, by_id, world_model, agent, judge, max_steps=max_steps)
-        for scenario in scenario_set.scenarios
-    ]
+    with world_model.frozen():
+        verdicts = [
+            _verify_one(scenario, by_id, world_model, agent, judge, max_steps=max_steps)
+            for scenario in scenario_set.scenarios
+        ]
     return VerificationReport(verdicts=verdicts)
 
 

@@ -57,7 +57,7 @@ def kmeans_labels(embeddings: np.ndarray, k: int, *, seed: int = 0) -> np.ndarra
         return np.arange(n, dtype=np.int64)
     rng = np.random.default_rng(seed)
     centroids = _kmeans_pp_init(matrix, k, rng)
-    labels = np.zeros(n, dtype=np.int64)
+    labels = np.full(n, -1, dtype=np.int64)  # impossible sentinel: never false-converges on iter 1
     for _ in range(_KMEANS_ITERS):
         distances = _sq_distances(matrix, centroids)
         new_labels = distances.argmin(axis=1)
