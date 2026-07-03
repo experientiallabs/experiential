@@ -57,7 +57,7 @@ from wmh.engine.eval_suites import (
     result_path,
 )
 from wmh.engine.grid import GridResult, ModelSpec, merge_results, run_grid
-from wmh.engine.grid_plot import plot_grid
+from wmh.engine.grid_plot import plot_grid, plot_grid_heatmap
 from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.ingest import VendorPull
@@ -553,6 +553,13 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             )
         _eval_grid_plot(args[1:], out=out, dataset_label=dataset_label)
         return
+    if args and args[0] == "grid-heatmap":
+        if len(args) < 2:
+            raise typer.BadParameter(
+                "usage: wmh eval grid-heatmap <result.json> [<result.json>...]"
+            )
+        _eval_grid_heatmap(args[1:], out=out)
+        return
     if args and args[0] == "run":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval run <suite>")
@@ -795,6 +802,22 @@ def _eval_grid_plot(
         n_test_traces=merged.total_test_traces,
     )
     _console.print(f"wrote merged grid chart -> {png}")
+
+
+def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
+    """Render the whole grid as one heatmap from result JSONs (merged per suite).
+
+    Accepts any mix of API/Qwen result JSONs; same-suite results are merged into one 5-model row
+    set, then all suites become the heatmap's columns (rows = model x condition).
+    """
+    by_suite: dict[str, list[GridResult]] = {}
+    for p in paths:
+        res = GridResult.model_validate_json(Path(p).read_text(encoding="utf-8"))
+        by_suite.setdefault(res.suite, []).append(res)
+    merged = {suite: merge_results(rs) for suite, rs in by_suite.items()}
+    png = Path(out) if out else Path("grid-heatmap.png")
+    plot_grid_heatmap(merged, png)
+    _console.print(f"wrote grid heatmap -> {png} ({len(merged)} benchmarks)")
 
 
 def _eval_run_suite(

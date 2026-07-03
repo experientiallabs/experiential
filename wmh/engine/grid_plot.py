@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wmh.engine.grid import GridResult
+from wmh.engine.grid import CONDITIONS, GridResult
 
 _TITLE = "World-Model Harness Fidelity"
 
@@ -82,6 +82,84 @@ def plot_grid(
         color="#555",
     )
     sns.despine(ax=ax)
+    fig.tight_layout()
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+def plot_grid_heatmap(
+    results: dict[str, GridResult],
+    out_path: str | Path,
+    *,
+    benchmark_order: list[str] | None = None,
+) -> Path:
+    """Render the whole grid as one heatmap: rows = model x condition, columns = benchmark.
+
+    `results` maps a benchmark label to its merged `GridResult` (all 5 models x 4 conditions). Each
+    cell is the mean fidelity, annotated and colored on a shared 0..1 scale so every benchmark reads
+    on the same footing. A model x condition with no cell for a benchmark is left blank (NaN).
+    Columns follow `benchmark_order` when given, else the dict's insertion order.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import seaborn as sns
+
+    if not results:
+        raise ValueError("no grid results to plot")
+    benchmarks = benchmark_order or list(results)
+
+    # Row order: models in first-seen order, each followed by its four conditions.
+    models: list[str] = []
+    labels: dict[str, str] = {}
+    for res in results.values():
+        for cell in res.cells:
+            if cell.model_label not in models:
+                models.append(cell.model_label)
+            labels.setdefault(cell.condition, cell.condition_label)
+    rows = [(m, c) for m in models for c in CONDITIONS]
+
+    # (model, condition, benchmark) -> fidelity lookup.
+    fid: dict[tuple[str, str, str], float] = {}
+    for bench, res in results.items():
+        for cell in res.cells:
+            fid[(cell.model_label, cell.condition, bench)] = cell.fidelity
+
+    matrix = np.full((len(rows), len(benchmarks)), np.nan)
+    for r, (model, cond) in enumerate(rows):
+        for c, bench in enumerate(benchmarks):
+            if (model, cond, bench) in fid:
+                matrix[r, c] = fid[(model, cond, bench)]
+    row_labels = [f"{m}  ·  {labels.get(c, c)}" for m, c in rows]
+
+    sns.set_theme(style="white", context="talk")
+    fig, ax = plt.subplots(figsize=(1.7 * len(benchmarks) + 4, 0.42 * len(rows) + 2.2))
+    sns.heatmap(
+        matrix,
+        ax=ax,
+        cmap="rocket",
+        vmin=0.0,
+        vmax=1.0,
+        annot=True,
+        fmt=".2f",
+        annot_kws={"fontsize": 9},
+        linewidths=0.6,
+        linecolor="white",
+        cbar_kws={"label": "Mean fidelity", "shrink": 0.6},
+        xticklabels=benchmarks,
+        yticklabels=row_labels,
+    )
+    # Separator lines between models (every 4 conditions) so the model blocks read as groups.
+    for i in range(len(CONDITIONS), len(rows), len(CONDITIONS)):
+        ax.axhline(i, color="#333", linewidth=1.4)
+    ax.set_title(f"{_TITLE} — full grid", fontsize=17, fontweight="bold", pad=16)
+    ax.tick_params(axis="y", labelsize=9, rotation=0)
+    ax.tick_params(axis="x", labelsize=11)
     fig.tight_layout()
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
