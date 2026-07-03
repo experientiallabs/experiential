@@ -188,7 +188,9 @@ def run_build_wizard(
     # missing credential is prompted for and persisted to .env rather than failing mid-build.
     providers = list(_PROVIDER_MODELS)
     with_creds = [p for p in providers if _has_credentials(p)]
-    notes = {p: "api key exists" for p in with_creds}
+    # Name the actual variable so a key inherited from the shell (e.g. exported in ~/.zshrc)
+    # is traceable — "api key exists" alone reads as a mystery when .env doesn't have it.
+    notes = {p: _creds_note(p) for p in with_creds}
     provider_default = defaults.provider or (with_creds[0] if with_creds else None)
     while True:
         provider = _select(
@@ -427,6 +429,12 @@ def _provider_env_vars(provider: str) -> list[str]:
         return PROVIDER_ENV_VARS[ProviderKind(provider)]
     except (ValueError, KeyError):
         return []
+
+
+def _creds_note(provider: str) -> str:
+    """Picker annotation for a provider whose credentials are present, naming what was found."""
+    env_vars = _provider_env_vars(provider)
+    return f"{env_vars[0]} set" if len(env_vars) == 1 else "creds set"
 
 
 def _has_credentials(provider: str) -> bool:

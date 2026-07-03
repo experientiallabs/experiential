@@ -531,8 +531,9 @@ def test_build_wizard_annotates_providers_that_have_keys(monkeypatch) -> None:  
         verify_embed=_ok_verify,
     )
     out = console.export_text()
-    assert "openai  (api key exists)" in out
-    assert "anthropic  (api key exists)" not in out
+    assert "openai  (OPENAI_API_KEY set)" in out  # names the variable: traceable to zshrc/.env
+    assert "bedrock  (creds set)" in out  # multi-var providers get the generic label
+    assert "anthropic" in out and "ANTHROPIC_API_KEY set" not in out
 
 
 # --- selection picker ----------------------------------------------------------------------------
