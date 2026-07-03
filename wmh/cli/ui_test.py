@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import io
+import importlib
 import os
 
 import pytest
@@ -12,7 +12,7 @@ from rich.console import Console
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
-    _read_key,
+    _decode_key,
     _step_selection,
     models_table,
     run_build_wizard,
@@ -24,6 +24,8 @@ from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
+
+ui_module = importlib.import_module("wmh.cli.ui")
 
 
 @pytest.fixture(autouse=True)
@@ -154,12 +156,30 @@ def test_play_repl_exits_cleanly_on_eof() -> None:
 # --- creation wizard -----------------------------------------------------------------------------
 
 
-def test_read_key_decodes_arrows_and_plain_chars() -> None:
-    assert _read_key(io.StringIO("\x1b[A")) == "up"
-    assert _read_key(io.StringIO("\x1b[B")) == "down"
-    assert _read_key(io.StringIO("\x1b[C")) == "esc"  # unhandled escape sequences are inert
-    assert _read_key(io.StringIO("j")) == "j"
-    assert _read_key(io.StringIO("\r")) == "\r"
+def test_decode_key_maps_arrows_and_passes_plain_chars() -> None:
+    assert _decode_key("\x1b[A") == "up"
+    assert _decode_key("\x1bOA") == "up"  # application cursor mode
+    assert _decode_key("\x1b[B") == "down"
+    assert _decode_key("\x1b[1;5A") == "esc"  # modified arrows are inert, not a stray '5'
+    assert _decode_key("\x1b[5~") == "esc"  # PgUp is inert
+    assert _decode_key("\x1b") == "esc"
+    assert _decode_key("j") == "j"
+    assert _decode_key("\r") == "\r"
+
+
+def test_arrow_select_moves_pointer_and_accepts(monkeypatch) -> None:  # noqa: ANN001
+    keys = iter(["\x1b[B", "\x1b[1;5A", "\r"])  # down, inert modified arrow, Enter
+    monkeypatch.setattr(ui_module.click, "getchar", lambda: next(keys))
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    assert ui_module._arrow_select(console, ["a", "b", "c"], 0) == 1
+    assert "\u276f b" in console.export_text()  # pointer painted on the accepted row
+
+
+def test_arrow_select_aborts_on_eof(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(ui_module.click, "getchar", lambda: "")
+    console = Console(force_terminal=False, no_color=True, width=100)
+    with pytest.raises(typer.Abort):  # closed stdin must abort, not busy-loop
+        ui_module._arrow_select(console, ["a", "b"], 0)
 
 
 def test_step_selection_navigates_wraps_and_accepts() -> None:

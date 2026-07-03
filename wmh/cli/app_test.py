@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -176,6 +177,17 @@ def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> N
     unknown = runner.invoke(app, ["examples", "run", "nope"])
     assert unknown.exit_code == 2
     assert "available: good-example" in unknown.output
+
+
+def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # The persistence half of the wizard's credential flow: keys saved to .env must be back in
+    # os.environ on the next `wmh` invocation (main), and importing the module must NOT load.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("WMH_TEST_MAIN_VAR=loaded\n", encoding="utf-8")
+    monkeypatch.delenv("WMH_TEST_MAIN_VAR", raising=False)
+    monkeypatch.setattr(cli_app_module, "app", lambda: None)
+    cli_app_module.main()
+    assert os.environ["WMH_TEST_MAIN_VAR"] == "loaded"
 
 
 def test_providers_subcommand_is_registered() -> None:

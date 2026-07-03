@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import os
 import sys
-import termios
-import tty
 from collections.abc import Callable
 
+import click
 import typer
 from pydantic import BaseModel
 from rich.console import Console
+from rich.control import Control
 from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
@@ -36,6 +36,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
+from rich.segment import ControlType
 from rich.table import Table
 
 from wmh.config import (
@@ -176,8 +177,9 @@ def run_build_wizard(
     # of them is the suggested default (no default when none have creds). After the pick, any
     # missing credential is prompted for and persisted to .env rather than failing mid-build.
     providers = list(_PROVIDER_MODELS)
-    notes = {p: "api key exists" for p in providers if _has_credentials(p)}
-    provider_default = defaults.provider or next((p for p in providers if p in notes), None)
+    with_creds = [p for p in providers if _has_credentials(p)]
+    notes = {p: "api key exists" for p in with_creds}
+    provider_default = defaults.provider or (with_creds[0] if with_creds else None)
     provider = _select(
         console,
         ask,
@@ -186,7 +188,6 @@ def run_build_wizard(
         provider_default,
         interactive=interactive,
         notes=notes,
-        fallback_to_first=False,
     )
     _ensure_credentials(console, ask_secret, provider)
     model = _select(
@@ -227,7 +228,12 @@ def run_build_wizard(
         if embed_provider != provider:
             _ensure_credentials(console, ask_secret, embed_provider)
         embed_model = _select(
-            console, ask, "Embeddings model id", embed_models, embed_model, interactive=interactive
+            console,
+            ask,
+            "Embeddings model id",
+            embed_models,
+            embed_model or embed_models[0],
+            interactive=interactive,
         )
 
     return BuildParams(
@@ -245,19 +251,26 @@ def run_build_wizard(
     )
 
 
-def _stdin_is_tty(console: Console) -> bool:
-    """Whether the arrow-key picker can run: rich sees a terminal and stdin is a real TTY."""
-    return console.is_terminal and sys.stdin.isatty()
+def _picker_fits(console: Console, row_count: int) -> bool:
+    """Whether the arrow-key picker can run: a real TTY and every row fits on screen at once
+    (the repaint moves the cursor up over the block, which breaks if the block scrolled)."""
+    return console.is_terminal and sys.stdin.isatty() and row_count + 2 <= console.size.height
 
 
-def _read_key(stream) -> str:  # noqa: ANN001 - any .read(n) text stream (stdin, StringIO in tests)
-    """Read one keypress; arrow escape sequences decode to 'up'/'down', other ESC input to 'esc'."""
-    ch = stream.read(1)
-    if ch != "\x1b":
-        return ch
-    if stream.read(1) != "[":
+def _decode_key(seq: str) -> str:
+    """Map one click.getchar() sequence to a picker key.
+
+    getchar returns a whole escape sequence per call ('\x1b[A'), so nothing can desync: plain
+    and application-mode arrows decode to 'up'/'down', any other escape sequence (modified
+    arrows, PgUp, Delete, bare ESC) is the inert 'esc', and a plain character passes through.
+    """
+    if seq in ("\x1b[A", "\x1bOA"):
+        return "up"
+    if seq in ("\x1b[B", "\x1bOB"):
+        return "down"
+    if seq.startswith("\x1b"):
         return "esc"
-    return {"A": "up", "B": "down"}.get(stream.read(1), "esc")
+    return seq
 
 
 def _step_selection(key: str, index: int, count: int) -> tuple[int, bool]:
@@ -272,41 +285,43 @@ def _step_selection(key: str, index: int, count: int) -> tuple[int, bool]:
         return (index + 1) % count, False
     if key in ("\r", "\n"):
         return index, True
-    if key.isdigit() and 1 <= int(key) <= count:
+    # ASCII-decimal only: '²'.isdigit() is True but int('²') raises.
+    if key.isascii() and key.isdecimal() and 1 <= int(key) <= count:
         return int(key) - 1, True
     return index, False
 
 
 def _arrow_select(console: Console, rows: list[str], index: int) -> int:
-    """Drive an up/down picker over pre-rendered `rows` on the raw-mode TTY; return chosen index.
+    """Drive an up/down picker over pre-rendered `rows`; return the chosen index.
 
-    Caller guarantees a real TTY (`_stdin_is_tty`). cbreak keeps ISIG, so Ctrl-C still raises
-    KeyboardInterrupt and click renders its usual clean abort.
+    Keys come from click.getchar(): raw mode handled portably (termios on Unix, msvcrt on
+    Windows), one whole escape sequence per call, Ctrl-C raised as KeyboardInterrupt for
+    click's usual clean abort. EOF (closed stdin) aborts rather than spinning.
     """
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
     painted = False
 
     def paint(current: int) -> None:
         nonlocal painted
         if painted:
-            console.file.write(f"\x1b[{len(rows)}A")
+            console.control(Control.move(y=-len(rows)))
         for i, row in enumerate(rows):
-            console.file.write("\x1b[2K")
+            console.control(Control((ControlType.ERASE_IN_LINE, 2)))
             pointer = "[bold cyan]\u276f[/bold cyan]" if i == current else " "
-            console.print(f" {pointer} {row}", highlight=False)
+            console.print(f" {pointer} {row}", highlight=False, no_wrap=True, overflow="ellipsis")
         painted = True
 
-    try:
-        tty.setcbreak(fd)
-        while True:
+    while True:
+        paint(index)
+        try:
+            seq = click.getchar()
+        except EOFError:
+            raise typer.Abort() from None
+        if seq == "":
+            raise typer.Abort()
+        index, accepted = _step_selection(_decode_key(seq), index, len(rows))
+        if accepted:
             paint(index)
-            index, accepted = _step_selection(_read_key(sys.stdin), index, len(rows))
-            if accepted:
-                paint(index)
-                return index
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            return index
 
 
 def _select(
@@ -318,18 +333,20 @@ def _select(
     *,
     interactive: bool = False,
     notes: dict[str, str] | None = None,
-    fallback_to_first: bool = True,
 ) -> str:
     """Pick one of `options`: an arrow-key picker on a real TTY, else a numbered prompt.
 
-    The Enter-default is `default` when present in `options`, else the first option — unless
-    `fallback_to_first` is off (the provider picker: a default exists only when creds do).
+    The Enter-default is `default` when present in `options`; a non-matching default falls
+    back to the first option, and None means no Enter-default at all (the provider picker: a
+    default exists only when creds do; the model picker: the choice is always explicit).
     `notes` adds a dim annotation after an option's name (e.g. "api key exists").
     """
     if default in options:
         chosen_default = default
+    elif default is not None:
+        chosen_default = options[0]
     else:
-        chosen_default = options[0] if fallback_to_first else None
+        chosen_default = None
     notes = notes or {}
 
     def row(opt: str) -> str:
@@ -337,7 +354,7 @@ def _select(
         marker = "  [dim](default)[/dim]" if opt == chosen_default else ""
         return f"{escape(opt)}{note}{marker}"
 
-    if interactive and _stdin_is_tty(console):
+    if interactive and _picker_fits(console, len(options)):
         console.print(f"[bold]{label}[/bold] [dim](up/down + Enter)[/dim]:")
         start = options.index(chosen_default) if chosen_default is not None else 0
         return options[_arrow_select(console, [row(opt) for opt in options], start)]
@@ -400,30 +417,21 @@ def select_model(
     """
     if len(infos) == 1:
         return infos[0].name
-
-    def score(info: ModelInfo) -> str:
-        acc = info.held_out_accuracy
-        return "" if acc is None else f"  [dim](held-out {acc:.2f})[/dim]"
-
-    if reader is None and _stdin_is_tty(console):
-        console.print("[bold]Select a world model:[/bold] [dim](up/down + Enter)[/dim]")
-        rows = [f"{escape(info.name)}{score(info)}" for info in infos]
-        return infos[_arrow_select(console, rows, 0)].name
-
     ask = reader if reader is not None else (lambda text: console.input(text))
-    console.print("[bold]Select a world model:[/bold]")
-    for i, info in enumerate(infos, start=1):
-        console.print(f"  [cyan]{i}[/cyan]. {info.name}{score(info)}")
-    while True:
-        raw = ask("> ").strip()
-        choice = _parse_int(raw)
-        if choice is not None and 1 <= choice <= len(infos):
-            return infos[choice - 1].name
-        # Allow typing the name directly too.
-        for info in infos:
-            if raw == info.name:
-                return info.name
-        console.print(f"[red]pick 1-{len(infos)} or a model name[/red]")
+    notes = {
+        info.name: f"held-out {info.held_out_accuracy:.2f}"
+        for info in infos
+        if info.held_out_accuracy is not None
+    }
+    return _select(
+        console,
+        ask,
+        "Select a world model",
+        [info.name for info in infos],
+        None,
+        interactive=reader is None,
+        notes=notes,
+    )
 
 
 def _prompt_text(

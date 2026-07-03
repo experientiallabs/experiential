@@ -72,10 +72,6 @@ from wmh.telemetry import (
 )
 from wmh.tracking import MeteredProvider, Phase, RunTracker, classify_build_call, save_run
 
-# Load .env from the working directory at import so wizard-saved provider keys persist across
-# sessions (a typer callback would flip help rendering under CliRunner; import-time is simpler).
-load_env_file()
-
 app = typer.Typer(
     help="World Model Harness: a frontier LLM acts as your agent's environment.",
     no_args_is_help=True,
@@ -897,4 +893,12 @@ def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, nam
 
 
 if __name__ == "__main__":
+    app()
+
+
+def main() -> None:
+    """CLI entry point: load `.env` from the working directory (so wizard-saved provider keys
+    persist across sessions), then dispatch. Kept out of import time so importing the module
+    never mutates os.environ."""
+    load_env_file()
     app()

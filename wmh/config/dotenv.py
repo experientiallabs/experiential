@@ -7,6 +7,7 @@ the build wizard are persisted here so the next `wmh` invocation has them withou
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 ENV_FILE = ".env"
@@ -22,7 +23,11 @@ def load_env_file(path: str | Path = ENV_FILE) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip().strip("'\"")
+        key, value = key.strip(), value.strip()
+        # Strip only a MATCHED surrounding quote pair; a secret legitimately ending in a
+        # quote character must survive the round-trip.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
         if key and value and key not in os.environ:
             os.environ[key] = value
 
@@ -40,3 +45,5 @@ def upsert_env_var(var: str, value: str, path: str | Path = ENV_FILE) -> None:
     else:
         lines.append(rendered)
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Credentials file: owner-only, whatever the umask or pre-existing mode said.
+    env_path.chmod(stat.S_IRUSR | stat.S_IWUSR)

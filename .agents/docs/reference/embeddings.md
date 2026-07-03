@@ -18,7 +18,7 @@ action)`. The embedder that produces `phi` is chosen by `HarnessConfig.embed_pro
 | `hashing` (default) | `HashingEmbedder` | nothing | Offline hashed char-trigram vector, L2-normalized. Lexical, not semantic. Zero config. |
 | `bedrock` | Amazon Titan text embeddings | AWS creds + region | `embed_model` defaults to `amazon.titan-embed-text-v2:0`. |
 | `openai` | OpenAI embeddings | `OPENAI_API_KEY` | Set `embed_model` (e.g. `text-embedding-3-small`). |
-| `azure_openai` | Azure OpenAI embedding deployment | Azure creds + endpoint | `embed_model` is the **deployment name**, not the base model id. |
+| `azure` | Azure OpenAI embedding deployment | Azure creds + endpoint | `embed_model` is the **deployment name**, not the base model id. |
 
 Anthropic has no embeddings API, so there is no `anthropic` embedder kind — use one of the above (or
 `hashing`) for `phi` while serving the world model on Anthropic/Bedrock for *generation*.
