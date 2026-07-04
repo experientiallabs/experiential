@@ -4,7 +4,13 @@ One script for both serving configs so fixes (failover chain, ports, warm-up beh
 cannot diverge between the training env and the eval env:
 
 - ``train``: env + reward judge on Bedrock Haiku 4.5 (dated profile id — cost control;
-  the artifact's built-in Opus provider is overridden at load).
+  the artifact's built-in Opus provider is overridden at load). ``WMH_ENV_TEMPERATURE``
+  optionally pins the env's sampling temperature (judge unaffected): at the provider
+  default 0.7, the WM imagines materially different case circumstances per session —
+  measured live: identical 4-step action replays scored {0.95, 0.15, 0.3, 0.15, 0.65,
+  0.95} (stdev 0.34) across fresh sessions, which drowns group-relative advantages in
+  environment luck. Pinning ~0 makes same-actions → same-verdict, so within-group
+  reward differences reflect the policy again.
 - ``eval`` (D30): env on the pinned GPT-5.5 (OpenAI; strongest circularity blunting vs
   the haiku training env), reward judge on Opus 4.8 (D12/D21 — third family vs both WM
   backends). Requires OPENAI_API_KEY, read from the gitignored ``.env`` at the repo root.
@@ -32,7 +38,15 @@ import uvicorn
 
 from wmh.engine.world_model import WorldModel
 from wmh.providers import get_provider
-from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+from wmh.providers.base import (
+    DEFAULT_MAX_TOKENS,
+    Completion,
+    Message,
+    Provider,
+    ProviderConfig,
+    ProviderKind,
+    VerifyResult,
+)
 from wmh.providers.fallback import FallbackProvider
 from wmh.serving.server import create_app
 
@@ -54,6 +68,39 @@ def _fallback_chain(config: ProviderConfig) -> Provider:
     if config.kind is ProviderKind.BEDROCK and config.region != "us-west-2":
         chain.append(get_provider(config.model_copy(update={"region": "us-west-2"})))
     return FallbackProvider(chain)
+
+
+class PinnedTemperatureProvider:
+    """Forces one sampling temperature on every ``complete`` call it forwards.
+
+    Wraps ONLY the WM's serve provider: callers' temperature arguments (the WM never
+    passes one, so it otherwise gets the 0.7 provider default) are replaced, while the
+    reward judge keeps its own unwrapped provider and its explicit temperature=0.0.
+    """
+
+    def __init__(self, inner: Provider, temperature: float) -> None:
+        self._inner = inner
+        self._temperature = temperature
+        self.config = inner.config
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Completion:
+        del temperature
+        return self._inner.complete(
+            system, messages, temperature=self._temperature, max_tokens=max_tokens
+        )
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._inner.embed(texts)
+
+    def verify(self) -> VerifyResult:
+        return self._inner.verify()
 
 
 def _load_dotenv() -> None:
@@ -81,6 +128,9 @@ def main() -> None:
         haiku = ProviderConfig(kind=ProviderKind.BEDROCK, model=HAIKU_MODEL, region="us-east-1")
         serve_provider = _fallback_chain(haiku)
         reward_provider = serve_provider
+        env_temp = os.environ.get("WMH_ENV_TEMPERATURE")
+        if env_temp is not None:
+            serve_provider = PinnedTemperatureProvider(serve_provider, float(env_temp))
     else:
         _load_dotenv()
         if not os.environ.get("OPENAI_API_KEY"):
