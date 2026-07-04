@@ -20,6 +20,7 @@ from wmh.scenarios.selection import (
     hybrid_select,
 )
 from wmh.scenarios.synthesis import EvalScenario, ScenarioSet, ScenarioSynthesizer
+from wmh.scenarios.verification import ChecklistJudge
 
 
 class ScenarioBuildConfig(BaseModel):
@@ -28,6 +29,7 @@ class ScenarioBuildConfig(BaseModel):
     budget: int = 20  # scenarios to construct
     k: int | None = None  # cluster count; default sqrt(n)
     seed: int = 0
+    validate_checklists: bool = True  # back-agreement gate inside the build (drop on repeat fail)
     dedup_threshold: float = DEDUP_THRESHOLD
     proportional_fraction: float = PROPORTIONAL_FRACTION
     coverage_tau: float = 0.7  # facet counts as covered when cosine-within-tau of a selection
@@ -67,19 +69,33 @@ def build_scenario_set(
     facets_by_id = {facet.trace_id: facet for facet in facets}
     cluster_names = {cluster.cluster_id: cluster.name for cluster in clusters}
     synthesizer = ScenarioSynthesizer(provider)
+    judge = ChecklistJudge(provider) if config.validate_checklists else None
     scenarios: list[EvalScenario] = []
+    dropped = 0
     for selection in selections:
-        scenario = synthesizer.synthesize(
-            traces_by_id[selection.trace_id], facets_by_id[selection.trace_id]
-        )
+        source = traces_by_id[selection.trace_id]
+        scenario = synthesizer.synthesize(source, facets_by_id[selection.trace_id])
+        if judge is not None:
+            # A generated checklist must correctly grade the very episode it was distilled
+            # from; one that misgrades its own source can't be trusted on new trajectories.
+            # One regeneration retry, then drop — an invalid scenario never leaves the build.
+            if not _checklist_agrees(judge, scenario, source):
+                scenario = synthesizer.synthesize(source, facets_by_id[selection.trace_id])
+                if not _checklist_agrees(judge, scenario, source):
+                    dropped += 1
+                    continue
         scenario.cluster_name = cluster_names.get(selection.cluster_id, "")
         scenario.weight = selection.weight
         if selection.pinned_failure is not None:
             scenario.failure_category = selection.pinned_failure
         scenarios.append(scenario)
 
-    selected_ids = {selection.trace_id for selection in selections}
+    selected_ids = {scenario.provenance[0] for scenario in scenarios}
     coverage = _corpus_coverage(facets, embeddings, selected_ids, tau=config.coverage_tau)
+    total_weight = sum(scenario.weight for scenario in scenarios)
+    if dropped and total_weight > 0:  # dropped scenarios must not leave weights summing < 1
+        for scenario in scenarios:
+            scenario.weight /= total_weight
     return ScenarioSet(
         scenarios=scenarios,
         clusters=clusters,
@@ -87,6 +103,18 @@ def build_scenario_set(
         corpus_coverage=coverage,
         coverage_tau=config.coverage_tau,
     )
+
+
+def _checklist_agrees(judge: ChecklistJudge, scenario: EvalScenario, source: Trace) -> bool:
+    """Back-agreement: the judge's verdict on the SOURCE trajectory must match its recorded
+    outcome. Traces without a recorded outcome can't disagree, so they pass."""
+    if not scenario.checklist:
+        return False
+    reward = source.metadata.get("reward")
+    if not isinstance(reward, int | float):
+        return True
+    verdict = judge.score(scenario.task, scenario.checklist, source.steps)
+    return verdict.success == (float(reward) >= 1.0)
 
 
 def _corpus_coverage(

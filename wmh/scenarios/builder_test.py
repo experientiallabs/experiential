@@ -12,10 +12,12 @@ from wmh.scenarios.facets import Outcome, TraceFacet
 
 
 class JsonEchoProvider:
-    """Answers cluster-naming and synthesis prompts with valid canned JSON."""
+    """Answers cluster-naming, synthesis, and checklist-judge prompts with valid canned JSON."""
 
-    def __init__(self) -> None:
+    def __init__(self, judge_success: bool = True) -> None:
         self.config = ProviderConfig(kind=ProviderKind.ANTHROPIC, model="m")
+        self._judge_success = "true" if judge_success else "false"
+        self.judge_calls = 0
 
     def complete(
         self,
@@ -27,6 +29,12 @@ class JsonEchoProvider:
     ) -> Completion:
         if "name one cluster" in system.lower():
             return Completion(text='{"name": "Cluster Name", "description": "What they share."}')
+        if "grade one ai-agent episode" in system.lower():
+            self.judge_calls += 1
+            ok = self._judge_success
+            return Completion(
+                text=f'{{"passed": [{ok}], "success": {ok}, "critique": "x"}}'
+            )
         return Completion(
             text=(
                 '{"task": "Do the synthesized task.", "initial_state": "The world exists.", '
@@ -115,3 +123,34 @@ def test_build_scenario_set_rejects_misaligned_inputs() -> None:
         build_scenario_set(
             [], [], JsonEchoProvider(), HashingEmbedder(dim=64), ScenarioBuildConfig()
         )
+
+
+def test_build_validates_checklists_against_recorded_outcomes() -> None:
+    """Traces with a recorded reward exercise the inline back-agreement gate."""
+    traces, facets = _corpus()
+    for trace in traces:
+        trace.metadata["reward"] = 1.0  # recorded success; judge must agree
+
+    agreeing = JsonEchoProvider(judge_success=True)
+    kept = build_scenario_set(
+        traces, facets, agreeing, HashingEmbedder(dim=64), ScenarioBuildConfig(budget=4, k=2)
+    )
+    assert len(kept.scenarios) == 4
+    assert agreeing.judge_calls == 4  # one back-agreement check per scenario
+
+    disagreeing = JsonEchoProvider(judge_success=False)
+    dropped = build_scenario_set(
+        traces, facets, disagreeing, HashingEmbedder(dim=64), ScenarioBuildConfig(budget=4, k=2)
+    )
+    assert dropped.scenarios == []  # regenerated once, still disagreeing -> dropped
+    assert disagreeing.judge_calls == 8  # two judge calls per scenario (original + regen)
+
+
+def test_build_validation_skips_traces_without_recorded_outcome() -> None:
+    traces, facets = _corpus()  # no reward metadata anywhere
+    provider = JsonEchoProvider(judge_success=False)  # would fail everything if consulted
+    scenario_set = build_scenario_set(
+        traces, facets, provider, HashingEmbedder(dim=64), ScenarioBuildConfig(budget=4, k=2)
+    )
+    assert len(scenario_set.scenarios) == 4
+    assert provider.judge_calls == 0

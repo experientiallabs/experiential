@@ -124,6 +124,11 @@ class BedrockProvider:
             return self._complete_nova(
                 system, messages, temperature=temperature, max_tokens=max_tokens
             )
+        if "anthropic" not in self.config.model:
+            # Kimi, DeepSeek, and other third-party models: the model-agnostic Converse API.
+            return self._complete_converse(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
         # Claude 4.8 rejects sampling params, so temperature is intentionally not forwarded.
         body = {
             "anthropic_version": _ANTHROPIC_BEDROCK_VERSION,
@@ -137,6 +142,37 @@ class BedrockProvider:
         usage = TokenUsage(
             input_tokens=data["usage"]["input_tokens"],
             output_tokens=data["usage"]["output_tokens"],
+        )
+        return Completion(text=text, usage=usage)
+
+    def _complete_converse(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Completion:
+        """Complete via the Converse API (model-agnostic: Kimi, DeepSeek, ...).
+
+        Converse normalizes request/response shapes across vendors; thinking models may emit
+        `reasoningContent` blocks, which are skipped — callers get the visible text only.
+        """
+        kwargs: dict[str, JsonValue] = {
+            "modelId": self.config.model,
+            "messages": [
+                {"role": m.role, "content": [{"text": m.content}]} for m in messages
+            ],
+            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
+        }
+        if system:
+            kwargs["system"] = [{"text": system}]
+        response = self._get_client().converse(**kwargs)
+        blocks = response["output"]["message"]["content"]
+        text = "".join(block["text"] for block in blocks if "text" in block)
+        usage = TokenUsage(
+            input_tokens=int(response["usage"]["inputTokens"]),
+            output_tokens=int(response["usage"]["outputTokens"]),
         )
         return Completion(text=text, usage=usage)
 
