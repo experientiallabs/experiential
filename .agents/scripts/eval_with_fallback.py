@@ -1,8 +1,10 @@
-"""Run a benchmark fidelity eval through a Bedrock FallbackProvider chain (4-8 -> 4-7).
+"""Run a benchmark fidelity eval through an llm-waterfall chain (same-weights first links).
 
-Workaround for evals dying on single ServiceUnavailableException blips: the provider layer
-deliberately disables botocore retries (FallbackProvider owns failover), but `wmh eval run`
-constructs a bare provider. This script mirrors the suite runner with a resilient chain.
+Chain: bedrock/opus-4-8 -> anthropic-direct/claude-opus-4-8 -> bedrock/opus-4-7, with chain-wide
+wraparound retry (RetryPolicy rounds) — llm-waterfall owns ALL failover/backoff, replacing the
+earlier hand-rolled FallbackProvider + retry wrapper. The first two links serve identical Opus
+4.8 weights via different transports, so Bedrock flaps never change the judge (D12
+comparability); 4-7 is the last resort.
 
 Usage: uv run python .agents/scripts/eval_with_fallback.py <suite-root> <benchmark>
 """
@@ -11,65 +13,64 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from pathlib import Path
 
+from llm_waterfall import Backend, RetryPolicy, Waterfall
+
 from wmh.engine.build import split_traces
+from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.replay import replay
 from wmh.ingest import get_adapter
-from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.optimize.judge import RubricJudge
-from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.providers.fallback import FallbackProvider
-from wmh.providers.registry import get_provider
+from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, TokenUsage
 from wmh.retrieval.embedders import HashingEmbedder
+from wmh.retrieval.retriever import EmbeddingRetriever
 
 
-class RetryingProvider:
-    """Retry ANY provider error with backoff — outer loop around the fallback chain, for nights
-    when every Bedrock model flaps at once. Complete() only; config passthrough for metering."""
+class WaterfallProvider:
+    """wmh Provider facade over an llm_waterfall.Waterfall (complete() only, for eval runs)."""
 
-    def __init__(self, inner, attempts: int = 8, backoff_s: float = 10.0) -> None:
-        self._inner = inner
-        self._attempts = attempts
-        self._backoff_s = backoff_s
-        self.config = inner.config
+    def __init__(self, waterfall: Waterfall) -> None:
+        self._waterfall = waterfall
+        self.config = ProviderConfig(
+            kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8", region="us-east-1"
+        )
 
-    def complete(self, *args, **kwargs):
-        last: Exception | None = None
-        for attempt in range(self._attempts):
-            try:
-                return self._inner.complete(*args, **kwargs)
-            except Exception as error:  # noqa: BLE001 - deliberate outer resilience loop
-                last = error
-                time.sleep(self._backoff_s * (attempt + 1))
-        raise last  # type: ignore[misc]
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        # temperature is dropped: the anthropic-direct link rejects it for Opus 4.8
+        # ("deprecated for this model"), and fidelity replay doesn't depend on it.
+        del temperature
+        result = self._waterfall.complete(
+            system=system,
+            messages=[{"role": m.role, "content": m.content} for m in messages],
+            max_tokens=max_tokens,
+        )
+        usage = TokenUsage(
+            input_tokens=result.usage.input_tokens, output_tokens=result.usage.output_tokens
+        )
+        return Completion(text=result.text, usage=usage)
 
 
 def main() -> None:
     root, bench = Path(sys.argv[1]), sys.argv[2]
-    chain = FallbackProvider(
-        [
-            # Same Opus 4.8 weights via two transports first (judge comparability),
-            # Bedrock 4-7 only as the last resort.
-            get_provider(
-                ProviderConfig(
-                    kind=ProviderKind.BEDROCK,
-                    model="us.anthropic.claude-opus-4-8",
-                    region="us-east-1",
-                )
-            ),
-            get_provider(ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-opus-4-8")),
-            get_provider(
-                ProviderConfig(
-                    kind=ProviderKind.BEDROCK,
-                    model="us.anthropic.claude-opus-4-7",
-                    region="us-east-1",
-                )
-            ),
-        ]
+    chain = WaterfallProvider(
+        Waterfall(
+            [
+                Backend("bedrock", "us.anthropic.claude-opus-4-8", region="us-east-1"),
+                Backend("anthropic", "claude-opus-4-8"),
+                Backend("bedrock", "us.anthropic.claude-opus-4-7", region="us-east-1"),
+            ],
+            retry=RetryPolicy(rounds=6, backoff_base_s=15.0),
+        )
     )
-    resilient = RetryingProvider(chain)
+    resilient = chain
     # Mirrors evaluate_files' per-file body, adding replay's concurrency (steps are independent).
     traces = get_adapter("otel-genai").from_file(str(root / bench / "traces.otel.jsonl"))
     train, holdout = split_traces(traces, 0.7)
