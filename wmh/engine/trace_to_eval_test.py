@@ -51,7 +51,7 @@ class FakeJudge:
     def __init__(self, score: float) -> None:
         self._score = score
 
-    def score(self, predicted: Observation, actual: Observation, context: Step):
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
         return JudgeResult(score=self._score, critique="ok")
 
 
