@@ -6,8 +6,9 @@ stand up a real benchmark environment, an agent acts in it, and the real `(actio
 pairs become the trace corpus a world model is built from.
 
 It is a uv workspace member (`environment_capture` package) designed to be extraction-ready: the
-package never imports `wmh` (one round-trip test pins the wire format against wmh's ingest and
-moves across the boundary if this is ever split out to its own repo).
+package never imports `wmh` — the dependency arrow is absolute (AGENTS.md § Monorepo). The
+wire format is pinned from the flagship side: `wmh/ingest/otel_genai_envcap_roundtrip_test.py`
+round-trips emitted spans through the real ingest adapter.
 
 ## The contract
 

@@ -1,8 +1,8 @@
-"""Round-trip test: emitted spans must parse through wmh's real OTel GenAI ingest adapter.
+"""Round-trip test: environment-capture's emitted spans parse through the real ingest adapter.
 
-This is the one test in the package allowed to import wmh — it pins the wire format against its
-actual consumer. If environment-capture is ever extracted to its own repo, this test moves to the
-wmh side of the boundary.
+Lives on the wmh side of the workspace boundary (flagship -> member is the legal dependency
+direction; members never import wmh). Pins the OTel GenAI wire format against its actual
+consumer — this is the acceptance contract the future standalone package must keep.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 
 from environment_capture.otel import trajectory_to_spans, write_spans_jsonl
 from environment_capture.trajectory import StepRecord, Task, ToolCall, Trajectory
+
 from wmh.ingest.otel_genai import OtelGenAIAdapter
 
 
