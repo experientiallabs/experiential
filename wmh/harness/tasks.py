@@ -1,8 +1,8 @@
 """Task specs for closed-loop evaluation: an instruction plus gold assertions that define success.
 
-Gold assertions are semantic post-conditions the `GoldJudge` checks against the run transcript
-(WebArena/OSWorld-style "programmatic post-condition" evals, made robust to wording by an LLM
-judge). Tasks are typically derived from the same benchmark the world model's traces came from —
+Gold assertions are semantic post-conditions the `GoldJudge` checks against the run transcript —
+conditions on the final state, made robust to wording by an LLM judge instead of brittle exact
+matching. Tasks are typically derived from the same benchmark the world model's traces came from —
 `Trace.metadata` already carries gold assertions for traces captured with them.
 """
 

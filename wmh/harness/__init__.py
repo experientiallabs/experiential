@@ -2,7 +2,7 @@
 
 Open-loop eval (`wmh eval <files>`) replays recorded steps teacher-forced and scores per-step
 fidelity. This package is the closed-loop counterpart (docs/reference/closed_loop.md): a minimal
-pi-style agent loop (`AgentRuntime`) steps against `WorldModel.step` via the `AgentEnvironment`
+minimal agent loop (`AgentRuntime`) steps against `WorldModel.step` via the `AgentEnvironment`
 seam, a gold-assertion judge scores *task success* on the resulting transcript, and
 `compute_agreement` compares two closed-loop reports (e.g. simulated vs real) — the
 outcome-agreement number docs name as the headline closed-loop validity metric.

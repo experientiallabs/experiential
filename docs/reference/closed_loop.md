@@ -14,8 +14,8 @@ wmh eval closed-loop tasks.jsonl --name <world-model> --k 3 --out sim_report.jso
 ```
 
 - `tasks.jsonl` — one task per line: `{"task_id": ..., "instruction": ..., "gold": ["...", ...]}`.
-  `gold` is a list of plain-English assertions that define success (WebArena/OSWorld-style
-  post-conditions, checked semantically).
+  `gold` is a list of plain-English assertions that define success (post-conditions on the final
+  state, checked semantically).
 - The **agent is fixed** (a minimal 4-tool loop: `bash`, `read_file`, `write_file`, `submit`) so any
   score movement is attributable to the world model, not the agent.
 - Every task runs **k=3 passes** (the repo's eval-reporting convention); the score is the fraction of

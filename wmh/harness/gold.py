@@ -2,8 +2,8 @@
 
 Closed-loop eval scores *task success*, not per-step fidelity (docs/reference/closed_loop.md).
 Success is defined by the task's `gold` assertions — semantic post-conditions checked against the
-transcript by an LLM judge, so they are robust to wording (rule-only checks systematically
-under-report agent success, per AgentRewardBench). The verdict is always scored against the FULL
+transcript by an LLM judge, so they are robust to wording (exact-match rules systematically
+under-report success on semantically-correct answers). The verdict is always scored against the FULL
 gold list: a truncated judge reply that omits assertions cannot report success.
 """
 

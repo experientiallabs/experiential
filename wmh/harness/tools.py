@@ -1,8 +1,8 @@
-"""The rollout agent's tool surface: a pi-style minimal set, rendered compactly.
+"""The rollout agent's tool surface: a deliberately minimal set, rendered compactly.
 
-Following pi (badlogic/pi-mono: a handful of tools and a short system prompt), the agent gets four
-tools: `bash` + file read/write against the environment, and `submit` to end the run. Everything
-else the agent needs it composes with bash — progressive disclosure instead of a wide tool schema.
+The agent gets four tools: `bash` + file read/write against the environment, and `submit` to end
+the run. Everything else the agent needs it composes with bash — a small always-loaded tool schema
+keeps the prompt cheap, and capability comes from composition rather than tool count.
 
 Env tools become `Action`s the environment answers (the world model, in closed-loop eval); `submit`
 is handled by the runtime itself.

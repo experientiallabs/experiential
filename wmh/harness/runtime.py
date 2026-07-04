@@ -1,6 +1,6 @@
 """`AgentRuntime`: the minimal agent loop that drives closed-loop rollouts.
 
-A plain, owned while-loop (pi-style): build the system prompt, ask the agent model for one action,
+A plain, owned while-loop: build the system prompt, ask the agent model for one action,
 dispatch it to the environment, append the observation, repeat until `submit` or the turn cap. The
 loop is deliberately fixed and small — closed-loop eval tests the *world model*, so the agent must
 be a constant: any divergence is then attributable to the world model alone.
@@ -37,7 +37,7 @@ Every reply MUST be a single JSON object and nothing else:
 Work in small, verifiable steps: inspect state, act, check the result, then continue. When the
 task is done, call `submit` with your answer. Prefer composing small bash commands over guessing."""
 
-DEFAULT_MAX_TURNS = 20  # Qwen-AgentWorld used 50; small shell tasks converge well before 20
+DEFAULT_MAX_TURNS = 20  # small shell tasks converge well before this; raise for longer horizons
 
 # Per-observation cap in the judge-facing transcript. Generous rather than tight: gold evidence
 # routinely lives deep in long outputs (`cat` of a produced file, `ls -R`), and truncating it away
