@@ -182,3 +182,58 @@ length is the lever), the wake/sleep LoRA checkpoint namespace trap (peft silent
 matches zero keys; checkpoints are evaluated via direct W += α/r·B·A application), and
 the non-thinking SFT template mismatch (immediate-EOS without
 `chat_template_kwargs={"enable_thinking": false}`).
+
+## Improvement sprint (v2): four arms against the flatness
+
+Four differentiated levers, each isolated by a same-config A/B where possible. Raw
+records in `.agents/docs/research/wm_tau_eval_results/{rft_sft,rpp_hard_0129,dense_0172,t0_manual060}.jsonl`;
+paired Δ = mean per-episode reward delta vs base on the intersection of clean episodes.
+
+| arm | lever | success | reward | paired Δ | verdict |
+|---|---|---|---|---|---|
+| A — RFT/STaR (`wm_tau-rft-sft`) | SFT on own high-reward rollouts (148 rollouts / 829 records, ≥0.9, dedup, ≤2/scenario) | 53.8% | 0.519 | −0.037 (13W/18L) | negative — did not beat demo-SFT (60.0%) |
+| B — hard curriculum, ckpt 0129 (`qwen3_5_9b_wm_tau_rpp_n4_hard`) | R++ n=4 scalar on the 58 informative scenarios | 45.9% | 0.515 | −0.022 (13W/12L) | negative — run later collapsed at ~290 steps |
+| C — dense per-turn rewards, ckpt 0172 (`qwen3_5_9b_wm_tau_rpp_n4_dense`) | judge `step_rewards` → per-turn credit | 42.5% | 0.547 | −0.020 (15W/15L) | eval-flat — but the **stability** result stands (below) |
+| **D — temp-0 environment, ckpt manual060** (`qwen3_5_9b_wm_tau_rpp_n4_t0`) | `WMH_ENV_TEMPERATURE=0.0` training WM | **54.1%** | **0.588** | **+0.030 (15W/11L)** | only positive row; only rising train curve |
+
+All rows n≈40 (±~15pts CI) — read direction and mechanism, not point estimates.
+
+### Finding 1 — environment luck was the ceiling (D62)
+
+Replaying an identical 4-step action sequence into fresh train-WM sessions scored
+`{0.95, 0.15, 0.3, 0.15, 0.65, 0.95}` (stdev **0.34** on identical behavior): the env
+samples at the 0.7 provider default and imagines different case circumstances per
+session. The judge is *not* the noise source (stdev 0.022 across 8 rescores of one
+fixed history; its temp was already 0.0). The trainer batch-whitens advantages, so this
+lottery is rescaled to unit-magnitude gradient. Fix: `WMH_ENV_TEMPERATURE` in
+`serve_tau_wm.py` (luck stdev 0.34 → 0.24 at temp 0; a canonical-state annex only
+reached 0.21 and was shelved).
+
+### Finding 2 — the temp-0 arm produced the bench's first rising train curve (D64)
+
+Arm D epoch-1 thirds: reward 0.625→0.660→0.730, success 0.388→0.463→0.603 (uniform
+groups 6%). Arm B on the *same seed and scenario order* was flat (0.729/0.689/0.753).
+The WM-rolling-success-predicts-eval pattern (D59) held for all four arms: the three
+flat-train arms evaled ≤ base; the one rising-train arm evaled above it.
+
+### Finding 3 — the collapse budget scales with signal density (D63); dense rewards stabilize (Arm C A/B)
+
+At fixed lr 1e-5 + KL 0.05: v1 n=4 on the diluted 97-scenario set was stable for 304
+steps; Arm B (3× denser signal) collapsed at ~290 steps (KL 0.02→0.85, entropy
+0.34→0.04); Arm D (denser still: 6% uniform groups) collapsed at ~260. Same config with
+dense per-turn rewards (Arm C) ran all ~330 steps to completion and ended healthy
+(entropy 0.34) — per-turn credit variation appears to break the uniform-hindsight-credit
+dynamic. Practical rule: **drain checkpoints early and often** (Arm D's row exists only
+because a manual insurance drain at step 254 caught the policy at its behavioral peak,
+~10 steps before terminal collapse; behavior lags trainer metrics).
+
+### Honest reading (v2)
+
+The WM-as-training-env story sharpens: the harness works, and the binding constraint was
+never the estimator or the LR — it is **reward channel quality**. Pinning env
+temperature converts flat→learning within a run and flips the eval direction, but the
+transferred effect is modest (+0.030 at n=37) because the run hits the stability budget
+after ~1 epoch of productive learning. The composable next step (not run here): temp-0
+env + dense rewards + per-~50-step checkpoint drains, which by Finding 3 should extend
+the productive window; and B3's D59 overfitting-meter usage generalizes — the WM's
+rolling train success is a reliable, cheap eval predictor across all six arms measured.
