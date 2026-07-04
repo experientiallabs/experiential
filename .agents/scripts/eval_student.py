@@ -37,7 +37,7 @@ from wmh.ingest import get_adapter  # noqa: E402
 from wmh.scenarios import ChecklistJudge, ScenarioSet  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
-JUDGE_MODEL = "gemini-2.5-flash"
+JUDGE_MODEL = "gemini-2.5-flash"  # default; --judge-model overrides (bedrock: prefix for Converse models)
 MAX_STEPS = 10
 WORKERS = 4
 
@@ -112,14 +112,22 @@ def main() -> None:
     parser.add_argument("--passes", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=1.0)  # BENCH-B2 eval protocol
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--wm-model", default=NOVA_LITE, help="Bedrock model backing the WM")
+    parser.add_argument("--judge-model", default=JUDGE_MODEL,
+                        help="judge: gemini model name, or bedrock:<model-id>")
     args = parser.parse_args()
 
     _load_gemini_key()
     from openai import OpenAI
 
     client = OpenAI(base_url=args.endpoint, api_key="not-needed")
-    judge = ChecklistJudge(gemini(JUDGE_MODEL))
-    world_model = WorldModel.load(str(WM_DIR), bedrock(NOVA_LITE), telemetry_root=str(REPO / ".wmh"))
+    if args.judge_model.startswith("bedrock:"):
+        judge = ChecklistJudge(bedrock(args.judge_model.removeprefix("bedrock:")))
+    else:
+        judge = ChecklistJudge(gemini(args.judge_model))
+    world_model = WorldModel.load(
+        str(WM_DIR), bedrock(args.wm_model), telemetry_root=str(REPO / ".wmh")
+    )
 
     pool = ScenarioSet.load(DISTILL / "eval_pool.json")
     scenarios = pool.scenarios[: args.limit] if args.limit else pool.scenarios
