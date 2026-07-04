@@ -37,6 +37,21 @@ def test_parse_observation_falls_back_to_plaintext() -> None:
     assert obs.is_error is False
 
 
+def test_parse_observation_honors_empty_contract() -> None:
+    # A silent success (many shell writes/redirects print nothing) is a valid empty observation,
+    # not raw JSON text: the contract keys are present even though every value is empty/false.
+    obs = parse_observation('{"output": "", "is_error": false, "state_note": ""}')
+    assert obs.content == ""
+    assert obs.is_error is False
+    assert "state_note" not in obs.metadata
+
+
+def test_parse_observation_ignores_non_contract_json() -> None:
+    # Arbitrary JSON with none of the contract keys is preserved as raw text (not coerced to empty).
+    obs = parse_observation('{"foo": 1}')
+    assert obs.content == '{"foo": 1}'
+
+
 def test_dumps_observation_contract_roundtrips() -> None:
     obs = Observation(content="ok", is_error=False, metadata={"state_note": "did x"})
     text = dumps_observation_contract(obs)

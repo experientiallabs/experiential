@@ -17,7 +17,7 @@ from wmh.ingest import VendorPull, get_adapter
 from wmh.optimize import GEPAOptimizer, OptimizeResult, RubricJudge
 from wmh.providers import get_provider
 from wmh.providers.base import Embedder, Provider
-from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
+from wmh.retrieval import EmbeddingRetriever, get_embedder
 
 
 def _count_steps(traces: list[Trace]) -> int:
@@ -104,9 +104,9 @@ def build(
     """Ingest traces and run the full build, creating + persisting the artifact under `root`.
 
     `serve_provider` / `embedder` are injectable for testing; in production they are constructed
-    from `config` (serve provider via the registry, embedder = offline HashingEmbedder sized to
-    `config.embed_dim`). `reporter` receives progress events (defaults to a no-op). Returns the
-    GEPA OptimizeResult (also persisted).
+    from `config` (serve provider via the registry, embedder via `get_embedder(config)` — the
+    offline HashingEmbedder by default, or the configured provider-backed one). `reporter` receives
+    progress events (defaults to a no-op). Returns the GEPA OptimizeResult (also persisted).
     """
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)
@@ -132,7 +132,10 @@ def build(
             )
         else:
             judge_provider = provider
-    embed = embedder or HashingEmbedder(dim=config.embed_dim)
+    # Honor the CONFIGURED embedder: building the index with hashing while `_persist` saves a
+    # provider-backed embed_provider would make the served query vectors come from a different
+    # embedding space than the stored matrix (invalid rankings / dimension mismatch on load).
+    embed = embedder or get_embedder(config)
 
     # Serving index over the full corpus: at serve time we retrieve from everything we have seen.
     retriever = EmbeddingRetriever(embed)

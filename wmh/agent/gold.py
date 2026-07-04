@@ -91,13 +91,17 @@ def _parse(text: str, gold: list[str]) -> GoldVerdict:
         except ValidationError:
             parsed = None
         if parsed is not None and parsed.assertions:
-            n_pass = sum(1 for a in parsed.assertions if a.passed)
-            fraction = n_pass / len(parsed.assertions)
+            # Score against ALL required gold assertions, not just the subset the judge echoed back:
+            # a truncated reply that omits some assertions must NOT be able to report success. Cap
+            # passes at the gold count so duplicated/hallucinated assertions can't over-credit.
+            total = len(gold)
+            n_pass = min(sum(1 for a in parsed.assertions if a.passed), total)
+            fraction = n_pass / total if total else 1.0
             return GoldVerdict(
-                passed=parsed.passed and n_pass == len(parsed.assertions),
+                passed=parsed.passed and n_pass == total,
                 fraction=fraction,
                 assertions=parsed.assertions,
-                rationale=f"{n_pass}/{len(parsed.assertions)} assertions satisfied",
+                rationale=f"{n_pass}/{total} assertions satisfied",
             )
     return GoldVerdict(
         passed=False,
