@@ -83,7 +83,7 @@ class QwenStudentAgent:
         response = self._client.chat.completions.create(
             model=self._model,
             messages=messages,
-            max_tokens=6144,  # Qwen3.5 reasoning tokens count against the budget
+            max_tokens=10240,  # Qwen3.5 reasoning tokens count against the budget
             temperature=self._temperature,
         )
         text = response.choices[0].message.content or ""

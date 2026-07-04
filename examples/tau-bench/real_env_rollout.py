@@ -64,7 +64,7 @@ def run_episode(client: OpenAI, model: str, env, tool_names: list[str], scenario
     final_text = ""
     for _ in range(MAX_STEPS):
         response = client.chat.completions.create(
-            model=model, messages=messages, max_tokens=6144, temperature=temperature
+            model=model, messages=messages, max_tokens=10240, temperature=temperature
         )
         text = response.choices[0].message.content or ""
         stripped = THINK_RE.sub("", text)
