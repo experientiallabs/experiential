@@ -178,6 +178,171 @@ def evolve_harness(
         _console.print(f"  wrote archive ({len(result.archive.entries)} variants) -> {archive_out}")
 
 
+@agent_app.command("verify")
+def verify(
+    tasks_file: str = _TASKS_ARG,
+    name: str = typer.Option(
+        None, "--name", help="World model to check against (default: only one)."
+    ),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding the world model."),
+    archive: str = typer.Option(
+        None, "--archive", help="Evolve archive JSON; verifies every variant it holds."
+    ),
+    spec_file: str = typer.Option(
+        None, "--spec", help="Also verify this HarnessSpec JSON (e.g. an evolve winner)."
+    ),
+    limit: int = typer.Option(
+        0, help="Cap the number of variants verified (0 = all). Cost control."
+    ),
+    k: int = typer.Option(3, help="Passes per task per variant, per world."),
+    threshold: float = typer.Option(0.5, help="Pass threshold on a task's k-pass success rate."),
+    provider: str = typer.Option("bedrock", "--provider", help="Agent model provider."),
+    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Agent model id."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    skills: str = typer.Option(None, "--skills", help="Skill library dir to seed from."),
+    template: str = typer.Option(None, "--template", help="E2B template id (default: base image)."),
+) -> None:
+    """Sim-real validity check: score variants in the world model AND real E2B, report agreement.
+
+    The headline is whether the world model ranks harnesses like reality (rank correlation) and how
+    often its per-task pass/fail matches (outcome agreement). Needs `uv sync --extra e2b` +
+    `$E2B_API_KEY` for the real leg. This is the number that says whether sim-driven evolution
+    transfers — run it on an evolve `--archive` after evolving.
+    """
+    from wmh.agent.agreement import sim_real_agreement
+    from wmh.agent.gold import GoldJudge
+    from wmh.agent.skills import SkillLibrary
+    from wmh.agent.tasks import load_tasks
+    from wmh.cli.agent_support import load_world_model_for_agent
+
+    tasks = load_tasks(tasks_file)
+    specs = _gather_specs(archive, spec_file)
+    if limit > 0:
+        specs = specs[:limit]
+    if len(specs) < 2:
+        _console.print(
+            "[yellow]note[/yellow]: fewer than 2 variants — rank correlation will be n/a; "
+            "pass an evolve --archive to compare a population"
+        )
+    world_model, _wm_provider = load_world_model_for_agent(name, root)
+    agent_provider = _load_agent_provider(provider, model, region)
+    library = SkillLibrary(skills) if skills else None
+    judge = GoldJudge(agent_provider)
+
+    _console.print(
+        f"verifying {len(specs)} variant(s) on {len(tasks)} task(s), k={k}, "
+        f"in the world model AND real E2B…"
+    )
+    report = sim_real_agreement(
+        specs,
+        tasks,
+        world_model,
+        agent_provider,
+        judge,
+        library=library,
+        k=k,
+        pass_threshold=threshold,
+        e2b_template=template,
+    )
+    _print_agreement(report)
+
+
+def _gather_specs(archive: str | None, spec_file: str | None):  # noqa: ANN202 - list[HarnessSpec]
+    """Collect the variants to verify: every variant in the archive, plus an optional extra spec.
+
+    Falls back to the baseline HarnessSpec when neither is given, so `verify` always has something
+    to run (though a single variant yields no rank correlation).
+    """
+    from pathlib import Path
+
+    from wmh.agent.evolve import load_archive
+    from wmh.agent.spec import HarnessSpec
+
+    specs: list[HarnessSpec] = []
+    seen: set[str] = set()
+    if archive is not None:
+        for entry in load_archive(archive).entries:
+            if entry.spec.name not in seen:
+                seen.add(entry.spec.name)
+                specs.append(entry.spec)
+    if spec_file is not None:
+        spec = HarnessSpec.model_validate_json(Path(spec_file).read_text(encoding="utf-8"))
+        if spec.name not in seen:
+            specs.append(spec)
+    if not specs:
+        specs.append(HarnessSpec())
+    return specs
+
+
+def _print_agreement(report) -> None:  # noqa: ANN001 - AgreementReport
+    """Render the agreement scorecard: per-variant sim-vs-real, the 2x2 confusion, and headlines."""
+    _console.print("\n[bold]per-variant success (sim vs real)[/bold]:")
+    for v in sorted(report.per_variant, key=lambda x: x.real_success, reverse=True):
+        flag = "  [red]<- sim over-credits[/red]" if v.gap > 0.15 else ""
+        _console.print(
+            f"  {v.harness:20} sim={v.sim_success:.3f}  real={v.real_success:.3f}  "
+            f"gap={v.gap:+.3f}{flag}"
+        )
+    c = report.confusion
+    _console.print("\n[bold]outcome confusion (variant×task cells)[/bold]:")
+    _console.print(f"  sim-pass & real-pass: {c.sim_pass_real_pass}")
+    _console.print(
+        f"  sim-pass & real-FAIL: {c.sim_pass_real_fail}  (mirage: evolution chases this)"
+    )
+    _console.print(f"  sim-FAIL & real-pass: {c.sim_fail_real_pass}")
+    _console.print(f"  sim-FAIL & real-FAIL: {c.sim_fail_real_fail}")
+    rc = "n/a" if report.rank_correlation is None else f"{report.rank_correlation:.3f}"
+    _console.print(
+        f"\n[bold]VERDICT[/bold] outcome_agreement={report.outcome_agreement:.3f}  "
+        f"rank_correlation={rc}  mean_abs_gap={report.mean_abs_gap:.3f}"
+    )
+
+
+@agent_app.command("gate")
+def gate(
+    tasks_file: str = _TASKS_ARG,
+    provider: str = typer.Option("bedrock", "--provider", help="Agent model provider."),
+    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Agent model id."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    k: int = typer.Option(3, help="Passes per task."),
+    threshold: float = typer.Option(
+        0.5, help="Min real success rate for a task to be admitted (>= this passes the gate)."
+    ),
+    max_turns: int = typer.Option(20, help="Agent turn cap per task."),
+    template: str = typer.Option(None, "--template", help="E2B template id (default: base image)."),
+) -> None:
+    """Oracle-gate a task suite: run the baseline agent for real in E2B and flag unreliable tasks.
+
+    A task nobody can solve — or whose gold assertions never fire on a genuine success — is a broken
+    eval that corrupts every downstream score. Terminal-Bench admits a task only if a reference
+    solution passes its verifier; here the strong baseline agent is that reference. Tasks below
+    `--threshold` are reported as NOT admitted so you can fix or drop them before evolving.
+    Needs `uv sync --extra e2b` + `$E2B_API_KEY`.
+    """
+    from wmh.agent.gold import GoldJudge
+    from wmh.agent.real_loop import evaluate_real
+    from wmh.agent.spec import HarnessSpec
+    from wmh.agent.tasks import load_tasks
+
+    tasks = load_tasks(tasks_file)
+    agent_provider = _load_agent_provider(provider, model, region)
+    judge = GoldJudge(agent_provider)
+    spec = HarnessSpec(max_turns=max_turns)
+
+    _console.print(f"oracle-gating {len(tasks)} task(s) with the baseline agent in E2B, k={k}…")
+    report = evaluate_real(spec, tasks, agent_provider, judge, k=k, template=template)
+    admitted, rejected = [], []
+    for task_id, outcome in report.per_task.items():
+        ok = outcome.success_rate >= threshold
+        (admitted if ok else rejected).append((task_id, outcome.success_rate))
+        mark = "[green]admit[/green]" if ok else "[red]REJECT[/red]"
+        _console.print(f"  {mark} {task_id:20} real_success={outcome.success_rate:.2f}")
+    _console.print(
+        f"\n[bold]{len(admitted)}/{len(tasks)} admitted[/bold]"
+        + (f"; fix or drop: {', '.join(t for t, _ in rejected)}" if rejected else "")
+    )
+
+
 def _read_spec(spec_file: str | None):  # noqa: ANN202 - HarnessSpec
     from pathlib import Path
 

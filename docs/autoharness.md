@@ -36,8 +36,14 @@ not the eval (see [`closed_loop.md`](./closed_loop.md), [`sim_real_agreement.md`
 | `capture.py` | Runs → `Trace` → OTel GenAI JSONL, gold-stamped, so captures feed `wmh build` directly. |
 | `collect.py` | Real trace collection: run each task in a fresh E2B sandbox, capture. |
 | `gold.py` | `GoldJudge` — semantic gold-assertion checking (fuzzy post-conditions, not brittle rules). |
-| `closed_loop.py` | `evaluate_closed_loop` — the **fitness function**: k=3 passes per task against the world model → success rate + per-task Pareto vector. |
+| `closed_loop.py` | `evaluate_with_env` (env-agnostic core) + `evaluate_closed_loop` — the **fitness function**: k=3 passes per task against the world model → success rate + per-task Pareto vector. |
+| `real_loop.py` | `evaluate_real` — the same scoring core against real E2B (the validation counterpart of the sim fitness fn). |
 | `evolve.py` | `HarnessArchive` + `evolve` — the meta-loop: DGM parent selection, GEPA reflective mutation, instance-level Pareto retention. |
+| `agreement.py` | `sim_real_agreement` — does the world model rank harnesses like reality? Outcome-agreement confusion + Spearman rank correlation. See [`sim_real_validation.md`](./sim_real_validation.md). |
+
+CLI: `wmh agent collect | eval | evolve | gate | verify`. `gate` oracle-checks a task suite in real
+E2B; `verify` runs the sim-real agreement study over an evolve archive — the number that says whether
+sim-driven evolution transfers.
 
 ## What we stole, and from where
 

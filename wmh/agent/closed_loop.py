@@ -13,11 +13,12 @@ of swapping the environment, not the eval.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
-from wmh.agent.environment import WorldModelEnvironment
+from wmh.agent.environment import AgentEnvironment, WorldModelEnvironment
 from wmh.agent.gold import GoldJudge, GoldVerdict
 from wmh.agent.runtime import AgentRuntime, RunResult
 from wmh.agent.skills import SkillLibrary
@@ -27,6 +28,11 @@ from wmh.engine.world_model import WorldModel
 from wmh.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
+
+# A factory that opens a fresh `AgentEnvironment` for one task. The world-model backend and the real
+# E2B backend both fit this shape, which is exactly what lets the SAME scoring core measure a
+# harness in simulation and in reality — the substitution the sim-real agreement check turns on.
+EnvFactory = Callable[[TaskSpec], AgentEnvironment]
 
 
 class TaskOutcome(BaseModel):
@@ -59,22 +65,27 @@ class ClosedLoopReport(BaseModel):
         return {tid: o.success_rate for tid, o in self.per_task.items()}
 
 
-def evaluate_closed_loop(
+def evaluate_with_env(
     spec: HarnessSpec,
     tasks: list[TaskSpec],
-    world_model: WorldModel,
+    make_env: EnvFactory,
     agent_provider: Provider,
     judge: GoldJudge,
     *,
     library: SkillLibrary | None = None,
     k: int = DEFAULT_K,
 ) -> ClosedLoopReport:
-    """Score `spec` on `tasks` against `world_model`, k passes per task, returning the scorecard."""
+    """Score `spec` on `tasks` against whatever environment `make_env` opens, k passes per task.
+
+    Environment-agnostic core shared by simulated (`evaluate_closed_loop`) and real
+    (`wmh.agent.real_loop.evaluate_real`) evaluation: only `make_env` differs, so any score gap
+    between the two is attributable to sim-vs-real, not to the scoring path.
+    """
     per_task: dict[str, TaskOutcome] = {}
     for task in tasks:
         verdicts: list[GoldVerdict] = []
         for _ in range(k):
-            result = _run_once(spec, task, world_model, agent_provider, library)
+            result = _run_once(spec, task, make_env, agent_provider, library)
             transcript = result.transcript()
             verdicts.append(judge.score(task.instruction, result.answer, transcript, task.gold))
         successes = [1.0 if v.passed else 0.0 for v in verdicts]
@@ -97,16 +108,38 @@ def evaluate_closed_loop(
     )
 
 
+def evaluate_closed_loop(
+    spec: HarnessSpec,
+    tasks: list[TaskSpec],
+    world_model: WorldModel,
+    agent_provider: Provider,
+    judge: GoldJudge,
+    *,
+    library: SkillLibrary | None = None,
+    k: int = DEFAULT_K,
+) -> ClosedLoopReport:
+    """Score `spec` on `tasks` against `world_model`, k passes per task (the sim fitness fn)."""
+    return evaluate_with_env(
+        spec,
+        tasks,
+        lambda task: WorldModelEnvironment(world_model, task=task.instruction),
+        agent_provider,
+        judge,
+        library=library,
+        k=k,
+    )
+
+
 def _run_once(
     spec: HarnessSpec,
     task: TaskSpec,
-    world_model: WorldModel,
+    make_env: EnvFactory,
     agent_provider: Provider,
     library: SkillLibrary | None,
 ) -> RunResult:
-    """One closed-loop rollout: fresh runtime + fresh world-model session driving the agent loop."""
+    """One rollout: fresh runtime + a fresh environment (sim or real) driving the agent loop."""
     runtime = AgentRuntime(spec, agent_provider, library=library)
-    env = WorldModelEnvironment(world_model, task=task.instruction)
+    env = make_env(task)
     try:
         return runtime.run(task.task_id, task.instruction, env)
     finally:
