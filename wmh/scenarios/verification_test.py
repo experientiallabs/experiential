@@ -22,6 +22,7 @@ class ScriptedProvider:
         self.config = ProviderConfig(kind=ProviderKind.ANTHROPIC, model="m")
         self._replies = replies
         self.calls: list[tuple[str, str]] = []
+        self.last_max_tokens = 0
 
     def complete(
         self,
@@ -32,6 +33,7 @@ class ScriptedProvider:
         max_tokens: int = 8192,
     ) -> Completion:
         self.calls.append((system, messages[0].content))
+        self.last_max_tokens = max_tokens
         reply = self._replies[min(len(self.calls) - 1, len(self._replies) - 1)]
         return Completion(text=reply)
 
@@ -83,6 +85,14 @@ def test_checklist_judge_pads_short_verdicts_with_failures() -> None:
     assert result.passed == [True, False, False]
     assert result.success is True
     assert result.pass_rate == 1 / 3
+
+
+def test_checklist_judge_gives_reasoning_judges_token_headroom() -> None:
+    # Reasoning judges think before emitting JSON; a tight max_tokens truncates the verdict
+    # mid-string and silently scores as failure (found live: Gemini Flash at 1024).
+    provider = ScriptedProvider([_judge_reply(success=True, passed=[True])])
+    ChecklistJudge(provider).score("task", ["a"], [])
+    assert provider.last_max_tokens >= 4096
 
 
 def test_checklist_judge_treats_garbage_as_failure() -> None:

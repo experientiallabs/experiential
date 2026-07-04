@@ -64,11 +64,13 @@ class ChecklistJudge:
 
     def score(self, task: str, checklist: list[str], steps: list[Step]) -> ChecklistResult:
         prompt = _render_judge_prompt(task, checklist, steps)
+        # Generous budget: reasoning judges spend completion tokens on thinking before the JSON;
+        # a tight cap truncates the verdict mid-string and silently scores as failure.
         completion = self._provider.complete(
             CHECKLIST_SYSTEM,
             [Message(role="user", content=prompt)],
             temperature=0.0,
-            max_tokens=1024,
+            max_tokens=8192,
         )
         raw = extract_json_object(completion.text)
         if raw is not None:
