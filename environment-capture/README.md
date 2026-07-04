@@ -44,6 +44,9 @@ scripts are committed; cloned upstreams, venvs, and raw run output stay local an
 
 ## Adding a benchmark
 
+**Agents: follow [INTEGRATION.md](INTEGRATION.md) — it is the complete, self-contained
+playbook** (contract, step order, non-negotiables, acceptance checklist). Summary:
+
 1. Implement a `BenchmarkAdapter` in `environment_capture/benchmarks/<name>.py` — fresh code
    against the benchmark's real upstream dataset (tests inline).
 2. Create `environment-capture/<name>/` with the task data (license-checked) and a capture or
