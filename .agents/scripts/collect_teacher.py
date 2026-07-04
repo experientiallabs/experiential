@@ -209,6 +209,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None, help="only first N scenarios (smoke)")
+    parser.add_argument(
+        "--teacher",
+        default="nova-pro",
+        choices=["nova-pro", "gemini-pro"],
+        help="Teacher backend: Nova Pro (Bedrock, no daily quota) or Gemini Pro (1000 req/day).",
+    )
+    parser.add_argument("--resume", action="store_true", help="skip scenarios already in output")
     args = parser.parse_args()
 
     _load_gemini_key()
@@ -217,10 +224,21 @@ def main() -> None:
 
     pool = ScenarioSet.load(DISTILL / "train_pool.json")
     scenarios = pool.scenarios[: args.limit] if args.limit else pool.scenarios
+    existing_records: list[dict] = []
+    out_path = DISTILL / "teacher_episodes.jsonl"
+    if args.resume and out_path.exists():
+        existing_records = [
+            json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line
+        ]
+        done_ids = {r["scenario_id"] for r in existing_records}
+        scenarios = [s for s in scenarios if s.scenario_id not in done_ids]
+        print(f"resume: {len(existing_records)} episodes kept already; {len(scenarios)} scenarios to go")
     traces = get_adapter("otel-genai").from_file(str(TRACES))
     traces_by_id = {t.trace_id: t for t in traces}
 
-    teacher = gemini(TEACHER_MODEL)
+    teacher = (
+        bedrock("us.amazon.nova-pro-v1:0") if args.teacher == "nova-pro" else gemini(TEACHER_MODEL)
+    )
     judge = ChecklistJudge(gemini(JUDGE_MODEL))
     world_model = WorldModel.load(str(WM_DIR), bedrock(NOVA_LITE), telemetry_root=str(REPO / ".wmh"))
 
@@ -292,6 +310,7 @@ def main() -> None:
             kept_records.extend(records)
 
     out = DISTILL / "teacher_episodes.jsonl"
+    kept_records = existing_records + kept_records
     with out.open("w", encoding="utf-8") as f:
         for record in kept_records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
