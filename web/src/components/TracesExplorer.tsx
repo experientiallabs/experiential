@@ -55,9 +55,10 @@ function StepBlock({ step }: { step: ScenarioStep }) {
   );
 }
 
-function ComparisonView({ rows }: { rows: ReplayRow[] }) {
+function ComparisonView({ rows, replaying }: { rows: ReplayRow[]; replaying: boolean }) {
   const { done, matches } = fidelity(rows);
   const pct = done ? Math.round((matches / done) * 100) : null;
+  const stoppedEarly = !replaying && done < rows.length;
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-3">
@@ -70,7 +71,8 @@ function ComparisonView({ rows }: { rows: ReplayRow[] }) {
           {pct == null ? "..." : `${pct}%`}
         </span>
         <span className="text-xs text-ink-faint">
-          {matches}/{done} steps match the recorded observation
+          {matches}/{done} of {rows.length} steps match the recorded observation
+          {stoppedEarly && " (replay stopped early)"}
         </span>
       </div>
       <div className="grid grid-cols-2 gap-3">
@@ -93,7 +95,7 @@ function ComparisonView({ rows }: { rows: ReplayRow[] }) {
                     : "border-accent-amber/50 bg-accent-amber/[0.05] text-ink"
               }`}
             >
-              {row.wm ?? "..."}
+              {row.wm ?? (replaying ? "..." : "not run")}
             </pre>
           </div>
         ))}
@@ -168,7 +170,7 @@ function ScenarioCard({ entry, scenario }: { entry: IndexEntry; scenario: Scenar
             </button>
           </div>
           {rows ? (
-            <ComparisonView rows={rows} />
+            <ComparisonView rows={rows} replaying={replaying} />
           ) : (
             <div>
               {scenario.steps.map((s, i) => (

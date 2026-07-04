@@ -47,7 +47,7 @@ class BuildFn(Protocol):
 
 
 class BuildRouteRequest(BaseModel):
-    """Inputs for one serve-side build — the `wmh build` wizard's fields over HTTP."""
+    """Inputs for one serve-side build - the `wmh build` wizard's fields over HTTP."""
 
     name: str
     file: str  # server-local path to exported traces (use the uploads route from a browser)
@@ -216,7 +216,7 @@ class BuildManager:
         self._name_taken = name_taken or self._store.exists
         self._register = register
         self._builds: dict[str, _BuildState] = {}
-        # Names of builds that are launched but not yet on disk — closes the TOCTOU where two
+        # Names of builds that are launched but not yet on disk - closes the TOCTOU where two
         # same-name builds both pass the existence check before either writes config.toml.
         self._reserved: set[str] = set()
         self._lock = threading.Lock()
@@ -243,7 +243,7 @@ class BuildManager:
             train_split=request.train_split,
         )
         # Reserve the name atomically against in-flight builds, the served set (`name_taken`), AND
-        # the writable root's disk — the last catches a model built earlier but not currently
+        # the writable root's disk - the last catches a model built earlier but not currently
         # served (via `--name`), which would otherwise be silently overwritten.
         with self._lock:
             if (
@@ -278,7 +278,7 @@ class BuildManager:
     def _run(self, state: _BuildState, request: BuildRouteRequest, config: HarnessConfig) -> None:
         reporter = _RecordingReporter(state)
         model_dir = self._store.model_dir(request.name)
-        # If the dir already exists, this build did not create it — never delete it on failure
+        # If the dir already exists, this build did not create it - never delete it on failure
         # (it could be a real, previously-built model that just wasn't in the served set).
         preexisting = model_dir.exists()
         try:
@@ -286,7 +286,7 @@ class BuildManager:
             self._build_fn(config, file=request.file, root=str(model_dir), reporter=reporter)
         except Exception as exc:  # noqa: BLE001 - report any failure to the client, never a dead silent thread
             # Remove the partial artifact so a failed build doesn't leave a model that `exists()`
-            # then treats as real (bricking retries with 409 and serving a broken model) — but
+            # then treats as real (bricking retries with 409 and serving a broken model) - but
             # only if this build created the dir, never a pre-existing model.
             if not preexisting:
                 shutil.rmtree(model_dir, ignore_errors=True)

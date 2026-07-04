@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Generate src/data/index.json — the site's local "db" of world models.
+ * Generate src/data/index.json - the site's local "db" of world models.
  *
  * Walks every model dir under examples/<task>/models/ and .wmh/models/ in the repo root,
  * reading card.json (the record the gallery renders) and metrics.json (build accuracy).
@@ -17,7 +17,7 @@ const repoRoot = resolve(here, "..", "..");
 const outPath = join(here, "..", "src", "data", "index.json");
 
 function modelRoots() {
-  // .wmh (the writable build root) comes FIRST so serveCommand() lists it first — that is where
+  // .wmh (the writable build root) comes FIRST so serveCommand() lists it first - that is where
   // `wmh serve` writes server-side builds and uploads; putting a committed examples/ dir first
   // would send build artifacts into the git tree.
   const roots = [];

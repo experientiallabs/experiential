@@ -68,11 +68,16 @@ export function Playground({
   const [error, setError] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const inFlight = useRef(false); // hard guard: exactly one step in flight at a time
 
   // Report live session read-outs up so the side panel can show them.
   useEffect(() => {
     onLive(sessionId ? { scratchpad, usage } : null);
   }, [sessionId, scratchpad, usage, onLive]);
+
+  // Clear the side panel when the playground unmounts (e.g. switching to the Traces tab), so it
+  // never shows a stale session's scratchpad/usage next to something else.
+  useEffect(() => () => onLive(null), [onLive]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -86,7 +91,7 @@ export function Playground({
   const stepAction = useCallback(
     async (sid: string, raw: string) => {
       const text = raw.trim();
-      if (!text) return;
+      if (!text || inFlight.current) return; // ignore re-entrant submits (key-repeat, click+Enter)
       let action: Action;
       try {
         action = parseAction(text);
@@ -94,6 +99,7 @@ export function Playground({
         setError(e instanceof Error ? e.message : String(e));
         return;
       }
+      inFlight.current = true;
       setError(null);
       setInput("");
       // Show the action immediately with a pending observation (the spinner renders for it).
@@ -111,9 +117,17 @@ export function Playground({
           return next;
         });
         setScratchpad(state.scratchpad);
-        setUsage(await sessionUsage(name, sid));
+        // Usage is best-effort: a failure here must not undo the step the user just saw answered.
+        try {
+          setUsage(await sessionUsage(name, sid));
+        } catch {
+          // leave the previous usage in place
+        }
       } catch (e) {
-        setTurns((prev) => prev.slice(0, -1)); // drop the pending action
+        // Only drop the turn if it is still pending (its observation never arrived).
+        setTurns((prev) =>
+          prev.length && prev[prev.length - 1].observation === null ? prev.slice(0, -1) : prev,
+        );
         if (e instanceof ApiError && e.status === 404) {
           setError("session expired on the server; start a new one");
           setSessionId(null);
@@ -121,6 +135,7 @@ export function Playground({
           setError(e instanceof Error ? e.message : String(e));
         }
       } finally {
+        inFlight.current = false;
         setBusy(false);
       }
     },

@@ -1,7 +1,7 @@
-"""Local FastAPI backend — the live environment agents call over HTTP.
+"""Local FastAPI backend - the live environment agents call over HTTP.
 
 Routes are namespaced by world model name (`/world_models/{name}/...`) so one backend can serve
-several named models at once — from one or more store roots (`.wmh`, `examples/<task>`, ...).
+several named models at once - from one or more store roots (`.wmh`, `examples/<task>`, ...).
 Each route is a thin transport over an in-process `WorldModel`; the CLI and the API share the
 same code path. `GET /world_models` also returns each model's `card.json` (when present), and
 the `/world_models/builds` routes run new builds server-side so the website's build-your-own
@@ -9,7 +9,7 @@ flow can watch progress over SSE.
 
 The backend is also the *reward* server for RL training: `POST .../sessions/{id}/score` judges the
 session's rollout (task + history) with `EpisodeRewardJudge`, returning the scalar episode reward
-(GRPO/PPO/REINFORCE++), per-step rewards, and a critique string (SDPO's teacher feedback) — so a
+(GRPO/PPO/REINFORCE++), per-step rewards, and a critique string (SDPO's teacher feedback) - so a
 training scaffold gets environment and reward behind one API.
 """
 
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Only browser origins matching this may reach the API (see the CORS note in create_app). Kept as
 # a module constant so the multipart-upload route can re-check it: multipart POSTs are CORS
 # "simple requests" that skip preflight, so CORSMiddleware alone does not stop a foreign page from
-# writing to disk — the route validates the Origin header itself.
+# writing to disk - the route validates the Origin header itself.
 ALLOWED_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
 # Reject an upload whose body exceeds this; keeps a stray/malicious POST from filling the disk.
@@ -130,8 +130,8 @@ def resolve_model_dirs(artifact_dirs: Sequence[str], names: list[str] | None) ->
 def _load_card_or_none(model_dir: Path) -> ModelCard | None:
     """Read a model's card, degrading a malformed one to None instead of aborting the server.
 
-    A card is additive metadata (see `wmh.config.card`); one corrupt `card.json` — e.g. a
-    build killed mid-write — must not stop the healthy models from being served.
+    A card is additive metadata (see `wmh.config.card`); one corrupt `card.json` - e.g. a
+    build killed mid-write - must not stop the healthy models from being served.
     """
     try:
         return load_card(model_dir)
@@ -197,7 +197,7 @@ def create_app(
         models[name] = world_model
 
     def _name_taken(name: str) -> bool:
-        # Taken if it's in the live served set OR built on disk under any root — the latter
+        # Taken if it's in the live served set OR built on disk under any root - the latter
         # catches a model built earlier but not currently served (via `--name`), which a build
         # would otherwise silently overwrite.
         if name in models:

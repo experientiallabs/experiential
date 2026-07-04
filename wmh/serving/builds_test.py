@@ -151,7 +151,7 @@ def test_failed_build_removes_partial_artifact(tmp_path: Path) -> None:
 
 
 def test_failed_build_keeps_a_preexisting_model(tmp_path: Path) -> None:
-    # A build whose name matches a model already on disk must be rejected — and even if it ran,
+    # A build whose name matches a model already on disk must be rejected - and even if it ran,
     # a failure must never delete that pre-existing model (data loss).
     model_dir = tmp_path / ".wmh" / "models" / "fresh"
     model_dir.mkdir(parents=True)
@@ -170,7 +170,7 @@ def test_failed_build_keeps_a_preexisting_model(tmp_path: Path) -> None:
 
 def test_card_write_failure_keeps_completed_build(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
     # A card-write failure (e.g. disk full) after a successful build must NOT delete the
-    # finished model artifact — the build still succeeds, card is just missing.
+    # finished model artifact - the build still succeeds, card is just missing.
     def _boom(card, model_dir) -> None:  # noqa: ANN001
         raise OSError("disk full")
 

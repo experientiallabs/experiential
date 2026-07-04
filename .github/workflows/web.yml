@@ -32,7 +32,7 @@ jobs:
           node scripts/build-index.mjs
           if ! diff <(jq 'del(.generated_at)' src/data/index.json) \
                     <(git show HEAD:web/src/data/index.json | jq 'del(.generated_at)'); then
-            echo "::error::src/data/index.json is stale — run 'npm run index' and commit the result"
+            echo "::error::src/data/index.json is stale - run 'npm run index' and commit the result"
             exit 1
           fi
       - run: npm run build

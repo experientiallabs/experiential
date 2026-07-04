@@ -30,7 +30,12 @@ export function ModelView({ entry, serveHint }: { entry: IndexEntry; serveHint: 
   // surfaced through the serve command the user copies rather than a per-session switch.
   const effectiveHint = maxFidelity ? `${serveHint} --max-fidelity` : serveHint;
 
-  const onLive = useCallback((next: LiveState | null) => setLive(next), []);
+  // When the live session goes away (ended, or the Play tab unmounted), collapse the panels so a
+  // stale selection can't leave the remaining panel rendered-but-closed.
+  const onLive = useCallback((next: LiveState | null) => {
+    setLive(next);
+    if (!next) setOpenPanel(null);
+  }, []);
 
   useEffect(() => {
     isServeUp().then(setServeUp);

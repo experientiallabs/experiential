@@ -3,7 +3,7 @@
 `card.json` sits in the artifact root next to `config.toml` and is what distribution surfaces
 (the website gallery, `GET /world_models`, future `wmh export`/`pull`) render. The shape follows
 the registry contract sketch in the coordination plan (PLAN.md §2.1); WS-A4 owns and extends it.
-A model without a card still loads everywhere — cards are additive metadata, never required.
+A model without a card still loads everywhere - cards are additive metadata, never required.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ def make_build_card(
     """Assemble the card a completed build writes.
 
     The single card-construction site for both build paths (`wmh build` and serve-side builds),
-    so their cards never drift. `fidelity`/cost/latency stay unset here — they are stamped later
+    so their cards never drift. `fidelity`/cost/latency stay unset here - they are stamped later
     from eval results, not known at build time.
     """
     return ModelCard(
