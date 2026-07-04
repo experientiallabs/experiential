@@ -63,6 +63,12 @@ class _RawObservation(BaseModel):
     state_note: str = ""
 
 
+# The keys that mark a reply as following the observation contract (any one present is enough). Used
+# to tell a real — possibly empty — contract response apart from arbitrary JSON that happens to
+# validate against `_RawObservation`'s all-defaulted fields.
+_CONTRACT_KEYS = frozenset({"output", "is_error", "state_note"})
+
+
 def parse_observation(text: str) -> Observation:
     """Parse a world-model completion into a structured Observation.
 
@@ -74,14 +80,27 @@ def parse_observation(text: str) -> Observation:
     raw = extract_json_object(text)
     if raw is not None:
         try:
-            parsed = _RawObservation.model_validate_json(raw)
-        except ValidationError:
-            parsed = None
-        if parsed is not None and (parsed.output or parsed.state_note):
-            metadata: JsonObject = {}
-            if parsed.state_note:
-                metadata["state_note"] = parsed.state_note
-            return Observation(content=parsed.output, is_error=parsed.is_error, metadata=metadata)
+            obj: object = json.loads(raw)
+        except json.JSONDecodeError:
+            obj = None
+        # Recognize the contract by the PRESENCE of its keys, not by truthy values.
+        # `_RawObservation` defaults every field, so arbitrary JSON like `{"foo": 1}` would validate
+        # to an all-empty observation; requiring a contract key keeps that falling through to raw
+        # text. But a legitimate silent success `{"output": "", "is_error": false, ...}` (many shell
+        # writes/redirects print nothing) MUST be honored as an empty observation, not re-serialized
+        # as visible JSON text — closed-loop rollouts would otherwise show spurious output.
+        if isinstance(obj, dict) and _CONTRACT_KEYS.intersection(obj):
+            try:
+                parsed = _RawObservation.model_validate(obj)
+            except ValidationError:
+                parsed = None
+            if parsed is not None:
+                metadata: JsonObject = {}
+                if parsed.state_note:
+                    metadata["state_note"] = parsed.state_note
+                return Observation(
+                    content=parsed.output, is_error=parsed.is_error, metadata=metadata
+                )
     return Observation(content=text.strip())
 
 

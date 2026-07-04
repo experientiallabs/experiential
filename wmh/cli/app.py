@@ -484,17 +484,52 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
     ),
     limit: int = typer.Option(20, help="Rows to show for `wmh eval results`."),
+    name: str | None = typer.Option(
+        None, "--name", help="World model for `closed-loop` (default: the only built one)."
+    ),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models (closed-loop)."),
+    k: int = typer.Option(3, help="Closed-loop passes per task (means reported, never 1-pass)."),
+    max_turns: int = typer.Option(20, help="Closed-loop agent turn cap per task."),
+    threshold: float = typer.Option(
+        0.5, help="Agreement pass threshold on a task's k-pass success rate."
+    ),
 ) -> None:
     """Score reconstruction fidelity, or run named example-local eval suites.
 
     Flows:
-    - `wmh eval <trace files...>`: ad hoc replay scoring.
+    - `wmh eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced).
     - `wmh eval list`: list named suites under `examples/<task>/evals/`.
     - `wmh eval run <suite>`: run a suite and save a local JSON result.
     - `wmh eval results optional-suite`: summarize local suite results.
+    - `wmh eval closed-loop <tasks.jsonl>`: a live agent runs tasks WITH the world model as its
+      environment; score task success against gold assertions (see docs/closed_loop.md).
+    - `wmh eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
+      (e.g. world-model vs real environment) — the outcome-agreement validity check.
     """
     args = tokens or []
     suite_root = str(_examples_root()) if examples_root is None else examples_root
+    if args and args[0] == "closed-loop":
+        if len(args) != 2:
+            raise typer.BadParameter("usage: wmh eval closed-loop <tasks.jsonl>")
+        from wmh.cli.eval_closed_loop import run_closed_loop
+
+        run_closed_loop(
+            _console,
+            tasks_file=args[1],
+            name=name,
+            root=root,
+            k=k,
+            max_turns=max_turns,
+            out=out,
+        )
+        return
+    if args and args[0] == "agreement":
+        if len(args) != 3:
+            raise typer.BadParameter("usage: wmh eval agreement <report_a.json> <report_b.json>")
+        from wmh.cli.eval_closed_loop import run_agreement
+
+        run_agreement(_console, report_a=args[1], report_b=args[2], threshold=threshold)
+        return
     if args and args[0] == "list":
         if len(args) != 1:
             raise typer.BadParameter("usage: wmh eval list")
