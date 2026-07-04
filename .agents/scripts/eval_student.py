@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
-from collect_teacher import _load_gemini_key, domain_tool_hint, gemini  # noqa: E402
+from collect_teacher import _load_gemini_key, domain_tool_hint, foundry, gemini, openai_direct  # noqa: E402
 from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, bedrock  # noqa: E402
 
 from wmh.core.types import Action, ActionKind, EnvState, Step  # noqa: E402
@@ -104,6 +104,18 @@ class QwenStudentAgent:
             return Action(kind=ActionKind.MESSAGE, content=stripped.strip()[:400])
 
 
+def _resolve(spec: str):  # noqa: ANN202 - Provider; routes bedrock:/foundry:/openai:/gemini names
+    if spec.startswith("bedrock:"):
+        return bedrock(spec.removeprefix("bedrock:"))
+    if spec.startswith("foundry:"):
+        return foundry(spec.removeprefix("foundry:"))
+    if spec.startswith("openai:"):
+        return openai_direct(spec.removeprefix("openai:"))
+    if spec.startswith("gemini"):
+        return gemini(spec)
+    return bedrock(spec)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
@@ -121,12 +133,9 @@ def main() -> None:
     from openai import OpenAI
 
     client = OpenAI(base_url=args.endpoint, api_key="not-needed")
-    if args.judge_model.startswith("bedrock:"):
-        judge = ChecklistJudge(bedrock(args.judge_model.removeprefix("bedrock:")))
-    else:
-        judge = ChecklistJudge(gemini(args.judge_model))
+    judge = ChecklistJudge(_resolve(args.judge_model))
     world_model = WorldModel.load(
-        str(WM_DIR), bedrock(args.wm_model), telemetry_root=str(REPO / ".wmh")
+        str(WM_DIR), _resolve(args.wm_model), telemetry_root=str(REPO / ".wmh")
     )
 
     pool = ScenarioSet.load(DISTILL / "eval_pool.json")

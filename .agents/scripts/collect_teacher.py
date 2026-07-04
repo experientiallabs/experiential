@@ -69,17 +69,49 @@ Rules:
 - Work efficiently: no redundant calls; finish as soon as the task is done."""
 
 
+def _read_env_value(path, name):  # noqa: ANN001, ANN202
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"{name}="):
+            return line.split("=", 1)[1].strip().strip("\"'")
+    return None
+
+
 def _load_gemini_key() -> None:
-    """Set WMH_ENDPOINT_API_KEY from platform/.env.local without echoing it anywhere."""
-    if os.environ.get("WMH_ENDPOINT_API_KEY"):
-        return
-    env_file = REPO.parent / "platform" / ".env.local"
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        if line.startswith("GEMINI_API_KEY"):
-            value = line.split("=", 1)[1].strip().strip("\"'")
-            os.environ["WMH_ENDPOINT_API_KEY"] = value
-            return
-    raise RuntimeError("GEMINI_API_KEY not found in platform/.env.local")
+    """Load provider keys from the experientiallabs .env.local files (never echoed).
+
+    - AZURE_FOUNDRY_API_KEY -> WMH_ENDPOINT_API_KEY (custom-endpoint auth: DeepSeek-V4-Pro)
+    - OPENAI_API_KEY -> OPENAI_API_KEY (gpt-5 family, direct)
+    Falls back to GEMINI_API_KEY for WMH_ENDPOINT_API_KEY only if Foundry's key is absent.
+    """
+    labs = REPO.parent
+    if not os.environ.get("WMH_ENDPOINT_API_KEY"):
+        value = _read_env_value(labs / "world-model-harness" / ".env.local", "AZURE_FOUNDRY_API_KEY")
+        if value is None:
+            value = _read_env_value(labs / "platform" / ".env.local", "GEMINI_API_KEY")
+        if value is None:
+            raise RuntimeError("no AZURE_FOUNDRY_API_KEY or GEMINI_API_KEY found")
+        os.environ["WMH_ENDPOINT_API_KEY"] = value
+    if not os.environ.get("OPENAI_API_KEY"):
+        value = _read_env_value(labs / "world-models" / ".env.local", "OPENAI_API_KEY")
+        if value is not None:
+            os.environ["OPENAI_API_KEY"] = value
+
+
+FOUNDRY_ENDPOINT = "https://silen-resource.services.ai.azure.com/openai/v1/"
+
+
+def foundry(model: str) -> Provider:
+    """A model on the user's Azure AI Foundry resource (OpenAI-compatible)."""
+    _load_gemini_key()
+    return RetryProvider(
+        get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model, endpoint=FOUNDRY_ENDPOINT))
+    )
+
+
+def openai_direct(model: str) -> Provider:
+    """A model on the OpenAI API directly (reads OPENAI_API_KEY)."""
+    _load_gemini_key()
+    return RetryProvider(get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model)))
 
 
 def gemini(model: str) -> Provider:

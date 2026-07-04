@@ -21,7 +21,8 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
-from run_scenario_e2e import TRACES, bedrock, titan_embedder  # noqa: E402
+from collect_teacher import openai_direct  # noqa: E402
+from run_scenario_e2e import TRACES, titan_embedder  # noqa: E402
 
 from wmh.engine.build import split_traces  # noqa: E402
 from wmh.ingest import get_adapter  # noqa: E402
@@ -32,7 +33,7 @@ from wmh.scenarios.synthesis import ScenarioSynthesizer  # noqa: E402
 from wmh.scenarios.verification import ChecklistJudge  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
-KIMI = "moonshotai.kimi-k2.5"
+SYNTH_JUDGE = "gpt-5-mini"
 
 
 def main() -> None:
@@ -40,7 +41,7 @@ def main() -> None:
     parser.add_argument("--target", type=int, default=60, help="valid scenarios per arm")
     args = parser.parse_args()
 
-    provider = bedrock(KIMI)
+    provider = openai_direct(SYNTH_JUDGE)
     traces = get_adapter("otel-genai").from_file(str(TRACES))
     train_traces, _ = split_traces(traces, 0.8)
     facet_data = json.loads((DISTILL / "facets_full.json").read_text())["train"]

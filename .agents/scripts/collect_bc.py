@@ -26,7 +26,8 @@ sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
 from collect_teacher import domain_tool_hint  # noqa: E402
 from eval_student import student_system  # noqa: E402
-from run_scenario_e2e import TRACES, WM_DIR, bedrock  # noqa: E402
+from collect_teacher import foundry, openai_direct  # noqa: E402
+from run_scenario_e2e import TRACES, WM_DIR  # noqa: E402
 
 from wmh.core.types import Action, ActionKind, Observation, Step  # noqa: E402
 from wmh.engine.world_model import WorldModel  # noqa: E402
@@ -35,8 +36,8 @@ from wmh.ingest import get_adapter  # noqa: E402
 from wmh.scenarios import ChecklistJudge, ScenarioSet  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
-WM_MODEL = "deepseek.v3.2"
-JUDGE_MODEL = "moonshotai.kimi-k2.5"
+WM_MODEL = "DeepSeek-V4-Pro"  # user's Azure Foundry deployment
+JUDGE_MODEL = "gpt-5-mini"
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 MAX_STEPS = 10
@@ -127,8 +128,8 @@ def main() -> None:
     from openai import OpenAI
 
     client = OpenAI(base_url=args.endpoint, api_key="not-needed")
-    judge = ChecklistJudge(bedrock(JUDGE_MODEL))
-    world_model = WorldModel.load(str(WM_DIR), bedrock(WM_MODEL), telemetry_root=str(REPO / ".wmh"))
+    judge = ChecklistJudge(openai_direct(JUDGE_MODEL))
+    world_model = WorldModel.load(str(WM_DIR), foundry(WM_MODEL), telemetry_root=str(REPO / ".wmh"))
     pool = ScenarioSet.load(DISTILL / args.pool)
     traces = get_adapter("otel-genai").from_file(str(TRACES))
     t0 = time.time()
