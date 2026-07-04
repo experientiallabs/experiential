@@ -438,18 +438,23 @@ def build(
         )
     record = tracker.record_summary()
     save_run(record, ArtifactPaths(model_dir).runs)
-    save_card(
-        make_build_card(
-            name=params.name,
-            provider=params.provider,
-            model_id=params.model,
-            traces=build_stats.input_trace_count,
-            steps=build_stats.input_step_count,
-            built_at=datetime.now(UTC).isoformat(),
-            source=Path(params.file).name if params.file else params.vendor,
-        ),
-        model_dir,
-    )
+    # The card is additive metadata; a write failure (disk full, permissions) must not make an
+    # otherwise-complete build exit non-zero and then block retries with "already exists".
+    try:
+        save_card(
+            make_build_card(
+                name=params.name,
+                provider=params.provider,
+                model_id=params.model,
+                traces=build_stats.input_trace_count,
+                steps=build_stats.input_step_count,
+                built_at=datetime.now(UTC).isoformat(),
+                source=Path(params.file).name if params.file else params.vendor,
+            ),
+            model_dir,
+        )
+    except OSError as err:
+        _console.print(f"[yellow]warning[/yellow]: could not write card.json: {err}")
     capture_build_completed(
         stats=build_stats,
         gepa_budget=params.gepa_budget,
