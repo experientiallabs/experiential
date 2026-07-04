@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from wmh.config import ARTIFACT_DIR, WorldModelStore
+from wmh.config import ARTIFACT_DIR, WorldModelStore, validate_name
 from wmh.config.card import ModelCard, load_card
 from wmh.core.types import Action, EnvState, Observation, Session
 from wmh.engine.loader import load_world_model
@@ -94,6 +94,9 @@ def resolve_model_dirs(artifact_dirs: Sequence[str], names: list[str] | None) ->
     """
     resolved: dict[str, Path] = {}
     owners: dict[str, str] = {}
+    if names is not None:
+        for name in names:
+            validate_name(name)  # friendly ValueError on an unsafe name, before any disk lookup
     wanted = set(names) if names is not None else None
     for root in artifact_dirs:
         store = WorldModelStore(root)

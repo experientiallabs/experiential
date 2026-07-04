@@ -34,7 +34,7 @@ function stageDetail(events: BuildEvent[], key: string): string | null {
     case "ingest_done":
       return `${event.traces} traces, ${event.steps} steps`;
     case "split_done":
-      return `${event.train} train / ${event.test} held-out`;
+      return `${event.train} train / ${event.val} val / ${event.test} test`;
     case "index_done":
       return `${event.steps} steps indexed`;
     case "optimize_done":

@@ -75,6 +75,7 @@ class BuildEvent(BaseModel):
     traces: int | None = None
     steps: int | None = None
     train: int | None = None
+    val: int | None = None
     test: int | None = None
     budget: int | None = None
     done: int | None = None
@@ -141,8 +142,12 @@ class _RecordingReporter(BuildReporter):
         self.ingested_traces, self.ingested_steps = traces, steps
         self._state.append(BuildEvent(type="ingest_done", traces=traces, steps=steps))
 
-    def split_done(self, train: int, test: int) -> None:
-        self._state.append(BuildEvent(type="split_done", train=train, test=test))
+    def split_done(self, train: int, val: int, test: int) -> None:
+        self._state.append(BuildEvent(type="split_done", train=train, val=val, test=test))
+
+    def activity(self, line: str) -> None:
+        # Fine-grained activity lines are not surfaced in the staged build progress view.
+        pass
 
     def index_done(self, steps: int) -> None:
         self._state.append(BuildEvent(type="index_done", steps=steps))

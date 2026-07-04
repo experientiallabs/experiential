@@ -34,7 +34,7 @@ def _request(tmp_path: Path, name: str = "fresh") -> BuildRouteRequest:
 def _ok_build_fn(config: HarnessConfig, *, file: str, root: str, reporter: BuildReporter) -> None:
     """A stand-in build: emits the real reporter sequence and writes a minimal artifact."""
     reporter.ingest_done(3, 12)
-    reporter.split_done(2, 1)
+    reporter.split_done(2, 1, 1)
     reporter.index_done(12)
     reporter.optimize_start(2)
     reporter.rollout(1, 2, 0.5)

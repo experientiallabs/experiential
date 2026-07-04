@@ -126,6 +126,7 @@ export type BuildEvent = {
   traces?: number;
   steps?: number;
   train?: number;
+  val?: number;
   test?: number;
   budget?: number;
   done?: number;
