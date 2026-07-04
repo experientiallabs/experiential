@@ -1,0 +1,523 @@
+{
+ "label": "real-before",
+ "episodes": 63,
+ "success_rate": 0.031746031746031744,
+ "mean_pass_rate": 0.12698412698412698,
+ "per_domain": {
+  "retail": {
+   "episodes": 9,
+   "success_rate": 0.1111111111111111
+  },
+  "telecom": {
+   "episodes": 54,
+   "success_rate": 0.018518518518518517
+  }
+ },
+ "wall_clock_seconds": 42.9,
+ "results": [
+  {
+   "scenario_id": "scenario-74a01bb8ee0674a20d69750925198010",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-74a01bb8ee0674a20d69750925198010",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 9
+  },
+  {
+   "scenario_id": "scenario-74a01bb8ee0674a20d69750925198010",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-5daf57194510c0d36bc6062d2eb81fcb",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-5daf57194510c0d36bc6062d2eb81fcb",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4
+  },
+  {
+   "scenario_id": "scenario-5daf57194510c0d36bc6062d2eb81fcb",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-16a3db00374348ca059aa8cd6dab251d",
+   "domain": "retail",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-16a3db00374348ca059aa8cd6dab251d",
+   "domain": "retail",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4
+  },
+  {
+   "scenario_id": "scenario-16a3db00374348ca059aa8cd6dab251d",
+   "domain": "retail",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-f203f0c5439f3d240836f4f53497ab4e",
+   "domain": "retail",
+   "pass_index": 0,
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-f203f0c5439f3d240836f4f53497ab4e",
+   "domain": "retail",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-f203f0c5439f3d240836f4f53497ab4e",
+   "domain": "retail",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-88eb6e31edfbfbc693dc49031889c8bd",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-88eb6e31edfbfbc693dc49031889c8bd",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 8
+  },
+  {
+   "scenario_id": "scenario-88eb6e31edfbfbc693dc49031889c8bd",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-c427cd6ef1bbce94b59584c8c1c4fc25",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-c427cd6ef1bbce94b59584c8c1c4fc25",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 6
+  },
+  {
+   "scenario_id": "scenario-c427cd6ef1bbce94b59584c8c1c4fc25",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-f1dc69be505b0e3d76f266ff50833242",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-f1dc69be505b0e3d76f266ff50833242",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 3
+  },
+  {
+   "scenario_id": "scenario-f1dc69be505b0e3d76f266ff50833242",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 6
+  },
+  {
+   "scenario_id": "scenario-0d937e573d0ff722278c2a8904dfd4f6",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 7
+  },
+  {
+   "scenario_id": "scenario-0d937e573d0ff722278c2a8904dfd4f6",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 3
+  },
+  {
+   "scenario_id": "scenario-0d937e573d0ff722278c2a8904dfd4f6",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 1
+  },
+  {
+   "scenario_id": "scenario-959dae3165642074e89fad8a366ab77e",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-959dae3165642074e89fad8a366ab77e",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-959dae3165642074e89fad8a366ab77e",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 9
+  },
+  {
+   "scenario_id": "scenario-ee85d9e0014891e715c9f5dc44197815",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-ee85d9e0014891e715c9f5dc44197815",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 7
+  },
+  {
+   "scenario_id": "scenario-ee85d9e0014891e715c9f5dc44197815",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 5
+  },
+  {
+   "scenario_id": "scenario-38503046fd9ba41b44ee88b31bac553d",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-38503046fd9ba41b44ee88b31bac553d",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-38503046fd9ba41b44ee88b31bac553d",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 7
+  },
+  {
+   "scenario_id": "scenario-264854df7a3ec58474959490bbac9173",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.6666666666666666,
+   "steps": 9
+  },
+  {
+   "scenario_id": "scenario-264854df7a3ec58474959490bbac9173",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4
+  },
+  {
+   "scenario_id": "scenario-264854df7a3ec58474959490bbac9173",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 3
+  },
+  {
+   "scenario_id": "scenario-8fb0686ede3a2eab2503447cbf66b3b5",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-8fb0686ede3a2eab2503447cbf66b3b5",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 2
+  },
+  {
+   "scenario_id": "scenario-8fb0686ede3a2eab2503447cbf66b3b5",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-ddf6fb1eedffa8d4a4488ee063749fbc",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 1
+  },
+  {
+   "scenario_id": "scenario-ddf6fb1eedffa8d4a4488ee063749fbc",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-ddf6fb1eedffa8d4a4488ee063749fbc",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-09703eb0f8b08c845aa4992fe569cb16",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-09703eb0f8b08c845aa4992fe569cb16",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 8
+  },
+  {
+   "scenario_id": "scenario-09703eb0f8b08c845aa4992fe569cb16",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4
+  },
+  {
+   "scenario_id": "scenario-e17213398730b5a021f0b5e8c15d4746",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 9
+  },
+  {
+   "scenario_id": "scenario-e17213398730b5a021f0b5e8c15d4746",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-e17213398730b5a021f0b5e8c15d4746",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.6666666666666666,
+   "steps": 7
+  },
+  {
+   "scenario_id": "scenario-7c3b5d85af5693401568a338e700ec86",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 8
+  },
+  {
+   "scenario_id": "scenario-7c3b5d85af5693401568a338e700ec86",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 0
+  },
+  {
+   "scenario_id": "scenario-7c3b5d85af5693401568a338e700ec86",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 1.0,
+   "steps": 4
+  },
+  {
+   "scenario_id": "scenario-f28821d3560939354c7a553ad08e614f",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 3
+  },
+  {
+   "scenario_id": "scenario-f28821d3560939354c7a553ad08e614f",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 9
+  },
+  {
+   "scenario_id": "scenario-f28821d3560939354c7a553ad08e614f",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4
+  },
+  {
+   "scenario_id": "scenario-38569c124fcdb38990becf52bc5b11d1",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 1
+  },
+  {
+   "scenario_id": "scenario-38569c124fcdb38990becf52bc5b11d1",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-38569c124fcdb38990becf52bc5b11d1",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 9
+  },
+  {
+   "scenario_id": "scenario-c5f353b87088341401464e87bcdbd557",
+   "domain": "telecom",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.3333333333333333,
+   "steps": 7
+  },
+  {
+   "scenario_id": "scenario-c5f353b87088341401464e87bcdbd557",
+   "domain": "telecom",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-c5f353b87088341401464e87bcdbd557",
+   "domain": "telecom",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4
+  },
+  {
+   "scenario_id": "scenario-062912cc0d4f38fffff4f1453ce97307",
+   "domain": "retail",
+   "pass_index": 0,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 7
+  },
+  {
+   "scenario_id": "scenario-062912cc0d4f38fffff4f1453ce97307",
+   "domain": "retail",
+   "pass_index": 1,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10
+  },
+  {
+   "scenario_id": "scenario-062912cc0d4f38fffff4f1453ce97307",
+   "domain": "retail",
+   "pass_index": 2,
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0
+  }
+ ]
+}

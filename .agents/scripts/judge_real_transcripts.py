@@ -32,10 +32,13 @@ DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
 
 
 def to_steps(record: dict) -> list[Step]:
+    def as_dict(value):  # noqa: ANN001, ANN202 - agents sometimes emit positional-arg lists
+        return value if isinstance(value, dict) else {"args": value}
+
     steps = [
         Step(
             action=Action(
-                kind=ActionKind.TOOL_CALL, name=s["tool"], arguments=s.get("arguments") or {}
+                kind=ActionKind.TOOL_CALL, name=s["tool"], arguments=as_dict(s.get("arguments") or {})
             ),
             observation=Observation(content=s["observation"], is_error=s.get("is_error", False)),
         )
