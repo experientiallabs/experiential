@@ -39,7 +39,6 @@ from typing import Iterable
 
 from pydantic import BaseModel
 
-
 from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.providers.base import Embedder, Provider
 
