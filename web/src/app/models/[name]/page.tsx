@@ -17,13 +17,15 @@ export default async function ModelPage({
   const entry = findModel(decoded);
 
   return (
-    <div className="flex flex-col gap-8">
-      <header className="flex flex-col items-center gap-3 pt-10 text-center">
+    <div className="flex flex-col gap-4">
+      <header className="flex flex-col items-center gap-1.5 pt-4 text-center">
         <Wordmark />
-        <h1 className="text-2xl font-semibold tracking-tight">
+        <h1 className="text-xl font-semibold tracking-tight">
           {entry ? entry.card.title : decoded}
         </h1>
-        {entry && <p className="max-w-2xl text-ink-soft">{entry.card.description}</p>}
+        {entry && (
+          <p className="line-clamp-2 max-w-2xl text-sm text-ink-soft">{entry.card.description}</p>
+        )}
       </header>
       {entry ? (
         <ModelView entry={entry} serveHint={serveCommand()} />

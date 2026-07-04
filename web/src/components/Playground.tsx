@@ -1,17 +1,20 @@
 "use client";
 
 /**
- * The interactive playground: create a session against a locally running `wmh serve`, type
- * actions in the `wmh play` grammar (or click a suggestion / start from a recorded scenario),
- * and watch the world model's observations, scratchpad, and live usage.
+ * The interactive playground. Before a session it is a centered composer (type an action, or pick
+ * an example tool call or a scenario to replay). In session it is a single transcript: your action
+ * appears immediately, then a spinner while the environment responds. Scratchpad and usage are
+ * lifted to the parent so they live in the side panel and never grow the page.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, createSession, sessionUsage, step } from "@/lib/api";
+import type { LiveState } from "@/components/LivePanels";
+import { Spinner } from "@/components/Spinner";
 import { parseAction } from "@/lib/parse-action";
-import type { Action, EnvState, IndexEntry, RunRecord, Scenario } from "@/lib/types";
+import type { Action, IndexEntry, Scenario } from "@/lib/types";
 
-type Turn = { action: string; observation: string; is_error: boolean };
+type Turn = { action: string; observation: string | null; is_error: boolean };
 
 function actionLabel(action: Action): string {
   if (action.kind === "tool_call") {
@@ -22,7 +25,16 @@ function actionLabel(action: Action): string {
   return `say ${action.content ?? ""}`;
 }
 
-/** A clickable example action; clicking loads it into the input for review before sending. */
+/** Render a recorded task (tau tasks are JSON; terminal/swe are plain) as readable text. */
+export function readableTask(task: string): string {
+  try {
+    const p = JSON.parse(task);
+    return [p.reason_for_call, p.task_instructions, p.query].filter(Boolean).join("\n\n") || task;
+  } catch {
+    return task;
+  }
+}
+
 function Chip({ label, onPick }: { label: string; onPick: () => void }) {
   return (
     <button
@@ -35,119 +47,153 @@ function Chip({ label, onPick }: { label: string; onPick: () => void }) {
   );
 }
 
-export function Playground({ entry }: { entry: IndexEntry }) {
+export function Playground({
+  entry,
+  onLive,
+}: {
+  entry: IndexEntry;
+  onLive: (live: LiveState | null) => void;
+}) {
+  const name = entry.card.name;
   const suggestions = entry.suggestions;
   const scenarios = entry.scenarios;
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [seededScenario, setSeededScenario] = useState<Scenario | null>(null);
-  const [taskText, setTaskText] = useState("");
+  const [seeded, setSeeded] = useState<Scenario | null>(null);
+  const [sessionTask, setSessionTask] = useState<string | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [state, setState] = useState<EnvState | null>(null);
-  const [usage, setUsage] = useState<RunRecord | null>(null);
+  const [scratchpad, setScratchpad] = useState("");
+  const [usage, setUsage] = useState<LiveState["usage"]>(null);
   const [input, setInput] = useState(suggestions[0] ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // In a seeded scenario, offer that scenario's recorded actions in order; otherwise the model's
-  // generic example actions.
-  const chips = useMemo(
-    () => (seededScenario ? seededScenario.steps.map((s) => s.action_label) : suggestions),
-    [seededScenario, suggestions],
-  );
+  // Report live session read-outs up so the side panel can show them.
+  useEffect(() => {
+    onLive(sessionId ? { scratchpad, usage } : null);
+  }, [sessionId, scratchpad, usage, onLive]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [turns, busy]);
+  }, [turns]);
+
+  const chips = useMemo(
+    () => (seeded ? seeded.steps.map((s) => s.action_label) : suggestions),
+    [seeded, suggestions],
+  );
+
+  const stepAction = useCallback(
+    async (sid: string, raw: string) => {
+      const text = raw.trim();
+      if (!text) return;
+      let action: Action;
+      try {
+        action = parseAction(text);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        return;
+      }
+      setError(null);
+      setInput("");
+      // Show the action immediately with a pending observation (the spinner renders for it).
+      setTurns((prev) => [...prev, { action: actionLabel(action), observation: null, is_error: false }]);
+      setBusy(true);
+      try {
+        const { observation, state } = await step(name, sid, action);
+        setTurns((prev) => {
+          const next = [...prev];
+          next[next.length - 1] = {
+            action: next[next.length - 1].action,
+            observation: observation.content,
+            is_error: observation.is_error,
+          };
+          return next;
+        });
+        setScratchpad(state.scratchpad);
+        setUsage(await sessionUsage(name, sid));
+      } catch (e) {
+        setTurns((prev) => prev.slice(0, -1)); // drop the pending action
+        if (e instanceof ApiError && e.status === 404) {
+          setError("session expired on the server; start a new one");
+          setSessionId(null);
+        } else {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        setBusy(false);
+      }
+    },
+    [name],
+  );
 
   const begin = useCallback(
-    async (scenario: Scenario | null) => {
+    async (scenario: Scenario | null, firstAction?: string) => {
       setBusy(true);
       setError(null);
-      const task = scenario ? scenario.task : taskText.trim() || null;
+      const task = scenario ? scenario.task : null;
       try {
-        const { session_id, state } = await createSession(entry.card.name, task);
+        const { session_id, state } = await createSession(name, task);
         setSessionId(session_id);
-        setSeededScenario(scenario);
+        setSeeded(scenario);
+        setSessionTask(task);
         setTurns([]);
+        setScratchpad(state.scratchpad);
         setUsage(null);
-        setState(state);
         setInput(scenario?.steps[0]?.action_label ?? suggestions[0] ?? "");
+        if (firstAction) await stepAction(session_id, firstAction);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
         setBusy(false);
       }
     },
-    [entry.card.name, taskText, suggestions],
+    [name, suggestions, stepAction],
   );
 
-  const send = useCallback(async () => {
-    if (!sessionId || !input.trim()) return;
-    let action: Action;
-    try {
-      action = parseAction(input);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      const { observation, state } = await step(entry.card.name, sessionId, action);
-      setTurns((prev) => [
-        ...prev,
-        { action: actionLabel(action), observation: observation.content, is_error: observation.is_error },
-      ]);
-      setInput("");
-      setState(state);
-      setUsage(await sessionUsage(entry.card.name, sessionId));
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 404) {
-        setError("session expired on the server; start a new one");
-        setSessionId(null);
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    } finally {
-      setBusy(false);
-    }
-  }, [entry.card.name, sessionId, input]);
-
+  // Pre-session: a centered composer with example tool calls and scenario replays below it.
   if (!sessionId) {
     return (
-      <div className="flex flex-col gap-5 rounded-xl border border-line p-6">
-        <div className="flex flex-col gap-2">
-          <label className="mono-label" htmlFor="task">
-            task (optional)
-          </label>
-          <div className="flex flex-col gap-2 sm:flex-row">
+      <div className="flex flex-col items-center gap-8 py-4">
+        <div className="flex w-full max-w-2xl flex-col gap-3">
+          <p className="text-center text-sm text-ink-soft">
+            Send a tool call or message to the{" "}
+            <span className="text-ink">{entry.card.task ?? "world model"}</span> environment and
+            watch how it responds.
+          </p>
+          <div className="flex gap-2">
             <input
-              id="task"
-              value={taskText}
-              onChange={(e) => setTaskText(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !busy && begin(null)}
-              placeholder={
-                entry.card.task
-                  ? `what should the agent try to do in this ${entry.card.task} environment?`
-                  : "what should the agent try to do?"
-              }
-              className="flex-1 rounded-lg border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+              autoFocus
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !busy && input.trim() && begin(null, input)}
+              placeholder={'tool_name {"arg": "value"}   ·   say <message>'}
+              className="flex-1 rounded-lg border border-line px-4 py-2.5 font-mono text-xs outline-none focus:border-accent"
             />
             <button
-              onClick={() => begin(null)}
-              disabled={busy}
-              className="rounded-lg bg-ink px-5 py-2 text-sm font-medium text-white transition-opacity hover:opacity-85 disabled:opacity-40"
+              onClick={() => begin(null, input)}
+              disabled={busy || !input.trim()}
+              className="rounded-lg bg-ink px-5 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-85 disabled:opacity-40"
             >
-              Start session
+              Send
             </button>
           </div>
         </div>
 
+        {suggestions.length > 0 && (
+          <div className="flex w-full max-w-2xl flex-col items-center gap-2">
+            <span className="mono-label">example tool calls</span>
+            <div className="flex flex-wrap justify-center gap-2">
+              {suggestions.map((s, i) => (
+                <Chip key={`${s}-${i}`} label={s} onPick={() => begin(null, s)} />
+              ))}
+            </div>
+          </div>
+        )}
+
         {scenarios.length > 0 && (
-          <div className="flex flex-col gap-2 border-t border-line pt-4">
-            <span className="mono-label">or replay a recorded scenario, open loop</span>
+          <div className="flex w-full max-w-2xl flex-col gap-2">
+            <span className="mono-label text-center">replay a scenario</span>
             <div className="flex flex-col gap-2">
               {scenarios.map((s) => (
                 <button
@@ -176,18 +222,17 @@ export function Playground({ entry }: { entry: IndexEntry }) {
     <section className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-xs text-ink-faint">
-          <span
-            className={`inline-block h-1.5 w-1.5 rounded-full ${busy ? "bg-accent-teal" : "bg-live"}`}
-          />
-          <span className="mono-label">{busy ? "stepping" : "live session"}</span>
-          {seededScenario && <span className="truncate">· replaying: {seededScenario.label}</span>}
+          <span className="inline-block h-1.5 w-1.5 rounded-full bg-live" />
+          <span className="mono-label">live session</span>
+          {seeded && <span className="truncate">· replaying: {seeded.label}</span>}
         </div>
         <button
           onClick={() => {
             setSessionId(null);
-            setSeededScenario(null);
+            setSeeded(null);
+            setSessionTask(null);
             setTurns([]);
-            setState(null);
+            setScratchpad("");
             setUsage(null);
             setError(null);
             setInput(suggestions[0] ?? "");
@@ -201,9 +246,17 @@ export function Playground({ entry }: { entry: IndexEntry }) {
       {/* Transcript */}
       <div
         ref={logRef}
-        className="well h-[26rem] overflow-y-auto rounded-xl border border-line bg-surface px-5 py-4 text-sm leading-7"
+        className="well h-[24rem] overflow-y-auto rounded-xl border border-line bg-surface px-5 py-4 text-sm leading-7"
       >
-        {turns.length === 0 ? (
+        {sessionTask && (
+          <div className="mb-3 rounded-lg border border-line bg-surface-sunk px-3 py-2">
+            <div className="mono-label mb-1">task</div>
+            <div className="max-h-28 overflow-y-auto whitespace-pre-wrap text-[13px] text-ink-soft">
+              {readableTask(sessionTask)}
+            </div>
+          </div>
+        )}
+        {turns.length === 0 && !busy ? (
           <p className="text-ink-faint">
             Type an action below, or click a suggestion. <code className="font-mono">bash</code> /{" "}
             <code className="font-mono">get_user</code>-style calls take JSON args;{" "}
@@ -213,17 +266,22 @@ export function Playground({ entry }: { entry: IndexEntry }) {
           turns.map((turn, i) => (
             <div key={i} className="mb-3">
               <div className="font-mono text-[13px] text-accent">&rsaquo; {turn.action}</div>
-              <div
-                className={`whitespace-pre-wrap font-mono text-[13px] ${
-                  turn.is_error ? "text-accent-red" : "text-ink"
-                }`}
-              >
-                {turn.observation}
-              </div>
+              {turn.observation === null ? (
+                <div className="flex items-center gap-2 text-[13px] text-ink-faint">
+                  <Spinner /> getting environment response
+                </div>
+              ) : (
+                <div
+                  className={`whitespace-pre-wrap font-mono text-[13px] ${
+                    turn.is_error ? "text-accent-red" : "text-ink"
+                  }`}
+                >
+                  {turn.observation}
+                </div>
+              )}
             </div>
           ))
         )}
-        {busy && <div className="text-xs text-ink-faint">stepping...</div>}
       </div>
 
       {/* Suggestion chips */}
@@ -248,16 +306,16 @@ export function Playground({ entry }: { entry: IndexEntry }) {
           ref={inputRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && !busy && send()}
+          onKeyDown={(e) => e.key === "Enter" && !busy && sessionId && stepAction(sessionId, input)}
           placeholder={'tool_name {"arg": "value"}   ·   say <message>'}
           className="flex-1 rounded-lg border border-line px-3 py-2 font-mono text-xs outline-none focus:border-accent"
         />
         <button
-          onClick={send}
+          onClick={() => sessionId && stepAction(sessionId, input)}
           disabled={busy || !input.trim()}
           className="rounded-lg bg-ink px-5 py-2 text-sm font-medium text-white transition-opacity hover:opacity-85 disabled:opacity-40"
         >
-          Step
+          Send
         </button>
       </div>
 
@@ -265,42 +323,6 @@ export function Playground({ entry }: { entry: IndexEntry }) {
         <p className="rounded-lg border border-accent-red/40 px-3 py-2 text-sm text-accent-red">
           {error}
         </p>
-      )}
-
-      {/* Scratchpad shows only when the model actually wrote to it. */}
-      {state?.scratchpad?.trim() && (
-        <details className="rounded-lg border border-line px-4 py-2">
-          <summary className="mono-label cursor-pointer select-none">
-            scratchpad (model memory)
-          </summary>
-          <pre className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap font-mono text-xs text-ink-soft">
-            {state.scratchpad}
-          </pre>
-        </details>
-      )}
-
-      {/* Session usage, collapsed by default so it never crowds the chat. */}
-      {usage && (
-        <details className="rounded-lg border border-line px-4 py-2">
-          <summary className="mono-label flex cursor-pointer select-none items-center justify-between">
-            <span>session usage</span>
-            <span className="font-mono text-ink-soft">
-              {usage.total.calls} steps · ${usage.total.cost_usd.toFixed(4)}
-            </span>
-          </summary>
-          <dl className="mt-2 grid grid-cols-2 gap-y-1 text-xs">
-            <dt className="text-ink-faint">steps</dt>
-            <dd className="text-right tabular-nums">{usage.total.calls}</dd>
-            <dt className="text-ink-faint">tokens</dt>
-            <dd className="text-right tabular-nums">
-              {(usage.total.input_tokens + usage.total.output_tokens).toLocaleString()}
-            </dd>
-            <dt className="text-ink-faint">cost</dt>
-            <dd className="text-right tabular-nums">${usage.total.cost_usd.toFixed(4)}</dd>
-            <dt className="text-ink-faint">wall clock</dt>
-            <dd className="text-right tabular-nums">{usage.duration_seconds.toFixed(1)}s</dd>
-          </dl>
-        </details>
       )}
     </section>
   );

@@ -9,8 +9,21 @@
  */
 
 import { useCallback, useState } from "react";
+import { readableTask } from "@/components/Playground";
 import { createSession, step } from "@/lib/api";
 import type { IndexEntry, Scenario, ScenarioStep } from "@/lib/types";
+
+function TaskPrompt({ task }: { task: string | null }) {
+  if (!task) return null;
+  return (
+    <div className="rounded-lg border border-line bg-surface-sunk px-3 py-2">
+      <div className="mono-label mb-1">initial task prompt</div>
+      <div className="max-h-32 overflow-y-auto whitespace-pre-wrap text-[13px] text-ink-soft">
+        {readableTask(task)}
+      </div>
+    </div>
+  );
+}
 
 type ReplayRow = {
   label: string;
@@ -143,8 +156,9 @@ function ScenarioCard({ entry, scenario }: { entry: IndexEntry; scenario: Scenar
       </button>
       {open && (
         <div className="flex flex-col gap-3 border-t border-line px-4 py-3">
+          <TaskPrompt task={scenario.task} />
           <div className="flex items-center justify-between gap-3">
-            <span className="mono-label">recorded trace</span>
+            <span className="mono-label">{rows ? "open-loop replay" : "recorded trace"}</span>
             <button
               onClick={replay}
               disabled={replaying}
