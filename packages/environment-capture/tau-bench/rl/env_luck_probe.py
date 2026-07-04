@@ -108,12 +108,16 @@ def _seed_state_from(trace: Trace, n_steps: int) -> EnvState:
 
 
 def _replay(
-    wm: WorldModel, task: str, actions: list[Action], seed_state: EnvState | None
+    wm: WorldModel,
+    task: str,
+    actions: list[Action],
+    seed_state: EnvState | None,
+    rubric: str | None = None,
 ) -> tuple[float, str]:
     session = wm.new_session(task=task, seed_state=seed_state)
     for action in actions:
         wm.step(session.id, action)
-    score = wm.score_session(session.id)
+    score = wm.score_session(session.id, rubric=rubric)
     wm.end_session(session.id)
     return score.reward, score.critique
 
@@ -132,10 +136,18 @@ def main() -> int:
     print(f"probe trace {trace.trace_id} | task[:100]: {task[:100]!r}")
     print(f"replaying {len(actions)} recorded actions x {args.sessions} sessions per condition\n")
 
-    results: dict[str, list[float]] = {"unseeded": [], "seeded": []}
-    for label, state in (("unseeded", None), ("seeded", seed)):
+    # the scenario's success rubric = real tau2's gold criteria, stored by the converter
+    rubric_raw = trace.metadata.get("gold")  # the converter stores tau2 evaluation_criteria here
+    rubric = json.dumps(rubric_raw, ensure_ascii=False) if rubric_raw else None
+    print(f"rubric available: {bool(rubric)}\n")
+    results: dict[str, list[float]] = {"unseeded": [], "seeded": [], "seeded+rubric": []}
+    for label, state, rub in (
+        ("unseeded", None, None),
+        ("seeded", seed, None),
+        ("seeded+rubric", seed, rubric),
+    ):
         for i in range(args.sessions):
-            reward, critique = _replay(wm, task, actions, state)
+            reward, critique = _replay(wm, task, actions, state, rub)
             results[label].append(reward)
             # a zero from a broken judge reply must be visible, not silently averaged in
             print(f"  {label} session {i + 1}: reward={reward:.2f} | {critique[:110]!r}")
@@ -146,9 +158,8 @@ def main() -> int:
         std = statistics.pstdev(rewards)
         shown = ", ".join(f"{r:.2f}" for r in rewards)
         print(f"{label:9s} rewards=[{shown}] mean={mean:.3f} stdev={std:.3f}")
-    reduction = statistics.pstdev(results["unseeded"]) - statistics.pstdev(results["seeded"])
-    print(f"\nluck-stdev reduction from seed_state: {reduction:+.3f} "
-          f"(D62 baselines: 0.34 @ temp 0.7, 0.24 @ temp 0)")
+    print("\n(D62 baselines: stdev 0.34 @ temp 0.7, 0.24 @ temp 0; real tau2 scored this "
+          "episode reward=1.0)")
     return 0
 
 

@@ -232,7 +232,7 @@ class WorldModel:
         """Return up to `n` steps from the replay buffer (used to seed the demo agent)."""
         return self._retriever.sample(n)
 
-    def score_session(self, session_id: str) -> EpisodeScore:
+    def score_session(self, session_id: str, rubric: str | None = None) -> EpisodeScore:
         """Judge the session's rollout so far: episode reward, per-step rewards, and a critique.
 
         This is the RL reward signal. The reward judge sees the session's task and its full step
@@ -250,7 +250,7 @@ class WorldModel:
             if tracker is not None
             else self._reward_provider
         )
-        score = EpisodeRewardJudge(provider).score(session.task, session.history)
+        score = EpisodeRewardJudge(provider).score(session.task, session.history, rubric=rubric)
         # The scalar rides the final observation too, so replay-buffer consumers that read
         # Observation.reward (DreamGym-style terminal r) see the same number the API returned.
         if session.history:
