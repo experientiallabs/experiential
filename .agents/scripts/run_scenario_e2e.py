@@ -89,9 +89,9 @@ class RetryProvider:
         return self._inner.verify()
 
 
-def bedrock(model: str) -> Provider:
+def bedrock(model: str, region: str = REGION) -> Provider:
     return RetryProvider(
-        get_provider(ProviderConfig(kind=ProviderKind.BEDROCK, model=model, region=REGION))
+        get_provider(ProviderConfig(kind=ProviderKind.BEDROCK, model=model, region=region))
     )
 
 

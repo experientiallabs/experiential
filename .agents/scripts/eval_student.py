@@ -26,7 +26,14 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
-from collect_teacher import _load_gemini_key, domain_tool_hint, foundry, gemini, openai_direct  # noqa: E402
+from collect_teacher import (  # noqa: E402
+    _load_gemini_key,
+    domain_tool_hint,
+    foundry,
+    gemini,
+    openai_direct,
+    opus_judge,
+)
 from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, bedrock  # noqa: E402
 
 from wmh.core.types import Action, ActionKind, EnvState, Step  # noqa: E402
@@ -105,6 +112,8 @@ class QwenStudentAgent:
 
 
 def _resolve(spec: str):  # noqa: ANN202 - Provider; routes bedrock:/foundry:/openai:/gemini names
+    if spec == "opus-judge":
+        return opus_judge()
     if spec.startswith("bedrock:"):
         return bedrock(spec.removeprefix("bedrock:"))
     if spec.startswith("foundry:"):

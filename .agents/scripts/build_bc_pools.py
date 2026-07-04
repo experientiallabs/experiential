@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
-from collect_teacher import openai_direct  # noqa: E402
+from collect_teacher import foundry, opus_judge  # noqa: E402
 from run_scenario_e2e import TRACES, titan_embedder  # noqa: E402
 
 from wmh.engine.build import split_traces  # noqa: E402
@@ -33,7 +33,7 @@ from wmh.scenarios.synthesis import ScenarioSynthesizer  # noqa: E402
 from wmh.scenarios.verification import ChecklistJudge  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
-SYNTH_JUDGE = "gpt-5-mini"
+SYNTH_MODEL = "gpt-5.4"  # Foundry; judge = Opus 4.8 (AWS)
 
 
 def main() -> None:
@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("--target", type=int, default=60, help="valid scenarios per arm")
     args = parser.parse_args()
 
-    provider = openai_direct(SYNTH_JUDGE)
+    provider = foundry(SYNTH_MODEL)
     traces = get_adapter("otel-genai").from_file(str(TRACES))
     train_traces, _ = split_traces(traces, 0.8)
     facet_data = json.loads((DISTILL / "facets_full.json").read_text())["train"]
@@ -49,12 +49,14 @@ def main() -> None:
     assert len(facets) == len(train_traces), "cached facets misaligned with train split"
 
     # Arm A — MINED: the full pipeline with inline validation, over-budget then trim.
+    judge_llm = opus_judge()
     mined = build_scenario_set(
         train_traces,
         facets,
         provider,
         titan_embedder(),
         ScenarioBuildConfig(budget=args.target + 20, seed=0),
+        judge_provider=judge_llm,
     )
     mined.scenarios = mined.scenarios[: args.target]
     mined.save(DISTILL / "bc_pool_mined.json")
@@ -66,7 +68,7 @@ def main() -> None:
     order = list(range(len(train_traces)))
     rng.shuffle(order)
     synthesizer = ScenarioSynthesizer(provider)
-    judge = ChecklistJudge(provider)
+    judge = ChecklistJudge(judge_llm)
     random_scenarios = []
     attempts = 0
     for index in order:

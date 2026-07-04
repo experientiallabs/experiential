@@ -108,6 +108,15 @@ def foundry(model: str) -> Provider:
     )
 
 
+OPUS_JUDGE_REGION = "us-east-2"  # Opus 4.8 is enabled here under AWS_PROFILE=claas-bedrock
+
+
+def opus_judge() -> Provider:
+    """Claude Opus 4.8 on Bedrock (claas-bedrock profile, us-east-2) — the checklist judge."""
+    os.environ.setdefault("AWS_PROFILE", "claas-bedrock")
+    return bedrock("us.anthropic.claude-opus-4-8", region=OPUS_JUDGE_REGION)
+
+
 def openai_direct(model: str) -> Provider:
     """A model on the OpenAI API directly (reads OPENAI_API_KEY)."""
     _load_gemini_key()

@@ -41,11 +41,15 @@ def build_scenario_set(
     provider: Provider,
     embedder: Embedder,
     config: ScenarioBuildConfig,
+    *,
+    judge_provider: Provider | None = None,
 ) -> ScenarioSet:
     """Construct a representative scenario set from a facet-annotated trace corpus.
 
     `provider` drives cluster naming and scenario synthesis; `embedder` embeds facet summaries.
-    Raises when traces/facets are empty or misaligned.
+    `judge_provider` backs the inline checklist validation (defaults to `provider`) — pass a
+    different model to keep synthesis and validation families separate. Raises when traces/facets
+    are empty or misaligned.
     """
     if not traces or not facets:
         raise ValueError("need a non-empty trace corpus and facets to build a scenario set")
@@ -69,7 +73,9 @@ def build_scenario_set(
     facets_by_id = {facet.trace_id: facet for facet in facets}
     cluster_names = {cluster.cluster_id: cluster.name for cluster in clusters}
     synthesizer = ScenarioSynthesizer(provider)
-    judge = ChecklistJudge(provider) if config.validate_checklists else None
+    judge = (
+        ChecklistJudge(judge_provider or provider) if config.validate_checklists else None
+    )
     scenarios: list[EvalScenario] = []
     dropped = 0
     for selection in selections:

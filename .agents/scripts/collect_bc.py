@@ -26,7 +26,7 @@ sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
 from collect_teacher import domain_tool_hint  # noqa: E402
 from eval_student import student_system  # noqa: E402
-from collect_teacher import foundry, openai_direct  # noqa: E402
+from collect_teacher import foundry, opus_judge  # noqa: E402
 from run_scenario_e2e import TRACES, WM_DIR  # noqa: E402
 
 from wmh.core.types import Action, ActionKind, Observation, Step  # noqa: E402
@@ -36,8 +36,8 @@ from wmh.ingest import get_adapter  # noqa: E402
 from wmh.scenarios import ChecklistJudge, ScenarioSet  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
-WM_MODEL = "DeepSeek-V4-Pro"  # user's Azure Foundry deployment
-JUDGE_MODEL = "gpt-5-mini"
+WM_MODEL = "gpt-5.4"  # Azure Foundry
+# judge: Opus 4.8 (AWS claas-bedrock us-east-2) via opus_judge()
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 MAX_STEPS = 10
@@ -128,7 +128,7 @@ def main() -> None:
     from openai import OpenAI
 
     client = OpenAI(base_url=args.endpoint, api_key="not-needed")
-    judge = ChecklistJudge(openai_direct(JUDGE_MODEL))
+    judge = ChecklistJudge(opus_judge())
     world_model = WorldModel.load(str(WM_DIR), foundry(WM_MODEL), telemetry_root=str(REPO / ".wmh"))
     pool = ScenarioSet.load(DISTILL / args.pool)
     traces = get_adapter("otel-genai").from_file(str(TRACES))
