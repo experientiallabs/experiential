@@ -104,6 +104,43 @@ def test_is_env_action_gates_tool_calls() -> None:
     assert not is_env_action(Action(kind=ActionKind.MESSAGE, content="hi"))
 
 
+def test_evaluate_rejects_k_below_one() -> None:
+    provider = RoleProvider()
+    tasks = [TaskSpec(task_id="q", instruction="x", gold=[])]
+    try:
+        evaluate_closed_loop(tasks, _wm(provider), provider, GoldJudge(provider), k=0)
+    except ValueError as exc:
+        assert "k must be >= 1" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError for k=0")
+
+
+def test_gold_judge_duplicate_assertions_cannot_pad_the_count() -> None:
+    """Echoing a passing assertion twice must not substitute for an omitted one."""
+
+    class DuplicatingJudgeProvider(RoleProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> Completion:
+            if "grade whether an agent completed a task" in system:
+                return Completion(
+                    text='{"assertions": [{"assertion": "a", "passed": true, "why": ""}, '
+                    '{"assertion": "a", "passed": true, "why": ""}], "passed": true}'
+                )
+            return super().complete(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+
+    verdict = GoldJudge(DuplicatingJudgeProvider()).score("t", "ans", "tr", ["a", "b"])
+    assert not verdict.passed  # 'b' was never judged; duplicated 'a' doesn't cover it
+    assert verdict.fraction == 0.5
+
+
 def test_gold_judge_scores_against_full_gold_list() -> None:
     """A truncated judge reply that omits assertions must not be able to report success."""
 

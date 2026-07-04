@@ -71,8 +71,18 @@ def test_runtime_hits_turn_cap() -> None:
     assert result.turns == 3
 
 
-def test_runtime_stops_on_unparseable_reply() -> None:
-    result = AgentRuntime(ScriptedProvider(["i refuse to json"])).run("t", "x", RecordingEnv())
+def test_runtime_recovers_from_one_unparseable_reply() -> None:
+    # One malformed reply is agent noise: a nudge goes back and the run continues.
+    provider = ScriptedProvider(
+        ["i refuse to json", '{"tool": "submit", "arguments": {"answer": "recovered"}}']
+    )
+    result = AgentRuntime(provider).run("t", "x", RecordingEnv())
+    assert result.stop_reason == StopReason.SUBMITTED
+    assert result.answer == "recovered"
+
+
+def test_runtime_stops_after_two_unparseable_replies() -> None:
+    result = AgentRuntime(ScriptedProvider(["nope", "still nope"])).run("t", "x", RecordingEnv())
     assert result.stop_reason == StopReason.NO_ACTION
     assert result.steps == []
 

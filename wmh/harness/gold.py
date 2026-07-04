@@ -1,7 +1,7 @@
 """Gold-assertion judging: did the agent's run satisfy the task's success conditions?
 
-Closed-loop eval scores *task success*, not per-step fidelity (docs/closed_loop.md). Success is
-defined by the task's `gold` assertions — semantic post-conditions checked against the run
+Closed-loop eval scores *task success*, not per-step fidelity (docs/reference/closed_loop.md).
+Success is defined by the task's `gold` assertions — semantic post-conditions checked against the
 transcript by an LLM judge, so they are robust to wording (rule-only checks systematically
 under-report agent success, per AgentRewardBench). The verdict is always scored against the FULL
 gold list: a truncated judge reply that omits assertions cannot report success.
@@ -91,11 +91,13 @@ def _parse(text: str, gold: list[str]) -> GoldVerdict:
         except ValidationError:
             parsed = None
         if parsed is not None and parsed.assertions:
-            # Score against ALL required gold assertions, not just the subset the judge echoed back:
-            # a truncated reply that omits assertions must NOT be able to report success. Cap passes
-            # at the gold count so duplicated/hallucinated assertions can't over-credit.
+            # Score against ALL required gold assertions, matched BY TEXT to what the judge echoed
+            # back (the prompt demands verbatim echoes). A truncated reply that omits an assertion,
+            # or one that duplicates a passing assertion to pad the count, cannot report success:
+            # every unmatched gold assertion counts as failed. Fail-closed by construction.
+            passed_texts = {a.assertion.strip() for a in parsed.assertions if a.passed}
             total = len(gold)
-            n_pass = min(sum(1 for a in parsed.assertions if a.passed), total)
+            n_pass = sum(1 for g in gold if g.strip() in passed_texts)
             return GoldVerdict(
                 passed=parsed.passed and n_pass == total,
                 fraction=n_pass / total if total else 1.0,

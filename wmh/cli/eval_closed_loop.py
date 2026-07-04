@@ -3,7 +3,7 @@
 Kept out of `app.py` so the (large) eval command stays readable; `app.py` routes the two tokens
 here. `closed-loop` runs the fixed agent against a built world model and scores task success;
 `agreement` compares two saved closed-loop reports (e.g. one produced against the world model and
-one produced against a real environment) — the outcome-agreement check docs/closed_loop.md names.
+one against a real environment) — the outcome-agreement check docs/reference/closed_loop.md names.
 """
 
 from __future__ import annotations
@@ -33,7 +33,10 @@ def run_closed_loop(
     from wmh.harness.runtime import AgentRuntime
     from wmh.harness.tasks import load_tasks
 
-    tasks = load_tasks(tasks_file)
+    try:
+        tasks = load_tasks(tasks_file)
+    except (OSError, ValueError) as exc:  # missing file, malformed JSONL, empty, duplicate ids
+        raise typer.BadParameter(f"cannot load tasks from {tasks_file!r}: {exc}") from exc
     store = WorldModelStore(root)
     try:
         model_dir = store.resolve(name)

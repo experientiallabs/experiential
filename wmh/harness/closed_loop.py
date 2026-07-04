@@ -73,6 +73,8 @@ def evaluate_with_env(
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
 ) -> ClosedLoopReport:
     """Score the agent on `tasks` against whatever env `make_env` opens, k passes per task."""
+    if k < 1:
+        raise ValueError("k must be >= 1 (metrics are means over k passes)")
     per_task: dict[str, TaskOutcome] = {}
     for task in tasks:
         verdicts: list[GoldVerdict] = []

@@ -488,8 +488,10 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         None, "--name", help="World model for `closed-loop` (default: the only built one)."
     ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models (closed-loop)."),
-    k: int = typer.Option(3, help="Closed-loop passes per task (means reported, never 1-pass)."),
-    max_turns: int = typer.Option(20, help="Closed-loop agent turn cap per task."),
+    k: int = typer.Option(
+        3, min=1, help="Closed-loop passes per task (means reported, never 1-pass)."
+    ),
+    max_turns: int = typer.Option(20, min=1, help="Closed-loop agent turn cap per task."),
     threshold: float = typer.Option(
         0.5, help="Agreement pass threshold on a task's k-pass success rate."
     ),
@@ -502,7 +504,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmh eval run <suite>`: run a suite and save a local JSON result.
     - `wmh eval results optional-suite`: summarize local suite results.
     - `wmh eval closed-loop <tasks.jsonl>`: a live agent runs tasks WITH the world model as its
-      environment; score task success against gold assertions (see docs/closed_loop.md).
+      environment; score task success against gold assertions (see docs/reference/closed_loop.md).
     - `wmh eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
       (e.g. world-model vs real environment) — the outcome-agreement validity check.
     """

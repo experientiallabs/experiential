@@ -39,6 +39,16 @@ task is done, call `submit` with your answer. Prefer composing small bash comman
 
 DEFAULT_MAX_TURNS = 20  # Qwen-AgentWorld used 50; small shell tasks converge well before 20
 
+# Per-observation cap in the judge-facing transcript. Generous rather than tight: gold evidence
+# routinely lives deep in long outputs (`cat` of a produced file, `ls -R`), and truncating it away
+# turns real successes into judged failures.
+TRANSCRIPT_OBS_CHARS = 2000
+
+_NUDGE = (
+    "[ERROR] that reply was not a single valid JSON tool call. Reply with EXACTLY one JSON "
+    'object: {"tool": "<tool name>", "arguments": {...}}'
+)
+
 
 class StopReason(StrEnum):
     SUBMITTED = "submitted"  # the agent called submit
@@ -64,7 +74,7 @@ class RunResult(BaseModel):
             if act.kind == ActionKind.TOOL_CALL and act.arguments:
                 desc = f"{act.name} {act.arguments}"
             lines.append(f"[{i}] {act.kind.value}: {desc}")
-            lines.append(f"    -> {step.observation.content[:500]}")
+            lines.append(f"    -> {step.observation.content[:TRANSCRIPT_OBS_CHARS]}")
         return "\n".join(lines)
 
 
@@ -97,6 +107,7 @@ class AgentRuntime:
         messages: list[Message] = [Message(role="user", content=f"TASK: {instruction}")]
         steps: list[Step] = []
         state = EnvState()
+        nudged = False
 
         for turn in range(1, self._max_turns + 1):
             completion = self._provider.complete(
@@ -105,6 +116,14 @@ class AgentRuntime:
             reply = completion.text.strip()
             call = parse_tool_call(reply)
             if call is None:
+                # One recovery nudge per run (symmetric with the unavailable-tool path, which also
+                # feeds an error back): at nonzero temperature a single malformed reply is agent
+                # noise, and aborting the rollout would charge it to the world model's score.
+                if not nudged:
+                    nudged = True
+                    messages.append(Message(role="assistant", content=reply))
+                    messages.append(Message(role="user", content=_NUDGE))
+                    continue
                 return self._result(task_id, steps, StopReason.NO_ACTION, turns=turn)
 
             if call.tool == SUBMIT.name:

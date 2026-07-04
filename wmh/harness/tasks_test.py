@@ -28,3 +28,13 @@ def test_load_tasks_empty_raises(tmp_path: Path) -> None:
     path.write_text("\n\n", encoding="utf-8")
     with pytest.raises(ValueError, match="no tasks"):
         load_tasks(path)
+
+
+def test_load_tasks_duplicate_ids_raise(tmp_path: Path) -> None:
+    path = tmp_path / "dup.jsonl"
+    path.write_text(
+        '{"task_id": "t1", "instruction": "x"}\n{"task_id": "t1", "instruction": "y"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate task_id"):
+        load_tasks(path)

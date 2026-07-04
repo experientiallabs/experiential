@@ -22,7 +22,11 @@ class TaskSpec(BaseModel):
 
 
 def load_tasks(path: str | Path) -> list[TaskSpec]:
-    """Read a JSONL task file (one TaskSpec per line; blank lines ignored)."""
+    """Read a JSONL task file (one TaskSpec per line; blank lines ignored).
+
+    Duplicate `task_id`s are an error: reports key outcomes by task_id, so a duplicate would run
+    (and cost) k passes twice while silently keeping only the last outcome.
+    """
     tasks: list[TaskSpec] = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -30,4 +34,8 @@ def load_tasks(path: str | Path) -> list[TaskSpec]:
             tasks.append(TaskSpec.model_validate_json(stripped))
     if not tasks:
         raise ValueError(f"no tasks in {path}")
+    ids = [t.task_id for t in tasks]
+    duplicates = sorted({i for i in ids if ids.count(i) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate task_id(s) in {path}: {duplicates}")
     return tasks
