@@ -19,7 +19,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from wmh.core.types import Observation, Step, Trace
+from wmh.core.types import Observation, Step
 from wmh.engine.trace_to_eval import TraceToEvalConverter
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.optimize.judge import JudgeResult
