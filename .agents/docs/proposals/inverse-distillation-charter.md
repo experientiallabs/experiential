@@ -53,6 +53,29 @@ tau2-bench runner.
 - Full provenance: every SFT example traces to (scenario_id, source trace_id, teacher rollout).
 - Gates clean; PR(s) with honest writeup including negative results if the lift doesn't appear.
 
+## Prior art in-repo: BENCH-B2 (feat/rl-arms-sft-ppo-rpp, results.md)
+
+The direct predecessor already ran: Qwen3.5-9B vs the tau WM — base 55%, trace-SFT (LoRA on 97
+raw recorded demonstrations) 60%, PPO/REINFORCE++ flat. Diagnosed SFT failure modes: (1) trained
+without think blocks → stopped deliberating; (2) imitates action patterns without checking policy
+constraints. **The bar for this run: beat the trace-SFT arm on a comparable held-out protocol,**
+attacking exactly those two failure modes — checklists encode the constraints, the privileged
+teacher demonstrates *with* reasoning, rejection sampling keeps only constraint-satisfying
+trajectories, and cluster balancing fixes the demonstration-coverage skew (their SFT lift
+concentrated in airline, where its demos lived). Mind the D32/D35 telecom-leakage caveat: report
+per-domain, read non-telecom columns for signal.
+
+## Execution notes (2026-07-03, autonomous run)
+
+- Box: azureuser@4.154.170.26 (h100-dev-box, 2×H100). GPU 0 runs the user's `qwen35pilot` vLLM
+  (Qwen3.5-9B, port 8000) — read-only for me (student-before baseline endpoint). GPU 1 free for
+  training. Disk tight (~5GB free): LoRA-only, no full checkpoints.
+- Stack verified: Nova Lite WM (Bedrock), Gemini 2.5 Pro teacher + Flash judge via the OpenAI
+  provider custom endpoint (`WMH_ENDPOINT_API_KEY`), claas-verl tau scaffold pattern for the
+  student loop.
+- Mining (stage 1) launched over all 1033 traces: 822 train / 211 eval by stable hash; facet
+  outcomes {success 807, failure 63, unknown 163}.
+
 ## Known risks
 
 - WM fidelity bounds everything: run open-loop fidelity on the on-policy distribution before/after;
