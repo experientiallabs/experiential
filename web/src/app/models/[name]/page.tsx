@@ -26,13 +26,9 @@ export default async function ModelPage({
         {entry && <p className="max-w-2xl text-ink-soft">{entry.card.description}</p>}
       </header>
       {entry ? (
-        <ModelView
-          card={entry.card}
-          heldOutAccuracy={entry.held_out_accuracy}
-          serveHint={serveCommand()}
-        />
+        <ModelView entry={entry} serveHint={serveCommand()} />
       ) : (
-        // Not in the generated index — e.g. freshly built via /build; ask the live backend.
+        // Not in the generated index (e.g. freshly built via /build); ask the live backend.
         <LiveModel name={decoded} serveHint={serveCommand()} />
       )}
     </div>

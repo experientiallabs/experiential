@@ -8,7 +8,7 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 export const metadata: Metadata = {
   title: "world-model-harness",
   description:
-    "The open source world model collection — environments built from your agent traces.",
+    "The open source world model collection. Environments built from your agent traces.",
 };
 
 function StarBanner() {
@@ -40,7 +40,7 @@ export default function RootLayout({
         <main className="mx-auto w-full max-w-7xl flex-1 px-6 pb-16">{children}</main>
         <footer className="border-t border-line">
           <div className="mx-auto w-full max-w-7xl px-6 py-6 text-center text-xs text-ink-faint">
-            by Experiential Labs — simulating reality for hypothesis testing
+            by Experiential Labs. Simulating reality for hypothesis testing.
           </div>
         </footer>
       </body>

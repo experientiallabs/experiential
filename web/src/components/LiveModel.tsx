@@ -8,7 +8,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { listModels } from "@/lib/api";
-import type { ModelCard } from "@/lib/types";
+import type { IndexEntry, ModelCard } from "@/lib/types";
 import { ModelView } from "./ModelView";
 
 type State =
@@ -16,6 +16,19 @@ type State =
   | { status: "offline" } // backend unreachable
   | { status: "notfound" } // backend up, no such model
   | { status: "found"; card: ModelCard };
+
+/** A freshly built model is not in the static index yet, so it has no indexed seeds. */
+function liveEntry(card: ModelCard): IndexEntry {
+  return {
+    card,
+    dir: "",
+    held_out_accuracy: null,
+    serve_root: "",
+    preview: [],
+    suggestions: [],
+    scenarios: [],
+  };
+}
 
 export function LiveModel({ name, serveHint }: { name: string; serveHint: string }) {
   const [state, setState] = useState<State>({ status: "loading" });
@@ -42,14 +55,14 @@ export function LiveModel({ name, serveHint }: { name: string; serveHint: string
           },
         });
       })
-      // A rejected fetch means the backend is unreachable — NOT that the model is missing.
+      // A rejected fetch means the backend is unreachable, NOT that the model is missing.
       .catch(() => setState({ status: "offline" }));
   }, [name]);
 
   if (state.status === "loading") {
     return (
       <div className="rounded-lg border border-line p-5 text-center text-sm text-ink-faint">
-        Looking up {name} on the local backend…
+        Looking up {name} on the local backend...
       </div>
     );
   }
@@ -75,11 +88,10 @@ export function LiveModel({ name, serveHint }: { name: string; serveHint: string
           local backend.
         </p>
         <Link href="/" className="text-sm text-accent hover:underline">
-          ← Back to models
+          Back to models
         </Link>
       </div>
     );
   }
-  const { card } = state;
-  return <ModelView card={card} heldOutAccuracy={null} serveHint={serveHint} />;
+  return <ModelView entry={liveEntry(state.card)} serveHint={serveHint} />;
 }

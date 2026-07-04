@@ -52,33 +52,107 @@ function clip(text, max) {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
-/**
- * The card's "screenshot": a couple of real (action -> observation) steps from the model's own
- * replay index, rendered as a mini terminal in the gallery tile. Standardized across every
- * model — no per-model artwork.
- */
-function samplePreview(dir) {
+/** Format an action in the wmh-play grammar: `name {json}` / `name` / `say <msg>`. */
+function formatAction(action) {
+  if (!action) return null;
+  if (action.kind === "tool_call") {
+    const args = action.arguments ?? {};
+    return Object.keys(args).length ? `${action.name} ${JSON.stringify(args)}` : action.name;
+  }
+  return action.content ? `say ${action.content}` : null;
+}
+
+/** A short, readable label for a recorded task (tau tasks are JSON; terminal/swe are plain text). */
+function scenarioLabel(task, fallbackIndex) {
+  if (!task) return `Scenario ${fallbackIndex + 1}`;
+  try {
+    const parsed = JSON.parse(task);
+    const text = parsed.reason_for_call || parsed.task_instructions || parsed.query || task;
+    return clip(text, 68);
+  } catch {
+    return clip(task, 68);
+  }
+}
+
+/** Read all valid steps from a model's replay index once. */
+function readSteps(dir) {
   const stepsPath = join(dir, "index", "steps.jsonl");
   if (!existsSync(stepsPath)) return [];
-  const lines = readFileSync(stepsPath, "utf-8").split("\n").filter(Boolean);
-  const preview = [];
-  for (const line of lines) {
-    let step;
+  const steps = [];
+  for (const line of readFileSync(stepsPath, "utf-8").split("\n")) {
+    if (!line) continue;
     try {
-      step = JSON.parse(line);
+      steps.push(JSON.parse(line));
     } catch {
-      continue;
+      // skip malformed line
     }
-    const action =
-      step.action?.kind === "tool_call"
-        ? `${step.action.name} ${Object.keys(step.action.arguments ?? {}).length ? JSON.stringify(step.action.arguments) : ""}`
-        : step.action?.content;
+  }
+  return steps;
+}
+
+/** The card's "screenshot": a couple of real (action -> observation) steps as a mini terminal. */
+function samplePreview(steps) {
+  const preview = [];
+  for (const step of steps) {
+    const action = formatAction(step.action);
     const observation = step.observation?.content;
     if (!action || !observation) continue;
     preview.push({ action: clip(action, 76), observation: clip(observation, 110) });
     if (preview.length === 2) break;
   }
   return preview;
+}
+
+/** A few distinct example actions in play grammar, for suggestion chips + the default input. */
+function suggestions(steps, max = 5) {
+  const out = [];
+  const seenActions = new Set();
+  for (const step of steps) {
+    const label = formatAction(step.action);
+    if (!label || seenActions.has(label) || label.length > 120) continue;
+    seenActions.add(label);
+    out.push(label);
+    if (out.length === max) break;
+  }
+  return out;
+}
+
+/**
+ * Recorded traces grouped by task = replayable scenarios. Bounded so index.json stays small:
+ * at most `maxScenarios` tasks, each capped at `maxSteps` steps. Each scenario can be replayed
+ * open-loop (seed a session with the task, feed the recorded actions, compare observations).
+ */
+function scenarios(steps, maxScenarios = 6, maxSteps = 10) {
+  const byTask = new Map();
+  for (const step of steps) {
+    const task = step.task ?? null;
+    const key = task ?? "__none__";
+    if (!byTask.has(key)) byTask.set(key, { task, steps: [] });
+    const group = byTask.get(key);
+    if (group.steps.length >= maxSteps) continue;
+    const label = formatAction(step.action);
+    if (!label || step.observation?.content == null) continue;
+    group.steps.push({
+      action: step.action,
+      action_label: clip(label, 100),
+      observation: step.observation.content,
+      is_error: Boolean(step.observation.is_error),
+    });
+  }
+  const out = [];
+  let i = 0;
+  for (const group of byTask.values()) {
+    if (group.steps.length === 0) continue;
+    out.push({
+      id: `s${i}`,
+      label: scenarioLabel(group.task, i),
+      task: group.task,
+      steps: group.steps,
+    });
+    i += 1;
+    if (out.length === maxScenarios) break;
+  }
+  return out;
 }
 
 const entries = [];
@@ -110,12 +184,15 @@ for (const { serveRoot, modelsDir } of modelRoots()) {
       };
     }
     const metrics = readJson(join(dir, "metrics.json"));
+    const steps = readSteps(dir);
     entries.push({
       card,
       dir: relative(repoRoot, dir),
       held_out_accuracy: typeof metrics?.held_out_accuracy === "number" ? metrics.held_out_accuracy : null,
       serve_root: serveRoot,
-      preview: samplePreview(dir),
+      preview: samplePreview(steps),
+      suggestions: suggestions(steps),
+      scenarios: scenarios(steps),
     });
   }
 }

@@ -3,7 +3,7 @@
  *
  * Plain fetch wrappers, one per endpoint. Unexpected statuses throw with the server's `detail`
  * message; callers branch on thrown ApiError.status for expected failures (404, 409, 503).
- * The base URL comes from NEXT_PUBLIC_WMH_API (default: http://localhost:8000) — never a secret.
+ * The base URL comes from NEXT_PUBLIC_WMH_API (default: http://localhost:8000) - never a secret.
  */
 
 import type {
@@ -13,7 +13,6 @@ import type {
   ModelsResponse,
   Observation,
   RunRecord,
-  Session,
 } from "./types";
 
 export const API_BASE =
@@ -88,12 +87,6 @@ export function createSession(
     method: "POST",
     body: JSON.stringify({ task }),
   });
-}
-
-export function getSession(model: string, sessionId: string): Promise<Session> {
-  return request(
-    `/world_models/${encodeURIComponent(model)}/sessions/${sessionId}`,
-  );
 }
 
 /** Step returns both the observation and the post-step env state (no follow-up session GET). */

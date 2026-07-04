@@ -16,7 +16,7 @@ export function findModel(name: string): IndexEntry | undefined {
   return index.models.find((m) => m.card.name === name);
 }
 
-/** The exact serve command that exposes every indexed model — shown when the API is down. */
+/** The exact serve command that exposes every indexed model - shown when the API is down. */
 export function serveCommand(): string {
   const roots = [...new Set(index.models.map((m) => m.serve_root))];
   return `uv run wmh serve ${roots.map((r) => `--root ${r}`).join(" ")}`;

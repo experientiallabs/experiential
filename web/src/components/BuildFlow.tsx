@@ -74,7 +74,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
   const [events, setEvents] = useState<BuildEvent[]>([]);
   const [status, setStatus] = useState<"idle" | "running" | "succeeded" | "failed">("idle");
   const [error, setError] = useState<string | null>(null);
-  // The name the in-flight build was started with — the success link must use this, not the
+  // The name the in-flight build was started with - the success link must use this, not the
   // (still-editable) name input the user may have changed while watching progress.
   const [startedName, setStartedName] = useState("");
   const sourceRef = useRef<EventSource | null>(null);
@@ -121,7 +121,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
       sourceRef.current = source;
       source.onmessage = (message) => {
         // Dedup by the frame's event id: on reconnect the server resumes from Last-Event-ID, but
-        // if a proxy strips that header the stream replays — the id guard keeps events unique.
+        // if a proxy strips that header the stream replays - the id guard keeps events unique.
         const idx = Number(message.lastEventId);
         if (!Number.isNaN(idx)) {
           if (seenRef.current.has(idx)) return;
@@ -139,7 +139,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
         }
       };
       source.onerror = () => {
-        // A transient drop (readyState CONNECTING) auto-reconnects and resumes — not a failure.
+        // A transient drop (readyState CONNECTING) auto-reconnects and resumes - not a failure.
         // Only when the browser gives up (CLOSED) do we fall back to polling the snapshot until
         // the build reaches a terminal state, so the UI can never get stuck on "running" while
         // the build finishes server-side out of view.
@@ -148,7 +148,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
         pollRef.current = window.setInterval(async () => {
           try {
             const snap = await buildSnapshot(buildId);
-            setEvents(snap.events); // authoritative full log — replaces, never duplicates
+            setEvents(snap.events); // authoritative full log - replaces, never duplicates
             if (snap.status !== "running") {
               window.clearInterval(pollRef.current ?? undefined);
               pollRef.current = null;
@@ -164,7 +164,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
       setStatus("idle");
       setError(
         e instanceof ApiError && e.status === 409
-          ? `${e.message} — pick a different name`
+          ? `${e.message}, pick a different name`
           : e instanceof Error
             ? e.message
             : String(e),
@@ -296,7 +296,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
                     {optimizing && lastRollout && (
                       <span className="block text-xs text-ink-faint">
                         rollout {lastRollout.done}/{lastRollout.budget}
-                        {lastRollout.score != null && ` — best ${(lastRollout.score * 100).toFixed(1)}%`}
+                        {lastRollout.score != null && `  best ${(lastRollout.score * 100).toFixed(1)}%`}
                       </span>
                     )}
                   </span>

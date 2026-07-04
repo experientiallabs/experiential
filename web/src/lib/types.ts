@@ -1,7 +1,7 @@
 /**
  * Domain types, mirrored by hand from the Python models (wmh/config/card.py ModelCard,
  * wmh/core/types.py Action/Observation/Session, wmh/serving BuildSnapshot/RunRecord).
- * Keep in sync when the serving API changes — every page renders through these.
+ * Keep in sync when the serving API changes - every page renders through these.
  */
 
 export type CardCorpus = {
@@ -34,19 +34,37 @@ export type ModelCard = {
   tags: string[];
 };
 
-/** A sample (action -> observation) from the model's replay index — the card's "screenshot". */
+/** A sample (action -> observation) from the model's replay index (the card's "screenshot"). */
 export type PreviewStep = {
   action: string;
   observation: string;
 };
 
-/** One gallery entry in the generated index: the card plus build metrics from metrics.json. */
+/** One recorded step of a scenario: the raw action to replay, plus display strings. */
+export type ScenarioStep = {
+  action: Action; // the recorded action, sent verbatim during open-loop replay
+  action_label: string; // formatted in wmh-play grammar, for display + suggestion chips
+  observation: string; // what the real environment recorded (the ground truth to compare against)
+  is_error: boolean;
+};
+
+/** A recorded trace grouped by task: a replayable scenario for open-loop comparison. */
+export type Scenario = {
+  id: string;
+  label: string; // short, human-readable
+  task: string | null; // the raw task text a session is seeded with
+  steps: ScenarioStep[];
+};
+
+/** One gallery entry in the generated index: the card plus interaction seeds. */
 export type IndexEntry = {
   card: ModelCard;
   dir: string;
   held_out_accuracy: number | null;
   serve_root: string;
   preview: PreviewStep[];
+  suggestions: string[]; // example actions (wmh-play grammar) for the chips + default input
+  scenarios: Scenario[]; // recorded traces to explore + replay open-loop
 };
 
 export type SiteIndex = {

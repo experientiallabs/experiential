@@ -1,11 +1,11 @@
 @import "tailwindcss";
 
 /* Brand system (AGENTS.md rule 14): white background, ink text, hairline grids,
-   accents used sparingly and in order — blue, purple, amber, red, teal. */
+   accents used sparingly and in order - blue, purple, amber, red, teal. */
 @theme {
   --color-ink: #0a0a0a;
   /* Secondary text derived from ink / the one established muted tone (#8a8a8a, as in
-     scripts/plot_trace_scaling.py) so the site's neutrals match the brand figures — no ad-hoc
+     scripts/plot_trace_scaling.py) so the site's neutrals match the brand figures - no ad-hoc
      grays. The sunk surface is a hairline-tinted off-white, not an accent. */
   --color-ink-soft: color-mix(in srgb, var(--color-ink) 62%, #ffffff);
   --color-ink-faint: #8a8a8a;
@@ -26,11 +26,23 @@ body {
   color: var(--color-ink);
 }
 
-/* 10px uppercase tracked mono label — section eyebrows, stat labels, status chips. */
+/* 10px uppercase tracked mono label - section eyebrows, stat labels, status chips. */
 .mono-label {
   font-family: var(--font-geist-mono), monospace;
   font-size: 10px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--color-ink-faint);
+}
+
+/* Hairline scrollbar for the transcript well, so it reads as a quiet inset panel. */
+.well::-webkit-scrollbar {
+  width: 8px;
+}
+.well::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 8px;
+}
+.well::-webkit-scrollbar-track {
+  background: transparent;
 }
