@@ -55,7 +55,7 @@ class FakeJudge:
         return JudgeResult(score=self._score, critique="ok")
 
 
-def _write_otell_jsonl(path: Path, *, n_traces: int) -> None:
+def _write_otel_jsonl(path: Path, *, n_traces: int) -> None:
     # Minimal OTLP-JSON-ish payload per line containing enough semconv for the adapter.
     # We purposely mirror the structure used in `wmh/engine/eval_test.py`.
     lines: list[str] = []
