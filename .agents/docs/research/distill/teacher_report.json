@@ -1,77 +1,61 @@
 {
- "scenarios": 65,
- "episodes_kept": 23,
+ "scenarios": 49,
+ "episodes_kept": 56,
  "keep_rate_by_scenario": {
   "scenario-031f72f0d8b298768897cdd841954bed": {
-   "attempts": 4,
+   "attempts": 3,
    "kept": 0
   },
-  "scenario-06aa448a2133066cfcefb1d6190a64a9": {
-   "attempts": 4,
-   "kept": 1
-  },
-  "scenario-089154a5225b9fdfbc4e4ac627daf0a1": {
-   "attempts": 4,
-   "kept": 1
-  },
-  "scenario-0af7ead05d57180d4e0ba7c05576918d": {
-   "attempts": 4,
-   "kept": 2
-  },
   "scenario-0ca7d944afa147cd83b21dc001fb0a88": {
-   "attempts": 0,
+   "attempts": 3,
    "kept": 0
   },
   "scenario-0cb8967aa5df4c140698fb74385d8542": {
-   "attempts": 0,
+   "attempts": 3,
    "kept": 0
   },
   "scenario-0d1eaa50a2296b3690c33677c70338e5": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-11c7f5d0423623879927b4d69baa6145": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-232c5e4d6903d23c8fd407a99475beb7": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-2901566e05608b8cb0b4e7a0d3da7e74": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-3c1b004d31ebd843ee3de1ca8a6f6352": {
-   "attempts": 2,
-   "kept": 1
-  },
-  "scenario-4280c83d8b9ab189d65813f8ba54c4b9": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-481cf5fc6f55985c339cc3c8dc8c980e": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-4b46be4db9478cce60ba03e2e8539609": {
    "attempts": 4,
    "kept": 0
   },
+  "scenario-11c7f5d0423623879927b4d69baa6145": {
+   "attempts": 4,
+   "kept": 0
+  },
+  "scenario-232c5e4d6903d23c8fd407a99475beb7": {
+   "attempts": 4,
+   "kept": 2
+  },
+  "scenario-2901566e05608b8cb0b4e7a0d3da7e74": {
+   "attempts": 4,
+   "kept": 0
+  },
+  "scenario-4280c83d8b9ab189d65813f8ba54c4b9": {
+   "attempts": 4,
+   "kept": 2
+  },
+  "scenario-481cf5fc6f55985c339cc3c8dc8c980e": {
+   "attempts": 4,
+   "kept": 2
+  },
+  "scenario-4b46be4db9478cce60ba03e2e8539609": {
+   "attempts": 4,
+   "kept": 2
+  },
   "scenario-50fe75fd8bcef42237e35b827f625726": {
-   "attempts": 0,
+   "attempts": 4,
    "kept": 0
   },
   "scenario-510eeaac5ac684de1ef4f056e37f730f": {
-   "attempts": 0,
-   "kept": 0
+   "attempts": 4,
+   "kept": 1
   },
   "scenario-53a90f300bc2e60678573afe7859590d": {
-   "attempts": 0,
-   "kept": 0
+   "attempts": 3,
+   "kept": 1
   },
   "scenario-58073d42d6785cce303a3613da3b1f59": {
-   "attempts": 0,
+   "attempts": 4,
    "kept": 0
   },
   "scenario-595e3de6f4d7d275ae27f3a15cd2c62b": {
@@ -79,19 +63,15 @@
    "kept": 0
   },
   "scenario-5bb6e804f791ec695694c447668ec210": {
-   "attempts": 0,
+   "attempts": 2,
    "kept": 0
-  },
-  "scenario-5cbc8b2f524da962e5321c48d925c153": {
-   "attempts": 4,
-   "kept": 2
   },
   "scenario-654fea0283bf47bc66c35599437b50e8": {
    "attempts": 4,
    "kept": 0
   },
   "scenario-6b9d7f6a63351511d1b995ef4d28ac74": {
-   "attempts": 0,
+   "attempts": 4,
    "kept": 0
   },
   "scenario-74e963a061efa605b763e57c1b7568d9": {
@@ -99,123 +79,91 @@
    "kept": 0
   },
   "scenario-7741f81d0cd99c8bbe5d20801eb58e6e": {
-   "attempts": 0,
-   "kept": 0
+   "attempts": 4,
+   "kept": 2
   },
   "scenario-7954cf39e9ed66f717ec3d1c13bbf2c5": {
    "attempts": 4,
    "kept": 0
   },
   "scenario-7dc7f7a55ee78e7b0f0083daf6ecdcf4": {
-   "attempts": 1,
-   "kept": 0
-  },
-  "scenario-7e347b3a86087c9ed78f05612232fd30": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-7ef0ea11b02c98eb6714f3806d6c09ed": {
    "attempts": 4,
    "kept": 2
   },
-  "scenario-826897c584f0c0500a1add168fdc1e3d": {
-   "attempts": 1,
-   "kept": 0
-  },
-  "scenario-83316b5cf56b89feb209a75dc5f16d5a": {
+  "scenario-7e347b3a86087c9ed78f05612232fd30": {
    "attempts": 4,
    "kept": 1
   },
+  "scenario-826897c584f0c0500a1add168fdc1e3d": {
+   "attempts": 3,
+   "kept": 2
+  },
   "scenario-839a658586aa0c23652facf65b2d5b58": {
-   "attempts": 0,
+   "attempts": 3,
    "kept": 0
   },
   "scenario-8c7796c0d727aa6cb16212f4344ecb36": {
    "attempts": 4,
-   "kept": 0
-  },
-  "scenario-8cedde6b43520dc02eb016c89c0543c0": {
-   "attempts": 4,
-   "kept": 0
-  },
-  "scenario-90ad7598b989777a83811353845f2cef": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-9e69a600ec5702ce29af0bac94197aca": {
-   "attempts": 4,
-   "kept": 2
-  },
-  "scenario-a203e5ab0445dce2b34b5aaf0e9cb28f": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-a591d43605382baa204b730b0f8d6b32": {
-   "attempts": 4,
    "kept": 1
   },
-  "scenario-a6c416fc791afded01e66e51a4857e92": {
+  "scenario-8cedde6b43520dc02eb016c89c0543c0": {
+   "attempts": 3,
+   "kept": 1
+  },
+  "scenario-90ad7598b989777a83811353845f2cef": {
+   "attempts": 4,
+   "kept": 0
+  },
+  "scenario-a203e5ab0445dce2b34b5aaf0e9cb28f": {
    "attempts": 2,
    "kept": 0
   },
-  "scenario-ac99abe0f53e9f1bc387e27d0dba3e49": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-af83c3a47ee5b591c3c8c926ddf81cf3": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-b696f39e85291407ed6b814c6ca4158e": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-b7aa7bc6658fcf7d11bd330145c5f42f": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-b865e520ebeea51543f45f9d93606dec": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-b97757b2ec5116813ecdb64657fa62f9": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-be155f5a6548025b5b5fac96d6b419fa": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-c11ee8a5f8e518b711ce2473e3c76d5f": {
-   "attempts": 3,
-   "kept": 1
-  },
-  "scenario-c3a3379bb215b0567b2bb0c93ee2f79e": {
-   "attempts": 4,
-   "kept": 1
-  },
-  "scenario-c3c69dc0cfc29a3df788d656c7f8c469": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-c6be4488f6ed478a62685e3a201e654e": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-d4089d4333231f8614ad2969589ff815": {
+  "scenario-a6c416fc791afded01e66e51a4857e92": {
    "attempts": 3,
    "kept": 2
   },
-  "scenario-d4d8cdfa7319a1c6f87438529c261560": {
+  "scenario-ac99abe0f53e9f1bc387e27d0dba3e49": {
    "attempts": 4,
    "kept": 0
   },
-  "scenario-d8658e240ffd104ae2cafd35c11a0801": {
+  "scenario-af83c3a47ee5b591c3c8c926ddf81cf3": {
+   "attempts": 1,
+   "kept": 0
+  },
+  "scenario-b696f39e85291407ed6b814c6ca4158e": {
+   "attempts": 4,
+   "kept": 2
+  },
+  "scenario-b7aa7bc6658fcf7d11bd330145c5f42f": {
    "attempts": 4,
    "kept": 1
   },
+  "scenario-b865e520ebeea51543f45f9d93606dec": {
+   "attempts": 3,
+   "kept": 0
+  },
+  "scenario-b97757b2ec5116813ecdb64657fa62f9": {
+   "attempts": 4,
+   "kept": 0
+  },
+  "scenario-be155f5a6548025b5b5fac96d6b419fa": {
+   "attempts": 4,
+   "kept": 2
+  },
+  "scenario-c3c69dc0cfc29a3df788d656c7f8c469": {
+   "attempts": 4,
+   "kept": 2
+  },
+  "scenario-c6be4488f6ed478a62685e3a201e654e": {
+   "attempts": 4,
+   "kept": 0
+  },
+  "scenario-d4d8cdfa7319a1c6f87438529c261560": {
+   "attempts": 3,
+   "kept": 1
+  },
   "scenario-d8cee035d6b23083314928d0811f6401": {
-   "attempts": 0,
+   "attempts": 4,
    "kept": 0
   },
   "scenario-de3f65ce35a212cdd1a9d79592b0e3d8": {
@@ -223,45 +171,33 @@
    "kept": 0
   },
   "scenario-e05de39501888d40e3821c6bad41960a": {
-   "attempts": 0,
+   "attempts": 4,
    "kept": 0
   },
   "scenario-e7dc893ca46582d3e9a7fceb180ba03e": {
-   "attempts": 0,
+   "attempts": 4,
    "kept": 0
   },
   "scenario-ecccfb48d061011b6b98dd8ae1a1089a": {
    "attempts": 4,
-   "kept": 0
-  },
-  "scenario-f3bad4bd68e63428898578e062ff5b22": {
-   "attempts": 4,
-   "kept": 1
-  },
-  "scenario-f5799b36ece54ddae4997b383b06730c": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-f6402afd194f18c0353923672648af2c": {
-   "attempts": 4,
    "kept": 2
   },
-  "scenario-f87e79554ef721aa671396575ae83afe": {
+  "scenario-f5799b36ece54ddae4997b383b06730c": {
    "attempts": 4,
    "kept": 0
   },
+  "scenario-f87e79554ef721aa671396575ae83afe": {
+   "attempts": 3,
+   "kept": 1
+  },
   "scenario-fe4405b41511fda5722b1274dc2a25ff": {
-   "attempts": 0,
+   "attempts": 4,
    "kept": 0
   },
   "scenario-ff898d3a84573ef692b256c4e85f22fa": {
-   "attempts": 0,
-   "kept": 0
-  },
-  "scenario-ffcfbf6bd7eb4a94fbe92c6287b7eeef": {
    "attempts": 4,
-   "kept": 2
+   "kept": 1
   }
  },
- "wall_clock_seconds": 753.5
+ "wall_clock_seconds": 836.0
 }
