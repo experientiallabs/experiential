@@ -14,6 +14,12 @@ import typer
 from rich.console import Console
 
 from wmh.config import WorldModelStore
+from wmh.engine import load_world_model
+from wmh.harness.agreement import compute_agreement
+from wmh.harness.closed_loop import ClosedLoopReport, evaluate_closed_loop
+from wmh.harness.gold import GoldJudge, GoldVerdict
+from wmh.harness.runtime import AgentRuntime
+from wmh.harness.tasks import load_tasks
 
 
 def run_closed_loop(
@@ -27,12 +33,6 @@ def run_closed_loop(
     out: str | None,
 ) -> None:
     """Run the fixed agent on each task against the world model; print and optionally save."""
-    from wmh.engine import load_world_model
-    from wmh.harness.closed_loop import evaluate_closed_loop
-    from wmh.harness.gold import GoldJudge, GoldVerdict
-    from wmh.harness.runtime import AgentRuntime
-    from wmh.harness.tasks import load_tasks
-
     try:
         tasks = load_tasks(tasks_file)
     except (OSError, ValueError) as exc:  # missing file, malformed JSONL, empty, duplicate ids
@@ -76,8 +76,6 @@ def run_closed_loop(
 
 def run_agreement(console: Console, *, report_a: str, report_b: str, threshold: float) -> None:
     """Compare two saved closed-loop reports task-by-task and print the agreement verdict."""
-    from wmh.harness.agreement import compute_agreement
-
     a = _load_report(report_a)
     b = _load_report(report_b)
     result = compute_agreement(a, b, pass_threshold=threshold)
@@ -91,9 +89,7 @@ def run_agreement(console: Console, *, report_a: str, report_b: str, threshold: 
     console.print(f"[bold]VERDICT[/bold] {result.summary()}")
 
 
-def _load_report(path: str):  # noqa: ANN202 - ClosedLoopReport
-    from wmh.harness.closed_loop import ClosedLoopReport
-
+def _load_report(path: str) -> ClosedLoopReport:
     try:
         return ClosedLoopReport.model_validate_json(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

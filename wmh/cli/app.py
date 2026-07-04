@@ -27,6 +27,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 import wmh.providers as providers
+from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
@@ -513,8 +514,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     if args and args[0] == "closed-loop":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval closed-loop <tasks.jsonl>")
-        from wmh.cli.eval_closed_loop import run_closed_loop
-
         run_closed_loop(
             _console,
             tasks_file=args[1],
@@ -528,8 +527,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     if args and args[0] == "agreement":
         if len(args) != 3:
             raise typer.BadParameter("usage: wmh eval agreement <report_a.json> <report_b.json>")
-        from wmh.cli.eval_closed_loop import run_agreement
-
         run_agreement(_console, report_a=args[1], report_b=args[2], threshold=threshold)
         return
     if args and args[0] == "list":

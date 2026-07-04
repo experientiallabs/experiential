@@ -98,6 +98,22 @@ def test_world_model_environment_steps_and_ends_session() -> None:
     env.close()  # idempotent
 
 
+def test_rollouts_do_not_enrich_the_retrieval_buffer() -> None:
+    """A rollout's PREDICTED steps must not become retrieval demos for later rollouts."""
+    provider = RoleProvider()
+    wm = _wm(provider)
+    before = len(wm.sample_steps(1000))
+    env = WorldModelEnvironment(wm, task="do a thing")
+    env.execute(Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "ls"}))
+    env.execute(Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "pwd"}))
+    env.close()
+    assert len(wm.sample_steps(1000)) == before  # buffer unchanged: eval sessions don't enrich
+    # Serve-time sessions still enrich by default.
+    session = wm.new_session(task="serve")
+    wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "x"}))
+    assert len(wm.sample_steps(1000)) == before + 1
+
+
 def test_is_env_action_gates_tool_calls() -> None:
     assert is_env_action(Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={}))
     assert not is_env_action(Action(kind=ActionKind.TOOL_CALL, name="submit", arguments={}))

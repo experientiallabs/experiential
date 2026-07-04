@@ -47,7 +47,9 @@ class WorldModelEnvironment:
 
     def __init__(self, world_model: WorldModel, task: str) -> None:
         self._wm = world_model
-        self._session = world_model.new_session(task=task)
+        # enrich=False: this rollout's PREDICTED steps must not enter the retrieval buffer, or
+        # k=2 retrieves k=1's hallucinations as demos and scores become order-dependent.
+        self._session = world_model.new_session(task=task, enrich=False)
         self._closed = False
 
     @property

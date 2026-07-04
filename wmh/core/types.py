@@ -79,3 +79,8 @@ class Session(BaseModel):
     task: str | None = None
     state: EnvState = Field(default_factory=EnvState)
     history: list[Step] = Field(default_factory=list)  # {(s_i, a_i)} fed back into the prompt
+    # Whether this session's steps enrich the shared retrieval buffer. Serve-time default is True
+    # (DreamGym-style online enrichment). Evaluation sessions set False: a closed-loop rollout's
+    # PREDICTED steps must not become retrieval demos for later rollouts, or scores become
+    # order-dependent and self-reinforcing.
+    enrich: bool = True

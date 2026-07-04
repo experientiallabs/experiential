@@ -84,8 +84,19 @@ class WorldModel:
             reward_provider=reward_provider,
         )
 
-    def new_session(self, task: str | None = None, seed_state: EnvState | None = None) -> Session:
-        session = Session(id=uuid.uuid4().hex, task=task, state=seed_state or EnvState())
+    def new_session(
+        self,
+        task: str | None = None,
+        seed_state: EnvState | None = None,
+        *,
+        enrich: bool = True,
+    ) -> Session:
+        """Open a session. `enrich=False` keeps its steps out of the shared retrieval buffer —
+        required for evaluation rollouts, whose PREDICTED observations must not become demos for
+        later rollouts (order-dependent, self-reinforcing scores otherwise)."""
+        session = Session(
+            id=uuid.uuid4().hex, task=task, state=seed_state or EnvState(), enrich=enrich
+        )
         self._sessions[session.id] = session
         tracker = RunTracker(run_id=session.id, kind="serve")
         tracker.start()
@@ -247,7 +258,8 @@ class WorldModel:
         )
         session.history.append(step)
         self._update_state(session, step)
-        self._retriever.add(step)
+        if session.enrich:
+            self._retriever.add(step)
 
     def _update_state(self, session: Session, step: Step) -> None:
         """Fold the step's effect into session.state (the env's free-text scratchpad "database").
