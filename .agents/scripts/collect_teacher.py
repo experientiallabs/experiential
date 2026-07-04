@@ -253,6 +253,15 @@ def main() -> None:
                 )
                 for t in turns
             ]
+            # The final user-facing message is where "inform/refuse/communicate" checklist
+            # items are satisfied — the judge MUST see it, not just the tool calls.
+            if summary:
+                steps.append(
+                    Step(
+                        action=Action(kind=ActionKind.MESSAGE, content=summary),
+                        observation=Observation(content=""),
+                    )
+                )
             verdict = judge.score(scenario.task, scenario.checklist, steps)
             if verdict.success:
                 candidates.append(

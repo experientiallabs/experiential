@@ -64,6 +64,7 @@ class QwenStudentAgent:
         self._model = model
         self._tool_hint = tool_hint
         self._temperature = temperature
+        self.final_text: str | None = None  # last plain-text reply; the judge must see it
 
     def act(self, task: str | None, state: EnvState, history: list[Step]) -> Action:
         messages = [{"role": "system", "content": student_system(self._tool_hint)}]
@@ -89,6 +90,7 @@ class QwenStudentAgent:
         stripped = THINK_RE.sub("", text)
         match = TOOL_CALL_RE.search(stripped)
         if match is None:
+            self.final_text = stripped.strip()
             return Action(kind=ActionKind.MESSAGE, content=DONE_SIGNAL)
         try:
             data = json.loads(match.group(1).strip())
@@ -136,7 +138,19 @@ def main() -> None:
             seed_state=scenario.seed_state,
             max_steps=MAX_STEPS,
         )
-        verdict = judge.score(scenario.task, scenario.checklist, episode.steps)
+        judged_steps = list(episode.steps)
+        if agent.final_text:
+            # "inform/refuse/communicate" checklist items live in the final reply; without this
+            # the judge auto-fails them (the bug behind the first 11% baseline run).
+            from wmh.core.types import Observation
+
+            judged_steps.append(
+                Step(
+                    action=Action(kind=ActionKind.MESSAGE, content=agent.final_text),
+                    observation=Observation(content=""),
+                )
+            )
+        verdict = judge.score(scenario.task, scenario.checklist, judged_steps)
         source = traces_by_id.get(scenario.provenance[0])
         domain = source.metadata.get("domain") if source else "unknown"
         return {
