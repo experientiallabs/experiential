@@ -201,6 +201,7 @@ def verify(
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     skills: str = typer.Option(None, "--skills", help="Skill library dir to seed from."),
     template: str = typer.Option(None, "--template", help="E2B template id (default: base image)."),
+    out: str = typer.Option(None, "--out", help="Write the full AgreementReport JSON here."),
 ) -> None:
     """Sim-real validity check: score variants in the world model AND real E2B, report agreement.
 
@@ -245,6 +246,11 @@ def verify(
         e2b_template=template,
     )
     _print_agreement(report)
+    if out:
+        from pathlib import Path
+
+        Path(out).write_text(report.model_dump_json(indent=2), encoding="utf-8")
+        _console.print(f"  wrote agreement report -> {out}")
 
 
 def _gather_specs(archive: str | None, spec_file: str | None):  # noqa: ANN202 - list[HarnessSpec]
@@ -258,17 +264,21 @@ def _gather_specs(archive: str | None, spec_file: str | None):  # noqa: ANN202 -
     from wmh.agent.evolve import load_archive
     from wmh.agent.spec import HarnessSpec
 
-    specs: list[HarnessSpec] = []
-    seen: set[str] = set()
+    by_name: dict[str, HarnessSpec] = {}
     if archive is not None:
         for entry in load_archive(archive).entries:
-            if entry.spec.name not in seen:
-                seen.add(entry.spec.name)
-                specs.append(entry.spec)
+            by_name.setdefault(entry.spec.name, entry.spec)
     if spec_file is not None:
         spec = HarnessSpec.model_validate_json(Path(spec_file).read_text(encoding="utf-8"))
-        if spec.name not in seen:
-            specs.append(spec)
+        # An explicitly-passed --spec WINS over an archive variant of the same name (the file may be
+        # a hand-edited winner): override, and say so, rather than silently verifying the archived
+        # copy or dropping the request.
+        if spec.name in by_name:
+            _console.print(
+                f"[yellow]note[/yellow]: --spec '{spec.name}' overrides the archive entry by name"
+            )
+        by_name[spec.name] = spec
+    specs = list(by_name.values())
     if not specs:
         specs.append(HarnessSpec())
     return specs
@@ -291,10 +301,16 @@ def _print_agreement(report) -> None:  # noqa: ANN001 - AgreementReport
     )
     _console.print(f"  sim-FAIL & real-pass: {c.sim_fail_real_pass}")
     _console.print(f"  sim-FAIL & real-FAIL: {c.sim_fail_real_fail}")
+    if report.failed_variants:
+        _console.print(
+            f"\n[yellow]{len(report.failed_variants)} variant(s) skipped (raised)[/yellow]: "
+            f"{', '.join(report.failed_variants)}"
+        )
     rc = "n/a" if report.rank_correlation is None else f"{report.rank_correlation:.3f}"
+    oa = "n/a (no cells)" if report.outcome_agreement is None else f"{report.outcome_agreement:.3f}"
     _console.print(
-        f"\n[bold]VERDICT[/bold] outcome_agreement={report.outcome_agreement:.3f}  "
-        f"rank_correlation={rc}  mean_abs_gap={report.mean_abs_gap:.3f}"
+        f"\n[bold]VERDICT[/bold] outcome_agreement={oa}  rank_correlation={rc}  "
+        f"mean_abs_gap={report.mean_abs_gap:.3f}  ({c.total} cells)"
     )
 
 
@@ -310,6 +326,7 @@ def gate(
     ),
     max_turns: int = typer.Option(20, help="Agent turn cap per task."),
     template: str = typer.Option(None, "--template", help="E2B template id (default: base image)."),
+    out: str = typer.Option(None, "--out", help="Write the gate result (per-task JSON) here."),
 ) -> None:
     """Oracle-gate a task suite: run the baseline agent for real in E2B and flag unreliable tasks.
 
@@ -341,6 +358,19 @@ def gate(
         f"\n[bold]{len(admitted)}/{len(tasks)} admitted[/bold]"
         + (f"; fix or drop: {', '.join(t for t, _ in rejected)}" if rejected else "")
     )
+    if out:
+        import json
+        from pathlib import Path
+
+        payload = {
+            "k": k,
+            "threshold": threshold,
+            "admitted": [t for t, _ in admitted],
+            "rejected": [t for t, _ in rejected],
+            "per_task": {tid: o.success_rate for tid, o in report.per_task.items()},
+        }
+        Path(out).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _console.print(f"  wrote gate result -> {out}")
 
 
 def _read_spec(spec_file: str | None):  # noqa: ANN202 - HarnessSpec

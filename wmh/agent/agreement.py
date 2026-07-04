@@ -24,7 +24,12 @@ from statistics import fmean
 
 from pydantic import BaseModel, Field
 
-from wmh.agent.closed_loop import ClosedLoopReport, evaluate_closed_loop
+from wmh.agent.closed_loop import (
+    ClosedLoopReport,
+    EnvFactory,
+    evaluate_closed_loop,
+    evaluate_with_env,
+)
 from wmh.agent.gold import GoldJudge
 from wmh.agent.skills import SkillLibrary
 from wmh.agent.spec import HarnessSpec
@@ -79,14 +84,18 @@ class AgreementReport(BaseModel):
     pass_threshold: float
     per_variant: list[VariantAgreement] = Field(default_factory=list)
     confusion: Confusion = Field(default_factory=Confusion)
-    outcome_agreement: float = 0.0  # fraction of (variant, task) cells where sim and real agree
+    # None (not 0.0) when there are no overlapping (variant, task) cells: 0.0 would read as "total
+    # disagreement" when the truth is "no data" (mismatched names/tasks, or an empty run).
+    outcome_agreement: float | None = None  # fraction of cells where sim and real agree
     rank_correlation: float | None = None  # Spearman of per-variant success (None if undefined)
     mean_abs_gap: float = 0.0  # mean |sim_success - real_success| across variants
+    failed_variants: list[str] = Field(default_factory=list)  # variants whose scoring raised
 
     def summary(self) -> str:
         rc = "n/a" if self.rank_correlation is None else f"{self.rank_correlation:.3f}"
+        oa = "n/a" if self.outcome_agreement is None else f"{self.outcome_agreement:.3f}"
         return (
-            f"outcome_agreement={self.outcome_agreement:.3f} "
+            f"outcome_agreement={oa} "
             f"rank_corr={rc} mean_abs_gap={self.mean_abs_gap:.3f} "
             f"(n={self.confusion.total} cells, {len(self.per_variant)} variants, k={self.k})"
         )
@@ -105,6 +114,12 @@ def compute_agreement(
     in only one report contributes no cells. `pass_threshold` binarizes each cell's k-pass success
     rate into pass/fail before tallying the confusion.
     """
+    # Name-keyed matching is only sound if names are unique; a collision would silently pair a sim
+    # report against the wrong real report. Reject dupes on BOTH sides rather than return a
+    # confidently-wrong verdict (the realistic entry point, sim_real_agreement, guards specs too).
+    _reject_duplicate_names(sim_reports, "sim")
+    _reject_duplicate_names(real_reports, "real")
+
     real_by_name = {r.harness: r for r in real_reports}
     per_variant: list[VariantAgreement] = []
     confusion = Confusion()
@@ -118,6 +133,9 @@ def compute_agreement(
                 harness=sim.harness, sim_success=sim.success_rate, real_success=real.success_rate
             )
         )
+        # Cells are the (variant, task) pairs present in BOTH reports. Iterating sim's tasks and
+        # intersecting with real yields exactly that intersection; a task in only one report drops
+        # out (it reduces the cell count `n`, it does not bias agreement).
         for task_id, sim_outcome in sim.per_task.items():
             real_outcome = real.per_task.get(task_id)
             if real_outcome is None:
@@ -133,12 +151,22 @@ def compute_agreement(
         pass_threshold=pass_threshold,
         per_variant=per_variant,
         confusion=confusion,
-        outcome_agreement=confusion.agree / total if total else 0.0,
+        outcome_agreement=confusion.agree / total if total else None,
         rank_correlation=_spearman(
             [v.sim_success for v in per_variant], [v.real_success for v in per_variant]
         ),
         mean_abs_gap=fmean(gaps) if gaps else 0.0,
     )
+
+
+def _reject_duplicate_names(reports: list[ClosedLoopReport], side: str) -> None:
+    names = [r.harness for r in reports]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(
+            f"duplicate harness name(s) in {side} reports {dupes}; variant names must be unique "
+            "(they key the sim<->real pairing)"
+        )
 
 
 def _tally(confusion: Confusion, sim_pass: bool, real_pass: bool) -> None:
@@ -196,37 +224,63 @@ def sim_real_agreement(
     library: SkillLibrary | None = None,
     k: int = 3,
     pass_threshold: float = DEFAULT_PASS_THRESHOLD,
+    make_real_env: EnvFactory | None = None,
     e2b_api_key: str | None = None,
     e2b_template: str | None = None,
     e2b_timeout: int = 300,
 ) -> AgreementReport:
-    """Score every `spec` in simulation AND real E2B, then quantify their agreement.
+    """Score every `spec` in simulation AND reality, then quantify their agreement.
 
-    The expensive orchestration: real evaluation runs a live sandbox per task per pass, so this is a
-    validation pass, not something evolution calls. Imports the real evaluator lazily so sim-only
-    code paths never require the E2B extra.
+    The expensive orchestration: the real leg runs a live sandbox per task per pass, so this is a
+    validation pass, not something evolution calls. The real environment is `make_real_env` if given
+    — the default builds fresh E2B sandboxes (lazily, so sim-only paths never need the E2B extra);
+    injecting a factory is what lets the whole comparison be exercised offline.
+
+    Variant names must be unique (they key the sim<->real pairing) — a collision is rejected up
+    front. A variant whose scoring raises (a flaky sandbox, a provider error) is *skipped*, not
+    fatal: its name lands in `AgreementReport.failed_variants` so one bad rollout on variant #10
+    does not discard the expensive scores of variants 1-9.
     """
-    from wmh.agent.real_loop import evaluate_real
+    names = [s.name for s in specs]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(
+            f"duplicate harness name(s) in specs {dupes}; variant names must be unique"
+        )
+
+    make_real = make_real_env or _e2b_factory(e2b_api_key, e2b_template, e2b_timeout)
 
     sim_reports: list[ClosedLoopReport] = []
     real_reports: list[ClosedLoopReport] = []
+    failed: list[str] = []
     for spec in specs:
-        sim_reports.append(
-            evaluate_closed_loop(
+        try:
+            sim = evaluate_closed_loop(
                 spec, tasks, world_model, agent_provider, judge, library=library, k=k
             )
-        )
-        real_reports.append(
-            evaluate_real(
-                spec,
-                tasks,
-                agent_provider,
-                judge,
-                library=library,
-                k=k,
-                api_key=e2b_api_key,
-                template=e2b_template,
-                timeout=e2b_timeout,
+            real = evaluate_with_env(
+                spec, tasks, make_real, agent_provider, judge, library=library, k=k
             )
-        )
-    return compute_agreement(sim_reports, real_reports, k=k, pass_threshold=pass_threshold)
+        except Exception:  # noqa: BLE001 - isolate a flaky variant; the run continues without it
+            failed.append(spec.name)
+            continue
+        sim_reports.append(sim)
+        real_reports.append(real)
+
+    report = compute_agreement(sim_reports, real_reports, k=k, pass_threshold=pass_threshold)
+    report.failed_variants = failed
+    return report
+
+
+def _e2b_factory(api_key: str | None, template: str | None, timeout: int) -> EnvFactory:
+    """The default real-env factory: a fresh E2B sandbox per task, seeded with its `setup`.
+
+    E2B is imported lazily (inside `E2BEnvironment`), so building this closure costs nothing and
+    sim-only code that never calls it stays free of the `e2b` extra.
+    """
+    from wmh.agent.environment import E2BEnvironment
+
+    def make(task: TaskSpec) -> E2BEnvironment:
+        return E2BEnvironment(api_key=api_key, template=template, timeout=timeout, setup=task.setup)
+
+    return make
