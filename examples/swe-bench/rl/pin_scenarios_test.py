@@ -42,13 +42,27 @@ def test_pinned_sets_are_leak_free_and_well_formed() -> None:
     train = _read(pin.TRAIN_OUT)
     ev = _read(pin.EVAL_OUT)
 
+    gold = json.loads(pin.GOLD_PATH.read_text(encoding="utf-8"))
     for row in (*train, *ev):
         assert isinstance(row["task"], str) and row["task"].strip()
         assert isinstance(row["provenance"], list) and row["provenance"]
         assert isinstance(row["instance_id"], str) and row["instance_id"]
         assert isinstance(row["repo"], str) and row["repo"]
-        # rubric is null: the corpus carries no gold-criteria field (see pin_scenarios docstring).
-        assert row["rubric"] is None
+        # rubric is the instance's SWE-bench gold, joined on instance_id: a compact JSON string
+        # with FAIL_TO_PASS verbatim (non-empty) + PASS_TO_PASS count + repo + base_commit, and it
+        # must match the committed gold cache exactly (no fabricated / drifted criteria).
+        assert isinstance(row["rubric"], str) and row["rubric"]
+        rubric = json.loads(row["rubric"])
+        assert set(rubric) == {"fail_to_pass", "pass_to_pass_count", "repo", "base_commit"}
+        assert isinstance(rubric["fail_to_pass"], list) and rubric["fail_to_pass"]
+        assert isinstance(rubric["pass_to_pass_count"], int)
+        g = gold[row["instance_id"]]
+        assert rubric["fail_to_pass"] == g["fail_to_pass"]
+        assert rubric["pass_to_pass_count"] == g["pass_to_pass_count"]
+        assert rubric["base_commit"] == g["base_commit"]
+
+    # 100% gold join coverage: every pinned instance resolves in the committed cache.
+    assert {r["instance_id"] for r in (*train, *ev)} <= gold.keys()
 
     assert len(train) <= pin.TRAIN_CAP
 
