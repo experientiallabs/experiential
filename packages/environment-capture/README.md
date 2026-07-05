@@ -35,7 +35,8 @@ from environment_capture import (
 ```
 packages/environment-capture/
   environment_capture/        # the package: contract + emitter + converters (+ inline *_test.py)
-  <benchmark>/                # one dir per benchmark: committed traces.otel.jsonl,
+  <benchmark>/                # one dir per benchmark: traces.otel.jsonl (Hub-hosted,
+                              # gitignored — see 'Corpora on the Hugging Face Hub'),
                               # provenance README, task data, thin capture/convert scripts
 ```
 

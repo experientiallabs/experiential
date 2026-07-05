@@ -21,7 +21,7 @@ the cleanest fresh-capture reference, `appworld/` the heavy-engine reference).
    README; "no redistribution / don't reshare / encrypted derivatives only" (GAIA, AppWorld) →
    data AND corpus stay local-only/gitignored, commit only tooling + README, disclose in the PR.
    "Don't train on eval data" requests are disclosed prominently and escalated.
-4. **Hygiene audit must be empty before any corpus commit**:
+4. **Hygiene audit must be empty before any corpus publish**:
    `from environment_capture import scan_spans_jsonl;
    scan_spans_jsonl(Path("...jsonl"), generic_path_markers=<your declared policy>) == {}`.
    Agents wander the host when they can't find their data (real home listings and usernames

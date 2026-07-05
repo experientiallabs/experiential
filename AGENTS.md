@@ -75,7 +75,9 @@ uv run pytest -q
      `packages/llm-waterfall/` (stateless LLM failover) and `packages/environment-capture/`
      (benchmark adapters + real-run trace capture emitting OTel GenAI JSONL). Each is its own
      PyPI package. Per-benchmark data dirs (`packages/environment-capture/<benchmark>/`) follow
-     the examples/ discipline: committed `traces.otel.jsonl` + provenance/license README + thin
+     the examples/ discipline: Hub-hosted `traces.otel.jsonl` (public datasets under the
+     experiential-labs org; gitignored here, fetched via `environment_capture.hub`) +
+     provenance/license README + thin
      scripts; heavy deps and cloned upstreams in local gitignored venvs (out-of-process
      `backend/` scripts ty-excluded; the three pre-contract dirs — tau-bench, terminal-tasks,
      swe-bench — keep their examples-era ruff/ty exemption).
