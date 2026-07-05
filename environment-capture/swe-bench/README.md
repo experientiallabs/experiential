@@ -141,3 +141,11 @@ train/holdout split inline so `--trace N` selects the SAME scenario as the world
 Observed (astropy__astropy-13453, `--trace 0`, cold `--no-cache`): **build from scratch 339.5s + 19
 commands, 362.0s total** — vs. the world model reconstructing the same 19-step scenario in ~96s with
 **zero** standup. The dependency install is the gap.
+
+## Hygiene
+
+Capture ran with the agent inside the task's Docker container, so absolute paths in commands and
+output (`/tmp/...`, `/usr/...`) are the container's own filesystem — the host-escape audit's
+command-path and generic path/toolchain signals do not apply to this corpus (see
+`environment-capture/INTEGRATION.md`). The machine-identity markers (real host username and
+home path) were verified absent.

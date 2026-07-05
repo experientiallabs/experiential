@@ -139,3 +139,28 @@ def test_extract_sql() -> None:
         "WITH t AS (SELECT 1) SELECT * FROM t;"
     )
     assert extract_sql("no sql here") == ""
+
+
+def test_float_cells_match_within_accumulation_noise() -> None:
+    """Different-but-correct query plans accumulate float aggregates in different orders;
+    ULP-level differences must not fail a correct query."""
+    from environment_capture.benchmarks.bird_sql import rows_match
+
+    gold: list[tuple[str | int | float | bytes | None, ...]] = [(200.0836189427305,)]
+    pred: list[tuple[str | int | float | bytes | None, ...]] = [(200.08361894273114,)]
+    assert rows_match(pred, gold, order_sensitive=False)
+    assert rows_match(pred, gold, order_sensitive=True)
+    off: list[tuple[str | int | float | bytes | None, ...]] = [(200.09,)]
+    assert not rows_match(off, gold, order_sensitive=False)
+
+
+def test_order_hints_match_words_not_substrings() -> None:
+    """'Frank' must not trigger 'rank', 'assortment' must not trigger 'sort'."""
+    from environment_capture.benchmarks.bird_sql import question_implies_order
+
+    assert not question_implies_order("Which hero is named Frank?")
+    assert not question_implies_order("How many items in the assortment?")
+    assert not question_implies_order("List laptop models available")
+    assert question_implies_order("Rank the schools by score")
+    assert question_implies_order("What are the top 3 drivers?")
+    assert question_implies_order("List names sorted by age")

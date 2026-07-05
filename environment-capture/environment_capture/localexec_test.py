@@ -75,3 +75,16 @@ def test_containment_guard_can_be_disabled(tmp_path: Path) -> None:
         assert "ran" in result.output
     finally:
         env.close()
+
+
+def test_binary_output_is_replaced_not_fatal(tmp_path: Path) -> None:
+    """An agent cat-ing a staged binary (sqlite db, csv with stray bytes) must yield a real
+    observation with replacement chars, not a UnicodeDecodeError that burns the whole task."""
+    (tmp_path / "blob.bin").write_bytes(b"\xca\xfe\xba\xbe binary")
+    env = LocalBashEnv(workspace=tmp_path)
+    try:
+        result = env.execute("cat blob.bin")
+        assert result.returncode == 0
+        assert "binary" in result.output
+    finally:
+        env.close()

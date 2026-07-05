@@ -52,10 +52,9 @@ from wmh.engine.build import build as run_build
 from wmh.engine.demo import run_demo
 from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.engine.eval_suites import (
-    EvalSuite,
     discover_eval_suites,
     list_eval_results,
-    load_eval_suite,
+    resolve_eval_suite,
     result_path,
 )
 from wmh.engine.loader import load_world_model
@@ -563,32 +562,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
 
 
-def _resolve_suite(selector: str, examples_roots: list[str]) -> EvalSuite:
-    """Resolve a suite selector across every benchmark root (first exact id, then alias)."""
-    direct = Path(selector)
-    if direct.suffix == ".toml" and direct.exists():
-        return load_eval_suite(direct)
-    suites: list[EvalSuite] = []
-    for root in examples_roots:
-        suites.extend(discover_eval_suites(root))
-    exact = [suite for suite in suites if suite.id == selector]
-    if exact:
-        return exact[0]
-    aliased = [suite for suite in suites if selector in suite.aliases]
-    if len(aliased) == 1:
-        return aliased[0]
-    if len(aliased) > 1:
-        choices = ", ".join(suite.id for suite in aliased)
-        raise ValueError(f"ambiguous eval suite {selector!r}; choose one of: {choices}")
-    available = ", ".join(suite.id for suite in suites)
-    hint = f" (available: {available})" if available else ""
-    raise ValueError(f"unknown eval suite {selector!r}{hint}")
-
-
 def _eval_list(examples_roots: list[str]) -> None:
-    suites = [
-        suite for root in examples_roots for suite in discover_eval_suites(root)
-    ]
+    suites = discover_eval_suites(examples_roots)
     if not suites:
         _console.print("[yellow]no eval suites found[/yellow]")
         return
@@ -619,7 +594,7 @@ def _eval_results(
     resolved_suite = suite_filter
     if suite_filter is not None:
         try:
-            resolved_suite = _resolve_suite(suite_filter, examples_roots).id
+            resolved_suite = resolve_eval_suite(suite_filter, examples_roots).id
         except ValueError:
             resolved_suite = suite_filter
     summaries = list_eval_results(results_root, resolved_suite, limit=limit)
@@ -665,7 +640,7 @@ def _eval_run_suite(
     top_k: int | None,
     out: str | None,
 ) -> None:
-    suite = _resolve_suite(selector, examples_roots)
+    suite = resolve_eval_suite(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -872,11 +847,6 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _examples_root() -> Path:
-    """Repo-local examples directory."""
-    return Path(__file__).resolve().parents[2] / "examples"
-
-
 def _benchmark_roots() -> tuple[Path, ...]:
     """Every root holding self-contained task dirs: examples/ + environment-capture/."""
     repo = Path(__file__).resolve().parents[2]
@@ -915,10 +885,12 @@ def _resolve_example(name: str) -> Path:
     except ValueError:
         safe = None
     if safe is not None:
-        for root in _benchmark_roots():
-            example_dir = root / safe
-            if example_dir.is_dir():
-                return example_dir
+        matches = [root / safe for root in _benchmark_roots() if (root / safe).is_dir()]
+        if len(matches) > 1:
+            found = ", ".join(str(path) for path in matches)
+            raise typer.BadParameter(f"example {name!r} exists in multiple roots: {found}")
+        if matches:
+            return matches[0]
     available = ", ".join(path.name for path in _discover_examples())
     hint = f" (available: {available})" if available else ""
     raise typer.BadParameter(f"unknown example {name!r}{hint}")

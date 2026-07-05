@@ -150,3 +150,13 @@ def test_load_baseline_cache_rejects_malformed_observation(tmp_path: Path) -> No
     trace_path.write_text(json.dumps(trace))
     with pytest.raises(ValueError, match="fb-train-0"):
         load_baseline_cache(root)
+
+
+def test_sentinel_normalization_spares_legitimate_submit_tokens(tmp_path: Path) -> None:
+    """Only short recording-harness prefixes are sentinels; content tokens like FORM_SUBMIT
+    are real environment text and must survive conversion unmangled."""
+    from environment_capture.baseline_cache import _normalize_sentinel
+
+    assert _normalize_sentinel("click the FORM_SUBMIT button") == "click the FORM_SUBMIT button"
+    assert _normalize_sentinel("AUTO_SUBMIT enabled") == "AUTO_SUBMIT enabled"
+    assert _normalize_sentinel("ZQ_SUBMIT\n$1577") == "SUBMIT\n$1577"

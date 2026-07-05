@@ -107,6 +107,7 @@ class DabstepAdapter:
         return env
 
     def grade(self, task: Task, submission: str) -> float:
+        """Numeric-tolerance or string match against the gold answer and its accepted variants."""
         gold = json.loads(
             (self.data_root / "gold" / f"{task.task_id}.json").read_text(encoding="utf-8")
         )

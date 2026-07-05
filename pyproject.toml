@@ -94,8 +94,7 @@ python-version = "3.11"
 # `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
 # (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
 exclude = ["examples/", ".agents/",
-    "environment-capture/appworld/backend/",
-    "environment-capture/gaia2/backend/",
+    "environment-capture/*/backend/",
     "environment-capture/tau-bench/",
     "environment-capture/terminal-tasks/",
     "environment-capture/swe-bench/",

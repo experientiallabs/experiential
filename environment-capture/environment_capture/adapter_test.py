@@ -141,3 +141,33 @@ def test_run_capture_explicit_task_shard() -> None:
     shard = adapter.tasks("train")[1:]
     result = run_capture(adapter, _OneShotAgent(), split="train", tasks=shard)
     assert [t.task.task_id for t in result.trajectories] == ["train-1", "train-2"]
+
+
+def test_run_capture_grades_after_env_close() -> None:
+    """Backends that flush state on close (out-of-process world servers) are graded only
+    after the env has closed — grading a still-open env reads pre-finalization state."""
+    adapter = _FakeAdapter()
+
+    class _CloseSensingAdapter:
+        name = adapter.name
+
+        def __init__(self) -> None:
+            self.env: _EchoEnv | None = None
+            self.graded_after_close: list[bool] = []
+
+        def tasks(self, split: str) -> list[Task]:
+            return adapter.tasks(split)[:1]
+
+        def open_env(self, task: Task) -> CommandEnv:
+            self.env = _EchoEnv()
+            return self.env
+
+        def grade(self, task: Task, submission: str) -> float:
+            assert self.env is not None
+            self.graded_after_close.append(self.env.closed)
+            return 1.0
+
+    sensing = _CloseSensingAdapter()
+    result = run_capture(sensing, _OneShotAgent(), split="train")
+    assert len(result.trajectories) == 1
+    assert sensing.graded_after_close == [True]

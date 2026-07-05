@@ -56,10 +56,17 @@ _STATEMENT_RE = re.compile(r"(?is)\b(with|select)\b")
 _FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
+_ORDER_HINTS_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(hint.strip()) for hint in _ORDER_HINTS) + r")\b"
+)
+
+
 def question_implies_order(prompt: str) -> bool:
-    """True when the question wording implies the row order of the answer matters."""
-    low = prompt.lower()
-    return any(hint in low for hint in _ORDER_HINTS)
+    """True when the question wording implies the row order of the answer matters.
+
+    Hints match as whole words: 'Frank' must not trigger 'rank', 'assortment' not 'sort'.
+    """
+    return _ORDER_HINTS_RE.search(prompt.lower()) is not None
 
 
 def _first_statement(chunk: str) -> str:
@@ -89,17 +96,35 @@ def extract_sql(submission: str) -> str:
     return _first_statement(submission)
 
 
+def _canon_cell(cell: _Cell) -> _Cell:
+    """Canonicalize a result cell for comparison.
+
+    Floats are collapsed to 10 significant digits: different-but-correct query plans accumulate
+    aggregates (AVG, SUM of floats) in different orders, so ULP-level noise must not fail an
+    execution match. 10 significant digits is far tighter than any value the benchmark
+    distinguishes and far looser than accumulation noise.
+    """
+    if isinstance(cell, float):
+        return float(f"{cell:.10g}")
+    return cell
+
+
+def _canon_row(row: _Row) -> _Row:
+    return tuple(_canon_cell(cell) for cell in row)
+
+
 def _multiset(rows: list[_Row]) -> dict[_Row, int]:
     counts: dict[_Row, int] = {}
     for row in rows:
-        counts[row] = counts.get(row, 0) + 1
+        canon = _canon_row(row)
+        counts[canon] = counts.get(canon, 0) + 1
     return counts
 
 
 def rows_match(pred: list[_Row], gold: list[_Row], *, order_sensitive: bool) -> bool:
     """Compare two result-row lists (multiset by default, strict sequence when ordered)."""
     if order_sensitive:
-        return pred == gold
+        return [_canon_row(row) for row in pred] == [_canon_row(row) for row in gold]
     return _multiset(pred) == _multiset(gold)
 
 
@@ -151,6 +176,8 @@ class BirdSqlAdapter:
         return env
 
     def grade(self, task: Task, submission: str) -> float:
+        """Execute submitted vs gold SQL on the task DB; result sets must match
+        (order-sensitive only when the question implies an order)."""
         gold = json.loads(
             (self.data_root / "gold" / f"{task.task_id}.json").read_text(encoding="utf-8")
         )

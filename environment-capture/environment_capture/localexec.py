@@ -56,6 +56,7 @@ class LocalBashEnv:
                 cwd=self.workspace,
                 capture_output=True,
                 text=True,
+                errors="replace",  # binary output becomes a real observation, not a crash
                 timeout=self.timeout_s,
             )
         except subprocess.TimeoutExpired:

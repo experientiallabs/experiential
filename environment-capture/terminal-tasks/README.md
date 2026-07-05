@@ -95,3 +95,11 @@ re-implements the harness's blake2b train/holdout split inline so `--trace N` ma
 side. These commands hit live public APIs, so a real re-run reflects *current* data and the output
 may differ from the recorded observation (rates change, releases bump) — that is the honest real
 environment. Observed (`--trace 1`, cold): build from scratch 8.7s + 10 commands, 10.8s total.
+
+## Hygiene
+
+Capture ran with the agent inside the task's Docker container, so absolute paths in commands and
+output (`/tmp/...`, `/usr/...`) are the container's own filesystem — the host-escape audit's
+command-path and generic path/toolchain signals do not apply to this corpus (see
+`environment-capture/INTEGRATION.md`). The machine-identity markers (real host username and
+home path) were verified absent.

@@ -146,3 +146,15 @@ def test_grade_text_answer(data_root: Path) -> None:
     assert adapter.grade(task, "The category is Office Products.") == 1.0  # containment
     assert adapter.grade(task, "office products") == 1.0  # normalized exact
     assert adapter.grade(task, "Electronics") == 0.0
+
+
+def test_relative_data_root_yields_working_symlink(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """A relative data_root must not produce a dangling workspace symlink: Path.symlink_to
+    stores the target verbatim, and the OS resolves it against the LINK's directory."""
+    root = tmp_path / "bench"
+    (root / "datafiles").mkdir(parents=True)
+    (root / "datafiles" / "products.db").write_bytes(b"stub")
+    monkeypatch.chdir(tmp_path)
+    adapter = ContinualLearningAdapter(data_root=Path("bench"))
+    assert adapter.db_path.is_absolute()
+    assert adapter.db_path.exists()

@@ -79,7 +79,10 @@ class ContinualLearningAdapter:
         ``schema_sql`` tasks ignore it. `timeout_s` is generous because queries scan a large db.
         """
         self.data_root = data_root
-        self.db_path = db_path if db_path is not None else data_root / "datafiles" / "products.db"
+        # resolve(): the symlink target is stored verbatim and resolved against the WORKSPACE dir,
+        # so a relative db_path would dangle even though the exists() guard (cwd-relative) passes.
+        raw_db_path = db_path if db_path is not None else data_root / "datafiles" / "products.db"
+        self.db_path = raw_db_path.resolve()
         self.timeout_s = timeout_s
 
     def tasks(self, split: str) -> list[Task]:
@@ -116,6 +119,7 @@ class ContinualLearningAdapter:
         return env
 
     def grade(self, task: Task, submission: str) -> float:
+        """Numeric gold: tolerance match; text gold: normalized equality or containment."""
         gold = self._gold(task.task_id)
         predicted = _extract_final_answer(submission)
         numeric = gold.get("numeric")

@@ -218,6 +218,7 @@ class CrmArenaAdapter:
         return env
 
     def grade(self, task: Task, submission: str) -> float:
+        """Score against the gold answer with the task's own metric (exact or fuzzy match)."""
         gold = json.loads(
             (self.data_root / "gold" / f"{task.task_id}.json").read_text(encoding="utf-8")
         )

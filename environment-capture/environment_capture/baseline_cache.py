@@ -30,8 +30,11 @@ _FENCE_RE = re.compile(r"```\w*bash\s*\n(.*?)```", re.DOTALL)
 _RETURNCODE_RE = re.compile(r"<returncode>(-?\d+)</returncode>")
 _OUTPUT_RE = re.compile(r"<output>\n?(.*?)\n?</output>\s*\Z", re.DOTALL)
 # No leading \b: the sentinel is often glued to prior output (e.g. a cat without a trailing
-# newline directly followed by the sentinel echo), which a word boundary would miss.
-_SENTINEL_RE = re.compile(r"[A-Z][A-Z0-9]{1,7}_SUBMIT\b")
+# newline directly followed by the sentinel echo), which a word boundary would miss. The
+# lookbehind instead forbids an UPPERCASE/underscore predecessor, so the pattern never starts
+# mid-token inside a longer ALLCAPS word — legitimate content like FORM_SUBMIT / AUTO_SUBMIT
+# survives — while lowercase- or digit-glued sentinels ("...46ZQ_SUBMIT") still normalize.
+_SENTINEL_RE = re.compile(r"(?<![A-Z_])[A-Z][A-Z0-9]{1,2}_SUBMIT\b")
 
 
 def _normalize_sentinel(text: str) -> str:

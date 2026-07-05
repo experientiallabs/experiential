@@ -91,6 +91,7 @@ class FinanceBenchAdapter:
         return env
 
     def grade(self, task: Task, submission: str) -> float:
+        """Numeric gold: tolerance match; text gold: token-F1 banded to reward 1.0/0.5/0.0."""
         gold = json.loads(
             (self.data_root / "gold" / f"{task.task_id}.json").read_text(encoding="utf-8")
         )

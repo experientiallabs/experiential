@@ -22,12 +22,17 @@ the cleanest fresh-capture reference, `appworld/` the heavy-engine reference).
    data AND corpus stay local-only/gitignored, commit only tooling + README, disclose in the PR.
    "Don't train on eval data" requests are disclosed prominently and escalated.
 4. **Hygiene audit must be empty before any corpus commit**:
-   `from environment_capture import scan_spans_jsonl; scan_spans_jsonl(Path("...jsonl")) == {}`.
+   `from environment_capture import scan_spans_jsonl;
+   scan_spans_jsonl(Path("...jsonl"), generic_path_markers=<your declared policy>) == {}`.
    Agents wander the host when they can't find their data (real home listings and usernames
    leaked into corpora once). `LocalBashEnv(contain=True)` stays on; flagged trajectories are
    dropped WHOLE (never redacted). If the benchmark's own simulated filesystem legitimately uses
-   `~/`-style paths, pass `generic_path_markers=False` to `partition_contained` with a written
-   justification (identity markers still run).
+   `~/`-style paths, pass `generic_path_markers=False` — to `partition_contained` at capture
+   time AND to `scan_spans_jsonl` at audit time, so the audit mirrors the capture policy — with
+   a written justification (sensitive-path and identity markers always run regardless).
+   Container-isolated benchmarks (the agent runs INSIDE Docker, so absolute paths in commands
+   are the container's own filesystem, not the host's) are exempt from the command-escape
+   signal by construction — say so in the benchmark README instead of forcing an empty scan.
 5. **The test split is never captured** and, when expanding task sets, the existing
    `data/test.jsonl` stays byte-identical (write the invariant test first — see
    `dabstep/dabstep_split_invariant_test.py`).

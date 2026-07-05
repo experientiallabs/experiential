@@ -13,9 +13,10 @@ from environment_capture.benchmarks.gaia2 import (
     _graded_agent_actions,
     score_actions,
 )
+from environment_capture.trajectory import JsonValue
 
 
-def _act(app: str, function: str, **args: object) -> Action:
+def _act(app: str, function: str, **args: JsonValue) -> Action:
     return Action(app=app, function=function, args=dict(args))
 
 

@@ -70,7 +70,7 @@ def test_machine_username_in_observation_is_flagged() -> None:
     listing = f"total 0\ndrwx------@ 3 {user}  staff  96 Jul  1 22:06 ."
     findings = host_escape_findings(_trajectory("ls -la", listing))
     assert findings and findings[0].field == "output"
-    assert findings[0].marker == user
+    assert user in findings[0].marker  # matched in ownership context, not as a bare word
 
 
 def test_partition_contained_splits_and_preserves_order() -> None:
@@ -143,3 +143,73 @@ def test_scan_spans_jsonl_maps_trace_ids_to_findings(tmp_path: Path) -> None:
     assert set(flagged) == {"bbb", "ccc"}
     assert flagged["bbb"][0].field == "command"
     assert flagged["ccc"][0].field == "output"
+
+
+def test_import_survives_missing_username(monkeypatch) -> None:  # noqa: ANN001
+    """A container run as a bare uid (no passwd entry, no USER env) must not crash the harness:
+    runtime identity markers degrade to whatever is resolvable instead of raising at import."""
+    import environment_capture.hygiene as hygiene
+
+    def _boom() -> str:
+        raise KeyError("getpwuid(): uid not found")
+
+    monkeypatch.setattr(hygiene.getpass, "getuser", _boom)
+    hygiene._runtime_markers.cache_clear()
+    try:
+        markers = hygiene._runtime_markers()
+        assert str(Path.home()) in " ".join(markers)  # home still contributes
+        clean = _trajectory("ls docs", "a.txt")
+        assert host_escape_findings(clean) == []  # detection still works
+    finally:
+        hygiene._runtime_markers.cache_clear()
+
+
+def test_bare_username_word_does_not_flag() -> None:
+    """A common username appearing as an ordinary WORD is not an identity leak — only
+    ownership-column (ls -l) and home-path contexts are. Guards CI boxes with usernames like
+    'runner'/'ubuntu' from mass false drops."""
+    import getpass
+
+    user = getpass.getuser()
+    prose = _trajectory("echo status", f"test {user} passed all checks for {user} mode")
+    assert host_escape_findings(prose) == []
+    listing = _trajectory("ls -la", f"drwxr-xr-x@ 3 {user}  staff  96 Jul  1 22:06 .")
+    assert host_escape_findings(listing), "ls -l ownership column must still flag"
+    home_leak = _trajectory("python3 x.py", f"home is {Path.home()}/secrets")
+    assert host_escape_findings(home_leak), "home-path leak must still flag"
+
+
+def test_own_workspace_tempdir_path_does_not_flag() -> None:
+    """macOS workspaces live under /var/folders — an observation echoing the workspace's own
+    absolute path (pwd, tracebacks, sqlite errors) is not a host escape and must not be dropped."""
+    own_path = _trajectory(
+        "pwd", "/var/folders/wy/l2n7bpj15sgb25k6ylm9txkh0000gn/T/envcap-abc123"
+    )
+    assert host_escape_findings(own_path) == []
+
+
+def test_generic_flag_keeps_credential_markers() -> None:
+    """generic_path_markers=False relaxes only PATH-shaped markers; credential markers
+    (.ssh, id_rsa, site-packages, ...) always run — a simulated-filesystem benchmark must not
+    silence real key leaks."""
+    sim_path = _trajectory("apis.fs.ls()", "saved to ~/documents/out.csv")
+    assert host_escape_findings(sim_path, generic_path_markers=False) == []
+    key_leak = _trajectory("apis.fs.ls()", "found ~/keys/id_rsa and .ssh/config")
+    findings = host_escape_findings(key_leak, generic_path_markers=False)
+    assert findings and findings[0].field == "output"
+
+
+def test_scan_spans_jsonl_honors_marker_policy(tmp_path: Path) -> None:
+    """The corpus auditor accepts the same policy flag as capture-time filtering, so a
+    benchmark's declared relaxation is auditable rather than silently unenforceable."""
+    span = {
+        "traceId": "sim1",
+        "spanId": "sim1-s",
+        "attributes": [
+            {"key": "gen_ai.tool.message", "value": {"stringValue": "wrote ~/notes/a.txt"}}
+        ],
+    }
+    path = tmp_path / "t.jsonl"
+    path.write_text(json.dumps(span) + "\n")
+    assert "sim1" in scan_spans_jsonl(path)
+    assert scan_spans_jsonl(path, generic_path_markers=False) == {}
