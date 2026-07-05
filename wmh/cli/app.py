@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +22,8 @@ from uuid import uuid4
 import typer
 import uvicorn
 from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 
 import wmh.providers as providers
@@ -32,6 +36,7 @@ from wmh.cli.ui import (
     run_build_wizard,
     run_play_repl,
     select_model,
+    select_provider_and_model,
 )
 from wmh.config import (
     ARTIFACT_DIR,
@@ -49,6 +54,7 @@ from wmh.config import (
     validate_name,
 )
 from wmh.engine.build import build as run_build
+from wmh.engine.build import ingest
 from wmh.engine.demo import run_demo
 from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.engine.eval_suites import (
@@ -57,12 +63,14 @@ from wmh.engine.eval_suites import (
     resolve_eval_suite,
     result_path,
 )
-from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import VendorPull
+from wmh.engine.world_model import WorldModel
+from wmh.ingest import VendorPull, list_adapters
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import EmbedderKind
+from wmh.providers.fallback import _is_capacity_error
+from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
 from wmh.serving.server import create_app
 from wmh.telemetry import (
@@ -212,8 +220,23 @@ def examples_run(
 @app.command("build")
 def build(
     name: str = typer.Option(None, "--name", help="Name for this world model."),
-    file: str = typer.Option(None, "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
-    vendor: str = typer.Option(None, "--vendor", help="Vendor name to pull traces via SDK."),
+    source: str = typer.Option(
+        "otel-genai",
+        "--source",
+        help="Trace source adapter: otel-genai, chat-json, braintrust, phoenix, langfuse, "
+        "langsmith, posthog, mastra.",
+    ),
+    file: str = typer.Option(None, "--file", help="Path to an exported traces file for --source."),
+    pull: bool = typer.Option(
+        False, "--pull", help="Pull traces live from the source's vendor API (instead of --file)."
+    ),
+    project: str = typer.Option(None, "--project", help="Vendor project/workspace id (--pull)."),
+    api_key: str = typer.Option(None, "--api-key", help="Vendor API key (else env var)."),
+    since: str = typer.Option(None, "--since", help="Only pull traces since this ISO timestamp."),
+    limit: int = typer.Option(None, "--limit", help="Max number of traces to pull."),
+    vendor: str = typer.Option(
+        None, "--vendor", help="[deprecated] alias for --source <name> --pull."
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
     provider: str = typer.Option(
         None, "--provider", help="Provider that serves the model (default: bedrock)."
@@ -246,15 +269,26 @@ def build(
     With no `--name`/`--file` on an interactive terminal, this launches a guided creation wizard;
     pass `--no-interactive` (or any of those flags) to stay fully scriptable.
     """
+    # `--vendor <name>` is the deprecated alias for `--source <name> --pull`: it names the source
+    # adapter and implies a live pull.
+    if vendor:
+        source = vendor
+        pull = True
+
     # Decide whether to run the wizard: explicit flag wins; otherwise auto when at a TTY and the
-    # essential inputs (a name and a trace source) were not supplied.
-    needs_input = name is None or (file is None and vendor is None)
+    # essential inputs (a name and a trace source — a file or a live pull) were not supplied.
+    needs_input = name is None or (file is None and not pull)
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
     params = BuildParams(
         name=name or DEFAULT_MODEL_NAME,
+        source=source,
         file=file,
-        vendor=vendor,
+        pull=pull,
+        project=project,
+        api_key=api_key,
+        since=since,
+        limit=limit,
         provider=provider,
         model=model,
         region=region,
@@ -267,8 +301,16 @@ def build(
     )
     if use_wizard:
         params = run_build_wizard(_console, params)
-    elif name is None and file is None and vendor is None:
-        raise typer.BadParameter("provide --file (or --vendor), or run `wmh build` interactively")
+    elif name is None and file is None and not pull:
+        raise typer.BadParameter(
+            "provide --file <export> or --pull (with --source), or run `wmh build` interactively"
+        )
+    if params.file and params.pull:
+        raise typer.BadParameter("pass either --file or --pull, not both")
+    if params.source not in list_adapters():
+        raise typer.BadParameter(
+            f"unknown --source {params.source!r}; choose one of: {', '.join(list_adapters())}"
+        )
     # The wizard always resolves a provider; the flag path keeps its historical default.
     params.provider = params.provider or "bedrock"
 
@@ -312,6 +354,7 @@ def build(
         gepa_budget=params.gepa_budget,
         train_split=params.train_split,
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
+        trace_adapter=params.source,
     )
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
@@ -339,8 +382,17 @@ def build(
     with tracker.timed(), RichBuildReporter(_console, params.name) as reporter:
         result = run_build(
             config,
-            file=params.file,
-            vendor=VendorPull() if params.vendor else None,
+            file=None if params.pull else params.file,
+            vendor=(
+                VendorPull(
+                    api_key=params.api_key,
+                    project=params.project,
+                    since=params.since,
+                    limit=params.limit,
+                )
+                if params.pull
+                else None
+            ),
             root=model_dir,
             serve_provider=metered,
             judge_provider=metered_judge,
@@ -802,28 +854,227 @@ def _eval_report_payload(report: EvalReport) -> dict[str, object]:
 
 @app.command("demo")
 def demo(
-    name: str = typer.Option(None, "--name", help="World model to demo (default: the only one)."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    name: str = typer.Option(None, "--name", help="World model to demo (default: pick one)."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    steps: int = typer.Option(5, help="Max scenario steps to replay."),
+    traces: str = typer.Option(
+        None, "--traces", help="Trace file to sample the scenario from (default: the model's)."
+    ),
+    seed: int = typer.Option(None, help="Seed for the scenario sample (default: random)."),
+    show_prompt: bool = typer.Option(
+        True,
+        "--show-prompt/--no-prompt",
+        help="Print the exact env prompt the world model sees for the first step.",
+    ),
 ) -> None:
-    """Demo the harness: an LLM agent makes a tool call vs the world model; show prompt+output."""
-    wm, _resolved_name, provider = _load_model(name, root)
-    # Seed the demo agent from whatever steps the index holds.
-    examples = wm.sample_steps(3)
-    result = run_demo(wm, provider, examples)
-    _console.print(f"[bold]agent action[/bold]: {result.agent_action.model_dump()}")
-    _console.print(f"[bold]env prompt[/bold]:\n{result.env_prompt}")
-    _console.print(f"[bold]observation[/bold]: {result.observation.model_dump()}")
+    """Replay a randomly sampled recorded scenario against the world model, open loop."""
+    wm, resolved_name, _provider, model_root = _load_model_any(name, root)
+    traces_file = Path(traces) if traces else _traces_for_root(model_root)
+    if traces_file is None or not traces_file.exists():
+        raise typer.BadParameter(
+            f"no trace file found for {resolved_name!r} under {model_root}; pass --traces"
+        )
+    model_dir = WorldModelStore(str(model_root)).resolve(resolved_name)
+    config = load_config(model_dir)  # the model dir holds its own HarnessConfig
+    candidates = [t for t in ingest(config, file=str(traces_file)) if t.steps]
+    if not candidates:
+        raise typer.BadParameter(f"{traces_file} contains no replayable traces")
+    trace = random.Random(seed).choice(candidates)
+
+    total = min(steps, len(trace.steps))
+    _console.print(
+        f"replaying scenario [bold]{trace.trace_id}[/bold] against [bold]{resolved_name}[/bold] "
+        f"(open loop, {total} of {len(trace.steps)} steps)…"
+    )
+    if trace.steps[0].task:
+        _console.print(f"[dim]task: {escape(trace.steps[0].task)}[/dim]")
+    if show_prompt:
+        _console.print(
+            Panel(
+                escape(_first_prompt(wm, trace)),
+                title="[dim]env prompt (step 1) — what the world model sees[/dim]",
+                border_style="bright_black",
+            )
+        )
+
+    done: list = []  # DemoStep results stream in as each prediction lands
+
+    def _print_result(i: int, n: int, demo_step) -> None:  # noqa: ANN001 - engine DemoStep
+        done.append(demo_step)
+        action = demo_step.action
+        call = (
+            f"{action.name} {json.dumps(action.arguments)}"
+            if action.name
+            else (action.content or "")[:120]
+        )
+        verdict = (
+            "[green]exact match[/green]" if demo_step.exact_match else "[yellow]differs[/yellow]"
+        )
+        _console.print(f"\n[bold]step {i}/{n}[/bold]  [cyan]{escape(call)}[/cyan]  {verdict}")
+        _console.print(f"  [green]predicted[/green]: {escape(demo_step.predicted.content)}")
+        _console.print(f"  [dim]actual[/dim]:    {escape(demo_step.actual.content)}")
+        note = demo_step.predicted.metadata.get("state_note")
+        if isinstance(note, str) and note.strip():
+            _console.print(f"  [dim]model note: {escape(note.strip())}[/dim]")
+
+    while True:
+        try:
+            busy = "[dim]world model predicting…[/dim]"
+            with _console.status(busy, spinner="dots") as status:
+                _NARRATOR.attach(status, busy)
+
+                def _on_step(i: int, n: int) -> None:
+                    text = f"[dim]world model predicting step {i}/{n}…[/dim]"
+                    _NARRATOR.busy = text
+                    status.update(text)
+
+                try:
+                    run_demo(
+                        wm,
+                        trace,
+                        max_steps=steps,
+                        on_step=_on_step,
+                        on_result=_print_result,
+                        skip=len(done),
+                    )
+                finally:
+                    _NARRATOR.detach()
+            break
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not _is_capacity_error(exc) or not _console.is_terminal:
+                raise
+            # Retries are exhausted and the backend is still down: offer to re-point the model
+            # at a different provider (same picker as the build wizard) and RESUME from the
+            # failed step — completed steps stay done.
+            _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
+            _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
+            provider_name, model_id, region = select_provider_and_model(
+                _console,
+                lambda text: _console.input(text),
+                lambda text: _console.input(text, password=True),
+                default_provider=None,
+                default_model=None,
+                default_region=None,
+                interactive=True,
+                check=lambda cfg: verify_all([cfg])[0],
+            )
+            switched = ProviderConfig(
+                kind=ProviderKind(provider_name), model=model_id, region=region
+            )
+            provider = RetryingProvider(
+                providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
+            )
+            wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
+            _console.print(
+                f"[dim]resuming from step {len(done) + 1} with {provider_name} ({model_id})…[/dim]"
+            )
+    matches = sum(1 for d in done if d.exact_match)
+    _console.print(f"\n{matches}/{len(done)} exact matches (run `wmh eval` for judged fidelity)")
+
+
+def _first_prompt(wm: WorldModel, trace) -> str:  # noqa: ANN001 - core Trace
+    """Render the first step's env prompt on a throwaway session (display only)."""
+    probe = wm.new_session(task=trace.steps[0].task)
+    try:
+        return wm.render_step_prompt(probe.id, trace.steps[0].action)
+    finally:
+        wm.end_session(probe.id)
 
 
 @app.command("play")
 def play(
-    name: str = typer.Option(None, "--name", help="World model to play (default: the only one)."),
+    name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
 ) -> None:
     """Step into the environment yourself: type actions, the world model returns observations."""
-    wm, resolved_name, _provider = _load_model(name, root)
-    run_play_repl(_console, wm, resolved_name, task)
+    wm, resolved_name, _provider, _model_root = _load_model_any(name, root)
+    suggestions = _action_suggestions(wm)
+    run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
+
+
+def _traces_for_root(model_root: Path) -> Path | None:
+    """The trace corpus that built the models under `model_root`, when it ships alongside."""
+    candidate = model_root / "traces.otel.jsonl"
+    return candidate if candidate.exists() else None
+
+
+def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
+    """Real action lines sampled from the model's corpus, to seed the play prompt."""
+    suggestions: list[str] = []
+    for step in wm.sample_steps(8):
+        action = step.action
+        if action.name:
+            args = json.dumps(action.arguments) if action.arguments else ""
+            line = f"{action.name} {args}".strip()
+        elif action.content:
+            line = f"say {action.content[:60]}"
+        else:
+            continue
+        if line not in suggestions:
+            suggestions.append(line)
+        if len(suggestions) >= n:
+            break
+    return suggestions
+
+
+def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider, Path)
+    """Resolve a model across the project dir AND shipped examples, then load it.
+
+    An explicit non-default `--root` keeps the old single-root behavior. Otherwise the picker
+    spans `<root>/models/*` plus `examples/*/models/*`, labeling each with its source.
+    """
+    if root != ARTIFACT_DIR:
+        wm, resolved, provider = _load_model(name, root)
+        return wm, resolved, provider, Path(root)
+
+    candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
+    local = WorldModelStore(root)
+    candidates.extend((f"{n} (local)", Path(root), n) for n in local.list_names())
+    for example_dir in _discover_examples():
+        example_store = WorldModelStore(example_dir)
+        candidates.extend(
+            (f"{n} ({example_dir.name} example)", example_dir, n)
+            for n in example_store.list_names()
+        )
+
+    if name is not None:
+        matched = [c for c in candidates if c[2] == name]
+        if not matched:
+            have = ", ".join(c[2] for c in candidates) or "none built"
+            raise typer.BadParameter(f"no world model named {name!r} (have: {have})")
+        # Prefer the local build over a same-named example artifact.
+        label, store_root, resolved = matched[0]
+    elif not candidates:
+        raise typer.BadParameter(
+            "no world models found; run `wmh build` or try an example (examples/tau-bench)"
+        )
+    elif len(candidates) == 1:
+        label, store_root, resolved = candidates[0]
+    elif _console.is_terminal:
+        labels = [c[0] for c in candidates]
+        chosen = _select_from(labels)
+        label, store_root, resolved = candidates[labels.index(chosen)]
+    else:
+        have = ", ".join(c[2] for c in candidates)
+        raise typer.BadParameter(f"multiple world models ({have}); pass --name")
+
+    wm, resolved, provider = _load_model(resolved, str(store_root))
+    return wm, resolved, provider, store_root
+
+
+def _select_from(labels: list[str]) -> str:
+    """Interactive picker over pre-rendered labels (arrow keys on a TTY)."""
+    from wmh.cli import ui as _ui  # package-internal: reuse the wizard's picker machinery
+
+    return _ui._select(
+        _console,
+        lambda text: _console.input(text),
+        "Select a world model",
+        labels,
+        None,
+        interactive=True,
+    )
 
 
 def _resolve_name(store: WorldModelStore, name: str | None) -> str:
@@ -848,9 +1099,9 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
 
 
 def _benchmark_roots() -> tuple[Path, ...]:
-    """Every root holding self-contained task dirs: examples/ + environment-capture/."""
+    """Every root holding self-contained task dirs: examples/ + the capture member's data dirs."""
     repo = Path(__file__).resolve().parents[2]
-    return (repo / "examples", repo / "environment-capture")
+    return (repo / "examples", repo / "packages" / "environment-capture")
 
 
 def _discover_examples() -> list[Path]:
@@ -896,17 +1147,87 @@ def _resolve_example(name: str) -> Path:
     raise typer.BadParameter(f"unknown example {name!r}{hint}")
 
 
+def _short_error(exc: Exception) -> str:
+    """The error's code + service message, without transport chatter.
+
+    botocore's text ("... (reached max retries: 1) ...") reads as OUR retry state and confuses
+    the narration; the structured code + message is what the user needs.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error", {})
+        code, message = error.get("Code"), error.get("Message") or ""
+        if code:
+            return f"{code}: {message}".rstrip(": ")[:110]
+    return str(exc).splitlines()[0][:110]
+
+
+class _RetryNarrator:
+    """Console narration for RetryingProvider: hiccup lines + an inline countdown.
+
+    The hiccup line prints only when the failure CHANGES (a stream of identical throttles says
+    it once); while a rich status is attached (demo), the wait counts down in place as
+    "retry k/3 — waiting Ns…" and then hands the spinner back to the busy text.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._status = None  # rich Status while a spinner context is active
+        self.busy = ""
+        self._last_error: str | None = None
+        self._attempt = 0
+        self._total = 0
+
+    def attach(self, status, busy: str) -> None:  # noqa: ANN001 - rich Status
+        self._status = status
+        self.busy = busy
+
+    def detach(self) -> None:
+        self._status = None
+        self._last_error = None
+
+    def on_retry(self, attempt: int, total: int, delay: float, exc: Exception) -> None:
+        detail = _short_error(exc)
+        if detail != self._last_error:
+            self._console.print(f"  [yellow]provider hiccup: {escape(detail)}[/yellow]")
+            self._last_error = detail
+        self._attempt, self._total = attempt, total
+        if self._status is None:
+            self._console.print(f"  [yellow]retry {attempt}/{total} in {delay:.0f}s…[/yellow]")
+
+    def sleep(self, delay: float) -> None:
+        remaining = int(delay)
+        while remaining > 0:
+            if self._status is not None:
+                self._status.update(
+                    f"[yellow]retry {self._attempt}/{self._total} — waiting {remaining}s…[/yellow]"
+                )
+            time.sleep(1)
+            remaining -= 1
+        if self._status is not None:
+            self._status.update(self.busy)
+
+
+_NARRATOR = _RetryNarrator(_console)
+
+
 def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider)
     """Resolve + load a named world model (or the single built one) with its serve provider.
 
-    Returns `(world_model, resolved_name, provider)` so callers can reuse the provider without
-    re-reading config / reconstructing it.
+    The serve provider comes from the MODEL'S OWN config (the one it was built to serve on),
+    wrapped so transient capacity errors retry with narrated exponential backoff instead of
+    dying. Returns `(world_model, resolved_name, provider)`.
     """
     store = WorldModelStore(root)
     resolved_name = _resolve_name(store, name)
-    world_model, provider = load_world_model(
-        store.resolve(resolved_name), telemetry_root=store.root
+    model_dir = store.resolve(resolved_name)
+    config = load_config(model_dir)
+    provider = RetryingProvider(
+        providers.get_provider(config.serve_provider_config()),
+        on_retry=_NARRATOR.on_retry,
+        sleep=_NARRATOR.sleep,
     )
+    world_model = WorldModel.load(str(model_dir), provider, telemetry_root=store.root)
     return world_model, resolved_name, provider
 
 

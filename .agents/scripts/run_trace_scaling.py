@@ -138,8 +138,8 @@ def main() -> None:
     parser.add_argument("--file", default=None, help="Raw OTel trace file (instead of a suite).")
     parser.add_argument(
         "--examples",
-        default="environment-capture",
-        help="Benchmark-suite root (all benchmark suites moved to environment-capture/).",
+        default="packages/environment-capture",
+        help="Benchmark-suite root (all benchmark suites moved to packages/environment-capture/).",
     )
     parser.add_argument("--counts", default=DEFAULT_COUNTS, help="Comma-separated train counts.")
     parser.add_argument("--modes", default="base,gepa", help="Comma-separated: base, gepa.")
