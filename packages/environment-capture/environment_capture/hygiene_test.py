@@ -154,14 +154,21 @@ def test_import_survives_missing_username(monkeypatch) -> None:  # noqa: ANN001
         raise KeyError("getpwuid(): uid not found")
 
     monkeypatch.setattr(hygiene.getpass, "getuser", _boom)
-    hygiene._runtime_markers.cache_clear()
+    hygiene._runtime_markers_cache = None
+    hygiene._identity_regexes_cache = None
     try:
         markers = hygiene._runtime_markers()
         assert str(Path.home()) in " ".join(markers)  # home still contributes
         clean = _trajectory("ls docs", "a.txt")
         assert host_escape_findings(clean) == []  # detection still works
+        assert hygiene._identity_regexes() == ()
     finally:
-        hygiene._runtime_markers.cache_clear()
+        hygiene._runtime_markers_cache = None
+        hygiene._identity_regexes_cache = None
+    # The failure must not be memoized: once getuser resolves again (monkeypatch undone),
+    # identity detection comes back in the same process — the cache is success-only.
+    monkeypatch.undo()
+    assert hygiene._identity_regexes() != ()
 
 
 def test_bare_username_word_does_not_flag() -> None:
@@ -213,3 +220,17 @@ def test_scan_spans_jsonl_honors_marker_policy(tmp_path: Path) -> None:
     path.write_text(json.dumps(span) + "\n")
     assert "sim1" in scan_spans_jsonl(path)
     assert scan_spans_jsonl(path, generic_path_markers=False) == {}
+
+
+def test_bare_root_sweep_is_flagged() -> None:
+    """`ls /` with the slash at end-of-command (the common form) is a filesystem-root sweep —
+    it must be refused like `ls / <anything>` is, or a lost agent lists the real host root."""
+    from environment_capture.hygiene import command_targets_host
+
+    assert command_targets_host("ls /")
+    assert command_targets_host("ls -la /")
+    assert command_targets_host("du -sh /")
+    assert command_targets_host("find / -name products.db")
+    assert not command_targets_host("ls ./")
+    assert not command_targets_host("ls data/")
+    assert not command_targets_host("grep -r pattern src/")

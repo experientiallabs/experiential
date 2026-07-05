@@ -7,6 +7,7 @@ the suite file. Generated run results are local artifacts, normally written unde
 from __future__ import annotations
 
 import json
+import logging
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+
+logger = logging.getLogger(__name__)
 
 SampleTurns = Literal["all", "sampled"]
 JudgeName = Literal["rubric", "match"]
@@ -78,13 +81,21 @@ class EvalResultSummary:
 
 
 def discover_eval_suites(examples_root: str | Path | Iterable[str | Path]) -> list[EvalSuite]:
-    """Find every example-local suite under `<root>/*/evals/*.toml` across one or more roots."""
+    """Find every example-local suite under `<root>/*/evals/*.toml` across one or more roots.
+
+    A malformed suite file is skipped with a warning naming the file and the parse error —
+    one broken benchmark dir must not take down listing/resolution for every other suite.
+    Loading the broken suite directly (by path) still raises the full error.
+    """
     suites: list[EvalSuite] = []
     for root in _as_roots(examples_root):
         if not root.exists():
             continue
         for path in sorted(root.glob("*/evals/*.toml")):
-            suites.append(load_eval_suite(path))
+            try:
+                suites.append(load_eval_suite(path))
+            except ValueError as exc:
+                logger.warning("skipping eval suite %s: %s", path, exc)
     return suites
 
 

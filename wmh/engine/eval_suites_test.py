@@ -54,3 +54,19 @@ def test_resolve_rejects_same_id_in_multiple_roots(tmp_path: Path) -> None:
     _write_suite(root_b, "alpha")
     with pytest.raises(ValueError, match="multiple roots"):
         resolve_eval_suite("alpha/default", [root_a, root_b])
+
+
+def test_discover_skips_malformed_suite_with_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One broken evals/*.toml must not take down discovery for every other benchmark."""
+    root = tmp_path / "examples"
+    _write_suite(root, "alpha")
+    bad_dir = root / "broken" / "evals"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "default.toml").write_text("not valid toml [[[", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        suites = discover_eval_suites(root)
+    assert [s.id for s in suites] == ["alpha/default"]
+    assert any("broken" in record.message for record in caplog.records)

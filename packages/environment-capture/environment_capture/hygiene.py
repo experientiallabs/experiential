@@ -32,7 +32,7 @@ _CMD_ESCAPE_RE = re.compile(
     r"|~(?:[/\s]|$)"
     r"|\$HOME\b"
     r"|cd\s+\.\."
-    r"|(?:find|ls|tree|du)\s+(?:-[^\s]+\s+)*/\s"
+    r"|(?:find|ls|tree|du)\s+(?:-[^\s]+\s+)*/(?:\s|$)"
     r")"
 )
 
@@ -63,38 +63,47 @@ _SENSITIVE_MARKERS = (
 )
 
 
-@functools.lru_cache(maxsize=1)
+# Manual success-only caches: a TRANSIENT resolution failure (a bare uid with no passwd entry,
+# a momentarily unset USER in a container) must degrade that one call, not get baked into an
+# lru_cache and silently disable identity detection for the rest of the process.
+_runtime_markers_cache: tuple[str, ...] | None = None
+_identity_regexes_cache: tuple[re.Pattern[str], ...] | None = None
+
+
 def _runtime_markers() -> tuple[str, ...]:
     """Machine-identity markers, learned at runtime (never committed as literals).
 
     The home PATH always contributes when resolvable. The bare username is NOT a marker on its
     own — common CI usernames (`runner`, `ubuntu`) appear as ordinary words in legitimate
     output — it is matched only in identity-shaped contexts (see `_identity_regexes`). Resolution
-    failures (a bare uid with no passwd entry and no USER env, as in some containers) degrade to
-    fewer markers instead of crashing the import.
+    failures degrade to fewer markers for THIS call instead of crashing the import; success is
+    cached, failure is retried.
     """
-    markers: list[str] = []
-    try:
-        markers.append(str(Path.home()))
-    except (KeyError, OSError, RuntimeError):
-        pass
-    return tuple(markers)
+    global _runtime_markers_cache
+    if _runtime_markers_cache is None:
+        try:
+            _runtime_markers_cache = (str(Path.home()),)
+        except (KeyError, OSError, RuntimeError):
+            return ()
+    return _runtime_markers_cache
 
 
-@functools.lru_cache(maxsize=1)
 def _identity_regexes() -> tuple[re.Pattern[str], ...]:
     """Username-in-context patterns: `ls -l` ownership columns and /home-style paths."""
-    try:
-        user = getpass.getuser()
-    except (KeyError, OSError):
-        return ()
-    quoted = re.escape(user)
-    return (
-        # ls -l style: permission bits ... links ... owner column.
-        re.compile(rf"[dl\-][rwxsStT\-]{{8}}\S*\s+\d+\s+{quoted}\b"),
-        # A home path constructed for this account on either platform.
-        re.compile(rf"/(?:Users|home)/{quoted}\b"),
-    )
+    global _identity_regexes_cache
+    if _identity_regexes_cache is None:
+        try:
+            user = getpass.getuser()
+        except (KeyError, OSError):
+            return ()
+        quoted = re.escape(user)
+        _identity_regexes_cache = (
+            # ls -l style: permission bits ... links ... owner column.
+            re.compile(rf"[dl\-][rwxsStT\-]{{9}}\S*\s+\d+\s+{quoted}\b"),
+            # A home path constructed for this account on either platform.
+            re.compile(rf"/(?:Users|home)/{quoted}\b"),
+        )
+    return _identity_regexes_cache
 
 
 def command_targets_host(command: str) -> bool:
@@ -111,12 +120,18 @@ class HygieneFinding:
     excerpt: str
 
 
-@functools.lru_cache(maxsize=4)
 def _marker_regex(generic_path_markers: bool) -> re.Pattern[str]:
-    """One alternation over the active marker set (single pass per text, built once)."""
+    """One alternation over the active marker set (single pass per text)."""
     markers = _SENSITIVE_MARKERS + _runtime_markers()
     if generic_path_markers:
         markers = _PATH_MARKERS + markers
+    return _compile_alternation(markers)
+
+
+@functools.lru_cache(maxsize=8)
+def _compile_alternation(markers: tuple[str, ...]) -> re.Pattern[str]:
+    """Compile once per distinct marker set — keyed on the markers themselves, so a runtime
+    marker that resolves later (see the success-only caches above) is picked up, not baked in."""
     return re.compile("|".join(re.escape(marker) for marker in markers))
 
 
