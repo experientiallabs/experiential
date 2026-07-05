@@ -19,7 +19,7 @@ Two jobs:
 Usage (from the repo root):
     uv run python packages/environment-capture/dabstep/fetch_data.py            # payments.csv only
     uv run python packages/environment-capture/dabstep/fetch_data.py --all      # every context file
-    uv run python packages/environment-capture/dabstep/fetch_data.py --expand   # append ~130 train tasks
+    uv run python packages/environment-capture/dabstep/fetch_data.py --expand  # +~130 train tasks
 """
 
 from __future__ import annotations

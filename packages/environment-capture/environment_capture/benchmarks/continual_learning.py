@@ -113,7 +113,8 @@ class ContinualLearningAdapter:
         if not self.db_path.exists():
             raise FileNotFoundError(
                 f"shared products.db not found at {self.db_path}. Fetch it first: "
-                f"`uv run python packages/environment-capture/continual-learning/fetch_data.py --confirm`"
+                f"`uv run python packages/environment-capture/continual-learning/fetch_data.py "
+                f"--confirm`"
             )
         target.symlink_to(self.db_path)
         return env

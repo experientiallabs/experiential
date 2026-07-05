@@ -7,8 +7,8 @@ here (a binary blob) and fetched by this script so a fresh clone is runnable. Th
 by ``build_split.py`` to (re)generate the committed train/test split. Stdlib-only (urllib).
 
 Usage (from the repo root):
-    uv run python packages/environment-capture/crmarena/fetch_data.py           # crm.db (the queryable org)
-    uv run python packages/environment-capture/crmarena/fetch_data.py --all     # + task file + schema
+    uv run python packages/environment-capture/crmarena/fetch_data.py        # crm.db only
+    uv run python packages/environment-capture/crmarena/fetch_data.py --all  # + task file + schema
 """
 
 from __future__ import annotations

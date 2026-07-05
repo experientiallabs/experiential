@@ -30,7 +30,8 @@ Written under this directory:
 
 Usage (from the repo root):
     # base: reproduce the original split
-    uv run python packages/environment-capture/bird-sql/fetch_data.py --minidev-root /path/to/minidev/MINIDEV
+    uv run python packages/environment-capture/bird-sql/fetch_data.py \
+        --minidev-root /path/to/minidev/MINIDEV
     # expand: append ~150 new train tasks across all 11 mini-dev databases
     uv run python packages/environment-capture/bird-sql/fetch_data.py \
         --minidev-root /path/to/minidev/MINIDEV --expand
