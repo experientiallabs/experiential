@@ -57,8 +57,8 @@ packages = ["wmh"]
 include = ["/wmh", "/README.md", "/pyproject.toml", "/conftest.py"]
 
 [tool.uv.workspace]
-# The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members are
-# top-level dirs, each independently published to PyPI. `uv sync` resolves the whole workspace.
+# The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members live
+# under packages/, each independently published to PyPI. `uv sync` resolves the whole workspace.
 members = ["packages/*"]
 
 [tool.uv.sources]
