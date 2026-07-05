@@ -45,6 +45,10 @@ DEFAULT_CORPUS = _HERE.parent / "traces.otel.jsonl"
 # simulator across every checkpoint row so rows differ only by policy.
 DEFAULT_USER_LLM = "bedrock/us.anthropic.claude-opus-4-8"
 
+# The pinned telecom scenarios were captured from telecom's 2285-task "full" split;
+# tau2's default split for the domain is "base" and raises on the missing ids.
+TASK_SET_OVERRIDES = {"telecom": "telecom_full"}
+
 
 def resolve_tasks(scenarios_path: Path, corpus_path: Path) -> list[dict]:
     """Map each pinned eval scenario to its real tau2 (domain, task_id) via provenance."""
@@ -80,6 +84,7 @@ def run_domain(args: argparse.Namespace, domain: str, task_ids: list[str], save_
         "run",
         "--domain",
         domain,
+        *(["--task-set-name", TASK_SET_OVERRIDES[domain]] if domain in TASK_SET_OVERRIDES else []),
         "--task-ids",
         *task_ids,
         "--num-trials",
