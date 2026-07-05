@@ -42,6 +42,31 @@ packages/environment-capture/
 Per-benchmark dirs follow the `examples/` discipline: only traces, small task data, and thin
 scripts are committed; cloned upstreams, venvs, and raw run output stay local and gitignored.
 
+## Corpora on the Hugging Face Hub
+
+Every publishable corpus is mirrored as a public dataset under the
+[`experiential-labs`](https://huggingface.co/experiential-labs) org (repo per benchmark:
+`experiential-labs/wmh-<benchmark>-traces`, license tag matching the upstream terms). Corpora are
+**local-first**: capture always writes `traces.otel.jsonl` into the benchmark dir and nothing ever
+deletes it; the Hub is the sharing/distribution layer.
+
+```bash
+# publish or UPDATE one corpus (or 'all') — every push is a Hub commit, history kept
+uv run python -m environment_capture.hub push bird-sql
+uv run python -m environment_capture.hub push all            # add --private for private repos
+
+# pull the full set (e.g. after cloning without corpora); never clobbers a local file
+uv run python -m environment_capture.hub fetch dabstep
+uv run python -m environment_capture.hub fetch all --force   # explicit overwrite
+
+# or push straight from a capture wave
+uv run python packages/environment-capture/dabstep/capture.py ... --push-hub
+```
+
+Pushing needs a write token (`hf auth login` or `HF_TOKEN`); fetching public corpora needs none.
+`appworld` is the deliberate exception: its license only allows encrypted redistribution of
+derivatives, so that corpus stays local-only (`hub.py` refuses to push it).
+
 ## Adding a benchmark
 
 **Agents: follow [INTEGRATION.md](INTEGRATION.md) — it is the complete, self-contained

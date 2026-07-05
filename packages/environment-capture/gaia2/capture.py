@@ -43,6 +43,7 @@ from environment_capture import (
 )
 from environment_capture.agent import ConverseClient
 from environment_capture.benchmarks.gaia2 import Gaia2Adapter, Gaia2Agent
+from environment_capture.hub import add_hub_args, push_after_capture
 
 _HERE = Path(__file__).parent
 _BENCHMARK = "gaia2"
@@ -175,6 +176,7 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=18)
     parser.add_argument("--out", default=str(_HERE / "traces.otel.jsonl"))
     parser.add_argument("--append", action="store_true", help="Append to --out (default: refuse)")
+    add_hub_args(parser)
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -218,6 +220,8 @@ def main() -> None:
         f"captured {sink.n_traces} runs with transitions ({sink.n_steps} steps, "
         f"mean reward {mean_reward:.3f}) in {time.time() - started:.0f}s -> {out} (raw: {sink.raw})"
     )
+    push_after_capture("gaia2", enabled=args.push_hub, private=args.hub_private)
+
 
 
 if __name__ == "__main__":

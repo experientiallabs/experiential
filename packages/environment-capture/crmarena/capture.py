@@ -36,6 +36,7 @@ from environment_capture import (
 )
 from environment_capture.agent import BedrockBashAgent
 from environment_capture.benchmarks.crmarena import CrmArenaAdapter
+from environment_capture.hub import add_hub_args, push_after_capture
 from environment_capture.trajectory import Task
 
 _HERE = Path(__file__).parent
@@ -109,6 +110,7 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=16)
     parser.add_argument("--out", default=str(_HERE / "traces.otel.jsonl"))
     parser.add_argument("--append", action="store_true", help="Append to --out (default: refuse)")
+    add_hub_args(parser)
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -158,6 +160,8 @@ def main() -> None:
         f"{sum(len(t.steps) for t in kept)} steps, mean reward {mean_reward:.3f}) "
         f"in {time.time() - started:.0f}s -> {out} (raw: {raw_path})"
     )
+    push_after_capture("crmarena", enabled=args.push_hub, private=args.hub_private)
+
 
 
 if __name__ == "__main__":
