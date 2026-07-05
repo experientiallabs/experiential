@@ -197,6 +197,38 @@ def test_eval_trace_file_command_still_scores(patched_provider, tmp_path) -> Non
     assert "fidelity=0.500" in result.output
 
 
+def test_eval_pinned_judge_builds_its_own_provider(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    """--judge-model pins the grader to its own provider config (vs riding the serve model)."""
+    import wmh.providers as providers_pkg
+
+    requested: list[tuple[str, str]] = []
+
+    def recording_get_provider(config):  # noqa: ANN001, ANN202
+        requested.append((config.kind.value, config.model))
+        return FakeProvider()
+
+    monkeypatch.setattr(providers_pkg, "get_provider", recording_get_provider)
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            _traces_file(tmp_path),
+            "--judge",
+            "match",
+            "--no-rag",
+            "--model",
+            "serve-model",
+            "--judge-model",
+            "pinned-judge",
+            "--judge-provider",
+            "bedrock",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert ("bedrock", "serve-model") in requested
+    assert ("bedrock", "pinned-judge") in requested
+
+
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
     examples_root = tmp_path / "examples"
     task_dir = examples_root / "tiny-task"

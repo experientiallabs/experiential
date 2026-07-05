@@ -436,6 +436,15 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     judge: str | None = typer.Option(
         None, help="Scorer: rubric (5-dim) | match (functional). Default: rubric, or suite config."
     ),
+    judge_model: str | None = typer.Option(
+        None,
+        "--judge-model",
+        help="Pin the judge to its own model instead of the serve model. Comparing fidelity "
+        "across serve backends REQUIRES a pinned judge, or the grader changes with the cell.",
+    ),
+    judge_provider: str = typer.Option(
+        "bedrock", "--judge-provider", help="Provider for --judge-model."
+    ),
     sample_turns: str | None = typer.Option(
         None, help="Turns scored per trace: all | sampled (5). Default: all, or suite config."
     ),
@@ -488,6 +497,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             embed_dim=embed_dim,
             rag=rag,
             judge=judge,
+            judge_model=judge_model,
+            judge_provider=judge_provider,
             sample_turns=sample_turns,
             seed=seed,
             top_k=top_k,
@@ -516,6 +527,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         provider=provider,
         model=model,
         region=region,
+        judge_model=judge_model,
+        judge_provider=judge_provider,
     )
     _print_eval_report(report)
     if out:
@@ -606,6 +619,8 @@ def _eval_run_suite(
     embed_dim: int | None,
     rag: bool | None,
     judge: str | None,
+    judge_model: str | None,
+    judge_provider: str,
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
@@ -624,7 +639,15 @@ def _eval_run_suite(
         top_k=top_k if top_k is not None else suite.config.top_k,
     )
     files = suite.resolve_files()
-    report = _run_eval_files(files, options, provider=provider, model=model, region=region)
+    report = _run_eval_files(
+        files,
+        options,
+        provider=provider,
+        model=model,
+        region=region,
+        judge_model=judge_model,
+        judge_provider=judge_provider,
+    )
     _print_eval_report(report)
 
     run_id = uuid4().hex
@@ -641,6 +664,8 @@ def _eval_run_suite(
             "provider": provider,
             "model": model,
             "region": region,
+            "judge_model": judge_model,
+            "judge_provider": judge_provider if judge_model else None,
             "prompt": options.prompt_file,
             "files": [str(path) for path in files],
             "train_split": options.train_split,
@@ -715,6 +740,8 @@ def _run_eval_files(
     provider: str,
     model: str,
     region: str | None,
+    judge_model: str | None = None,
+    judge_provider: str = "bedrock",
 ) -> EvalReport:
     for path in files:
         if not path.exists():
@@ -731,7 +758,16 @@ def _run_eval_files(
         else BASE_ENV_PROMPT
     )
     embedder = HashingEmbedder(dim=options.embed_dim) if options.use_rag else None
-    scorer = RubricJudge(llm) if options.judge == "rubric" else LLMJudge(llm)
+    # A pinned judge keeps the grader constant when fidelity is compared across serve
+    # backends; without it the judge changes with the cell and the numbers don't compare.
+    judge_llm = (
+        providers.get_provider(
+            ProviderConfig(kind=ProviderKind(judge_provider), model=judge_model, region=region)
+        )
+        if judge_model
+        else llm
+    )
+    scorer = RubricJudge(judge_llm) if options.judge == "rubric" else LLMJudge(judge_llm)
     return evaluate_files(
         files,
         prompt,
