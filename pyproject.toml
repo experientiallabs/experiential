@@ -49,7 +49,10 @@ packages = ["wmh"]
 python_files = ["*_test.py"]
 # examples/ tests guard committed data contracts (pinned scenario sets, exporters) and
 # must fail the same gate that guards wmh/ — they are hermetic (no creds, no network).
-testpaths = ["wmh", "examples"]
+# examples/ are gated per-directory, not via flat testpaths: the benchmark rl/ dirs
+# share helper basenames (real_eval.py, pin_scenarios.py) that collide in one pytest
+# session. Gate them with:  for d in examples/*/rl; do uv run pytest "$d" -q; done
+testpaths = ["wmh"]
 
 [tool.ruff]
 line-length = 100
