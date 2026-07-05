@@ -67,6 +67,13 @@ def _fallback_chain(config: ProviderConfig) -> Provider:
     chain = [get_provider(config), get_provider(config)]
     if config.kind is ProviderKind.BEDROCK and config.region != "us-west-2":
         chain.append(get_provider(config.model_copy(update={"region": "us-west-2"})))
+    # Cross-PROVIDER last resort for Opus 4.8: the Anthropic direct API (own quota pool,
+    # rides through Bedrock-wide storms). Key distributed to the box .envs (Silen ack'd
+    # direct-key use after the D68 OpenAI termination).
+    if "opus-4-8" in config.model and os.environ.get("ANTHROPIC_API_KEY"):
+        chain.append(
+            get_provider(ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-opus-4-8"))
+        )
     return FallbackProvider(chain)
 
 
@@ -123,6 +130,7 @@ def main() -> None:
         raise SystemExit(f"usage: {sys.argv[0]} train|eval [port]")
     mode = sys.argv[1]
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+    _load_dotenv()  # OPENAI/ANTHROPIC keys for backend swaps + the direct-API opus link
 
     top_k: int | None = None
     if mode == "train":
