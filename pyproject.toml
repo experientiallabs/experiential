@@ -59,7 +59,7 @@ include = ["/wmh", "/README.md", "/pyproject.toml", "/conftest.py"]
 [tool.uv.workspace]
 # The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members are
 # top-level dirs, each independently published to PyPI. `uv sync` resolves the whole workspace.
-members = ["llm-waterfall"]
+members = ["packages/*"]
 
 [tool.uv.sources]
 # Inside the workspace, anything that depends on a member resolves it from source, not PyPI.
@@ -69,7 +69,7 @@ llm-waterfall = { workspace = true }
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
 # One root gate covers the flagship and every Python member (same inline-test convention).
-testpaths = ["wmh", "llm-waterfall"]
+testpaths = ["wmh", "packages"]
 
 [tool.ruff]
 line-length = 100
