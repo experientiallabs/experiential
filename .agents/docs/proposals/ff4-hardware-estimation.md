@@ -1,0 +1,196 @@
+---
+area: Form-factor launch (FF4)
+status: Proposal — v1 domains chosen, capture architecture pending sign-off
+created: 2026-07-05
+---
+
+# FF4 — the world model as a pre-run estimator
+
+**Thesis.** Any process whose real measurement loop is slow, expensive, or dangerous can be
+compressed by a world model trained on traces of real runs: propose a configuration
+(action = structured tool call), get a predicted measured outcome (observation = numbers +
+failure states) *before* running it. A "trace" is a sweep session, so retrieval conditions on
+sweep history — the WM does grounded in-context regression **with provenance**: every estimate
+traces back to real runs on *your* hardware, not a textbook formula. This is the entry point to
+the manufacturing/hardware wedge: physical testing cycles are slow and expensive; companies need
+cheaper counterfactual testing before building.
+
+## The domain taxonomy
+
+Every entry has the same shape: **config → measured outcome (+ failure cliff, if any)**, with a
+ground-truth tag: `[have-now]` measurable on hardware we own (M3 Max 128 GB / MPS, 2×H100 dev
+box), `[public-data]` distillable from a published dataset, `[synthetic]` generatable from a
+real toolchain, `[acquire]` needs partner data or lab access.
+
+### 1. Performance & resources
+
+- **ML training memory / OOM / throughput** `[have-now]` — model dims, batch, seq len, dtype,
+  optimizer, grad-checkpointing, device → peak memory, tokens/sec, **OOM-or-not**.
+  *Useful:* right-size the GPU before renting it; predict the OOM before launching the
+  multi-hour job; the failure cliff is where analytic formulas systematically miss (allocator
+  overhead, fragmentation, MPS/CUDA context).
+- **LLM inference serving** (vLLM) `[have-now, H100]` — batch, context length, quantization,
+  KV-cache config, tensor parallel → throughput, TTFT/ITL latency, **CUDA OOM**.
+  *Useful:* capacity planning and "will this model fit at this context length" answered without
+  burning GPU-hours; the most quotable form of the launch ("predict the OOM before you rent the
+  GPU").
+- **FPGA synthesis + place-and-route** (yosys/nextpnr) `[have-now, synthetic-from-real-tool]` —
+  HDL design parameters (width, depth, pipeline stages, target part) → LUT/BRAM/DSP usage,
+  **fits-on-chip-or-not**, max clock MHz. *Useful:* P&R is the minutes-to-hours loop hardware
+  engineers actually wait on; predicting "fits + closes timing" before the run compresses EDA
+  iteration. The most genuinely hardware-flavored corpus we can ground-truth today, and the
+  gateway to full chip-design PPA estimation (OpenROAD/OpenLane).
+- **Distributed training config** `[have-now, 2×H100]` — DDP/FSDP/TP sharding, gradient
+  accumulation → step time, comms overhead, memory per rank. *Useful:* pick the cluster layout
+  before the multi-node rental.
+- **Embedded firmware size** (arm-none-eabi-gcc for MCU targets) `[have-now]` — features,
+  optimization flags, target MCU → .text/.data/.bss bytes, **fits-in-flash-or-not**.
+  *Useful:* flash/RAM exhaustion is embedded's OOM; cheap to sweep, real hardware constraint.
+- **Build/CI resource profiling** `[have-now]` — -j, LTO, debug/release, cache state → build
+  wall-clock, peak RSS. *Useful:* schedule runners, predict CI duration before pushing.
+- **Database query performance** `[have-now]` — indexes, work_mem, table scale → latency, plan
+  choice, **spill-to-disk**. *Useful:* predict the plan flip before it happens on prod-size data.
+- **Media encoding** (ffmpeg) `[have-now]` — codec, preset, CRF, resolution → encode time, file
+  size, VMAF quality. *Useful:* pick the rate/quality/speed point without sweeping.
+- **OS/kernel tuning** `[have-now]` — sysctl/scheduler/network-stack knobs → benchmark
+  throughput/latency. *Useful:* tuning without reboot-and-measure loops.
+
+### 2. Energy & thermal
+
+- **GPU power capping** `[have-now, H100]` — nvidia-smi power limit × workload → throughput,
+  joules/token, clocks. *Useful:* perf-per-watt frontier for datacenter capacity and energy cost
+  forecasting, measured on the actual card.
+- **Apple Silicon power/thermal** (powermetrics) `[have-now]` — workload config → package watts,
+  **thermal-throttle onset**, sustained clock. *Useful:* the only *physically* measured signal
+  (heat) we can capture today; predicts sustained vs burst performance.
+- **Battery drain / cycle life** `[public-data: NASA, Severson et al.]` — charge protocol,
+  temperature, load → capacity fade, **end-of-life**. *Useful:* each real data point costs weeks
+  of cycling; the canonical "expensive physical measurement" domain.
+- **Datacenter/HVAC cooling** `[acquire]` — setpoints, load placement → PUE, hotspot temps.
+  *Useful:* counterfactual cooling policies without risking thermal incidents.
+
+### 3. Accuracy & quality (predicting experiment outcomes)
+
+- **Hyperparameter → final accuracy** `[public-data: LCBench, HPO-B, YAHPO; have-now for small
+  models]` — HP config (+ optional early learning-curve prefix) → final val accuracy, wall-clock.
+  *Useful:* kill bad runs early, HPO without full training; large public sweep datasets exist to
+  distill.
+- **ML-experiment outcome prediction** (MLE-bench / PaperBench style) `[synthetic-from-agent-runs,
+  expensive]` — an ML-engineering plan or paper-reproduction attempt → achieved score,
+  success/failure. *Useful:* route agent compute to attempts likely to work; meta-level estimator
+  for agentic ML engineering. Each ground-truth point is itself an expensive agent run — a later
+  corpus, possibly distilled from published benchmark run logs.
+- **Quantization/pruning → accuracy drop** `[have-now]` — method, bits, layer selection → eval
+  score delta, speedup. *Useful:* pick compression without an eval sweep per candidate.
+- **Data mix / scale extrapolation** `[public-data + have-now small-scale]` — corpus mix, model
+  scale → loss. *Useful:* the scaling-law question every lab asks; hardest generalization claim.
+- **RAG/prompt config → eval score** `[have-now — dogfood]` — retriever k, prompt variant, model
+  → suite fidelity, cost. *Useful:* wmh predicting its own eval outcomes; recursive but real.
+
+### 4. Reliability, failure & safety
+
+- **Load/chaos testing** `[have-now]` — request rate, concurrency, pod memory limits → p99
+  latency, error rate, **collapse point**. *Useful:* find the breaking point without breaking
+  prod; counterfactual load tests.
+- **Container/K8s sizing** `[have-now]` — cgroup memory/CPU limits × workload → **OOM-kill**,
+  throttling, runtime. *Useful:* right-size deployments; real kernel OOM-killer as ground truth.
+- **API rate-limit behavior** `[have-now — we already meter this]` — request pattern, model,
+  region → throttle rate, retry latency. *Useful:* capacity-plan against providers; the Bedrock
+  throttling traces exist as a byproduct of every capture we run.
+- **Flaky-test probability** `[have-now]` — test, parallelism, seed, machine load → pass/fail
+  distribution. *Useful:* predict flake before merging retry-loops into CI.
+- **Hardware-damage envelopes** `[acquire]` — over-voltage/thermal-runaway boundaries.
+  *Useful:* the safety case for physical iteration — never measure the cliff by falling off it.
+
+### 5. Cost & time
+
+- **Cloud job cost/duration** `[have-now]` — instance type, spot vs on-demand, job config →
+  $ and wall-clock (composite over category 1). *Useful:* quote the run before submitting it;
+  finops as a world-model query.
+- **LLM API cost/latency** `[have-now — MeteredProvider already records it]` — model, prompt
+  shape, batching → tokens, $, latency. *Useful:* free corpus from our own tracking data.
+
+### 6. Physical hardware & manufacturing — the wedge
+
+All `[acquire]` unless noted; each iteration costs days-to-weeks and real money, which is exactly
+why a grounded estimator is valuable — and why v1 uses the cheapest-to-measure proxies above to
+prove the method first.
+
+- **PCB design** — stackup, trace geometry, materials → impedance, crosstalk, EMC pre-scan
+  results, **bring-up failures**. *Useful:* a respin costs weeks + thousands of dollars; board
+  bring-up logs are the trace corpus a hardware org already has.
+- **Antenna/RF tuning** — geometry, matching network → S11, gain, bandwidth.
+- **3D printing** `[semi-have-now: slicer estimates free; real print outcomes need a printer]` —
+  layer height, speed, temps → print time, **warp/adhesion failure**.
+- **CNC machining** — feeds, speeds, material → surface finish, tool wear, **chatter**.
+- **Semiconductor process** `[public-data: SECOM]` — process parameters → yield, defect class.
+- **Turbofan/rotating-machinery degradation** `[public-data: NASA C-MAPSS]` — operating profile →
+  remaining useful life. *Useful:* the classic prognostics benchmark, reframed as WM estimation.
+- **Wet-lab / materials synthesis** — protocol parameters → yield, purity. *Useful:* the
+  science-vertical version of the same loop.
+
+## v1 choice (user, 2026-07-05): start with the simplest three and see how they perform
+
+1. **ml-memory** — torch train/infer sweeps on M3 Max (MPS/CPU); optional CUDA leg on the H100
+   dev box. Headline: OOM classification + peak-memory/throughput relative error.
+2. **vllm-serving** — vLLM sweeps on the H100 dev box: fits-at-context?, throughput, latency.
+3. **fpga-pnr** — yosys/nextpnr iCE40/ECP5 sweeps locally: fits?, LUTs, Fmax.
+
+All three share one corpus schema (config tool-call → measured JSON), one judge
+(`wmh.optimize.numeric.NumericJudge`: relative error + threshold classification), and one
+baseline table (analytic formula where one exists, k-NN over training sweeps, mean predictor).
+Honesty rule: if a baseline wins, the table ships anyway and the framing shifts to provenance +
+breadth ("one estimator, any process you have traces for, grounded in your hardware"), not
+point accuracy.
+
+## Capture architecture: extend `environment-capture` (PR #56) with sweep capture
+
+PR #56's contract is agent-runs-a-benchmark: `BenchmarkAdapter.tasks/open_env/grade`,
+`CommandEnv.execute(command) -> ExecResult`, `run_capture` (per-task failure isolation), an OTel
+GenAI JSONL emitter pinned against `wmh.ingest`, and `CommandEnv.execute` as the WM-swap seam.
+
+**Assessment: reuse is the right call.** A sweep session maps cleanly onto the existing record
+types — `Task` = one sweep spec ("characterize gpt2-family training memory on MPS"),
+`StepRecord` = one (config tool-call → measured-JSON observation) transition, `Trajectory` = the
+sweep session, `trajectory_to_spans` emits the corpus with zero wire-format work, and
+`run_capture`'s isolation is exactly what a sweep needs (measurement runs *crash by design* —
+OOM is data, not an error). Two deliberate deltas, both additive:
+
+1. **The "agent" is not an LLM.** A `SweepPolicy` (grid / random / adaptive-bisection toward the
+   cliff) implements the existing `CaptureAgent` protocol. Consequence worth advertising:
+   sweep capture is deterministic and token-free — corpus cost is pure measurement time.
+2. **Measurement envs run the config in a subprocess.** A generic
+   `SubprocessMeasurementEnv(measure_fn)` executes one JSON-config command per fresh child
+   process (an OOM must kill the child, never the sweep), returns measured JSON as
+   `ExecResult.output`, and encodes *outcome* failures (OOM, doesn't-fit, timing-fail) as fields
+   in the measurement — `is_error` stays reserved for "the measurement itself broke". This is
+   the general "capture traces from a package" mechanism: a domain dir contributes one pure
+   `measure(config) -> measurements` function over its package (torch, vLLM client, yosys
+   wrapper) plus a config-space spec; everything else is shared.
+
+Open contract question for WS-B2 (via DECISIONS.md): `grade()` is meaningless for sweeps
+(`Trajectory.reward` is already optional). Options: (a) sweeps return `reward=None` through a
+trivial `grade`, or (b) a sibling `SweepAdapter` protocol without `grade`, sharing every other
+type. We propose (b) — honest surfaces over vacuous methods — but implement whichever WS-B2
+prefers, since they own the package.
+
+Layout (follows PR #56's benchmark-dir pattern): shared sweep machinery in
+`environment_capture/sweep.py` (+ tests, inside the python gate); domain dirs
+`packages/environment-capture/{ml-memory,vllm-serving,fpga-pnr}/` each with `measure.py`,
+`configspace.py`, `capture.py`, `README.md`, committed `traces.otel.jsonl`, and `evals/*.toml`;
+heavy deps (torch pinned, vllm, yosys via oss-cad-suite) in domain-local venvs, gate-excluded.
+Sequencing risk: PR #56 is open — FF4 branches from it (or rebases when it merges) rather than
+duplicating the contract; if #56 stalls, fallback is the older self-contained
+`examples/<name>/` converter pattern.
+
+## Eval & demo
+
+- **Open-loop**: D12 conventions, scored by `NumericJudge` — per-field relative error +
+  threshold classification (OOM/fits) from `JudgeResult.dimensions`. Held-out = random configs
+  (interpolation headline) **plus** one held-out region per domain (e.g. batch sizes above
+  anything swept) reported separately as the extrapolation stress test.
+- **Closed-loop teaser**: `wmh.env.run_episode` with a sweep agent searching for "max batch that
+  fits" against WM vs real env — does the WM-guided search land on the same config with N× fewer
+  real runs?
+- **Demo**: `wmh play` REPL against the built models ("batch 64, seq 2048, fp16, MPS → ?") — the
+  ask-your-hardware GIF.
