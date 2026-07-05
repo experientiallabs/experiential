@@ -45,9 +45,11 @@ DEFAULT_CORPUS = _HERE.parent / "traces.otel.jsonl"
 # simulator across every checkpoint row so rows differ only by policy.
 DEFAULT_USER_LLM = "bedrock/us.anthropic.claude-opus-4-8"
 
-# The pinned telecom scenarios were captured from telecom's 2285-task "full" split;
-# tau2's default split for the domain is "base" and raises on the missing ids.
-TASK_SET_OVERRIDES = {"telecom": "telecom_full"}
+# The pinned telecom scenarios were captured from telecom's 2285-task "full" split
+# (get_tasks("telecom", task_split_name="full") — see capture_telecom_multimodel.py);
+# tau2's default split is "base" and raises on the missing ids. (--task-set-name
+# telecom_full is NOT equivalent: that set's loader rejects split names entirely.)
+TASK_SPLIT_OVERRIDES = {"telecom": "full"}
 
 
 def resolve_tasks(scenarios_path: Path, corpus_path: Path) -> list[dict]:
@@ -84,7 +86,11 @@ def run_domain(args: argparse.Namespace, domain: str, task_ids: list[str], save_
         "run",
         "--domain",
         domain,
-        *(["--task-set-name", TASK_SET_OVERRIDES[domain]] if domain in TASK_SET_OVERRIDES else []),
+        *(
+            ["--task-split-name", TASK_SPLIT_OVERRIDES[domain]]
+            if domain in TASK_SPLIT_OVERRIDES
+            else []
+        ),
         "--task-ids",
         *task_ids,
         "--num-trials",
