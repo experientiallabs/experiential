@@ -110,6 +110,9 @@ def run_domain(args: argparse.Namespace, domain: str, task_ids: list[str], save_
         "{}",
         "--save-to",
         save_name,
+        # Reruns must not block on the interactive "resume? (y/n)" prompt (observed: a
+        # headless rerun sat on it for hours).
+        "--auto-resume",
     ]
     env = os.environ | {"TAU2_DATA_DIR": args.data_dir}
     print(f"[real_eval] {domain}: {len(task_ids)} tasks x {args.trials} trials", flush=True)
