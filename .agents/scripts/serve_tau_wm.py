@@ -124,10 +124,30 @@ def main() -> None:
     mode = sys.argv[1]
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
 
+    top_k: int | None = None
     if mode == "train":
+        # Fidelity->transfer curve (D67): WMH_ENV_MODEL/WMH_ENV_PROVIDER swap the env
+        # backend per curve point; the reward judge stays PINNED on the haiku chain so
+        # points differ by environment fidelity only. WMH_TOP_K=0 = the no-RAG point.
         haiku = ProviderConfig(kind=ProviderKind.BEDROCK, model=HAIKU_MODEL, region="us-east-1")
-        serve_provider = _fallback_chain(haiku)
-        reward_provider = serve_provider
+        reward_provider = _fallback_chain(haiku)
+        env_model = os.environ.get("WMH_ENV_MODEL")
+        env_kind = ProviderKind(os.environ.get("WMH_ENV_PROVIDER", "bedrock"))
+        if env_model is None:
+            serve_provider = reward_provider
+        else:
+            if env_kind is ProviderKind.OPENAI:
+                _load_dotenv()
+            serve_provider = _fallback_chain(
+                ProviderConfig(
+                    kind=env_kind,
+                    model=env_model,
+                    region="us-east-1" if env_kind is ProviderKind.BEDROCK else None,
+                )
+            )
+        raw_top_k = os.environ.get("WMH_TOP_K")
+        if raw_top_k is not None:
+            top_k = int(raw_top_k)
         env_temp = os.environ.get("WMH_ENV_TEMPERATURE")
         if env_temp is not None:
             serve_provider = PinnedTemperatureProvider(serve_provider, float(env_temp))
@@ -144,7 +164,9 @@ def main() -> None:
             ProviderConfig(kind=ProviderKind.BEDROCK, model=JUDGE_MODEL, region="us-east-1")
         )
 
-    wm = WorldModel.load(str(MODEL_DIR), serve_provider, reward_provider=reward_provider)
+    wm = WorldModel.load(
+        str(MODEL_DIR), serve_provider, reward_provider=reward_provider, top_k=top_k
+    )
     app = create_app(world_models={"tau-bench": wm})
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 

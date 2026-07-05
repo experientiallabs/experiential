@@ -54,6 +54,7 @@ class WorldModel:
         embedder: Embedder | None = None,
         telemetry_root: str | Path | None = None,
         reward_provider: Provider | None = None,
+        top_k: int | None = None,
     ) -> WorldModel:
         """Construct from a built `.wmh/` artifact (optimized prompt + indexed replay buffer).
 
@@ -61,7 +62,8 @@ class WorldModel:
         when omitted we reconstruct the configured embedder (`embed_provider` + `embed_dim`), which
         defaults to the offline `HashingEmbedder` so loading needs no embedding credentials.
         `reward_provider` backs `score_session` (defaults to `provider`) — pass it to judge with a
-        different model than the one simulating the environment.
+        different model than the one simulating the environment. `top_k` overrides the artifact's
+        pinned retrieval depth (0 disables retrieval demos entirely — a "no-RAG" ablation serve).
         """
         config = load_config(artifact_dir)
         paths = ArtifactPaths(artifact_dir)
@@ -79,7 +81,7 @@ class WorldModel:
             provider,
             retriever,
             env_prompt=env_prompt,
-            top_k=config.top_k,
+            top_k=config.top_k if top_k is None else top_k,
             telemetry_root=telemetry_root or _default_telemetry_root(artifact_dir),
             reward_provider=reward_provider,
         )
