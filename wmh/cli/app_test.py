@@ -422,12 +422,13 @@ def test_build_interactive_wizard_creates_model(
     for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(var, "test-cred")  # creds present: no interactive key prompts
     # --interactive forces the wizard even under CliRunner (non-TTY); feed each answer line in
-    # prompt order: name, file, provider (select), model (select), region (bedrock only),
-    # judge model (select), budget, embedder (select). The offline 'hashing' embedder skips
-    # the embed-model prompt; phi dim isn't prompted. Provider/model/embedder pick by index.
+    # prompt order: name, trace source (select), file, provider (select), model (select), region
+    # (bedrock only), judge model (select), budget, embedder (select). The offline 'hashing'
+    # embedder skips the embed-model prompt; phi dim isn't prompted. Selects pick by index.
     answers = "\n".join(
         [
             "wizard-built",
+            "",  # trace source: accept the default (otel-genai)
             _traces_file(tmp_path),
             "3",  # provider: bedrock (order: openai, anthropic, bedrock, azure, ...)
             "1",  # model: us.anthropic.claude-opus-4-8

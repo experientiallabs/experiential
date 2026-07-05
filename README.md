@@ -26,6 +26,8 @@ A frontier LLM acts as the *environment* your agent steps against, reconstructed
 1. **Build** from your OTel traces: ingest → normalize → split train/held-out → index a replay buffer → evolve the env prompt with GEPA against the held-out split.
 2. **Serve**: agents call `WorldModel.step(action)` (in-process or via the local HTTP backend). Each step retrieves the most similar past `(state, action) → observation` examples and predicts the next observation.
 
+Already have traces in **Braintrust, Arize Phoenix, Langfuse, LangSmith, PostHog, or Mastra** — or just chat/tool-call logs? Pick the source right in `wmh build` (`--source <name>` with `--file` or `--pull`, or choose it in the wizard); it's normalized into the harness's trace format via one pluggable interface, no separate step. See [`docs/ingest.md`](./docs/ingest.md).
+
 ## Try it
 
 ```bash

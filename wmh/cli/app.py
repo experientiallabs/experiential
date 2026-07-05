@@ -65,7 +65,7 @@ from wmh.engine.eval_suites import (
 )
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
-from wmh.ingest import VendorPull
+from wmh.ingest import VendorPull, list_adapters
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import EmbedderKind
@@ -220,8 +220,23 @@ def examples_run(
 @app.command("build")
 def build(
     name: str = typer.Option(None, "--name", help="Name for this world model."),
-    file: str = typer.Option(None, "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
-    vendor: str = typer.Option(None, "--vendor", help="Vendor name to pull traces via SDK."),
+    source: str = typer.Option(
+        "otel-genai",
+        "--source",
+        help="Trace source adapter: otel-genai, chat-json, braintrust, phoenix, langfuse, "
+        "langsmith, posthog, mastra.",
+    ),
+    file: str = typer.Option(None, "--file", help="Path to an exported traces file for --source."),
+    pull: bool = typer.Option(
+        False, "--pull", help="Pull traces live from the source's vendor API (instead of --file)."
+    ),
+    project: str = typer.Option(None, "--project", help="Vendor project/workspace id (--pull)."),
+    api_key: str = typer.Option(None, "--api-key", help="Vendor API key (else env var)."),
+    since: str = typer.Option(None, "--since", help="Only pull traces since this ISO timestamp."),
+    limit: int = typer.Option(None, "--limit", help="Max number of traces to pull."),
+    vendor: str = typer.Option(
+        None, "--vendor", help="[deprecated] alias for --source <name> --pull."
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
     provider: str = typer.Option(
         None, "--provider", help="Provider that serves the model (default: bedrock)."
@@ -254,15 +269,26 @@ def build(
     With no `--name`/`--file` on an interactive terminal, this launches a guided creation wizard;
     pass `--no-interactive` (or any of those flags) to stay fully scriptable.
     """
+    # `--vendor <name>` is the deprecated alias for `--source <name> --pull`: it names the source
+    # adapter and implies a live pull.
+    if vendor:
+        source = vendor
+        pull = True
+
     # Decide whether to run the wizard: explicit flag wins; otherwise auto when at a TTY and the
-    # essential inputs (a name and a trace source) were not supplied.
-    needs_input = name is None or (file is None and vendor is None)
+    # essential inputs (a name and a trace source — a file or a live pull) were not supplied.
+    needs_input = name is None or (file is None and not pull)
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
     params = BuildParams(
         name=name or DEFAULT_MODEL_NAME,
+        source=source,
         file=file,
-        vendor=vendor,
+        pull=pull,
+        project=project,
+        api_key=api_key,
+        since=since,
+        limit=limit,
         provider=provider,
         model=model,
         region=region,
@@ -275,8 +301,16 @@ def build(
     )
     if use_wizard:
         params = run_build_wizard(_console, params)
-    elif name is None and file is None and vendor is None:
-        raise typer.BadParameter("provide --file (or --vendor), or run `wmh build` interactively")
+    elif name is None and file is None and not pull:
+        raise typer.BadParameter(
+            "provide --file <export> or --pull (with --source), or run `wmh build` interactively"
+        )
+    if params.file and params.pull:
+        raise typer.BadParameter("pass either --file or --pull, not both")
+    if params.source not in list_adapters():
+        raise typer.BadParameter(
+            f"unknown --source {params.source!r}; choose one of: {', '.join(list_adapters())}"
+        )
     # The wizard always resolves a provider; the flag path keeps its historical default.
     params.provider = params.provider or "bedrock"
 
@@ -320,6 +354,7 @@ def build(
         gepa_budget=params.gepa_budget,
         train_split=params.train_split,
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
+        trace_adapter=params.source,
     )
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
@@ -347,8 +382,17 @@ def build(
     with tracker.timed(), RichBuildReporter(_console, params.name) as reporter:
         result = run_build(
             config,
-            file=params.file,
-            vendor=VendorPull() if params.vendor else None,
+            file=None if params.pull else params.file,
+            vendor=(
+                VendorPull(
+                    api_key=params.api_key,
+                    project=params.project,
+                    since=params.since,
+                    limit=params.limit,
+                )
+                if params.pull
+                else None
+            ),
             root=model_dir,
             serve_provider=metered,
             judge_provider=metered_judge,

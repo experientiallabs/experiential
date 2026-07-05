@@ -109,7 +109,18 @@ class BuildParams(BaseModel):
     """The fully-resolved inputs for a build, as collected by the creation wizard."""
 
     name: str
+    # Trace source: which adapter ingests, and where the traces come from. `source` is a registered
+    # adapter name (otel-genai, chat-json, braintrust, phoenix, langfuse, langsmith, posthog,
+    # mastra). A source is read from a `file` export or `pull`ed live from its vendor API
+    # (`project`/`api_key`, optionally windowed by `since`/`limit`).
+    source: str = "otel-genai"
     file: str | None = None
+    pull: bool = False
+    project: str | None = None
+    api_key: str | None = None
+    since: str | None = None
+    limit: int | None = None
+    # Deprecated alias for `--source <name> --pull`; kept so old invocations keep working.
     vendor: str | None = None
     # None = not chosen yet: the wizard suggests the first provider with credentials present,
     # and the non-interactive path falls back to bedrock.
@@ -123,6 +134,81 @@ class BuildParams(BaseModel):
     embed_provider: str = "hashing"
     embed_model: str | None = None
     embed_dim: int = 512
+
+
+# Trace sources offered in the build wizard: name -> (label, can-pull-live). File-only sources
+# (otel-genai/chat-json) read an export; the rest can also pull live from a vendor API. Any adapter
+# registered in `wmh.ingest` is usable via `--source` even if it isn't surfaced here.
+_SOURCES: dict[str, tuple[str, bool]] = {
+    "otel-genai": ("OpenTelemetry GenAI spans (file)", False),
+    "chat-json": ("Chat / tool-call log, OpenAI-style (file)", False),
+    "braintrust": ("Braintrust", True),
+    "phoenix": ("Arize Phoenix", True),
+    "langfuse": ("Langfuse", True),
+    "langsmith": ("LangSmith", True),
+    "posthog": ("PostHog", True),
+    "mastra": ("Mastra", True),
+}
+
+
+def _collect_source(
+    console: Console,
+    ask: PromptReader,
+    ask_secret: PromptReader,
+    defaults: BuildParams,
+    interactive: bool,
+) -> tuple[str, str | None, bool, str | None, str | None]:
+    """Pick the trace source and where its traces come from.
+
+    Returns `(source, file, pull, project, api_key)`. The source is a registered adapter; traces
+    are read from a `file` export or pulled live (`pull`, with `project` + a masked `api_key`). A
+    source/file/pull already supplied via flags is honored without re-prompting.
+    """
+    # A source supplied entirely via flags (a file, a pull, or a non-default --source) is accepted
+    # as-is; otherwise prompt for the adapter.
+    source = defaults.source
+    if source == "otel-genai" and not defaults.file and not defaults.pull:
+        names = list(_SOURCES)
+        labels = [_SOURCES[n][0] for n in names]
+        chosen = _select(
+            console, ask, "Trace source", labels, _SOURCES[source][0], interactive=interactive
+        )
+        source = names[labels.index(chosen)]
+
+    can_pull = _SOURCES.get(source, ("", False))[1]
+    file = defaults.file
+    pull = defaults.pull
+    project = defaults.project
+    api_key = defaults.api_key
+
+    # A pull-capable vendor with no file already given: offer file-vs-pull.
+    if can_pull and not file and not pull:
+        mode = _select(
+            console, ask, "Read traces from", ["exported file", "live API pull"], None,
+            interactive=interactive,
+        )
+        pull = mode == "live API pull"
+
+    if pull:
+        if not project:
+            project = _prompt_text(console, ask, f"{source} project / workspace", None) or None
+        # Read the key without echo (it's a secret); blank falls back to the source's env var.
+        if not api_key:
+            api_key = ask_secret(f"{source} API key (blank = use env var): ").strip() or None
+        return source, None, True, project, api_key
+
+    # File source: require a path, re-prompting on empty input rather than erroring out.
+    while not file:
+        file = _prompt_text(
+            console,
+            ask,
+            f"Path to the {source} export to ingest",
+            None,
+            example="examples/tau-bench/traces.otel.jsonl",
+        )
+        if not file:
+            console.print("[red]a trace export path is required[/red]")
+    return source, file, False, project, api_key
 
 
 def select_provider_and_model(
@@ -252,20 +338,12 @@ def run_build_wizard(
             console.print(f"  [dim]using[/dim] {escape(name)}")
         break
 
-    file = defaults.file
-    vendor = defaults.vendor
-    if not file and not vendor:
-        # A trace source is required, so re-prompt on empty input rather than erroring out.
-        while not file:
-            file = _prompt_text(
-                console,
-                ask,
-                "Path to exported traces (OTLP-JSON / JSONL)",
-                None,
-                example="examples/tau-bench/traces.otel.jsonl",
-            )
-            if not file:
-                console.print("[red]a traces path is required (or pass --vendor)[/red]")
+    # Trace source: pick which adapter ingests, then where its traces come from — a file export or a
+    # live pull from the vendor's API (with project + masked API key). A source already supplied via
+    # flags (--file/--pull/--source) is kept without re-prompting.
+    source, file, pull, project, api_key = _collect_source(
+        console, ask, ask_secret, defaults, interactive
+    )
 
     provider, model, region = select_provider_and_model(
         console,
@@ -366,8 +444,13 @@ def run_build_wizard(
 
     return BuildParams(
         name=name,
+        source=source,
         file=file,
-        vendor=vendor,
+        pull=pull,
+        project=project,
+        api_key=api_key,
+        since=defaults.since,
+        limit=defaults.limit,
         provider=provider,
         model=model,
         judge_model=judge_model,
