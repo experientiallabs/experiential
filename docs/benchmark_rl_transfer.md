@@ -40,6 +40,15 @@ easier than the WM eval env: 90% vs 55% base — absolute numbers are never comp
    scalar collapses (same-config A/B); rolling WM success is a live overfitting meter (D58) —
    the WM makes RL diagnosis cheap.
 5. **Train-curve direction predicted every eval row** (4/4 + B3's runs) — cheap early stopping.
+6. **Fidelity is a training-stability knob, not a monotone good** (B2's curve, D73-b): at fixed
+   hypers, both HIGH-fidelity training envs (0.943 / 0.956) collapsed at ~ep 90 — twice,
+   independently — while both LOW-fidelity envs ran healthy full epochs, and the lowest-fidelity
+   backend (0.335) produced the best real-env transfer (92.5%). Mechanism: faithful envs grade
+   harshly (clean-episode reward 0.54 vs ~0.70) → denser negative advantages → the D63 collapse
+   budget shrinks below one epoch. "Train in the highest-fidelity sim available" is falsified
+   at fixed hypers; fidelity must be matched to the optimizer (or vice versa). Product corollary:
+   a WM exposes fidelity as a DIAL (down for stable training, up for harsh eval) — no real
+   environment offers that.
 
 ## Cost reality
 
@@ -56,8 +65,11 @@ Contrast: [real-env training economics — cite concurrency-scaling docs when me
 ## Pending sections (slots reserved)
 
 - §Cross-benchmark replication (D67): gui-tasks / terminal / swe columns, both method families.
-- §Fidelity→transfer curve: X = D69 cells (0.335 / 0.633 / 0.943 / 0.956), Y = paired Δ; two
-  recipe curves (B2 family, B3 family); real-env endpoints.
+- §Fidelity→transfer curve: X = D69 cells (0.335 / 0.633 / 0.943 / 0.956) COMPLETE; B2-family Y
+  partial (haiku-no-RAG 92.5% / haiku+RAG 85.0% real-env; high-fidelity points = pre-collapse
+  drain ckpts, evals in flight). Honest caveat for the figure: with base at 90.0% and n=40,
+  Y differences are weak — the robust curve result is finding 6 (stability), not the Y spread.
+  B3-family curve pending.
 - §Figures: ladder bars + the curve (brand palette, scripts/plot_trace_scaling.py conventions).
 
 ## Data provenance
