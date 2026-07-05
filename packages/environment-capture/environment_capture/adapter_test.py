@@ -171,3 +171,19 @@ def test_run_capture_grades_after_env_close() -> None:
     result = run_capture(sensing, _OneShotAgent(), split="train")
     assert len(result.trajectories) == 1
     assert sensing.graded_after_close == [True]
+
+
+def test_run_capture_isolates_open_env_failures() -> None:
+    """A backend that fails to BOOT for one task (readiness timeout, broken venv, missing
+    fixture) is recorded as that task's failure — it must not abort the whole capture."""
+
+    class _BootFailsAdapter(_FakeAdapter):
+        def open_env(self, task: Task) -> CommandEnv:
+            if task.task_id == "train-1":
+                raise RuntimeError("world backend failed to boot")
+            return super().open_env(task)
+
+    result = run_capture(_BootFailsAdapter(), _OneShotAgent(), split="train", attempts=2)
+    assert [t.task.task_id for t in result.trajectories] == ["train-0", "train-2"]
+    assert [f.task_id for f in result.failures] == ["train-1"]
+    assert "failed to boot" in result.failures[0].error

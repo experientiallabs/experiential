@@ -229,20 +229,34 @@ def scan_spans_jsonl(
 def _scan_lines(
     lines: Iterable[str], flagged: dict[str, list[HygieneFinding]], generic_path_markers: bool
 ) -> dict[str, list[HygieneFinding]]:
-    for line in lines:
+    for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             continue
-        span = json.loads(line)
+        try:
+            span = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"corpus line {lineno} is not valid JSON ({error}); the file is corrupt — "
+                "re-emit the corpus before auditing"
+            ) from error
         trace_id = str(span.get("traceId", ""))
         for attribute in span.get("attributes", []):
             key = attribute.get("key", "")
             value = attribute.get("value", {}).get("stringValue", "")
             findings: list[HygieneFinding] = []
             if key == "gen_ai.tool.call.arguments":
-                arguments = json.loads(value)
-                for argument in arguments.values():
-                    if isinstance(argument, str):
-                        findings.extend(_check_text("command", argument))
+                try:
+                    arguments = json.loads(value)
+                except json.JSONDecodeError:
+                    arguments = None
+                if isinstance(arguments, dict):
+                    for argument in arguments.values():
+                        if isinstance(argument, str):
+                            findings.extend(_check_text("command", argument))
+                else:
+                    # Scalar/array-shaped tool arguments (some tool schemas emit these): scan
+                    # the raw text instead of crashing the audit on .values().
+                    findings.extend(_check_text("command", value))
             elif key == "gen_ai.tool.message":
                 findings.extend(
                     _check_text("output", value, generic_path_markers=generic_path_markers)

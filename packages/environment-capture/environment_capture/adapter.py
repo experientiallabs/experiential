@@ -104,7 +104,14 @@ def run_capture(
     for task in (tasks if tasks is not None else adapter.tasks(split))[:limit]:
         last_error = ""
         for _attempt in range(attempts):
-            env = adapter.open_env(task)
+            # open_env is part of the isolated unit: stateful backends boot subprocesses here
+            # (readiness handshakes time out, venvs break) and file-based ones copy fixtures —
+            # a boot failure on one task must not abort the whole capture.
+            try:
+                env = adapter.open_env(task)
+            except Exception as error:  # noqa: BLE001 - isolation is the contract; error recorded
+                last_error = f"{type(error).__name__}: {error}"
+                continue
             try:
                 run = agent.run(task, env)
             except Exception as error:  # noqa: BLE001 - isolation is the contract; error recorded

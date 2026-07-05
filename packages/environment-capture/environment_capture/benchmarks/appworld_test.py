@@ -209,3 +209,32 @@ def test_agent_ends_on_plain_text() -> None:
     run = agent.run(Task(task_id="aw-train-0", prompt="x"), _FakeEnv())
     assert run.final_answer == "I give up."
     assert run.steps == []
+
+
+def test_retry_boot_gets_fresh_experiment_name(root: Path) -> None:
+    """run_capture's retry re-opens the env; the second boot must NOT reuse the experiment dir
+    the crashed first attempt dirtied (AppWorld state is per-experiment and persists). The first
+    boot keeps the legacy un-suffixed name so committed corpora stay reproducible."""
+    adapter = _adapter(root)
+    task = adapter.tasks("train")[0]
+
+    env1 = adapter.open_env(task)
+    name1 = adapter._experiment(task)
+    env1.close()
+    env2 = adapter.open_env(task)
+    name2 = adapter._experiment(task)
+    env2.close()
+
+    assert name1 == "reward-1.0--abc_1"  # first boot: unchanged naming
+    assert name2 == "reward-1.0--abc_1--a2"  # retry: disjoint experiment dir
+    assert name1 != name2
+
+
+def test_boot_serials_are_per_task(root: Path) -> None:
+    adapter = _adapter(root)
+    task_a, task_b = adapter.tasks("train")
+    adapter.open_env(task_a).close()
+    adapter.open_env(task_b).close()
+    # each task saw exactly one boot, so both keep the un-suffixed name
+    assert adapter._experiment(task_a).endswith("--abc_1")
+    assert adapter._experiment(task_b).endswith("--abc_2")

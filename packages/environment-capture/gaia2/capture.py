@@ -78,15 +78,19 @@ class _Sink:
 
     def emit(self, trajectory: Trajectory) -> None:
         with self._lock:
+            with self.raw.open("a", encoding="utf-8") as raw:
+                raw.write(json.dumps(dataclasses.asdict(trajectory), ensure_ascii=False) + "\n")
+            if not trajectory.steps:
+                # A step-less run (agent answered without touching the env) leaves no spans, so
+                # it must not count toward the corpus totals the summary reports — the raw
+                # record above still preserves it for debugging.
+                return
             self.n_traces += 1
             self.n_steps += len(trajectory.steps)
             self.reward_sum += trajectory.reward or 0.0
-            with self.raw.open("a", encoding="utf-8") as raw:
-                raw.write(json.dumps(dataclasses.asdict(trajectory), ensure_ascii=False) + "\n")
-            if trajectory.steps:
-                write_spans_jsonl(
-                    trajectory_to_spans(trajectory, benchmark=self.benchmark), self.out, append=True
-                )
+            write_spans_jsonl(
+                trajectory_to_spans(trajectory, benchmark=self.benchmark), self.out, append=True
+            )
 
 
 def _capture_shard(
@@ -104,7 +108,11 @@ def _capture_shard(
         trajectory: Trajectory | None = None
         last_error = ""
         for _attempt in range(_TASK_ATTEMPTS):
-            env = adapter.open_env(task)
+            try:
+                env = adapter.open_env(task)
+            except Exception as error:  # noqa: BLE001 - isolate per-task failures like run_capture
+                last_error = f"{type(error).__name__}: {error}"
+                continue
             try:
                 run = agent.run(task, env)
             except Exception as error:  # noqa: BLE001 - isolate per-task failures like run_capture
@@ -112,11 +120,16 @@ def _capture_shard(
                 continue
             finally:
                 env.close()
+            try:
+                reward = adapter.grade(task, run.final_answer)
+            except Exception as error:  # noqa: BLE001 - a grader edge case must not kill the shard
+                last_error = f"{type(error).__name__}: {error}"
+                continue
             trajectory = Trajectory(
                 task=task,
                 steps=run.steps,
                 final_answer=run.final_answer,
-                reward=adapter.grade(task, run.final_answer),
+                reward=reward,
                 model=run.model,
                 split=split,
             )

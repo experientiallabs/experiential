@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutErr
 
 from environment_capture.adapter import AgentRun, CommandEnv, ExecResult
 from environment_capture.agent import ConverseClient, make_bedrock_client
+from environment_capture.subproc import StderrTail
 from environment_capture.trajectory import JsonValue, StepRecord, Task, ToolCall
 
 # The line-delimited JSON stdio protocol spoken with backend/world_backend.py serve. Requests and
@@ -74,6 +76,9 @@ class AppWorldEnv:
             text=True,
             bufsize=1,
         )
+        # Backends deliberately route all engine chatter to stderr to keep stdout a clean
+        # protocol channel — stderr must be drained or the child blocks once the pipe fills.
+        self._stderr_tail = StderrTail(self._process.stderr)
         self._await_ready()
 
     def _await_ready(self) -> None:
@@ -95,7 +100,7 @@ class AppWorldEnv:
             if line:
                 return line
             if self._process.poll() is not None:
-                stderr = self._process.stderr.read() if self._process.stderr else ""
+                stderr = self._stderr_tail.text()
                 raise AppWorldError(
                     f"world backend exited (code {self._process.returncode}): {stderr}"
                 )
@@ -164,6 +169,9 @@ class AppWorldAdapter:
         self.venv_python = venv_python or root / ".venv" / "bin" / "python"
         self.backend = backend or root / "backend" / "world_backend.py"
         self.timeout_s = timeout_s
+        # boot serial per task: see _experiment (fresh experiment dir on every open_env)
+        self._boot_serials: dict[str, int] = {}
+        self._serial_lock = threading.Lock()
 
     def tasks(self, split: str) -> list[Task]:
         path = self.root / "data" / f"{split}.jsonl"
@@ -184,14 +192,22 @@ class AppWorldAdapter:
         return appworld_id
 
     def _experiment(self, task: Task) -> str:
-        """A per-(capture-run, task) AppWorld experiment name so states never collide.
+        """A per-(capture-run, task, boot) AppWorld experiment name so states never collide.
 
         ``experiment_prefix`` carries the capture's run tag (model + pass), so two shards grading
-        the same AppWorld task write to disjoint experiment directories.
+        the same AppWorld task write to disjoint experiment directories. The boot serial makes
+        every ``open_env`` (including run_capture's retry of a failed attempt) start from a
+        FRESH experiment dir — a retry over the dirty state a crashed attempt left behind would
+        grade the wrong world. ``grade`` reads the name of the latest boot for the task.
         """
-        return f"{self.experiment_prefix}--{self._appworld_id(task)}"
+        serial = self._boot_serials.get(self._appworld_id(task), 0)
+        suffix = f"--a{serial}" if serial > 1 else ""
+        return f"{self.experiment_prefix}--{self._appworld_id(task)}{suffix}"
 
     def open_env(self, task: Task) -> AppWorldEnv:
+        appworld_id = self._appworld_id(task)
+        with self._serial_lock:
+            self._boot_serials[appworld_id] = self._boot_serials.get(appworld_id, 0) + 1
         command = [
             str(self.venv_python),
             str(self.backend),

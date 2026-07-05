@@ -3,7 +3,7 @@
 You are integrating a new benchmark into `packages/environment-capture/`: a real environment behind the
 adapter contract, a corpus of REAL agent-environment transitions, and a fidelity row. This file
 is self-contained — follow it top to bottom; you should not need to read package internals.
-Six benchmarks were integrated exactly this way (financebench, bird-sql, continual-learning,
+Seven benchmarks were integrated exactly this way (financebench, bird-sql, continual-learning,
 dabstep, crmarena, appworld, gaia2 — read any of their dirs as a worked example; `bird-sql/` is
 the cleanest fresh-capture reference, `appworld/` the heavy-engine reference).
 
@@ -73,8 +73,8 @@ venv, driven by a thin client in the adapter; add `backend/*.py` to the root ty 
    callable for throttle resistance. Models `us.anthropic.claude-opus-4-8` / `-4-7` ONLY
    (`-4-6-v1` escapes workspaces even when guarded), ≤2 threads, a workspace-scoped
    `system_prompt` ("everything is inside the current directory..."), and RUN-SUFFIXED task ids
-   (`<task>#opus48-r1`) so trace ids never collide across waves; bump `--run-tag`/`--run-start`
-   every wave. Stop waves at ~5 runs/task — expand the TASK SET instead of resampling.
+   (`<task>#opus48-r1`) so trace ids never collide across waves; bump the wave counter
+   every wave (`--run-start` where the script has it, otherwise its run-tag argument). Stop waves at ~5 runs/task — expand the TASK SET instead of resampling.
 5. **Verify the corpus**: hygiene == {}; unique trace ids; ingests via
    `wmh.ingest.otel_genai.OtelGenAIAdapter().from_file(...)`; then EYEBALL several trajectories
    (real commands? real outputs? sane rewards?) and say what you saw in the PR.

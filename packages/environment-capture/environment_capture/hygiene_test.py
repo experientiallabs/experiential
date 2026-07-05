@@ -234,3 +234,31 @@ def test_bare_root_sweep_is_flagged() -> None:
     assert not command_targets_host("ls ./")
     assert not command_targets_host("ls data/")
     assert not command_targets_host("grep -r pattern src/")
+
+
+def test_scan_tolerates_non_object_tool_arguments(tmp_path: Path) -> None:
+    """Some tool schemas emit scalar/array-shaped arguments; the audit scans them as raw text
+    instead of crashing — and still catches a leak inside one."""
+    path = tmp_path / "traces.otel.jsonl"
+    spans = [
+        {"traceId": "s1", "attributes": [
+            {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": "[1, 2]"}}]},
+        {"traceId": "s2", "attributes": [
+            {"key": "gen_ai.tool.call.arguments",
+             "value": {"stringValue": json.dumps("cat /Users/someone/.zshrc")}}]},
+    ]
+    path.write_text("\n".join(json.dumps(s) for s in spans) + "\n")
+    flagged = scan_spans_jsonl(path)
+    assert set(flagged) == {"s2"}
+
+
+def test_scan_names_the_corrupt_line(tmp_path: Path) -> None:
+    """A truncated/corrupt line fails the audit LOUDLY with its line number — never a bare
+    traceback, and never a silent pass over content that couldn't be screened."""
+    import pytest
+
+    path = tmp_path / "traces.otel.jsonl"
+    good = json.dumps({"traceId": "ok", "attributes": []})
+    path.write_text(good + "\n{truncated\n")
+    with pytest.raises(ValueError, match="line 2"):
+        scan_spans_jsonl(path)

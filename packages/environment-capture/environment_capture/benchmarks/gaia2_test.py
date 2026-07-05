@@ -116,3 +116,18 @@ def test_grade_reads_state_file_and_oracle(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert adapter.grade(task, "") == 1.0
+
+
+def test_identifier_strings_with_leading_zeros_stay_distinct() -> None:
+    """Phone numbers / zips / ids are numeric-LOOKING but not numbers: '0612345678' must not
+    grade equal to '612345678' (float coercion would collapse both to 612345678.0)."""
+    oracle = [_act("Contacts", "update_contact", contact_id="c1", phone="0612345678")]
+    wrong = [_act("Contacts", "update_contact", contact_id="c1", phone="612345678")]
+    right = [_act("Contacts", "update_contact", contact_id="c1", phone="0612345678")]
+    assert score_actions(wrong, oracle) == 0.0
+    assert score_actions(right, oracle) == 1.0
+    # plain numeric equivalence still holds (int arg vs decimal string)
+    assert score_actions(
+        [_act("Contacts", "update_contact", contact_id="c1", age=25)],
+        [_act("Contacts", "update_contact", contact_id="c1", age="25.0")],
+    ) == 1.0

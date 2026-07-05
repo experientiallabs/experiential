@@ -40,6 +40,7 @@ from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutErr
 
 from environment_capture.adapter import AgentRun, CommandEnv, ExecResult
 from environment_capture.agent import ConverseClient, make_bedrock_client
+from environment_capture.subproc import StderrTail
 from environment_capture.trajectory import JsonValue, StepRecord, Task, ToolCall
 
 _READY_TIMEOUT_S = 180.0  # first boot imports ARE + populates the scenario universe
@@ -87,10 +88,16 @@ def _canonical(value: JsonValue) -> JsonValue:
                 return _canonical(json.loads(text))
             except (json.JSONDecodeError, ValueError):
                 pass
-        try:
-            return float(text)
-        except ValueError:
-            return _WS_RE.sub(" ", text).lower().strip()
+        # A numeric-LOOKING string with a leading zero is an identifier (phone number, zip,
+        # account id): '007' must not equal '7'. Only canonical numeric text becomes a float.
+        stripped = text.lstrip("+-")
+        is_id_like = len(stripped) > 1 and stripped[0] == "0" and stripped[1] not in ".eE"
+        if not is_id_like:
+            try:
+                return float(text)
+            except ValueError:
+                pass
+        return _WS_RE.sub(" ", text).lower().strip()
     return value
 
 
@@ -186,6 +193,9 @@ class Gaia2Env:
             text=True,
             bufsize=1,
         )
+        # Backends deliberately route all engine chatter to stderr to keep stdout a clean
+        # protocol channel — stderr must be drained or the child blocks once the pipe fills.
+        self._stderr_tail = StderrTail(self._process.stderr)
         self._await_ready()
 
     def _await_ready(self) -> None:
@@ -207,7 +217,7 @@ class Gaia2Env:
             if line:
                 return line
             if self._process.poll() is not None:
-                stderr = self._process.stderr.read() if self._process.stderr else ""
+                stderr = self._stderr_tail.text()
                 raise Gaia2Error(
                     f"world backend exited (code {self._process.returncode}): {stderr}"
                 )

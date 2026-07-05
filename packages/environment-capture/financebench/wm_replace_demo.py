@@ -67,11 +67,15 @@ def _run_task(
         real_env.close()
     real_reward = adapter.grade(task, real_run.final_answer)
 
-    wm_env = WorldModelCommandEnv(WorldModelEnv(world_model), task=task.prompt)
+    # The episode reset (inside WorldModelCommandEnv.__init__) can itself raise on a provider
+    # error, so the underlying env's close is guarded from construction — symmetric with the
+    # real-env branch above.
+    wm_inner = WorldModelEnv(world_model)
     try:
+        wm_env = WorldModelCommandEnv(wm_inner, task=task.prompt)
         wm_run = agent.run(task, wm_env)
     finally:
-        wm_env.close()
+        wm_inner.close()
     wm_reward = adapter.grade(task, wm_run.final_answer)
 
     return {
