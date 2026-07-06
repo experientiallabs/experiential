@@ -79,7 +79,7 @@ target-version = "py311"
 extend-exclude = ["examples/", ".agents/"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ANN", "BLE"]
+select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
 
 [tool.ty.environment]
 python-version = "3.11"

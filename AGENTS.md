@@ -20,6 +20,10 @@ uv run pytest -q
 - Every Python file must have a module docstring.
 - Write Google-style docstrings for all classes and functions with significant logic. Use plain
   one-line docstrings for simple/self-explanatory classes and functions.
+- **Never `print`.** All diagnostic/progress output goes through a module logger
+  (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
+  The one exception is deliberate user-facing CLI presentation, which goes through the rich
+  `Console` in `wmh/cli/ui.py` (that is product output, not logging).
 
 ## Rules
 
