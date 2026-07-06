@@ -4,8 +4,10 @@ Raw traces are dominated by boilerplate (tool schemas, retrieved content), so em
 directly washes out task intent — two traces with identical scaffolding but different tasks land
 nearly on top of each other. Instead, a cheap LLM reads a compact digest of each trace and emits a
 `TraceFacet`: a short task summary (what the user was trying to get done), the outcome, and a
-failure category when the episode failed. The deterministic tool-call signature is computed in
-code, not by the LLM. Downstream clustering/selection operates on facet embeddings only.
+failure category when the episode failed. The deterministic tool-call signature and the corpus
+domain are computed in code, not by the LLM, and join the summary in the embedded text so
+clustering groups by capability rather than phrasing. Downstream clustering/selection operates on
+facet embeddings only.
 """
 
 from __future__ import annotations
@@ -31,12 +33,34 @@ class TraceFacet(BaseModel):
     trace_id: str
     task_summary: str  # <= ~30 words: what the user was trying to get done
     tool_signature: str  # deterministic "tool_a>tool_b>..." with consecutive repeats collapsed
+    domain: str | None = None  # from trace metadata when the corpus records one
     outcome: Outcome = Outcome.UNKNOWN
     failure_category: str | None = None  # short label, only when outcome == FAILURE
 
     def embed_text(self) -> str:
-        """The text clustering embeds: task intent only (signature/outcome stay as metadata)."""
-        return self.task_summary
+        """The text clustering embeds: domain + task intent + capabilities exercised.
+
+        Embedding the summary alone clusters by phrasing, which splits one capability into
+        several clusters ("MMS troubleshooting" vs "International MMS troubleshooting") and lets
+        cluster-level allocation double-count it. Domain and the tool signature pull traces that
+        exercise the same capability together regardless of how the request was worded.
+        """
+        parts = []
+        if self.domain:
+            parts.append(f"[{self.domain}]")
+        parts.append(self.task_summary)
+        text = " ".join(parts)
+        if self.tool_signature:
+            text = f"{text} | tools: {self.tool_signature}"
+        return text
+
+
+def trace_domain(trace: Trace) -> str | None:
+    """The trace's domain from corpus metadata, when recorded (e.g. tau2's telecom/retail)."""
+    value = trace.metadata.get("domain")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def tool_signature(trace: Trace) -> str:
@@ -147,6 +171,7 @@ class FacetExtractor:
             max_tokens=512,
         )
         signature = tool_signature(trace)
+        domain = trace_domain(trace)
         raw = extract_json_object(completion.text)
         if raw is not None:
             try:
@@ -160,6 +185,7 @@ class FacetExtractor:
                     trace_id=trace.trace_id,
                     task_summary=parsed.task_summary.strip(),
                     tool_signature=signature,
+                    domain=domain,
                     outcome=outcome,
                     failure_category=_normalize_category(category),
                 )
@@ -168,6 +194,7 @@ class FacetExtractor:
             trace_id=trace.trace_id,
             task_summary=_truncate(_trace_task(trace) or "(no task recorded)", 200),
             tool_signature=signature,
+            domain=domain,
             outcome=Outcome.UNKNOWN,
         )
 

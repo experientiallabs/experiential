@@ -28,7 +28,7 @@ from wmh.engine.build import split_traces  # noqa: E402
 from wmh.ingest import get_adapter  # noqa: E402
 from wmh.scenarios import ScenarioBuildConfig, ScenarioSet, build_scenario_set  # noqa: E402
 from wmh.scenarios.builder import _checklist_agrees  # noqa: E402
-from wmh.scenarios.facets import TraceFacet  # noqa: E402
+from wmh.scenarios.facets import TraceFacet, trace_domain  # noqa: E402
 from wmh.scenarios.synthesis import ScenarioSynthesizer  # noqa: E402
 from wmh.scenarios.verification import ChecklistJudge  # noqa: E402
 
@@ -39,6 +39,9 @@ SYNTH_MODEL = "gpt-5.4"  # Foundry; judge = Opus 4.8 (AWS)
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=int, default=60, help="valid scenarios per arm")
+    parser.add_argument("--arm", choices=["mined", "random", "both"], default="both")
+    parser.add_argument("--mined-out", default="bc_pool_mined.json")
+    parser.add_argument("--random-out", default="bc_pool_random.json")
     args = parser.parse_args()
 
     provider = foundry(SYNTH_MODEL)
@@ -47,9 +50,18 @@ def main() -> None:
     facet_data = json.loads((DISTILL / "facets_full.json").read_text())["train"]
     facets = [TraceFacet.model_validate(f) for f in facet_data]
     assert len(facets) == len(train_traces), "cached facets misaligned with train split"
+    # Cached facets predate the domain field; backfill it from trace metadata so the enriched
+    # embed_text (domain + tool signature) has the domain without re-running facet extraction.
+    facets = [
+        facet.model_copy(update={"domain": trace_domain(trace)})
+        for facet, trace in zip(facets, train_traces, strict=True)
+    ]
 
-    # Arm A — MINED: the full pipeline with inline validation, over-budget then trim.
     judge_llm = opus_judge()
+    if args.arm == "random":
+        _build_random_arm(args, provider, judge_llm, train_traces, facets)
+        return
+    # Arm A — MINED: the full pipeline with inline validation, over-budget then trim.
     mined = build_scenario_set(
         train_traces,
         facets,
@@ -59,9 +71,14 @@ def main() -> None:
         judge_provider=judge_llm,
     )
     mined.scenarios = mined.scenarios[: args.target]
-    mined.save(DISTILL / "bc_pool_mined.json")
-    print(f"mined arm: {len(mined.scenarios)} valid scenarios", flush=True)
+    mined.save(DISTILL / args.mined_out)
+    print(f"mined arm: {len(mined.scenarios)} valid scenarios -> {args.mined_out}", flush=True)
+    if args.arm == "mined":
+        return
+    _build_random_arm(args, provider, judge_llm, train_traces, facets)
 
+
+def _build_random_arm(args, provider, judge_llm, train_traces, facets) -> None:  # noqa: ANN001
     # Arm B — RANDOM: uniform random source traces, same synthesizer + same validity gate.
     facets_by_id = {f.trace_id: f for f in facets}
     rng = random.Random(0)
@@ -87,7 +104,7 @@ def main() -> None:
         if len(random_scenarios) % 10 == 0:
             print(f"  random arm: {len(random_scenarios)}/{args.target}", flush=True)
     random_pool = ScenarioSet(scenarios=random_scenarios, corpus_traces=len(train_traces))
-    random_pool.save(DISTILL / "bc_pool_random.json")
+    random_pool.save(DISTILL / args.random_out)
     print(f"random arm: {len(random_scenarios)} valid scenarios ({attempts} attempts)", flush=True)
 
 

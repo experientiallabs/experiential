@@ -104,7 +104,33 @@ def test_extract_normalizes_unknown_outcome_values() -> None:
     assert facet.outcome is Outcome.UNKNOWN
 
 
-def test_embed_text_is_the_task_summary() -> None:
+def test_embed_text_includes_domain_and_tools() -> None:
     reply = '{"task_summary": "Review a return", "outcome": "success"}'
-    facet = FacetExtractor(FakeProvider(reply)).extract(_trace(["review"]))
+    trace = _trace(["review", "refund"])
+    trace.metadata["domain"] = "retail"
+    facet = FacetExtractor(FakeProvider(reply)).extract(trace)
+    assert facet.domain == "retail"
+    assert facet.embed_text() == "[retail] Review a return | tools: review>refund"
+
+
+def test_embed_text_without_domain_or_tools_is_the_summary() -> None:
+    reply = '{"task_summary": "Review a return", "outcome": "success"}'
+    message_step = Step(
+        action=Action(kind=ActionKind.MESSAGE, content="hello"),
+        observation=Observation(content="ok"),
+        task="review",
+    )
+    trace = Trace(trace_id="t1", steps=[message_step])
+    facet = FacetExtractor(FakeProvider(reply)).extract(trace)
+    assert facet.domain is None
     assert facet.embed_text() == "Review a return"
+
+
+def test_extract_populates_domain_on_fallback_and_ignores_blank_domain() -> None:
+    trace = _trace(["search"])
+    trace.metadata["domain"] = "  telecom  "
+    facet = FacetExtractor(FakeProvider("not json at all")).extract(trace)
+    assert facet.domain == "telecom"
+    blank = _trace(["search"])
+    blank.metadata["domain"] = "   "
+    assert FacetExtractor(FakeProvider("not json at all")).extract(blank).domain is None
