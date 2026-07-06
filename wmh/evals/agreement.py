@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from wmh.harness.closed_loop import ClosedLoopReport
+from wmh.evals.closed_loop import ClosedLoopReport
 
 DEFAULT_PASS_THRESHOLD = 0.5  # a task "passes" when >= this fraction of its k passes do
 

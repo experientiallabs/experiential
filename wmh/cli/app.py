@@ -57,7 +57,6 @@ from wmh.config import (
 from wmh.engine.build import build as run_build
 from wmh.engine.build import ingest
 from wmh.engine.demo import run_demo
-from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.engine.eval_suites import (
     discover_eval_suites,
     list_eval_results,
@@ -66,6 +65,7 @@ from wmh.engine.eval_suites import (
 )
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
+from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
@@ -452,6 +452,12 @@ def serve(
 @app.command("eval")
 def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin isn't used here
     tokens: list[str] | None = _EVAL_TOKENS,
+    mode: str = typer.Option(
+        "open-loop",
+        "--mode",
+        help="open-loop: replay traces, score per-step fidelity (default). "
+        "closed-loop: a live agent runs tasks with the world model as its environment.",
+    ),
     prompt_file: str | None = typer.Option(
         None, "--prompt", help="Prompt file; default=BASE_ENV_PROMPT."
     ),
@@ -486,9 +492,11 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     ),
     limit: int = typer.Option(20, help="Rows to show for `wmh eval results`."),
     name: str | None = typer.Option(
-        None, "--name", help="World model for `closed-loop` (default: the only built one)."
+        None, "--name", help="World model for --mode closed-loop (default: the only built one)."
     ),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models (closed-loop)."),
+    root: str = typer.Option(
+        ARTIFACT_DIR, help="Project dir holding world models (--mode closed-loop)."
+    ),
     k: int = typer.Option(
         3, min=1, help="Closed-loop passes per task (means reported, never 1-pass)."
     ),
@@ -500,23 +508,27 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     """Score reconstruction fidelity, or run named example-local eval suites.
 
     Flows:
-    - `wmh eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced).
+    - `wmh eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
+      default mode).
+    - `wmh eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
+      as its environment; score task success against gold assertions
+      (see docs/reference/closed_loop.md).
     - `wmh eval list`: list named suites under `examples/<task>/evals/`.
     - `wmh eval run <suite>`: run a suite and save a local JSON result.
     - `wmh eval results optional-suite`: summarize local suite results.
-    - `wmh eval closed-loop <tasks.jsonl>`: a live agent runs tasks WITH the world model as its
-      environment; score task success against gold assertions (see docs/reference/closed_loop.md).
     - `wmh eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
       (e.g. world-model vs real environment) — the outcome-agreement validity check.
     """
     args = tokens or []
     suite_root = str(_examples_root()) if examples_root is None else examples_root
-    if args and args[0] == "closed-loop":
-        if len(args) != 2:
-            raise typer.BadParameter("usage: wmh eval closed-loop <tasks.jsonl>")
+    if mode not in ("open-loop", "closed-loop"):
+        raise typer.BadParameter(f"unknown --mode {mode!r}; choose open-loop or closed-loop")
+    if mode == "closed-loop":
+        if len(args) != 1 or args[0] in ("list", "run", "results", "agreement"):
+            raise typer.BadParameter("usage: wmh eval <tasks.jsonl> --mode closed-loop")
         run_closed_loop(
             _console,
-            tasks_file=args[1],
+            tasks_file=args[0],
             name=name,
             root=root,
             k=k,
@@ -799,7 +811,7 @@ def _run_eval_files(
     )
     embedder = HashingEmbedder(dim=options.embed_dim) if options.use_rag else None
     scorer = RubricJudge(llm) if options.judge == "rubric" else LLMJudge(llm)
-    return evaluate_files(
+    evaluation = OpenLoopEval(
         files,
         prompt,
         llm,
@@ -810,6 +822,7 @@ def _run_eval_files(
         sample_turns=options.sample_turns,
         seed=options.seed,
     )
+    return evaluation.run()
 
 
 def _print_eval_report(report: EvalReport) -> None:

@@ -1,4 +1,4 @@
-# Closed-loop evaluation (`wmh eval closed-loop`)
+# Closed-loop evaluation (`wmh eval --mode closed-loop`)
 
 Open-loop eval (`wmh eval <files>`) replays recorded steps teacher-forced and scores per-step
 reconstruction fidelity. Closed-loop is the other half: a **live agent** runs a task with the world
@@ -10,7 +10,7 @@ the simulated environment as against the real one?*
 ## Running it
 
 ```bash
-wmh eval closed-loop tasks.jsonl --name <world-model> --k 3 --out sim_report.json
+wmh eval tasks.jsonl --mode closed-loop --name <world-model> --k 3 --out sim_report.json
 ```
 
 - `tasks.jsonl` — one task per line: `{"task_id": ..., "instruction": ..., "gold": ["...", ...]}`.
@@ -40,6 +40,10 @@ those.
 
 ## Where the pieces live
 
-`wmh/harness/`: `runtime.py` (the fixed agent loop), `environment.py` (the env seam +
-`WorldModelEnvironment`), `gold.py` (gold-assertion judge), `closed_loop.py` (k-pass scoring),
-`agreement.py` (report-vs-report comparison), `tasks.py` (task specs).
+`wmh/evals/`: `base.py` (the general `Evaluation`/`EvalResult` interface), `open_loop.py`
+(teacher-forced replay fidelity — the default `wmh eval` mode), `closed_loop.py` (k-pass live
+scoring + `WorldModelEnvironment`), `gold.py` (gold-assertion judge), `agreement.py`
+(report-vs-report comparison), `tasks.py` (task specs).
+
+`wmh/harness/`: `runtime.py` (the fixed agent loop), `environment.py` (the `AgentEnvironment`
+seam the loop drives), `tools.py` (the tool registry).

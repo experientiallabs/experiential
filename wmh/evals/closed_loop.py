@@ -1,12 +1,16 @@
-"""Closed-loop scoring: run the fixed agent on tasks against an environment, judge task success.
+"""Closed-loop scoring: run a live agent on tasks against an environment, judge task success.
 
-For each task, the agent loop runs to completion (submit or turn cap) and the `GoldJudge` scores the
-transcript against the task's gold assertions. Per the repo's eval convention, every task runs
-**k=3 passes** and metrics are means over the passes — never single-pass.
+Open-loop eval (`wmh/engine/eval.py`, the default `wmh eval` mode) replays recorded steps
+teacher-forced and scores per-step fidelity. This module is the closed-loop counterpart
+(`wmh eval --mode closed-loop`): for each task, the agent loop runs to completion (submit or turn
+cap) and the `GoldJudge` scores the transcript against the task's gold assertions. Per the repo's
+eval convention, every task runs **k=3 passes** and metrics are means over the passes — never
+single-pass.
 
-The environment is a factory parameter: `evaluate_closed_loop` binds it to the world model (the
-`wmh eval closed-loop` path), and any real execution backend can bind the same core, producing a
-directly comparable report (see `wmh.harness.agreement`).
+The environment is a factory parameter: `evaluate_closed_loop` binds it to the world model
+(`WorldModelEnvironment`), and any real execution backend can bind the same core through the
+`AgentEnvironment` protocol, producing a directly comparable report (see
+`wmh.evals.agreement`).
 """
 
 from __future__ import annotations
@@ -16,11 +20,12 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
+from wmh.core.types import Action, Observation
 from wmh.engine.world_model import WorldModel
-from wmh.harness.environment import AgentEnvironment, WorldModelEnvironment
-from wmh.harness.gold import GoldJudge, GoldVerdict
+from wmh.evals.gold import GoldJudge, GoldVerdict
+from wmh.evals.tasks import TaskSpec
+from wmh.harness.environment import AgentEnvironment
 from wmh.harness.runtime import AgentRuntime, RunResult
-from wmh.harness.tasks import TaskSpec
 from wmh.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
@@ -28,6 +33,34 @@ DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes
 # Opens a fresh environment for one task. The world-model backend and any real backend both fit
 # this shape, which is what lets the SAME scoring core measure simulation and reality.
 EnvFactory = Callable[[TaskSpec], AgentEnvironment]
+
+
+class WorldModelEnvironment:
+    """A simulated environment: actions are answered by the world model, not a real shell.
+
+    Wraps one `WorldModel` session, so the agent loop drives closed-loop eval exactly as it would
+    drive a real environment. Sessions are explicitly ended on `close` so batch rollouts don't
+    accumulate resident session state in the model.
+    """
+
+    def __init__(self, world_model: WorldModel, task: str) -> None:
+        self._wm = world_model
+        # enrich=False: this rollout's PREDICTED steps must not enter the retrieval buffer, or
+        # k=2 retrieves k=1's hallucinations as demos and scores become order-dependent.
+        self._session = world_model.new_session(task=task, enrich=False)
+        self._closed = False
+
+    @property
+    def session_id(self) -> str:
+        return self._session.id
+
+    def execute(self, action: Action) -> Observation:
+        return self._wm.step(self._session.id, action)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._wm.end_session(self._session.id)
+            self._closed = True
 
 
 class TaskOutcome(BaseModel):
@@ -53,6 +86,11 @@ class ClosedLoopReport(BaseModel):
     success_std: float = 0.0  # spread of per-task success rates
     k: int = DEFAULT_K
     per_task: dict[str, TaskOutcome] = Field(default_factory=dict)
+
+    @property
+    def headline(self) -> float:
+        """The `EvalResult` headline: end-to-end task success."""
+        return self.success_rate
 
     def summary(self) -> str:
         return (
@@ -115,7 +153,7 @@ def evaluate_closed_loop(
     runtime: AgentRuntime | None = None,
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
 ) -> ClosedLoopReport:
-    """Score the fixed agent on `tasks` against `world_model` (`wmh eval closed-loop`)."""
+    """Score the fixed agent on `tasks` against `world_model` (`wmh eval --mode closed-loop`)."""
     return evaluate_with_env(
         tasks,
         lambda task: WorldModelEnvironment(world_model, task=task.instruction),
@@ -125,6 +163,43 @@ def evaluate_closed_loop(
         k=k,
         on_progress=on_progress,
     )
+
+
+class ClosedLoopEval:
+    """The closed-loop `Evaluation`: a live agent runs tasks with the world model as its env."""
+
+    def __init__(
+        self,
+        tasks: list[TaskSpec],
+        world_model: WorldModel,
+        agent_provider: Provider,
+        judge: GoldJudge,
+        *,
+        label: str = "world-model",
+        k: int = DEFAULT_K,
+        runtime: AgentRuntime | None = None,
+        on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
+    ) -> None:
+        self._tasks = tasks
+        self._world_model = world_model
+        self._agent_provider = agent_provider
+        self._judge = judge
+        self._label = label
+        self._k = k
+        self._runtime = runtime
+        self._on_progress = on_progress
+
+    def run(self) -> ClosedLoopReport:
+        return evaluate_closed_loop(
+            self._tasks,
+            self._world_model,
+            self._agent_provider,
+            self._judge,
+            label=self._label,
+            k=self._k,
+            runtime=self._runtime,
+            on_progress=self._on_progress,
+        )
 
 
 def _run_once(task: TaskSpec, make_env: EnvFactory, runtime: AgentRuntime) -> RunResult:

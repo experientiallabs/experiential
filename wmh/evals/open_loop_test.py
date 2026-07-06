@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from wmh.core.types import Observation, Step
-from wmh.engine.eval import evaluate_files
+from wmh.evals.open_loop import evaluate_files
 from wmh.optimize.judge import JudgeResult
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import HashingEmbedder

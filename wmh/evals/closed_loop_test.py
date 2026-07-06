@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from wmh.core.types import Action, ActionKind
 from wmh.engine.world_model import WorldModel
-from wmh.harness.closed_loop import evaluate_closed_loop
-from wmh.harness.environment import WorldModelEnvironment, is_env_action
-from wmh.harness.gold import GoldJudge, GoldVerdict
-from wmh.harness.tasks import TaskSpec
+from wmh.evals.closed_loop import WorldModelEnvironment, evaluate_closed_loop
+from wmh.evals.gold import GoldJudge, GoldVerdict
+from wmh.evals.tasks import TaskSpec
+from wmh.harness.environment import is_env_action
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 

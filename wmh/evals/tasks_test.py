@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from wmh.harness.tasks import TaskSpec, load_tasks
+from wmh.evals.tasks import TaskSpec, load_tasks
 
 
 def test_load_tasks_reads_jsonl_and_skips_blanks(tmp_path: Path) -> None:

@@ -1,7 +1,7 @@
-"""`wmh eval closed-loop` and `wmh eval agreement` — the closed-loop halves of eval.
+"""`wmh eval --mode closed-loop` and `wmh eval agreement` — the closed-loop halves of eval.
 
-Kept out of `app.py` so the (large) eval command stays readable; `app.py` routes the two tokens
-here. `closed-loop` runs the fixed agent against a built world model and scores task success;
+Kept out of `app.py` so the (large) eval command stays readable; `app.py` routes here.
+Closed-loop mode runs the fixed agent against a built world model and scores task success;
 `agreement` compares two saved closed-loop reports (e.g. one produced against the world model and
 one against a real environment) — the outcome-agreement check docs/reference/closed_loop.md names.
 """
@@ -15,11 +15,11 @@ from rich.console import Console
 
 from wmh.config import WorldModelStore
 from wmh.engine import load_world_model
-from wmh.harness.agreement import compute_agreement
-from wmh.harness.closed_loop import ClosedLoopReport, evaluate_closed_loop
-from wmh.harness.gold import GoldJudge, GoldVerdict
+from wmh.evals.agreement import compute_agreement
+from wmh.evals.closed_loop import ClosedLoopEval, ClosedLoopReport
+from wmh.evals.gold import GoldJudge, GoldVerdict
+from wmh.evals.tasks import load_tasks
 from wmh.harness.runtime import AgentRuntime
-from wmh.harness.tasks import load_tasks
 
 
 def run_closed_loop(
@@ -53,7 +53,7 @@ def run_closed_loop(
         mark = "[green]pass[/green]" if verdict.passed else "[red]fail[/red]"
         console.print(f"  {task_id} #{attempt}: {mark} ({verdict.rationale})")
 
-    report = evaluate_closed_loop(
+    evaluation = ClosedLoopEval(
         tasks,
         world_model,
         provider,
@@ -63,6 +63,7 @@ def run_closed_loop(
         runtime=AgentRuntime(provider, max_turns=max_turns),
         on_progress=_progress,
     )
+    report = evaluation.run()
     for task_id, outcome in report.per_task.items():
         console.print(
             f"  {task_id:24} success={outcome.success_rate:.2f} "

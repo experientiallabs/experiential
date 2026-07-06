@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from wmh.harness.agreement import AgreementReport, compute_agreement
-from wmh.harness.closed_loop import ClosedLoopReport, TaskOutcome
+from wmh.evals.agreement import AgreementReport, compute_agreement
+from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
 
 
 def _report(label: str, per_task: dict[str, float], k: int = 3) -> ClosedLoopReport:
