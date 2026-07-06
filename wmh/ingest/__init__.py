@@ -9,8 +9,9 @@ scaffolding, so adding a new source is transport + attribute-mapping, not a rewr
 Bundled adapters:
   - `otel-genai`  : OTLP-JSON spans following the OTel GenAI semantic conventions (file or pull).
   - `chat-json`   : recorded OpenAI-style chat/tool-call conversations (file).
-Provider adapters (Braintrust, Phoenix/Arize, Langfuse, LangSmith) register when their module is
-imported; their heavy SDKs are optional extras, imported lazily inside the adapter.
+Provider adapters (Braintrust, Langfuse, LangSmith, Mastra, Phoenix/Arize, PostHog,
+Weave) register when their module is imported; their heavy SDKs are optional extras,
+imported lazily inside the adapter.
 """
 
 # Import for the registration side effect so `get_adapter(...)` works on package import. The
@@ -25,6 +26,7 @@ from wmh.ingest import messages as messages  # noqa: F401
 from wmh.ingest import otel_genai as otel_genai  # noqa: F401
 from wmh.ingest import phoenix as phoenix  # noqa: F401
 from wmh.ingest import posthog as posthog  # noqa: F401
+from wmh.ingest import weave as weave  # noqa: F401
 from wmh.ingest.adapter import (
     TraceAdapter,
     VendorPull,
