@@ -1,0 +1,306 @@
+<!-- clarity-report: scenario-research program through pinned baselines -->
+<title>Can we pick training scenarios better than chance? The research program, explained</title>
+<style>
+  :root{
+    --paper:#FCFCFA; --ink:#22252A; --muted:#5D6470; --line:#E4E4DE;
+    /* Side A (indigo) = ENGINEERED (mined / generated selection). Side B (green) = RANDOM. */
+    --side-a:#4F52C0; --side-a-tint:#EFEFFA; --side-a-line:#C9C9EE;
+    --side-b:#1F7A46; --side-b-tint:#E9F4EC; --side-b-line:#BFDECB;
+    --danger:#C03A2B; --danger-tint:#FBEDEA;
+    --amber:#8A6D1B; --amber-tint:#F8F2DF;
+    --code-bg:#F4F4F0;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --serif:Charter,"Bitstream Charter",Georgia,Cambria,serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--serif);
+       font-size:17px;line-height:1.65;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:760px;margin:0 auto;padding:56px 24px 96px}
+  h1,h2,h3{font-family:var(--sans);line-height:1.25;text-wrap:balance;margin:0}
+  h1{font-size:34px;font-weight:700;letter-spacing:-.01em}
+  h2{font-size:23px;font-weight:700;margin-top:64px;padding-top:28px;border-top:1px solid var(--line)}
+  h3{font-size:17px;font-weight:650;margin-top:28px}
+  p{margin:14px 0 0}
+  .eyebrow{font-family:var(--sans);font-size:12px;font-weight:600;letter-spacing:.12em;
+           text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .dek{font-size:19px;color:#3A3F47;margin-top:16px}
+  .oneline{font-family:var(--sans);font-size:15.5px;font-weight:600;background:#F5F5F1;
+           border-left:3px solid var(--ink);padding:12px 16px;margin-top:18px;border-radius:0 6px 6px 0}
+  code,.mono{font-family:var(--mono);font-size:.86em;background:var(--code-bg);
+       padding:1px 5px;border-radius:4px}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;
+      padding:14px 16px;overflow-x:auto;margin:16px 0 0;line-height:1.5}
+  pre code{background:none;padding:0;font-size:13.5px}
+  table{border-collapse:collapse;width:100%;margin-top:16px;font-family:var(--sans);
+        font-size:14.5px;font-variant-numeric:tabular-nums}
+  th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);
+     text-align:left;font-weight:600;padding:8px 12px;border-bottom:2px solid var(--ink)}
+  td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  .tablewrap{overflow-x:auto}
+  .pill{display:inline-block;font-family:var(--sans);font-size:12px;font-weight:700;
+        padding:2px 10px;border-radius:99px;white-space:nowrap}
+  .pill.a{background:var(--side-a-tint);color:var(--side-a);border:1px solid var(--side-a-line)}
+  .pill.b{background:var(--side-b-tint);color:var(--side-b);border:1px solid var(--side-b-line)}
+  .pill.ok{background:var(--side-b-tint);color:var(--side-b)}
+  .pill.pend{background:var(--amber-tint);color:var(--amber)}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-top:22px;
+          font-family:var(--sans);font-size:14px;color:var(--muted)}
+  .a-word{color:var(--side-a);font-weight:700}
+  .b-word{color:var(--side-b);font-weight:700}
+  .danger-word{color:var(--danger);font-weight:700}
+  .note{font-family:var(--sans);font-size:14px;color:var(--muted);margin-top:10px}
+  .flow{display:flex;flex-direction:column;margin-top:22px;font-family:var(--sans)}
+  .stage{border:1.5px solid var(--line);border-radius:10px;padding:14px 18px;background:#fff}
+  .stage.a{border-color:var(--side-a-line);background:var(--side-a-tint)}
+  .stage.b{border-color:var(--side-b-line);background:var(--side-b-tint)}
+  .stage.both{border-color:var(--ink);background:#fff}
+  .stage .name{font-weight:700;font-size:15px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .stage .name .cmd{font-family:var(--mono);font-weight:400;font-size:12.5px;color:var(--muted)}
+  .stage .what{font-size:14px;color:#3A3F47;margin-top:4px;line-height:1.5}
+  .arrow{align-self:center;color:var(--muted);font-size:13px;font-family:var(--sans);
+         padding:6px 0;display:flex;align-items:center;gap:8px}
+  .arrow::before{content:"";display:block;width:1.5px;height:16px;background:var(--muted);margin-left:24px}
+  .arrow span{position:relative;top:8px}
+  .seam{margin-top:22px;font-family:var(--sans);display:flex;flex-direction:column}
+  .seam .topbox{border:2px solid var(--ink);border-radius:10px;padding:14px 18px;background:#fff;text-align:center}
+  .seam .topbox .sub{font-size:13px;color:var(--muted);margin-top:2px}
+  .seam .stem{display:flex;justify-content:center;padding:2px 0}
+  .seam .stem div{width:1.5px;height:18px;background:var(--muted)}
+  .seam .iface{border:1.5px dashed var(--muted);border-radius:8px;padding:8px 14px;text-align:center;
+               font-family:var(--mono);font-size:13px;background:#FAFAF7}
+  .seam .split{display:flex;justify-content:space-around;padding:4px 0 2px}
+  .seam .split div{width:1.5px;height:18px;background:var(--muted)}
+  .seam .branches{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .branch{border-radius:10px;padding:14px 16px;font-size:14px;line-height:1.5}
+  .branch.a{background:var(--danger-tint);border:1.5px solid #EAC4BC}
+  .branch.b{background:var(--side-b-tint);border:1.5px solid var(--side-b-line)}
+  .branch .tag{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;display:block;margin-bottom:4px}
+  .branch.a .tag{color:var(--danger)} .branch.b .tag{color:var(--side-b)}
+  .grid2{display:grid;grid-template-columns:110px 1fr 1fr;gap:6px;margin-top:18px;
+         font-family:var(--sans);font-size:13.5px;max-width:620px}
+  .grid2 .hdr{font-weight:700;align-self:end;padding:4px 6px}
+  .grid2 .rowhdr{font-weight:700;align-self:center;padding:4px 6px;text-align:right}
+  .grid2 .cell{border-radius:8px;padding:12px 14px;line-height:1.45;border:1.5px solid var(--line);background:#fff}
+  .grid2 .good{background:var(--side-b-tint);border-color:var(--side-b-line)}
+  .grid2 .bad{background:var(--danger-tint);border-color:#EAC4BC}
+  .grid2 .meh{background:#F5F5F1}
+  .grid2 b{display:block;font-size:14px}
+  .footer{margin-top:72px;padding-top:20px;border-top:1px solid var(--line);
+          font-family:var(--sans);font-size:13.5px;color:var(--muted);line-height:1.7}
+  ul{margin:12px 0 0;padding-left:22px} li{margin-top:6px}
+  a{color:var(--side-a)}
+  @media(max-width:600px){
+    .seam .branches{grid-template-columns:1fr}
+    .grid2{grid-template-columns:84px 1fr 1fr;font-size:12.5px}
+    h1{font-size:28px}
+  }
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+
+<div class="eyebrow">world-model-harness · PR #81 · feature/scenario-set-construction · through 2026-07-07</div>
+<h1>Can we pick training scenarios better than chance? The research program, explained</h1>
+<p class="dek">Three experiments in, the honest answer is: not yet — every engineered selection
+method sits at parity with random. But along the way the measurement itself turned out to be
+broken, and fixing it changed what the earlier results meant. This page tells both stories: what
+was tried, and how the yardstick was rebuilt so the next attempt can actually be judged.</p>
+
+<div class="legend">
+  <span>Two colors are used consistently everywhere below:</span>
+  <span class="pill a">ENGINEERED — scenarios chosen or generated by the mining pipeline</span>
+  <span class="pill b">RANDOM — scenarios drawn uniformly at random (the chance baseline)</span>
+</div>
+
+<h2>1 · The question, and why it's harder than it looks</h2>
+<p class="oneline">In one line: the pipeline that turns real agent traces into training scenarios
+has one step whose value was never proven — whether <em>choosing</em> scenarios intelligently
+beats choosing them at random — and chance is a much stronger opponent than it sounds.</p>
+<p>The repo mines ~1,000 recorded customer-service conversations ("traces") into training
+<em>scenarios</em>: a task plus a judge-gradable checklist. A fine-tune trained through this
+pipeline beats the base model. But the pipeline's selection step — extract behavioral facets,
+cluster them, pick a diverse spread — had never been tested against the null hypothesis. And the
+null hypothesis has a structural advantage: a uniform draw automatically matches the corpus (and
+therefore the eval) distribution, while any diversity-seeking selector deliberately moves away
+from it. Beating random requires knowing something a coin flip doesn't.</p>
+
+<h2>2 · What was tried: three arms, one verdict each</h2>
+<p class="oneline">In one line: summary-based selection lost to random, capability-based selection
+recovered to exact parity, and nothing so far has been better than chance.</p>
+<div class="flow">
+  <div class="stage a">
+    <div class="name">Arm 1 — mined v1 <span class="pill a">ENGINEERED</span> <span class="cmd">cluster on task phrasing</span></div>
+    <div class="what"><b>Lost to random</b> (−8.0 pts vs the multi-seed mean). Post-mortem found two mechanisms: clustering on how tasks are <em>worded</em> split one capability into duplicate clusters, and the diversity-seeking allocator drifted the domain mix away from the corpus (15% airline training data — a domain the eval doesn't contain).</div>
+  </div>
+  <div class="arrow"><span>fix: embed capability, not phrasing</span></div>
+  <div class="stage a">
+    <div class="name">Arm 2 — mined v2 <span class="pill a">ENGINEERED</span> <span class="cmd">embed "[domain] summary | tools: signature"</span></div>
+    <div class="what"><b>Exact parity with the random mean</b> (48.6% vs 47.4% on the final pool, paired 33W/27L/14T). Fixed the retail collapse outright. The whole facet→cluster→select machinery now buys what <code>random.shuffle</code> buys — at the same cost on every axis, including training-set size.</div>
+  </div>
+  <div class="arrow"><span>literature survey: what could actually win?</span></div>
+  <div class="stage a">
+    <div class="name">Arm 3 — generative synthesis <span class="pill a">ENGINEERED</span> <span class="cmd">not yet built</span></div>
+    <div class="what">The next bet, chosen from a 25-source verified survey: <b>skill-extraction-driven synthesis</b> (generate novel scenarios from a skill inventory, not replay traces) — the one approach in the literature with a teacher-controlled, budget-matched win over random selection. Difficulty-aware budget reallocation is the companion arm.</div>
+  </div>
+</div>
+<p class="note">All arms share everything except selection: same scenario synthesis + validation
+(gpt-5.4 writes, Opus 4.8 back-checks), same self-collection (the student attempts each scenario
+6× in a simulated environment; a judge keeps ≤2 passing episodes), same LoRA recipe, same eval
+protocol (3 passes per scenario, means only).</p>
+
+<h2>3 · The one trick this session actually shipped: a yardstick you can't fool</h2>
+<p class="oneline">In one line: the same experiment read against one random draw said "random wins
+by 14 points," and read against the fair baseline says "parity" — so the fair baseline is now
+locked in before any new arm runs.</p>
+<div class="seam">
+  <div class="topbox"><b>Same question: is mined-v2 better than random?</b>
+    <div class="sub">identical training runs, identical eval protocol — only the baseline construction differs</div></div>
+  <div class="stem"><div></div></div>
+  <div class="iface">what do you compare against?</div>
+  <div class="split"><div></div><div></div></div>
+  <div class="branches">
+    <div class="branch a"><span class="tag">The naive read</span><b>One random draw, 21-scenario eval</b><br>
+      Random = 36.5%, mined-v2 = 30.2% → "mining loses by 6." That draw turned out to be the luckiest of three seeds, on an eval pool whose noise floor (±5.5 pts) exceeded most effects being measured.</div>
+    <div class="branch b"><span class="tag">The fair read</span><b>3-seed mean, 74-scenario frozen pool</b><br>
+      Random = 47.4% ± 3.8, mined-v2 = 48.6% → parity (+1.2, inside noise). The decision rule is pre-registered: a new arm "wins" only if it clears the mean by &gt;2× the seed spread (7.6 pts) with a paired sign-test p&lt;0.05.</div>
+  </div>
+</div>
+<p>Three commitments now make the yardstick tamper-proof, all recorded in the goal charter before
+any generative arm exists: the eval pool is <b>frozen</b> (74 validated held-out scenarios,
+committed at <span class="mono">4adc4b5</span>); the baseline is a <b>multi-seed mean</b>, never a
+single draw; and the <b>decision rule is fixed in advance</b>, so no post-hoc framing can turn
+parity into a win. Budgets are matched everywhere — scenario count, collection compute, and
+training-sample count (which had silently varied by up to 46% between arms).</p>
+
+<h2>4 · The worked example: watch the lucky draw evaporate</h2>
+<p class="oneline">In one line: when the eval pool grew from 21 to 74 scenarios, the three random
+seeds completely reordered — the "best" seed became the worst — which is the concrete proof the
+old rankings were noise.</p>
+<p>These are real numbers from the six committed eval files; each cell is the mean of 3 full
+passes.</p>
+<div class="tablewrap"><table>
+  <tr><th>random seed</th><th>old pool (21 scenarios)</th><th>frozen pool v2 (74 scenarios)</th><th>what happened</th></tr>
+  <tr><td>seed 0</td><td><b>36.5%</b> — "random beats everything!"</td><td>45.0% — <b>lowest</b> of the three</td><td>the lucky draw, exposed</td></tr>
+  <tr><td>seed 1</td><td>27.0% — tied for worst</td><td><b>51.8%</b> — best of the three</td><td>full reversal</td></tr>
+  <tr><td>seed 2</td><td>27.0%</td><td>45.5%</td><td>—</td></tr>
+  <tr><td><b>mean ± sd</b></td><td>30.2% ± 5.5</td><td><b>47.4% ± 3.8</b></td><td>the number that matters</td></tr>
+</table></div>
+<p>Every conclusion drawn from a single seed on the old pool would have been wrong in a different
+way. The early "random wins by 14 points" headline was seed-0's luck; the later "mined-v2 exactly
+ties the mean" survived both pools and both directions of the sign — that is what a robust parity
+looks like.</p>
+<p class="note">Provenance: all values from <code>eval_bc-random*{,-ep2}.json</code> in
+<code>.agents/docs/research/distill/</code>, produced by live runs on 2026-07-06.</p>
+
+<h2>5 · What the literature says the next arm should be</h2>
+<p class="oneline">In one line: a 25-source adversarially-verified survey found exactly one
+approach with a controlled, budget-matched win over random selection — synthesize novel tasks
+from an extracted skill inventory — and explicitly demoted the ideas we liked most.</p>
+<p>The survey (107 sub-agents, 124 extracted claims, each surviving claim confirmed by 3
+independent verifiers) mapped five literatures. What survived:</p>
+<ul>
+  <li><b>Adapt — skill-extraction synthesis</b> (Instruct-SkillMix): 1K synthesized examples beat
+  5K uniform-randomly selected real ones ~2.4×, and the win survives a teacher-controlled 1K-vs-1K
+  ablation. This is the template for Arm 3: our facets + tool signatures already approximate the
+  skill inventory.</li>
+  <li><b>Adapt as companion — difficulty-aware budget reallocation</b> (DART-Math, HS-STaR):
+  vanilla filtered collection starves hard scenarios (our dead-slot problem); reallocating rollout
+  budget toward the ~12.5–87.5% pass-rate band wins budget-matched — but only by 1–2 points, and
+  <b>selection without reallocation gains +0.2%</b>, i.e. nothing.</li>
+  <li><b>Demoted — capability composition</b>: the same paper's ablation shows mixing two skills
+  adds ~nothing over extracting them well. This was our favorite idea before the survey.</li>
+  <li><b>Flagged for us</b>: difficulty gains shrink to ~1 pt on strong models because scenario
+  <em>diversity</em> becomes the bottleneck — independent support for generation over selection.
+  Three plausible-sounding claims (including "Self-Instruct beat real data") were refuted in
+  verification and are marked do-not-cite.</li>
+</ul>
+
+<h2>6 · The unsolved design problem blocking Arm 3</h2>
+<p class="oneline">In one line: every scenario so far was validated by checking its checklist
+against the real trace it came from — generated scenarios have no source trace, so they need a
+new gate before any of them may touch training.</p>
+<p>The current validity gate is <em>back-agreement</em>: a judge confirms the synthesized checklist
+is faithful to the source conversation. A generated scenario has no source conversation. The
+planned replacement (designed, not yet built) has three parts: agreement against the <em>skill
+specification</em> that prompted the generation; a solvability probe inside the simulated
+environment; and an embedding-space duplicate check against the frozen eval pool — with the
+maximum similarity reported — so generation can never quietly leak eval content into training.
+The danger cell is exactly that leak:</p>
+<div class="grid2">
+  <div></div><div class="hdr">passes new gate</div><div class="hdr">fails new gate</div>
+  <div class="rowhdr">novel</div>
+  <div class="cell good"><b>trainable</b>the scenario the program needs</div>
+  <div class="cell meh"><b>discarded</b>wasted synthesis, harmless</div>
+  <div class="rowhdr">eval-like</div>
+  <div class="cell bad"><b><span class="danger-word">silent leak</span></b>trains on the test — inflates every downstream number</div>
+  <div class="cell meh"><b>caught</b>what the dedup check is for</div>
+</div>
+
+<h2>7 · How the results are protected</h2>
+<p class="oneline">In one line: five separate artifacts tried to corrupt these numbers — a
+reasoning leak, two network-poisoned collections, a fake 0%, and a disk-full training crash — and
+every one was caught and answered by re-running, never by patching.</p>
+<ul>
+  <li>A serving flag omission silently merged the model's private reasoning into its visible
+  replies — would have poisoned all training targets; caught by a smoke generation before
+  collection.</li>
+  <li>Two collection runs were killed by network trouble (one outage, one flapping SSH tunnel
+  whose aggressive keepalives amplified stalls into 220 connection errors). Both outputs were
+  quarantined and both arms re-collected whole.</li>
+  <li>A shell quirk sent one eval a nonexistent model name → 0.0%; deleted, re-run.</li>
+  <li>A training crash at step 70/105 traced to checkpoint writes overflowing the nearly-full GPU
+  box disk; fixed by disabling mid-run checkpoints (pure I/O, identical optimization).</li>
+  <li>Inherited from earlier debugging: the judge must see the agent's final message and needs an
+  8K-token verdict budget — both bugs would have deflated every arm equally and invisibly.</li>
+</ul>
+
+<h2>8 · What you can run</h2>
+<p class="oneline">In one line: the whole program is five scripts against a tunnel on
+<code>localhost:18002</code>; the frozen pool and every eval artifact are committed.</p>
+<div class="tablewrap"><table>
+  <tr><th>Command</th><th>Side</th><th>What it does</th><th>Produces</th></tr>
+  <tr><td><code>build_bc_pools.py --arm {mined|random} --random-seed N</code></td><td><span class="pill a">ENG</span> <span class="pill b">RND</span></td><td>Builds a 60-scenario training pool (shared synthesis + validation)</td><td><code>bc_pool_*.json</code></td></tr>
+  <tr><td><code>build_eval_pool_v2.py</code></td><td>both</td><td>Mines the 211 held-out traces into the frozen 74-scenario eval pool</td><td><code>eval_pool_v2.json</code></td></tr>
+  <tr><td><code>collect_bc.py --pool P --out O --samples 6</code></td><td>per arm</td><td>Student self-attempts; judge keeps ≤2 passing episodes/scenario</td><td><code>bc_*.jsonl</code></td></tr>
+  <tr><td><code>train_sft_box.py</code> (GPU box, via tmux)</td><td>per arm</td><td>LoRA r=32, 3 epochs, completion-only loss, no checkpoints</td><td><code>adapter_bc_*</code></td></tr>
+  <tr><td><code>eval_student.py --eval-pool eval_pool_v2.json --passes 3 --wm-model foundry:gpt-5.4 --judge-model opus-judge</code></td><td>all arms</td><td>222 episodes per arm on the frozen pool</td><td><code>eval_*-ep2.json</code></td></tr>
+</table></div>
+
+<h2>9 · Proven vs. pending</h2>
+<p class="oneline">In one line: parity of engineered selection with random is now proven twice
+over on two pools; everything about generation — the arm, its validity gate, and any claim it
+wins — is pending.</p>
+<div class="tablewrap"><table>
+  <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+  <tr><td>Summary-based mined selection is worse than the random mean (−8 pts)</td><td><span class="pill ok">verified live</span></td><td>3-seed baseline, old pool; mechanisms confirmed in kept-episode data</td></tr>
+  <tr><td>Capability-enriched selection is at parity with random (both pools, both sign directions)</td><td><span class="pill ok">verified live</span></td><td>+0.0 on old pool, +1.2 on frozen pool; paired 33W/27L/14T</td></tr>
+  <tr><td>Old 21-scenario eval rankings were noise</td><td><span class="pill ok">verified live</span></td><td>Seed ordering fully reversed on the 74-scenario pool (§4)</td></tr>
+  <tr><td>Frozen pool + pinned baselines + pre-registered decision rule</td><td><span class="pill ok">verified live</span></td><td>Committed <span class="mono">4adc4b5</span>/<span class="mono">f94cbc0</span>; recorded in the Notion charter before any generative arm exists</td></tr>
+  <tr><td>Skill-extraction synthesis beats random <em>in our setting</em></td><td><span class="pill pend">pending</span></td><td>Literature-supported only (Instruct-SkillMix); Arm 3 not built</td></tr>
+  <tr><td>Validity gate for source-less generated scenarios</td><td><span class="pill pend">pending</span></td><td>Designed (skill-spec agreement + solvability probe + eval dedup); no code yet</td></tr>
+  <tr><td>Any of this transfers outside the simulator</td><td><span class="pill pend">pending</span></td><td>No real-environment leg has ever run for the BC arms</td></tr>
+</table></div>
+<p>The blunt version: after three engineered arms and roughly 4,000 evaluated episodes, nothing
+beats a coin flip yet — and the program's honest output so far is a measurement apparatus rigorous
+enough to know that, plus a literature-vetted plan for the first attempt that plausibly could.</p>
+
+<h2>10 · Map of the work</h2>
+<p class="oneline">In one line: one package does the mining, six scripts run the experiments, and
+the program's memory lives in three linked documents.</p>
+<div class="tablewrap"><table>
+  <tr><th>Where</th><th>Plain-English job</th></tr>
+  <tr><td><code>wmh/scenarios/</code></td><td>The PR deliverable: facets, clustering, selection, synthesis, inline validation (575 tests)</td></tr>
+  <tr><td><code>.agents/scripts/</code></td><td>Experiment runners: pool builders, collector, trainer, evaluator</td></tr>
+  <tr><td><code>.agents/docs/research/distill/</code></td><td>All artifacts: pools, kept episodes, 11 eval JSONs, PR comment draft, both clarity reports</td></tr>
+  <tr><td>Notion · <a href="https://app.notion.com/p/3960f8b3f5918180b843e431a5fc9aaa">Ablation writeup</a></td><td>The completed mined-vs-random experiment, with full chronological log</td></tr>
+  <tr><td>Notion · <a href="https://app.notion.com/p/3960f8b3f5918117b400cfcbb27e66ba">Goal charter</a></td><td>The open research goal, pre-registered protocol, survey map, pinned baselines</td></tr>
+  <tr><td><code>claas-verl/experiments/tau/07_03_2026_…md</code></td><td>The running lab journal, including every failure</td></tr>
+</table></div>
+
+<div class="footer">
+  <b>Where it lives</b> · <a href="https://github.com/experientiallabs/world-model-harness/pull/81">PR #81 — Scenario-set construction from traces</a> · branch <span class="mono">feature/scenario-set-construction</span> @ <span class="mono">f94cbc0</span><br>
+  32 commits over base · 575 tests passing, 7 skipped · lint + type gate clean · every number on this page is a mean of 3 passes.
+</div>
+
+</div>
