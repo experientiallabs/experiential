@@ -59,7 +59,9 @@ uv run python -m environment_capture.hub push bird-sql
 uv run python -m environment_capture.hub push all            # add --private for private repos
 
 # pull the full bundle (corpus + data dirs) after a fresh clone; never clobbers local files
-uv run python -m environment_capture.hub fetch dabstep
+uv run wmh download                 # interactive picker over the org's live datasets
+uv run wmh download dabstep         # same thing, direct (also: 'all', --force)
+uv run python -m environment_capture.hub fetch dabstep   # library-level equivalent
 uv run python -m environment_capture.hub fetch all --force   # explicit overwrite
 
 # or push straight from a capture wave

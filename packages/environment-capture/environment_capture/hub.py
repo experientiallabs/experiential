@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -46,6 +47,8 @@ class HubApi(Protocol):
         repo_type: str,
         commit_message: str,
     ) -> object: ...
+
+    def list_datasets(self, *, author: str) -> Iterable[object]: ...
 
     def upload_folder(
         self,
@@ -175,9 +178,53 @@ CORPORA: dict[str, CorpusSpec] = {
 }
 
 
+@dataclass(frozen=True)
+class PublishedCorpus:
+    """One live dataset repo under the org, mapped back to its benchmark."""
+
+    benchmark: str
+    repo_id: str
+    last_modified: str  # ISO date, "" when the Hub omits it
+
+
+def published_corpora(
+    *, token: str | None = None, api: HubApi | None = None
+) -> list[PublishedCorpus]:
+    """The org's live corpus datasets (Hub API), newest first, mapped to benchmark names.
+
+    Only repos that follow the ``wmh-<benchmark>-traces`` convention AND appear in the local
+    manifest are returned — those are the ones ``fetch_corpus`` knows where to place.
+    """
+    hub = api or HfApi(token=token)
+    published: list[PublishedCorpus] = []
+    for info in hub.list_datasets(author=_ORG):
+        repo_id = str(getattr(info, "id", ""))
+        name = repo_id.removeprefix(f"{_ORG}/")
+        if not (name.startswith("wmh-") and name.endswith("-traces")):
+            continue
+        benchmark = name.removeprefix("wmh-").removesuffix("-traces")
+        if benchmark not in CORPORA:
+            continue
+        modified = getattr(info, "last_modified", None)
+        published.append(
+            PublishedCorpus(
+                benchmark=benchmark,
+                repo_id=repo_id,
+                last_modified=modified.strftime("%Y-%m-%d") if modified else "",
+            )
+        )
+    published.sort(key=lambda c: c.last_modified, reverse=True)
+    return published
+
+
 def repo_id_for(benchmark: str) -> str:
     """The dataset repo backing one benchmark's corpus."""
     return f"{_ORG}/wmh-{benchmark}-traces"
+
+
+def corpus_path(benchmark: str) -> Path:
+    """Where the benchmark's local trace corpus lives (whether or not it exists yet)."""
+    return _data_root() / benchmark / _CORPUS_FILE
 
 
 def _data_root() -> Path:
@@ -244,7 +291,7 @@ path = hf_hub_download(
 or, from a world-model-harness checkout:
 
 ```bash
-uv run python -m environment_capture.hub fetch {spec.benchmark}
+uv run wmh download {spec.benchmark}
 ```
 """
 
@@ -268,7 +315,7 @@ def push_corpus(
             f"{benchmark!r} is not a publishable corpus (available: {publishable}). "
             "appworld is local-only: its license forbids plain-text redistribution."
         )
-    corpus = _data_root() / benchmark / _CORPUS_FILE
+    corpus = corpus_path(benchmark)
     if not corpus.exists():
         raise FileNotFoundError(
             f"no local corpus at {corpus}; capture one first (see the benchmark README)"
@@ -323,7 +370,7 @@ def fetch_corpus(
     if spec is None:
         publishable = ", ".join(sorted(CORPORA))
         raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
-    target = dest or _data_root() / benchmark / _CORPUS_FILE
+    target = dest or corpus_path(benchmark)
     if not target.exists() or force:
         downloaded = hf_hub_download(
             repo_id_for(benchmark), _CORPUS_FILE, repo_type="dataset", token=token
@@ -401,7 +448,7 @@ def main() -> None:
             url = push_corpus(name, private=args.private)
             print(f"pushed {name} -> {url}")
         else:
-            existing = (_data_root() / name / _CORPUS_FILE).exists()
+            existing = corpus_path(name).exists()
             path = fetch_corpus(name, force=args.force)
             state = "kept local" if existing and not args.force else "fetched"
             print(f"{state} {name} -> {path}")

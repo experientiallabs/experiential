@@ -36,6 +36,9 @@ class _StubApi:
         )
         self.uploaded[f"{repo_id}/{path_in_repo}"] = content
 
+    def list_datasets(self, *, author: str) -> list[object]:
+        return []
+
     def upload_folder(
         self,
         *,

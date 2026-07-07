@@ -21,6 +21,12 @@ from uuid import uuid4
 
 import typer
 import uvicorn
+from environment_capture.hub import (
+    CORPORA,
+    corpus_path,
+    fetch_corpus,
+    published_corpora,
+)
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -36,6 +42,7 @@ from wmh.cli.ui import (
     run_build_wizard,
     run_play_repl,
     select_model,
+    select_option,
     select_provider_and_model,
 )
 from wmh.config import (
@@ -103,6 +110,9 @@ _CHECK = "[green]✓[/green]"
 _EVAL_TOKENS = typer.Argument(
     None,
     help="Trace files to score, or eval flow: list | run <suite> | results optional-suite.",
+)
+_DOWNLOAD_BENCHMARKS = typer.Argument(
+    None, help="Benchmark bundles to download, or 'all'. Omit for a picker."
 )
 
 
@@ -467,6 +477,48 @@ def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list
         _console.print("[yellow]no world models built yet[/yellow]; run `wmh build --name <name>`")
         return
     _console.print(models_table(infos))
+
+
+@app.command("download")
+def download(
+    benchmarks: list[str] = _DOWNLOAD_BENCHMARKS,
+    force: bool = typer.Option(False, "--force", help="Overwrite existing local files."),
+) -> None:
+    """Download benchmark data bundles (trace corpus + task data) from the Hub.
+
+    With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
+    picker. Bundles land in `packages/environment-capture/<benchmark>/`; existing local files
+    are kept unless `--force`.
+    """
+    selected = list(benchmarks or [])
+    if selected == ["all"]:
+        selected = sorted(CORPORA)
+    if not selected:
+        published = published_corpora()
+        if not published:
+            raise typer.BadParameter(
+                "no published corpora found on the Hub (offline?); "
+                "pass benchmark names directly, e.g. `wmh download bird-sql`"
+            )
+        notes = {}
+        for corpus in published:
+            local = (corpus_path(corpus.benchmark)).exists()
+            state = "local copy present" if local else "not downloaded"
+            when = f", updated {corpus.last_modified}" if corpus.last_modified else ""
+            notes[corpus.benchmark] = f"{state}{when}"
+        choices = [corpus.benchmark for corpus in published]
+        picked = select_option(
+            _console, "Download which data bundle?", [*choices, "all"], notes=notes
+        )
+        selected = choices if picked == "all" else [picked]
+    for name in selected:
+        existing = corpus_path(name).exists()
+        try:
+            path = fetch_corpus(name, force=force)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        state = "kept local" if existing and not force else "fetched"
+        _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
 
 
 @app.command("serve")

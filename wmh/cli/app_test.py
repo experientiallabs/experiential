@@ -125,7 +125,7 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    assert names == {"build", "list", "serve", "demo", "eval", "play"}
+    assert names == {"build", "list", "serve", "demo", "eval", "play", "download"}
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -522,3 +522,61 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
+
+
+def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    fetched: list[tuple[str, bool]] = []
+
+    def fake_fetch(name: str, *, force: bool = False) -> Path:
+        fetched.append((name, force))
+        return tmp_path / name / "traces.otel.jsonl"
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fake_fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "bird-sql", "dabstep", "--force"])
+    assert result.exit_code == 0, result.output
+    assert fetched == [("bird-sql", True), ("dabstep", True)]
+    assert "fetched" in result.output
+
+
+def test_download_all_expands_to_the_manifest(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    fetched: list[str] = []
+    monkeypatch.setattr(
+        cli_app_module, "fetch_corpus", lambda name, force=False: fetched.append(name) or tmp_path
+    )
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "all"])
+    assert result.exit_code == 0, result.output
+    assert fetched == sorted(cli_app_module.CORPORA)
+
+
+def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "nope"])
+    assert result.exit_code != 0
+    assert "no published corpus" in result.output
+
+
+def test_download_picker_lists_published_and_fetches_choice(
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+) -> None:
+    from environment_capture.hub import PublishedCorpus
+
+    published = [
+        PublishedCorpus(
+            benchmark="gaia2",
+            repo_id="experiential-labs/wmh-gaia2-traces",
+            last_modified="2026-07-06",
+        )
+    ]
+    fetched: list[str] = []
+    monkeypatch.setattr(cli_app_module, "published_corpora", lambda: published)
+    monkeypatch.setattr(
+        cli_app_module, "fetch_corpus", lambda name, force=False: fetched.append(name) or tmp_path
+    )
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download"], input="1\n")
+    assert result.exit_code == 0, result.output
+    assert fetched == ["gaia2"]
+    assert "not downloaded" in result.output  # picker showed local status

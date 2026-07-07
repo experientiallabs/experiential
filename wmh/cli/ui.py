@@ -686,6 +686,19 @@ def _ensure_credentials(console: Console, ask_secret: PromptReader, provider: st
             console.print(f"  [yellow]{var} still unset[/yellow]")
 
 
+def select_option(
+    console: Console,
+    label: str,
+    options: list[str],
+    *,
+    notes: dict[str, str] | None = None,
+    reader: PromptReader | None = None,
+) -> str:
+    """Pick one of `options` (arrow-key picker on a TTY, numbered prompt otherwise)."""
+    ask = reader if reader is not None else (lambda text: console.input(text))
+    return _select(console, ask, label, options, None, interactive=True, notes=notes)
+
+
 def select_model(
     console: Console, infos: list[ModelInfo], reader: PromptReader | None = None
 ) -> str:
