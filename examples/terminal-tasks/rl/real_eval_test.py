@@ -168,3 +168,24 @@ def test_evaluate_builds_records_keyed_by_provenance() -> None:
     )
     assert all(not r.success and r.steps == 0 and r.errors for r in bad)
     assert "docker boom" in bad[0].errors[0]
+
+
+def test_long_command_output_is_truncated_head_and_tail() -> None:
+    """Unbounded outputs overflow the policy context (400s); cap keeps head + tail."""
+    from real_eval import MAX_OUTPUT_CHARS
+
+    big = "A" * 10_000 + "TAIL"
+
+    def execute(command: str) -> tuple[str, int]:
+        return big, 0
+
+    scripted = [_tool_turn("cat big"), _text_turn("done")]
+    steps, calls = _run(scripted, execute)
+
+    content = steps[0].observation.content
+    assert len(content) < MAX_OUTPUT_CHARS + 200
+    assert content.startswith("A" * 100)
+    assert content.endswith("TAIL")
+    assert "chars truncated" in content
+    # the truncated form (not the raw dump) is what returns to the policy
+    assert any("chars truncated" in str(m.get("content", "")) for m in calls[1]["messages"])

@@ -67,6 +67,9 @@ _HTTP_BACKOFF = 2.0
 # One nudge when a turn has no tool call, mirroring the tau scaffold: give the policy a chance to
 # either act or cleanly stop, then end the episode on a second toolless turn.
 NUDGE = "Use the bash tool, or stop if the task is complete."
+# Per-command output cap fed back to the policy (and the judge): see the truncation
+# note in the episode loop.
+MAX_OUTPUT_CHARS = 6000
 
 SYSTEM_PROMPT = """You are an expert operating a Debian bash shell to complete a task.
 
@@ -263,6 +266,17 @@ def run_policy_loop(
         for tc in message.tool_calls:
             command = _parse_command(tc.function.arguments)
             output, code = execute(command)
+            # Cap per-command output: unbounded dumps (cat of large files, verbose
+            # installs) overflow the policy's context and 400 the endpoint (observed:
+            # 10/56 base-row episodes died on it). Head+tail keeps both the banner and
+            # the part that usually matters (the end).
+            if len(output) > MAX_OUTPUT_CHARS:
+                keep = MAX_OUTPUT_CHARS // 2
+                output = (
+                    output[:keep]
+                    + f"\n... [{len(output) - MAX_OUTPUT_CHARS} chars truncated] ...\n"
+                    + output[-keep:]
+                )
             content = f"[exit {code}] {output}" if code != 0 else output
             steps.append(
                 Step(
