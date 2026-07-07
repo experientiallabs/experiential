@@ -115,15 +115,11 @@ def build(
         raise ValueError("no traces ingested; nothing to build")
     report.ingest_done(len(traces), _count_steps(traces))
 
-    # 2-way (legacy) selects GEPA candidates on the held-out `test` — which leaks if an eval later
-    # reports on that same band. With `val_frac > 0` we split 3 ways and select on `val`, holding
-    # `test` (the [train_split+val_frac, 1) hash band) fully out for an independent eval to report.
-    if config.val_frac > 0:
-        train, gepa_val, test = split_traces_3way(traces, config.train_split, config.val_frac)
-    else:
-        train, test = split_traces(traces, config.train_split)
-        gepa_val = test
-    report.split_done(len(train), len(test))
+    # Three disjoint sets: train seeds GEPA's reflection minibatches, val (capped) selects
+    # among candidate prompts, and test is never seen by GEPA — `wmh eval` grades on it without
+    # selection overfitting. The remainder after train splits evenly into val/test.
+    train, val, test = split_traces_3way(traces, config.train_split, (1.0 - config.train_split) / 2)
+    report.split_done(len(train), len(val), len(test))
 
     provider = serve_provider or get_provider(config.serve_provider_config())
     # The GEPA judge can run on a cheaper model (config.judge_model) of the same provider kind;
@@ -175,9 +171,8 @@ def build(
     # Every GEPA iteration re-scores the whole valset, so an uncapped held-out split multiplies
     # wall-clock and spend by its step count for no selection benefit (fidelity saturates fast —
     # see docs/trace_scaling_law.md). Candidate selection only needs a stable sample; the full
-    # held-out split still backs `wmh eval`. Cap whichever val band the split produced (the 3-way
-    # `val` when `val_frac > 0`, else the 2-way `test`).
-    gepa_val = _cap_gepa_valset(gepa_val or train)
+    # held-out split still backs `wmh eval`.
+    gepa_val = _cap_gepa_valset(val or train)
     result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
     # A GEPA candidate can be empty — a weak reflection LM (e.g. a self-reflecting open model)
     # sometimes proposes a blank env prompt that still scores acceptably on easy steps and gets
@@ -197,7 +192,8 @@ def build(
 
 
 # Ceiling on GEPA's candidate-selection valset, in steps (~one full-val pass per iteration).
-_GEPA_VAL_STEP_CAP = 64
+# Small on purpose: selection only needs a stable ranking signal, and fidelity saturates fast.
+_GEPA_VAL_STEP_CAP = 16
 
 
 def _cap_gepa_valset(traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP) -> list[Trace]:

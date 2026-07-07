@@ -95,7 +95,7 @@ def test_reporter_degrades_to_plain_lines_when_not_a_tty() -> None:
     reporter = RichBuildReporter(console, "airline")
     with console.capture() as cap:
         reporter.ingest_done(3, 9)
-        reporter.split_done(2, 1)
+        reporter.split_done(2, 1, 1)
         reporter.index_done(9)
         reporter.optimize_start(20)
         reporter.rollout(1, 20, 0.4)
@@ -104,10 +104,10 @@ def test_reporter_degrades_to_plain_lines_when_not_a_tty() -> None:
     out = cap.get()
     assert "ingested 3 traces" in out
     assert "normalized 9 steps" in out
-    assert "2 train / 1 held-out" in out
+    assert "2 train / 1 val / 1 test" in out
     assert "GEPA metric call 1/20" in out  # non-TTY heartbeat
     assert "GEPA metric call 10/20" in out
-    assert "held-out 0.600" in out
+    assert "val 0.600" in out
 
 
 def test_reporter_does_not_show_impossible_progress_denominator() -> None:
@@ -181,6 +181,43 @@ def test_arrow_select_moves_pointer_and_accepts(monkeypatch) -> None:  # noqa: A
     assert "\u276f b" in console.export_text()  # pointer painted on the accepted row
 
 
+def test_split_keys_separates_batched_sequences() -> None:
+    assert ui_module._split_keys("\x1b[B\x1b[B") == ["\x1b[B", "\x1b[B"]
+    assert ui_module._split_keys("\x1b[1;5A") == ["\x1b[1;5A"]
+    assert ui_module._split_keys("jk\r") == ["j", "k", "\r"]
+    assert ui_module._split_keys("\x1bOA5") == ["\x1bOA", "5"]
+    assert ui_module._split_keys("\x1b") == ["\x1b"]
+
+
+def test_arrow_select_reveals_hidden_rows_on_navigation(monkeypatch) -> None:  # noqa: ANN001
+    # Collapsed picker: two rows + a "… N more" row; arrowing down onto it expands in place
+    # and the highlight lands on the first revealed option.
+    keys = iter(["\x1b[B", "\x1b[B", "\x1b[B", "\r"])  # down to "more", auto-expand, down, Enter
+    monkeypatch.setattr(ui_module.click, "getchar", lambda: next(keys))
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    chosen = ui_module._arrow_select(console, ["a", "b"], 0, ["c", "d"])
+    assert chosen == 3  # a -> b -> (more: expands, highlight on c) -> d -> Enter
+    out = console.export_text()
+    assert "… 2 more" in out  # the collapsed affordance rendered
+    assert "\u276f d" in out  # and the final highlight reached a previously hidden row
+
+
+def test_select_collapsed_keeps_numbered_fallback_complete() -> None:
+    # Non-TTY: collapsed is an arrow-picker affordance only; scripted input sees every option.
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    chosen = ui_module._select(
+        console,
+        _scripted_reader(["4"]),
+        "Pick",
+        ["a", "b", "c", "d"],
+        "a",
+        interactive=False,
+        collapsed=2,
+    )
+    assert chosen == "d"
+    assert "4." in console.export_text()  # all four options listed
+
+
 def test_arrow_select_aborts_on_eof(monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setattr(ui_module.click, "getchar", lambda: "")
     console = Console(force_terminal=False, no_color=True, width=100)
@@ -202,11 +239,12 @@ def test_step_selection_navigates_wraps_and_accepts() -> None:
 
 def test_build_wizard_collects_all_inputs() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
-    # Prompts in order: name, file, provider (select), model (select), region (bedrock only),
-    # budget, embedder (select). No embed-model (hashing default) and no phi-dim prompt.
+    # Prompts in order: name, trace source (select), file, provider (select), model (select),
+    # region (bedrock only), budget, embedder (select). No embed-model (hashing) or phi-dim prompt.
     reader = _scripted_reader(
         [
             "tau2-airline",
+            "",  # trace source: accept the default (otel-genai)
             "/tmp/traces.jsonl",
             "bedrock",
             "us.anthropic.claude-opus-4-8",
@@ -238,7 +276,7 @@ def test_build_wizard_select_by_number() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # Provider/model/embedder are numbered pickers; choosing by index must work. Pick anthropic (2),
     # its second model, no region prompt (not bedrock), budget 8, hashing embedder (1).
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "2", "2", "", "8", "1"])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "2", "2", "", "8", "1"])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -257,7 +295,7 @@ def test_build_wizard_collects_provider_embedder() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # A provider-backed embedder adds an embeddings-model picker; phi dim keeps its default.
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "openai", "gpt-5.5", "", "8", "openai", "text-embedding-3-large"]
+        ["m", "", "/tmp/t.jsonl", "openai", "gpt-5.5", "", "8", "openai", "text-embedding-3-large"]
     )
     params = run_build_wizard(
         console,
@@ -321,6 +359,20 @@ def test_build_reporter_activity_window_streams_within_fixed_height() -> None:
     assert reporter._live is None  # display released on completion
 
 
+def test_build_reporter_activity_lines_are_width_safe() -> None:
+    # Judge critiques can contain combining marks / double-width glyphs whose cell width the
+    # terminal and rich disagree on; one such line in the live region desyncs every repaint
+    # (orphaned frame headers). Lines are reduced to printable ASCII before rendering.
+    console = Console(force_terminal=True, no_color=True, width=100, file=io.StringIO())
+    reporter = RichBuildReporter(console, "demo")
+    reporter.optimize_start(10)
+    reporter.activity("matches the \u0935\u093e\u0938\u094d\u0924\u0935\u093f\u0915 obs\te\u0301")
+    line = reporter._activity[-1]
+    assert all(" " <= ch <= "~" for ch in line)
+    assert line.startswith("matches the ")
+    reporter.optimize_done(0.5, 1, 10)
+
+
 def test_build_reporter_activity_is_quiet_when_piped() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     reporter = RichBuildReporter(console, "demo")
@@ -334,7 +386,7 @@ def test_build_wizard_dashes_spaces_in_name() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # Whitespace is dash-joined rather than rejected: typing "tau bench" quietly becomes
     # "tau-bench", with a dim note showing the name actually used.
-    reader = _scripted_reader(["tau bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["tau bench", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -350,7 +402,7 @@ def test_build_wizard_reprompts_on_invalid_name() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # A name normalization can't rescue ("tau/bench" has a path separator) must re-prompt with
     # the friendly validation message, not escape as a ValueError traceback.
-    reader = _scripted_reader(["tau/bench", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["tau/bench", "tau-bench", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -366,7 +418,7 @@ def test_build_wizard_normalizes_flag_name_in_default() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # A whitespace-y --name flag becomes the normalized bracketed default, acceptable via Enter
     # on the first prompt (no validation error, no re-prompt).
-    reader = _scripted_reader(["", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="tau bench"),
@@ -382,7 +434,7 @@ def test_build_wizard_drops_invalid_flag_name_from_default() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # An unrescuable --name flag must not become the bracketed Enter-default (it could never be
     # accepted); blank input then means "no name yet" and re-prompts until a valid one arrives.
-    reader = _scripted_reader(["", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["", "tau-bench", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="tau/bench"),
@@ -407,10 +459,11 @@ def test_build_wizard_aborts_cleanly_on_eof() -> None:
 
 
 def test_build_wizard_reprompts_on_blank_trace_source() -> None:
-    # A blank traces path must re-ask, not crash. After a name, blank the file once, then give a
-    # real path; remaining prompts (provider/model/region/budget/embedder) take defaults.
+    # A blank traces path must re-ask, not crash. After a name and the trace-source select, blank
+    # the file once, then give a real path; remaining prompts (provider/model/region/budget/
+    # embedder) take defaults.
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["mymodel", "", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["mymodel", "", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -433,9 +486,9 @@ def test_build_wizard_prompts_for_missing_credentials_and_saves(
     monkeypatch.chdir(tmp_path)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(
-        # name, file, provider, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (skip),
-        # model, region, budget, embedder
-        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "", "8", "1"]
+        # name, trace source, file, provider, AWS_REGION, AWS_ACCESS_KEY_ID,
+        # AWS_SECRET_ACCESS_KEY (skip), model, region, budget, embedder
+        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "", "8", "1"]
     )
     params = run_build_wizard(
         console,
@@ -468,7 +521,7 @@ def test_build_wizard_keeps_session_creds_when_persistence_fails(
     monkeypatch.setattr(ui_module, "upsert_env_var", refuse)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "", "8", "1"]
+        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "", "8", "1"]
     )
     params = run_build_wizard(
         console,
@@ -493,7 +546,7 @@ def test_build_wizard_verifies_provider_and_retries_on_failure() -> None:
         return VerifyResult(ok=ok, kind=cfg.kind, model=cfg.model, detail="" if ok else "bad key")
 
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "anthropic", "", "", "", ""])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "openai", "", "anthropic", "", "", "", ""])
     params = run_build_wizard(
         console, BuildParams(name="default"), reader=reader, verify=flaky, verify_embed=_ok_verify
     )
@@ -514,7 +567,7 @@ def test_build_wizard_verifies_embedder_with_embed_config() -> None:
 
     console = Console(force_terminal=False, no_color=True, width=100)
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "openai", "", "", "", "openai", "text-embedding-3-large"]
+        ["m", "", "/tmp/t.jsonl", "openai", "", "", "", "openai", "text-embedding-3-large"]
     )
     run_build_wizard(
         console,
@@ -533,7 +586,7 @@ def test_build_wizard_defaults_to_first_provider_with_creds(monkeypatch) -> None
     # bedrock, azure order) whose creds are present — here anthropic, once openai's key is gone.
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -549,7 +602,7 @@ def test_build_wizard_annotates_providers_that_have_keys(monkeypatch) -> None:  
     # Providers whose creds are present are labeled in the picker; cleared ones are not.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "", "", ""])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "openai", "", "", "", ""])
     run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -580,6 +633,22 @@ def test_select_model_picks_by_number() -> None:
         ModelInfo(name="retail", serve_provider="bedrock", serve_model="opus"),
     ]
     assert select_model(console, infos, reader=_scripted_reader(["2"])) == "retail"
+
+
+def test_play_repl_shows_sampled_action_suggestions() -> None:
+    console = Console(force_terminal=False, no_color=True, width=100)
+    with console.capture() as cap:
+        run_play_repl(
+            console,
+            _world_model(),
+            "airline",
+            task=None,
+            reader=_scripted_reader([":quit"]),
+            suggestions=['get_user {"id": "u1"}', "list_flights"],
+        )
+    out = cap.get()
+    assert "Real actions from this model's traces" in out
+    assert 'get_user {"id": "u1"}' in out
 
 
 def test_select_model_reprompts_then_accepts_name() -> None:

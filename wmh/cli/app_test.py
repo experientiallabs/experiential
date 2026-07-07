@@ -190,6 +190,69 @@ def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:
     assert os.environ["WMH_TEST_MAIN_VAR"] == "loaded"
 
 
+def test_demo_replays_a_sampled_scenario_open_loop(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    _build(root, "demo-model", tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--seed",
+            "0",
+            "--steps",
+            "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "replaying scenario" in result.output
+    assert "predicted" in result.output
+    assert "actual" in result.output
+    assert "exact matches" in result.output
+
+
+def test_retry_narrator_dedupes_identical_failures_and_counts_down(monkeypatch) -> None:  # noqa: ANN001
+    from rich.console import Console as RichConsole
+
+    _RetryNarrator = cli_app_module._RetryNarrator
+
+    console = RichConsole(force_terminal=False, no_color=True, width=100)
+
+    class Boto(Exception):
+        def __init__(self, code: str) -> None:
+            super().__init__("An error occurred (reached max retries: 1)")
+            self.response = {"Error": {"Code": code, "Message": "Bedrock is unable"}}
+
+    class FakeStatus:
+        def __init__(self) -> None:
+            self.updates: list[str] = []
+
+        def update(self, text: str) -> None:
+            self.updates.append(text)
+
+    monkeypatch.setattr(cli_app_module.time, "sleep", lambda _s: None)
+    narrator = _RetryNarrator(console)
+    status = FakeStatus()
+    narrator.attach(status, "busy")
+    with console.capture() as cap:
+        narrator.on_retry(1, 3, 1.0, Boto("ServiceUnavailableException"))
+        narrator.sleep(1.0)
+        narrator.on_retry(2, 3, 3.0, Boto("ServiceUnavailableException"))  # same failure: silent
+        narrator.sleep(3.0)
+        narrator.on_retry(3, 3, 9.0, Boto("ThrottlingException"))  # different: printed
+    out = cap.get()
+    assert out.count("provider hiccup") == 2  # deduped consecutive identical failures
+    assert "ServiceUnavailableException: Bedrock is unable" in out
+    assert "reached max retries" not in out  # transport chatter stripped
+    assert "retry 2/3 — waiting 3s…" in " ".join(status.updates)  # inline countdown
+    assert status.updates[-1] == "busy"  # spinner text restored after the wait
+
+
 def test_providers_subcommand_is_registered() -> None:
     group_names = {group.name for group in app.registered_groups}
     assert "providers" in group_names
@@ -359,12 +422,13 @@ def test_build_interactive_wizard_creates_model(
     for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(var, "test-cred")  # creds present: no interactive key prompts
     # --interactive forces the wizard even under CliRunner (non-TTY); feed each answer line in
-    # prompt order: name, file, provider (select), model (select), region (bedrock only),
-    # judge model (select), budget, embedder (select). The offline 'hashing' embedder skips
-    # the embed-model prompt; phi dim isn't prompted. Provider/model/embedder pick by index.
+    # prompt order: name, trace source (select), file, provider (select), model (select), region
+    # (bedrock only), judge model (select), budget, embedder (select). The offline 'hashing'
+    # embedder skips the embed-model prompt; phi dim isn't prompted. Selects pick by index.
     answers = "\n".join(
         [
             "wizard-built",
+            "",  # trace source: accept the default (otel-genai)
             _traces_file(tmp_path),
             "3",  # provider: bedrock (order: openai, anthropic, bedrock, azure, ...)
             "1",  # model: us.anthropic.claude-opus-4-8

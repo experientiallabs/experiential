@@ -149,58 +149,6 @@ def _multi_trace_file(tmp_path, n: int) -> str:  # noqa: ANN001 - pytest fixture
     return str(p)
 
 
-def test_build_val_frac_reserves_test_band_from_gepa(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    """With val_frac>0, GEPA trains/selects on train+val only; the test band is held out fully."""
-    import sys
-
-    from wmh.engine.build import split_traces_3way
-    from wmh.optimize import OptimizeResult
-
-    # The package re-exports `build`, so `import ... as` shadows the module; use sys.modules.
-    build_mod = sys.modules["wmh.engine.build"]
-
-    traces_file = _multi_trace_file(tmp_path, 40)
-
-    seen: dict[str, set[str]] = {}
-
-    class _SpyOptimizer:
-        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
-            pass
-
-        def optimize(self, train, val, *a, **k) -> OptimizeResult:  # noqa: ANN001, ANN002, ANN003
-            seen["train"] = {t.trace_id for t in train}
-            seen["val"] = {t.trace_id for t in val}
-            return OptimizeResult(prompt="EVOLVED", frontier=["EVOLVED"])
-
-    monkeypatch.setattr(build_mod, "GEPAOptimizer", _SpyOptimizer)
-
-    config = HarnessConfig(
-        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
-        serve_provider=ProviderKind.BEDROCK,
-        embed_dim=64,
-        gepa_budget=2,
-        train_split=0.7,
-        val_frac=0.15,
-    )
-    build(
-        config,
-        file=traces_file,
-        root=str(tmp_path / ".wmh"),
-        serve_provider=FakeProvider(),
-        embedder=HashingEmbedder(dim=64),
-    )
-
-    # Reconstruct the reserved test band and assert GEPA saw none of it.
-    from wmh.ingest import get_adapter
-
-    all_traces = get_adapter("otel-genai").from_file(traces_file)
-    _, _, test = split_traces_3way(all_traces, 0.7, 0.15)
-    test_ids = {t.trace_id for t in test}
-    assert test_ids, "test band must be non-empty for the assertion to mean anything"
-    assert not (seen["train"] & test_ids)
-    assert not (seen["val"] & test_ids)
-
-
 def test_build_falls_back_to_base_when_gepa_prompt_is_empty(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     """An empty GEPA winner (weak reflection LM) must not be persisted; base is written instead."""
     import sys

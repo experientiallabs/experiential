@@ -34,6 +34,13 @@ dev = [
     "world-model-harness[otel,viz]",
 ]
 
+[dependency-groups]
+# Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
+# gate covers their tests — WITHOUT entering wmh's published metadata: members aren't on PyPI,
+# so a published extra requiring them would make `pip install world-model-harness[dev]`
+# unresolvable outside the workspace.
+dev = ["llm-waterfall[all]"]
+
 [project.scripts]
 wmh = "wmh.cli:main"
 
@@ -44,10 +51,25 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["wmh"]
 
+[tool.hatch.build.targets.sdist]
+# The flagship sdist ships the flagship only — not workspace members (independently packaged),
+# not the agents' workspace, not the website.
+include = ["/wmh", "/README.md", "/pyproject.toml", "/conftest.py"]
+
+[tool.uv.workspace]
+# The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members live
+# under packages/, each independently published to PyPI. `uv sync` resolves the whole workspace.
+members = ["packages/*"]
+
+[tool.uv.sources]
+# Inside the workspace, anything that depends on a member resolves it from source, not PyPI.
+llm-waterfall = { workspace = true }
+
 [tool.pytest.ini_options]
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
-testpaths = ["wmh"]
+# One root gate covers the flagship and every Python member (same inline-test convention).
+testpaths = ["wmh", "packages"]
 
 [tool.ruff]
 line-length = 100
