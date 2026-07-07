@@ -521,3 +521,53 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
+
+
+def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001
+    from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    made: list[ProviderConfig] = []
+
+    def fake_get_provider(config: ProviderConfig) -> ProviderConfig:
+        made.append(config)
+        return config  # identity provider: assertions read the config directly
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", fake_get_provider)
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings",
+        lambda: ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(provider="azure", model="gpt-5.4", endpoint="https://x/v1"),
+                judge=ModelRole(
+                    provider="bedrock", model="us.anthropic.claude-opus-4-8", region="us-east-2"
+                ),
+            )
+        ),
+    )
+    summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
+    assert summary is worker  # unset summary falls back to the worker role
+    assert cast(ProviderConfig, worker).model == "gpt-5.4"
+    assert cast(ProviderConfig, worker).endpoint == "https://x/v1"
+    assert cast(ProviderConfig, judge).model == "us.anthropic.claude-opus-4-8"
+    assert cast(ProviderConfig, judge).region == "us-east-2"
+    assert len(made) == 2  # worker constructed once and shared with summary
+
+
+def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
+    assert summary is worker
+    assert worker is judge
+    assert cast(ProviderConfig, worker).model == "some-model"
+
+
+def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None:  # noqa: ANN001
+    from wmh.config.settings import ProjectSettings
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
+    assert summary is worker
+    assert worker is judge
+    assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"

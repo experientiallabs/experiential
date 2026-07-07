@@ -69,7 +69,7 @@ from wmh.env.llm_agent import LLMAgent
 from wmh.ingest import VendorPull, get_adapter
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
-from wmh.providers.base import Embedder, EmbedderKind
+from wmh.providers.base import Embedder, EmbedderKind, Provider
 from wmh.providers.fallback import _is_capacity_error
 from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
@@ -825,8 +825,15 @@ def scenarios_build(
     budget: int = typer.Option(20, help="Number of scenarios to construct."),
     k: int = typer.Option(None, help="Cluster count (default: sqrt(corpus size))."),
     limit: int = typer.Option(None, help="Only use the first N ingested traces (cost control)."),
-    provider: str = typer.Option("bedrock", "--provider", help="LLM for facets/naming/synthesis."),
-    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
+    provider: str = typer.Option(
+        None,
+        "--provider",
+        help=(
+            "Pin ONE LLM for every role (facets/naming/synthesis/validation). When omitted, "
+            "roles resolve from .wmh/settings.toml [models.worker|judge|summary]."
+        ),
+    ),
+    model: str = typer.Option(None, help="Model id (pins all roles, like --provider)."),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     embed_provider: str = typer.Option(
         "hashing",
@@ -850,13 +857,15 @@ def scenarios_build(
         traces = traces[:limit]
     if not traces:
         raise typer.BadParameter(f"no traces ingested from {file}")
-    llm = providers.get_provider(_provider_config(provider, model, region))
+    summary_llm, worker_llm, judge_llm = _scenario_role_llms(provider, model, region)
     embedder = _resolve_scenario_embedder(embed_provider, embed_model, embed_dim, region)
 
     _console.print(f"extracting facets for {len(traces)} traces…")
-    facets = FacetExtractor(llm).extract_all(traces)
+    facets = FacetExtractor(summary_llm).extract_all(traces)
     config = ScenarioBuildConfig(budget=budget, k=k, seed=seed)
-    scenario_set = build_scenario_set(traces, facets, llm, embedder, config)
+    scenario_set = build_scenario_set(
+        traces, facets, worker_llm, embedder, config, judge_provider=judge_llm
+    )
     scenario_set.save(out)
 
     table = Table(title="Scenario set")
@@ -905,12 +914,19 @@ def scenarios_verify(
     else:
         world_model, _resolved_name, llm = _load_model(name, root)
 
+    # The rollout agent takes the worker role and the grader the judge role when configured in
+    # settings (judge should differ in family from the generator); both fall back to the world
+    # model's serve provider, which was the only behavior before roles existed.
+    worker_config = _role_provider_config("worker", region)
+    judge_config = _role_provider_config("judge", region)
+    agent_llm = providers.get_provider(worker_config) if worker_config else llm
+    judge_llm = providers.get_provider(judge_config) if judge_config else llm
     report = verify_scenarios(
         scenario_set,
         traces,
         world_model,
-        LLMAgent(llm),
-        ChecklistJudge(llm),
+        LLMAgent(agent_llm),
+        ChecklistJudge(judge_llm),
         max_steps=max_steps,
     )
     table = Table(title="Scenario verification")
@@ -951,6 +967,55 @@ def _provider_config(provider: str, model: str, region: str | None) -> ProviderC
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
     return ProviderConfig(kind=kind, model=model, region=region)
+
+
+_SCENARIO_DEFAULT_PROVIDER = "bedrock"
+_SCENARIO_DEFAULT_MODEL = "us.anthropic.claude-opus-4-8"
+
+
+def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
+    """ProviderConfig for a settings-defined model role, or None when the role isn't configured.
+
+    Roles live in `.wmh/settings.toml` under `[models.worker|judge|summary]`; unset judge/summary
+    fall back to worker (see `ModelsSettings.resolve`). A role's stored region wins over the
+    generic `--region` flag — the flag also feeds the embedder, and e.g. a judge pinned to the
+    one region where its model is enabled must not follow it.
+    """
+    configured = load_settings().models.resolve(role)
+    if configured is None:
+        return None
+    config = _provider_config(configured.provider, configured.model, configured.region or region)
+    return config.model_copy(
+        update={"endpoint": configured.endpoint, "deployment": configured.deployment}
+    )
+
+
+def _scenario_role_llms(
+    provider: str | None, model: str | None, region: str | None
+) -> tuple[Provider, Provider, Provider]:
+    """(summary, worker, judge) providers for scenario construction.
+
+    Explicit `--provider`/`--model` flags pin ALL roles to that one model (the pre-roles
+    behavior). Otherwise each role resolves from `.wmh/settings.toml`, falling back to worker,
+    then to the built-in default. Judging benefits from a different family than the worker —
+    a same-family judge carries self-preference bias toward the generator's outputs.
+    """
+    if provider is not None or model is not None:
+        config = _provider_config(
+            provider or _SCENARIO_DEFAULT_PROVIDER, model or _SCENARIO_DEFAULT_MODEL, region
+        )
+        llm = providers.get_provider(config)
+        return llm, llm, llm
+    default = _provider_config(_SCENARIO_DEFAULT_PROVIDER, _SCENARIO_DEFAULT_MODEL, region)
+    cache: dict[str, Provider] = {}
+    by_role: dict[str, Provider] = {}
+    for role in ("summary", "worker", "judge"):
+        config = _role_provider_config(role, region) or default
+        key = f"{config.kind.value}:{config.model}:{config.endpoint}:{config.region}"
+        if key not in cache:
+            cache[key] = providers.get_provider(config)
+        by_role[role] = cache[key]
+    return by_role["summary"], by_role["worker"], by_role["judge"]
 
 
 def _resolve_scenario_embedder(
