@@ -96,8 +96,10 @@ def main() -> None:
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         logging_steps=5,
-        save_strategy="epoch",
-        save_total_limit=1,
+        # No mid-training checkpoints: only the final adapter is ever used, and the checkpoint's
+        # optimizer state (~1 GB transient, written before the old one is deleted) overflows the
+        # box's nearly-full /mnt. Pure I/O change — the optimization trajectory is unaffected.
+        save_strategy="no",
         bf16=True,
         max_length=args.max_len,
         gradient_checkpointing=True,
