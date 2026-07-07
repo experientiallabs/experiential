@@ -2,16 +2,16 @@
 
 Run agent benchmarks **for real** and record every agent-environment transition — each
 `(action → observation)` pair, exactly as the environment returned it — as OpenTelemetry GenAI
-JSONL. Ten benchmarks are integrated behind one small contract, with **5,900+ real trajectories
-/ 27,000+ real transitions** already captured and published as license-tagged datasets on the
-[Hugging Face Hub](https://huggingface.co/experiential-labs).
+JSONL. Integrating a benchmark is one small adapter; ten are already in (**5,900+ real
+trajectories / 27,000+ real transitions** captured and published as license-tagged datasets on
+the [Hugging Face Hub](https://huggingface.co/experiential-labs)).
 
 ## Why
 
 Because it's annoying to:
 
-- **set up benchmarks and run models against them** — ten real benchmarks, one three-method
-  interface, any agent or provider
+- **set up benchmarks and run models against them** — one three-method interface for any
+  benchmark, any agent, any provider
 - **capture traces in a standardized format** — every `(action → observation)` transition as
   OTel GenAI JSONL, agnostic to benchmark and provider
 
