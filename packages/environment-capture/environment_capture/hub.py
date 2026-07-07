@@ -305,8 +305,20 @@ def fetch_corpus(
 
 
 def _data_root() -> Path:
-    """The sibling benchmark data dirs (packages/environment-capture/<benchmark>/)."""
-    return Path(__file__).resolve().parents[1]
+    """Where benchmark data dirs live (``<root>/<benchmark>/traces.otel.jsonl``).
+
+    Resolution order: the ``ENVCAP_DATA_ROOT`` env var; a repo checkout (the dir holding
+    this package — its sibling benchmark dirs); else, for an installed wheel,
+    ``environment-capture-data/`` under the current directory — a pip user's bundles land in
+    their project, never inside site-packages.
+    """
+    override = os.environ.get("ENVCAP_DATA_ROOT")
+    if override:
+        return Path(override)
+    sibling = Path(__file__).resolve().parents[1]
+    if (sibling / "pyproject.toml").exists():  # repo checkout: the member dir itself
+        return sibling
+    return Path.cwd() / "environment-capture-data"
 
 
 def _default_token() -> str | None:

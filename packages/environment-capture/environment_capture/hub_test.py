@@ -244,3 +244,19 @@ def test_published_corpora_follows_pagination(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(hub, "_http_json_page", page)
     assert [c.benchmark for c in published_corpora()] == ["gaia2", "bird-sql"]
+
+
+def test_data_root_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Env override wins; a repo checkout uses the package's sibling dirs; an installed wheel
+    (no sibling pyproject) lands bundles under the CWD, never inside site-packages."""
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(tmp_path / "override"))
+    assert hub._data_root() == tmp_path / "override"
+
+    monkeypatch.delenv("ENVCAP_DATA_ROOT")
+    assert (hub._data_root() / "pyproject.toml").exists()  # repo checkout: the member dir
+
+    site = tmp_path / "venv" / "site-packages" / "environment_capture"
+    site.mkdir(parents=True)
+    monkeypatch.setattr(hub, "__file__", str(site / "hub.py"))
+    monkeypatch.chdir(tmp_path)
+    assert hub._data_root() == tmp_path / "environment-capture-data"

@@ -3,6 +3,7 @@ name = "environment-capture"
 version = "0.1.0"
 description = "Run benchmarks for real and record agent-environment transitions as OTel GenAI JSONL."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = []
 
@@ -19,3 +20,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["environment_capture"]
+
+[tool.hatch.build.targets.sdist]
+# Ship ONLY the library: the sibling benchmark dirs are repo working data (capture scripts,
+# prebuilt example models, fetched bundles) and would bloat the sdist by tens of MB.
+include = ["/environment_capture", "/README.md", "/LICENSE", "/INTEGRATION.md"]

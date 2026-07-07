@@ -6,36 +6,16 @@ JSONL. Ten benchmarks are integrated behind one small contract, with **5,900+ re
 / 27,000+ real transitions** already captured and published as license-tagged datasets on the
 [Hugging Face Hub](https://huggingface.co/experiential-labs).
 
-## Why this over the alternatives
+## Why
 
-- **Real transitions, never synthesized.** Every observation in a corpus came from a live
-  benchmark environment (a real SQLite query, a real container shell, a real simulated-world
-  API) — not from a model imagining what an environment might say. If you are training or
-  evaluating environment/world models, imitation policies, or reward models, synthetic
-  observations teach the model your generator's quirks; these teach it the environment.
-- **One contract across wildly different benchmarks.** `tasks(split) / open_env(task) /
-  grade(task, submission)` plus a single env seam (`execute(command) -> output, returncode`)
-  covers text-to-SQL, document QA, pandas data analysis, CRM analytics, stateful multi-app
-  worlds, customer-service tool agents, terminal computer-use, and software engineering. A new
-  benchmark is one adapter, not a new harness.
-- **Deterministic, LLM-free grading.** Every `grade` is a fixed function — rewards are
-  reproducible, free, and comparable across runs. No judge drift, no judge bill.
-- **A standard wire format, not a proprietary one.** Corpora are OTel GenAI semantic-convention
-  spans, one JSON object per line — readable by any OTel-aware tooling and trivially parseable
-  without this package installed.
-- **Privacy hygiene is built in, because it bit us.** Agents that can't find their data wander
-  the host; a built-in scanner (`scan_spans_jsonl`) detects host-escape content (home paths,
-  credentials, machine identity) at capture time and in committed corpora, and flagged
-  trajectories are dropped whole, never redacted.
-- **Capture runs survive the real world.** Per-task fault isolation with retries: one throttled
-  provider call, grader edge case, or backend crash records a failure and moves on — a
-  multi-hour capture never loses its completed trajectories.
-- **License discipline end to end.** Each corpus ships with provenance and the upstream's
-  license tag on its dataset card; benchmarks whose terms forbid plain-text redistribution
-  (AppWorld) are refused by the publisher and stay local-only.
-- **Agent-first integration.** [INTEGRATION.md](INTEGRATION.md) is a complete, self-contained
-  playbook: hand it to a coding agent and it has everything needed to integrate a new benchmark
-  — contract, step order, non-negotiables, and the acceptance checklist.
+- **Capture real traces.** Every agent-environment transition — each `(action → observation)`
+  pair, exactly as the environment returned it — recorded as standard OTel GenAI JSONL while
+  your agent runs. Nothing synthesized, ever.
+- **One standard interface.** `tasks / open_env / grade` covers ten wildly different benchmarks
+  (SQL, terminal, SWE, finance docs, CRM, multi-app worlds, ...). A new benchmark is one
+  adapter — hand your coding agent [INTEGRATION.md](INTEGRATION.md) and it has the full playbook.
+- **Deterministic, LLM-free grading.** Rewards are fixed functions: reproducible, free,
+  comparable across runs. No judge drift, no judge bill.
 
 ## The benchmarks
 
@@ -54,6 +34,34 @@ JSONL. Ten benchmarks are integrated behind one small contract, with **5,900+ re
 
 All published bundles include the trace corpus plus the task data needed to run the benchmark
 (task index, gold sidecars, evidence/context files).
+
+## Install
+
+```bash
+pip install environment-capture            # the library: contract, capture driver, hygiene, hub fetch
+pip install 'environment-capture[fetch]'   # + huggingface_hub, for publishing bundles
+```
+
+Pure-package usage — capture YOUR benchmark and pull OUR data, no repo checkout needed:
+
+```python
+from pathlib import Path
+from environment_capture import run_capture, trajectory_to_spans, write_spans_jsonl
+from environment_capture.hub import fetch_corpus
+
+# 1) pull a published bundle (lands in ./environment-capture-data/, or $ENVCAP_DATA_ROOT)
+corpus = fetch_corpus("bird-sql")
+
+# 2) capture your own benchmark: implement the 3-method adapter + an agent, then
+result = run_capture(my_adapter, my_agent, split="train")
+spans = [s for t in result.trajectories for s in trajectory_to_spans(t, benchmark="my-bench")]
+write_spans_jsonl(spans, Path("traces.otel.jsonl"))
+```
+
+The wheel ships the library and every benchmark adapter; benchmark *data* always comes from the
+Hub (or your own capture runs). Note: `hub` publishing is currently pinned to the
+`experiential-labs` org manifest — pushing your own benchmark's bundle means adding a
+`CorpusSpec` (see INTEGRATION.md).
 
 ## The contract
 
