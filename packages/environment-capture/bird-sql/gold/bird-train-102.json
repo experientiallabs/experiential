@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT DISTINCT borderColor FROM cards WHERE name = 'Ancestor''s Chosen'"}

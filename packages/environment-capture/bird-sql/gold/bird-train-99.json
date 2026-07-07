@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT COUNT(id) FROM cards WHERE originalType = 'Summon - Angel' AND subtypes != 'Angel'"}

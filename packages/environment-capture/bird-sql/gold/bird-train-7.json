@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT CAST(SUM(height_cm) AS REAL) / COUNT(id) FROM superhero"}

@@ -36,6 +36,20 @@ class _StubApi:
         )
         self.uploaded[f"{repo_id}/{path_in_repo}"] = content
 
+    def upload_folder(
+        self,
+        *,
+        folder_path: str,
+        path_in_repo: str,
+        repo_id: str,
+        repo_type: str,
+        commit_message: str,
+    ) -> None:
+        for file in sorted(Path(folder_path).rglob("*")):
+            if file.is_file():
+                rel = file.relative_to(folder_path)
+                self.uploaded[f"{repo_id}/{path_in_repo}/{rel}"] = file.read_bytes()
+
 
 @pytest.fixture()
 def data_root(tmp_path: Path, monkeypatch) -> Path:  # noqa: ANN001
@@ -43,9 +57,17 @@ def data_root(tmp_path: Path, monkeypatch) -> Path:  # noqa: ANN001
     return tmp_path
 
 
+def _make_bench(data_root: Path, benchmark: str) -> None:
+    bench = data_root / benchmark
+    bench.mkdir()
+    (bench / "traces.otel.jsonl").write_text('{"traceId": "t"}\n')
+    for data_dir in CORPORA[benchmark].data_dirs:
+        (bench / data_dir).mkdir()
+        (bench / data_dir / "part.jsonl").write_text("x\n")
+
+
 def test_push_uploads_corpus_and_card(data_root: Path) -> None:
-    (data_root / "bird-sql").mkdir()
-    (data_root / "bird-sql" / "traces.otel.jsonl").write_text('{"traceId": "t"}\n')
+    _make_bench(data_root, "bird-sql")
     api = _StubApi()
 
     url = push_corpus("bird-sql", api=api)
@@ -62,11 +84,14 @@ def test_push_uploads_corpus_and_card(data_root: Path) -> None:
     card = api.uploaded[f"{repo_id}/README.md"].decode()
     assert card.startswith("---\nlicense: cc-by-sa-4.0\n")  # tag must match upstream terms
     assert "bird-bench mini-dev" in card  # attribution rides the card
+    # the data payload rides the same repo, under its dir names
+    assert api.uploaded[f"{repo_id}/data/part.jsonl"] == b"x\n"
+    assert api.uploaded[f"{repo_id}/gold/part.jsonl"] == b"x\n"
+    assert api.uploaded[f"{repo_id}/schemas/part.jsonl"] == b"x\n"
 
 
 def test_push_private_flag_reaches_create_repo(data_root: Path) -> None:
-    (data_root / "dabstep").mkdir()
-    (data_root / "dabstep" / "traces.otel.jsonl").write_text("{}\n")
+    _make_bench(data_root, "dabstep")
     api = _StubApi()
     push_corpus("dabstep", private=True, api=api)
     assert api.created[0]["private"] is True
@@ -95,17 +120,26 @@ def test_fetch_keeps_existing_local_corpus_unless_forced(
     local.write_text("local-waves\n")
     remote = tmp_path / "remote.jsonl"
     remote.write_text("published\n")
+    snapshot = tmp_path / "snapshot"
+    (snapshot / "data").mkdir(parents=True)
+    (snapshot / "data" / "train.jsonl").write_text("tasks\n")
     monkeypatch.setattr(hub, "hf_hub_download", lambda *a, **k: str(remote))
+    monkeypatch.setattr(hub, "snapshot_download", lambda *a, **k: str(snapshot))
 
     assert fetch_corpus("gaia2") == local
     assert local.read_text() == "local-waves\n"  # kept
+    assert (data_root / "gaia2" / "data" / "train.jsonl").read_text() == "tasks\n"  # materialized
     assert fetch_corpus("gaia2", force=True) == local
     assert local.read_text() == "published\n"  # explicitly overwritten
 
+    # a plain re-fetch keeps everything (no clobber without force)
+    (data_root / "gaia2" / "data" / "train.jsonl").write_text("local-edit\n")
+    fetch_corpus("gaia2")
+    assert (data_root / "gaia2" / "data" / "train.jsonl").read_text() == "local-edit\n"
+
 
 def test_gaia2_card_carries_the_disclosures(data_root: Path) -> None:
-    (data_root / "gaia2").mkdir()
-    (data_root / "gaia2" / "traces.otel.jsonl").write_text("{}\n")
+    _make_bench(data_root, "gaia2")
     api = _StubApi()
     push_corpus("gaia2", api=api)
     card = " ".join(api.uploaded[f"{repo_id_for('gaia2')}/README.md"].decode().split())

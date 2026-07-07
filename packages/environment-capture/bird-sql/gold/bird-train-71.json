@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT circuitRef FROM circuits WHERE name = 'Marina Bay Street Circuit'"}

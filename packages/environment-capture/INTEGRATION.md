@@ -33,12 +33,14 @@ the cleanest fresh-capture reference, `appworld/` the heavy-engine reference).
    Container-isolated benchmarks (the agent runs INSIDE Docker, so absolute paths in commands
    are the container's own filesystem, not the host's) are exempt from the command-escape
    signal by construction — say so in the benchmark README instead of forcing an empty scan.
-5. **Publish/update the corpus on the Hub** once the audit is clean: add a `CorpusSpec` to
-   `environment_capture/hub.py` (license tag MUST match the upstream terms you checked in #3;
-   local-only licenses like appworld's are excluded there, not special-cased in scripts), then
+5. **Publish/update the data bundle on the Hub** once the audit is clean: add a `CorpusSpec`
+   to `environment_capture/hub.py` — license tag MUST match the upstream terms you checked in
+   #3, and `data_dirs` lists the benchmark's data payload dirs (task index, gold, evidence);
+   local-only licenses like appworld's are excluded there, not special-cased in scripts. Then
    `uv run python -m environment_capture.hub push <benchmark>` — or pass `--push-hub` to the
-   capture script. Re-pushing after later waves is the update path. Corpora stay local-first:
-   nothing deletes the local `traces.otel.jsonl`.
+   capture script. NOTHING under those dirs (or `traces.otel.jsonl`) is committed to git — the
+   package `.gitignore` enforces it. Re-pushing after later waves is the update path; bundles
+   stay local-first (nothing deletes local files).
 
 6. **The test split is never captured** and, when expanding task sets, the existing
    `data/test.jsonl` stays byte-identical (write the invariant test first — see

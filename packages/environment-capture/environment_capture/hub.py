@@ -1,9 +1,10 @@
 """Publish and fetch trace corpora on the Hugging Face Hub.
 
 Corpora are local-first: capture always writes `traces.otel.jsonl` into the benchmark dir, and
-nothing here deletes it. This module adds the sharing layer on top — push a corpus to a dataset
-repo (public or private), fetch the full set back when you need more than a committed sample.
-Updating a corpus is just pushing again: the Hub versions every upload as a commit.
+nothing here deletes it. This module adds the sharing layer on top — push a benchmark's data
+bundle (the trace corpus plus its task data / gold / evidence dirs) to a dataset repo (public or
+private), and fetch it back after a fresh clone. Updating is just pushing again: the Hub
+versions every upload as a commit.
 
 Requires the ``fetch`` extra (``environment-capture[fetch]``) and a Hub token with write access
 (``hf auth login`` or the ``HF_TOKEN`` env var; fetching public datasets needs no token).
@@ -23,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 _ORG = "experiential-labs"
 _CORPUS_FILE = "traces.otel.jsonl"
@@ -46,6 +47,16 @@ class HubApi(Protocol):
         commit_message: str,
     ) -> object: ...
 
+    def upload_folder(
+        self,
+        *,
+        folder_path: str,
+        path_in_repo: str,
+        repo_id: str,
+        repo_type: str,
+        commit_message: str,
+    ) -> object: ...
+
 
 @dataclass(frozen=True)
 class CorpusSpec:
@@ -56,6 +67,9 @@ class CorpusSpec:
     upstream: str  # attribution line for the dataset card
     description: str  # one-sentence environment summary
     extra_terms: str = ""  # disclosures that ride below the boilerplate
+    # Data payload dirs published alongside the trace corpus (task indexes, gold sidecars,
+    # evidence docs, ...). Same license as the corpus — they ARE the upstream-derived data.
+    data_dirs: tuple[str, ...] = ()
 
 
 # The publishable corpora. appworld is deliberately ABSENT: its protected data may only be
@@ -66,6 +80,7 @@ CORPORA: dict[str, CorpusSpec] = {
     for spec in (
         CorpusSpec(
             benchmark="financebench",
+            data_dirs=("data", "gold", "corpus"),
             license_id="cc-by-nc-4.0",
             upstream="PatronusAI/financebench (CC BY-NC 4.0)",
             description=(
@@ -75,6 +90,7 @@ CORPORA: dict[str, CorpusSpec] = {
         ),
         CorpusSpec(
             benchmark="bird-sql",
+            data_dirs=("data", "gold", "schemas"),
             license_id="cc-by-sa-4.0",
             upstream="bird-bench mini-dev (CC BY-SA 4.0)",
             description=(
@@ -84,6 +100,7 @@ CORPORA: dict[str, CorpusSpec] = {
         ),
         CorpusSpec(
             benchmark="continual-learning",
+            data_dirs=("data", "gold"),
             license_id="cc-by-4.0",
             upstream="Continual Learning Bench (CC BY 4.0)",
             description=(
@@ -93,6 +110,7 @@ CORPORA: dict[str, CorpusSpec] = {
         ),
         CorpusSpec(
             benchmark="dabstep",
+            data_dirs=("data", "gold", "datafiles"),
             license_id="cc-by-4.0",
             upstream="adyen/DABstep (CC BY 4.0)",
             description=(
@@ -102,6 +120,7 @@ CORPORA: dict[str, CorpusSpec] = {
         ),
         CorpusSpec(
             benchmark="crmarena",
+            data_dirs=("data", "gold"),
             license_id="cc-by-nc-4.0",
             upstream="Salesforce CRMArena (CC BY-NC 4.0)",
             description=(
@@ -111,6 +130,7 @@ CORPORA: dict[str, CorpusSpec] = {
         ),
         CorpusSpec(
             benchmark="gaia2",
+            data_dirs=("data",),
             license_id="cc-by-4.0",
             upstream="meta-agents-research-environments/gaia2 (CC-BY-4.0, attribution to Meta)",
             description=(
@@ -168,6 +188,16 @@ def _data_root() -> Path:
 def _dataset_card(spec: CorpusSpec) -> str:
     """The dataset card (README.md with Hub YAML frontmatter) for one corpus."""
     extra = f"\n{spec.extra_terms}\n" if spec.extra_terms else ""
+    dir_blurbs = {
+        "data": "task index (train/test splits: prompts + task metadata)",
+        "gold": "per-task gold sidecars (graders read these; never staged into agent workspaces)",
+        "corpus": "evidence documents the tasks are answered from",
+        "datafiles": "shared context files (manual, datasets) staged into agent workspaces",
+        "schemas": "database DDL per task database",
+    }
+    data_dir_lines = "".join(
+        f"- `{d}/` — {dir_blurbs.get(d, 'benchmark data payload')}\n" for d in spec.data_dirs
+    )
     return f"""---
 license: {spec.license_id}
 pretty_name: "{spec.benchmark} agent-environment traces (world-model-harness)"
@@ -197,6 +227,10 @@ Derived from **{spec.upstream}**; this corpus is redistributed under the same te
 (`{spec.license_id}`). The trace text embeds task data and environment output from the upstream
 benchmark — keep this attribution if you redistribute.
 {extra}
+## Contents
+
+- `traces.otel.jsonl` — the trace corpus (OTel GenAI spans, one JSON object per line)
+{data_dir_lines}
 ## Using it
 
 ```python
@@ -249,6 +283,19 @@ def push_corpus(
         repo_type="dataset",
         commit_message=f"update {benchmark} corpus",
     )
+    for data_dir in spec.data_dirs:
+        local_dir = _data_root() / benchmark / data_dir
+        if not local_dir.is_dir():
+            raise FileNotFoundError(
+                f"declared data dir {local_dir} is missing; fetch or rebuild it before pushing"
+            )
+        hub.upload_folder(
+            folder_path=str(local_dir),
+            path_in_repo=data_dir,
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=f"update {benchmark} {data_dir}/",
+        )
     hub.upload_file(
         path_or_fileobj=_dataset_card(spec).encode("utf-8"),
         path_in_repo="README.md",
@@ -266,23 +313,48 @@ def fetch_corpus(
     force: bool = False,
     token: str | None = None,
 ) -> Path:
-    """Download the benchmark's full corpus into its data dir (or ``dest``); returns the path.
+    """Download the benchmark's corpus AND published data dirs into place; returns the corpus path.
 
-    Local-first: an existing file is kept unless ``force=True`` — fetching must never silently
-    clobber a corpus that local capture waves have grown past the published one.
+    Local-first: existing files/dirs are kept unless ``force=True`` — fetching must never
+    silently clobber a corpus that local capture waves have grown past the published one.
+    With an explicit ``dest`` only the corpus file is written (no data dirs).
     """
-    if benchmark not in CORPORA:
+    spec = CORPORA.get(benchmark)
+    if spec is None:
         publishable = ", ".join(sorted(CORPORA))
         raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
     target = dest or _data_root() / benchmark / _CORPUS_FILE
-    if target.exists() and not force:
-        return target
-    downloaded = hf_hub_download(
-        repo_id_for(benchmark), _CORPUS_FILE, repo_type="dataset", token=token
-    )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(downloaded, target)
+    if not target.exists() or force:
+        downloaded = hf_hub_download(
+            repo_id_for(benchmark), _CORPUS_FILE, repo_type="dataset", token=token
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(downloaded, target)
+    if dest is None:
+        _fetch_data_dirs(spec, force=force, token=token)
     return target
+
+
+def _fetch_data_dirs(spec: CorpusSpec, *, force: bool, token: str | None) -> None:
+    """Materialize the benchmark's published data dirs next to the corpus (skip existing)."""
+    pending = [
+        d for d in spec.data_dirs if force or not (_data_root() / spec.benchmark / d).is_dir()
+    ]
+    if not pending:
+        return
+    snapshot = Path(
+        snapshot_download(
+            repo_id_for(spec.benchmark),
+            repo_type="dataset",
+            allow_patterns=[f"{d}/**" for d in pending],
+            token=token,
+        )
+    )
+    for data_dir in pending:
+        source = snapshot / data_dir
+        if not source.is_dir():
+            continue
+        shutil.copytree(source, _data_root() / spec.benchmark / data_dir, dirs_exist_ok=True)
 
 
 def add_hub_args(parser: argparse.ArgumentParser) -> None:

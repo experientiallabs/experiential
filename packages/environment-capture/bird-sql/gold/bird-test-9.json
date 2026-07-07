@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT DISTINCT T.element FROM atom AS T WHERE T.molecule_id = 'TR004'"}

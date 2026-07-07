@@ -45,18 +45,20 @@ scripts are committed; cloned upstreams, venvs, and raw run output stay local an
 
 ## Corpora on the Hugging Face Hub
 
-Every publishable corpus is mirrored as a public dataset under the
-[`experiential-labs`](https://huggingface.co/experiential-labs) org (repo per benchmark:
-`experiential-labs/wmh-<benchmark>-traces`, license tag matching the upstream terms). Corpora are
-**local-first**: capture always writes `traces.otel.jsonl` into the benchmark dir and nothing ever
-deletes it; the Hub is the sharing/distribution layer.
+Every publishable benchmark's data bundle — the trace corpus (`traces.otel.jsonl`) AND its data
+payloads (`data/` task index, `gold/` sidecars, evidence/context dirs) — lives as a public
+dataset under the [`experiential-labs`](https://huggingface.co/experiential-labs) org (repo per
+benchmark: `experiential-labs/wmh-<benchmark>-traces`, license tag matching the upstream terms).
+None of it is committed to git (only code, evals, and READMEs are). Bundles are **local-first**:
+capture and `fetch_data.py` write into the benchmark dir and nothing ever deletes local files;
+the Hub is the sharing/distribution layer.
 
 ```bash
 # publish or UPDATE one corpus (or 'all') — every push is a Hub commit, history kept
 uv run python -m environment_capture.hub push bird-sql
 uv run python -m environment_capture.hub push all            # add --private for private repos
 
-# pull the full set (e.g. after cloning without corpora); never clobbers a local file
+# pull the full bundle (corpus + data dirs) after a fresh clone; never clobbers local files
 uv run python -m environment_capture.hub fetch dabstep
 uv run python -m environment_capture.hub fetch all --force   # explicit overwrite
 

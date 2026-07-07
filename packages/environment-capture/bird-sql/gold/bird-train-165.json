@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT DisplayName FROM users WHERE STRFTIME('%Y', CreationDate) = '2011'"}

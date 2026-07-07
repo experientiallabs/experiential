@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT player_name FROM Player WHERE SUBSTR(birthday, 1, 7) = '1970-10'"}

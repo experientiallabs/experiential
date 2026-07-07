@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT ExcerptPostId, WikiPostId FROM tags WHERE TagName = 'sample'"}

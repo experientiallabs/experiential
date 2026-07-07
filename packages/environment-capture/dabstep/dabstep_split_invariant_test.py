@@ -11,9 +11,17 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
 from environment_capture.trajectory import JsonValue
 
 _HERE = Path(__file__).parent
+# The splits are Hub-hosted (gitignored): on a checkout that hasn't fetched them there is
+# nothing to guard. The invariants run wherever the data exists — capture machines and CI
+# after `python -m environment_capture.hub fetch`.
+pytestmark = pytest.mark.skipif(
+    not (_HERE / "data").is_dir(),
+    reason="benchmark data not fetched (uv run python -m environment_capture.hub fetch)",
+)
 _DATA = _HERE / "data"
 _GOLD = _HERE / "gold"
 

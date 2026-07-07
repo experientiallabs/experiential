@@ -1,1 +1,0 @@
-{"gold_sql": "SELECT MAX(spent) FROM budget"}
