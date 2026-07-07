@@ -1,0 +1,2250 @@
+{
+ "label": "base-ep2",
+ "model": "Qwen/Qwen3.5-9B",
+ "endpoint": "http://localhost:18002/v1",
+ "passes": 3,
+ "temperature": 1.0,
+ "scenarios": 74,
+ "success_rate": 0.4144144144144144,
+ "mean_pass_rate": 0.6527027027027027,
+ "per_domain": {
+  "airline": {
+   "episodes": 27,
+   "success_rate": 0.4444444444444444,
+   "mean_pass_rate": 0.6444444444444444
+  },
+  "retail": {
+   "episodes": 18,
+   "success_rate": 0.4444444444444444,
+   "mean_pass_rate": 0.6166666666666667
+  },
+  "telecom": {
+   "episodes": 177,
+   "success_rate": 0.4067796610169492,
+   "mean_pass_rate": 0.6576271186440679
+  }
+ },
+ "wall_clock_seconds": 939.0,
+ "results": [
+  {
+   "scenario_id": "scenario-efec6ac80ec302b2539752de1d58d7d3",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-efec6ac80ec302b2539752de1d58d7d3",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-efec6ac80ec302b2539752de1d58d7d3",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b333941ccdeb37c9a78375fbaf15b436",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 0.75,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b333941ccdeb37c9a78375fbaf15b436",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b333941ccdeb37c9a78375fbaf15b436",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.5,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-16e5f88274b89eb32563a7706625d44d",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-16e5f88274b89eb32563a7706625d44d",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-16e5f88274b89eb32563a7706625d44d",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-041936340729fbfb33d3b1b6e6f799c8",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-041936340729fbfb33d3b1b6e6f799c8",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-041936340729fbfb33d3b1b6e6f799c8",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-56917256da22ca30bddb2da69adf75dd",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-56917256da22ca30bddb2da69adf75dd",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-56917256da22ca30bddb2da69adf75dd",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-e5b3fd60b950d3d481323c21e73d7d35",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-e5b3fd60b950d3d481323c21e73d7d35",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-e5b3fd60b950d3d481323c21e73d7d35",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-3023718144427decfd3ed937683c061e",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-3023718144427decfd3ed937683c061e",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-3023718144427decfd3ed937683c061e",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-97f8d3b70f874bce498f8d534ef83149",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-97f8d3b70f874bce498f8d534ef83149",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-97f8d3b70f874bce498f8d534ef83149",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8a036f7d5cd8db835fdfc028d7478131",
+   "pass_index": 0,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8a036f7d5cd8db835fdfc028d7478131",
+   "pass_index": 1,
+   "domain": "airline",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8a036f7d5cd8db835fdfc028d7478131",
+   "pass_index": 2,
+   "domain": "airline",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-833fcb9fb230b74ed2adf8b52a76c636",
+   "pass_index": 0,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-833fcb9fb230b74ed2adf8b52a76c636",
+   "pass_index": 1,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 0.75,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-833fcb9fb230b74ed2adf8b52a76c636",
+   "pass_index": 2,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-062912cc0d4f38fffff4f1453ce97307",
+   "pass_index": 0,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-062912cc0d4f38fffff4f1453ce97307",
+   "pass_index": 1,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-062912cc0d4f38fffff4f1453ce97307",
+   "pass_index": 2,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-08688231b59cafce2c83d95c1d4df8ae",
+   "pass_index": 0,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-08688231b59cafce2c83d95c1d4df8ae",
+   "pass_index": 1,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-08688231b59cafce2c83d95c1d4df8ae",
+   "pass_index": 2,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-16a3db00374348ca059aa8cd6dab251d",
+   "pass_index": 0,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-16a3db00374348ca059aa8cd6dab251d",
+   "pass_index": 1,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-16a3db00374348ca059aa8cd6dab251d",
+   "pass_index": 2,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-de10ee216b62ae67d9e0a0d668fdab63",
+   "pass_index": 0,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-de10ee216b62ae67d9e0a0d668fdab63",
+   "pass_index": 1,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.25,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-de10ee216b62ae67d9e0a0d668fdab63",
+   "pass_index": 2,
+   "domain": "retail",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f203f0c5439f3d240836f4f53497ab4e",
+   "pass_index": 0,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f203f0c5439f3d240836f4f53497ab4e",
+   "pass_index": 1,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f203f0c5439f3d240836f4f53497ab4e",
+   "pass_index": 2,
+   "domain": "retail",
+   "success": false,
+   "pass_rate": 0.25,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8fb0686ede3a2eab2503447cbf66b3b5",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8fb0686ede3a2eab2503447cbf66b3b5",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8fb0686ede3a2eab2503447cbf66b3b5",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-687df893630e7e8f7a7e5343bd0c5d01",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-687df893630e7e8f7a7e5343bd0c5d01",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-687df893630e7e8f7a7e5343bd0c5d01",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-69095e52c910946d7704aa3f6a2c6514",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-69095e52c910946d7704aa3f6a2c6514",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-69095e52c910946d7704aa3f6a2c6514",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d059af5653e160fe5db9101f293fbc47",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d059af5653e160fe5db9101f293fbc47",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d059af5653e160fe5db9101f293fbc47",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-73076f5d1691322bd7c3a89d8e987fe7",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-73076f5d1691322bd7c3a89d8e987fe7",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-73076f5d1691322bd7c3a89d8e987fe7",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d319c463660c23053033da4fda1eb687",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 0.8,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d319c463660c23053033da4fda1eb687",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d319c463660c23053033da4fda1eb687",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-7c3b5d85af5693401568a338e700ec86",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-7c3b5d85af5693401568a338e700ec86",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-7c3b5d85af5693401568a338e700ec86",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-cbffce9cdc687c8eb5c165ea07e6b23a",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-cbffce9cdc687c8eb5c165ea07e6b23a",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-cbffce9cdc687c8eb5c165ea07e6b23a",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f4298311aaff6d33f164d6c0b7796ca5",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f4298311aaff6d33f164d6c0b7796ca5",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f4298311aaff6d33f164d6c0b7796ca5",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-00d70fca3124eb5666d3d766897633ee",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-00d70fca3124eb5666d3d766897633ee",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-00d70fca3124eb5666d3d766897633ee",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-78a43efe7e9e0b5461d00b57062c239b",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-78a43efe7e9e0b5461d00b57062c239b",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 9,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-78a43efe7e9e0b5461d00b57062c239b",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-92aa8830d7567683e308b007b298da52",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-92aa8830d7567683e308b007b298da52",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-92aa8830d7567683e308b007b298da52",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4866e1334c704565e2cc4e3ba1138508",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4866e1334c704565e2cc4e3ba1138508",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4866e1334c704565e2cc4e3ba1138508",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ab1c614d9039fdd837fadb0f0055f19a",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ab1c614d9039fdd837fadb0f0055f19a",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ab1c614d9039fdd837fadb0f0055f19a",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-a5a876f315c7ae4c3ed7796c0ade1e71",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-a5a876f315c7ae4c3ed7796c0ade1e71",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-a5a876f315c7ae4c3ed7796c0ade1e71",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-74a01bb8ee0674a20d69750925198010",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-74a01bb8ee0674a20d69750925198010",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-74a01bb8ee0674a20d69750925198010",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b42da82b7283366b1acd3ad0627b9b1e",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b42da82b7283366b1acd3ad0627b9b1e",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b42da82b7283366b1acd3ad0627b9b1e",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-04f1c9136dd1730c92e25f34e5ddb2ae",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-04f1c9136dd1730c92e25f34e5ddb2ae",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.5,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-04f1c9136dd1730c92e25f34e5ddb2ae",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8c94a704d44ecf1535daecda304efc89",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 0.8,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8c94a704d44ecf1535daecda304efc89",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-8c94a704d44ecf1535daecda304efc89",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-99b27aae73a4ca4f6e5181a1e69e0386",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-99b27aae73a4ca4f6e5181a1e69e0386",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-99b27aae73a4ca4f6e5181a1e69e0386",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ee85d9e0014891e715c9f5dc44197815",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ee85d9e0014891e715c9f5dc44197815",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ee85d9e0014891e715c9f5dc44197815",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-a7b2807772c0528a5cb204d0f40a6f34",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-a7b2807772c0528a5cb204d0f40a6f34",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-a7b2807772c0528a5cb204d0f40a6f34",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c07a010739041d655ff03374d44acbe3",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c07a010739041d655ff03374d44acbe3",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c07a010739041d655ff03374d44acbe3",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-27d81f2f44632d71d52946fa1f830dd8",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-27d81f2f44632d71d52946fa1f830dd8",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-27d81f2f44632d71d52946fa1f830dd8",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-5384ab190d9ff4ec70e92f25b2518c82",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-5384ab190d9ff4ec70e92f25b2518c82",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-5384ab190d9ff4ec70e92f25b2518c82",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-264854df7a3ec58474959490bbac9173",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-264854df7a3ec58474959490bbac9173",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-264854df7a3ec58474959490bbac9173",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f28821d3560939354c7a553ad08e614f",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f28821d3560939354c7a553ad08e614f",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f28821d3560939354c7a553ad08e614f",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 9,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b4c12dff491b8edb40be936fbc2f93f9",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 0.8,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b4c12dff491b8edb40be936fbc2f93f9",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b4c12dff491b8edb40be936fbc2f93f9",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-09703eb0f8b08c845aa4992fe569cb16",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-09703eb0f8b08c845aa4992fe569cb16",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-09703eb0f8b08c845aa4992fe569cb16",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-959dae3165642074e89fad8a366ab77e",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-959dae3165642074e89fad8a366ab77e",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-959dae3165642074e89fad8a366ab77e",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4dd1581e728c0cc59c24b05c516c523f",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4dd1581e728c0cc59c24b05c516c523f",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4dd1581e728c0cc59c24b05c516c523f",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-90717ee667acd4de15cf2bd4c9ed85c4",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.25,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-90717ee667acd4de15cf2bd4c9ed85c4",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 9,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-90717ee667acd4de15cf2bd4c9ed85c4",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.5,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-dbc2e931ac1f0c55e5f9940bba9c10c1",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-dbc2e931ac1f0c55e5f9940bba9c10c1",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-dbc2e931ac1f0c55e5f9940bba9c10c1",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c5f353b87088341401464e87bcdbd557",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c5f353b87088341401464e87bcdbd557",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c5f353b87088341401464e87bcdbd557",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-5daf57194510c0d36bc6062d2eb81fcb",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-5daf57194510c0d36bc6062d2eb81fcb",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-5daf57194510c0d36bc6062d2eb81fcb",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c0eff22b7b95c0bd5f9932a113193a5b",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c0eff22b7b95c0bd5f9932a113193a5b",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c0eff22b7b95c0bd5f9932a113193a5b",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.25,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-fec2b138b763adca765c645492789103",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-fec2b138b763adca765c645492789103",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 9,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-fec2b138b763adca765c645492789103",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c07ac4a25e9c25ce490a8a1cfced5f68",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c07ac4a25e9c25ce490a8a1cfced5f68",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c07ac4a25e9c25ce490a8a1cfced5f68",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-0d937e573d0ff722278c2a8904dfd4f6",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-0d937e573d0ff722278c2a8904dfd4f6",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-0d937e573d0ff722278c2a8904dfd4f6",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f1dc69be505b0e3d76f266ff50833242",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f1dc69be505b0e3d76f266ff50833242",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 9,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-f1dc69be505b0e3d76f266ff50833242",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-127340f6837896829a5c4deb58feeea6",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-127340f6837896829a5c4deb58feeea6",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-127340f6837896829a5c4deb58feeea6",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c0a2762dc4b7ff599063ec17e174ae83",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c0a2762dc4b7ff599063ec17e174ae83",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c0a2762dc4b7ff599063ec17e174ae83",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-7e56dba7ab62ddeea7c611671dbb37f1",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-7e56dba7ab62ddeea7c611671dbb37f1",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-7e56dba7ab62ddeea7c611671dbb37f1",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b6f7c6b2419dd715d612c6e44abc040b",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b6f7c6b2419dd715d612c6e44abc040b",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b6f7c6b2419dd715d612c6e44abc040b",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-152bd99ab9ad40996444d5ef268aadab",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 0.8,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-152bd99ab9ad40996444d5ef268aadab",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-152bd99ab9ad40996444d5ef268aadab",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ddf6fb1eedffa8d4a4488ee063749fbc",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ddf6fb1eedffa8d4a4488ee063749fbc",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 6,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ddf6fb1eedffa8d4a4488ee063749fbc",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.2,
+   "steps": 9,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-934c6ab1818f250512451722a3cf350a",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-934c6ab1818f250512451722a3cf350a",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-934c6ab1818f250512451722a3cf350a",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-985a10e0e1ddc5eeb2923712a513db92",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-985a10e0e1ddc5eeb2923712a513db92",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-985a10e0e1ddc5eeb2923712a513db92",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-627981b6e49d8294394673266334a77d",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-627981b6e49d8294394673266334a77d",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-627981b6e49d8294394673266334a77d",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ea9230b7c0128bb43ac2674b3c7bc4a5",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ea9230b7c0128bb43ac2674b3c7bc4a5",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-ea9230b7c0128bb43ac2674b3c7bc4a5",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c9d49b67ebcf4c185a10382ee5903d9c",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c9d49b67ebcf4c185a10382ee5903d9c",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.6,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c9d49b67ebcf4c185a10382ee5903d9c",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 0.8,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-2838746db3a1cbc447c557e57bbfc927",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-2838746db3a1cbc447c557e57bbfc927",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-2838746db3a1cbc447c557e57bbfc927",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d6790b660a1ab23533f0848dafe03d96",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d6790b660a1ab23533f0848dafe03d96",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-d6790b660a1ab23533f0848dafe03d96",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4cf09f9e6ddc820a85c646ce0fde80cb",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4cf09f9e6ddc820a85c646ce0fde80cb",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 5,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-4cf09f9e6ddc820a85c646ce0fde80cb",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c427cd6ef1bbce94b59584c8c1c4fc25",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c427cd6ef1bbce94b59584c8c1c4fc25",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 10,
+   "stop_reason": "max_steps",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c427cd6ef1bbce94b59584c8c1c4fc25",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.4,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-552ef34d8aeae29412ef80508def2996",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-552ef34d8aeae29412ef80508def2996",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-552ef34d8aeae29412ef80508def2996",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c7df8731cbdbbc4db0aed5587d01464f",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 2,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c7df8731cbdbbc4db0aed5587d01464f",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-c7df8731cbdbbc4db0aed5587d01464f",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.75,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-9da339dcf637859ca8380cae82dca574",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 0,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-9da339dcf637859ca8380cae82dca574",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": true,
+   "pass_rate": 1.0,
+   "steps": 8,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-9da339dcf637859ca8380cae82dca574",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 3,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b54b597c4a6631b5f71e3681a15ed2ee",
+   "pass_index": 0,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.8,
+   "steps": 4,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b54b597c4a6631b5f71e3681a15ed2ee",
+   "pass_index": 1,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 1,
+   "stop_reason": "agent_done",
+   "error": null
+  },
+  {
+   "scenario_id": "scenario-b54b597c4a6631b5f71e3681a15ed2ee",
+   "pass_index": 2,
+   "domain": "telecom",
+   "success": false,
+   "pass_rate": 0.0,
+   "steps": 7,
+   "stop_reason": "agent_done",
+   "error": null
+  }
+ ]
+}
