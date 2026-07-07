@@ -33,6 +33,14 @@ from wmh.engine.loader import load_world_model
 from wmh.engine.world_model import WorldModel
 from wmh.optimize.reward import EpisodeScore
 from wmh.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
+from wmh.serving.traces_source import (
+    TRACES_FILENAME,
+    TracesDownloader,
+    TracesResponse,
+    local_traces_path,
+    resolve_url,
+    scenarios_from_traces,
+)
 from wmh.tracking import RunRecord
 
 logger = logging.getLogger(__name__)
@@ -142,16 +150,18 @@ def _load_card_or_none(model_dir: Path) -> ModelCard | None:
 
 def _load_models(
     artifact_dirs: Sequence[str], names: list[str] | None
-) -> tuple[dict[str, WorldModel], dict[str, ModelCard | None]]:
-    """Load the requested world models (or all built ones) plus their cards."""
+) -> tuple[dict[str, WorldModel], dict[str, ModelCard | None], dict[str, Path]]:
+    """Load the requested world models (or all built ones) plus their cards and dirs."""
     telemetry_root = artifact_dirs[0]
     models: dict[str, WorldModel] = {}
     cards: dict[str, ModelCard | None] = {}
+    dirs: dict[str, Path] = {}
     for name, model_dir in resolve_model_dirs(artifact_dirs, names).items():
         world_model, _provider = load_world_model(model_dir, telemetry_root=telemetry_root)
         models[name] = world_model
         cards[name] = _load_card_or_none(model_dir)
-    return models, cards
+        dirs[name] = model_dir
+    return models, cards, dirs
 
 
 def create_app(
@@ -182,8 +192,10 @@ def create_app(
     if world_models is not None:
         models = world_models
         model_cards = cards if cards is not None else {}
+        model_dirs: dict[str, Path] = {}
     else:
-        models, model_cards = _load_models(artifact_dirs, names)
+        models, model_cards, model_dirs = _load_models(artifact_dirs, names)
+    downloader = TracesDownloader()
 
     def _register(name: str, model_dir: Path) -> None:
         """A finished serve-side build joins the live serving set immediately.
@@ -194,6 +206,7 @@ def create_app(
         """
         world_model, _provider = load_world_model(model_dir, telemetry_root=artifact_dirs[0])
         model_cards[name] = _load_card_or_none(model_dir)
+        model_dirs[name] = model_dir
         models[name] = world_model
 
     def _name_taken(name: str) -> bool:
@@ -360,5 +373,48 @@ def create_app(
         wm = _model_or_404(world_model_name)
         _session_or_404(wm, session_id)
         return wm.end_session(session_id)
+
+    @app.get("/world_models/{world_model_name}/traces", response_model=TracesResponse)
+    def get_traces(world_model_name: str) -> TracesResponse:
+        """Recorded traces for the model: local scenarios if present, else a Hub download offer."""
+        _model_or_404(world_model_name)
+        model_dir = model_dirs.get(world_model_name)
+        card = model_cards.get(world_model_name)
+        progress = downloader.progress(world_model_name)
+        local = local_traces_path(model_dir) if model_dir is not None else None
+        if local is not None:
+            return TracesResponse(
+                source="local",
+                downloadable=False,
+                scenarios=scenarios_from_traces(local),
+                download=progress,
+            )
+        has_hub = card is not None and card.traces_hf is not None
+        return TracesResponse(
+            source="hub" if has_hub else "none",
+            downloadable=has_hub,
+            download=progress,
+        )
+
+    @app.post("/world_models/{world_model_name}/traces/download", status_code=202)
+    def download_traces(world_model_name: str) -> dict[str, str]:
+        """Kick off a background fetch of the model's traces from its declared Hub source."""
+        _model_or_404(world_model_name)
+        model_dir = model_dirs.get(world_model_name)
+        card = model_cards.get(world_model_name)
+        if model_dir is None or card is None or card.traces_hf is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"no Hugging Face traces source declared for {world_model_name!r}",
+            )
+        downloader.start(world_model_name, resolve_url(card.traces_hf), model_dir / TRACES_FILENAME)
+        return {"status": "started"}
+
+    @app.get("/world_models/{world_model_name}/traces/download")
+    def download_progress(world_model_name: str) -> dict[str, object]:
+        """Poll the current/last trace download's byte progress for this model."""
+        _model_or_404(world_model_name)
+        progress = downloader.progress(world_model_name)
+        return {"download": progress.model_dump() if progress else None}
 
     return app

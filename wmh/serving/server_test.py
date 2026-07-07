@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from wmh.config.card import CardCorpus, ModelCard
+from wmh.config.card import CardCorpus, ModelCard, TracesSource
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
@@ -279,3 +279,30 @@ def test_end_session_returns_usage_and_frees_the_session() -> None:
     assert response.status_code == 200
     assert "events" in response.json() or "run_id" in response.json()
     assert client.get(f"/world_models/airline/sessions/{session_id}").status_code == 404
+
+
+def test_traces_none_for_plain_injected_model() -> None:
+    body = _client().get("/world_models/airline/traces").json()
+    assert body["source"] == "none"
+    assert body["downloadable"] is False
+    assert body["scenarios"] == []
+
+
+def test_traces_downloadable_when_card_declares_hub_source() -> None:
+    card = ModelCard(
+        name="airline",
+        title="Airline",
+        corpus=CardCorpus(traces=1, steps=2),
+        provider="bedrock",
+        model_id="m",
+        traces_hf=TracesSource(repo="org/wmh-airline", path="traces.otel.jsonl"),
+    )
+    app = create_app(world_models={"airline": _world_model()}, cards={"airline": card})
+    body = TestClient(app).get("/world_models/airline/traces").json()
+    assert body["downloadable"] is True
+    assert body["source"] == "hub"
+
+
+def test_download_traces_400_without_source() -> None:
+    resp = _client().post("/world_models/airline/traces/download")
+    assert resp.status_code == 400

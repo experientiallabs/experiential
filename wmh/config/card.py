@@ -37,6 +37,20 @@ class CardFidelity(BaseModel):
     run_id: str | None = None
 
 
+class TracesSource(BaseModel):
+    """Where this model's trace corpus lives on the Hugging Face Hub.
+
+    The traces are the raw agent sessions (`traces.otel.jsonl`), which are large and need not be
+    committed: when they are absent locally, the serve backend fetches them from here on demand
+    over the public resolve URL (no auth, no client-side Hub API). A local copy always supersedes.
+    """
+
+    repo: str  # e.g. "experientiallabs/wmh-tau-bench"
+    path: str = "traces.otel.jsonl"  # file within the repo
+    revision: str = "main"
+    kind: str = "dataset"  # "dataset" or "model" repo namespace on the Hub
+
+
 class ModelCard(BaseModel):
     """Machine-readable description of one built world model (see module docstring)."""
 
@@ -54,6 +68,7 @@ class ModelCard(BaseModel):
     built_at: str | None = None  # ISO-8601 UTC
     license: str | None = None
     tags: list[str] = Field(default_factory=list)
+    traces_hf: TracesSource | None = None  # Hub source for on-demand trace download
 
 
 def make_build_card(

@@ -140,6 +140,20 @@ export function openBuildEvents(buildId: string): EventSource {
   return new EventSource(`${API_BASE}/world_models/builds/${buildId}/events`);
 }
 
+export function getTraces(model: string): Promise<import("./types").TracesResponse> {
+  return request(`/world_models/${encodeURIComponent(model)}/traces`);
+}
+
+export async function startTracesDownload(model: string): Promise<void> {
+  await request(`/world_models/${encodeURIComponent(model)}/traces/download`, { method: "POST" });
+}
+
+export function tracesDownloadProgress(
+  model: string,
+): Promise<{ download: import("./types").DownloadProgress | null }> {
+  return request(`/world_models/${encodeURIComponent(model)}/traces/download`);
+}
+
 export async function uploadTraces(file: File): Promise<string> {
   const body = new FormData();
   body.append("file", file);

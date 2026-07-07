@@ -8,10 +8,23 @@
  * the teacher-forced replay `wmh eval` runs, made interactive.
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { readableTask } from "@/components/Playground";
-import { createSession, step } from "@/lib/api";
-import type { IndexEntry, Scenario, ScenarioStep } from "@/lib/types";
+import { Spinner } from "@/components/Spinner";
+import {
+  createSession,
+  getTraces,
+  startTracesDownload,
+  step,
+  tracesDownloadProgress,
+} from "@/lib/api";
+import type {
+  DownloadProgress,
+  IndexEntry,
+  Scenario,
+  ScenarioStep,
+  TracesResponse,
+} from "@/lib/types";
 
 function TaskPrompt({ task }: { task: string | null }) {
   if (!task) return null;
@@ -189,23 +202,160 @@ function ScenarioCard({ entry, scenario }: { entry: IndexEntry; scenario: Scenar
   );
 }
 
+const INTRO =
+  "Recorded agent traces, grouped by task. Replay one open loop to see how faithfully the world model reconstructs each step against what really happened.";
+
+function ScenarioList({ entry, scenarios }: { entry: IndexEntry; scenarios: Scenario[] }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="text-sm text-ink-soft">{INTRO}</p>
+      {scenarios.map((s) => (
+        <ScenarioCard key={s.id} entry={entry} scenario={s} />
+      ))}
+    </div>
+  );
+}
+
+function fmtBytes(n: number): string {
+  return n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Offers a Hub download for models whose traces are not present locally, and shows progress. */
+function DownloadPanel({ entry, onDone }: { entry: IndexEntry; onDone: () => void }) {
+  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const download = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await startTracesDownload(entry.card.name);
+      // Poll byte progress until the backend reports a terminal state.
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 800));
+        const { download } = await tracesDownloadProgress(entry.card.name);
+        setProgress(download);
+        if (!download || download.status === "done") {
+          onDone();
+          return;
+        }
+        if (download.status === "failed") {
+          setError(download.error ?? "download failed");
+          return;
+        }
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [entry.card.name, onDone]);
+
+  const pct =
+    progress?.total && progress.total > 0
+      ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
+      : null;
+
+  return (
+    <div className="flex flex-col gap-3 rounded-xl border border-line p-6">
+      <div className="mono-label">traces not downloaded</div>
+      <p className="text-sm text-ink-soft">
+        This model&apos;s traces live on the Hugging Face Hub. Download them to explore and replay
+        them here; they land on your local <code className="font-mono">wmh serve</code>, so this is
+        a one-time fetch.
+      </p>
+      <button
+        onClick={download}
+        disabled={busy}
+        className="flex w-fit items-center gap-2 rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-85 disabled:opacity-40"
+      >
+        {busy && <Spinner className="border-white border-t-transparent" />}
+        {busy ? "Downloading traces" : "Download traces"}
+      </button>
+      {progress && progress.status === "running" && (
+        <div className="flex items-center gap-2 text-xs text-ink-faint">
+          <span className="tabular-nums">
+            {fmtBytes(progress.downloaded)}
+            {progress.total ? ` / ${fmtBytes(progress.total)}` : ""}
+          </span>
+          {pct !== null && (
+            <span className="h-1.5 w-40 overflow-hidden rounded-full bg-line">
+              <span
+                className="block h-full rounded-full bg-accent-teal transition-all"
+                style={{ width: `${pct}%` }}
+              />
+            </span>
+          )}
+          {pct !== null && <span className="tabular-nums">{pct}%</span>}
+        </div>
+      )}
+      {error && (
+        <p className="rounded-lg border border-accent-red/40 px-3 py-2 text-sm text-accent-red">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function TracesExplorer({ entry }: { entry: IndexEntry }) {
-  if (entry.scenarios.length === 0) {
+  // Prefer live traces from the backend (which reflect a local file or a fresh Hub download);
+  // fall back to the statically indexed scenarios when the backend is unreachable.
+  const [resp, setResp] = useState<TracesResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [reachable, setReachable] = useState(true);
+
+  // Async so the effect does no synchronous setState; the first state update lands after the fetch.
+  const load = useCallback(async () => {
+    try {
+      const r = await getTraces(entry.card.name);
+      setResp(r);
+      setReachable(true);
+    } catch {
+      setReachable(false);
+    } finally {
+      setLoading(false);
+    }
+  }, [entry.card.name]);
+
+  useEffect(() => {
+    // load() only setStates after an awaited fetch, so no synchronous cascade despite the rule.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
+
+  if (loading) {
     return (
+      <div className="flex items-center gap-2 rounded-xl border border-line p-6 text-sm text-ink-faint">
+        <Spinner /> checking for traces...
+      </div>
+    );
+  }
+
+  // Backend unreachable: show whatever the static index captured.
+  if (!reachable || !resp) {
+    return entry.scenarios.length ? (
+      <ScenarioList entry={entry} scenarios={entry.scenarios} />
+    ) : (
       <div className="rounded-xl border border-line p-6 text-sm text-ink-faint">
         No recorded traces are indexed for this model.
       </div>
     );
   }
-  return (
-    <div className="flex flex-col gap-3">
-      <p className="text-sm text-ink-soft">
-        Recorded agent traces, grouped by task. Replay one open loop to see how faithfully the
-        world model reconstructs each step against what really happened.
-      </p>
-      {entry.scenarios.map((s) => (
-        <ScenarioCard key={s.id} entry={entry} scenario={s} />
-      ))}
+
+  if (resp.scenarios.length) {
+    return <ScenarioList entry={entry} scenarios={resp.scenarios} />;
+  }
+  if (resp.downloadable) {
+    return <DownloadPanel entry={entry} onDone={load} />;
+  }
+  // No live traces and nothing to download: last resort is the static index.
+  return entry.scenarios.length ? (
+    <ScenarioList entry={entry} scenarios={entry.scenarios} />
+  ) : (
+    <div className="rounded-xl border border-line p-6 text-sm text-ink-faint">
+      No recorded traces are available for this model.
     </div>
   );
 }

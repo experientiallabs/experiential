@@ -56,6 +56,22 @@ export type Scenario = {
   steps: ScenarioStep[];
 };
 
+/** Byte progress of a backend trace download from the Hugging Face Hub. */
+export type DownloadProgress = {
+  status: "running" | "done" | "failed";
+  downloaded: number;
+  total: number | null;
+  error?: string | null;
+};
+
+/** The Explore-traces payload: local scenarios if present, else a Hub download offer. */
+export type TracesResponse = {
+  source: "local" | "hub" | "none";
+  downloadable: boolean;
+  scenarios: Scenario[];
+  download: DownloadProgress | null;
+};
+
 /** One gallery entry in the generated index: the card plus interaction seeds. */
 export type IndexEntry = {
   card: ModelCard;
