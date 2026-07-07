@@ -8,14 +8,15 @@ JSONL. Ten benchmarks are integrated behind one small contract, with **5,900+ re
 
 ## Why
 
-- **Capture real traces.** Every agent-environment transition — each `(action → observation)`
-  pair, exactly as the environment returned it — recorded as standard OTel GenAI JSONL while
-  your agent runs. Nothing synthesized, ever.
-- **One standard interface.** `tasks / open_env / grade` covers ten wildly different benchmarks
-  (SQL, terminal, SWE, finance docs, CRM, multi-app worlds, ...). A new benchmark is one
-  adapter — hand your coding agent [INTEGRATION.md](INTEGRATION.md) and it has the full playbook.
-- **Deterministic, LLM-free grading.** Rewards are fixed functions: reproducible, free,
-  comparable across runs. No judge drift, no judge bill.
+Because it's annoying to:
+
+- **set up benchmarks and run models against them** — ten real benchmarks, one three-method
+  interface, any agent or provider
+- **capture traces in a standardized format** — every `(action → observation)` transition as
+  OTel GenAI JSONL, agnostic to benchmark and provider
+
+Adding a benchmark? Point your coding agent at [INTEGRATION.md](INTEGRATION.md) — it's the
+complete, self-contained playbook for integrating one.
 
 ## The benchmarks
 
