@@ -283,3 +283,36 @@ Two claims, curve-shape only (n=1/point, n=40/row):
 Ops finding that unblocked all of this: gpt-5.5 was lost mid-program (OpenAI account
 terminated, D68) — opus-4.8 substitutes, with an Anthropic direct-API link appended to
 its failover chains.
+
+## Cross-benchmark replication: terminal-tasks (D67 leg 2)
+
+Raw rows in `.agents/docs/research/real_terminal_eval_results/`; harness =
+`examples/terminal-tasks/rl/real_eval.py` (real bash-in-docker, wmh judge on Opus 4.8);
+28 pinned eval scenarios × 2 trials, all rows zero error records after two live-fire
+harness fixes (per-command output cap; salvage+normalize of sloppy tool-argument JSON —
+WM-trained ckpts emit it, verbatim replay 400s vLLM).
+
+Training smoke: R++ n=4 vs the terminal WM (haiku env, temp-0), 150 pinned train
+scenarios. The run collapsed on the D73 trajectory (KL 0.13→1.98, entropy 0.52→0.20,
+no-tool episodes emerging; onset ~step 90) — **the 4th replication, first on a non-tau
+benchmark: the collapse budget is benchmark-general.**
+
+Real-env rows (base 85.7% / 0.861):
+
+| checkpoint | step | success | reward | paired Δ |
+|---|---|---|---|---|
+| drain 0015 | ~30 | 80.4% | 0.794 | −0.067 (8W/12L) |
+| drain 0030 | ~60 | 42.9% | 0.465 | **−0.396 (3W/38L)** |
+| manual048 | 158 | 78.6% | 0.771 | −0.090 (4W/17L) |
+
+**Terminal transfer is negative at every checkpoint** — the opposite of tau
+(flat-to-positive). The trough is diagnostic: the step-60 policy issues long runs of
+EMPTY bash commands (mean 13.6 steps vs base 5.7; judge critiques read "you issued 18
+empty bash commands and never wrote any code"), then partially recovers format by step
+158 without recovering task quality. Mechanism hypothesis: the terminal WM tolerates
+malformed/empty commands and still simulates plausible outcomes, so training never
+penalizes them — a reward-channel blind spot on the *counterfactual error path* that the
+D12 fidelity metric (which replays recorded actions) cannot see. The real shell is not
+so forgiving. Implication for WM training: fidelity on recorded actions is not
+sufficient; error-path fidelity (does the WM push back on garbage actions the way the
+real env does?) is a distinct, load-bearing dimension.
