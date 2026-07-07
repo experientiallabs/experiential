@@ -21,12 +21,13 @@ def data_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
     """Stand in for the Hub REST API: a tree listing plus resolve-URL streaming."""
 
-    def http_json(url: str, *, token: str | None) -> object:
+    def http_json_page(url: str, *, token: str | None) -> tuple[object, None]:
         assert "/api/datasets/" in url and "/tree/main?recursive=true" in url
-        return [
+        listing = [
             {"type": "file", "path": path, "size": len(content)}
             for path, content in files.items()
         ]
+        return listing, None
 
     def stream_to(
         url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
@@ -38,7 +39,7 @@ def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
         chunk_done(len(content))
         return len(content)
 
-    monkeypatch.setattr(hub, "_http_json", http_json)
+    monkeypatch.setattr(hub, "_http_json_page", http_json_page)
     monkeypatch.setattr(hub, "_stream_to", stream_to)
 
 
@@ -127,7 +128,7 @@ def test_published_corpora_maps_repos_to_benchmarks(monkeypatch: pytest.MonkeyPa
         {"id": "experiential-labs/unrelated-dataset", "lastModified": "2026-07-06T00:00:00.000Z"},
         {"id": "experiential-labs/wmh-not-a-benchmark-traces", "lastModified": ""},
     ]
-    monkeypatch.setattr(hub, "_http_json", lambda url, *, token: listing)
+    monkeypatch.setattr(hub, "_http_json_page", lambda url, *, token: (listing, None))
 
     published = published_corpora()
     assert [(c.benchmark, c.last_modified) for c in published] == [
@@ -217,3 +218,29 @@ def test_license_tags_match_the_provenance_readmes() -> None:
         checked += 1
     if not checked:  # standalone package install
         pytest.skip("no benchmark READMEs shipped")
+
+
+def test_published_corpora_follows_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An org with more datasets than one page must not hide corpora beyond page 1."""
+    pages = {
+        "page1": (
+            [{"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-07T00:00:00Z"}],
+            "page2",
+        ),
+        "page2": (
+            [
+                {
+                    "id": "experiential-labs/wmh-bird-sql-traces",
+                    "lastModified": "2026-07-06T00:00:00Z",
+                }
+            ],
+            None,
+        ),
+    }
+
+    def page(url: str, *, token: str | None) -> tuple[object, str | None]:
+        key = "page2" if url == "page2" else "page1"
+        return pages[key]
+
+    monkeypatch.setattr(hub, "_http_json_page", page)
+    assert [c.benchmark for c in published_corpora()] == ["gaia2", "bird-sql"]

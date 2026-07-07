@@ -43,7 +43,8 @@ the cleanest fresh-capture reference, `appworld/` the heavy-engine reference).
    stay local-first (nothing deletes local files).
 
 6. **The test split is never captured** and, when expanding task sets, the existing
-   `data/test.jsonl` stays byte-identical (write the invariant test first — see
+   `data/test.jsonl` stays byte-identical (write the invariant test first — the guard SKIPS on
+   checkouts that haven't fetched the data, so edit splits only on a fetched checkout — see
    `dabstep/dabstep_split_invariant_test.py`).
 7. **No references to the source of any converted cache** (module names, READMEs, commits, PR
    text): frozen caches of prior real runs are called "a frozen baseline cache of real runs".

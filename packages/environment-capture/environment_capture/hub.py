@@ -29,13 +29,16 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from http.client import HTTPMessage
 from pathlib import Path
+from typing import IO
 
 from environment_capture.trajectory import JsonValue
 
 _ORG = "experiential-labs"
 _CORPUS_FILE = "traces.otel.jsonl"
-_HUB = "https://huggingface.co"
+# Honors enterprise/mirror endpoints the way huggingface_hub does.
+_HUB = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 _CHUNK_BYTES = 1 << 20
 
 # on_progress(bytes_done, bytes_total): called after every streamed chunk, across ALL files in
@@ -189,9 +192,10 @@ def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
     Only repos that follow the ``wmh-<benchmark>-traces`` convention AND appear in the local
     manifest are returned — those are the ones ``fetch_corpus`` knows where to place.
     """
-    listing = _http_json(f"{_HUB}/api/datasets?author={_ORG}&limit=100", token=token)
+    token = token if token is not None else _default_token()
+    listing = _http_json_pages(f"{_HUB}/api/datasets?author={_ORG}&limit=100", token=token)
     published: list[PublishedCorpus] = []
-    for entry in listing if isinstance(listing, list) else []:
+    for entry in listing:
         if not isinstance(entry, dict):
             continue
         repo_id = str(entry.get("id", ""))
@@ -234,6 +238,7 @@ def fetch_corpus(
     if spec is None:
         publishable = ", ".join(sorted(CORPORA))
         raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
+    token = token if token is not None else _default_token()
     repo_id = repo_id_for(benchmark)
     root = _data_root()
     target = dest or corpus_path(benchmark)
@@ -272,7 +277,25 @@ def fetch_corpus(
 
     for remote_path, local, size in work:
         url = f"{_HUB}/datasets/{repo_id}/resolve/{revision}/{urllib.parse.quote(remote_path)}"
-        written = _stream_to(url, local, token=token, chunk_done=chunk_done)
+        file_base = done
+        written = -1
+        last: Exception | None = None
+        for delay_s in (0, 1, 3):  # transient failures retry THIS file, not the whole bundle
+            if delay_s:
+                time.sleep(delay_s)
+                done = file_base  # roll the bar back to the file boundary before re-streaming
+            try:
+                written = _stream_to(url, local, token=token, chunk_done=chunk_done)
+                break
+            except urllib.error.HTTPError as error:
+                if error.code < 500:
+                    raise
+                last = error
+            except urllib.error.URLError as error:
+                last = error
+        if written < 0:
+            assert last is not None
+            raise last
         if size and written != size:
             raise OSError(
                 f"{remote_path}: downloaded {written} bytes but the Hub tree lists {size} — "
@@ -286,6 +309,46 @@ def _data_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _default_token() -> str | None:
+    """The token huggingface_hub would use: HF_TOKEN env, else the stored `hf auth login`."""
+    env = os.environ.get("HF_TOKEN")
+    if env:
+        return env
+    stored = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "token"
+    try:
+        return stored.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Drop the Authorization header when a redirect leaves the original host.
+
+    Hub `resolve/` URLs 302 large files to a CDN/S3 presigned host; forwarding the bearer
+    token there leaks it to a third-party origin and can 400 on presigned URLs (dual auth).
+    This mirrors huggingface_hub's behavior.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(
+            req.full_url
+        ).netloc:
+            new.headers.pop("Authorization", None)
+        return new
+
+
+_OPENER = urllib.request.build_opener(_AuthStrippingRedirectHandler)
+
+
 def _request(url: str, token: str | None) -> urllib.request.Request:
     headers = {"User-Agent": "environment-capture/hub"}
     if token:
@@ -294,14 +357,36 @@ def _request(url: str, token: str | None) -> urllib.request.Request:
 
 
 def _http_json(url: str, *, token: str | None) -> JsonValue:
-    """GET a JSON document, retrying transient failures (5xx, connection drops) twice."""
+    """GET one JSON document (first page only — use ``_http_json_pages`` for listings)."""
+    body, _next = _http_json_page(url, token=token)
+    return body
+
+
+def _http_json_pages(url: str, *, token: str | None) -> list[JsonValue]:
+    """GET a paginated JSON listing, following RFC5988 Link rel="next" headers to the end."""
+    items: list[JsonValue] = []
+    next_url: str | None = url
+    while next_url:
+        body, next_url = _http_json_page(next_url, token=token)
+        items.extend(body if isinstance(body, list) else [body])
+    return items
+
+
+def _http_json_page(url: str, *, token: str | None) -> tuple[JsonValue, str | None]:
+    """One GET with transient-failure retry; returns (json, next-page url from the Link header)."""
     last: Exception | None = None
     for delay_s in (0, 1, 3):
         if delay_s:
             time.sleep(delay_s)
         try:
-            with urllib.request.urlopen(_request(url, token), timeout=60) as response:  # noqa: S310
-                return json.loads(response.read().decode("utf-8"))
+            with _OPENER.open(_request(url, token), timeout=60) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                link = response.headers.get("Link", "")
+                next_url = None
+                for part in link.split(","):
+                    if 'rel="next"' in part and "<" in part:
+                        next_url = part.split("<", 1)[1].split(">", 1)[0]
+                return body, next_url
         except urllib.error.HTTPError as error:
             if error.code < 500:
                 raise  # 4xx is a real answer, not a flake
@@ -313,11 +398,11 @@ def _http_json(url: str, *, token: str | None) -> JsonValue:
 
 
 def _repo_tree(repo_id: str, revision: str, *, token: str | None) -> list[tuple[str, int]]:
-    """(path, size) for every FILE in the dataset repo (one recursive listing)."""
+    """(path, size) for every FILE in the dataset repo (recursive, follows pagination)."""
     url = f"{_HUB}/api/datasets/{repo_id}/tree/{revision}?recursive=true"
-    listing = _http_json(url, token=token)
+    listing = _http_json_pages(url, token=token)
     files: list[tuple[str, int]] = []
-    for entry in listing if isinstance(listing, list) else []:
+    for entry in listing:
         if isinstance(entry, dict) and entry.get("type") == "file":
             size = entry.get("size")
             files.append(
@@ -338,7 +423,7 @@ def _stream_to(
     part = dest.with_name(dest.name + ".part")
     written = 0
     try:
-        with urllib.request.urlopen(_request(url, token), timeout=300) as response:  # noqa: S310
+        with _OPENER.open(_request(url, token), timeout=300) as response:
             with part.open("wb") as sink:
                 while True:
                     chunk = response.read(_CHUNK_BYTES)
