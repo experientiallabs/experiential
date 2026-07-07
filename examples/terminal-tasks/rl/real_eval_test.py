@@ -189,3 +189,44 @@ def test_long_command_output_is_truncated_head_and_tail() -> None:
     assert "chars truncated" in content
     # the truncated form (not the raw dump) is what returns to the policy
     assert any("chars truncated" in str(m.get("content", "")) for m in calls[1]["messages"])
+
+
+def test_malformed_tool_arguments_are_normalized_on_replay() -> None:
+    """WM-trained ckpts emit sloppy argument JSON; replaying it verbatim 400s vLLM."""
+    import json as json_mod
+
+    executed = []
+
+    def execute(command: str) -> tuple[str, int]:
+        executed.append(command)
+        return "ok", 0
+
+    bad_args = '{"command": "ls /tmp"} trailing-garbage'
+    scripted = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": bad_args},
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        _text_turn("done"),
+        _text_turn("done"),
+    ]
+    steps, calls = _run(scripted, execute)
+    # the parsed command still executed, and the REPLAYED arguments are clean JSON
+    assert executed and "ls /tmp" in executed[0]
+    replayed = next(
+        m for m in calls[1]["messages"] if m["role"] == "assistant" and m.get("tool_calls")
+    )
+    json_mod.loads(replayed["tool_calls"][0]["function"]["arguments"])  # must not raise

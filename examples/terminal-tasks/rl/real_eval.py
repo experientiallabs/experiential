@@ -196,14 +196,23 @@ def _chat(
 
 
 def _assistant_dict(message: _AssistantMessage) -> JsonObject:
-    """Re-serialize an assistant message for appending back into the running messages list."""
+    """Re-serialize an assistant message for appending back into the running messages list.
+
+    Arguments are NORMALIZED to clean JSON of the parsed command rather than echoed
+    verbatim: WM-trained checkpoints sometimes emit malformed argument JSON, and vLLM's
+    chat template json-decodes replayed tool_calls — echoing the raw string 400s every
+    subsequent turn of the episode (observed: 18/56 episodes on the first trained ckpt).
+    """
     out: JsonObject = {"role": "assistant", "content": message.content or ""}
     if message.tool_calls:
         out["tool_calls"] = [
             {
                 "id": tc.id,
                 "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": json.dumps({"command": _parse_command(tc.function.arguments)}),
+                },
             }
             for tc in message.tool_calls
         ]
@@ -291,10 +300,16 @@ def run_policy_loop(
 
 
 def _parse_command(arguments: str) -> str:
-    """Extract the bash command from a tool call's JSON argument string (empty on garbage)."""
+    """Extract the bash command from a tool call's JSON argument string (empty on garbage).
+
+    WM-trained checkpoints sometimes append stray tokens after valid argument JSON;
+    ``raw_decode`` salvages the leading object instead of dropping the whole call.
+    """
     try:
-        parsed: JsonObject = json.loads(arguments or "{}")
+        parsed, _end = json.JSONDecoder().raw_decode((arguments or "{}").strip())
     except json.JSONDecodeError:
+        return ""
+    if not isinstance(parsed, dict):
         return ""
     command = parsed.get("command", "")
     return command if isinstance(command, str) else ""
