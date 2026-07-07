@@ -8,8 +8,9 @@ dependencies = []
 
 [project.optional-dependencies]
 bedrock = ["boto3>=1.34"]
-# Fetching a benchmark's heavy shared dataset from HuggingFace (e.g. continual-learning's ~400 MB
-# products.db); kept out of the core install so CI never pulls it.
+# Hub WRITE access (hub_push: publishing data bundles) and the fetch_data.py scripts that pull
+# heavy upstream datasets (e.g. continual-learning's ~400 MB products.db). Reading/downloading
+# published bundles (environment_capture.hub) is stdlib-only and needs no extra.
 fetch = ["huggingface_hub>=0.23"]
 
 [build-system]

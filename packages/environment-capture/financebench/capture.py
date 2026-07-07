@@ -33,7 +33,7 @@ from environment_capture import (
 )
 from environment_capture.agent import BedrockBashAgent
 from environment_capture.benchmarks.financebench import FinanceBenchAdapter
-from environment_capture.hub import add_hub_args, push_after_capture
+from environment_capture.hub_push import add_hub_args, push_after_capture
 
 _HERE = Path(__file__).parent
 

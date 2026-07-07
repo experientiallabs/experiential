@@ -1,157 +1,144 @@
-"""Tests for Hub corpus publishing/fetching (hermetic — a stub stands in for the Hub API)."""
+"""Tests for the stdlib read core: listing, fetching, progress, atomicity (no network)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from environment_capture import hub
-from environment_capture.hub import CORPORA, fetch_corpus, push_corpus, repo_id_for
-
-
-class _StubApi:
-    def __init__(self) -> None:
-        self.created: list[dict[str, object]] = []
-        self.uploaded: dict[str, bytes] = {}
-
-    def create_repo(self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool) -> None:
-        self.created.append(
-            {"repo_id": repo_id, "repo_type": repo_type, "private": private, "exist_ok": exist_ok}
-        )
-
-    def upload_file(
-        self,
-        *,
-        path_or_fileobj: str | bytes,
-        path_in_repo: str,
-        repo_id: str,
-        repo_type: str,
-        commit_message: str,
-    ) -> None:
-        content = (
-            Path(path_or_fileobj).read_bytes()
-            if isinstance(path_or_fileobj, str)
-            else path_or_fileobj
-        )
-        self.uploaded[f"{repo_id}/{path_in_repo}"] = content
-
-    def list_datasets(self, *, author: str) -> list[object]:
-        return []
-
-    def upload_folder(
-        self,
-        *,
-        folder_path: str,
-        path_in_repo: str,
-        repo_id: str,
-        repo_type: str,
-        commit_message: str,
-    ) -> None:
-        for file in sorted(Path(folder_path).rglob("*")):
-            if file.is_file():
-                rel = file.relative_to(folder_path)
-                self.uploaded[f"{repo_id}/{path_in_repo}/{rel}"] = file.read_bytes()
+from environment_capture.hub import CORPORA, fetch_corpus, published_corpora, repo_id_for
 
 
 @pytest.fixture()
-def data_root(tmp_path: Path, monkeypatch) -> Path:  # noqa: ANN001
+def data_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(hub, "_data_root", lambda: tmp_path)
     return tmp_path
 
 
-def _make_bench(data_root: Path, benchmark: str) -> None:
-    bench = data_root / benchmark
-    bench.mkdir()
-    (bench / "traces.otel.jsonl").write_text('{"traceId": "t"}\n')
-    for data_dir in CORPORA[benchmark].data_dirs:
-        (bench / data_dir).mkdir()
-        (bench / data_dir / "part.jsonl").write_text("x\n")
+def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
+    """Stand in for the Hub REST API: a tree listing plus resolve-URL streaming."""
+
+    def http_json(url: str, *, token: str | None) -> object:
+        assert "/api/datasets/" in url and "/tree/main" in url
+        subpath = url.split("/tree/main", 1)[1].split("?", 1)[0].lstrip("/")
+        return [
+            {"type": "file", "path": path, "size": len(content)}
+            for path, content in files.items()
+            if not subpath or path.startswith(f"{subpath}/")
+        ]
+
+    def stream_to(
+        url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
+    ) -> None:
+        remote_path = url.split("/resolve/main/", 1)[1]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        content = files[remote_path]
+        dest.write_bytes(content)
+        chunk_done(len(content))
+
+    monkeypatch.setattr(hub, "_http_json", http_json)
+    monkeypatch.setattr(hub, "_stream_to", stream_to)
 
 
-def test_push_uploads_corpus_and_card(data_root: Path) -> None:
-    _make_bench(data_root, "bird-sql")
-    api = _StubApi()
+def test_fetch_downloads_corpus_and_data_dirs_with_one_progress_bar(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_hub(
+        monkeypatch,
+        {
+            "traces.otel.jsonl": b"spans\n",
+            "data/train.jsonl": b"tasks\n",
+            "gold/t1.json": b"{}",
+        },
+    )
+    progress: list[tuple[int, int]] = []
 
-    url = push_corpus("bird-sql", api=api)
+    path = fetch_corpus(
+        "continual-learning", on_progress=lambda done, total: progress.append((done, total))
+    )
 
-    repo_id = repo_id_for("bird-sql")
-    assert url == f"https://huggingface.co/datasets/{repo_id}"
-    assert api.created[0] == {
-        "repo_id": repo_id,
-        "repo_type": "dataset",
-        "private": False,
-        "exist_ok": True,
-    }
-    assert api.uploaded[f"{repo_id}/traces.otel.jsonl"] == b'{"traceId": "t"}\n'
-    card = api.uploaded[f"{repo_id}/README.md"].decode()
-    assert card.startswith("---\nlicense: cc-by-sa-4.0\n")  # tag must match upstream terms
-    assert "bird-bench mini-dev" in card  # attribution rides the card
-    # the data payload rides the same repo, under its dir names
-    assert api.uploaded[f"{repo_id}/data/part.jsonl"] == b"x\n"
-    assert api.uploaded[f"{repo_id}/gold/part.jsonl"] == b"x\n"
-    assert api.uploaded[f"{repo_id}/schemas/part.jsonl"] == b"x\n"
-
-
-def test_push_private_flag_reaches_create_repo(data_root: Path) -> None:
-    _make_bench(data_root, "dabstep")
-    api = _StubApi()
-    push_corpus("dabstep", private=True, api=api)
-    assert api.created[0]["private"] is True
+    assert path == data_root / "continual-learning" / "traces.otel.jsonl"
+    assert path.read_bytes() == b"spans\n"
+    assert (data_root / "continual-learning" / "data" / "train.jsonl").read_bytes() == b"tasks\n"
+    assert (data_root / "continual-learning" / "gold" / "t1.json").read_bytes() == b"{}"
+    # one monotone bar over the WHOLE bundle: total constant, done reaches it
+    total = 6 + 6 + 2
+    assert progress == [(6, total), (12, total), (14, total)]
 
 
-def test_push_rejects_unpublishable_benchmark(data_root: Path) -> None:
-    """appworld's license forbids plain-text redistribution — pushing it must be an error that
-    says so, not a silent upload."""
-    with pytest.raises(ValueError, match="appworld is local-only"):
-        push_corpus("appworld", api=_StubApi())
-
-
-def test_push_requires_a_local_corpus(data_root: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="capture one first"):
-        push_corpus("gaia2", api=_StubApi())
-
-
-def test_fetch_keeps_existing_local_corpus_unless_forced(
-    data_root: Path,
-    monkeypatch,  # noqa: ANN001
-    tmp_path: Path,
+def test_fetch_keeps_existing_local_files_unless_forced(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Local-first: a corpus grown by local capture waves must never be silently clobbered."""
-    local = data_root / "gaia2" / "traces.otel.jsonl"
-    local.parent.mkdir()
-    local.write_text("local-waves\n")
-    remote = tmp_path / "remote.jsonl"
-    remote.write_text("published\n")
-    snapshot = tmp_path / "snapshot"
-    (snapshot / "data").mkdir(parents=True)
-    (snapshot / "data" / "train.jsonl").write_text("tasks\n")
-    monkeypatch.setattr(hub, "hf_hub_download", lambda *a, **k: str(remote))
-    monkeypatch.setattr(hub, "snapshot_download", lambda *a, **k: str(snapshot))
+    _fake_hub(monkeypatch, {"traces.otel.jsonl": b"published\n", "data/train.jsonl": b"tasks\n"})
+    bench = data_root / "gaia2"
+    (bench / "data").mkdir(parents=True)
+    (bench / "traces.otel.jsonl").write_text("local-waves\n")
+    (bench / "data" / "train.jsonl").write_text("local-edit\n")
 
-    assert fetch_corpus("gaia2") == local
-    assert local.read_text() == "local-waves\n"  # kept
-    assert (data_root / "gaia2" / "data" / "train.jsonl").read_text() == "tasks\n"  # materialized
-    assert fetch_corpus("gaia2", force=True) == local
-    assert local.read_text() == "published\n"  # explicitly overwritten
-
-    # a plain re-fetch keeps everything (no clobber without force)
-    (data_root / "gaia2" / "data" / "train.jsonl").write_text("local-edit\n")
     fetch_corpus("gaia2")
-    assert (data_root / "gaia2" / "data" / "train.jsonl").read_text() == "local-edit\n"
+    assert (bench / "traces.otel.jsonl").read_text() == "local-waves\n"  # kept
+    assert (bench / "data" / "train.jsonl").read_text() == "local-edit\n"  # kept
+
+    fetch_corpus("gaia2", force=True)
+    assert (bench / "traces.otel.jsonl").read_text() == "published\n"
+    assert (bench / "data" / "train.jsonl").read_text() == "tasks\n"
 
 
-def test_gaia2_card_carries_the_disclosures(data_root: Path) -> None:
-    _make_bench(data_root, "gaia2")
-    api = _StubApi()
-    push_corpus("gaia2", api=api)
-    card = " ".join(api.uploaded[f"{repo_id_for('gaia2')}/README.md"].decode().split())
-    assert "not comparable to the official leaderboard" in card
-    assert "models not be trained on evaluation data" in card
+def test_fetch_with_dest_writes_only_the_corpus_file(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_hub(monkeypatch, {"traces.otel.jsonl": b"spans\n", "data/train.jsonl": b"tasks\n"})
+    dest = tmp_path / "elsewhere" / "corpus.jsonl"
+    assert fetch_corpus("gaia2", dest=dest) == dest
+    assert dest.read_bytes() == b"spans\n"
+    assert not (data_root / "gaia2" / "data").exists()
+
+
+def test_fetch_unknown_benchmark_names_the_available_ones(data_root: Path) -> None:
+    with pytest.raises(ValueError, match="no published corpus"):
+        fetch_corpus("nope")
+
+
+def test_stream_to_is_atomic(tmp_path: Path) -> None:
+    """The real streamer writes a .part sibling and renames over — a partial download must
+    never be mistaken for a complete corpus by a concurrent reader."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x" * (3 * 1024))
+    dest = tmp_path / "out" / "corpus.jsonl"
+    seen: list[int] = []
+
+    hub._stream_to(source.as_uri(), dest, token=None, chunk_done=seen.append)
+
+    assert dest.read_bytes() == b"x" * (3 * 1024)
+    assert not dest.with_name(dest.name + ".part").exists()
+    assert sum(seen) == 3 * 1024
+
+
+def test_published_corpora_maps_repos_to_benchmarks(monkeypatch: pytest.MonkeyPatch) -> None:
+    listing = [
+        {"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-07T06:00:00.000Z"},
+        {
+            "id": "experiential-labs/wmh-bird-sql-traces",
+            "lastModified": "2026-07-05T00:00:00.000Z",
+        },
+        {"id": "experiential-labs/unrelated-dataset", "lastModified": "2026-07-06T00:00:00.000Z"},
+        {"id": "experiential-labs/wmh-not-a-benchmark-traces", "lastModified": ""},
+    ]
+    monkeypatch.setattr(hub, "_http_json", lambda url, *, token: listing)
+
+    published = published_corpora()
+    assert [(c.benchmark, c.last_modified) for c in published] == [
+        ("gaia2", "2026-07-07"),
+        ("bird-sql", "2026-07-05"),
+    ]
+    assert published[0].repo_id == repo_id_for("gaia2")
 
 
 def test_every_committed_corpus_is_publishable_or_documented_local_only() -> None:
-    """Manifest coverage: every benchmark dir with a committed corpus must either be in the
+    """Manifest coverage: every benchmark dir with a local corpus must either be in the
     publish manifest or be appworld (the documented local-only exception)."""
     root = hub._data_root()
     dirs = {p.parent.name for p in root.glob("*/traces.otel.jsonl")}

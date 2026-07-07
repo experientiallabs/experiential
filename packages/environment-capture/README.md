@@ -68,9 +68,12 @@ uv run python -m environment_capture.hub fetch all --force   # explicit overwrit
 uv run python packages/environment-capture/dabstep/capture.py ... --push-hub
 ```
 
-Pushing needs a write token (`hf auth login` or `HF_TOKEN`); fetching public corpora needs none.
-`appworld` is the deliberate exception: its license only allows encrypted redistribution of
-derivatives, so that corpus stays local-only (`hub.py` refuses to push it).
+Fetching is plain-HTTP stdlib (`environment_capture.hub`): no extra dependency, no token for
+public repos, per-chunk progress callbacks for UIs, and atomic `.part` writes — the same core
+backs `wmh download` and the serving API. Pushing lives in `environment_capture.hub_push`
+(needs the `fetch` extra + a write token via `hf auth login` or `HF_TOKEN`). `appworld` is the
+deliberate exception: its license only allows encrypted redistribution of derivatives, so that
+corpus stays local-only (pushing it is refused).
 
 ## Adding a benchmark
 

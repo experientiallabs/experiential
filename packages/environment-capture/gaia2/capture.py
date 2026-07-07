@@ -43,7 +43,7 @@ from environment_capture import (
 )
 from environment_capture.agent import ConverseClient
 from environment_capture.benchmarks.gaia2 import Gaia2Adapter, Gaia2Agent
-from environment_capture.hub import add_hub_args, push_after_capture
+from environment_capture.hub_push import add_hub_args, push_after_capture
 
 _HERE = Path(__file__).parent
 _BENCHMARK = "gaia2"

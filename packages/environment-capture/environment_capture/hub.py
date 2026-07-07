@@ -1,64 +1,41 @@
-"""Publish and fetch trace corpora on the Hugging Face Hub.
+"""Fetch and list trace-corpus data bundles from the Hugging Face Hub (stdlib-only).
 
-Corpora are local-first: capture always writes `traces.otel.jsonl` into the benchmark dir, and
-nothing here deletes it. This module adds the sharing layer on top — push a benchmark's data
-bundle (the trace corpus plus its task data / gold / evidence dirs) to a dataset repo (public or
-private), and fetch it back after a fresh clone. Updating is just pushing again: the Hub
-versions every upload as a commit.
+Every publishable benchmark's bundle — the trace corpus plus its task data / gold / evidence
+dirs — lives in a dataset repo under the org. This module is the READ core shared by every
+front-end (`wmh download`, the serving API's trace-download endpoint, `python -m
+environment_capture.hub fetch`): plain-HTTP against the Hub's public REST API, so it needs no
+extra dependency and no token for public repos (pass ``token`` for private ones). Uploading
+lives in `environment_capture.hub_push` (requires the ``fetch`` extra).
 
-Requires the ``fetch`` extra (``environment-capture[fetch]``) and a Hub token with write access
-(``hf auth login`` or the ``HF_TOKEN`` env var; fetching public datasets needs no token).
+Bundles are local-first: capture writes into the benchmark dir, nothing here deletes local
+files, and fetching never overwrites an existing file unless forced. Downloads stream to a
+``.part`` sibling and are atomically renamed, so a failed fetch never looks like a corpus.
 
 Usage (from the repo root):
-    uv run python -m environment_capture.hub push bird-sql          # create/update, public
-    uv run python -m environment_capture.hub push all --private
-    uv run python -m environment_capture.hub fetch dabstep          # skip if already present
-    uv run python -m environment_capture.hub fetch all --force      # overwrite local copies
+    uv run wmh download                                              # interactive picker
+    uv run python -m environment_capture.hub fetch dabstep           # skip if already present
+    uv run python -m environment_capture.hub fetch all --force       # overwrite local copies
+    uv run python -m environment_capture.hub push bird-sql           # see hub_push
 """
 
 from __future__ import annotations
 
 import argparse
-import shutil
-from collections.abc import Iterable
+import json
+import os
+import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
-
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 _ORG = "experiential-labs"
 _CORPUS_FILE = "traces.otel.jsonl"
+_HUB = "https://huggingface.co"
+_CHUNK_BYTES = 1 << 20
 
-
-class HubApi(Protocol):
-    """The slice of ``HfApi`` this module uses (injectable for tests)."""
-
-    def create_repo(
-        self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool
-    ) -> object: ...
-
-    def upload_file(
-        self,
-        *,
-        path_or_fileobj: str | bytes,
-        path_in_repo: str,
-        repo_id: str,
-        repo_type: str,
-        commit_message: str,
-    ) -> object: ...
-
-    def list_datasets(self, *, author: str) -> Iterable[object]: ...
-
-    def upload_folder(
-        self,
-        *,
-        folder_path: str,
-        path_in_repo: str,
-        repo_id: str,
-        repo_type: str,
-        commit_message: str,
-    ) -> object: ...
+# on_progress(bytes_done, bytes_total): called after every streamed chunk, across ALL files in
+# the fetch (front-ends render one bar for the whole bundle).
+ProgressCallback = Callable[[int, int], None]
 
 
 @dataclass(frozen=True)
@@ -187,170 +164,44 @@ class PublishedCorpus:
     last_modified: str  # ISO date, "" when the Hub omits it
 
 
-def published_corpora(
-    *, token: str | None = None, api: HubApi | None = None
-) -> list[PublishedCorpus]:
-    """The org's live corpus datasets (Hub API), newest first, mapped to benchmark names.
-
-    Only repos that follow the ``wmh-<benchmark>-traces`` convention AND appear in the local
-    manifest are returned — those are the ones ``fetch_corpus`` knows where to place.
-    """
-    hub = api or HfApi(token=token)
-    published: list[PublishedCorpus] = []
-    for info in hub.list_datasets(author=_ORG):
-        repo_id = str(getattr(info, "id", ""))
-        name = repo_id.removeprefix(f"{_ORG}/")
-        if not (name.startswith("wmh-") and name.endswith("-traces")):
-            continue
-        benchmark = name.removeprefix("wmh-").removesuffix("-traces")
-        if benchmark not in CORPORA:
-            continue
-        modified = getattr(info, "last_modified", None)
-        published.append(
-            PublishedCorpus(
-                benchmark=benchmark,
-                repo_id=repo_id,
-                last_modified=modified.strftime("%Y-%m-%d") if modified else "",
-            )
-        )
-    published.sort(key=lambda c: c.last_modified, reverse=True)
-    return published
-
-
 def repo_id_for(benchmark: str) -> str:
     """The dataset repo backing one benchmark's corpus."""
     return f"{_ORG}/wmh-{benchmark}-traces"
 
 
 def corpus_path(benchmark: str) -> Path:
-    """Where the benchmark's local trace corpus lives (whether or not it exists yet)."""
+    """The canonical local path of the benchmark's trace corpus (whether or not it exists yet).
+
+    This is the "is it local, and where" resolver every front-end shares: check
+    ``corpus_path(b).exists()`` before deciding to download or to serve from disk.
+    """
     return _data_root() / benchmark / _CORPUS_FILE
 
 
-def _data_root() -> Path:
-    """The sibling benchmark data dirs (packages/environment-capture/<benchmark>/)."""
-    return Path(__file__).resolve().parents[1]
+def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
+    """The org's live corpus datasets (Hub REST API), newest first, mapped to benchmark names.
 
-
-def _dataset_card(spec: CorpusSpec) -> str:
-    """The dataset card (README.md with Hub YAML frontmatter) for one corpus."""
-    extra = f"\n{spec.extra_terms}\n" if spec.extra_terms else ""
-    dir_blurbs = {
-        "data": "task index (train/test splits: prompts + task metadata)",
-        "gold": "per-task gold sidecars (graders read these; never staged into agent workspaces)",
-        "corpus": "evidence documents the tasks are answered from",
-        "datafiles": "shared context files (manual, datasets) staged into agent workspaces",
-        "schemas": "database DDL per task database",
-    }
-    data_dir_lines = "".join(
-        f"- `{d}/` — {dir_blurbs.get(d, 'benchmark data payload')}\n" for d in spec.data_dirs
-    )
-    return f"""---
-license: {spec.license_id}
-pretty_name: "{spec.benchmark} agent-environment traces (world-model-harness)"
-language:
-- en
-tags:
-- agent-trajectories
-- world-models
-- llm-environments
----
-
-# {spec.benchmark} — real agent-environment traces
-
-{spec.description}
-
-Every trace is a REAL run: an LLM agent stepping against the actual benchmark environment, with
-each transition (tool call → true environment observation) recorded as OpenTelemetry GenAI spans
-(`{_CORPUS_FILE}`, one span per line). Captured by
-[world-model-harness](https://github.com/experientiallabs/world-model-harness)'s
-`environment-capture` package, which also holds the adapter, capture scripts, and per-corpus
-provenance: see
-[`packages/environment-capture/{spec.benchmark}/`](https://github.com/experientiallabs/world-model-harness/tree/main/packages/environment-capture/{spec.benchmark}).
-
-## License and attribution
-
-Derived from **{spec.upstream}**; this corpus is redistributed under the same terms
-(`{spec.license_id}`). The trace text embeds task data and environment output from the upstream
-benchmark — keep this attribution if you redistribute.
-{extra}
-## Contents
-
-- `traces.otel.jsonl` — the trace corpus (OTel GenAI spans, one JSON object per line)
-{data_dir_lines}
-## Using it
-
-```python
-from huggingface_hub import hf_hub_download
-
-path = hf_hub_download(
-    "{repo_id_for(spec.benchmark)}", "{_CORPUS_FILE}", repo_type="dataset"
-)
-```
-
-or, from a world-model-harness checkout:
-
-```bash
-uv run wmh download {spec.benchmark}
-```
-"""
-
-
-def push_corpus(
-    benchmark: str,
-    *,
-    private: bool = False,
-    token: str | None = None,
-    api: HubApi | None = None,
-) -> str:
-    """Create/update the benchmark's dataset repo from the local corpus; returns the repo URL.
-
-    Re-pushing after local capture waves is the update path: the Hub records each push as a
-    commit, so history is kept and downloads always see the latest corpus.
+    Only repos that follow the ``wmh-<benchmark>-traces`` convention AND appear in the local
+    manifest are returned — those are the ones ``fetch_corpus`` knows where to place.
     """
-    spec = CORPORA.get(benchmark)
-    if spec is None:
-        publishable = ", ".join(sorted(CORPORA))
-        raise ValueError(
-            f"{benchmark!r} is not a publishable corpus (available: {publishable}). "
-            "appworld is local-only: its license forbids plain-text redistribution."
+    listing = _http_json(f"{_HUB}/api/datasets?author={_ORG}&limit=100", token=token)
+    published: list[PublishedCorpus] = []
+    for entry in listing if isinstance(listing, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        repo_id = str(entry.get("id", ""))
+        name = repo_id.removeprefix(f"{_ORG}/")
+        if not (name.startswith("wmh-") and name.endswith("-traces")):
+            continue
+        benchmark = name.removeprefix("wmh-").removesuffix("-traces")
+        if benchmark not in CORPORA:
+            continue
+        modified = str(entry.get("lastModified") or "")
+        published.append(
+            PublishedCorpus(benchmark=benchmark, repo_id=repo_id, last_modified=modified[:10])
         )
-    corpus = corpus_path(benchmark)
-    if not corpus.exists():
-        raise FileNotFoundError(
-            f"no local corpus at {corpus}; capture one first (see the benchmark README)"
-        )
-    hub = api or HfApi(token=token)
-    repo_id = repo_id_for(benchmark)
-    hub.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
-    hub.upload_file(
-        path_or_fileobj=str(corpus),
-        path_in_repo=_CORPUS_FILE,
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=f"update {benchmark} corpus",
-    )
-    for data_dir in spec.data_dirs:
-        local_dir = _data_root() / benchmark / data_dir
-        if not local_dir.is_dir():
-            raise FileNotFoundError(
-                f"declared data dir {local_dir} is missing; fetch or rebuild it before pushing"
-            )
-        hub.upload_folder(
-            folder_path=str(local_dir),
-            path_in_repo=data_dir,
-            repo_id=repo_id,
-            repo_type="dataset",
-            commit_message=f"update {benchmark} {data_dir}/",
-        )
-    hub.upload_file(
-        path_or_fileobj=_dataset_card(spec).encode("utf-8"),
-        path_in_repo="README.md",
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=f"update {benchmark} dataset card",
-    )
-    return f"https://huggingface.co/datasets/{repo_id}"
+    published.sort(key=lambda c: c.last_modified, reverse=True)
+    return published
 
 
 def fetch_corpus(
@@ -359,72 +210,108 @@ def fetch_corpus(
     dest: Path | None = None,
     force: bool = False,
     token: str | None = None,
+    revision: str = "main",
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Download the benchmark's corpus AND published data dirs into place; returns the corpus path.
 
     Local-first: existing files/dirs are kept unless ``force=True`` — fetching must never
     silently clobber a corpus that local capture waves have grown past the published one.
     With an explicit ``dest`` only the corpus file is written (no data dirs).
+    ``on_progress(bytes_done, bytes_total)`` fires per streamed chunk across the whole bundle.
     """
     spec = CORPORA.get(benchmark)
     if spec is None:
         publishable = ", ".join(sorted(CORPORA))
         raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
+    repo_id = repo_id_for(benchmark)
     target = dest or corpus_path(benchmark)
+
+    # Work list: (remote path, local target, size). Sizes come from the tree API so the total
+    # is known up front and one progress bar can cover the whole bundle.
+    work: list[tuple[str, Path, int]] = []
     if not target.exists() or force:
-        downloaded = hf_hub_download(
-            repo_id_for(benchmark), _CORPUS_FILE, repo_type="dataset", token=token
-        )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(downloaded, target)
+        (corpus_entry,) = [
+            e for e in _repo_tree(repo_id, revision, token=token) if e[0] == _CORPUS_FILE
+        ] or [(_CORPUS_FILE, 0)]
+        work.append((_CORPUS_FILE, target, corpus_entry[1]))
     if dest is None:
-        _fetch_data_dirs(spec, force=force, token=token)
+        pending = [
+            d for d in spec.data_dirs if force or not (_data_root() / benchmark / d).is_dir()
+        ]
+        for data_dir in pending:
+            for remote_path, size in _repo_tree(repo_id, revision, subpath=data_dir, token=token):
+                local = _data_root() / benchmark / remote_path
+                work.append((remote_path, local, size))
+
+    total = sum(size for _, _, size in work)
+    done = 0
+    for remote_path, local, _size in work:
+        url = f"{_HUB}/datasets/{repo_id}/resolve/{revision}/{remote_path}"
+
+        def chunk_done(n: int) -> None:
+            nonlocal done
+            done += n
+            if on_progress is not None:
+                on_progress(done, total)
+
+        _stream_to(url, local, token=token, chunk_done=chunk_done)
     return target
 
 
-def _fetch_data_dirs(spec: CorpusSpec, *, force: bool, token: str | None) -> None:
-    """Materialize the benchmark's published data dirs next to the corpus (skip existing)."""
-    pending = [
-        d for d in spec.data_dirs if force or not (_data_root() / spec.benchmark / d).is_dir()
-    ]
-    if not pending:
-        return
-    snapshot = Path(
-        snapshot_download(
-            repo_id_for(spec.benchmark),
-            repo_type="dataset",
-            allow_patterns=[f"{d}/**" for d in pending],
-            token=token,
-        )
-    )
-    for data_dir in pending:
-        source = snapshot / data_dir
-        if not source.is_dir():
-            continue
-        shutil.copytree(source, _data_root() / spec.benchmark / data_dir, dirs_exist_ok=True)
+def _data_root() -> Path:
+    """The sibling benchmark data dirs (packages/environment-capture/<benchmark>/)."""
+    return Path(__file__).resolve().parents[1]
 
 
-def add_hub_args(parser: argparse.ArgumentParser) -> None:
-    """Wire the optional post-capture Hub push into a capture script's CLI."""
-    parser.add_argument(
-        "--push-hub",
-        action="store_true",
-        help="After capture, push the corpus to its Hub dataset repo (needs a write token via "
-        "`hf auth login` or HF_TOKEN). The local file always stays.",
-    )
-    parser.add_argument(
-        "--hub-private",
-        action="store_true",
-        help="Create the dataset repo private (matters on the first push only).",
-    )
+def _request(url: str, token: str | None) -> urllib.request.Request:
+    headers = {"User-Agent": "environment-capture/hub"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.Request(url, headers=headers)  # noqa: S310 - https-only constants
 
 
-def push_after_capture(benchmark: str, *, enabled: bool, private: bool) -> None:
-    """The capture scripts' post-run hook: push when ``--push-hub`` was passed, else no-op."""
-    if not enabled:
-        return
-    url = push_corpus(benchmark, private=private)
-    print(f"pushed corpus -> {url}")
+def _http_json(url: str, *, token: str | None) -> object:
+    with urllib.request.urlopen(_request(url, token), timeout=60) as response:  # noqa: S310
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _repo_tree(
+    repo_id: str, revision: str, *, subpath: str = "", token: str | None
+) -> list[tuple[str, int]]:
+    """(path, size) for every FILE under ``subpath`` in the dataset repo."""
+    suffix = f"/{subpath}" if subpath else ""
+    url = f"{_HUB}/api/datasets/{repo_id}/tree/{revision}{suffix}?recursive=true"
+    listing = _http_json(url, token=token)
+    files: list[tuple[str, int]] = []
+    for entry in listing if isinstance(listing, list) else []:
+        if isinstance(entry, dict) and entry.get("type") == "file":
+            size = entry.get("size")
+            files.append(
+                (str(entry.get("path", "")), size if isinstance(size, int) else 0)
+            )
+    return files
+
+
+def _stream_to(
+    url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
+) -> None:
+    """Stream ``url`` to ``dest`` atomically: write a ``.part`` sibling, then rename over.
+
+    A partially-downloaded corpus must never be mistaken for a complete one by a concurrent
+    reader (the serving API polls the target path for byte progress).
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    with urllib.request.urlopen(_request(url, token), timeout=300) as response:  # noqa: S310
+        with part.open("wb") as sink:
+            while True:
+                chunk = response.read(_CHUNK_BYTES)
+                if not chunk:
+                    break
+                sink.write(chunk)
+                chunk_done(len(chunk))
+    os.replace(part, dest)
 
 
 def main() -> None:
@@ -435,17 +322,28 @@ def main() -> None:
     push.add_argument("benchmark", help=f"Benchmark name, or 'all' ({', '.join(sorted(CORPORA))})")
     push.add_argument("--private", action="store_true", help="Create the repo(s) private.")
 
-    fetch = sub.add_parser("fetch", help="Download full corpora into the benchmark data dirs.")
+    fetch = sub.add_parser("fetch", help="Download full data bundles into the benchmark dirs.")
     fetch.add_argument("benchmark", help="Benchmark name, or 'all'")
     fetch.add_argument(
-        "--force", action="store_true", help="Overwrite an existing local corpus file."
+        "--force", action="store_true", help="Overwrite existing local corpus/data files."
     )
 
     args = parser.parse_args()
+    if args.command == "push":
+        # The write path is the one place that needs huggingface_hub (the `fetch` extra); the
+        # import lives at the dispatch so plain fetch installs never pay for it. A missing
+        # extra fails loudly right here with the install hint.
+        try:
+            from environment_capture import hub_push
+        except ModuleNotFoundError as error:  # pragma: no cover - exercised only without extra
+            raise SystemExit(
+                "pushing needs huggingface_hub: install the extra "
+                "(`pip install 'environment-capture[fetch]'` / `uv sync --extra dev`)"
+            ) from error
     names = sorted(CORPORA) if args.benchmark == "all" else [args.benchmark]
     for name in names:
         if args.command == "push":
-            url = push_corpus(name, private=args.private)
+            url = hub_push.push_corpus(name, private=args.private)
             print(f"pushed {name} -> {url}")
         else:
             existing = corpus_path(name).exists()
