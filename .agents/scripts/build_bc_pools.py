@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--arm", choices=["mined", "random", "both"], default="both")
     parser.add_argument("--mined-out", default="bc_pool_mined.json")
     parser.add_argument("--random-out", default="bc_pool_random.json")
+    parser.add_argument("--random-seed", type=int, default=0, help="seed for the uniform draw")
     args = parser.parse_args()
 
     provider = foundry(SYNTH_MODEL)
@@ -81,7 +82,7 @@ def main() -> None:
 def _build_random_arm(args, provider, judge_llm, train_traces, facets) -> None:  # noqa: ANN001
     # Arm B — RANDOM: uniform random source traces, same synthesizer + same validity gate.
     facets_by_id = {f.trace_id: f for f in facets}
-    rng = random.Random(0)
+    rng = random.Random(args.random_seed)
     order = list(range(len(train_traces)))
     rng.shuffle(order)
     synthesizer = ScenarioSynthesizer(provider)
