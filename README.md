@@ -41,26 +41,6 @@ uv run wmh serve                  # local HTTP backend on :8000
 
 Example-local prebuilt models live under `examples/<task>/models/`; pass `--root examples/<task>` to `wmh list`, `wmh demo`, `wmh play`, or `wmh serve` to use one without rebuilding.
 
-## Mine scenarios from traces
-
-Turn a raw trace corpus into a validated, judgeable scenario set — each scenario is a
-self-contained task, a seed environment state, and a checklist a judge can grade any new
-rollout against. The pipeline summarizes every trace into an embeddable facet, clusters by
-capability, selects representative sources, has an LLM write each scenario, and back-checks
-every checklist against its source trace before the scenario may exist.
-
-```bash
-uv run wmh scenarios build --file traces.otel.jsonl --out scenarios.json \
-    --budget 60 --embed-provider bedrock --embed-model amazon.titan-embed-text-v2:0
-uv run wmh scenarios verify scenarios.json --file traces.otel.jsonl --drop
-```
-
-`verify` closes the loop extrinsically — back-agreement on source traces plus solvability
-rollouts against the world model — and `--drop` prunes failures in place. Models per role
-(worker for synthesis, judge for validation, summary for facet extraction) come from
-`.wmh/settings.toml` `[models.worker|judge|summary]`, overridable with `--provider`/`--model`;
-a separate judge family avoids grading bias toward the synthesizer's own outputs.
-
 ## Use it as an API
 
 ```python
