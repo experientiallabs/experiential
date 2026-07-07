@@ -18,7 +18,7 @@ from wmh.research.scenario_fidelity import (
 )
 from wmh.scenarios.synthesis import EvalScenario
 from wmh.scenarios.verification import CHECKLIST_SYSTEM, ChecklistJudge
-from wmh.scenarios.verification_test import EmptyRetriever, OneShotAgent
+from wmh.scenarios.verification.verify_test import EmptyRetriever, OneShotAgent
 
 
 class RoutedProvider:

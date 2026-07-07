@@ -21,8 +21,8 @@ from __future__ import annotations
 import numpy as np
 from pydantic import BaseModel
 
-from wmh.scenarios.clustering import normalize_rows
-from wmh.scenarios.facets import Outcome, TraceFacet
+from wmh.scenarios.mining.clustering import normalize_rows
+from wmh.scenarios.mining.facets import Outcome, TraceFacet
 
 DEDUP_THRESHOLD = 0.95
 PROPORTIONAL_FRACTION = 0.7

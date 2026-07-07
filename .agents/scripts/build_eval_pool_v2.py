@@ -31,7 +31,7 @@ from run_scenario_e2e import TRACES, titan_embedder  # noqa: E402
 from wmh.engine.build import split_traces  # noqa: E402
 from wmh.ingest import get_adapter  # noqa: E402
 from wmh.scenarios import ScenarioBuildConfig, build_scenario_set  # noqa: E402
-from wmh.scenarios.facets import TraceFacet, trace_domain  # noqa: E402
+from wmh.scenarios.mining.facets import TraceFacet, trace_domain  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
 SYNTH_MODEL = "gpt-5.4"

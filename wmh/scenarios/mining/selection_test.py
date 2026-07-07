@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from wmh.scenarios.facets import Outcome, TraceFacet
-from wmh.scenarios.selection import hybrid_select, semdedup_keep
+from wmh.scenarios.mining.facets import Outcome, TraceFacet
+from wmh.scenarios.mining.selection import hybrid_select, semdedup_keep
 
 
 def _facet(

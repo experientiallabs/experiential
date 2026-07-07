@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmh.scenarios.facets import FacetExtractor, Outcome, tool_signature, trace_digest
+from wmh.scenarios.mining.facets import FacetExtractor, Outcome, tool_signature, trace_digest
 
 
 class FakeProvider:

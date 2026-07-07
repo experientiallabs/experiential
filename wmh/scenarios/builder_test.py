@@ -8,7 +8,7 @@ from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import HashingEmbedder
 from wmh.scenarios.builder import ScenarioBuildConfig, build_scenario_set
-from wmh.scenarios.facets import Outcome, TraceFacet
+from wmh.scenarios.mining.facets import Outcome, TraceFacet
 
 
 class JsonEchoProvider:
@@ -32,9 +32,7 @@ class JsonEchoProvider:
         if "grade one ai-agent episode" in system.lower():
             self.judge_calls += 1
             ok = self._judge_success
-            return Completion(
-                text=f'{{"passed": [{ok}], "success": {ok}, "critique": "x"}}'
-            )
+            return Completion(text=f'{{"passed": [{ok}], "success": {ok}, "critique": "x"}}')
         return Completion(
             text=(
                 '{"task": "Do the synthesized task.", "initial_state": "The world exists.", '

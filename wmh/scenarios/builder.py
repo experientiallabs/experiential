@@ -12,9 +12,9 @@ from pydantic import BaseModel
 
 from wmh.core.types import Trace
 from wmh.providers.base import Embedder, Provider
-from wmh.scenarios.clustering import cluster_facets, name_clusters, normalize_rows
-from wmh.scenarios.facets import TraceFacet
-from wmh.scenarios.selection import (
+from wmh.scenarios.mining.clustering import cluster_facets, name_clusters, normalize_rows
+from wmh.scenarios.mining.facets import TraceFacet
+from wmh.scenarios.mining.selection import (
     DEDUP_THRESHOLD,
     PROPORTIONAL_FRACTION,
     hybrid_select,
@@ -73,9 +73,7 @@ def build_scenario_set(
     facets_by_id = {facet.trace_id: facet for facet in facets}
     cluster_names = {cluster.cluster_id: cluster.name for cluster in clusters}
     synthesizer = ScenarioSynthesizer(provider)
-    judge = (
-        ChecklistJudge(judge_provider or provider) if config.validate_checklists else None
-    )
+    judge = ChecklistJudge(judge_provider or provider) if config.validate_checklists else None
     scenarios: list[EvalScenario] = []
     dropped = 0
     for selection in selections:

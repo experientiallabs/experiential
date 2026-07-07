@@ -13,7 +13,7 @@ from pydantic import BaseModel, ValidationError
 
 from wmh.core.parsing import extract_json_object
 from wmh.providers.base import Message, Provider
-from wmh.scenarios.facets import TraceFacet
+from wmh.scenarios.mining.facets import TraceFacet
 
 _KMEANS_ITERS = 50
 _NAME_SAMPLE = 10

@@ -28,7 +28,7 @@ from wmh.engine.build import split_traces  # noqa: E402
 from wmh.ingest import get_adapter  # noqa: E402
 from wmh.scenarios import ScenarioBuildConfig, ScenarioSet, build_scenario_set  # noqa: E402
 from wmh.scenarios.builder import _checklist_agrees  # noqa: E402
-from wmh.scenarios.facets import TraceFacet, trace_domain  # noqa: E402
+from wmh.scenarios.mining.facets import TraceFacet, trace_domain  # noqa: E402
 from wmh.scenarios.synthesis import ScenarioSynthesizer  # noqa: E402
 from wmh.scenarios.verification import ChecklistJudge  # noqa: E402
 

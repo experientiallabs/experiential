@@ -1,0 +1,85 @@
+{
+  "note": "offline correction on the saved 4-agent x 30-scenario x 3-pass score matrix",
+  "uniform_random": {
+    "draws": 2000,
+    "mae_mean": 0.045377546296296305,
+    "mae_median": 0.04033564814814809,
+    "coverage_mean": 5.1785
+  },
+  "ours_original_run_buggy_reclustering": {
+    "mae": 0.035,
+    "beats_pct_of_random": 0.6055,
+    "clusters_covered": 4
+  },
+  "ours_corrected": {
+    "mae": 0.10051883780332063,
+    "beats_pct_of_random": 0.031,
+    "clusters_covered": 7,
+    "selection": [
+      {
+        "trace_id": "scenario-1f0ca0031cd4",
+        "cluster_id": 0,
+        "weight": 0.13793103448275862,
+        "pinned_failure": null
+      },
+      {
+        "trace_id": "scenario-000d3ffa1250",
+        "cluster_id": 0,
+        "weight": 0.13793103448275862,
+        "pinned_failure": null
+      },
+      {
+        "trace_id": "scenario-f3bad4bd68e6",
+        "cluster_id": 3,
+        "weight": 0.20689655172413793,
+        "pinned_failure": null
+      },
+      {
+        "trace_id": "scenario-4b46be4db947",
+        "cluster_id": 7,
+        "weight": 0.13793103448275862,
+        "pinned_failure": null
+      },
+      {
+        "trace_id": "scenario-44d1be579665",
+        "cluster_id": 1,
+        "weight": 0.10344827586206896,
+        "pinned_failure": null
+      },
+      {
+        "trace_id": "scenario-de54486e1d0a",
+        "cluster_id": 4,
+        "weight": 0.10344827586206896,
+        "pinned_failure": null
+      },
+      {
+        "trace_id": "scenario-0ca7d944afa1",
+        "cluster_id": 6,
+        "weight": 0.10344827586206896,
+        "pinned_failure": null
+      },
+      {
+        "trace_id": "scenario-b333941ccdeb",
+        "cluster_id": 2,
+        "weight": 0.06896551724137931,
+        "pinned_failure": null
+      }
+    ]
+  },
+  "stratified_random_control": {
+    "draws": 2000,
+    "mae_mean": 0.05392421775223499,
+    "mae_median": 0.047278097062579794,
+    "allocation": {
+      "Flight Management Tasks": 2,
+      "Item Return/Exchange": 1,
+      "Order Modification Requests": 1,
+      "Flight booking tasks": 1,
+      "Mobile Data Abroad": 1,
+      "Mobile Data Roaming": 1,
+      "Flight reservation modifications": 1
+    }
+  },
+  "n_clusters": 8,
+  "reading": "For estimating the POOL MEAN, selection is at best random-equivalent; the coverage-corrected selection is WORSE than random because intent-space medoids are biased in score space (stratified-random with the same allocation is fine). The method's value is coverage (7/8 clusters vs ~5/8 random) and auditability, not mean-score calibration; for calibration use random-within-cluster picks or the Design-C IRT pass."
+}

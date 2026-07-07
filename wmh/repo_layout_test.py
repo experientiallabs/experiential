@@ -7,6 +7,7 @@ Skipped outside a git checkout (e.g. an installed sdist).
 from __future__ import annotations
 
 import functools
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -170,4 +171,14 @@ def test_top_level_files_are_allowlisted() -> None:
     assert not unexpected, (
         f"top-level files {sorted(unexpected)} are not allowlisted; config belongs in "
         "pyproject.toml, tasks in the justfile, and everything else under an allowlisted dir"
+    )
+
+
+def test_no_finder_duplicate_files_are_tracked() -> None:
+    """macOS Finder copies ("foo 2.py") dodge pytest collection and imports, so they rot
+    silently; 24 of them once shipped in a PR before anyone noticed."""
+    duplicates = [p for p in _tracked_files() if re.search(r" \d+\.\w+$", p)]
+    assert not duplicates, (
+        f"tracked Finder-style duplicate files {sorted(duplicates)}; delete the copies "
+        "(they are never imported or collected) and keep the originals"
     )

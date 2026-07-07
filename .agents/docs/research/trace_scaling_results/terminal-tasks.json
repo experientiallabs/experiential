@@ -1,0 +1,114 @@
+{
+  "name": "trace-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "base@10",
+        "params": {
+          "mode": "base",
+          "n_train": 10
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8602424242424243
+        },
+        {
+          "seed": 1,
+          "score": 0.8528080808080808
+        }
+      ],
+      "mean": 0.8565252525252525,
+      "std": 0.00371717171717173
+    },
+    {
+      "condition": {
+        "label": "base@20",
+        "params": {
+          "mode": "base",
+          "n_train": 20
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8547070707070707
+        },
+        {
+          "seed": 1,
+          "score": 0.8560606060606061
+        }
+      ],
+      "mean": 0.8553838383838384,
+      "std": 0.0006767676767676645
+    },
+    {
+      "condition": {
+        "label": "base@40",
+        "params": {
+          "mode": "base",
+          "n_train": 40
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8410707070707071
+        },
+        {
+          "seed": 1,
+          "score": 0.8694747474747475
+        }
+      ],
+      "mean": 0.8552727272727273,
+      "std": 0.014202020202020216
+    },
+    {
+      "condition": {
+        "label": "base@80",
+        "params": {
+          "mode": "base",
+          "n_train": 80
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8633939393939394
+        },
+        {
+          "seed": 1,
+          "score": 0.8689696969696971
+        }
+      ],
+      "mean": 0.8661818181818182,
+      "std": 0.002787878787878839
+    },
+    {
+      "condition": {
+        "label": "base@160",
+        "params": {
+          "mode": "base",
+          "n_train": 160
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8637777777777778
+        },
+        {
+          "seed": 1,
+          "score": 0.8687878787878789
+        }
+      ],
+      "mean": 0.8662828282828283,
+      "std": 0.0025050505050505656
+    }
+  ]
+}

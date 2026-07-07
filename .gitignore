@@ -36,8 +36,9 @@ settings.toml
 .claude/scheduled_tasks.lock
 .claude/projects/
 
-# Raw experiment data artifacts are NOT committed — they live in the Notion experiments area
-# (Research page) with a SHA-256 manifest. Analysis prose (.md) stays in git.
-.agents/docs/research/**/*.json
-.agents/docs/research/**/*.jsonl
-.agents/docs/research/**/*.html
+# Raw experiment data artifacts of the distill/ablation program are NOT committed — they live
+# in the Notion experiments area (Research page) with a SHA-256 manifest. Analysis prose (.md)
+# stays in git, as do small result JSONs elsewhere under research/ (e.g. trace_scaling_results).
+.agents/docs/research/distill/*.json
+.agents/docs/research/distill/*.jsonl
+.agents/docs/research/distill/*.html

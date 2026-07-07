@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import numpy as np
 
-from wmh.scenarios.clustering import (
+from wmh.scenarios.mining.clustering import (
     TraceCluster,
     cluster_facets,
     default_k,
     kmeans_labels,
     name_clusters,
 )
-from wmh.scenarios.facets import TraceFacet
-from wmh.scenarios.facets_test import FakeProvider
+from wmh.scenarios.mining.facets import TraceFacet
+from wmh.scenarios.mining.facets_test import FakeProvider
 
 
 def _facet(trace_id: str, summary: str) -> TraceFacet:
