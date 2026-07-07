@@ -79,7 +79,7 @@ This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/
 |---|---|---|
 | **wmh** (root) | Agent traces → a faithful world model of your environment | the quickstart above |
 | [`packages/llm-waterfall/`](./packages/llm-waterfall) | Pool LLM quota across models, providers, and AWS accounts: stateless failover that spills only on capacity errors, returning cost + the full attempt trail | `pip install "llm-waterfall @ git+https://github.com/experientiallabs/world-model-harness#subdirectory=packages/llm-waterfall"` *(PyPI release pending)* |
-| `packages/environment-capture/` *(in progress)* | Point it at any agent benchmark: integrate via a small adapter, smoke-test it, capture real-run traces as OTel GenAI JSONL | — |
+| [`packages/environment-capture/`](./packages/environment-capture) | Point it at any agent benchmark: integrate via a small adapter, capture every real agent-environment transition as OTel GenAI JSONL; 27k+ transitions already published on the [Hub](https://huggingface.co/experiential-labs) | `pip install environment-capture` |
 
 One clone, one `uv sync`, one gate (`just gate`); each package is built and released independently.
 
