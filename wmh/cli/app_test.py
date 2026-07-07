@@ -302,7 +302,7 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
     command = cast(list[str], seen["command"])
     assert Path(command[0]).as_posix().endswith("environment-capture/tau-bench/run.sh")
     assert command[1:] == ["--trace", "0"]
-    assert Path(seen["cwd"]).as_posix().endswith("environment-capture/tau-bench")
+    assert Path(cast(str, seen["cwd"])).as_posix().endswith("environment-capture/tau-bench")
     assert seen["check"] is False
 
 
