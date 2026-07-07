@@ -237,3 +237,49 @@ after ~1 epoch of productive learning. The composable next step (not run here): 
 env + dense rewards + per-~50-step checkpoint drains, which by Finding 3 should extend
 the productive window; and B3's D59 overfitting-meter usage generalizes — the WM's
 rolling train success is a reliable, cheap eval predictor across all six arms measured.
+
+## Real-environment validation + fidelity→transfer curve (D67 program)
+
+Full detail in PR #116; raw rows in `.agents/docs/research/real_tau_eval_results/`,
+fidelity cells in `.agents/docs/research/tau_fidelity_cells/`, figure at
+`docs/research/fidelity_transfer_curve.png` (regenerate:
+`.agents/scripts/plot_fidelity_transfer.py`).
+
+**Real-env validation (D70).** On REAL tau2 (real gym, real Opus user-simulator, real
+grader; 20 pinned tasks × 2 trials): base **90.0%**, pinned arm (R++ n=4 ckpt-0192)
+**92.5%**, paired **+0.025** (3W/2L/35T). WM-trained policy transfers with no
+degradation and a slight lift against a 90% ceiling. The real env is far easier than the
+WM eval env (55% vs 90% for the same base policy): WM-side and real-side absolutes never
+compare; think-in-content serving (required because tau2 rejects pure-think turns)
+contributes ~20pts to both rows.
+
+**Fidelity→transfer curve.** One R++ n=4 smoke (1 epoch × 58-scenario curriculum, same
+seed/order, temp-0 env, judge pinned haiku) per training-WM backend; Y = paired Δ vs base
+on the REAL env; checkpoint rule uniform across points = last pre-collapse drain.
+
+| backend | fidelity (D69) | smoke outcome | real-env Y | paired Δ |
+|---|---|---|---|---|
+| haiku no-RAG | 0.335 | healthy full epoch | 92.5% | +0.025 |
+| haiku+RAG | 0.633 | healthy full epoch | 85.0% | −0.050 |
+| sonnet-5+RAG | 0.943 | collapsed ~ep 90 (2× replicated) | 87.5% (pre-collapse drain) | −0.025 |
+| opus-4.8+RAG | 0.956 | collapsed ~ep 90 | 92.5% (pre-collapse drain) | +0.025 |
+| sonnet-5+RAG, collapsed ckpt | 0.943 | post-collapse | 13.8% | −0.793 |
+
+Two claims, curve-shape only (n=1/point, n=40/row):
+
+1. **Healthy-checkpoint transfer is flat within noise across a 3× fidelity range**
+   (+0.025 / −0.050 / −0.025 / +0.025). At smoke scale against a 90% real-env ceiling,
+   training-WM fidelity does not measurably change transfer — a 0.335-fidelity WM
+   (haiku, no retrieval) trained as well as a 0.956 one (opus+RAG). Fidelity spend is
+   not where the leverage is at this scale.
+2. **Fidelity is not free for training — the fidelity/stability trade-off (D73, 3×
+   replicated).** Both high-fidelity backends collapsed into a no-tool-call policy at
+   ~episode 90 under the exact hypers where both haiku backends ran healthy full epochs
+   (mechanism: harsher grading → denser negative advantages → the D63 collapse budget
+   shrinks below one epoch). The collapsed-checkpoint row (−0.793) shows the cliff is
+   total. Practical rule: when training against strong WMs, drain checkpoints early and
+   select the last pre-collapse drain.
+
+Ops finding that unblocked all of this: gpt-5.5 was lost mid-program (OpenAI account
+terminated, D68) — opus-4.8 substitutes, with an Anthropic direct-API link appended to
+its failover chains.
