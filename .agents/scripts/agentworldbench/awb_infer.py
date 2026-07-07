@@ -68,24 +68,25 @@ def infer_wm(rows: list[JsonObject], model_dir: str) -> list[JsonObject]:
     """Predict via a built model's serving path: seeded session -> one step (retrieval included)."""
     world_model, provider = load_world_model(model_dir)
     for i, row in enumerate(rows):
-        session = world_model.new_session(task=None)
+        row["gen"] = ""
+        session = None
         try:
+            session = world_model.new_session(task=None)
             world_model.seed_session(session.id, history_steps(row))
             observation = world_model.step(session.id, current_action(row))
             row["gen"] = wrap_gen(observation)
         except Exception:  # per-row isolation; their judge marks gen == "" as failed
-            row["gen"] = ""
             print(f"[{i + 1}/{len(rows)}] infer failed for id={row.get('id')}", file=sys.stderr)
             traceback.print_exc()
         finally:
-            usage = world_model.end_session(session.id)
+            usage = world_model.end_session(session.id) if session is not None else None
         row["wmh_infer"] = {
             "mode": "wm",
             "model_dir": model_dir,
             "serve_model": provider.config.model,
-            "input_tokens": usage.total.input_tokens,
-            "output_tokens": usage.total.output_tokens,
-            "cost_usd": usage.total.cost_usd,
+            "input_tokens": usage.total.input_tokens if usage else 0,
+            "output_tokens": usage.total.output_tokens if usage else 0,
+            "cost_usd": usage.total.cost_usd if usage else 0.0,
         }
         print(f"[{i + 1}/{len(rows)}] id={row.get('id')} turn={row.get('turn_idx')} ok")
     return rows
@@ -149,7 +150,7 @@ def main() -> None:
         for line in Path(args.data).read_text(encoding="utf-8").splitlines()
         if line
     ]
-    if args.limit:
+    if args.limit is not None:
         rows = rows[: args.limit]
     print(f"{len(rows)} rows from {args.data} (mode={args.mode})")
 
