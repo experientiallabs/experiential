@@ -202,27 +202,9 @@ def test_malformed_tool_arguments_are_normalized_on_replay() -> None:
         return "ok", 0
 
     bad_args = '{"command": "ls /tmp"} trailing-garbage'
-    scripted = [
-        {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": "c1",
-                                "type": "function",
-                                "function": {"name": "bash", "arguments": bad_args},
-                            }
-                        ],
-                    }
-                }
-            ]
-        },
-        _text_turn("done"),
-        _text_turn("done"),
-    ]
+    bad_turn = _tool_turn("ignored")
+    bad_turn["tool_calls"][0]["function"]["arguments"] = bad_args
+    scripted = [bad_turn, _text_turn("done"), _text_turn("done")]
     steps, calls = _run(scripted, execute)
     # the parsed command still executed, and the REPLAYED arguments are clean JSON
     assert executed and "ls /tmp" in executed[0]
