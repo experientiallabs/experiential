@@ -1,0 +1,1937 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "scenario-efec6ac80ec302b2539752de1d58d7d3",
+      "task": "You are assisting Emma Kim (user id: emma_kim_9957). She wants to cancel airline reservation EHGLP3. If the reservation cannot be canceled because it is outside the normal 24-hour window, explain that limitation and note her stated reason that she was out of town during that time. Provide the cancellation outcome and any refund or credit details that apply.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Reservation EHGLP3 belongs to Emma Kim (user id emma_kim_9957). It is a one-way basic economy itinerary from PHX to JFK with two flight segments: HAT156 from PHX to SEA on 2024-05-17 priced at 50, and HAT021 from SEA to JFK on 2024-05-17. Emma Kim's customer profile exists with name Emma Kim, email emma.kim3947@example.com, and mailing address 109 Willow Lane, Suite 171, Philadelphia, PA 19151, USA."
+      },
+      "checklist": [
+        "The response correctly identifies reservation EHGLP3 as Emma Kim's booking.",
+        "The final outcome clearly states whether the reservation was canceled or could not be canceled.",
+        "If cancellation is not allowed, the response explicitly mentions the 24-hour policy limitation and includes Emma's reason that she was out of town.",
+        "If cancellation is allowed, the response includes the resulting refund, credit, or forfeiture details.",
+        "The response does not confuse the itinerary details: it remains a one-way PHX→SEA→JFK basic economy reservation on 2024-05-17."
+      ],
+      "provenance": [
+        "efec6ac80ec302b2539752de1d58d7d3"
+      ],
+      "cluster_name": "Flight reservation cancellation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b333941ccdeb37c9a78375fbaf15b436",
+      "task": "Help Sophia Taylor (user id: sophia_taylor_9065) with reservation PEP4E0. She believes trip insurance was added to her upcoming flight, but it is not showing online. Determine whether insurance is actually attached to the booking and, if it is missing, add the appropriate trip insurance if allowed. If insurance cannot be added, clearly explain the outcome and any relevant limitation.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "There is an existing airline reservation PEP4E0 belonging to user sophia_taylor_9065. The itinerary is a one-way basic economy trip from CLT to PHX with two flight segments: HAT176 from CLT to DTW on 2024-05-20 and HAT097 from DTW to PHX on 2024-05-20. The booking exists and can be retrieved by reservation number. The issue at the start is that trip insurance is not showing in the online reservation view, and the customer expects confirmation or correction."
+      },
+      "checklist": [
+        "The final response correctly identifies whether trip insurance is currently attached to reservation PEP4E0.",
+        "If insurance can be added, the reservation ends with trip insurance attached and the customer is told it was added.",
+        "If insurance cannot be added, the customer is explicitly informed that it could not be added and given the relevant reason or policy limitation.",
+        "The response refers to the correct reservation/customer context (Sophia Taylor, reservation PEP4E0)."
+      ],
+      "provenance": [
+        "b333941ccdeb37c9a78375fbaf15b436"
+      ],
+      "cluster_name": "Flight reservation cancellation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-16e5f88274b89eb32563a7706625d44d",
+      "task": "Assist Sophia Silva (user id: sophia_silva_7557) with her request for compensation related to a supposedly canceled business-class flight earlier this month. Verify her reservations and flight status, determine whether any compensation is actually allowed, and respond truthfully according to the records. Do not issue or promise compensation unless the records support an eligible disrupted flight.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Sophia Silva has user id sophia_silva_7557 and multiple May 2024 reservations on file. Her reservations include NM1VX1 (MSP-EWR round trip, basic economy, flights on 2024-05-25 and return), KC18K6 (MSP-CLT one way, basic economy, connecting via EWR on 2024-05-21), S61CZX (LAX-CLT round trip, economy, outbound on 2024-05-23), H8Q05L (JFK-ATL one way, basic economy, 2024-05-24), and WUNA5K (ORD-PHL round trip, economy). Reservation WUNA5K includes flight HAT271 from ORD to PHL on 2024-05-10, and the recorded status of HAT271 on 2024-05-10 is landed, not canceled. No reservation shown is in business class."
+      },
+      "checklist": [
+        "The final response does not grant, issue, or promise compensation or credit for the claimed canceled business-class flight.",
+        "The response correctly states that the records do not show an eligible canceled business-class flight for Sophia earlier this month.",
+        "The response is consistent with the available reservation data, including that flight HAT271 on 2024-05-10 was landed rather than canceled.",
+        "The response avoids fabricating unsupported disruptions, bookings, or cabin classes.",
+        "If alternatives are offered, they are limited to truthful next steps such as asking for a valid reservation or explaining policy, not unauthorized compensation."
+      ],
+      "provenance": [
+        "16e5f88274b89eb32563a7706625d44d"
+      ],
+      "cluster_name": "flight cancellation compensation claim",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "unauthorized_request"
+    },
+    {
+      "scenario_id": "scenario-041936340729fbfb33d3b1b6e6f799c8",
+      "task": "You are assisting Chen Lee (user ID: chen_lee_6825) with reservation YAX4DR for an upcoming one-way trip from Boston (BOS) to Minneapolis (MSP). The user wants to change the booking to business class for all passengers and add 2 checked bags to the reservation. If the class change cannot be completed, still fulfill any feasible part of the request and clearly report the outcome, including any limitations or remaining issues.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Chen Lee has an airline customer profile under user ID chen_lee_6825 with a saved payment method credit_card_4938634. Reservation YAX4DR belongs to this user and is a one-way itinerary from BOS to MSP in economy cabin with two flight segments: HAT235 from BOS to MCO on 2024-05-18 and HAT298 from MCO to MSP on 2024-05-19. The reservation exists before any changes are made. The system can search flight availability by segment and can update baggage on the reservation using the saved payment method."
+      },
+      "checklist": [
+        "The final outcome correctly addresses both requested changes: business-class upgrade for all passengers and addition of 2 checked bags, or explicitly states which part could not be completed.",
+        "If the business-class change is not completed, the response accurately communicates that limitation rather than claiming the reservation was upgraded.",
+        "The reservation ends with 2 checked bags added to it.",
+        "Any charges or payment usage mentioned are consistent with the actual completed changes on the reservation.",
+        "The final communication identifies reservation YAX4DR and summarizes the resulting itinerary/class and baggage status."
+      ],
+      "provenance": [
+        "041936340729fbfb33d3b1b6e6f799c8"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-56917256da22ca30bddb2da69adf75dd",
+      "task": "You are Omar Rossi (user id: omar_rossi_1241). Find your upcoming trip from the New York area to Chicago and modify that reservation so the passenger is Omar Rossi, the cabin is economy, and the reservation includes 3 checked bags. Use one of Omar's saved payment methods if a payment is required, and report the updated reservation details.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Omar Rossi has user id omar_rossi_1241, date of birth 1970-06-06, and saved payment methods including a gift card with id gift_card_8190333. He has several existing reservations, including reservation FQ8APE, a one-way trip from EWR to ORD on 2024-05-25 with flights HAT056 (EWR to IAH) and HAT138 (IAH to ORD). Reservation FQ8APE initially has cabin basic_economy and is the relevant upcoming trip from the New York area to Chicago. Other reservations exist for unrelated routes and should not be changed."
+      },
+      "checklist": [
+        "The reservation for the New York-area to Chicago trip (FQ8APE, EWR to ORD) ends up assigned to passenger Omar Rossi with DOB 1970-06-06.",
+        "That reservation's cabin is changed from basic_economy to economy.",
+        "That reservation ends up with 3 checked bags recorded.",
+        "If any fee is needed for the changes, a valid saved payment method belonging to Omar is used.",
+        "The final response identifies the updated reservation/trip details rather than modifying an unrelated booking."
+      ],
+      "provenance": [
+        "56917256da22ca30bddb2da69adf75dd"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-e5b3fd60b950d3d481323c21e73d7d35",
+      "task": "Sofia Kim (user id: sofia_kim_7287) wants to modify her upcoming round-trip reservation for travel from Houston (IAH) to Denver. The outbound departure is on May 27 and should remain unchanged. Change only the return portion to the fastest available itinerary from Denver (DEN) back to Houston (IAH) on May 27, keeping the reservation in economy cabin. If no direct return flight is available, use the fastest one-stop option. Preserve her baggage allowance at 2 total checked bags with 0 paid bags, and use one of her existing payment methods if any payment is required.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Sofia Kim has multiple reservations, including reservation OBUT9V, which is the relevant round-trip economy booking from IAH to DEN. In OBUT9V, the outbound on 2024-05-27 is a two-leg itinerary: HAT078 from IAH to ORD and HAT118 from ORD to DEN. The return portion of OBUT9V is initially booked separately and is eligible to be changed without altering the outbound. For DEN to IAH on 2024-05-27, there are no direct flights available, but at least one one-stop economy itinerary is available; the fastest available option uses flights HAT290 and HAT175. Sofia has a stored gift card payment method ending in 6276644 that can be used for reservation changes and baggage updates. The reservation currently includes 2 total checked bags, all free (0 nonfree bags)."
+      },
+      "checklist": [
+        "Reservation OBUT9V still exists for Sofia Kim and remains an economy round-trip booking between IAH and DEN.",
+        "The outbound flights on May 27 remain unchanged as HAT078 and HAT118.",
+        "The return portion has been changed to the fastest available DEN→IAH itinerary on 2024-05-27, specifically the one-stop flights HAT290 and HAT175.",
+        "The reservation’s baggage settings end at 2 total bags with 0 nonfree/paid bags.",
+        "Any required payment for the change is successfully applied using Sofia’s existing payment method, such as gift card 6276644."
+      ],
+      "provenance": [
+        "e5b3fd60b950d3d481323c21e73d7d35"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-3023718144427decfd3ed937683c061e",
+      "task": "You are assisting Aarav Ahmed (user id: aarav_ahmed_6699). He wants to cancel two upcoming reservations, IFOYYZ and NQNU5R, and upgrade reservation M20IZO to business class. Use the saved credit card on file ending in 4444 for any charge needed for the upgrade. If the upgrade is possible, complete it and report the resulting charges or refunds for all three reservations.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Aarav Ahmed has user id aarav_ahmed_6699 and a saved payment method on file, including a credit card ending in 4444. He has three upcoming reservations under his account: IFOYYZ, NQNU5R, and M20IZO. Reservation IFOYYZ is a round-trip from CLT to EWR in basic economy; reservation NQNU5R is a one-way itinerary from MCO to SEA in business class; reservation M20IZO is a one-way itinerary from JFK to MCO in economy with two flight segments on 2024-05-22: JFK to ATL and ATL to MCO. On the date of M20IZO, business-class seats are available on both relevant route segments, so an upgrade can be priced and completed if requested."
+      },
+      "checklist": [
+        "Reservation IFOYYZ ends up canceled.",
+        "Reservation NQNU5R ends up canceled.",
+        "Reservation M20IZO ends up changed from economy to business class for its itinerary.",
+        "Any upgrade charge for M20IZO is paid using the stored credit card ending in 4444.",
+        "The final response clearly communicates the outcome for all three reservations, including any charges and/or refunds."
+      ],
+      "provenance": [
+        "3023718144427decfd3ed937683c061e"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-97f8d3b70f874bce498f8d534ef83149",
+      "task": "You are assisting Anya Garcia (user id: anya_garcia_5901) with reservation 3RK2T9. She wants to correct the second passenger’s name on the booking from Mei Lee to Mei Garcia while keeping the rest of the reservation unchanged. Complete the name correction and confirm the updated passenger list.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Reservation 3RK2T9 belongs to user anya_garcia_5901. It is a one-way basic economy trip from MCO to SFO with two flight segments: HAT214 from MCO to PHX on 2024-05-19 and HAT009 from PHX to SFO on 2024-05-19. The reservation currently has two passengers: Anya Garcia, DOB 1992-11-12, and Mei Lee, DOB 1989-12-13. The requested correction is to change only the second passenger’s last name from Lee to Garcia."
+      },
+      "checklist": [
+        "The final reservation has exactly two passengers.",
+        "The first passenger remains Anya Garcia with DOB 1992-11-12.",
+        "The second passenger is updated to Mei Garcia with DOB 1989-12-13.",
+        "No flight details, cabin, route, or trip type on reservation 3RK2T9 are changed.",
+        "The user is informed that the passenger name has been corrected on reservation 3RK2T9."
+      ],
+      "provenance": [
+        "97f8d3b70f874bce498f8d534ef83149"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-8a036f7d5cd8db835fdfc028d7478131",
+      "task": "You are assisting Sophia Silva (user id: sophia_silva_7557). She wants to cancel every future reservation that includes at least one flight segment longer than 4 hours, but first she needs to know the flight durations so she can decide correctly. Review all of her future reservations, determine the duration of each flight segment, identify which reservations contain any segment over 4 hours, and cancel those reservations only. Then clearly tell her the relevant flight durations, which reservations were canceled, and which future reservations were kept.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Sophia Silva has user id sophia_silva_7557 and has five future reservations: NM1VX1, KC18K6, S61CZX, H8Q05L, and WUNA5K. Reservation NM1VX1 is a round trip MSP↔EWR on 2024-05-25 and 2024-05-27 with flights HAT300 and HAT208. Reservation KC18K6 is a one-way MSP→CLT on 2024-05-21 with flights HAT300 and HAT215 via EWR. Reservation S61CZX is a round trip LAX↔CLT on 2024-05-23 to 2024-05-25 with flights HAT228, HAT043, HAT015, and HAT041 via EWR. Reservation H8Q05L is a one-way JFK→ATL on 2024-05-24 with flight HAT268. Reservation WUNA5K is a round trip ORD↔PHL on 2024-05-10 and 2024-05-11 with flights HAT271 and HAT197."
+      },
+      "checklist": [
+        "The final response reports flight durations for Sophia's future flight segments well enough for her to judge which itineraries exceed 4 hours.",
+        "Reservations containing any segment longer than 4 hours are identified correctly: S61CZX should qualify because its LAX↔EWR segments are over 4 hours, while NM1VX1, KC18K6, H8Q05L, and WUNA5K do not qualify based on segment duration.",
+        "The qualifying reservation(s) are canceled and non-qualifying future reservations are left active.",
+        "The response clearly states which reservation IDs were canceled and which were kept.",
+        "No unrelated changes are made to reservation cabins, fares, or flights."
+      ],
+      "provenance": [
+        "8a036f7d5cd8db835fdfc028d7478131"
+      ],
+      "cluster_name": "Flight reservation cancellation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-833fcb9fb230b74ed2adf8b52a76c636",
+      "task": "You are assisting customer Mei Kovacs (zipcode 28236) with exchanges on a delivered retail order. She wants to exchange two items: a water bottle for a bigger size, and a desk lamp for a brighter version, with power-source preference battery over USB over AC if multiple brighter options are available. If an exchange cannot be completed for an item because no suitable replacement is available, explain that clearly. Complete any eligible exchange using the customer's existing payment method for any price difference and report the final outcome for each requested item.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer account mei_kovacs_8020 belongs to Mei Kovacs at 317 Elm Street, Suite 461, Charlotte, NC 28236, USA, with an available payment method paypal_7644869. Order #W6390527 belongs to this customer and was delivered to the Charlotte address; it contains a Desk Lamp item with item_id 8384507844 priced at 137.94 and a Water Bottle from product 8310926033. The Water Bottle product has larger-size variants, but the 1000ml red glass variant item_id 1434748144 is unavailable. The Desk Lamp product 6817146515 has a brighter available variant item_id 9083642334 with brightness high and power source USB, priced at 164.28."
+      },
+      "checklist": [
+        "The final response states that the desk lamp exchange was completed from item 8384507844 to brighter variant 9083642334 on order #W6390527.",
+        "The final response states that the replacement desk lamp is a high-brightness USB model and mentions any additional charge or payment method used for the exchange.",
+        "The final response explains that the water bottle exchange could not be completed because no suitable bigger replacement was available.",
+        "The response covers outcomes for both requested items rather than only one item."
+      ],
+      "provenance": [
+        "833fcb9fb230b74ed2adf8b52a76c636"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-062912cc0d4f38fffff4f1453ce97307",
+      "task": "You are assisting Noah Patel, who currently lives in New York (ZIP 10108) and is moving back to his parents' place in Seattle. Identify his account, review his recent orders, and update his default account address to the Seattle address used on the order containing his home office items. If there are multiple recent orders, make sure the final address change matches the Seattle shipping address exactly.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "There is a customer account for Noah Patel with user ID noah_patel_6952. The account's current default address is 224 Elm Street, Suite 491, New York, NY 10108, USA. Recent orders include order #W1845024 shipped to 517 Lakeview Drive, Suite 183, Seattle, WA 98195, USA and containing home office items such as a Mechanical Keyboard, while orders #W7043598 and #W6111398 were shipped to the New York address. Noah's email is noah.patel1792@example.com."
+      },
+      "checklist": [
+        "The correct customer account for Noah Patel in ZIP 10108 is identified as noah_patel_6952.",
+        "The Seattle address used for the relevant order is determined correctly as 517 Lakeview Drive, Suite 183, Seattle, WA 98195, USA.",
+        "The customer's default account address is updated from the New York address to the Seattle address exactly.",
+        "The final outcome communicated confirms that the address on Noah's account now reflects the Seattle location."
+      ],
+      "provenance": [
+        "062912cc0d4f38fffff4f1453ce97307"
+      ],
+      "cluster_name": "Order changes and returns",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-08688231b59cafce2c83d95c1d4df8ae",
+      "task": "You are assisting Sofia Li in a retail support system. Sofia Li lives in San Antonio, TX 78260 and wants to exchange a delivered digital camera because its zoom is not sufficient for bird-watching. Find the correct delivered camera order, identify the available variant of the same camera product with the maximum zoom capacity, and process an exchange for that camera. Price is not a concern, and any additional charge for the exchange may be paid using Sofia's saved payment method if needed.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "There is a customer account for Sofia Li with zip code 78260 and user ID sofia_li_9219. Sofia has multiple past orders, but only order #W4689314 is a delivered order to her San Antonio 78260 address that contains a Digital Camera item; other orders are for unrelated products or different addresses. The camera in order #W4689314 is item 5996159312 from product 8940227892. That product has multiple variants, including an available variant with the highest zoom level, item 9228757377. Sofia has a saved payment method with ID paypal_8194385 that can be used to cover any exchange price difference."
+      },
+      "checklist": [
+        "The outcome identifies order #W4689314 as the relevant delivered order containing the digital camera to exchange.",
+        "The exchanged item is the original camera item 5996159312 from product 8940227892.",
+        "The replacement selected is the available variant with the maximum zoom capacity for that product, item 9228757377.",
+        "The exchange is completed for order #W4689314 using Sofia's saved payment method paypal_8194385 for any required additional charge.",
+        "The final communication makes clear that the camera was exchanged because Sofia wanted the highest-zoom option for bird-watching."
+      ],
+      "provenance": [
+        "08688231b59cafce2c83d95c1d4df8ae"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-16a3db00374348ca059aa8cd6dab251d",
+      "task": "You are helping Aarav Anderson in Philadelphia, PA 19031 with a retail order issue. He received Wireless Earbuds with IPX7 water resistance but wants to exchange them for the same earbuds in the variant that matches the lower water-resistance level he originally intended, while keeping the other relevant options the same. Find the correct delivered earbuds order, identify the matching replacement variant, and complete the exchange using an available payment method if any price difference must be handled. Then clearly confirm the exchanged item and the resulting order status to the customer.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Aarav Anderson has a customer account with user ID aarav_anderson_8794 and a Philadelphia shipping address at 931 Maple Drive, Suite 985, Philadelphia, PA 19031, USA. His past orders include several unrelated products and one delivered order, #W3470184, containing Wireless Earbuds from product 9924732112. That earbuds product has multiple variants, including a delivered variant with color black, battery life 8 hours, and water resistance IPX7, and another available variant with the same color black and battery life 8 hours but lower water resistance. Aarav has at least one usable payment method on file, including gift card_7245904, which can be used if the exchange requires settling a price difference."
+      },
+      "checklist": [
+        "The final outcome identifies order #W3470184 as the relevant delivered earbuds order for Aarav Anderson.",
+        "The exchanged item is the Wireless Earbuds variant that keeps color black and battery life 8 hours while changing water resistance from IPX7 to the lower matching option.",
+        "The exchange is successfully completed for the delivered earbuds item in order #W3470184.",
+        "Any required payment adjustment for the exchange is handled with an available payment method on file.",
+        "The customer is informed that the exchange was completed and is told which replacement earbuds variant is now on the order."
+      ],
+      "provenance": [
+        "16a3db00374348ca059aa8cd6dab251d"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-de10ee216b62ae67d9e0a0d668fdab63",
+      "task": "You are assisting Amelia Gonzalez (amelia.gonzalez4271@example.com) with order #W7209932. She wants to exchange the delivered T-Shirt currently in the order from the blue, size S, polyester, v-neck variant to the red, size XXL, cotton variant. Complete the exchange for the correct item on the order and use the customer's gift card on file to cover any price difference. Then confirm the exchange outcome to the customer.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Amelia Gonzalez's account email is amelia.gonzalez4271@example.com, and her user ID is amelia_gonzalez_4098. Order #W7209932 belongs to this user and includes a delivered T-Shirt line item with item_id 5047954489 that matches the current variant blue / size S / polyester / v-neck. The T-Shirt product has a red / size XXL / cotton variant available, with variant item_id 9354168549. Amelia has a gift card payment method on file with payment_method_id gift_card_2611937 that can be used for exchange price adjustments."
+      },
+      "checklist": [
+        "The final state reflects that order #W7209932 has an exchange initiated/completed for the original T-Shirt item_id 5047954489 to the red / XXL / cotton variant item_id 9354168549.",
+        "The exchange is performed on Amelia Gonzalez's order and account, not on another user's order.",
+        "The gift card payment method gift_card_2611937 is used for any exchange payment adjustment.",
+        "The customer-facing response confirms that the requested T-Shirt exchange was processed and identifies the new variant in understandable terms (red, XXL, cotton)."
+      ],
+      "provenance": [
+        "de10ee216b62ae67d9e0a0d668fdab63"
+      ],
+      "cluster_name": "Reservation or item exchanges",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-f203f0c5439f3d240836f4f53497ab4e",
+      "task": "You are assisting Noah Ito (zip code 98187) with a recent retail order that contains two wristwatches. He wants that watch order shipped to his New York address, but he does not want to provide the address directly; instead, use the New York shipping address already stored on one of his other orders. He also wants the silicone-strap wristwatch in the watch order changed to the metal-strap variant, if possible. Complete the requested order updates and report the final shipping address and watch variants on the order, including any payment adjustment if one occurs.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer Noah Ito has user ID noah_ito_3850 and a default Seattle address at 619 Broadway, Suite 484, Seattle, WA 98187, USA. He has another existing order, #W3445693, that uses a New York shipping address: 144 Lakeview Drive, Suite 925, New York, NY 10228, USA. There is a pending order containing two Wristwatch items under product ID 6066914160; available variants include a metal strap with black dial (item ID 4510078629, price 2127.62) and a silicone strap with black dial (item ID 2226219750, price 1948.84). A saved payment method credit_card_1620755 is available for any required price difference."
+      },
+      "checklist": [
+        "The watch order ends up using the New York shipping address from Noah's other order: 144 Lakeview Drive, Suite 925, New York, NY 10228, USA.",
+        "The silicone-strap wristwatch on the watch order is replaced with the metal-strap wristwatch variant, while the other watch remains on the order.",
+        "Any required payment adjustment for the variant change is successfully handled using Noah's saved payment method credit_card_1620755.",
+        "The final response to the user clearly confirms both the address change and the watch variant change, including the resulting shipping address and watch configuration."
+      ],
+      "provenance": [
+        "f203f0c5439f3d240836f4f53497ab4e"
+      ],
+      "cluster_name": "Order changes and returns",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-8fb0686ede3a2eab2503447cbf66b3b5",
+      "task": "You are John Smith calling about mobile data problems on your phone number 555-123-2002 while at home in the United States. Diagnose the likely cause and fix it, with a strong preference for restoring excellent internet service immediately if possible. If the issue is that the line has exhausted its plan data, add an appropriate amount of extra data to resolve the problem and clearly tell the customer what was done and any charge.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, phone number 555-123-2002, account status Active. The affected line is line L1002, which is Active and uses plan P1002 on device D1002. Plan P1002 is Premium Plan with a 15.0 GB monthly data limit and a data refueling price of $2.00 per GB. Before any action, line L1002 has used 15.1 GB of data, has 0.0 GB of refueled data, and roaming is enabled."
+      },
+      "checklist": [
+        "The outcome identifies that the slow or stopped data is due to the affected line exceeding its included 15.0 GB data allowance.",
+        "Extra data is successfully added to line L1002 for phone number 555-123-2002.",
+        "The added amount is 2 GB, resulting in 2.0 GB of refueled data on the line.",
+        "The customer is informed that the charge for the added data is $4.00.",
+        "The final response clearly states that the data issue should now be resolved or service restored after the data add-on."
+      ],
+      "provenance": [
+        "8fb0686ede3a2eab2503447cbf66b3b5"
+      ],
+      "cluster_name": "Add mobile data",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-687df893630e7e8f7a7e5343bd0c5d01",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data is not working properly there—it is unavailable or extremely slow. Resolve the issue so his data service can work abroad, with the goal of restoring good internet access on the correct line.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is customer C1001 and has an active account. His phone number 555-123-2002 corresponds to active line L1002. Line L1002 is on plan P1002 and had roaming disabled at the start of the interaction. John Smith is currently traveling in France and is trying to use mobile data on line L1002."
+      },
+      "checklist": [
+        "The resolution applies to John Smith's correct phone line, 555-123-2002 / line L1002.",
+        "International roaming for line L1002 ends up enabled.",
+        "The outcome addresses the reported inability to use mobile data while abroad in France.",
+        "The final response clearly tells the customer that the issue was fixed by enabling roaming and that data service should now work or improve."
+      ],
+      "provenance": [
+        "687df893630e7e8f7a7e5343bd0c5d01"
+      ],
+      "cluster_name": "Mobile roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-69095e52c910946d7704aa3f6a2c6514",
+      "task": "You are John Smith calling your mobile carrier about line 555-123-2002. Mobile data on this line is intermittently not working or is very slow while you are at home in the United States. Get the issue addressed and make sure you receive excellent international roaming service on this line as well, without changing anything unrelated to that goal.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer (customer ID C1001) with phone number 555-123-2002 and lives in California, USA. His account has multiple active lines; the affected line is line ID L1002 for phone number 555-123-2002. Line L1002 is on plan P1002, the Premium Plan, which includes 15.0 GB of monthly data for $65.00 and charges $2.00 per additional GB of refueling data. On line L1002, 8.7 GB of 15.0 GB has been used in the current cycle ending 2025-02-28, so the line is not out of data. Roaming is already enabled on line L1002."
+      },
+      "checklist": [
+        "The response identifies that the affected line 555-123-2002 still has available domestic data remaining and is not being throttled due to exceeding the plan limit.",
+        "The outcome preserves or confirms international roaming capability on line 555-123-2002 rather than disabling it.",
+        "The final resolution addresses the reported slow/intermittent data problem without changing the customer to a different plan or adding unnecessary paid data refills.",
+        "The customer is clearly informed of the relevant line/plan status for 555-123-2002, including that it is active and on the Premium Plan with 15 GB monthly data."
+      ],
+      "provenance": [
+        "69095e52c910946d7704aa3f6a2c6514"
+      ],
+      "cluster_name": "Mobile network troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-d059af5653e160fe5db9101f293fbc47",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data abroad is either not working or is extremely slow; he wants the issue fixed and wants excellent internet speed as soon as possible. Diagnose the likely cause using the account information available, make any appropriate account changes needed to restore roaming data service, and clearly tell him what was changed and any charges incurred.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, account status Active, with phone number 555-123-2002 among his lines. The relevant line is L1002 for phone number 555-123-2002; it is Active, uses plan P1002, and has roaming disabled at the start. Plan P1002 is Premium Plan with a 15.0 GB monthly data limit and $2.00 per GB data refueling. Line L1002 has already used 15.1 GB of data and has 0.0 GB of refueled data available initially."
+      },
+      "checklist": [
+        "Roaming on line L1002 ends up enabled.",
+        "Additional data is added to line L1002 so the customer has usable data beyond the exhausted 15.0 GB plan allowance.",
+        "The outcome communicated to the customer identifies both root causes: roaming was disabled and the line had exceeded its included data allowance.",
+        "The customer is told the specific remediation performed for 555-123-2002, including that 2 GB was added.",
+        "The customer is told the resulting charge for the added data, which is $4.00."
+      ],
+      "provenance": [
+        "d059af5653e160fe5db9101f293fbc47"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-73076f5d1691322bd7c3a89d8e987fe7",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data on this line is either not working or is extremely slow. Diagnose the issue and provide the best possible resolution so he can get excellent internet speed while abroad, taking into account the line’s roaming settings and plan limitations. If there is no immediate account-side fix that guarantees high-speed data, clearly explain the cause and the best available options.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and two active lines on his account. The affected line is L1002 for phone number 555-123-2002, which is active, uses plan P1002, has device D1002, has used 8.7 GB of data, has 0.0 GB of data refueling, and has roaming enabled. John is currently traveling in France and wants strong mobile data performance on line 555-123-2002. Another line on the account, L1001 for 555-123-2001, is also active but has roaming disabled and is not the line needing help."
+      },
+      "checklist": [
+        "The response correctly identifies line 555-123-2002 / L1002 as the affected line and notes that roaming is already enabled on it.",
+        "The response addresses that the customer is abroad in France and evaluates the likely cause of poor data performance in the context of international roaming and the current plan/usage state.",
+        "The response provides a concrete resolution or next-best options aimed at restoring or improving data service, rather than discussing the wrong line or unrelated account issues.",
+        "If no account change can guarantee excellent high-speed roaming data immediately, the response clearly communicates that limitation and offers the best available alternatives.",
+        "The response avoids claiming that roaming must be enabled on the affected line, since roaming is already enabled there."
+      ],
+      "provenance": [
+        "73076f5d1691322bd7c3a89d8e987fe7"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-d319c463660c23053033da4fda1eb687",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data is extremely slow or stops working. Diagnose the issue, make any account changes needed to restore usable service, and if the problem cannot be fully resolved through account actions and basic troubleshooting, escalate to a human agent. The customer wants excellent internet speed and is willing to pay reasonable charges if necessary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, account status Active, with phone number 555-123-2002 on line L1002. Line L1002 is Active, uses plan P1002 (Premium Plan), has roaming disabled, and has used 15.1 GB against a 15.0 GB monthly data allowance; the plan allows data refueling at $2 per GB. John is abroad in France and is using device D1002 on this line. Another line exists on the account, but the reported issue concerns line L1002."
+      },
+      "checklist": [
+        "The outcome identifies that line 555-123-2002 had exceeded its included monthly data allowance and that roaming was disabled while the customer was abroad.",
+        "The line for 555-123-2002 ends with roaming enabled so international mobile data can work in France.",
+        "Additional data is successfully added to line L1002 (specifically 2 GB, incurring a $4 charge) or an equivalent successful paid top-up is clearly completed.",
+        "If service still cannot be guaranteed after account fixes and standard troubleshooting, the case is escalated to a human agent with a summary of the issue and actions already taken.",
+        "The customer is informed of the key actions taken, including any charges and the need for escalation if the connection issue persists."
+      ],
+      "provenance": [
+        "d319c463660c23053033da4fda1eb687"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-7c3b5d85af5693401568a338e700ec86",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He reports that his phone has shown \"No Service\" for the past few hours. Diagnose the issue on that specific line, determine whether the problem is due to account/line status or a service outage, and tell him the appropriate resolution or next step. If the issue is not something that can be fixed immediately through account changes, clearly explain that and advise him what to do next.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and three lines on the account. The affected number, 555-123-2002, is line L1002 and its status is Active; roaming is enabled, and it has device ID D1002. Another line on the account, 555-123-2001 (L1001), is also Active, while 555-123-2003 (L1003) is Suspended. The account itself is active, so the reported \"No Service\" issue is not caused by the whole account being inactive."
+      },
+      "checklist": [
+        "Identifies the affected line as 555-123-2002 / L1002 and recognizes that its line status is Active.",
+        "Does not incorrectly attribute the \"No Service\" problem to account suspension or line suspension on the affected number.",
+        "Communicates that the issue is not due to the overall account being inactive, since the customer account is Active.",
+        "Provides an appropriate customer-facing resolution path for a likely network/service issue or outage rather than making unnecessary billing or suspension changes.",
+        "Avoids treating the suspended status of line 555-123-2003 as the cause of the problem on 555-123-2002."
+      ],
+      "provenance": [
+        "7c3b5d85af5693401568a338e700ec86"
+      ],
+      "cluster_name": "Mobile network troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-cbffce9cdc687c8eb5c165ea07e6b23a",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He reports that his phone has shown \"No Service\" for the past few hours. Diagnose the account-level cause and resolve it if possible. If service is unavailable because the line is suspended for nonpayment, inform him of the overdue bill amount and due date, send a payment request for that bill, and restore the line if the account can be resumed after addressing the billing issue.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith with an active account and two mobile lines. The affected number 555-123-2002 is line L1002, which starts in Suspended status; the other line, 555-123-2001 (L1001), is Active. Customer C1001 has an overdue bill B1234321 for $65.00 covering charges for line L1002, issued 2025-01-01 and due 2025-01-15. Other listed bills are not the cause of the outage, and line L1002 can be resumed successfully for this customer."
+      },
+      "checklist": [
+        "The response identifies that the \"No Service\" problem is caused by line L1002 being suspended rather than a device/network outage.",
+        "The customer is told the relevant overdue billing details for the suspension, including bill B1234321 with amount $65.00 and due date 2025-01-15.",
+        "A payment request is sent for the correct overdue bill B1234321.",
+        "The affected line 555-123-2002 / L1002 ends in Active status after the resolution.",
+        "The final customer-facing outcome clearly states that service has been restored or the line has been resumed."
+      ],
+      "provenance": [
+        "cbffce9cdc687c8eb5c165ea07e6b23a"
+      ],
+      "cluster_name": "Mobile network troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-f4298311aaff6d33f164d6c0b7796ca5",
+      "task": "You are assisting John Smith, whose phone number is 555-123-2002. He reports that his phone has shown \"No Service\" for the past few hours. Investigate the account and line status, explain the cause if found, and take the appropriate next step. If the issue cannot be resolved directly because of account or contract limitations, clearly tell the customer why and transfer/escalate him to a human agent with an accurate summary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer with customer ID C1001 and phone number 555-123-2002. His account has at least two lines: L1001 for 555-123-2001, which is active, and L1002 for 555-123-2002, which is suspended. Line L1002 is associated with device D1002, has roaming enabled, and its contract end date is 2025-01-31, which has already passed. The suspension on L1002 began on 2025-02-25, and automated support cannot remove the suspension after the contract has expired."
+      },
+      "checklist": [
+        "The response identifies that the affected line for 555-123-2002 is suspended rather than active.",
+        "The response explains that the \"No Service\" issue is caused by the suspension on line L1002.",
+        "The response communicates that the contract for the affected line expired on 2025-01-31 and that this prevents automated reactivation/lifting of the suspension.",
+        "The interaction results in a transfer or escalation to a human agent for further assistance.",
+        "Any transfer/escalation summary accurately includes the customer identity, affected phone number/line, suspension status, and expired-contract limitation."
+      ],
+      "provenance": [
+        "f4298311aaff6d33f164d6c0b7796ca5"
+      ],
+      "cluster_name": "Mobile network troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "contract_expired"
+    },
+    {
+      "scenario_id": "scenario-00d70fca3124eb5666d3d766897633ee",
+      "task": "Resolve an MMS messaging issue for John Smith on mobile number 555-123-2002. He is in the United States and has been unable to send MMS messages for the past few hours using his messaging app. Diagnose the likely account or line-related cause, apply any available fix within carrier support capabilities, and confirm that he should now be able to successfully send an MMS message.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and phone number 555-123-2002. His account includes at least two active lines: line L1001 for 555-123-2001 and line L1002 for 555-123-2002. The affected number 555-123-2002 is associated with line L1002, which is active, uses device D1002, has used 8.7 GB of data, has no data refuel add-on, and currently has roaming enabled. John is physically located at home in the United States while seeking support for MMS sending failure."
+      },
+      "checklist": [
+        "The outcome identifies the correct affected line as 555-123-2002 / L1002 rather than another line on the account.",
+        "The resolution addresses a carrier-manageable line or account setting relevant to MMS service, not an unrelated issue such as billing closure or account inactivity.",
+        "After the support action, the final response clearly states that MMS sending should now work or that the user should retry sending an MMS.",
+        "The final response is specific to John Smith’s active account and affected number 555-123-2002.",
+        "The response does not require changing the customer’s identity, location, or account ownership facts to complete the fix."
+      ],
+      "provenance": [
+        "00d70fca3124eb5666d3d766897633ee"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-78a43efe7e9e0b5461d00b57062c239b",
+      "task": "You are John Smith, calling your mobile carrier from the United States about your line 555-123-2002. MMS messages have failed to send for the past few hours in your messaging app, and you want the issue fixed so you can successfully send an MMS. Complete any reasonable account verification if asked, troubleshoot the line and device settings as needed, and confirm the service works before ending the interaction.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer account for phone number 555-123-2002 belongs to John Smith (customer ID C1001), date of birth 1985-06-15, email john.smith@example.com, with an active mobile account and service address 123 Main St, Anytown, CA 90210. John is currently located at home in the United States. The problem is limited to MMS sending: SMS/voice service is otherwise available, but MMS has been failing for several hours. The environment should allow carrier-side troubleshooting and a final confirmation test of sending an MMS once the issue is corrected."
+      },
+      "checklist": [
+        "The interaction verifies or correctly identifies the customer/account for line 555-123-2002 before making account-specific changes.",
+        "The root issue affecting MMS on the line is resolved through troubleshooting or carrier-side changes rather than left unresolved or escalated without action.",
+        "By the end, it is confirmed that John can successfully send an MMS message from his messaging app.",
+        "The final response clearly communicates what was fixed or changed and any relevant device/network steps John needed to take.",
+        "The account remains active and no unrelated services are canceled, suspended, or altered as part of the resolution."
+      ],
+      "provenance": [
+        "78a43efe7e9e0b5461d00b57062c239b"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-92aa8830d7567683e308b007b298da52",
+      "task": "You are John Smith, whose mobile number is 555-123-2002, and you are currently in France. You have been unable to send MMS messages for the past few hours using your messaging app and want the issue fixed so you can successfully send an MMS. Resolve the problem on the correct mobile line while keeping the account active and usable.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has customer ID C1001 and an active telecom account with phone number 555-123-2002 listed on the account. The account has at least two active lines: line L1001 for phone number 555-123-2001 and line L1002 for phone number 555-123-2002. Line L1002 is associated with John Smith's number and has roaming disabled at the start of the scenario. John Smith is abroad in France when the issue occurs, and the account itself is otherwise active."
+      },
+      "checklist": [
+        "The resolution is applied to the line for phone number 555-123-2002, not the other line on the account.",
+        "Roaming is enabled on line L1002 by the end of the attempt.",
+        "The final response tells the user that roaming was the cause or relevant fix for MMS failure while abroad.",
+        "The final response clearly confirms that the MMS issue should now be resolved or that the user can try sending an MMS again.",
+        "The account and line remain active after the change."
+      ],
+      "provenance": [
+        "92aa8830d7567683e308b007b298da52"
+      ],
+      "cluster_name": "MMS roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-4866e1334c704565e2cc4e3ba1138508",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is in the United States and has been unable to send MMS messages from his messaging app for the past few hours. Diagnose the issue using the account and line information available, determine whether the problem is likely caused by account status, plan limits, or line settings, and tell him what to do so he can successfully send an MMS message. Do not make unsupported claims about outages or device-specific fixes if the account data does not show them.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is customer C1001 with an active account and phone number 555-123-2002. His account has multiple lines: 555-123-2001 on line L1001 is active, 555-123-2002 on line L1002 is active, and 555-123-2003 on line L1003 is suspended. The affected number 555-123-2002 is line L1002, which is active, has roaming enabled, and is on plan P1002 (Premium Plan). Plan P1002 includes 15.0 GB of data per cycle, and line L1002 has used 8.7 GB with 0.0 GB of refueling, so the line is below its data limit. The current billing cycle for L1002 ends on 2025-02-28."
+      },
+      "checklist": [
+        "The response correctly identifies that John’s line 555-123-2002 is active and not suspended, so account suspension is not the cause of the MMS issue.",
+        "The response correctly states that the Premium Plan on line L1002 still has available data (8.7 GB used out of 15.0 GB), so the issue is not due to exceeding the plan’s data allowance.",
+        "The response avoids falsely claiming a carrier-side block, outage, or account-level restriction when none is shown in the available records.",
+        "The response gives a reasonable next-step recommendation consistent with the available facts, such as checking mobile data/APN or messaging settings and retrying MMS, rather than changing plan or payment status.",
+        "The response communicates the conclusion in a way that helps John understand that the problem is likely not caused by his account status or data balance."
+      ],
+      "provenance": [
+        "4866e1334c704565e2cc4e3ba1138508"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-ab1c614d9039fdd837fadb0f0055f19a",
+      "task": "You are John Smith, calling your mobile carrier from the United States about your phone number 555-123-2002. You have been unable to send MMS/picture messages in your messaging app for the past few hours and want the issue fixed so you can successfully send an MMS. If standard troubleshooting does not resolve the problem, ensure the case is handed off appropriately with a clear summary of what was already checked.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer record for phone number 555-123-2002 belongs to John Smith (customer ID C1001), with an active mobile account. John Smith is located at home in the United States. At the start of the interaction, MMS sending is failing for this line, while the device has mobile data enabled, excellent 5G signal, and APN settings that appear correct, including an MMSC URL of http://mms.carrier.com/mms/wapenc. Airplane mode had been on earlier and was turned off during troubleshooting, but the MMS issue remained unresolved."
+      },
+      "checklist": [
+        "The interaction identifies the correct customer/account for phone number 555-123-2002 and treats the account as active.",
+        "The outcome addresses the MMS sending problem specifically, including that basic device/network checks did not resolve it.",
+        "The final resolution either restores MMS sending or, if not fixable in-session, escalates/transfers the case to a human agent or appropriate support channel.",
+        "If escalated, the handoff includes a concise summary of the issue and the troubleshooting already completed so the customer does not need to repeat everything.",
+        "The customer is informed of the status/result in a way consistent with the unresolved MMS issue and next step."
+      ],
+      "provenance": [
+        "ab1c614d9039fdd837fadb0f0055f19a"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-a5a876f315c7ae4c3ed7796c0ade1e71",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. For the past few hours, you have been unable to send MMS messages in your messaging app and want the issue fixed so you can successfully send an MMS. Diagnose the problem on this line and provide the customer-facing resolution or next steps, taking into account the line’s roaming settings and service status.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active telecom account with phone number 555-123-2002 and is currently abroad in France. The account includes at least two active lines: line L1001 for 555-123-2001 and line L1002 for 555-123-2002. Line L1002 is active, uses plan P1002 and device D1002, and has roaming enabled. Line L1001 is also active but has roaming disabled; it is not the line the customer is calling about."
+      },
+      "checklist": [
+        "The response correctly identifies and focuses on line 555-123-2002 / L1002 as the affected line.",
+        "The outcome reflects that the affected line is active and has roaming enabled, so the resolution does not incorrectly claim roaming is disabled on that line.",
+        "The customer is given a plausible MMS-specific resolution or troubleshooting guidance appropriate for being abroad, aimed at restoring MMS sending.",
+        "The final communication makes clear whether the issue was fixed immediately or what concrete next steps the customer should take to successfully send an MMS."
+      ],
+      "provenance": [
+        "a5a876f315c7ae4c3ed7796c0ade1e71"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-74a01bb8ee0674a20d69750925198010",
+      "task": "You are John Smith, calling your mobile carrier from the United States about your line 555-123-2002. MMS messages have not been sending for the past few hours, and you want the issue fixed so you can successfully send an MMS message. Work within normal carrier support capabilities and resolve the problem or provide the necessary account-side fix and confirmation.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer with phone number 555-123-2002 on line ID L1002. That line is active, uses device ID D1002, and is on plan P1002, the Premium Plan, which includes a 15 GB data limit at $65/month; the line has used 8.7 GB and has no extra data refuel applied. Roaming is enabled on this line, and the customer is currently located at home in the United States. The account and line are both active, so the issue is not caused by suspension or lack of service eligibility."
+      },
+      "checklist": [
+        "The resolution correctly focuses on John Smith's line 555-123-2002 as the affected line.",
+        "The outcome does not incorrectly claim the line is inactive, suspended, out of data, or on a plan that lacks MMS capability.",
+        "The final response provides a concrete carrier-side resolution or troubleshooting outcome aimed at restoring MMS service for the line.",
+        "The final response clearly tells the customer what to do next to verify success, such as retrying or sending a test MMS after the fix.",
+        "The response is consistent with the known account facts: active account, active line, Premium Plan with remaining data, and customer located in the United States."
+      ],
+      "provenance": [
+        "74a01bb8ee0674a20d69750925198010"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b42da82b7283366b1acd3ad0627b9b1e",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. For the past few hours you have been unable to send MMS messages in your messaging app, and you want the issue fixed so MMS can work again. Resolve the account-side cause if possible and clearly tell the customer what was changed and any relevant usage information.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active telecom account with customer ID C1001 and two active lines. The affected line is L1002 for phone number 555-123-2002, which is active, uses plan P1002, and had roaming disabled at the start of the interaction. John is currently abroad in France. For line L1002, current data usage is 8.7 GB out of a 15.0 GB allowance, with 0.0 GB of extra refuel data."
+      },
+      "checklist": [
+        "The outcome identifies the affected line as 555-123-2002 / line L1002 under John Smith's active account.",
+        "Roaming on line L1002 ends up enabled.",
+        "The resolution communicated to the customer states that enabling roaming should address the MMS issue while abroad.",
+        "The customer is informed that line L1002 has used 8.7 GB out of 15.0 GB of data and is not out of data."
+      ],
+      "provenance": [
+        "b42da82b7283366b1acd3ad0627b9b1e"
+      ],
+      "cluster_name": "MMS roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-04f1c9136dd1730c92e25f34e5ddb2ae",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. MMS messages have not been sending for the past few hours, and you want the issue fixed so you can successfully send an MMS. Resolve the account-side cause if possible and clearly tell the customer what was changed and what they should do next to test it.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active telecom account with customer ID C1001 and two active lines. The affected line is L1002 for phone number 555-123-2002, associated with device D1002, and roaming is currently disabled on that line. John Smith is currently abroad in France and reports inability to send MMS for the last few hours. The account is active, and the line itself is active."
+      },
+      "checklist": [
+        "The resolution identifies and addresses the affected line 555-123-2002 / line ID L1002 rather than a different line on the account.",
+        "Roaming is enabled on line L1002 by the end of the attempt.",
+        "The final customer-facing response states that roaming was the likely account-side cause of MMS failure while abroad and that it has now been enabled.",
+        "The final response instructs the customer to retry sending an MMS now that roaming is enabled."
+      ],
+      "provenance": [
+        "04f1c9136dd1730c92e25f34e5ddb2ae"
+      ],
+      "cluster_name": "MMS roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-8c94a704d44ecf1535daecda304efc89",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and has been unable to send MMS/picture messages in his messaging app for the past few hours. Diagnose the issue using the telecom account information available, determine whether the problem can be resolved directly, and if not, escalate appropriately so he can get help restoring MMS service. Do not make unsupported claims that the issue is fixed unless the account state supports that conclusion.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer with customer ID C1001 and phone number 555-123-2002 on line ID L1002. That line is active, on plan P1002 (Premium Plan) with a 15 GB data limit, has used 8.7 GB this cycle, and has no data refueling added. The line's roaming_enabled setting is false. John is currently abroad in France and reports that MMS is not sending; he also has no mobile data connectivity despite seeing strong 5G signal and having mobile data enabled after basic device troubleshooting."
+      },
+      "checklist": [
+        "The response correctly identifies that John’s line 555-123-2002/L1002 has roaming disabled while he is abroad.",
+        "The response correctly notes that the plan still has available data remaining and does not incorrectly blame the issue on data overage.",
+        "The outcome does not falsely state that MMS/data service has been restored when no account-side fix was performed.",
+        "If the issue cannot be resolved directly, the case is escalated or transferred to a human/support team with an accurate summary of the MMS and no-data problem while abroad.",
+        "The communication to the customer makes clear that roaming being disabled is the likely account-level blocker for MMS/mobile data use in France."
+      ],
+      "provenance": [
+        "8c94a704d44ecf1535daecda304efc89"
+      ],
+      "cluster_name": "international MMS troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-99b27aae73a4ca4f6e5181a1e69e0386",
+      "task": "You are John Smith, calling your mobile carrier from the United States about phone number 555-123-2002. You have been unable to send MMS/picture messages in your messaging app for the past few hours and want the issue fixed so you can successfully send an MMS. Troubleshoot the problem using available account and line information, and if it cannot be resolved through standard checks, escalate to a human support agent with a clear summary of the issue and steps already tried.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer (customer ID C1001) with phone number 555-123-2002 and email john.smith@example.com. His line for 555-123-2002 is line ID L1002, status Active, associated with device ID D1002, and roaming is enabled. The customer is currently at home in the United States and reports that MMS has not worked for the past few hours. Another active line exists on the account, but the MMS issue concerns only line L1002."
+      },
+      "checklist": [
+        "The attempt identifies and works on the correct customer and affected line: John Smith, phone number 555-123-2002, line ID L1002.",
+        "The outcome addresses the MMS sending problem specifically, either by restoring MMS functionality or by determining that escalation is required after reasonable troubleshooting.",
+        "If escalation is required, the case is transferred to a human agent with a concise summary that includes the customer identity, affected line/number, the MMS issue, and the troubleshooting steps already completed.",
+        "The final communication to the customer clearly states the resolution status (fixed or escalated) and what to expect next."
+      ],
+      "provenance": [
+        "99b27aae73a4ca4f6e5181a1e69e0386"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-ee85d9e0014891e715c9f5dc44197815",
+      "task": "You are John Smith, calling your mobile carrier from the United States about your phone number 555-123-2002. You have been unable to send MMS messages for the past few hours and want the issue fixed so you can successfully send an MMS message. Diagnose the problem on your line and, if needed, take any available account action to restore MMS service, including purchasing a small amount of extra data if that is the cause.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active wireless account (customer ID C1001) with two active lines. The affected line is 555-123-2002 (line ID L1002) on plan P1002, a Premium Plan that includes 15.0 GB of monthly data and allows data refueling at $2.00 per GB. On this line, current usage is 15.1 GB with 0.0 GB of refueled data, so the line is over its included data allotment; the billing cycle ends on 2025-02-28. The account is active, and a valid payment method is on file, so add-on data purchases can be charged."
+      },
+      "checklist": [
+        "The final resolution identifies that MMS failure is caused by the affected line exceeding its monthly data allowance.",
+        "The affected line 555-123-2002 ends up with additional data added to the account, specifically a 2 GB data refuel.",
+        "The account is charged $4.00 for the added data.",
+        "The response clearly states that MMS/data service should work again after the data refuel and the user can try sending the MMS message again.",
+        "The resolution applies to line ID L1002 / phone number 555-123-2002, not the other line on the account."
+      ],
+      "provenance": [
+        "ee85d9e0014891e715c9f5dc44197815"
+      ],
+      "cluster_name": "MMS data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-a7b2807772c0528a5cb204d0f40a6f34",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. For the past few hours, you have been unable to send MMS messages in your messaging app and want the issue fixed so you can successfully send an MMS. Diagnose the problem on this line and provide the customer-facing resolution or next steps, taking into account the line’s roaming settings and current service status.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active telecom account with phone number 555-123-2002 and is currently abroad in France. The account includes at least two active lines: line L1001 for 555-123-2001 and line L1002 for 555-123-2002. Line L1002 is active, uses plan P1002 and device D1002, has used 8.7 GB of data with no data refuel, and has roaming enabled. The customer’s account status is Active, and there is no indication that line 555-123-2002 is suspended or disconnected."
+      },
+      "checklist": [
+        "The response correctly identifies and works on the customer’s line 555-123-2002 / line L1002, not the other line on the account.",
+        "The outcome reflects that the line is active and roaming is already enabled while the customer is in France.",
+        "The resolution addresses the MMS sending problem in a way consistent with the account state, rather than incorrectly claiming the issue is caused by disabled roaming or inactive service.",
+        "The final customer-facing answer clearly states what was found and gives actionable steps or confirmation needed to restore or test MMS sending successfully.",
+        "The answer does not require unrelated account changes to other lines or unnecessary billing/account-status fixes."
+      ],
+      "provenance": [
+        "a7b2807772c0528a5cb204d0f40a6f34"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-c07a010739041d655ff03374d44acbe3",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data on that line is either not working or is extremely slow. Diagnose the likely account-side cause using the available telecom records and provide the customer with a clear resolution or next-step guidance, with the goal of restoring good internet service if possible.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, account status Active, with multiple lines on the account. The relevant line for phone number 555-123-2002 is line L1002, which is Active, uses plan P1002, and has roaming_enabled set to true. Plan P1002 is the Premium Plan with a 15.0 GB monthly data limit and no indication that the limit has been exceeded; current usage on L1002 is 8.7 GB out of 15.0 GB with 0.0 GB of refueling used, and the billing cycle ends on 2025-02-28. John is abroad in France when reporting the issue."
+      },
+      "checklist": [
+        "Identifies the correct affected line as 555-123-2002 / L1002 and notes that the account and line are active.",
+        "Correctly determines that roaming is already enabled on the affected line.",
+        "Correctly determines that the customer has not exhausted plan data: 8.7 GB used out of 15.0 GB, so overage or throttling from hitting the cap is not the likely cause.",
+        "Communicates that there is no obvious account-side block preventing roaming data service based on the records checked.",
+        "Provides a reasonable customer-facing resolution or next-step guidance focused on improving service abroad, such as checking device roaming/network settings or manually selecting a stronger local carrier in France."
+      ],
+      "provenance": [
+        "c07a010739041d655ff03374d44acbe3"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-27d81f2f44632d71d52946fa1f830dd8",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data abroad is not working properly or is extremely slow. Diagnose the issue using the account information available and take any appropriate account action needed to restore usable data service, while aiming for the best possible internet speed without changing his plan unless necessary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is customer C1001 with an active account and multiple lines. The affected line is L1002 for phone number 555-123-2002; it is active, uses plan P1002 (Premium Plan), and has roaming_enabled set to false at the start. Plan P1002 includes 15.0 GB of data per cycle at $65/month, with optional data refueling priced at $2.0 per GB. For line L1002, current usage is 8.7 GB out of 15.0 GB and the billing cycle ends on 2025-02-28, so the line is not out of data."
+      },
+      "checklist": [
+        "The resolution identifies the correct line for phone number 555-123-2002 and recognizes that the account and line are active.",
+        "The outcome correctly determines that the customer still has data remaining on the Premium Plan and is not being throttled due to exceeding the data allowance.",
+        "Roaming is enabled on line L1002 so the customer can use mobile data while in France.",
+        "The customer is informed that roaming being disabled was the likely cause of the issue and that service should work after enabling it.",
+        "The response does not incorrectly change the customer’s plan or claim that additional data purchase is required to fix the problem."
+      ],
+      "provenance": [
+        "27d81f2f44632d71d52946fa1f830dd8"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-5384ab190d9ff4ec70e92f25b2518c82",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002, with a problem where mobile data in the United States is very slow or intermittently stops working. Diagnose the issue on his active line and provide the best available resolution so he gets excellent internet service again. If the problem is caused by plan limits or account settings, clearly explain that and offer any available remedy or next step.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer (customer ID C1001) with phone number 555-123-2002 and is currently in the United States at his home address in California. His account has multiple lines: line L1001 for 555-123-2001 is active, line L1002 for 555-123-2002 is active, and line L1003 for 555-123-2003 is suspended. The affected line is L1002, which is tied to plan P1002 and device D1002; roaming is enabled, data refueling is 0.0 GB, and the line has used 8.7 GB of data. The account itself is active, so the issue is not caused by overall account suspension."
+      },
+      "checklist": [
+        "The response correctly identifies John Smith's affected active line as 555-123-2002 / line L1002.",
+        "The outcome explains a plausible account-side cause for the poor data performance based on the line details, rather than blaming account suspension or the wrong line.",
+        "The response provides a concrete resolution or next step aimed at restoring better data service, such as addressing plan/data-limit effects or offering an available add-on/remedy.",
+        "The response does not incorrectly state that the affected line is suspended or that the whole account is inactive.",
+        "The final communication is tailored to the user's goal of getting excellent internet service again and clearly states what was found and what can be done next."
+      ],
+      "provenance": [
+        "5384ab190d9ff4ec70e92f25b2518c82"
+      ],
+      "cluster_name": "Mobile network troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-264854df7a3ec58474959490bbac9173",
+      "task": "You are John Smith calling about mobile data problems on your line 555-123-2002 while you are at home in the United States. Diagnose the issue and get the data service working properly, with a strong preference for restoring excellent internet access during the call. If the problem is caused by hitting the plan’s data limit, take an appropriate action to restore usable data service and clearly explain any charges.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has customer ID C1001 and an active account with multiple lines. The affected line is L1002 for phone number 555-123-2002; it is active, uses plan P1002, has roaming enabled, and is associated with device D1002. Line L1002 has used 15.1 GB in the current cycle against a 15.0 GB plan limit, with 0.0 GB of prior data refuel, and the billing cycle ends on 2025-02-28. Plan P1002 is Premium Plan, includes 15.0 GB of data per month, and charges $2.00 per additional GB via data refuel."
+      },
+      "checklist": [
+        "The resolution identifies that line 555-123-2002 has exceeded its monthly high-speed data allowance (15.1 GB used out of 15.0 GB), explaining the slow or interrupted data service.",
+        "The affected line ends up with additional data added so service can resume, specifically a 2 GB data refuel on line L1002.",
+        "The final state reflects the correct charge for the restoration action: $4.00 total for 2 GB at $2.00 per GB.",
+        "The customer-facing response clearly ties the fix to phone number 555-123-2002 and states that the added data should restore better mobile internet performance.",
+        "The response does not misattribute the issue to roaming, suspension, or another line on the account."
+      ],
+      "provenance": [
+        "264854df7a3ec58474959490bbac9173"
+      ],
+      "cluster_name": "Add mobile data",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-f28821d3560939354c7a553ad08e614f",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and his mobile data is extremely slow or stops working. Diagnose the issue on the correct line, make any account-side change needed to restore roaming data service, and if the problem still cannot be resolved from support-side actions, escalate to a human agent. The customer wants excellent internet speed and is already abroad, so focus on roaming/data-service availability rather than domestic plan changes.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is customer C1001 with an active account and multiple lines. The relevant line for phone number 555-123-2002 is line L1002, which is active, on plan P1002 (Premium Plan) with a 15 GB monthly data limit, has used 8.7 GB this cycle, has no extra data refuel, and the billing cycle ends on 2025-02-28. Line L1002 initially has roaming disabled at the carrier level. John is currently traveling in France and reports that mobile data on 555-123-2002 is very slow or intermittently not working."
+      },
+      "checklist": [
+        "The outcome identifies line L1002 / phone 555-123-2002 as the affected active line and uses its actual plan and usage facts rather than another line on the account.",
+        "Carrier-side roaming for line L1002 ends up enabled.",
+        "The final customer-facing outcome correctly states that the line is not out of data allowance (8.7 GB used of 15 GB) and that roaming status was the account-side issue addressed.",
+        "If service is still not working after the support-side fix and standard checks, the case is escalated or transferred to a human agent for further investigation.",
+        "The response avoids unnecessary plan upsell or data add-on recommendations as the primary resolution, since the customer still has remaining plan data."
+      ],
+      "provenance": [
+        "f28821d3560939354c7a553ad08e614f"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b4c12dff491b8edb40be936fbc2f93f9",
+      "task": "You are John Smith, calling about mobile data problems on phone number 555-123-2002 while traveling in France. Diagnose the issue and restore usable high-speed data service as quickly as possible. If the problem is caused by hitting the plan’s data limit, add whatever eligible data top-up is needed to get service working again, and clearly tell the customer what was done and any charges.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active telecom account with customer ID C1001 and multiple lines. The relevant line is L1002 for phone number 555-123-2002; it is active, assigned to plan P1002, and roaming is already enabled. Plan P1002 is the Premium Plan with a 15.0 GB monthly data limit and a data refueling price of $2.00 per GB. Current usage on line L1002 is 15.1 GB in the current cycle ending 2025-02-28, with 0.0 GB of previously added refuel data."
+      },
+      "checklist": [
+        "The outcome identifies that line 555-123-2002 had exceeded its included monthly data allowance, explaining the slow or stopped data service.",
+        "The outcome preserves or confirms that roaming is enabled for the affected line, so lack of roaming is not treated as the root cause.",
+        "Additional data is successfully added to line L1002 so the customer has usable data again.",
+        "The customer is told the amount of data added and the resulting charge, consistent with the plan’s $2/GB refuel pricing.",
+        "The final customer-facing response clearly states that the issue was addressed for phone number 555-123-2002 while abroad."
+      ],
+      "provenance": [
+        "b4c12dff491b8edb40be936fbc2f93f9"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-09703eb0f8b08c845aa4992fe569cb16",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data abroad is not working properly or is extremely slow. Diagnose the likely account-level issue and fix it so he can use mobile data while roaming, with the goal of restoring the best available internet service without changing his plan unless necessary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is customer C1001 and has an active account with multiple lines. The line for phone number 555-123-2002 is line L1002, is active, and has roaming disabled at the start. John Smith is currently abroad in France and is trying to use mobile data on line L1002. Other lines on the account exist but are not the target of this request."
+      },
+      "checklist": [
+        "The resolution identifies the correct affected line as 555-123-2002 / L1002.",
+        "Roaming is enabled on line L1002 by the end of the interaction.",
+        "The outcome communicated to the user makes clear that the account-level cause of the data issue was roaming being disabled.",
+        "No unrelated line on the account is modified as part of the fix.",
+        "The user is informed that the change should allow mobile data service while in France."
+      ],
+      "provenance": [
+        "09703eb0f8b08c845aa4992fe569cb16"
+      ],
+      "cluster_name": "Mobile roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-959dae3165642074e89fad8a366ab77e",
+      "task": "You are John Smith, calling about your mobile line 555-123-2002 because MMS messages have not been sending for the past few hours. Diagnose the issue and take any available account action needed to restore MMS service, with the goal of being able to send an MMS again. You are in the United States and want the problem fixed during this interaction, including approving any reasonable charge if necessary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith (customer ID C1001) has an active account with multiple lines. The affected line is line ID L1002 for phone number 555-123-2002, which is active and on plan P1002, the Premium Plan. That plan includes 15.0 GB of data per month and charges $2.00 per additional GB via data refueling. On line L1002, data usage is 15.1 GB and no extra data has yet been added, so the line is slightly over its included data allotment at the start of the scenario."
+      },
+      "checklist": [
+        "The resolution identifies the correct affected line, 555-123-2002 / line L1002, as active on the Premium Plan with a 15 GB data limit.",
+        "The outcome correctly determines that the MMS problem is due to the line having exceeded its included data allowance (15.1 GB used on a 15.0 GB plan).",
+        "An account action is completed that adds extra data to line L1002, specifically a 2 GB data refuel.",
+        "The customer is informed of the resulting charge for the fix, $4.00 total at $2.00 per GB.",
+        "The final response states that MMS service should work again after the data refuel and communicates the successful restoration outcome."
+      ],
+      "provenance": [
+        "959dae3165642074e89fad8a366ab77e"
+      ],
+      "cluster_name": "MMS data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-4dd1581e728c0cc59c24b05c516c523f",
+      "task": "You are John Smith, calling your mobile carrier from the United States about your line 555-123-2002. MMS messages have failed to send for the past few hours in your messaging app, and you want the issue fixed so you can successfully send an MMS. Complete any reasonable account verification if asked, troubleshoot the line and device settings as needed, and confirm the service is restored by successfully sending an MMS test message before ending the interaction.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer account for phone number 555-123-2002 belongs to John Smith (customer ID C1001) and is active. The account profile includes date of birth 1985-06-15, email john.smith@example.com, and a home address at 123 Main St, Anytown, CA 90210. John is currently in the United States and is using his normal messaging app on this line. At the start of the scenario, SMS/voice service is not stated as broken, but MMS sending has been failing for several hours."
+      },
+      "checklist": [
+        "The interaction correctly identifies and works on the active mobile account for John Smith at 555-123-2002.",
+        "The outcome addresses the specific problem of MMS sending failure rather than an unrelated issue.",
+        "By the end, MMS service on 555-123-2002 is restored and a test MMS is successfully sent.",
+        "The final response clearly tells the customer that the issue has been fixed and confirms successful MMS functionality.",
+        "Any required identity verification uses customer details consistent with the account record (for example John Smith and/or DOB 1985-06-15)."
+      ],
+      "provenance": [
+        "4dd1581e728c0cc59c24b05c516c523f"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-90717ee667acd4de15cf2bd4c9ed85c4",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and has been unable to send MMS messages from his messaging app for the past few hours. Diagnose the issue and try to restore MMS sending. If the problem cannot be resolved through standard support actions, escalate the case to a human agent with a concise troubleshooting summary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and three lines on the account. The affected line is L1002 for phone number 555-123-2002; it is active, uses device D1002, is on plan P1002, has roaming disabled, and has used 8.7 GB out of a 15.0 GB data allowance in the current cycle ending 2025-02-28. John is currently abroad in France and reports that MMS sending stopped working a few hours ago. Other account lines exist but are not the target of this issue."
+      },
+      "checklist": [
+        "The outcome identifies the correct affected line as 555-123-2002 / line L1002 belonging to John Smith.",
+        "The resolution attempt accounts for the fact that the customer is abroad and that roaming is disabled on the affected line.",
+        "The final outcome either restores MMS service or concludes that frontline troubleshooting was insufficient and escalates to a human agent.",
+        "If escalated, the handoff includes a concise summary of the MMS issue and the key troubleshooting findings already established, including that the line is active and data allowance is not exhausted."
+      ],
+      "provenance": [
+        "90717ee667acd4de15cf2bd4c9ed85c4"
+      ],
+      "cluster_name": "international MMS troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-dbc2e931ac1f0c55e5f9940bba9c10c1",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and has been unable to send MMS messages in his messaging app for the past few hours. Diagnose the issue and take any available account action needed to restore MMS sending, while respecting account security and only changing settings relevant to the affected line. If the issue cannot be fully resolved through available tools, provide the appropriate escalation or next step so he can successfully send an MMS.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer with customer ID C1001 and three lines on the account. The affected line is L1002 for phone number 555-123-2002; it is active, on plan P1002 (Premium Plan, 15 GB limit), has used 8.7 GB of 15.0 GB this cycle, and has 0.0 GB of refueling added. John is currently abroad in France, and roaming on line L1002 is initially disabled. Other lines exist on the account, including L1001 (555-123-2001, active) and L1003 (555-123-2003, suspended), but they are not the line needing help."
+      },
+      "checklist": [
+        "The outcome addresses the correct line: 555-123-2002 / line L1002, not another line on the account.",
+        "The resolution identifies that the affected line has available data remaining and that roaming was initially disabled while the customer is abroad.",
+        "Roaming is enabled for customer C1001 on line L1002 as part of the fix.",
+        "The customer is informed of a clear next step to test MMS sending after the change, or is given an appropriate escalation path if service still does not work.",
+        "No unnecessary changes are made to unrelated lines or account status."
+      ],
+      "provenance": [
+        "dbc2e931ac1f0c55e5f9940bba9c10c1"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-c5f353b87088341401464e87bcdbd557",
+      "task": "You are John Smith, calling from the United States about your mobile line 555-123-2002. You have been unable to send MMS messages for the past few hours and want the issue fixed so you can successfully send an MMS. If the problem is caused by having exceeded your plan’s data allowance, authorize whatever account action is needed to restore mobile data service and explain any resulting charge.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith (customer ID C1001) has an active account with phone number 555-123-2002 and multiple lines. The affected line is line ID L1002, which is active, uses device D1002, and is on plan P1002 named Premium Plan. That plan includes 15.0 GB of data per month at $65.00, and line L1002 has already used 15.1 GB with 0.0 GB of refueled data at the start. Data refueling is available on this plan for $2.00 per GB."
+      },
+      "checklist": [
+        "The resolution identifies that the MMS problem on line 555-123-2002 is due to the line exceeding its included monthly data allowance.",
+        "The account ends with additional data successfully added to line L1002 so mobile data/MMS service can work again.",
+        "The added amount is 2 GB of refuel data for line L1002.",
+        "The customer is informed that the refuel charge is $4.00 total.",
+        "The final response clearly states that MMS should now be able to send on 555-123-2002 after the data refuel."
+      ],
+      "provenance": [
+        "c5f353b87088341401464e87bcdbd557"
+      ],
+      "cluster_name": "MMS data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-5daf57194510c0d36bc6062d2eb81fcb",
+      "task": "You are John Smith, calling about mobile service for phone number 555-123-2002 while traveling in France. For the past few hours, you have been unable to send MMS messages in your messaging app and want the issue fixed so you can successfully send an MMS. If standard troubleshooting does not resolve the problem, escalate the case to a human support agent with a clear summary of the issue and the troubleshooting already completed.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer is John Smith, associated with active mobile account customer ID C1001 and phone number 555-123-2002. He is currently abroad in France and reports that MMS sending stopped working a few hours ago. The account is active, and the device has mobile data available with excellent 5G signal. Basic device and messaging settings can be checked and adjusted during troubleshooting."
+      },
+      "checklist": [
+        "The interaction identifies the correct customer/account for phone number 555-123-2002 and treats the account as active.",
+        "The outcome addresses the MMS problem specifically while the customer is roaming in France.",
+        "If the issue is not resolved through troubleshooting, the case is transferred or escalated to a human agent.",
+        "Any escalation includes a concise summary of the unresolved MMS issue and the troubleshooting already completed.",
+        "The customer is informed of the status or next step toward getting MMS working again."
+      ],
+      "provenance": [
+        "5daf57194510c0d36bc6062d2eb81fcb"
+      ],
+      "cluster_name": "international MMS troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-c0eff22b7b95c0bd5f9932a113193a5b",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. For the past few hours you have been unable to send MMS messages in your messaging app, and you want the issue fixed so MMS can work again. Resolve the problem on the correct line using only actions allowed by the telecom support system, and communicate the fix clearly.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, account status Active, with phone number 555-123-2002 and multiple lines on the account. The relevant line for 555-123-2002 is line L1002, which is Active and has roaming_enabled set to false at the start. John is currently abroad in France, so international roaming settings affect service on this line. Other lines exist on the account, including L1001 for 555-123-2001 and L1003 for 555-123-2003, but they are not the line experiencing the MMS issue."
+      },
+      "checklist": [
+        "The outcome identifies line 555-123-2002 / L1002 as the affected line and addresses that line rather than a different one.",
+        "Roaming is enabled for customer C1001 on line L1002 by the end of the attempt.",
+        "The resolution communicated to the customer links the MMS problem to roaming being disabled while the customer is abroad in France.",
+        "The final response clearly tells the customer that the issue has been fixed or the needed account change has been completed so they can try sending an MMS again."
+      ],
+      "provenance": [
+        "c0eff22b7b95c0bd5f9932a113193a5b"
+      ],
+      "cluster_name": "MMS roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-fec2b138b763adca765c645492789103",
+      "task": "You are John Smith, calling from the United States about your mobile line 555-123-2002. You have been unable to send MMS messages in your messaging app for the past few hours and want the issue fixed so you can successfully send an MMS. If standard troubleshooting does not resolve the problem, escalate the case to a human support agent with a concise summary of what was checked and the current status.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer account for phone number 555-123-2002 belongs to John Smith, customer ID C1001. The account is active and the customer is located at home in the United States. The line currently has excellent 5G signal and mobile data is enabled. During the session, standard MMS troubleshooting facts may be confirmed: the SIM has been reseated, network mode is set to 4G/5G preferred, APN and MMSC settings are correct, Wi-Fi Calling is off, and the messaging app has storage and SMS permissions."
+      },
+      "checklist": [
+        "The interaction identifies the correct active customer account for phone number 555-123-2002.",
+        "The outcome addresses the MMS sending problem specifically for John Smith's line and does not introduce unrelated account issues.",
+        "If the issue remains unresolved after standard troubleshooting, the case is escalated to a human agent.",
+        "Any escalation includes a clear summary that standard MMS troubleshooting was completed and the problem persists.",
+        "The final response to the customer makes clear whether MMS was fixed or that the issue has been handed off for further support."
+      ],
+      "provenance": [
+        "fec2b138b763adca765c645492789103"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-c07ac4a25e9c25ce490a8a1cfced5f68",
+      "task": "You are John Smith, calling about your mobile line 555-123-2002 while traveling in France. For the past few hours you have been unable to send MMS messages in your messaging app, and you want the issue fixed so you can successfully send an MMS. Troubleshoot the problem within the telecom support system, taking into account that you are abroad and need any relevant roaming settings addressed. If the issue cannot be resolved through available support actions, escalate to a human agent with a clear summary of the troubleshooting already completed.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active account with phone number 555-123-2002 and is currently abroad in France. The account includes multiple lines; line L1002 corresponds to 555-123-2002, is active, and has roaming disabled at the start of the interaction. The customer reports that MMS sending has failed for the past few hours on this line. Other account and line records exist, but the MMS issue concerns only the active line for 555-123-2002."
+      },
+      "checklist": [
+        "The attempt correctly identifies line 555-123-2002 as the affected active line on John Smith's account.",
+        "The outcome addresses international usage by recognizing that roaming is relevant and that roaming was disabled on the affected line at the start.",
+        "The customer is given a resolution path aimed at restoring MMS sending, including appropriate troubleshooting for MMS/network settings while abroad.",
+        "If the issue remains unresolved, the case is escalated to a human agent rather than being incorrectly closed as fixed.",
+        "Any escalation includes a concise summary of the MMS problem and the troubleshooting already performed so the next agent can continue without repeating basic steps."
+      ],
+      "provenance": [
+        "c07ac4a25e9c25ce490a8a1cfced5f68"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-0d937e573d0ff722278c2a8904dfd4f6",
+      "task": "You are John Smith, calling from France about your mobile line 555-123-2002. For the past few hours, you have been unable to send MMS messages in your messaging app and want the issue fixed so you can successfully send an MMS. If standard troubleshooting does not resolve the problem, ensure the case is escalated to a human agent with an accurate summary of what was already tried so you do not have to repeat steps.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer account for phone number 555-123-2002 belongs to John Smith, customer ID C1001, and the account status is Active. John Smith is currently abroad in France while using this line. The MMS sending issue has been occurring for the past few hours. Basic account identity details on file include name John Smith, date of birth 1985-06-15, and email john.smith@example.com."
+      },
+      "checklist": [
+        "The outcome identifies the affected line as John Smith's active account for phone number 555-123-2002.",
+        "The final resolution attempt addresses MMS sending failure while the customer is roaming internationally in France.",
+        "If the issue remains unresolved, the interaction results in a transfer or escalation to a human agent.",
+        "Any escalation includes a concise summary that standard troubleshooting has already been completed, including mobile data enabled, network mode adjusted away from 2G to 4G/5G preferred, APN/MMSC settings checked, Wi-Fi Calling disabled, messaging app permissions verified, and the device rebooted.",
+        "The customer is informed of the status clearly enough to know the next step toward restoring MMS capability."
+      ],
+      "provenance": [
+        "0d937e573d0ff722278c2a8904dfd4f6"
+      ],
+      "cluster_name": "international MMS troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-f1dc69be505b0e3d76f266ff50833242",
+      "task": "You are John Smith, calling about your mobile service for phone number 555-123-2002 while traveling in France. You have been unable to send MMS messages in your messaging app for the past few hours and want the issue fixed so you can successfully send an MMS. If standard troubleshooting does not resolve the problem, ensure the case is escalated to a human technical support agent with a clear summary of the issue and steps already tried.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer account for phone number 555-123-2002 belongs to John Smith and is active. John Smith is currently abroad in France. For the past few hours, MMS sending has not been working in his messaging app. Basic device-side troubleshooting information may be relevant, including mobile data status, APN settings, Wi-Fi Calling status, device reboot, and messaging app SMS permissions."
+      },
+      "checklist": [
+        "The interaction identifies the affected line as John Smith's active account for phone number 555-123-2002.",
+        "The outcome addresses the MMS sending problem while John Smith is roaming in France.",
+        "If the issue is not resolved through standard troubleshooting, the case is transferred or escalated to a human technical support agent.",
+        "Any escalation includes a concise summary of the MMS issue and the troubleshooting steps already completed so the customer does not need to repeat them."
+      ],
+      "provenance": [
+        "f1dc69be505b0e3d76f266ff50833242"
+      ],
+      "cluster_name": "international MMS troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-127340f6837896829a5c4deb58feeea6",
+      "task": "You are John Smith, calling about mobile service for phone number 555-123-2002 while traveling in France. You have been unable to send MMS messages in your messaging app for the past few hours and want the issue fixed so you can successfully send an MMS. If standard troubleshooting does not resolve the problem, escalate the case to a human agent with a clear summary of the issue and the troubleshooting already completed.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "The customer account for phone number 555-123-2002 belongs to John Smith and is active. John Smith is currently abroad in France. MMS sending is currently failing on this line. Before escalation, the following troubleshooting facts are true: the APN and MMSC URL settings are correct, the network mode has been changed from 2G to 5G, Wi-Fi Calling has been turned off, the messaging app has storage and SMS permissions enabled, and the device has been rebooted, but MMS still cannot be sent."
+      },
+      "checklist": [
+        "The interaction correctly identifies the customer/account associated with phone number 555-123-2002 as John Smith with an active account.",
+        "The final outcome reflects that MMS sending still does not work after the listed troubleshooting steps have been completed.",
+        "If the issue remains unresolved, the case is transferred or escalated to a human agent rather than incorrectly claiming the problem is fixed.",
+        "Any escalation includes a concise summary mentioning the MMS failure while roaming in France and the troubleshooting already performed.",
+        "The response does not report a successful MMS send unless the issue has actually been resolved."
+      ],
+      "provenance": [
+        "127340f6837896829a5c4deb58feeea6"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-c0a2762dc4b7ff599063ec17e174ae83",
+      "task": "You are John Smith, calling about mobile data problems on your phone number 555-123-2002 while at home in the United States. Diagnose the issue and get the line working properly again, with excellent customer service. If the problem is caused by hitting the plan’s data limit, resolve it by adding an appropriate amount of extra data and clearly explain any charge and the updated data situation.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has customer ID C1001 and an active account with multiple lines. The affected line is L1002 for phone number 555-123-2002; it is active, uses device D1002, has roaming enabled, and is on plan P1002 (Premium Plan). That plan includes 15.0 GB of monthly data and charges $2.00 per additional GB of refueled data. At the start of the scenario, line L1002 has used 15.1 GB in the current cycle ending 2025-02-28 and has 0.0 GB of refueled data, which explains very slow or stopped mobile data."
+      },
+      "checklist": [
+        "The resolution correctly identifies line 555-123-2002 / L1002 as the affected active line and determines that the data issue is due to exceeding the monthly 15.0 GB plan allowance.",
+        "The final outcome includes adding extra data to line L1002 so service can resume, specifically resulting in 2.0 GB of refueled data on the line.",
+        "The customer is informed of the cost of the added data, with a total charge of $4.00 based on $2.00 per GB.",
+        "The response clearly communicates the updated data situation after the fix, including that the line had used 15.1 GB and now has additional refueled data available for the remainder of the cycle.",
+        "The communication is customer-friendly and confirms that the issue has been addressed rather than leaving the problem unresolved."
+      ],
+      "provenance": [
+        "c0a2762dc4b7ff599063ec17e174ae83"
+      ],
+      "cluster_name": "Add mobile data",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-7e56dba7ab62ddeea7c611671dbb37f1",
+      "task": "You are John Smith, calling from the United States about mobile data problems on your phone number 555-123-2002. Your data service is stopping or running very slowly, and you want the issue fixed while receiving excellent customer service. Diagnose the likely account-related cause and resolve it if possible, including offering or applying an appropriate data add-on if the line has run out of high-speed data, then clearly explain the outcome and any charges.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, account status Active, with phone number 555-123-2002 and multiple lines on the account. The affected line is L1002 for phone number 555-123-2002; it is Active, uses plan P1002, has roaming enabled, and has used 15.1 GB this cycle. Plan P1002 is Premium Plan with a 15.0 GB monthly data limit and optional data refueling at $2.00 per GB. Before any action, line L1002 has 0.0 GB of refueled data and the current billing cycle ends on 2025-02-28."
+      },
+      "checklist": [
+        "Identifies the correct affected line for 555-123-2002 and determines that the likely cause of slow/stopped data is exceeding the 15.0 GB plan limit.",
+        "Resolves the issue by adding extra data to line L1002 or otherwise restoring available data service in a way consistent with the account's options.",
+        "If extra data is added, the final state reflects 2.0 GB of refueled data on line L1002 with a $4.00 charge.",
+        "Communicates the diagnosis and resolution clearly to the customer, including that the line had used 15.1 GB out of 15.0 GB and any resulting charge.",
+        "Does not incorrectly change unrelated lines or misidentify the customer/account status."
+      ],
+      "provenance": [
+        "7e56dba7ab62ddeea7c611671dbb37f1"
+      ],
+      "cluster_name": "Add mobile data",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b6f7c6b2419dd715d612c6e44abc040b",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data on this line is either not working at all or is extremely slow, and he wants the issue fixed so he can get excellent internet speed while abroad. Investigate the account and line status, confirm any relevant roaming or usage details, perform any troubleshooting you can within the available tools, and if the issue cannot be resolved directly, escalate to a human agent with a concise summary of the problem and troubleshooting already completed.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and three lines on the account. The affected line is L1002 for phone number 555-123-2002; it is active, associated with plan P1002 and device D1002, and roaming is enabled on that line. John is currently abroad in France. For line L1002, current cycle data usage is 8.7 GB out of a 15.0 GB allowance with no extra data refuel, so the line is not out of data. Other lines on the account exist but are not the one reporting the roaming data issue."
+      },
+      "checklist": [
+        "The response identifies the correct affected line/account for phone number 555-123-2002 and recognizes that the customer is roaming internationally in France.",
+        "The outcome correctly states that roaming is enabled on the affected line and that the line still has remaining data allowance (8.7 GB used of 15.0 GB, with no refuel).",
+        "The agent does not falsely claim to have completed an unavailable network speed test or directly fixed network performance when the available tools do not support that.",
+        "If the issue remains unresolved, the case is escalated or handed off to a human agent/support team.",
+        "Any escalation summary or final communication includes the core issue (no/very slow mobile data while abroad) plus the key verified facts needed for follow-up, such as customer/line identification and relevant troubleshooting context."
+      ],
+      "provenance": [
+        "b6f7c6b2419dd715d612c6e44abc040b"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "tool_not_available"
+    },
+    {
+      "scenario_id": "scenario-152bd99ab9ad40996444d5ef268aadab",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data on this line is either not working or is extremely slow while abroad. Diagnose the issue using the account information available and provide the best resolution to restore strong mobile internet service, taking into account roaming settings, plan/data status, and any practical troubleshooting guidance relevant to international data use.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has customer ID C1001 and an active account. His line for phone number 555-123-2002 is line ID L1002, status Active, on plan P1002 with device D1002. For line L1002, roaming is enabled and current cycle data usage is 8.7 GB out of a 15.0 GB allowance, with 0.0 GB of data refueling used; the billing cycle ends on 2025-02-28. John is currently abroad in France and wants excellent mobile internet speed on this line."
+      },
+      "checklist": [
+        "The response correctly identifies that roaming is already enabled on John Smith's active line 555-123-2002.",
+        "The response correctly states that the line has not exhausted its monthly data allowance: 8.7 GB used out of 15.0 GB, with no refueling used.",
+        "The resolution does not incorrectly blame the issue on disabled roaming or fully used data allowance.",
+        "The response provides a plausible next-step resolution for poor roaming data performance in France, such as checking network selection/APN/device roaming settings or explaining that speed may depend on partner-network coverage and local conditions.",
+        "The response clearly communicates the outcome and guidance specifically for line 555-123-2002 while John is abroad in France."
+      ],
+      "provenance": [
+        "152bd99ab9ad40996444d5ef268aadab"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "unknown",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-ddf6fb1eedffa8d4a4488ee063749fbc",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data is extremely slow or stops working; he wants the issue fixed and wants excellent internet speed if possible. Diagnose the line, determine whether the problem is due to roaming/settings/coverage or exhausted data allowance, take any permitted action to restore usable data service, and clearly tell him the outcome, any charges applied, and any remaining limitation. If service still cannot be restored to a working connection after reasonable troubleshooting and account actions, escalate the case to a human agent with a concise summary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, account status Active, with multiple lines on the account. The affected line is L1002 for phone number 555-123-2002; it is Active, uses plan P1002 (Premium Plan), has roaming enabled, and is associated with device D1002. For line L1002, current cycle data usage is 15.1 GB against a 15.0 GB monthly limit, with 0.0 GB of refueled data initially available; the plan allows extra data refueling at $2.00 per GB. John is abroad in France and reports poor or nonworking mobile data on this line."
+      },
+      "checklist": [
+        "The final outcome identifies that line 555-123-2002 had exceeded its included monthly data allowance (15.1 GB used of 15.0 GB) and that this was a cause of the degraded/no data service.",
+        "The line ends up with additional data successfully added for the current cycle: 2 GB of refueled data on line L1002, with a total charge of $4.00.",
+        "The customer-facing response clearly states that roaming is enabled on the affected line and that extra data has been added, so the line should now have available data again.",
+        "The response communicates the practical result accurately: usable data should be restored, but 'excellent' speed cannot be guaranteed because network conditions while roaming abroad may still affect performance.",
+        "If the issue is not fully resolved after these actions, the case is escalated to a human agent, and the escalation summary includes the affected customer/line, the troubleshooting context, and the fact that data overage was addressed with a 2 GB refuel."
+      ],
+      "provenance": [
+        "ddf6fb1eedffa8d4a4488ee063749fbc"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-934c6ab1818f250512451722a3cf350a",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and reports that mobile data is either not working or is extremely slow; he wants the issue fixed and wants excellent internet speed if possible. Diagnose the problem on his active line, verify any relevant account or line settings and usage, guide through reasonable troubleshooting, and if the issue cannot be resolved through available support actions, escalate to a human agent with a concise summary of findings and steps already taken.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is customer C1001 with an active account and multiple lines. The affected line is L1002 for phone number 555-123-2002; it is active, uses plan P1002 (Premium Plan), has roaming disabled at the start, and has used 8.7 GB out of a 15.0 GB monthly data allowance with no extra data refuel purchased. John is abroad in France when the issue occurs. Other lines exist on the account but are not the target of this request."
+      },
+      "checklist": [
+        "The outcome identifies the correct affected line and customer context: John Smith, customer C1001, line L1002 / 555-123-2002, currently abroad in France.",
+        "The resolution addresses roaming/data service eligibility for the affected line and does not incorrectly claim the problem is due to the monthly data cap, since usage is 8.7 GB of 15.0 GB.",
+        "The customer is given or the record reflects reasonable troubleshooting for poor/no mobile data performance while abroad, aimed at restoring usable high-speed service.",
+        "If the issue remains unresolved, the case is escalated to a human agent.",
+        "Any escalation summary includes the key facts: customer/line identification, that the customer is in France with no or very slow mobile data, and the troubleshooting/actions already completed."
+      ],
+      "provenance": [
+        "934c6ab1818f250512451722a3cf350a"
+      ],
+      "cluster_name": "International mobile data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-985a10e0e1ddc5eeb2923712a513db92",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He reports that his phone has shown \"No Service\" for the past few hours. Diagnose the issue on his line and provide the appropriate resolution or next steps. If troubleshooting does not immediately restore service, continue investigating the account and line status to identify the underlying cause and clearly explain what is preventing service.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and three lines on the account. The affected number, 555-123-2002, corresponds to line ID L1002, which is currently marked Active and has roaming enabled. The account also includes line 555-123-2001 (L1001), which is Active, and line 555-123-2003 (L1003), which is Suspended. John Smith's account status is Active overall, and the affected line is associated with device ID D1002."
+      },
+      "checklist": [
+        "The response correctly identifies 555-123-2002 / line L1002 as the affected line and does not confuse it with the other lines on the account.",
+        "The outcome communicates that the customer's overall account is active and that the affected line itself is marked active, so the issue is not explained by a full account suspension.",
+        "The response includes a meaningful diagnosis or investigation of why an active line could show \"No Service,\" rather than stopping after basic account lookup.",
+        "If service is not immediately restored, the response provides clear next steps or escalation guidance tied to the diagnosed issue.",
+        "The explanation to the customer is clear about the status of the line and what action will happen next to address the loss of service."
+      ],
+      "provenance": [
+        "985a10e0e1ddc5eeb2923712a513db92"
+      ],
+      "cluster_name": "Mobile network troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-627981b6e49d8294394673266334a77d",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. His phone has shown \"No Service\" for the past few hours. Diagnose the issue on the correct line, guide him through reasonable troubleshooting, and if the problem cannot be resolved because the SIM is PIN-locked and requires a code he does not have, escalate the case to a human agent with a concise summary of the issue and steps already tried.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and three lines on the account. The affected number 555-123-2002 is line L1002, which is active, has roaming enabled, and is associated with device D1002, a Smartphone Pro Max that is activated and eSIM-capable. Other lines on the account are 555-123-2001 (active) and 555-123-2003 (suspended), so the agent must identify the correct line rather than assume all lines are affected. During troubleshooting, the phone can progress from showing no service to detecting the SIM after reseating it, but then the SIM presents as locked with a PIN code that is not available to the customer."
+      },
+      "checklist": [
+        "The outcome identifies and works on the correct affected line: John Smith's 555-123-2002 / line L1002.",
+        "The response includes reasonable troubleshooting guidance for a no-service issue and reflects that the SIM was reseated/detected but ended up PIN-locked rather than fully restored to service.",
+        "The final resolution does not falsely claim the issue was fixed when the SIM PIN is still required and unavailable.",
+        "The case is escalated or transferred to a human agent because the remaining blocker is a SIM PIN/security issue the customer cannot resolve alone.",
+        "Any escalation summary communicates the key facts: customer identity, affected number/line, no-service symptom, troubleshooting already attempted, and that the SIM is now PIN-locked and needs specialist assistance."
+      ],
+      "provenance": [
+        "627981b6e49d8294394673266334a77d"
+      ],
+      "cluster_name": "Mobile network troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-ea9230b7c0128bb43ac2674b3c7bc4a5",
+      "task": "You are John Smith, calling from the United States about your mobile line 555-123-2002. You have been unable to send MMS messages in your messaging app for the past few hours and want the issue fixed so you can successfully send an MMS. Diagnose the problem using the available telecom account and line information, and provide the customer with the resolution or next steps. Do not rely on unavailable tools; work only with the carrier account, line, device, and plan details that can be retrieved.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has an active telecom account with customer ID C1001 and phone number 555-123-2002 on the account. The account contains three lines: 555-123-2001 (line L1001, active), 555-123-2002 (line L1002, active), and 555-123-2003 (line L1003, suspended). The affected line is L1002 for phone number 555-123-2002; it is active, uses device D1002, is on plan P1002, has used 8.7 GB of data with no data refuel, has roaming enabled, and had a SIM replacement on 2025-01-20. The customer is currently at home in the United States, so domestic service conditions apply."
+      },
+      "checklist": [
+        "The response correctly identifies the affected line as 555-123-2002 / line L1002 and notes that the line status is active.",
+        "The response does not claim to have verified MMS functionality with a nonexistent or unavailable tool.",
+        "The response gives a plausible diagnosis and troubleshooting path for MMS failure based on available account/line facts, such as checking mobile data/APN or messaging settings, device/network refresh, or SIM/device-related factors.",
+        "The response clearly tells the customer what to do next to restore MMS sending and how to confirm success by attempting to send an MMS afterward.",
+        "The response avoids irrelevant changes to other lines on the account and does not treat the suspended line 555-123-2003 as the affected service."
+      ],
+      "provenance": [
+        "ea9230b7c0128bb43ac2674b3c7bc4a5"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "tool_not_found"
+    },
+    {
+      "scenario_id": "scenario-c9d49b67ebcf4c185a10382ee5903d9c",
+      "task": "You are John Smith, whose mobile number is 555-123-2002. You are currently in France and have been unable to send MMS messages from your messaging app for the past few hours. Contact the telecom provider to get the issue resolved so you can successfully send an MMS. If the issue cannot be fixed directly, ensure the case is escalated appropriately with a clear summary of the problem and troubleshooting already completed.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer with customer ID C1001 and phone number 555-123-2002. The affected line is L1002, which is active, uses device D1002, and has roaming disabled at the start of the scenario. John is currently abroad in France. During troubleshooting, the device conditions that can be confirmed are: signal is excellent on 5G, mobile data is enabled, the MMSC URL is correctly set to http://mms.carrier.com/mms/wapenc, Wi‑Fi Calling is off, and the messaging app already has storage and SMS permissions."
+      },
+      "checklist": [
+        "The response identifies the correct affected customer and line: John Smith / customer C1001 / phone 555-123-2002 / line L1002.",
+        "The outcome addresses that the MMS problem is occurring while the customer is abroad in France and recognizes roaming as relevant to the issue.",
+        "The final resolution either enables the necessary service for MMS abroad or escalates the issue to a human agent when direct resolution is not possible.",
+        "If escalated, the handoff includes a concise summary of the MMS issue and the troubleshooting already confirmed (good signal, mobile data on, correct MMSC URL, Wi‑Fi Calling off, app permissions granted).",
+        "The customer is told the resulting status clearly enough to know the next step toward being able to send an MMS."
+      ],
+      "provenance": [
+        "c9d49b67ebcf4c185a10382ee5903d9c"
+      ],
+      "cluster_name": "international MMS troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "tool_not_found"
+    },
+    {
+      "scenario_id": "scenario-2838746db3a1cbc447c557e57bbfc927",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. MMS messages have failed for the past few hours, and you want the issue fixed so you can send MMS again. Resolve the problem on the correct active line and confirm the service setting needed for MMS abroad has been enabled.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith has account ID C1001 and three mobile lines on the account. The affected number is 555-123-2002, which corresponds to active line L1002; this line has an active status, device D1002, plan P1002, 8.7 GB used out of a 15.0 GB data allowance, and roaming is initially disabled. John is currently in France. Other lines on the account include 555-123-2001 (active, L1001) and 555-123-2003 (suspended, L1003)."
+      },
+      "checklist": [
+        "The outcome addresses phone number 555-123-2002 / line L1002, not another line on the account.",
+        "Roaming on line L1002 ends up enabled.",
+        "The resolution does not depend on adding data or changing the plan, since the line still has available data allowance.",
+        "The final response tells the customer that roaming was the issue relevant to MMS use abroad and confirms it has been turned on so they can try sending an MMS again."
+      ],
+      "provenance": [
+        "2838746db3a1cbc447c557e57bbfc927"
+      ],
+      "cluster_name": "MMS roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-d6790b660a1ab23533f0848dafe03d96",
+      "task": "You are John Smith, calling about phone number 555-123-2002. You have been unable to send MMS messages in your messaging app for the past few hours and want the issue fixed so you can successfully send an MMS. Troubleshoot the problem using available telecom account/device information, and if the issue is caused by a phone setting or app permission outside carrier controls, clearly explain what the customer must change on the device.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and primary contact phone number 555-123-2002. The account has multiple lines: 555-123-2001 (active), 555-123-2002 (active), and 555-123-2003 (suspended). The affected line is line ID L1002 for phone number 555-123-2002; it is active, associated with device ID D1002, has used 8.7 GB of data, has no data refuel, and roaming is enabled. John is currently at home in the United States, so domestic service conditions apply."
+      },
+      "checklist": [
+        "The response identifies the correct affected line/account context: John Smith's active line 555-123-2002.",
+        "The outcome does not incorrectly claim the line is suspended, out of service, or blocked from MMS by account status.",
+        "The response provides a plausible resolution path for MMS failure that is consistent with carrier-side information being normal, such as checking/enabling required messaging app or device permissions/settings.",
+        "The response clearly tells the customer what to do next on the device to restore MMS sending, rather than relying on an unavailable carrier-side action.",
+        "The final guidance is aimed at achieving successful MMS sending for the messaging app on phone number 555-123-2002."
+      ],
+      "provenance": [
+        "d6790b660a1ab23533f0848dafe03d96"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "tool_not_found"
+    },
+    {
+      "scenario_id": "scenario-4cf09f9e6ddc820a85c646ce0fde80cb",
+      "task": "You are John Smith, calling about your mobile line 555-123-2002 because MMS messages have not been sending in your messaging app for the past few hours. Diagnose the issue using the available telecom account and line information, explain the likely cause in plain language, and provide clear steps to restore MMS service and verify it by sending a test MMS. Do not claim to have run unsupported diagnostics or confirmed a successful send if the system cannot directly test MMS delivery.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active customer (customer ID C1001) with phone number 555-123-2002 and is currently in the United States. His account has multiple lines: 555-123-2001 (active), 555-123-2002 (active), and 555-123-2003 (suspended). The affected line is line ID L1002 for phone number 555-123-2002; it is active, linked to device ID D1002, has used 8.7 GB of data with 0.0 GB of data refueling, and has roaming enabled. No tool is available to directly test whether MMS can be sent."
+      },
+      "checklist": [
+        "Identifies the correct affected line as 555-123-2002 / line ID L1002 and notes that the line status is active.",
+        "Does not report a confirmed MMS test result or pretend to use a nonexistent MMS-testing capability.",
+        "Provides a plausible diagnosis based on available facts, including that MMS depends on mobile data/cellular settings rather than account suspension.",
+        "Gives actionable troubleshooting steps to restore MMS, such as ensuring cellular data is on, checking messaging/MMS settings or APN/carrier settings, restarting the device, and retrying off Wi‑Fi if needed.",
+        "Advises the user to verify resolution by sending a test MMS after the steps and to contact support again if the issue persists."
+      ],
+      "provenance": [
+        "4cf09f9e6ddc820a85c646ce0fde80cb"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "tool_not_found"
+    },
+    {
+      "scenario_id": "scenario-c427cd6ef1bbce94b59584c8c1c4fc25",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. You have been unable to send MMS messages for the past few hours and want the issue fixed so MMS can work. Resolve the problem on this line, including making any needed account changes that are allowed, and clearly tell the customer what was changed and any charges incurred.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith (customer ID C1001) has an active account with phone number 555-123-2002 on line ID L1002. That line is active, uses plan P1002 (Premium Plan), has roaming disabled, and is currently being used abroad in France. The line has used 15.1 GB against a 15.0 GB monthly data limit, with 0.0 GB of refueled data before any action. The Premium Plan allows paid data refills at $2.00 per GB."
+      },
+      "checklist": [
+        "The resolution identifies that line 555-123-2002/L1002 had exceeded its included data allowance and that roaming was disabled, both relevant to MMS failure while abroad.",
+        "The final state has roaming enabled on line L1002.",
+        "The final state includes an added data refill of 2 GB on line L1002, increasing refueled data from 0.0 GB to 2.0 GB.",
+        "The customer is informed of the charge for the data refill as $4.00.",
+        "The response makes clear that these changes should restore the ability to send MMS while in France."
+      ],
+      "provenance": [
+        "c427cd6ef1bbce94b59584c8c1c4fc25"
+      ],
+      "cluster_name": "MMS roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-552ef34d8aeae29412ef80508def2996",
+      "task": "You are John Smith, calling about your mobile line 555-123-2002 while traveling in France. You have been unable to send MMS messages for the past few hours and want help fixing the issue so you can successfully send an MMS. Diagnose the likely account-side cause using available telecom account information, and tell the customer clearly whether the line is properly set up for roaming and whether data allowance is sufficient; if no account-side block is found, say that the issue is likely device or messaging-app related rather than a plan or account restriction.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith (customer ID C1001) has an active account and multiple lines. The relevant line is L1002 for phone number 555-123-2002; it is active, uses plan P1002, and has roaming_enabled set to true. For line L1002, current data usage is 8.7 GB out of a 15.0 GB allowance in the current cycle ending 2025-02-28, with no extra data refuel used. The customer is currently abroad in France and reports MMS sending problems over the last few hours."
+      },
+      "checklist": [
+        "Identifies the correct affected line as 555-123-2002 / line L1002 belonging to John Smith.",
+        "Confirms that roaming is enabled on the affected line, so roaming is not the account-side blocker.",
+        "Confirms that the line is active and still has available data remaining (8.7 GB used of 15.0 GB), so lack of data allowance is not the cause.",
+        "Communicates that no clear account or plan restriction preventing MMS is found based on the available records.",
+        "Advises that the MMS issue is therefore likely due to device settings, mobile data/app configuration, or local network conditions while abroad, and tells the customer to try sending again after checking those factors."
+      ],
+      "provenance": [
+        "552ef34d8aeae29412ef80508def2996"
+      ],
+      "cluster_name": "MMS sending troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "tool_not_found"
+    },
+    {
+      "scenario_id": "scenario-c7df8731cbdbbc4db0aed5587d01464f",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and has been unable to send MMS messages for the past few hours using his messaging app. Diagnose the likely account-side cause and take any available carrier action needed to restore MMS service, then tell him what was changed and what he should try next to successfully send an MMS.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "John Smith is an active telecom customer with customer ID C1001 and multiple lines on the account. The relevant line is L1002 for phone number 555-123-2002; it is active, on plan P1002 (Premium Plan with 15.0 GB data limit), has used 8.7 GB this cycle, and roaming is initially disabled on that line. John is abroad in France when the issue occurs. The account and line are otherwise in good standing, and there is no indication that the line is suspended or out of data."
+      },
+      "checklist": [
+        "Roaming ends up enabled for line L1002 / phone number 555-123-2002.",
+        "The response identifies roaming being disabled as the likely carrier-side reason MMS was not working while abroad.",
+        "The customer is told that a change was made on his line to help restore MMS service.",
+        "The customer is advised to retry sending an MMS now that roaming is enabled."
+      ],
+      "provenance": [
+        "c7df8731cbdbbc4db0aed5587d01464f"
+      ],
+      "cluster_name": "MMS roaming activation",
+      "weight": 0.013513513513513513,
+      "source_outcome": "failure",
+      "failure_category": "unsuccessful_tool_call"
+    },
+    {
+      "scenario_id": "scenario-9da339dcf637859ca8380cae82dca574",
+      "task": "You are John Smith, calling about mobile line 555-123-2002 while traveling in France. MMS messages have stopped working for the past few hours, and you want the issue fixed so you can send MMS again. Diagnose the likely account-level cause and take any allowed account action needed to restore MMS service, keeping changes limited to what is necessary.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer John Smith (customer ID C1001) has an active account and owns line 555-123-2002 (line ID L1002). That line is active, uses plan P1002 \"Premium Plan,\" and has roaming enabled, which is relevant because the customer is currently abroad in France. The plan includes 15.0 GB of monthly data, and the line has already used 15.1 GB this cycle with 0.0 GB of refueled data before any intervention. The Premium Plan allows additional data refills at $2.00 per GB."
+      },
+      "checklist": [
+        "The resolution identifies that the affected line 555-123-2002 has exceeded its included data allowance, making lack of available mobile data the likely cause of MMS failure.",
+        "The final state includes additional data successfully added to line L1002.",
+        "The added amount is 2 GB, and the resulting charge is $4.00.",
+        "The response makes clear that roaming was already enabled and therefore was not the blocking issue.",
+        "The customer is informed that MMS should work again after the data refill, assuming normal device/network conditions."
+      ],
+      "provenance": [
+        "9da339dcf637859ca8380cae82dca574"
+      ],
+      "cluster_name": "MMS data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    },
+    {
+      "scenario_id": "scenario-b54b597c4a6631b5f71e3681a15ed2ee",
+      "task": "You are assisting John Smith, whose mobile number is 555-123-2002. He is currently in France and has been unable to send MMS messages for the past few hours. Diagnose the issue and take any available account action needed to restore MMS service so he can successfully send an MMS. If a paid change is required, clearly state what was done and the charge.",
+      "seed_state": {
+        "structured": {},
+        "scratchpad": "Customer C1001 is John Smith, account status Active, with phone number 555-123-2002 and an active line L1002 on plan P1002 (Premium Plan). Line L1002 has roaming enabled and is associated with device D1002. The Premium Plan includes 15.0 GB of data per month at $65.00, and line L1002 has already used 15.1 GB with 0.0 GB of refueled data at the start. The account also has another active line, L1001, but the user’s issue concerns line L1002."
+      },
+      "checklist": [
+        "The resolution identifies that the affected line is 555-123-2002 / L1002 and that roaming is already enabled, so roaming is not the blocker.",
+        "The resolution identifies that the line has exceeded its included data allowance on plan P1002, making lack of available data the cause of MMS failure.",
+        "The final state includes an added 2 GB data refuel on line L1002 for customer C1001.",
+        "The communicated outcome states that the data refuel costs $4.00 total at $2.00 per GB.",
+        "The response tells the user that MMS should work again after the data add-on and that they can try sending the MMS now."
+      ],
+      "provenance": [
+        "b54b597c4a6631b5f71e3681a15ed2ee"
+      ],
+      "cluster_name": "MMS data troubleshooting",
+      "weight": 0.013513513513513513,
+      "source_outcome": "success",
+      "failure_category": null
+    }
+  ],
+  "clusters": [
+    {
+      "cluster_id": 0,
+      "name": "MMS sending troubleshooting",
+      "description": "These tasks all involve diagnosing and fixing John Smith's inability to send MMS messages on his phone or messaging app, often while traveling abroad.",
+      "member_trace_ids": [
+        "78a43efe7e9e0b5461d00b57062c239b",
+        "a5a876f315c7ae4c3ed7796c0ade1e71",
+        "b7e844f33296017d496641f5f8cb2527",
+        "74a01bb8ee0674a20d69750925198010",
+        "1fff5d4638d82c38bbe75b4e17e7184c",
+        "4f64910a0d7abee2af390f197f6697cd",
+        "a7b2807772c0528a5cb204d0f40a6f34",
+        "bbf53d77c0a052baa6b9da1e27c82ceb",
+        "4f803cab2d03ea0faa0594706cf757b1",
+        "4d2214b154f06c8e2cd1bc19335c994e",
+        "6d6b6ec5f341aebd7a8f41d98a72b9dd",
+        "8b235f71ec86a541d7c1193b0b4d0c49",
+        "6011931f54e76e5110b795745f22e262",
+        "17191d7b9766c8be65f09fc740775117",
+        "822a76f0604677ddbba9868f2163185f",
+        "9cc14ca1f8149f110ff8cafa4d204995",
+        "f6d50a87b16d8887ae2b179ec63f23db",
+        "b8b797eac98166e6d5c88c919d95a0ca",
+        "27b2eafd3681cd236c86e766fe21669e",
+        "dbc2e931ac1f0c55e5f9940bba9c10c1",
+        "d0579bdd835c9f9af03066c302d32ae0",
+        "fe6cdabdc273a3d839ece197e8b0d8e8",
+        "c07ac4a25e9c25ce490a8a1cfced5f68",
+        "40802a1e4113a04df1136dc793cd84ae",
+        "390651abc5dbe718d080d6f7ebf054a1",
+        "a6e81d8bbdab50d8dabc46895f80094b",
+        "127340f6837896829a5c4deb58feeea6",
+        "e4b921908882f191f8f6005d36c3ef92",
+        "c6663a169ff0a4c1f0fbac2d5d7d9de1",
+        "e124f9cb57e7cac19210a1db646f71d4",
+        "ded5e20397ae6cfcab4d93b254d1a983",
+        "ebcb2ab3daeec5eea52c7ac93e73017c",
+        "552ef34d8aeae29412ef80508def2996",
+        "4957d0a97ac83bb1f92c1af0f0916592",
+        "8f080dd651f102ffc4ecaa9c5696b3a4"
+      ]
+    },
+    {
+      "cluster_id": 5,
+      "name": "MMS sending troubleshooting",
+      "description": "These tasks all involve diagnosing and resolving an MMS message sending problem for the same phone number.",
+      "member_trace_ids": [
+        "00d70fca3124eb5666d3d766897633ee",
+        "f91bde6c9adf0ea805ce73745b2ac450",
+        "efb248300c0580790578832b96464746",
+        "4866e1334c704565e2cc4e3ba1138508",
+        "c796d88dd3c6fa96395fc83e678e97d2",
+        "196f51127bb0cac222c3c3bdc4cc890b",
+        "8da7b6ce07e896b960481711290211ff",
+        "786d5a8184069c948bebd32b97a03a2a",
+        "b2467b6ce2a0dab722e674f2ac1063f8",
+        "ba0ec9bc3f01552fe95140b34688cc7b",
+        "a85b6fc92bd1fd861a6d50fde774a6e2",
+        "e0f21b545b5dbb6ab42d83f80b8aa777",
+        "8b0f412cee66ec61e8bc97cb3c882a7b",
+        "136e1699e1e38bfcd8ef3162f6cd356f",
+        "624a71ddf2aa09a731449bdf418d181f",
+        "bc11ec139034ad6c1909654080ce80dc",
+        "ea9230b7c0128bb43ac2674b3c7bc4a5",
+        "7e08470e57fa52d9d5427c34883034cc",
+        "6a7c1a1ffb9f72ea2d6751a55cae07f9",
+        "e4d0800ec16a69dc2e1c762de57f9d25",
+        "b1a53526d886b9b38a085a6432760398",
+        "e5b95c88d47a20e11421b3343f713f92",
+        "b3717fcf2849d70674ff2c08a8bef053"
+      ]
+    },
+    {
+      "cluster_id": 4,
+      "name": "International mobile data troubleshooting",
+      "description": "These tasks all involve resolving a customer's mobile data connectivity problem while they are traveling abroad, specifically in France.",
+      "member_trace_ids": [
+        "d319c463660c23053033da4fda1eb687",
+        "652e0720008ffd798cbd7ea8762cfed2",
+        "c07a010739041d655ff03374d44acbe3",
+        "13cdb77bd5b06f495a09969a257409b6",
+        "b4c12dff491b8edb40be936fbc2f93f9",
+        "fdf1c5fe6d864b2b183de8c1fcd27210",
+        "36c06e771a8df3c6b525395411d10f9f",
+        "b6f7c6b2419dd715d612c6e44abc040b",
+        "2ed9e8e308e292d709d7e5f64d48c68c",
+        "ddf6fb1eedffa8d4a4488ee063749fbc",
+        "0f16670d30c69ce64e177fd92596c052",
+        "c96e5bdae71b5539e07a68a2ec1e63da",
+        "ca4e6c6d387fc1061ced39ce8611b079",
+        "6a54f7d48aa8ec420fe42d9dcd1f77e6",
+        "ea0670dcf2f297fd7d796ee7c3bdec54",
+        "934c6ab1818f250512451722a3cf350a",
+        "70b11cca9f075843cb783f777de84fff",
+        "93c31373f47d3dc3c3554753c456c2ad",
+        "12a95e29a3c842f5db3320a310c633c3"
+      ]
+    },
+    {
+      "cluster_id": 7,
+      "name": "international MMS troubleshooting",
+      "description": "These tasks all involve diagnosing and fixing a mobile phone's inability to send MMS messages while the user is traveling abroad, often specifically in France.",
+      "member_trace_ids": [
+        "8c94a704d44ecf1535daecda304efc89",
+        "4343ec927ae3473dbf262b868ab52612",
+        "88eb6e31edfbfbc693dc49031889c8bd",
+        "5e3c8d0002af8f39dd363e0e12cc5379",
+        "90717ee667acd4de15cf2bd4c9ed85c4",
+        "40ca955d14cc533972dd454cd6ccdbbe",
+        "3b6d65575b0188dad3bb97c3eeff199c",
+        "5daf57194510c0d36bc6062d2eb81fcb",
+        "dac5e37f522e29db1e3c3283c8503746",
+        "d7a04eef1e455c18e13911eebab5c3fb",
+        "455d31ca97b6bbcc407cc81efb719c9c",
+        "0d937e573d0ff722278c2a8904dfd4f6",
+        "f1dc69be505b0e3d76f266ff50833242",
+        "31db655a3dc06682c8b9e6582340587a",
+        "8a19016171602ddf88b5451baf592396",
+        "baa99508f5a7de677dc058955cb48626",
+        "c9d49b67ebcf4c185a10382ee5903d9c",
+        "2d854ec27a392e8ebd2cce456317769f",
+        "3959b549ba5bca79cefab4de44da481b"
+      ]
+    },
+    {
+      "cluster_id": 6,
+      "name": "MMS data troubleshooting",
+      "description": "These tasks all involve fixing MMS sending problems, typically by adding or refueling mobile data, often while the user is abroad.",
+      "member_trace_ids": [
+        "27a634468fe3fc7b1cdbcf8c1520ac10",
+        "66cd0428b66853eaf725aa707755a0e4",
+        "ee85d9e0014891e715c9f5dc44197815",
+        "63fede440a23b41556cea8cf2995b1d0",
+        "ab83c30718a8ff8a41217f9089ddc260",
+        "959dae3165642074e89fad8a366ab77e",
+        "4db5b43eb4303a4e8163c207a00e3dcd",
+        "c5f353b87088341401464e87bcdbd557",
+        "117e327fd58aef4e8223038008b555d7",
+        "a57b66c336067bf569d733615f574238",
+        "6a25e7d04bad258c8e58e1f81d0af62c",
+        "2f4d37e7fbd82165548bd658072a47e7",
+        "235a88321c5f102477ced652dbaf1359",
+        "9da339dcf637859ca8380cae82dca574",
+        "b54b597c4a6631b5f71e3681a15ed2ee",
+        "170ec879c7a7dc107f7db0992fe26e73",
+        "9bc11daca89a646aa9a82fe959be958b"
+      ]
+    },
+    {
+      "cluster_id": 8,
+      "name": "Mobile network troubleshooting",
+      "description": "These tasks all involve diagnosing and resolving cellular connectivity problems such as no service or mobile data issues on a phone line.",
+      "member_trace_ids": [
+        "69095e52c910946d7704aa3f6a2c6514",
+        "e12d3ee571ca6b2e7a3a8dbca1a51352",
+        "7c3b5d85af5693401568a338e700ec86",
+        "cbffce9cdc687c8eb5c165ea07e6b23a",
+        "f4298311aaff6d33f164d6c0b7796ca5",
+        "772c0b9b7afdfce7f6d518bed9b5172b",
+        "e17213398730b5a021f0b5e8c15d4746",
+        "5384ab190d9ff4ec70e92f25b2518c82",
+        "0007cd4198dd207a37423204296b117b",
+        "1d152f172f429dd4a5b202882278f2b7",
+        "00c3937622c3e9f29b43064203256ff7",
+        "a373d9e86e38a8023a2eacf75dcaf709",
+        "e68da37b9d5dfd2585ea5b4f45871f6e",
+        "985a10e0e1ddc5eeb2923712a513db92",
+        "a408ccb53ff681972662a6b25cbc23a2",
+        "627981b6e49d8294394673266334a77d",
+        "8bb5c454d761d004b86ca5ad06784418"
+      ]
+    },
+    {
+      "cluster_id": 12,
+      "name": "International mobile data troubleshooting",
+      "description": "These tasks all involve diagnosing and fixing mobile data connectivity problems while traveling abroad, often to restore reliable high-speed internet access.",
+      "member_trace_ids": [
+        "d059af5653e160fe5db9101f293fbc47",
+        "73076f5d1691322bd7c3a89d8e987fe7",
+        "030730a96c210d8090a0fe4e64e5c488",
+        "db907a28f347ffbd6038db25a30a2cf4",
+        "3f933f8e148843eb37cb065457c5e4db",
+        "11fb4b7e3762a97c2d265fd6ca46497b",
+        "27d81f2f44632d71d52946fa1f830dd8",
+        "38569c124fcdb38990becf52bc5b11d1",
+        "f28821d3560939354c7a553ad08e614f",
+        "9a4d754aaca7880751f0f3e42ee421c0",
+        "1bb3fe11da704d4b16cbb8a5671dab20",
+        "d4d78ad78d3de090f5cb79f913ddfad6",
+        "6c786e6d14cb39a97071d623615432e6",
+        "4edc9e9b0ea5ed47690a4d8617536e61",
+        "4c7a29b386ce0b19017facb2208d4f36",
+        "152bd99ab9ad40996444d5ef268aadab",
+        "f0892b6f8f6efaf9ef3edb19824a40fc"
+      ]
+    },
+    {
+      "cluster_id": 14,
+      "name": "MMS roaming activation",
+      "description": "These tasks all involve enabling mobile roaming so the customer can send MMS messages while traveling abroad.",
+      "member_trace_ids": [
+        "92aa8830d7567683e308b007b298da52",
+        "b42da82b7283366b1acd3ad0627b9b1e",
+        "04f1c9136dd1730c92e25f34e5ddb2ae",
+        "541fefca568562cdd0b18a44fa5ea270",
+        "2886ae29d1ba0e87f15f0696dbba9a93",
+        "8178355d964b317f61733b211b75f9a3",
+        "7de9389e476550ea487238fc6d12848c",
+        "796c55f5f6ac673754a3d03a8d4e2f68",
+        "7c3368c34a798cf33531bcde9499eb9e",
+        "c0eff22b7b95c0bd5f9932a113193a5b",
+        "693094444a9f291ef38886cb3017177c",
+        "6daaee27c66237e7737f5c61fc8e7099",
+        "2838746db3a1cbc447c557e57bbfc927",
+        "c427cd6ef1bbce94b59584c8c1c4fc25",
+        "c7df8731cbdbbc4db0aed5587d01464f"
+      ]
+    },
+    {
+      "cluster_id": 9,
+      "name": "MMS sending troubleshooting",
+      "description": "These tasks all involve diagnosing and fixing an issue that prevents MMS messages from being sent on a user's phone or messaging app.",
+      "member_trace_ids": [
+        "ab1c614d9039fdd837fadb0f0055f19a",
+        "99b27aae73a4ca4f6e5181a1e69e0386",
+        "a8d1b6a1e26da8ee6689644a30632b5e",
+        "4dd1581e728c0cc59c24b05c516c523f",
+        "fec2b138b763adca765c645492789103",
+        "9b77e3e598f3f6ca61a27c7a81873253",
+        "d6790b660a1ab23533f0848dafe03d96",
+        "4cf09f9e6ddc820a85c646ce0fde80cb",
+        "3ada009fda4c0e2551b39ddc8a981dcc",
+        "a4ef809f2137c28fe7d451ea8c644994",
+        "4f570d8671d68f2996f64df0bf7ecc4b"
+      ]
+    },
+    {
+      "cluster_id": 13,
+      "name": "Reservation or item exchanges",
+      "description": "These tasks all involve modifying an existing booking or purchase by changing details, upgrading options, canceling, or exchanging an item for a different variant.",
+      "member_trace_ids": [
+        "041936340729fbfb33d3b1b6e6f799c8",
+        "56917256da22ca30bddb2da69adf75dd",
+        "e5b3fd60b950d3d481323c21e73d7d35",
+        "3023718144427decfd3ed937683c061e",
+        "97f8d3b70f874bce498f8d534ef83149",
+        "29612d15e6d0105a5eb3825d0ff4cdf6",
+        "833fcb9fb230b74ed2adf8b52a76c636",
+        "831aa5412b5eba52d94718f6662b5a9e",
+        "08688231b59cafce2c83d95c1d4df8ae",
+        "16a3db00374348ca059aa8cd6dab251d",
+        "de10ee216b62ae67d9e0a0d668fdab63"
+      ]
+    },
+    {
+      "cluster_id": 10,
+      "name": "Add mobile data",
+      "description": "These tasks all involve resolving a slow mobile data connection by adding extra mobile data to the user's plan.",
+      "member_trace_ids": [
+        "8fb0686ede3a2eab2503447cbf66b3b5",
+        "38503046fd9ba41b44ee88b31bac553d",
+        "264854df7a3ec58474959490bbac9173",
+        "c0a2762dc4b7ff599063ec17e174ae83",
+        "7e56dba7ab62ddeea7c611671dbb37f1",
+        "e2bf89ccc2d218489e1a226015e56180",
+        "669c67a1c0bff48602cbb9b1fe275def",
+        "48f73058cc7fd9d6ada80b0e86f4f41d"
+      ]
+    },
+    {
+      "cluster_id": 11,
+      "name": "Order changes and returns",
+      "description": "These tasks involve modifying existing purchases or bookings, such as updating addresses, changing items or options, removing travelers, and processing returns, exchanges, or refunds.",
+      "member_trace_ids": [
+        "3635177f0858a25b553b7f3e9f33cf46",
+        "062912cc0d4f38fffff4f1453ce97307",
+        "a312f2ef6fe7123202164cdc4736dba1",
+        "ea1f0245551767937884c49a87f1b35b",
+        "279bcf6f14a8fd2da92d7950abccb8d1",
+        "b1d3938af12612fa17c035929374ecc8",
+        "f203f0c5439f3d240836f4f53497ab4e",
+        "bf04d8b8ae918bde6822ca6f7da01ab6"
+      ]
+    },
+    {
+      "cluster_id": 1,
+      "name": "Mobile roaming activation",
+      "description": "These tasks all involve turning on mobile data roaming for John Smith's phone while he is traveling abroad, specifically in France.",
+      "member_trace_ids": [
+        "687df893630e7e8f7a7e5343bd0c5d01",
+        "b3784a91163a012b1436090a9c478912",
+        "4352bfc9c8f7a17820267c600c8ade36",
+        "d7f2997cbe0fcd62d4feee3600bd644c",
+        "09703eb0f8b08c845aa4992fe569cb16",
+        "a59029327025ecb17749f041acfc782f"
+      ]
+    },
+    {
+      "cluster_id": 3,
+      "name": "Flight reservation cancellation",
+      "description": "These tasks involve checking or modifying flight bookings, especially canceling reservations and handling related refund or insurance details.",
+      "member_trace_ids": [
+        "efec6ac80ec302b2539752de1d58d7d3",
+        "b333941ccdeb37c9a78375fbaf15b436",
+        "003e2c577b20f0a9bb38ef9e065f6fd6",
+        "8a036f7d5cd8db835fdfc028d7478131"
+      ]
+    },
+    {
+      "cluster_id": 2,
+      "name": "flight cancellation compensation claim",
+      "description": "These tasks involve seeking reimbursement or compensation from an airline after a business flight was canceled.",
+      "member_trace_ids": [
+        "16e5f88274b89eb32563a7706625d44d"
+      ]
+    }
+  ],
+  "corpus_traces": 211,
+  "corpus_coverage": 0.976303317535545,
+  "coverage_tau": 0.7
+}

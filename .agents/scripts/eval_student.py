@@ -133,6 +133,7 @@ def main() -> None:
     parser.add_argument("--passes", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=1.0)  # BENCH-B2 eval protocol
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--eval-pool", default="eval_pool.json", help="pool file under distill/")
     parser.add_argument("--wm-model", default=NOVA_LITE, help="Bedrock model backing the WM")
     parser.add_argument("--judge-model", default=JUDGE_MODEL,
                         help="judge: gemini model name, or bedrock:<model-id>")
@@ -147,7 +148,7 @@ def main() -> None:
         str(WM_DIR), _resolve(args.wm_model), telemetry_root=str(REPO / ".wmh")
     )
 
-    pool = ScenarioSet.load(DISTILL / "eval_pool.json")
+    pool = ScenarioSet.load(DISTILL / args.eval_pool)
     scenarios = pool.scenarios[: args.limit] if args.limit else pool.scenarios
     traces = get_adapter("otel-genai").from_file(str(TRACES))
     traces_by_id = {t.trace_id: t for t in traces}
