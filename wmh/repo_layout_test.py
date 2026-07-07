@@ -27,9 +27,7 @@ ALLOWED_TOP_DIRS = {
     ".agents",
     ".claude",
     ".github",
-    # Monorepo workspace members (AGENTS.md § Monorepo):
-    "llm-waterfall",
-    "environment-capture",
+    "packages",  # monorepo workspace members live here (AGENTS.md § Monorepo)
 }
 
 
@@ -139,7 +137,12 @@ def test_root_gate_covers_every_python_member() -> None:
     with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
         root = tomllib.load(fh)
     testpaths = set(root["tool"]["pytest"]["ini_options"]["testpaths"])
-    missing = [d.name for d in _workspace_member_dirs() if d.name not in testpaths]
+
+    def covered(member: Path) -> bool:
+        rel = member.relative_to(REPO_ROOT)
+        return any(rel == Path(tp) or Path(tp) in rel.parents for tp in testpaths)
+
+    missing = [str(d.relative_to(REPO_ROOT)) for d in _workspace_member_dirs() if not covered(d)]
     assert not missing, (
         f"workspace members {missing} are not in [tool.pytest.ini_options].testpaths; the root "
         "gate must cover every Python member (AGENTS.md § Monorepo)"

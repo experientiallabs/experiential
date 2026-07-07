@@ -13,6 +13,11 @@ dependencies = [
     "numpy>=1.26",
     "httpx>=0.27",
     "rich>=13.7",
+    # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
+    # read core behind `wmh download` (stdlib-only; pushing needs the member's fetch extra).
+    # RELEASE ORDER: environment-capture must be published to PyPI before any wmh release —
+    # outside the workspace this dependency resolves from PyPI, not [tool.uv.sources].
+    "environment-capture",
     "gepa>=0.1.1",
     "tomli-w>=1.0",  # writing .wmh/config.toml (stdlib tomllib reads); every `wmh build` needs it
     "posthog>=7.0",
@@ -36,10 +41,10 @@ dev = [
 
 [dependency-groups]
 # Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
-# gate covers their tests — WITHOUT entering wmh's published metadata: members aren't on PyPI,
-# so a published extra requiring them would make `pip install world-model-harness[dev]`
-# unresolvable outside the workspace.
-dev = ["llm-waterfall[all]"]
+# gate covers their tests. llm-waterfall stays dev-only (no wmh code imports it);
+# environment-capture graduated to [project.dependencies] when `wmh download` started consuming
+# it — see the RELEASE ORDER note there. The dev group adds the members' heavy extras.
+dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]
 wmh = "wmh.cli:main"
@@ -57,29 +62,44 @@ packages = ["wmh"]
 include = ["/wmh", "/README.md", "/pyproject.toml", "/conftest.py"]
 
 [tool.uv.workspace]
-# The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members are
-# top-level dirs, each independently published to PyPI. `uv sync` resolves the whole workspace.
-members = ["llm-waterfall"]
+# The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members live
+# under packages/, each independently published to PyPI. `uv sync` resolves the whole workspace.
+members = ["packages/*"]
 
 [tool.uv.sources]
 # Inside the workspace, anything that depends on a member resolves it from source, not PyPI.
 llm-waterfall = { workspace = true }
+environment-capture = { workspace = true }
 
 [tool.pytest.ini_options]
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
 # One root gate covers the flagship and every Python member (same inline-test convention).
-testpaths = ["wmh", "llm-waterfall"]
+testpaths = ["wmh", "packages"]
+# tau2-bench is a local clone of the external real-environment runner (own test suite, own
+# deps) that lives beside the tau-bench member data; it is not part of this gate.
+norecursedirs = ["tau2-bench"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 # `examples/` holds isolated, self-contained task launch/capture helpers that can depend on their
 # own benchmark environments. They are not part of the reusable `wmh` package.
-extend-exclude = ["examples/", ".agents/"]
+extend-exclude = ["examples/", ".agents/",
+    # Pre-contract benchmark dirs keep their examples-era exemption (legacy capture tooling).
+    "packages/environment-capture/tau-bench/",
+    "packages/environment-capture/terminal-tasks/",
+    "packages/environment-capture/swe-bench/",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
+
+[tool.ruff.lint.per-file-ignores]
+# The environment-capture member's benchmark capture/smoke/fetch scripts are operator-run CLIs
+# that report progress on stdout/stderr — that is their product output, same class as the
+# legacy dirs excluded above. The never-print rule (AGENTS.md § Python) binds `wmh/` in full.
+"packages/environment-capture/**" = ["T20"]
 
 [tool.ty.environment]
 python-version = "3.11"
@@ -87,4 +107,9 @@ python-version = "3.11"
 [tool.ty.src]
 # `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
 # (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
-exclude = ["examples/", ".agents/"]
+exclude = ["examples/", ".agents/",
+    "packages/environment-capture/*/backend/",
+    "packages/environment-capture/tau-bench/",
+    "packages/environment-capture/terminal-tasks/",
+    "packages/environment-capture/swe-bench/",
+]

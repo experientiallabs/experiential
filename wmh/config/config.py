@@ -80,6 +80,7 @@ class HarnessConfig(BaseModel):
         gepa_budget: int,
         train_split: float = 0.8,
         judge_model: str | None = None,
+        trace_adapter: str = "otel-genai",
     ) -> HarnessConfig:
         """Assemble a build config from the choices `wmh build` collects.
 
@@ -112,6 +113,7 @@ class HarnessConfig(BaseModel):
             gepa_budget=gepa_budget,
             train_split=train_split,
             judge_model=judge_model,
+            trace_adapter=trace_adapter,
         )
 
 

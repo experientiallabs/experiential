@@ -56,8 +56,8 @@ PASSES = 3  # every metric is a mean of 3 passes (house rule)
 MAX_STEPS = 5
 WORKERS = 6
 OUT_DIR = REPO / ".agents" / "docs" / "research"
-TRACES = REPO / "examples" / "tau-bench" / "traces.otel.jsonl"
-WM_DIR = REPO / "examples" / "tau-bench" / "models" / "tau-bench"
+TRACES = REPO / "packages" / "environment-capture" / "tau-bench" / "traces.otel.jsonl"
+WM_DIR = REPO / "packages" / "environment-capture" / "tau-bench" / "models" / "tau-bench"
 
 
 class RetryProvider:

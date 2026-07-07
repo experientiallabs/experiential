@@ -136,7 +136,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("suite", nargs="?", help="Eval-suite name (e.g. tau-bench).")
     parser.add_argument("--file", default=None, help="Raw OTel trace file (instead of a suite).")
-    parser.add_argument("--examples", default="examples", help="Examples root for suite lookup.")
+    parser.add_argument(
+        "--examples",
+        default="packages/environment-capture",
+        help="Benchmark-suite root (all benchmark suites moved to packages/environment-capture/).",
+    )
     parser.add_argument("--counts", default=DEFAULT_COUNTS, help="Comma-separated train counts.")
     parser.add_argument("--modes", default="base,gepa", help="Comma-separated: base, gepa.")
     parser.add_argument("--seeds", default="0,1,2", help="Comma-separated seeds (error bars).")
