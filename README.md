@@ -34,6 +34,7 @@ Already have traces in **Braintrust, Arize Phoenix, Langfuse, LangSmith, PostHog
 uv run wmh examples list          # swe-bench, tau-bench, terminal-tasks
 uv run wmh eval list              # eval suites shipped with the examples
 uv run wmh eval run tau-bench     # replay + score reconstruction fidelity
+uv run wmh scenarios build --file traces.otel.jsonl   # traces -> judgeable eval scenarios
 uv run wmh play                   # step into the environment yourself
 uv run wmh serve                  # local HTTP backend on :8000
 ```
