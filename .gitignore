@@ -35,3 +35,9 @@ settings.toml
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude/projects/
+
+# Raw experiment data artifacts are NOT committed — they live in the Notion experiments area
+# (Research page) with a SHA-256 manifest. Analysis prose (.md) stays in git.
+.agents/docs/research/**/*.json
+.agents/docs/research/**/*.jsonl
+.agents/docs/research/**/*.html

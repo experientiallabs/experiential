@@ -66,7 +66,9 @@ uv run pytest -q
      worktrees and chats) but exempt from the gate, from review standards, and from any
      stability expectation: it is pruned periodically and nothing may import from it or link to
      it as if it were permanent. `.agents/docs/` is organized as `reference/`,
-     `design-decisions/`, `research/` (incl. raw results), `proposals/`. When work matures, its
+     `design-decisions/`, `research/` (analysis prose only — raw result DATA such as pools,
+     episodes, and eval JSONs is never committed; it goes to the Notion experiments area
+     under Research with a SHA-256 manifest, enforced by .gitignore), `proposals/`. When work matures, its
      product is promoted out (writeup → `docs/research/`, verified how-to → `docs/reference/`,
      reusable code → `wmh/`, dataset tooling → `examples/<task>/`) and the scraps die here.
    - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
