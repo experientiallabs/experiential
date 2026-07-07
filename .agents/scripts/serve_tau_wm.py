@@ -51,7 +51,12 @@ from wmh.providers.fallback import FallbackProvider
 from wmh.serving.server import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODEL_DIR = REPO_ROOT / "examples" / "tau-bench" / "models" / "tau-bench"
+# WMH_MODEL_DIR/WMH_WM_NAME swap the served artifact for the D67 cross-benchmark
+# smokes (terminal/swe/gui reuse this script unchanged apart from these two).
+MODEL_DIR = Path(
+    os.environ.get("WMH_MODEL_DIR", REPO_ROOT / "examples" / "tau-bench" / "models" / "tau-bench")
+)
+WM_NAME = os.environ.get("WMH_WM_NAME", "tau-bench")
 HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # dated profile id (required)
 EVAL_ENV_MODEL = "gpt-5.5"
 JUDGE_MODEL = "us.anthropic.claude-opus-4-8"  # the artifact's own serve model id
@@ -175,7 +180,7 @@ def main() -> None:
     wm = WorldModel.load(
         str(MODEL_DIR), serve_provider, reward_provider=reward_provider, top_k=top_k
     )
-    app = create_app(world_models={"tau-bench": wm})
+    app = create_app(world_models={WM_NAME: wm})
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 
 
