@@ -1,11 +1,11 @@
 """Fetch and list trace-corpus data bundles from the Hugging Face Hub (stdlib-only).
 
 Every publishable benchmark's bundle — the trace corpus plus its task data / gold / evidence
-dirs — lives in a dataset repo under the org. This module is the READ core shared by every
-front-end (`wmh download`, the serving API's trace-download endpoint, `python -m
-environment_capture.hub fetch`): plain-HTTP against the Hub's public REST API, so it needs no
-extra dependency and no token for public repos (pass ``token`` for private ones). Uploading
-lives in `environment_capture.hub_push` (requires the ``fetch`` extra).
+dirs — lives in a dataset repo under the org. This module is the READ core every front-end
+shares: `wmh download`, `python -m environment_capture.hub fetch`, and the contract the
+website's serving trace-download endpoint adopts (PR #52). Plain-HTTP against the Hub's public
+REST API, so it needs no extra dependency and no token for public repos (pass ``token`` for
+private ones). Uploading lives in `environment_capture.hub_push` (the ``fetch`` extra).
 
 Bundles are local-first: capture writes into the benchmark dir, nothing here deletes local
 files, and fetching never overwrites an existing file unless forced. Downloads stream to a
@@ -15,7 +15,7 @@ Usage (from the repo root):
     uv run wmh download                                              # interactive picker
     uv run python -m environment_capture.hub fetch dabstep           # skip if already present
     uv run python -m environment_capture.hub fetch all --force       # overwrite local copies
-    uv run python -m environment_capture.hub push bird-sql           # see hub_push
+    uv run python -m environment_capture.hub_push bird-sql           # publish/update (write side)
 """
 
 from __future__ import annotations
@@ -23,10 +23,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from environment_capture.trajectory import JsonValue
 
 _ORG = "experiential-labs"
 _CORPUS_FILE = "traces.otel.jsonl"
@@ -215,47 +220,64 @@ def fetch_corpus(
 ) -> Path:
     """Download the benchmark's corpus AND published data dirs into place; returns the corpus path.
 
-    Local-first: existing files/dirs are kept unless ``force=True`` — fetching must never
-    silently clobber a corpus that local capture waves have grown past the published one.
-    With an explicit ``dest`` only the corpus file is written (no data dirs).
-    ``on_progress(bytes_done, bytes_total)`` fires per streamed chunk across the whole bundle.
+    Local-first and resumable at file granularity: every published file that is missing locally
+    is fetched; existing files are kept unless ``force=True`` — fetching must never silently
+    clobber a corpus that local capture waves have grown past the published one, and an
+    interrupted fetch picks up the files it hasn't finished. With an explicit ``dest`` only the
+    corpus file is written (no data dirs). ``on_progress(bytes_done, bytes_total)`` fires per
+    streamed chunk across the whole bundle.
+
+    Raises ``ValueError`` for unknown/unpublished corpora and ``urllib.error.URLError`` (incl.
+    ``HTTPError``) when the Hub is unreachable — front-ends translate those for their users.
     """
     spec = CORPORA.get(benchmark)
     if spec is None:
         publishable = ", ".join(sorted(CORPORA))
         raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
     repo_id = repo_id_for(benchmark)
+    root = _data_root()
     target = dest or corpus_path(benchmark)
 
-    # Work list: (remote path, local target, size). Sizes come from the tree API so the total
-    # is known up front and one progress bar can cover the whole bundle.
+    # One recursive tree call covers the whole repo; sizes make the total known up front so a
+    # single progress bar can span the bundle.
+    sizes = dict(_repo_tree(repo_id, revision, token=token))
     work: list[tuple[str, Path, int]] = []
     if not target.exists() or force:
-        (corpus_entry,) = [
-            e for e in _repo_tree(repo_id, revision, token=token) if e[0] == _CORPUS_FILE
-        ] or [(_CORPUS_FILE, 0)]
-        work.append((_CORPUS_FILE, target, corpus_entry[1]))
+        if _CORPUS_FILE not in sizes:
+            raise ValueError(
+                f"{repo_id} has no {_CORPUS_FILE} at revision {revision!r} — the dataset repo "
+                "exists but the corpus was never pushed; push it or pick another benchmark"
+            )
+        work.append((_CORPUS_FILE, target, sizes[_CORPUS_FILE]))
     if dest is None:
-        pending = [
-            d for d in spec.data_dirs if force or not (_data_root() / benchmark / d).is_dir()
-        ]
-        for data_dir in pending:
-            for remote_path, size in _repo_tree(repo_id, revision, subpath=data_dir, token=token):
-                local = _data_root() / benchmark / remote_path
-                work.append((remote_path, local, size))
+        for remote_path, size in sorted(sizes.items()):
+            top = remote_path.split("/", 1)[0]
+            if top not in spec.data_dirs:
+                continue
+            local = root / benchmark / remote_path
+            # File-level skip, not dir-level: an interrupted fetch that materialized only part
+            # of a dir resumes with the missing files instead of treating the dir as done.
+            if local.exists() and not force:
+                continue
+            work.append((remote_path, local, size))
 
     total = sum(size for _, _, size in work)
     done = 0
-    for remote_path, local, _size in work:
-        url = f"{_HUB}/datasets/{repo_id}/resolve/{revision}/{remote_path}"
 
-        def chunk_done(n: int) -> None:
-            nonlocal done
-            done += n
-            if on_progress is not None:
-                on_progress(done, total)
+    def chunk_done(n: int) -> None:
+        nonlocal done
+        done += n
+        if on_progress is not None:
+            on_progress(done, total)
 
-        _stream_to(url, local, token=token, chunk_done=chunk_done)
+    for remote_path, local, size in work:
+        url = f"{_HUB}/datasets/{repo_id}/resolve/{revision}/{urllib.parse.quote(remote_path)}"
+        written = _stream_to(url, local, token=token, chunk_done=chunk_done)
+        if size and written != size:
+            raise OSError(
+                f"{remote_path}: downloaded {written} bytes but the Hub tree lists {size} — "
+                "truncated transfer; re-run the fetch"
+            )
     return target
 
 
@@ -271,17 +293,28 @@ def _request(url: str, token: str | None) -> urllib.request.Request:
     return urllib.request.Request(url, headers=headers)  # noqa: S310 - https-only constants
 
 
-def _http_json(url: str, *, token: str | None) -> object:
-    with urllib.request.urlopen(_request(url, token), timeout=60) as response:  # noqa: S310
-        return json.loads(response.read().decode("utf-8"))
+def _http_json(url: str, *, token: str | None) -> JsonValue:
+    """GET a JSON document, retrying transient failures (5xx, connection drops) twice."""
+    last: Exception | None = None
+    for delay_s in (0, 1, 3):
+        if delay_s:
+            time.sleep(delay_s)
+        try:
+            with urllib.request.urlopen(_request(url, token), timeout=60) as response:  # noqa: S310
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code < 500:
+                raise  # 4xx is a real answer, not a flake
+            last = error
+        except urllib.error.URLError as error:
+            last = error
+    assert last is not None
+    raise last
 
 
-def _repo_tree(
-    repo_id: str, revision: str, *, subpath: str = "", token: str | None
-) -> list[tuple[str, int]]:
-    """(path, size) for every FILE under ``subpath`` in the dataset repo."""
-    suffix = f"/{subpath}" if subpath else ""
-    url = f"{_HUB}/api/datasets/{repo_id}/tree/{revision}{suffix}?recursive=true"
+def _repo_tree(repo_id: str, revision: str, *, token: str | None) -> list[tuple[str, int]]:
+    """(path, size) for every FILE in the dataset repo (one recursive listing)."""
+    url = f"{_HUB}/api/datasets/{repo_id}/tree/{revision}?recursive=true"
     listing = _http_json(url, token=token)
     files: list[tuple[str, int]] = []
     for entry in listing if isinstance(listing, list) else []:
@@ -295,61 +328,61 @@ def _repo_tree(
 
 def _stream_to(
     url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
-) -> None:
-    """Stream ``url`` to ``dest`` atomically: write a ``.part`` sibling, then rename over.
+) -> int:
+    """Stream ``url`` to ``dest`` atomically; returns the byte count written.
 
-    A partially-downloaded corpus must never be mistaken for a complete one by a concurrent
-    reader (the serving API polls the target path for byte progress).
+    Writes a ``.part`` sibling and renames over, so a partially-downloaded corpus is never
+    mistaken for a complete one by a concurrent reader; a failed stream removes its ``.part``.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
-    with urllib.request.urlopen(_request(url, token), timeout=300) as response:  # noqa: S310
-        with part.open("wb") as sink:
-            while True:
-                chunk = response.read(_CHUNK_BYTES)
-                if not chunk:
-                    break
-                sink.write(chunk)
-                chunk_done(len(chunk))
+    written = 0
+    try:
+        with urllib.request.urlopen(_request(url, token), timeout=300) as response:  # noqa: S310
+            with part.open("wb") as sink:
+                while True:
+                    chunk = response.read(_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    sink.write(chunk)
+                    written += len(chunk)
+                    chunk_done(len(chunk))
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     os.replace(part, dest)
+    return written
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    push = sub.add_parser("push", help="Create/update dataset repo(s) from local corpora.")
-    push.add_argument("benchmark", help=f"Benchmark name, or 'all' ({', '.join(sorted(CORPORA))})")
-    push.add_argument("--private", action="store_true", help="Create the repo(s) private.")
+    # Pushing lives in hub_push (needs the huggingface_hub extra); this stub keeps the old
+    # command discoverable without importing the write side here (imports stay module-scope).
+    push = sub.add_parser("push", help="Moved: use `python -m environment_capture.hub_push`.")
+    push.add_argument("benchmark", nargs="?")
+    push.add_argument("--private", action="store_true")
 
     fetch = sub.add_parser("fetch", help="Download full data bundles into the benchmark dirs.")
-    fetch.add_argument("benchmark", help="Benchmark name, or 'all'")
+    fetch.add_argument("benchmark", help=f"Benchmark name, or 'all' ({', '.join(sorted(CORPORA))})")
     fetch.add_argument(
         "--force", action="store_true", help="Overwrite existing local corpus/data files."
     )
 
     args = parser.parse_args()
     if args.command == "push":
-        # The write path is the one place that needs huggingface_hub (the `fetch` extra); the
-        # import lives at the dispatch so plain fetch installs never pay for it. A missing
-        # extra fails loudly right here with the install hint.
-        try:
-            from environment_capture import hub_push
-        except ModuleNotFoundError as error:  # pragma: no cover - exercised only without extra
-            raise SystemExit(
-                "pushing needs huggingface_hub: install the extra "
-                "(`pip install 'environment-capture[fetch]'` / `uv sync --extra dev`)"
-            ) from error
+        raise SystemExit(
+            "pushing moved to the write module: "
+            "`uv run python -m environment_capture.hub_push <benchmark>|all [--private]` "
+            "(needs the fetch extra + a write token)"
+        )
     names = sorted(CORPORA) if args.benchmark == "all" else [args.benchmark]
     for name in names:
-        if args.command == "push":
-            url = hub_push.push_corpus(name, private=args.private)
-            print(f"pushed {name} -> {url}")
-        else:
-            existing = corpus_path(name).exists()
-            path = fetch_corpus(name, force=args.force)
-            state = "kept local" if existing and not args.force else "fetched"
-            print(f"{state} {name} -> {path}")
+        existing = corpus_path(name).exists()
+        path = fetch_corpus(name, force=args.force)
+        state = "kept local" if existing and not args.force else "fetched"
+        print(f"{state} {name} -> {path}")
 
 
 if __name__ == "__main__":

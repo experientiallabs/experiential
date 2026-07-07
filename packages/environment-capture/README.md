@@ -55,8 +55,8 @@ the Hub is the sharing/distribution layer.
 
 ```bash
 # publish or UPDATE one corpus (or 'all') — every push is a Hub commit, history kept
-uv run python -m environment_capture.hub push bird-sql
-uv run python -m environment_capture.hub push all            # add --private for private repos
+uv run python -m environment_capture.hub_push bird-sql
+uv run python -m environment_capture.hub_push all            # add --private for private repos
 
 # pull the full bundle (corpus + data dirs) after a fresh clone; never clobbers local files
 uv run wmh download                 # interactive picker over the org's live datasets

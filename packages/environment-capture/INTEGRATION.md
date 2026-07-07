@@ -37,7 +37,7 @@ the cleanest fresh-capture reference, `appworld/` the heavy-engine reference).
    to `environment_capture/hub.py` — license tag MUST match the upstream terms you checked in
    #3, and `data_dirs` lists the benchmark's data payload dirs (task index, gold, evidence);
    local-only licenses like appworld's are excluded there, not special-cased in scripts. Then
-   `uv run python -m environment_capture.hub push <benchmark>` — or pass `--push-hub` to the
+   `uv run python -m environment_capture.hub_push <benchmark>` — or pass `--push-hub` to the
    capture script. NOTHING under those dirs (or `traces.otel.jsonl`) is committed to git — the
    package `.gitignore` enforces it. Re-pushing after later waves is the update path; bundles
    stay local-first (nothing deletes local files).

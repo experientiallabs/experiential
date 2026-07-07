@@ -13,6 +13,7 @@ import logging
 import random
 import subprocess
 import time
+import urllib.error
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ from environment_capture.hub import (
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
 from rich.table import Table
 
 import wmh.providers as providers
@@ -494,10 +496,16 @@ def download(
     if selected == ["all"]:
         selected = sorted(CORPORA)
     if not selected:
-        published = published_corpora()
+        try:
+            published = published_corpora()
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"could not list the Hub's published datasets ({exc.reason}); check the "
+                "connection, or pass benchmark names directly, e.g. `wmh download bird-sql`"
+            ) from exc
         if not published:
             raise typer.BadParameter(
-                "no published corpora found on the Hub (offline?); "
+                "no published corpora found on the Hub; "
                 "pass benchmark names directly, e.g. `wmh download bird-sql`"
             )
         notes = {}
@@ -514,11 +522,38 @@ def download(
     for name in selected:
         existing = corpus_path(name).exists()
         try:
-            path = fetch_corpus(name, force=force)
+            path = _fetch_with_progress(name, force=force)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
+        except urllib.error.HTTPError as exc:
+            raise typer.BadParameter(
+                f"{name}: the Hub answered {exc.code} for {exc.url}; the dataset may not be "
+                "published yet — `wmh download` with no arguments lists what is"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"{name}: could not reach the Hub ({exc.reason}); check the connection and re-run"
+                " — fetches resume file-by-file"
+            ) from exc
         state = "kept local" if existing and not force else "fetched"
         _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+
+
+def _fetch_with_progress(name: str, *, force: bool) -> Path:
+    """fetch_corpus with a live byte progress bar (hidden when nothing needs downloading)."""
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        console=_console,
+        transient=True,
+    ) as progress:
+        task_id = progress.add_task(f"downloading {name}", total=None, visible=False)
+
+        def on_progress(done: int, total: int) -> None:
+            progress.update(task_id, completed=done, total=total or None, visible=True)
+
+        return fetch_corpus(name, force=force, on_progress=on_progress)
 
 
 @app.command("serve")

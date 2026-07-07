@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 
@@ -21,22 +22,21 @@ def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
     """Stand in for the Hub REST API: a tree listing plus resolve-URL streaming."""
 
     def http_json(url: str, *, token: str | None) -> object:
-        assert "/api/datasets/" in url and "/tree/main" in url
-        subpath = url.split("/tree/main", 1)[1].split("?", 1)[0].lstrip("/")
+        assert "/api/datasets/" in url and "/tree/main?recursive=true" in url
         return [
             {"type": "file", "path": path, "size": len(content)}
             for path, content in files.items()
-            if not subpath or path.startswith(f"{subpath}/")
         ]
 
     def stream_to(
         url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
-    ) -> None:
-        remote_path = url.split("/resolve/main/", 1)[1]
+    ) -> int:
+        remote_path = urllib.parse.unquote(url.split("/resolve/main/", 1)[1])
         dest.parent.mkdir(parents=True, exist_ok=True)
         content = files[remote_path]
         dest.write_bytes(content)
         chunk_done(len(content))
+        return len(content)
 
     monkeypatch.setattr(hub, "_http_json", http_json)
     monkeypatch.setattr(hub, "_stream_to", stream_to)
@@ -145,3 +145,75 @@ def test_every_committed_corpus_is_publishable_or_documented_local_only() -> Non
     if not dirs:  # standalone package install: data dirs don't ship
         pytest.skip("no sibling benchmark data dirs")
     assert dirs - set(CORPORA) <= {"appworld"}
+
+
+def test_fetch_resumes_missing_files_inside_an_existing_dir(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted fetch that materialized only part of a data dir picks up the missing
+    files on re-run — dir presence alone must not mean 'complete'."""
+    _fake_hub(
+        monkeypatch,
+        {
+            "traces.otel.jsonl": b"spans\n",
+            "data/train.jsonl": b"tasks\n",
+            "data/test.jsonl": b"held-out\n",
+        },
+    )
+    bench = data_root / "gaia2"
+    (bench / "data").mkdir(parents=True)
+    (bench / "traces.otel.jsonl").write_text("local\n")
+    (bench / "data" / "train.jsonl").write_text("already-here\n")
+
+    fetch_corpus("gaia2")
+    assert (bench / "data" / "train.jsonl").read_text() == "already-here\n"  # kept
+    assert (bench / "data" / "test.jsonl").read_bytes() == b"held-out\n"  # resumed
+
+
+def test_fetch_names_a_repo_missing_its_corpus(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_hub(monkeypatch, {"data/train.jsonl": b"tasks\n"})
+    with pytest.raises(ValueError, match="never pushed"):
+        fetch_corpus("gaia2")
+
+
+def test_gitignore_covers_every_declared_data_dir() -> None:
+    """The package .gitignore must shadow CORPORA's data_dirs: a spec dir with no matching
+    ignore pattern means `git add -A` can commit license-restricted payload."""
+    gitignore = hub._data_root() / ".gitignore"
+    if not gitignore.exists():  # standalone package install
+        pytest.skip("no package .gitignore shipped")
+    patterns = {
+        line.strip() for line in gitignore.read_text().splitlines() if line.strip().startswith("*/")
+    }
+    assert "*/traces.otel.jsonl" in patterns
+    declared = {d for spec in CORPORA.values() for d in spec.data_dirs}
+    missing = {d for d in declared if f"*/{d}/" not in patterns}
+    assert not missing, f"data dirs with no ignore pattern (license-leak risk): {missing}"
+
+
+def test_license_tags_match_the_provenance_readmes() -> None:
+    """CorpusSpec.license_id is what gets published on the dataset card; it must agree with the
+    license each benchmark README records (INTEGRATION.md non-negotiable #3)."""
+    human = {
+        "cc-by-nc-4.0": ("CC BY-NC",),
+        "cc-by-sa-4.0": ("CC BY-SA",),
+        "cc-by-4.0": ("CC BY 4.0", "CC-BY-4.0"),
+        "mit": ("MIT",),
+        "apache-2.0": ("Apache",),
+    }
+    root = hub._data_root()
+    checked = 0
+    for spec in CORPORA.values():
+        readme = root / spec.benchmark / "README.md"
+        if not readme.exists():
+            continue
+        text = readme.read_text(encoding="utf-8")
+        assert any(marker in text for marker in human[spec.license_id]), (
+            f"{spec.benchmark}: card would publish {spec.license_id} but its README never "
+            f"mentions {human[spec.license_id]} — fix whichever is wrong before pushing"
+        )
+        checked += 1
+    if not checked:  # standalone package install
+        pytest.skip("no benchmark READMEs shipped")

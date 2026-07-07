@@ -117,3 +117,11 @@ def test_gaia2_card_carries_the_disclosures(data_root: Path) -> None:
     card = " ".join(api.uploaded[f"{repo_id_for('gaia2')}/README.md"].decode().split())
     assert "not comparable to the official leaderboard" in card
     assert "models not be trained on evaluation data" in card
+
+
+def test_every_declared_data_dir_has_a_card_blurb() -> None:
+    """A new data_dir with no blurb would KeyError at push time; catch it at test time."""
+    from environment_capture.hub_push import DIR_BLURBS
+
+    declared = {d for spec in CORPORA.values() for d in spec.data_dirs}
+    assert declared <= set(DIR_BLURBS), f"missing blurbs: {declared - set(DIR_BLURBS)}"

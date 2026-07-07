@@ -15,6 +15,8 @@ dependencies = [
     "rich>=13.7",
     # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
     # read core behind `wmh download` (stdlib-only; pushing needs the member's fetch extra).
+    # RELEASE ORDER: environment-capture must be published to PyPI before any wmh release —
+    # outside the workspace this dependency resolves from PyPI, not [tool.uv.sources].
     "environment-capture",
     "gepa>=0.1.1",
     "tomli-w>=1.0",  # writing .wmh/config.toml (stdlib tomllib reads); every `wmh build` needs it
@@ -39,9 +41,9 @@ dev = [
 
 [dependency-groups]
 # Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
-# gate covers their tests — WITHOUT entering wmh's published metadata: members aren't on PyPI,
-# so a published extra requiring them would make `pip install world-model-harness[dev]`
-# unresolvable outside the workspace.
+# gate covers their tests. llm-waterfall stays dev-only (no wmh code imports it);
+# environment-capture graduated to [project.dependencies] when `wmh download` started consuming
+# it — see the RELEASE ORDER note there. The dev group adds the members' heavy extras.
 dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]

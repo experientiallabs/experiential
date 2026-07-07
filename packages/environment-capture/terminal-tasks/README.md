@@ -103,3 +103,9 @@ output (`/tmp/...`, `/usr/...`) are the container's own filesystem — the host-
 command-path and generic path/toolchain signals do not apply to this corpus (see
 `packages/environment-capture/INTEGRATION.md`). The machine-identity markers (real host username and
 home path) were verified absent.
+
+## License — read before redistributing
+
+[terminal-bench](https://github.com/laude-institute/terminal-bench) is published under
+**Apache 2.0**. The trace corpus embeds task text and container output from it and is
+redistributed under the same terms with attribution (see the Hub dataset card).

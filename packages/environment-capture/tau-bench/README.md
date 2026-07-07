@@ -153,3 +153,9 @@ blake2b train/holdout split inline so trace selection matches the world-model si
 (the one-time `pip install tau2-bench` is the venv Setup above). Observed (`--trace 0`, airline):
 standup 1.74s + 10 tool calls, 1.74s total. tau2's env is an in-memory DB, so the comparison here is
 less about speed than about not needing to stand up Sierra's stack at all.
+
+## License — read before redistributing
+
+[tau²-bench](https://github.com/sierra-research/tau2-bench) is published under **MIT**. The
+trace corpus embeds task/domain text from it and is redistributed under the same terms with
+attribution (see the Hub dataset card).

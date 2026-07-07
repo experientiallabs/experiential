@@ -6,8 +6,8 @@ Split from `environment_capture.hub` so the read path stays dependency-free: thi
 a commit, so history is kept and downloads always see the latest data.
 
 Usage (from the repo root):
-    uv run python -m environment_capture.hub push bird-sql          # create/update, public
-    uv run python -m environment_capture.hub push all --private
+    uv run python -m environment_capture.hub_push bird-sql          # create/update, public
+    uv run python -m environment_capture.hub_push all --private
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ class HubApi(Protocol):
 
     def create_repo(
         self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool
-    ) -> object: ...
+    ) -> None: ...
 
     def upload_file(
         self,
@@ -35,7 +35,7 @@ class HubApi(Protocol):
         repo_id: str,
         repo_type: str,
         commit_message: str,
-    ) -> object: ...
+    ) -> None: ...
 
     def upload_folder(
         self,
@@ -45,21 +45,25 @@ class HubApi(Protocol):
         repo_id: str,
         repo_type: str,
         commit_message: str,
-    ) -> object: ...
+    ) -> None: ...
+
+
+# One blurb per publishable data dir name; a test asserts every declared CorpusSpec.data_dir
+# has an entry, so a new dir can't silently publish with a generic card line.
+DIR_BLURBS: dict[str, str] = {
+    "data": "task index (train/test splits: prompts + task metadata)",
+    "gold": "per-task gold sidecars (graders read these; never staged into agent workspaces)",
+    "corpus": "evidence documents the tasks are answered from",
+    "datafiles": "shared context files (manual, datasets) staged into agent workspaces",
+    "schemas": "database DDL per task database",
+}
 
 
 def _dataset_card(spec: CorpusSpec) -> str:
     """The dataset card (README.md with Hub YAML frontmatter) for one corpus."""
     extra = f"\n{spec.extra_terms}\n" if spec.extra_terms else ""
-    dir_blurbs = {
-        "data": "task index (train/test splits: prompts + task metadata)",
-        "gold": "per-task gold sidecars (graders read these; never staged into agent workspaces)",
-        "corpus": "evidence documents the tasks are answered from",
-        "datafiles": "shared context files (manual, datasets) staged into agent workspaces",
-        "schemas": "database DDL per task database",
-    }
     data_dir_lines = "".join(
-        f"- `{d}/` — {dir_blurbs.get(d, 'benchmark data payload')}\n" for d in spec.data_dirs
+        f"- `{d}/` — {DIR_BLURBS[d]}\n" for d in spec.data_dirs
     )
     return f"""---
 license: {spec.license_id}
@@ -190,3 +194,21 @@ def push_after_capture(benchmark: str, *, enabled: bool, private: bool) -> None:
         return
     url = push_corpus(benchmark, private=private)
     print(f"pushed corpus -> {url}")
+
+
+def main() -> None:
+    """CLI: publish/update dataset repo(s) from local bundles."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "benchmark", help=f"Benchmark name, or 'all' ({', '.join(sorted(CORPORA))})"
+    )
+    parser.add_argument("--private", action="store_true", help="Create the repo(s) private.")
+    args = parser.parse_args()
+    names = sorted(CORPORA) if args.benchmark == "all" else [args.benchmark]
+    for name in names:
+        url = push_corpus(name, private=args.private)
+        print(f"pushed {name} -> {url}")
+
+
+if __name__ == "__main__":
+    main()

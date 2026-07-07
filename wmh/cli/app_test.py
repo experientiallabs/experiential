@@ -527,7 +527,7 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     fetched: list[tuple[str, bool]] = []
 
-    def fake_fetch(name: str, *, force: bool = False) -> Path:
+    def fake_fetch(name: str, *, force: bool = False, on_progress=None) -> Path:  # noqa: ANN001
         fetched.append((name, force))
         return tmp_path / name / "traces.otel.jsonl"
 
@@ -542,7 +542,9 @@ def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:
 def test_download_all_expands_to_the_manifest(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     fetched: list[str] = []
     monkeypatch.setattr(
-        cli_app_module, "fetch_corpus", lambda name, force=False: fetched.append(name) or tmp_path
+        cli_app_module,
+        "fetch_corpus",
+        lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
     monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "all"])
@@ -573,7 +575,9 @@ def test_download_picker_lists_published_and_fetches_choice(
     fetched: list[str] = []
     monkeypatch.setattr(cli_app_module, "published_corpora", lambda: published)
     monkeypatch.setattr(
-        cli_app_module, "fetch_corpus", lambda name, force=False: fetched.append(name) or tmp_path
+        cli_app_module,
+        "fetch_corpus",
+        lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
     monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download"], input="1\n")

@@ -149,3 +149,10 @@ output (`/tmp/...`, `/usr/...`) are the container's own filesystem — the host-
 command-path and generic path/toolchain signals do not apply to this corpus (see
 `packages/environment-capture/INTEGRATION.md`). The machine-identity markers (real host username and
 home path) were verified absent.
+
+## License — read before redistributing
+
+[SWE-bench](https://github.com/SWE-bench/SWE-bench) and
+[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) are published under **MIT**; the
+underlying repos are permissively licensed open source. The trace corpus embeds issue/repo text
+from them and is redistributed under the same terms with attribution (see the Hub dataset card).
