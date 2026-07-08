@@ -26,7 +26,7 @@ from wmh.core.types import Trace  # noqa: E402
 from wmh.engine.world_model import WorldModel  # noqa: E402
 from wmh.env.llm_agent import LLMAgent  # noqa: E402
 from wmh.ingest import get_adapter  # noqa: E402
-from wmh.providers import get_provider
+from wmh.providers import get_provider  # noqa: E402
 from wmh.providers.base import (  # noqa: E402
     Message,
     Provider,
