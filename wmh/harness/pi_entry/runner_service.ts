@@ -17,10 +17,13 @@
  * source materialization from episode_start.files + child-process isolation per episode is a later
  * migration step; today one runner serves episodes sequentially over the one connection.
  */
+import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import type { Model } from "@earendil-works/pi-ai";
-import { Agent } from "./src/agent.ts";
+import { Agent as StaticAgent } from "./src/agent.ts";
 import type { AgentTool, AgentToolResult } from "./src/types.ts";
 import { FrameConn, type Frame } from "./runner_frames.ts";
 
@@ -81,8 +84,29 @@ function startLlmBridge(conn: FrameConn): Promise<Bridge> {
 	});
 }
 
+/**
+ * Load pi's Agent for this episode. If episode_start carries `files` (the doc's code surfaces), they
+ * are materialized into a fresh per-episode dir under cwd (~/pi-run, so node_modules resolves
+ * upward) and the Agent is dynamically imported from there — a distinct module URL per episode, so a
+ * searched code mutation actually takes effect. With no files, the statically-imported Agent runs
+ * (dev / prompt-only searches). Returns [AgentCtor, cleanup].
+ */
+async function loadAgent(start: Frame): Promise<[any, () => void]> {
+	const files: Record<string, string> = start.files ?? {};
+	if (Object.keys(files).length === 0) return [StaticAgent, () => {}];
+	const base = path.join(process.cwd(), `ep-${start.episode_id}`);
+	for (const [rel, content] of Object.entries(files)) {
+		const dst = path.join(base, rel);
+		fs.mkdirSync(path.dirname(dst), { recursive: true });
+		fs.writeFileSync(dst, content);
+	}
+	const mod = await import(pathToFileURL(path.join(base, "src/agent.ts")).href);
+	return [mod.Agent, () => fs.rmSync(base, { recursive: true, force: true })];
+}
+
 async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 	const bridge = await startLlmBridge(conn);
+	const [AgentCtor, cleanupSrc] = await loadAgent(start);
 	const episodeId = start.episode_id;
 	let doneSent = false;
 	let lastAssistantText = "";
@@ -130,7 +154,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		},
 	};
 
-	const agent = new Agent({
+	const agent = new AgentCtor({
 		initialState: { systemPrompt: start.system ?? "", model, tools: [...envTools, submit] },
 		getApiKey: () => "x",
 	});
@@ -153,6 +177,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		if (!doneSent) conn.send({ type: "episode_error", episode_id: episodeId, note: String(e) });
 	} finally {
 		bridge.close();
+		cleanupSrc();
 	}
 }
 
