@@ -25,7 +25,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.environment import AgentEnvironment
-from wmh.harness.runtime import AgentRuntime, RunResult
+from wmh.harness.runtime import AgentRuntime, RunResult, Runtime
 from wmh.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
@@ -103,7 +103,7 @@ class ClosedLoopReport(BaseModel):
 def evaluate_with_env(
     tasks: list[TaskSpec],
     make_env: EnvFactory,
-    runtime: AgentRuntime,
+    runtime: Runtime,
     judge: GoldJudge,
     *,
     label: str = "",
@@ -150,7 +150,7 @@ def evaluate_closed_loop(
     *,
     label: str = "world-model",
     k: int = DEFAULT_K,
-    runtime: AgentRuntime | None = None,
+    runtime: Runtime | None = None,
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
 ) -> ClosedLoopReport:
     """Score the fixed agent on `tasks` against `world_model` (`wmh eval --mode closed-loop`)."""
@@ -177,7 +177,7 @@ class ClosedLoopEval:
         *,
         label: str = "world-model",
         k: int = DEFAULT_K,
-        runtime: AgentRuntime | None = None,
+        runtime: Runtime | None = None,
         on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
     ) -> None:
         self._tasks = tasks
@@ -202,7 +202,7 @@ class ClosedLoopEval:
         )
 
 
-def _run_once(task: TaskSpec, make_env: EnvFactory, runtime: AgentRuntime) -> RunResult:
+def _run_once(task: TaskSpec, make_env: EnvFactory, runtime: Runtime) -> RunResult:
     """One rollout: a fresh environment per attempt, always closed."""
     env = make_env(task)
     try:

@@ -12,6 +12,7 @@ the same types the rest of the harness uses.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -52,10 +53,23 @@ _NUDGE = (
 )
 
 
+@runtime_checkable
+class Runtime(Protocol):
+    """What closed-loop eval drives: any object that can run one episode against an environment.
+
+    `AgentRuntime` (the fixed loop) and `CodeRuntime` (the harness's own program) both satisfy
+    this; evaluation code depends on the shape, never the implementation.
+    """
+
+    def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult: ...
+
+
 class StopReason(StrEnum):
     SUBMITTED = "submitted"  # the agent called submit
     MAX_TURNS = "max_turns"  # hit the turn cap without submitting
     NO_ACTION = "no_action"  # the agent produced no parseable tool call
+    ERROR = "error"  # harness code raised (CodeRuntime episodes only)
+    BUDGET = "budget"  # harness code exhausted an episode budget (CodeRuntime episodes only)
 
 
 class RunResult(BaseModel):

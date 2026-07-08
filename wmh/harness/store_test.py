@@ -111,3 +111,18 @@ def test_skill_surfaces_render_and_reload(tmp_path: Path) -> None:
     reloaded = store.load("h")
     assert reloaded == saved
     assert [s.name for s in reloaded.skills()] == ["count-words"]
+
+
+def test_code_surface_round_trips_through_render_and_parse(tmp_path) -> None:  # noqa: ANN001
+    from wmh.harness.doc import CODE_RUNTIME_ID, code_baseline
+
+    store = HarnessStore(tmp_path)
+    saved = store.save_version(code_baseline("coded"))
+    exported = store.dir_for("coded") / f"v{saved.version}" / "runtime.py"
+    assert exported.exists()
+    # Hand-authored dirs (no doc.json) recover the code surface from the rendered file.
+    (store.dir_for("coded") / f"v{saved.version}" / "doc.json").unlink()
+    loaded = store.load("coded")
+    code = loaded.surface(CODE_RUNTIME_ID)
+    assert code is not None
+    assert code.content == exported.read_text(encoding="utf-8")

@@ -27,6 +27,7 @@ import tomli_w
 
 from wmh.config.store import validate_name
 from wmh.harness.doc import (
+    CODE_RUNTIME_ID,
     MAX_TURNS_ID,
     TEMPERATURE_ID,
     TOOL_POLICY_ID,
@@ -42,6 +43,7 @@ CHAMPION_ALIAS = "champion"
 _DOC_FILE = "doc.json"
 _SYSTEM_FILE = "SYSTEM.md"
 _CONFIG_FILE = "config.toml"
+_RUNTIME_FILE = "runtime.py"
 _SKILLS_DIR = "skills"
 _ALIASES_FILE = "aliases.toml"
 
@@ -168,6 +170,9 @@ def _render(doc: HarnessDoc) -> dict[str, str]:
     }
     for skill in doc.skills():
         files[f"{_SKILLS_DIR}/{skill.name}.md"] = skill.to_markdown()
+    code = doc.surface(CODE_RUNTIME_ID)
+    if code is not None:
+        files[_RUNTIME_FILE] = code.content
     return files
 
 
@@ -208,6 +213,15 @@ def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
                     id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content=str(config["temperature"])
                 )
             )
+    runtime_path = directory / _RUNTIME_FILE
+    if runtime_path.exists():
+        surfaces.append(
+            Surface(
+                id=CODE_RUNTIME_ID,
+                kind=SurfaceKind.CODE,
+                content=runtime_path.read_text(encoding="utf-8"),
+            )
+        )
     skills_dir = directory / _SKILLS_DIR
     if skills_dir.exists():
         for path in sorted(skills_dir.glob("*.md")):

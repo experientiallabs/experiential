@@ -29,9 +29,14 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from wmh.harness.code_runtime import (
+    DEFAULT_RUNTIME_CODE,
+    CodeRuntime,
+    compile_harness_code,
+)
 from wmh.harness.runtime import DEFAULT_MAX_TURNS, DEFAULT_SYSTEM_PROMPT, AgentRuntime
 from wmh.harness.skills import Skill, SkillLibrary
-from wmh.harness.tools import DEFAULT_TOOLS, resolve_tools
+from wmh.harness.tools import DEFAULT_TOOLS, render_tools, resolve_tools
 from wmh.providers.base import Provider
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -41,6 +46,7 @@ _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 TOOL_POLICY_ID = "tool_policy:main"
 MAX_TURNS_ID = "param:max-turns"
 TEMPERATURE_ID = "param:temperature"
+CODE_RUNTIME_ID = "code:runtime"
 
 DEFAULT_TEMPERATURE = 0.7
 
@@ -50,6 +56,7 @@ class SurfaceKind(StrEnum):
     SKILL = "skill"  # one skill: frontmatter (name, description) + body
     TOOL_POLICY = "tool_policy"  # the tool list, one tool name per line
     PARAM = "param"  # a scalar loop knob, serialized as its string form
+    CODE = "code"  # the agent loop itself: a module defining `run(kit)` (see code_runtime)
 
 
 class Surface(BaseModel):
@@ -117,6 +124,13 @@ class HarnessDoc(BaseModel):
                         f"skill surface {surface.id!r} declares frontmatter name "
                         f"{skill.name!r}; the slug and frontmatter name must match"
                     )
+            elif surface.kind is SurfaceKind.CODE:
+                if surface.id != CODE_RUNTIME_ID:
+                    raise ValueError(
+                        f"code surface must be {CODE_RUNTIME_ID!r} (got {surface.id!r}); "
+                        "the runtime is a singleton"
+                    )
+                compile_harness_code(surface.content)
         return self
 
     # -- surface access ---------------------------------------------------------------------
@@ -180,16 +194,40 @@ class HarnessDoc(BaseModel):
             Skill.from_markdown(s.content) for s in self.surfaces if s.kind is SurfaceKind.SKILL
         ]
 
-    def runtime(self, provider: Provider) -> AgentRuntime:
-        """The configured agent runtime this document describes."""
+    def runtime(self, provider: Provider) -> AgentRuntime | CodeRuntime:
+        """The configured agent runtime this document describes.
+
+        With a `code:runtime` surface the harness's own program drives episodes (budgeted and
+        kit-recorded); otherwise the fixed baseline loop runs. Both expose the same
+        `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
+        """
+        code = self.surface(CODE_RUNTIME_ID)
+        skills = SkillLibrary(self.skills())
+        if code is not None:
+            return CodeRuntime(
+                provider,
+                code=code.content,
+                tools=resolve_tools(self.tools()),
+                temperature=self.temperature(),
+                skills=skills,
+                system_prompt=self._assembled_prompt(skills),
+            )
         return AgentRuntime(
             provider,
             system_prompt=self.system_prompt(),
             tools=self.tools(),
             max_turns=self.max_turns(),
             temperature=self.temperature(),
-            skills=SkillLibrary(self.skills()),
+            skills=skills,
         )
+
+    def _assembled_prompt(self, skills: SkillLibrary) -> str:
+        """The full system prompt handed to harness code: sections + tools + skills index."""
+        prompt = f"{self.system_prompt()}\n\n## Tools\n{render_tools(resolve_tools(self.tools()))}"
+        index = skills.render_index()
+        if index:
+            prompt += f"\n\n## Your skills (read a body with read_skill)\n{index}"
+        return prompt
 
     @classmethod
     def baseline(cls, name: str = "baseline") -> HarnessDoc:
@@ -209,6 +247,17 @@ class HarnessDoc(BaseModel):
                 ),
             ],
         )
+
+
+def code_baseline(name: str = "baseline") -> HarnessDoc:
+    """The baseline harness with its loop as an editable `code:runtime` surface.
+
+    Behaviorally equivalent to `HarnessDoc.baseline()` — same prompt, tools, and one-call-per-turn
+    loop — but the loop is data, so `wmh harness create` can propose structural changes to it.
+    """
+    base = HarnessDoc.baseline(name)
+    code = Surface(id=CODE_RUNTIME_ID, kind=SurfaceKind.CODE, content=DEFAULT_RUNTIME_CODE)
+    return HarnessDoc(name=name, surfaces=[*base.surfaces, code])
 
 
 def _digest(text: str) -> str:
