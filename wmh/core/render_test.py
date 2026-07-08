@@ -80,7 +80,6 @@ def test_build_env_prompt_handles_empty_optional_blocks() -> None:
     assert "(no similar past examples)" in user
     assert "(start of session)" in user
     assert "scratchpad: (empty)" in user
-    assert "AGENT HARNESS" not in user  # no harness given -> no harness section
 
 
 _HARNESS = HarnessContext(
@@ -104,27 +103,17 @@ def test_render_harness_lists_system_prompt_and_tools() -> None:
     assert "submit" in text
 
 
-def test_build_env_prompt_includes_harness_section() -> None:
+def test_env_prompt_never_includes_the_harness() -> None:
+    # The world model simulates the ENVIRONMENT's response to an action; the agent's context
+    # assembly (system prompt, tools) is the harness's job and stays agent-side.
     system, user = build_env_prompt(
         "BASE",
         "build an app",
         EnvState(),
         Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "ls"}),
-        harness=_HARNESS,
     )
-    assert system == "BASE"  # harness context is evidence, not instructions
-    assert "AGENT HARNESS" in user
-    assert user.index("AGENT HARNESS") < user.index("TASK:")
-    assert "operating inside pi" in user
-    # An empty harness renders nothing.
-    _, bare = build_env_prompt(
-        "BASE",
-        "t",
-        EnvState(),
-        Action(kind=ActionKind.MESSAGE, content="hi"),
-        harness=HarnessContext(),
-    )
-    assert "AGENT HARNESS" not in bare
+    assert system == "BASE"
+    assert "AGENT HARNESS" not in user and "SYSTEM PROMPT" not in user
 
 
 def test_render_harness_labels_inferred_contexts() -> None:

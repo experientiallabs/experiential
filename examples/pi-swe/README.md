@@ -12,10 +12,11 @@ harness**:
   `createAllToolDefinitions`;
 - `wmh.state.structured` — `{"cwd": "/workspace", "harness": "pi"}` on every action span.
 
-A world model built from it therefore knows the harness contract it is simulating (tool argument
-schemas, validation-error shapes, output conventions), and `wmh scenarios create` can assemble a
-token-realistic scenario — the exact system prompt + tools + verbatim user message — for any new
-task.
+The harness is persisted with any world model built from this corpus (`harness.json`) and
+consumed agent-side: `wmh scenarios create` assembles a token-realistic scenario — the exact
+system prompt + tools + verbatim user message — for any new task, and verification rollouts run
+the baseline agent under the real system prompt. (The world model itself stays a pure
+environment simulator; it never sees the harness.)
 
 ## Provenance
 

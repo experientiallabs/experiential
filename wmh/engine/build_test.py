@@ -225,13 +225,13 @@ def test_build_persists_the_corpus_harness_and_load_serves_it(tmp_path) -> None:
     assert wm.harness is not None
     assert wm.harness.system_prompt == "You are a coding agent inside pi."
     assert [t.name for t in wm.harness.tools] == ["bash"]
-    # The served env prompt carries the harness, so predictions honor the real contract.
+    # Agent-side only: the env prompt stays harness-free (the world model simulates the
+    # environment's response to an action, not the agent's context assembly).
     session = wm.new_session(task="list files")
     prompt = wm.render_step_prompt(
         session.id, Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "ls"})
     )
-    assert "AGENT HARNESS" in prompt
-    assert "You are a coding agent inside pi." in prompt
+    assert "You are a coding agent inside pi." not in prompt
 
 
 def test_modal_harness_picks_the_most_common_context() -> None:

@@ -15,7 +15,7 @@ schemas from the evidence digest. The result is marked `HarnessSource.INFERRED` 
 consumers can label it, and it never overrides a captured harness — corpora that record the real
 attributes take precedence wherever both exist. On an unparseable LLM reply the deterministic
 schemas alone are returned (empty system prompt), which is still enough for schema-faithful
-simulation and scenario rendering.
+scenario rendering and agent rollouts.
 """
 
 from __future__ import annotations

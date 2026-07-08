@@ -1180,8 +1180,8 @@ def scenarios_create(
             )
             _console.print(
                 "[dim]predicted harness saved to the model artifact (harness.json, "
-                "source=inferred) — play/serve/verify now use it; a rebuild from traces that "
-                "capture the real one replaces it[/dim]"
+                "source=inferred) — future scenario creation and verify rollouts reuse it; a "
+                "rebuild from traces that capture the real one replaces it[/dim]"
             )
 
     scenario = scenario_from_task(task_text, harness, worker_llm, examples=examples)
@@ -1471,8 +1471,9 @@ def play(
     wm, resolved_name, _provider, _model_root = _load_model_any(name, root)
     if wm.harness is not None:
         _console.print(
-            f"[dim]harness captured with this model: system prompt + "
-            f"{len(wm.harness.tools)} tool definitions ride along in every env prompt[/dim]"
+            f"[dim]agent harness on file for this model ({wm.harness.source.value}): system "
+            f"prompt + {len(wm.harness.tools)} tool definitions — see `wmh scenarios create` "
+            "for the exact messages an agent would receive[/dim]"
         )
     suggestions = _action_suggestions(wm)
     run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)

@@ -40,8 +40,11 @@ class WorldModel:
         self._retriever = retriever
         self._env_prompt = env_prompt
         self._top_k = top_k
-        # The agent-side harness captured with the corpus (system prompt + tool definitions).
-        # Included in every env prompt so predictions honor the real harness contract.
+        # The agent-side harness that came with the corpus (system prompt + tool definitions).
+        # NOT part of env prompts — the world model simulates the environment's response to an
+        # action, never the agent's context assembly. Exposed for agent-side consumers:
+        # `wmh scenarios create` (token-realistic scenario messages) and `LLMAgent` (rolling
+        # under the real system prompt).
         self._harness = harness
         self._telemetry_root = Path(telemetry_root)
         self._sessions: dict[str, Session] = {}
@@ -196,7 +199,7 @@ class WorldModel:
         """
         session = self._sessions[session_id]
         demos = self._retriever.topk(session.state, action, self._top_k)
-        system, user = build_env_prompt(self._env_prompt, session, action, demos, self._harness)
+        system, user = build_env_prompt(self._env_prompt, session, action, demos)
         return f"{system}\n\n=== USER ===\n{user}"
 
     def step(self, session_id: str, action: Action) -> Observation:
@@ -208,7 +211,7 @@ class WorldModel:
         demos = self._retriever.topk(session.state, action, self._top_k)
 
         # (2) assemble the env prompt and (3) predict the observation
-        system, user = build_env_prompt(self._env_prompt, session, action, demos, self._harness)
+        system, user = build_env_prompt(self._env_prompt, session, action, demos)
         try:
             completion = self._provider.complete(system, [_user_message(user)])
         except Exception:

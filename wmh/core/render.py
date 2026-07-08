@@ -65,12 +65,11 @@ def render_demo(step: Step) -> str:
 
 
 def render_harness(harness: HarnessContext) -> str:
-    """Render an agent harness (system prompt + tool definitions) as an evidence block.
+    """Render an agent harness (system prompt + tool definitions) as a labeled text block.
 
-    Used inside the env prompt: the world model reads the harness the agent runs under so its
-    predictions honor the real contract — tool argument schemas (what a malformed call's
-    validation error looks like), the tools that exist at all, and the conventions the system
-    prompt establishes.
+    Agent-side only — the world model's env prompt never includes it (the environment it
+    simulates responds to actions; the agent's context assembly is the harness's job). Used to
+    ground scenario synthesis and for human-readable display.
     """
     lines: list[str] = []
     if harness.source is HarnessSource.INFERRED:
@@ -116,7 +115,6 @@ def build_env_prompt(
     *,
     history: list[Step] | None = None,
     demos: list[Step] | None = None,
-    harness: HarnessContext | None = None,
 ) -> tuple[str, str]:
     """Assemble the (system, user) world-model completion that predicts the next observation.
 
@@ -124,8 +122,9 @@ def build_env_prompt(
     the system message; the task, current state, recent history, retrieved demos, and the incoming
     action form the user message. This is the *single* assembly used by both the serving engine
     (`wmh.engine.prompts`) and the GEPA optimizer, so prompts are evolved against exactly what the
-    world model serves. A non-empty `harness` (the agent's captured system prompt + tools) leads
-    the user message: it is evidence about the environment's contract, not instructions.
+    world model serves. The agent's harness (system prompt + tools) is deliberately absent: the
+    world model simulates the ENVIRONMENT's response to an action, not the agent's context
+    assembly — harness context is consumed agent-side (scenarios, `LLMAgent`).
     """
     system = base_prompt
     demo_block = (
@@ -140,14 +139,7 @@ def build_env_prompt(
         if history
         else "(start of session)"
     )
-    harness_block = (
-        f"AGENT HARNESS (the system prompt and tools the agent operates under):\n"
-        f"{render_harness(harness)}\n\n"
-        if harness
-        else ""
-    )
     user = (
-        f"{harness_block}"
         f"TASK:\n{task or '(none)'}\n\n"
         f"INTERACTION HISTORY:\n{history_block}\n\n"
         f"SIMILAR PAST EXAMPLES:\n{demo_block}\n\n"

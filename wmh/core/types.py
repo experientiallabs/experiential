@@ -85,9 +85,12 @@ class HarnessContext(BaseModel):
     `gen_ai.tool.definitions`) — what the original agent actually received. `INFERRED` contexts
     are predicted from sparse trace evidence (observed calls, argument shapes, validation
     errors) when the capture recorded none; a captured context always takes precedence.
-    Carrying it through ingest -> build -> serve lets the world model condition its predictions
-    on the harness contract (tool argument schemas, validation errors, output formats), and lets
-    a scenario render the realistic messages a fresh agent would receive for a new task.
+
+    Consumed strictly AGENT-side: rendering the token-realistic messages a fresh agent would
+    receive for a new task (`wmh scenarios create`) and running the baseline `LLMAgent` under
+    the real system prompt. It is never part of the world model's env prompt — the world model
+    simulates the environment's response to an action, not the agent's context assembly (which
+    is a function of the harness's full per-step state, a different and harder object).
     """
 
     system_prompt: str = ""
