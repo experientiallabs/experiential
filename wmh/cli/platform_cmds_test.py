@@ -89,6 +89,40 @@ def test_status_surfaces_rejected_credentials(monkeypatch: pytest.MonkeyPatch) -
     assert "Unauthorized" in result.output
 
 
+def test_pull_rejects_unknown_kind() -> None:
+    """An invalid --kind fails fast instead of dispatching to harness routes."""
+    result = runner.invoke(app, ["pull", "anything", "--kind", "typo"])
+    assert result.exit_code != 0
+    assert "must be 'model' or 'harness'" in result.output
+
+
+def test_login_with_token_drops_stale_default_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relogin keeps the default project only if the new identity sees it."""
+    save_credentials(
+        PlatformCredentials(
+            web_url="https://platform.test",
+            api_url="https://api.test",
+            token="xpl_old",
+            default_project="proj-gone",
+        )
+    )
+    monkeypatch.setattr("wmh.cli.platform_cmds.fetch_cli_config", lambda _url: "https://api.test")
+    monkeypatch.setattr("wmh.cli.platform_cmds.PlatformClient", _StubClient)
+
+    result = runner.invoke(app, ["login", "--token", "xpl_new"])
+
+    assert result.exit_code == 0, result.output
+    from wmh.platform.credentials import load_credentials
+
+    saved = load_credentials()
+    assert saved.token == "xpl_new"
+    # proj-gone is invisible to the new identity; the single visible project
+    # becomes the default instead.
+    assert saved.default_project == "proj-1"
+
+
 def test_push_requires_login_first(tmp_path: Path) -> None:
     result = runner.invoke(app, ["push", "anything", "--root", str(tmp_path)])
     assert result.exit_code != 0

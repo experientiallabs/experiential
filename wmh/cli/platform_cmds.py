@@ -8,6 +8,7 @@ exists locally (or remotely, for pulls).
 
 from __future__ import annotations
 
+import socket
 import webbrowser
 from pathlib import Path
 from typing import Annotated
@@ -16,8 +17,19 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from wmh.platform.client import PlatformClient, PlatformError, WhoAmI
-from wmh.platform.credentials import PlatformCredentials
+from wmh.config.store import WorldModelStore
+from wmh.harness.doc import HarnessDoc
+from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
+from wmh.platform.auth import BrowserLogin
+from wmh.platform.client import PlatformClient, PlatformError, WhoAmI, fetch_cli_config
+from wmh.platform.credentials import (
+    PlatformCredentials,
+    clear_credentials,
+    credentials_path,
+    load_credentials,
+    save_credentials,
+)
+from wmh.platform.transfer import extract_push_meta, pack_model_dir, unpack_model_bundle
 
 _console = Console()
 _CHECK = "[green]✓[/green]"
@@ -52,9 +64,6 @@ def login(
     no_browser: Annotated[bool, _LOGIN_NO_BROWSER] = False,
 ) -> None:
     """Connect this machine to a platform account."""
-    from wmh.platform.client import fetch_cli_config
-    from wmh.platform.credentials import load_credentials, save_credentials
-
     credentials = load_credentials()
     web_url = (url or credentials.web_url or "").rstrip("/")
     if not web_url:
@@ -81,11 +90,22 @@ def login(
             _console.print(f"[red]The key was rejected:[/red] {error}")
             raise typer.Exit(code=1) from error
 
-    updated = credentials.model_copy(
-        update={"web_url": web_url, "api_url": api_url, "token": token}
+    # A relogin may land on a different account: keep the saved default
+    # project only if the new identity can still see it.
+    visible_projects = {project.id for project in identity.projects}
+    default_project = (
+        credentials.default_project if credentials.default_project in visible_projects else None
     )
-    if updated.default_project is None and len(identity.projects) == 1:
-        updated = updated.model_copy(update={"default_project": identity.projects[0].id})
+    if default_project is None and len(identity.projects) == 1:
+        default_project = identity.projects[0].id
+    updated = credentials.model_copy(
+        update={
+            "web_url": web_url,
+            "api_url": api_url,
+            "token": token,
+            "default_project": default_project,
+        }
+    )
     path = save_credentials(updated)
     org_names = ", ".join(org.name for org in identity.orgs) or "no organizations"
     _console.print(f"{_CHECK} Connected to [bold]{org_names}[/bold] ({path})")
@@ -94,8 +114,6 @@ def login(
 
 def logout() -> None:
     """Disconnect: delete the saved credential."""
-    from wmh.platform.credentials import clear_credentials, load_credentials
-
     credentials = load_credentials()
     removed = clear_credentials()
     if not removed:
@@ -108,8 +126,6 @@ def logout() -> None:
 
 def status() -> None:
     """Show the platform connection: account, organizations, and projects."""
-    from wmh.platform.credentials import credentials_path, load_credentials
-
     credentials = load_credentials()
     if not credentials.is_complete():
         _console.print(
@@ -138,9 +154,6 @@ def push(
     root: Annotated[str, _ROOT] = ".wmh",
 ) -> None:
     """Publish a local world model or harness to the platform registry."""
-    from wmh.config.store import WorldModelStore
-    from wmh.harness.store import HarnessStore
-
     model_dir = WorldModelStore(root).dir_for(name)
     harness_exists = HarnessStore(root).exists(name)
     resolved_kind = _resolve_kind(kind, model=model_dir is not None, harness=harness_exists)
@@ -163,6 +176,8 @@ def pull(
     root: Annotated[str, _ROOT] = ".wmh",
 ) -> None:
     """Fetch a world model or harness from the platform registry."""
+    if kind is not None and kind not in ("model", "harness"):
+        raise typer.BadParameter("--kind must be 'model' or 'harness'")
     credentials, project_id = _require_connection(project)
     with _client(credentials) as client:
         resolved_kind = kind or _detect_remote_kind(client, project_id, name)
@@ -177,15 +192,11 @@ def pull(
 
 def _browser_login(web_url: str, *, open_browser: bool) -> str | None:
     """Run the loopback browser flow; fall back to a hidden paste prompt."""
-    import socket
-
-    from wmh.platform.auth import BrowserLogin
-
     login_attempt = BrowserLogin()
-    login_attempt.start()
-    key_name = f"wmh on {socket.gethostname()}"
-    authorize_url = login_attempt.authorize_url(web_url, key_name=key_name)
     try:
+        login_attempt.start()
+        key_name = f"wmh on {socket.gethostname()}"
+        authorize_url = login_attempt.authorize_url(web_url, key_name=key_name)
         _console.print(f"Approve the request in your browser:\n  [bold]{authorize_url}[/bold]")
         if open_browser:
             webbrowser.open(authorize_url)
@@ -205,8 +216,6 @@ def _client(credentials: PlatformCredentials) -> PlatformClient:
 
 
 def _require_connection(project: str | None) -> tuple[PlatformCredentials, str]:
-    from wmh.platform.credentials import load_credentials
-
     credentials = load_credentials()
     if not credentials.is_complete():
         raise typer.BadParameter("not connected to a platform; run `wmh login` first")
@@ -249,8 +258,6 @@ def _detect_remote_kind(client: PlatformClient, project_id: str, name: str) -> s
 
 
 def _push_model(client: PlatformClient, project_id: str, remote_name: str, model_dir: Path) -> None:
-    from wmh.platform.transfer import extract_push_meta, pack_model_dir
-
     bundle = pack_model_dir(model_dir)
     meta = extract_push_meta(model_dir)
     try:
@@ -275,8 +282,6 @@ def _push_harness(
     ref: str | None,
     root: str,
 ) -> None:
-    from wmh.harness.store import HarnessStore
-
     doc = HarnessStore(root).load(local_name, ref)
     if remote_name != local_name:
         doc = doc.model_copy(update={"name": remote_name})
@@ -297,9 +302,6 @@ def _push_harness(
 def _pull_model(
     client: PlatformClient, project_id: str, name: str, root: str, *, force: bool
 ) -> None:
-    from wmh.config.store import WorldModelStore
-    from wmh.platform.transfer import unpack_model_bundle
-
     content = client.download_model_bundle(project_id, name)
     dest_dir = WorldModelStore(root).model_dir(name)
     try:
@@ -312,9 +314,6 @@ def _pull_model(
 def _pull_harness(
     client: PlatformClient, project_id: str, name: str, root: str, *, version: int | None
 ) -> None:
-    from wmh.harness.doc import HarnessDoc
-    from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
-
     if version is None:
         harness, _versions = client.get_harness(project_id, name)
         if harness.latest_version < 1:
