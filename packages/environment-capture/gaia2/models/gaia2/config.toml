@@ -1,0 +1,11 @@
+providers = [
+    { kind = "bedrock", model = "us.anthropic.claude-opus-4-8" },
+]
+serve_provider = "bedrock"
+embed_provider = "hashing"
+embed_dim = 512
+top_k = 5
+train_split = 0.8
+gepa_budget = 0
+judge_model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+trace_adapter = "otel-genai"
