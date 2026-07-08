@@ -77,6 +77,25 @@ def test_containment_guard_can_be_disabled(tmp_path: Path) -> None:
         env.close()
 
 
+def test_subprocess_environment_is_scrubbed_of_credentials(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """The workspace subprocess inherits an operational allowlist only — provider credentials in
+    the capture process's environment are never readable via `env`/`printenv`/`echo $VAR`."""
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sentinel-should-not-leak")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
+    monkeypatch.setenv("HF_TOKEN", "hf_shouldnotleak")
+    # contain=False isolates the env-scrub boundary from the command guard.
+    env = LocalBashEnv(workspace=tmp_path, contain=False)
+    try:
+        dump = env.execute("env; printenv AWS_SECRET_ACCESS_KEY; echo ref:$ANTHROPIC_API_KEY")
+        assert "should-not-leak" not in dump.output
+        assert "sk-ant-should-not-leak" not in dump.output
+        # Operational variables the shell/tools need survive the scrub.
+        path = env.execute("echo $PATH")
+        assert path.output.strip()
+    finally:
+        env.close()
+
+
 def test_binary_output_is_replaced_not_fatal(tmp_path: Path) -> None:
     """An agent cat-ing a staged binary (sqlite db, csv with stray bytes) must yield a real
     observation with replacement chars, not a UnicodeDecodeError that burns the whole task."""

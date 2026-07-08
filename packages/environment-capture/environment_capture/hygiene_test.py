@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from environment_capture.hygiene import (
+    command_targets_host,
     host_escape_findings,
     partition_contained,
     scan_spans_jsonl,
@@ -258,6 +259,70 @@ def test_scan_tolerates_non_object_tool_arguments(tmp_path: Path) -> None:
     path.write_text("\n".join(json.dumps(s) for s in spans) + "\n")
     flagged = scan_spans_jsonl(path)
     assert set(flagged) == {"s2"}
+
+
+def test_quoted_redirected_and_indirect_host_paths_are_flagged() -> None:
+    """Quoting, input redirection, `${var}` indirection, and relative traversal must not evade
+    the command guard — these all reach real host content in an unguarded shell."""
+    for command in (
+        'cat "/etc/passwd"',
+        "cat '/etc/passwd'",
+        "cat </etc/hostname",
+        'cat "$HOME/.ssh/id_rsa"',
+        "cat ${HOME}/.ssh/id_rsa",
+        "H=/etc; cat ${H}/passwd",
+        "cat ../../../root/.ssh/id_rsa",
+    ):
+        assert command_targets_host(command), command
+        findings = host_escape_findings(_trajectory(command, "whatever"))
+        assert findings and findings[0].field == "command", command
+
+
+def test_env_dumps_and_secret_var_reads_are_flagged() -> None:
+    """`env`/`printenv` dumps and reads of credential-shaped variables are refused; setting env
+    for one command (`env VAR=value cmd`) stays legitimate."""
+    for command in (
+        "env | grep -i aws",
+        "env",
+        "printenv ANTHROPIC_API_KEY",
+        "echo $AWS_SECRET_ACCESS_KEY",
+        'printf "%s" "$HF_TOKEN"',
+        "echo ${ANTHROPIC_API_KEY}",
+    ):
+        assert command_targets_host(command), command
+    for command in (
+        "env FOO=bar python3 analyze.py",
+        "ls data/ && cat data/manual.md",
+        "grep -r pattern src/",
+    ):
+        assert not command_targets_host(command), command
+
+
+def test_secret_values_in_observation_are_flagged() -> None:
+    """Opaque credential VALUES with no path/filename marker still drop the trajectory, and the
+    finding never re-emits the secret itself."""
+    for output in (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk...\n-----END OPENSSH PRIVATE KEY-",
+        "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+        "your key is sk-ant-api03-abcDEF123456_gh-ijkl",
+        "token=hf_abcdefghijklmnopqrstuvwxyz012345",
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "export ANTHROPIC_API_KEY=sk-ant-secretbody",
+    ):
+        findings = host_escape_findings(_trajectory("cat data/out.txt", output))
+        assert findings, f"expected flag for output: {output[:40]}"
+        assert findings[0].field == "output"
+        assert output not in findings[0].excerpt  # value is redacted, not re-leaked
+
+    # Secret values are flagged even for a benchmark that relaxed the generic path markers.
+    key_leak = _trajectory("apis.fs.read()", "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIexamplekeybody")
+    assert host_escape_findings(key_leak, generic_path_markers=False)
+
+
+def test_ordinary_observation_with_key_shaped_word_is_not_flagged() -> None:
+    """A lowercase data value that merely contains 'key' is not a credential dump."""
+    clean = _trajectory("cat data/rows.csv", "row primary_key = 5\nother_value = 12")
+    assert host_escape_findings(clean) == []
 
 
 def test_scan_names_the_corrupt_line(tmp_path: Path) -> None:
