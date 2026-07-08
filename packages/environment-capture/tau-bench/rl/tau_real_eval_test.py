@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from real_eval import collect_records, resolve_tasks
+from tau_real_eval import collect_records, resolve_tasks
 
 
 def _span(trace_id: str, domain: str, task_id: str) -> dict:

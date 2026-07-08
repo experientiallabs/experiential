@@ -10,7 +10,7 @@ import json
 from collections.abc import Callable
 
 import httpx
-from real_eval import NUDGE, Scenario, evaluate, run_policy_loop
+from terminal_real_eval import NUDGE, Scenario, evaluate, run_policy_loop
 
 from wmh.core.types import Action, ActionKind, JsonObject, Observation, Step
 from wmh.optimize.reward import EpisodeScore
@@ -172,7 +172,7 @@ def test_evaluate_builds_records_keyed_by_provenance() -> None:
 
 def test_long_command_output_is_truncated_head_and_tail() -> None:
     """Unbounded outputs overflow the policy context (400s); cap keeps head + tail."""
-    from real_eval import MAX_OUTPUT_CHARS
+    from terminal_real_eval import MAX_OUTPUT_CHARS
 
     big = "A" * 10_000 + "TAIL"
 

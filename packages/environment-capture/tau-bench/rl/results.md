@@ -287,7 +287,7 @@ its failover chains.
 ## Cross-benchmark replication: terminal-tasks (D67 leg 2)
 
 Raw rows in `.agents/docs/research/real_terminal_eval_results/`; harness =
-`packages/environment-capture/terminal-tasks/rl/real_eval.py` (real bash-in-docker, wmh judge on Opus 4.8);
+`packages/environment-capture/terminal-tasks/rl/terminal_real_eval.py` (real bash-in-docker, wmh judge on Opus 4.8);
 28 pinned eval scenarios × 2 trials, all rows zero error records after two live-fire
 harness fixes (per-command output cap; salvage+normalize of sloppy tool-argument JSON —
 WM-trained ckpts emit it, verbatim replay 400s vLLM).

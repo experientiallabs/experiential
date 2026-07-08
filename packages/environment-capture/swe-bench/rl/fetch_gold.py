@@ -3,7 +3,7 @@
 The pinned scenarios carry a `rubric` populated from SWE-bench's GOLD evaluation criteria — the
 per-instance `FAIL_TO_PASS` tests (the tests the correct patch must flip red->green; they ARE the
 grading gold). Those live in the upstream dataset, not in our trace corpus, so this one-off pull
-caches exactly the corpus's instances into `swe_gold.json`. `pin_scenarios.py` then reads that
+caches exactly the corpus's instances into `swe_gold.json`. `swe_pin_scenarios.py` then reads that
 committed cache (stdlib only) and never needs the heavy `datasets`/`swebench` stack — the same
 reason the trace corpus itself is a committed, reproducible artifact.
 

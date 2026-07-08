@@ -78,10 +78,9 @@ python_files = ["*_test.py"]
 testpaths = ["wmh", "packages"]
 # tau2-bench is a local clone of the external real-environment runner (own test suite, own
 # deps) that lives beside the tau-bench member data; it is not part of this gate.
-# The benchmark rl/ dirs share helper basenames (real_eval.py, pin_scenarios.py) that
-# collide in one pytest session, so they are gated per-directory instead:
-#   for d in packages/environment-capture/*/rl; do uv run pytest "$d" -q; done
-norecursedirs = ["tau2-bench", "rl"]
+# (Benchmark rl/ helpers carry unique, benchmark-prefixed basenames — tau_real_eval.py,
+# swe_pin_scenarios.py — so flat collection works; keep new helpers unique too.)
+norecursedirs = ["tau2-bench"]
 
 [tool.ruff]
 line-length = 100

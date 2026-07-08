@@ -5,10 +5,10 @@ The SFT baseline imitates the recorded tau agent. The claas-verl side
 the SAME system prompt / message shapes / compression as the wm_tau rollout scaffold, so
 the SFT row and the RL rows see byte-compatible prompts.
 
-Leakage rule (same as pin_scenarios.py, D26): any train trace whose task text appears in
+Leakage rule (same as tau_pin_scenarios.py, D26): any train trace whose task text appears in
 the pinned eval scenario set is dropped entirely — the policy must never train on an eval
 prompt, whether as a scenario or as a recorded demonstration. Task identity comes from
-`wmh.env.scenarios.trace_task`, the same helper pin_scenarios.py uses (via
+`wmh.env.scenarios.trace_task`, the same helper tau_pin_scenarios.py uses (via
 `scenarios_from_traces`), so the two filters cannot drift apart.
 
 Output (gitignored artifact root): .wmh/rl/sft_episodes.jsonl, one `SftEpisode` per line.

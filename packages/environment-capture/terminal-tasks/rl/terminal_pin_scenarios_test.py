@@ -1,14 +1,12 @@
-"""Guard the pinned swe-bench scenario sets against corpus drift and leakage.
+"""Guard the pinned terminal-tasks scenario sets against corpus drift and leakage.
 
 Locks the invariants the RL arms depend on: train is capped, eval is EVERY unique test-split task,
 the two are disjoint at BOTH the task-text and trace-id levels, every provenance id resolves to a
-real trace, every scenario carries its SWE-bench `instance_id`, and every scenario is task-text
-tier (`rubric: null` — the corpus has no gold-criteria field; gold is external, keyed by
-`instance_id`). It also re-derives the sets from the committed corpus and asserts the committed
-files still match.
+real trace, and every scenario is task-text tier (`rubric: null`). It also re-derives the sets from
+the committed corpus and asserts the committed files still match.
 
 `examples/` is off the root gate; run explicitly:
-    uv run pytest packages/environment-capture/swe-bench/rl/pin_scenarios_test.py
+    uv run pytest packages/environment-capture/terminal-tasks/rl/pin_scenarios_test.py
 """
 
 from __future__ import annotations
@@ -25,16 +23,19 @@ from wmh.ingest import get_adapter
 
 _DIR = Path(__file__).resolve().parent
 
-# The trace corpora moved off-repo (huggingface: experiential-labs/wmh-*-traces); the
-# corpus-drift half of this guard only runs where the corpus has been downloaded.
-pytestmark = pytest.mark.skipif(
+# The trace corpora moved off-repo (huggingface: experiential-labs/wmh-*-traces).
+# Corpus-reading tests skip when it isn't downloaded; the committed-file guards
+# (well-formedness, train/eval disjointness) always run.
+_needs_corpus = pytest.mark.skipif(
     not (_DIR.parent / "traces.otel.jsonl").exists(),
     reason="corpus not downloaded (see packages/environment-capture/README.md)",
 )
 
 
-def _load_pin():
-    spec = importlib.util.spec_from_file_location("swe_pin", _DIR / "pin_scenarios.py")
+def _load_pin() -> object:
+    spec = importlib.util.spec_from_file_location(
+        "terminal_pin", _DIR / "terminal_pin_scenarios.py"
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -51,27 +52,11 @@ def test_pinned_sets_are_leak_free_and_well_formed() -> None:
     train = _read(pin.TRAIN_OUT)
     ev = _read(pin.EVAL_OUT)
 
-    gold = json.loads(pin.GOLD_PATH.read_text(encoding="utf-8"))
     for row in (*train, *ev):
         assert isinstance(row["task"], str) and row["task"].strip()
         assert isinstance(row["provenance"], list) and row["provenance"]
-        assert isinstance(row["instance_id"], str) and row["instance_id"]
-        assert isinstance(row["repo"], str) and row["repo"]
-        # rubric is the instance's SWE-bench gold, joined on instance_id: a compact JSON string
-        # with FAIL_TO_PASS verbatim (non-empty) + PASS_TO_PASS count + repo + base_commit, and it
-        # must match the committed gold cache exactly (no fabricated / drifted criteria).
-        assert isinstance(row["rubric"], str) and row["rubric"]
-        rubric = json.loads(row["rubric"])
-        assert set(rubric) == {"fail_to_pass", "pass_to_pass_count", "repo", "base_commit"}
-        assert isinstance(rubric["fail_to_pass"], list) and rubric["fail_to_pass"]
-        assert isinstance(rubric["pass_to_pass_count"], int)
-        g = gold[row["instance_id"]]
-        assert rubric["fail_to_pass"] == g["fail_to_pass"]
-        assert rubric["pass_to_pass_count"] == g["pass_to_pass_count"]
-        assert rubric["base_commit"] == g["base_commit"]
-
-    # 100% gold join coverage: every pinned instance resolves in the committed cache.
-    assert {r["instance_id"] for r in (*train, *ev)} <= gold.keys()
+        assert isinstance(row["category"], str) and row["category"]
+        assert row["rubric"] is None
 
     assert len(train) <= pin.TRAIN_CAP
 
@@ -83,16 +68,18 @@ def test_pinned_sets_are_leak_free_and_well_formed() -> None:
     eval_ids = {tid for r in ev for tid in r["provenance"]}
     assert train_ids.isdisjoint(eval_ids)
 
-    # instance_ids are disjoint across the two sets too (no SWE-bench instance trains AND evals).
-    train_instances = {r["instance_id"] for r in train}
-    eval_instances = {r["instance_id"] for r in ev}
-    assert train_instances.isdisjoint(eval_instances)
 
+@_needs_corpus
+def test_pins_are_a_subset_of_the_corpus() -> None:
+    pin = _load_pin()
+    train_ids = {tid for r in _read(pin.TRAIN_OUT) for tid in r["provenance"]}
+    eval_ids = {tid for r in _read(pin.EVAL_OUT) for tid in r["provenance"]}
     traces = get_adapter("otel-genai").from_file(str(pin._TRACES_PATH))
     corpus_ids = {t.trace_id for t in traces}
     assert (train_ids | eval_ids) <= corpus_ids
 
 
+@_needs_corpus
 def test_committed_files_match_a_fresh_derivation() -> None:
     pin = _load_pin()
     traces = get_adapter("otel-genai").from_file(str(pin._TRACES_PATH))
@@ -107,6 +94,7 @@ def test_committed_files_match_a_fresh_derivation() -> None:
     assert len(committed_train_tasks) == min(pin.TRAIN_CAP, len(pool_tasks))
 
 
+@_needs_corpus
 def test_tools_inventory_is_train_derived() -> None:
     pin = _load_pin()
     traces = get_adapter("otel-genai").from_file(str(pin._TRACES_PATH))
