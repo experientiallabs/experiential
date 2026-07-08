@@ -60,6 +60,18 @@ async function awaitResponse(id: string): Promise<{ content: string; is_error?: 
 let toolSeq = 0;
 let doneSent = false;
 
+// pi often ends by writing its final answer as a normal assistant message rather than calling
+// `submit`; capture the latest assistant text to use as the answer if the loop exits without one.
+let lastAssistantText = "";
+function assistantText(msg: any): string {
+	if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return "";
+	return msg.content
+		.filter((c: any) => c?.type === "text")
+		.map((c: any) => String(c.text ?? ""))
+		.join("")
+		.trim();
+}
+
 function makeEnvTool(t: TaskTool): AgentTool<any> {
 	return {
 		name: t.name,
@@ -124,6 +136,10 @@ async function main(): Promise<void> {
 	});
 	let turns = 0;
 	agent.subscribe((event) => {
+		if (event.type === "turn_end" || event.type === "message_end") {
+			const t = assistantText((event as any).message);
+			if (t) lastAssistantText = t;
+		}
 		if (event.type === "turn_end") {
 			turns += 1;
 			if (turns >= MAX_TURNS) agent.abort();
@@ -131,7 +147,7 @@ async function main(): Promise<void> {
 	});
 
 	await agent.prompt(task.instruction);
-	if (!doneSent) emit("__WMH_DONE__", { answer: "" });
+	if (!doneSent) emit("__WMH_DONE__", { answer: lastAssistantText });
 	process.stderr.write(`[entry_e2b] turns=${turns} done=${doneSent}\n`);
 	process.exit(0);
 }

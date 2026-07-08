@@ -60,6 +60,19 @@ async function sendDone(answer: string | null): Promise<void> {
 	await postJson("/done", { answer });
 }
 
+// pi often ends by writing its final answer as a normal assistant message rather than calling
+// `submit`. Capture the latest assistant text so we can use it as the answer if the loop exits
+// without a submit call (otherwise the answer would be empty).
+let lastAssistantText = "";
+function assistantText(msg: any): string {
+	if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return "";
+	return msg.content
+		.filter((c: any) => c?.type === "text")
+		.map((c: any) => String(c.text ?? ""))
+		.join("")
+		.trim();
+}
+
 function makeShimTool(t: TaskTool): AgentTool<any> {
 	return {
 		name: t.name,
@@ -135,6 +148,10 @@ async function main(): Promise<void> {
 	// Hard turn cap: abort after MAX_TURNS assistant turns to avoid runaway loops.
 	let turnCount = 0;
 	agent.subscribe((event) => {
+		if (event.type === "turn_end" || event.type === "message_end") {
+			const t = assistantText((event as any).message);
+			if (t) lastAssistantText = t;
+		}
 		if (event.type === "turn_end") {
 			turnCount += 1;
 			if (turnCount >= MAX_TURNS) agent.abort();
@@ -143,10 +160,11 @@ async function main(): Promise<void> {
 
 	await agent.prompt(task.instruction);
 
-	// After the loop, ensure /done was sent (e.g. hit turn cap without submit).
+	// After the loop, ensure /done was sent. If pi never called submit, fall back to its last
+	// assistant message text (its de-facto answer) rather than reporting empty.
 	if (!doneSent) {
 		const err = agent.state.errorMessage;
-		await sendDone(err ? null : "");
+		await sendDone(err ? null : lastAssistantText);
 	}
 
 	console.error(`[entry] done sent=${doneSent} turns=${turnCount} err=${agent.state.errorMessage ?? ""}`);

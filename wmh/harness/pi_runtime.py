@@ -29,9 +29,11 @@ import os
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, cast
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
+from wmh.harness.runner_link import WorkerConfig, params_schema, worker_completion
 from wmh.harness.runtime import RunResult, StopReason
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import ToolSpec
@@ -41,10 +43,17 @@ from wmh.providers.base import Provider
 # source is overwritten from the harness surfaces.
 PI_RUNNER_HOST = os.environ.get("PI_RUNNER_HOST", "kion@nucbox.local")
 PI_RUNNER_DIR = os.environ.get("PI_RUNNER_DIR", "~/pi-run")
-# The agent model pi talks to: any OpenAI-compatible, function-calling endpoint.
+# The agent model pi talks to. Two backends:
+#   PI_AGENT_BACKEND=openai (default) -> transparent proxy to an OpenAI-compatible endpoint.
+#   PI_AGENT_BACKEND=bedrock          -> the shim translates pi's OpenAI chat request to a Bedrock
+#                                        Converse call (host-side, boto3) and back to OpenAI SSE, so
+#                                        a Bedrock model (e.g. Claude Haiku) can be the worker
+#                                        without pi needing AWS creds or a Bedrock transport.
+PI_AGENT_BACKEND = os.environ.get("PI_AGENT_BACKEND", "openai")
 PI_AGENT_BASE_URL = os.environ.get("PI_AGENT_BASE_URL", "https://api.deepseek.com/v1")
 PI_AGENT_MODEL = os.environ.get("PI_AGENT_MODEL", "deepseek-chat")
 PI_AGENT_KEY_ENV = os.environ.get("PI_AGENT_KEY_ENV", "DEEPSEEK_API_KEY")
+PI_AGENT_REGION = os.environ.get("PI_AGENT_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 
 DEFAULT_MAX_ENV_ACTIONS = 40
 _ENTRY_TS = os.path.join(os.path.dirname(__file__), "pi_entry", "entry.ts")
@@ -98,11 +107,9 @@ class _Episode:
         return {"content": obs.content, "is_error": obs.is_error}
 
 
-def _params_schema(tool: ToolSpec) -> JsonObject:
-    props: JsonObject = {
-        name: {"type": "string", "description": desc} for name, desc in tool.arguments.items()
-    }
-    return {"type": "object", "properties": props, "required": list(tool.arguments)}
+# The tool `parameters` schema builder lives in runner_link (shared with the frame transport);
+# re-exported here under its old private name so existing callers and tests keep working.
+_params_schema = params_schema
 
 
 class _ShimServer(ThreadingHTTPServer):
@@ -166,12 +173,16 @@ class _ShimHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, status=404)
 
     def _serve_completion(self, body: JsonObject) -> None:
-        """Proxy pi's chat-completion to the agent model, streaming the SSE bytes straight back.
+        """Answer pi's chat-completion from the configured worker backend, as OpenAI SSE.
 
-        A transparent passthrough preserves OpenAI's chunk framing (tool_calls, finish_reason)
-        exactly as pi's parser expects. `Connection: close` + closing the socket delimits the
-        streamed body and forces a fresh socket for pi's next turn.
+        openai backend: transparent passthrough preserving OpenAI's chunk framing (tool_calls,
+        finish_reason). bedrock backend: translate to a Bedrock Converse call and synthesize the
+        SSE reply. `Connection: close` + closing the socket delimits the body and forces a fresh
+        socket for pi's next turn.
         """
+        if PI_AGENT_BACKEND == "bedrock":
+            self._serve_completion_bedrock(body)
+            return
         import urllib.error
         import urllib.request
 
@@ -202,6 +213,41 @@ class _ShimHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 - never crash the shim
             self._ep.proxy_error = str(exc)
             err = json.dumps({"error": {"message": f"agent proxy failed: {exc}"}})
+            self.wfile.write(f"data: {err}\n\ndata: [DONE]\n\n".encode())
+
+    def _serve_completion_bedrock(self, body: JsonObject) -> None:
+        """Translate pi's OpenAI chat request to a Bedrock Converse call, reply as OpenAI SSE.
+
+        Non-streaming Converse on the host (boto3, host AWS creds), then synthesized as two SSE
+        chunks (delta, then finish_reason) + [DONE] — the framing pi's openai-completions parser
+        expects. The worker model never sees AWS creds; they stay on the control host.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            # The Bedrock translation + Converse call is shared with the frame transport
+            # (runner_link.worker_completion); here we only re-frame its completion object as the
+            # two SSE chunks pi's openai-completions parser expects.
+            cfg = WorkerConfig(backend="bedrock", model=PI_AGENT_MODEL, region=PI_AGENT_REGION)
+            completion = cast("Any", worker_completion(body, cfg))
+            choice = completion["choices"][0]
+            msg = choice["message"]
+            delta: dict[str, Any] = {"role": "assistant", "content": msg.get("content", "")}
+            tcs = msg.get("tool_calls")
+            if tcs:  # streaming delta needs an index per tool_call
+                delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(tcs)]
+            fin = choice.get("finish_reason")
+            first = {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+            last = {"choices": [{"index": 0, "delta": {}, "finish_reason": fin}]}
+            self.wfile.write(f"data: {json.dumps(first)}\n\n".encode())
+            self.wfile.write(f"data: {json.dumps(last)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+        except Exception as exc:  # noqa: BLE001 - never crash the shim
+            self._ep.proxy_error = str(exc)
+            err = json.dumps({"error": {"message": f"bedrock worker failed: {exc}"}})
             self.wfile.write(f"data: {err}\n\ndata: [DONE]\n\n".encode())
 
 
