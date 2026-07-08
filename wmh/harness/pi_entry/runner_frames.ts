@@ -15,10 +15,25 @@ export class FrameConn {
 	private waiters = new Map<number, (f: Frame) => void>();
 	private handlers = new Map<string, (f: Frame) => void>();
 	private reqSeq = 0;
+	private closed = false;
 
 	constructor(sock: net.Socket) {
 		this.sock = sock;
 		sock.on("data", (d: Buffer) => this._onData(d));
+		// If the channel drops while a request is in flight, settle every pending waiter with an
+		// error frame — otherwise awaiting llm_request/tool_request promises hang forever and the
+		// episode never returns a done/episode_error.
+		sock.on("close", () => this._settleAll("runner channel closed"));
+		sock.on("error", (e: Error) => this._settleAll(`runner channel error: ${e.message}`));
+	}
+
+	private _settleAll(reason: string): void {
+		this.closed = true;
+		const pending = [...this.waiters.values()];
+		this.waiters.clear();
+		for (const resolve of pending) {
+			resolve({ error: reason, content: reason, is_error: true });
+		}
 	}
 
 	/** Register a handler for a server-pushed frame type (no req_id): episode_start, cancel, ping. */
@@ -35,6 +50,10 @@ export class FrameConn {
 
 	/** Send a request frame with a fresh req_id; resolve with the matching response frame. */
 	request(type: string, payload: Frame): Promise<Frame> {
+		if (this.closed) {
+			const reason = "runner channel closed";
+			return Promise.resolve({ error: reason, content: reason, is_error: true });
+		}
 		const req_id = ++this.reqSeq;
 		return new Promise((resolve) => {
 			this.waiters.set(req_id, resolve);

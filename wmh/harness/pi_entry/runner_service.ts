@@ -65,7 +65,14 @@ function startLlmBridge(conn: FrameConn): Promise<Bridge> {
 					const msg = choice.message ?? {};
 					const delta: any = { role: "assistant", content: msg.content ?? "" };
 					if (msg.tool_calls) {
-						delta.tool_calls = msg.tool_calls.map((tc: any, i: number) => ({ index: i, ...tc }));
+						// Keep `function` explicitly nested (the streaming OpenAI shape the pi parser
+						// expects); index each call.
+						delta.tool_calls = msg.tool_calls.map((tc: any, i: number) => ({
+							index: i,
+							id: tc.id,
+							type: tc.type ?? "function",
+							function: tc.function ?? {},
+						}));
 					}
 					const first = { choices: [{ index: 0, delta, finish_reason: null }] };
 					const last = { choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }] };

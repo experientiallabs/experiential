@@ -4,7 +4,7 @@
 earendil-works/pi at v0.80.3 (commit a23abe4a695df8b69b613f73e9fdda2a8af894d4). The pin, the
 license attribution, and the integrity ledger live beside it: `vendor/pi-agent/VENDOR.md`,
 `vendor/pi-agent/LICENSE`, and `vendor/manifest.sha256` (regenerate/verify with
-`tools/vendor_pi.sh`).
+`wmh/harness/vendor/vendor_pi.sh`).
 
 This module is the ONLY place wmh reads that tree, and it reads it straight from disk:
 `pi_agent_code_surfaces()` loads pi's own TypeScript source into `code:` surfaces so the
@@ -52,7 +52,7 @@ def pi_agent_code_surfaces() -> list[Surface]:
     if not paths:
         raise FileNotFoundError(
             f"no pi source under {PI_AGENT_ROOT}; is the vendored copy present? "
-            "regenerate with tools/vendor_pi.sh"
+            "regenerate with wmh/harness/vendor/vendor_pi.sh"
         )
     surfaces: list[Surface] = []
     for p in paths:

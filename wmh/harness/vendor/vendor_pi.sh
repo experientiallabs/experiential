@@ -2,8 +2,8 @@
 # Re-materialize the vendored pi agent from upstream at the pinned commit, and regenerate the
 # integrity ledger. Idempotent: on a correct vendoring, a second run leaves `git status` clean.
 #
-#   tools/vendor_pi.sh            # vendor + write manifest
-#   tools/vendor_pi.sh --check    # verify only: fail if the committed tree drifts from upstream
+#   wmh/harness/vendor/vendor_pi.sh            # vendor + write manifest
+#   wmh/harness/vendor/vendor_pi.sh --check    # verify only: fail if the committed tree drifts from upstream
 #
 # This is the single source of truth for HOW the vendoring is produced. If you bump the pin, edit
 # PIN/TAG here, run it, and commit the result (including the regenerated manifest and VENDOR.md).

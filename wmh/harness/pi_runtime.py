@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +58,13 @@ PI_AGENT_REGION = os.environ.get("PI_AGENT_REGION", os.environ.get("AWS_REGION",
 
 DEFAULT_MAX_ENV_ACTIONS = 40
 _ENTRY_TS = os.path.join(os.path.dirname(__file__), "pi_entry", "entry.ts")
+# Runner paths are interpolated into remote shell commands, so restrict them to characters that
+# cannot break out of the command (allows `~` expansion; rejects spaces, quotes, `;`, `$`, etc.).
+_SAFE_REMOTE_PATH = re.compile(r"^[A-Za-z0-9_./~-]+$")
+
+
+class _MaterializeError(RuntimeError):
+    """Remote source materialization failed; the episode must not run stale files."""
 
 
 class _Episode:
@@ -237,8 +245,16 @@ class _ShimHandler(BaseHTTPRequestHandler):
             msg = choice["message"]
             delta: dict[str, Any] = {"role": "assistant", "content": msg.get("content", "")}
             tcs = msg.get("tool_calls")
-            if tcs:  # streaming delta needs an index per tool_call
-                delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(tcs)]
+            if tcs:  # streaming delta: index per call, function object kept explicitly nested
+                delta["tool_calls"] = [
+                    {
+                        "index": i,
+                        "id": tc.get("id"),
+                        "type": tc.get("type", "function"),
+                        "function": tc.get("function", {}),
+                    }
+                    for i, tc in enumerate(tcs)
+                ]
             fin = choice.get("finish_reason")
             first = {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
             last = {"choices": [{"index": 0, "delta": {}, "finish_reason": fin}]}
@@ -275,6 +291,12 @@ class PiRuntime:
         self._port = port
         self._workdir = workdir or f"{PI_RUNNER_DIR}/ep-{port}"
         self._max_env_actions = max_env_actions
+        for label, path in (("PI_RUNNER_DIR", PI_RUNNER_DIR), ("workdir", self._workdir)):
+            if not _SAFE_REMOTE_PATH.match(path):
+                raise ValueError(
+                    f"unsafe remote {label} {path!r}: only [A-Za-z0-9_./~-] allowed "
+                    "(it is interpolated into a remote shell command)"
+                )
 
     def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
         episode = _Episode(
@@ -289,35 +311,52 @@ class PiRuntime:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            self._materialize()
+            try:
+                self._materialize()
+            except _MaterializeError as exc:
+                # Remote write failed; do not run node against stale files from a prior episode.
+                return self._error_result(task_id, episode, instruction, str(exc), StopReason.ERROR)
             code, note = self._run_node()
         finally:
             server.shutdown()
             server.server_close()
         if not episode.done.is_set():
             stop = StopReason.ERROR if code != 0 else StopReason.MAX_TURNS
-            episode.steps.append(
-                Step(
-                    action=Action(kind=ActionKind.MESSAGE, content="(pi runtime)"),
-                    observation=Observation(
-                        content=note or "episode ended without submit", is_error=True
-                    ),
-                    state_before=EnvState(),
-                    task=instruction,
-                )
+            return self._error_result(
+                task_id, episode, instruction, note or "episode ended without submit", stop
             )
-            return RunResult(
-                task_id=task_id,
-                steps=episode.steps,
-                stop_reason=stop,
-                answer="",
-                turns=len(episode.steps),
+        if episode.proxy_error:
+            # The worker LLM proxy failed (auth/outage/HTTP error); entry.ts still POSTs /done, but
+            # this is infrastructure failure, not an agent submission — never count it as SUBMITTED.
+            return self._error_result(
+                task_id, episode, instruction,
+                f"worker LLM proxy error: {episode.proxy_error}", StopReason.ERROR,
             )
         return RunResult(
             task_id=task_id,
             steps=episode.steps,
             stop_reason=StopReason.SUBMITTED,
             answer=episode.answer,
+            turns=len(episode.steps),
+        )
+
+    @staticmethod
+    def _error_result(
+        task_id: str, episode: _Episode, instruction: str, note: str, stop: StopReason
+    ) -> RunResult:
+        episode.steps.append(
+            Step(
+                action=Action(kind=ActionKind.MESSAGE, content="(pi runtime)"),
+                observation=Observation(content=note, is_error=True),
+                state_before=EnvState(),
+                task=instruction,
+            )
+        )
+        return RunResult(
+            task_id=task_id,
+            steps=episode.steps,
+            stop_reason=stop,
+            answer="",
             turns=len(episode.steps),
         )
 
@@ -340,7 +379,12 @@ class PiRuntime:
             f" && ln -sfn {PI_RUNNER_DIR}/node_modules {self._workdir}/node_modules"
             f" && cd {self._workdir} && python3 -c {_shq(writer)}"
         )
-        _ssh(remote, input_bytes=blob.encode("utf-8"))
+        result = _ssh(remote, input_bytes=blob.encode("utf-8"))
+        if result.returncode != 0:
+            detail = (result.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+            raise _MaterializeError(
+                f"remote materialize failed (rc={result.returncode}): {detail}"
+            )
 
     def _run_node(self) -> tuple[int, str]:
         """Run entry.ts on the runner with a reverse tunnel back to the local shim."""

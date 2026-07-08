@@ -110,12 +110,14 @@ def worker_config_from_env() -> WorkerConfig:
     So `doc.runtime()` under PI_TRANSPORT=link answers the worker LLM the same way the SSH shim
     does (e.g. PI_AGENT_BACKEND=bedrock + PI_AGENT_MODEL=<Haiku profile>).
     """
+    # Defaults mirror pi_runtime.PI_AGENT_* exactly, so PI_TRANSPORT=link on an otherwise-default
+    # (deepseek) SSH setup works without extra env, not sending keyless/model-less requests.
     return WorkerConfig(
         backend=os.environ.get("PI_AGENT_BACKEND", "openai"),
-        model=os.environ.get("PI_AGENT_MODEL", ""),
+        model=os.environ.get("PI_AGENT_MODEL", "deepseek-chat"),
         region=os.environ.get("PI_AGENT_REGION", os.environ.get("AWS_REGION", "us-east-1")),
-        base_url=os.environ.get("PI_AGENT_BASE_URL", ""),
-        key_env=os.environ.get("PI_AGENT_KEY_ENV", ""),
+        base_url=os.environ.get("PI_AGENT_BASE_URL", "https://api.deepseek.com/v1"),
+        key_env=os.environ.get("PI_AGENT_KEY_ENV", "DEEPSEEK_API_KEY"),
     )
 
 
@@ -249,6 +251,17 @@ def openai_to_bedrock(body: JsonObject) -> tuple[list, list, dict | None]:
                 }
             )
         tool_config = {"tools": specs}
+        # Carry OpenAI tool_choice -> Bedrock toolChoice so a forced/required tool call is not
+        # silently downgraded to auto. "auto"/absent = Bedrock's default (no explicit toolChoice).
+        choice = b.get("tool_choice")
+        if choice == "required":
+            tool_config["toolChoice"] = {"any": {}}
+        elif isinstance(choice, dict) and choice.get("type") == "function":
+            name = choice.get("function", {}).get("name")
+            if name:
+                tool_config["toolChoice"] = {"tool": {"name": name}}
+        elif choice == "none":
+            tool_config = None  # caller asked the model NOT to use tools
     return system, msgs, tool_config
 
 
@@ -276,7 +289,14 @@ def bedrock_to_completion(resp: JsonObject) -> JsonObject:
     if tool_calls:
         msg["tool_calls"] = tool_calls
     stop = cast("Any", resp).get("stopReason", "end_turn")
-    finish = {"tool_use": "tool_calls", "max_tokens": "length"}.get(stop, "stop")
+    # Map Bedrock stop reasons to OpenAI finish_reasons. A blocked/filtered response is surfaced as
+    # "content_filter" rather than looking like a normal "stop", so downstream can tell it apart.
+    finish = {
+        "tool_use": "tool_calls",
+        "max_tokens": "length",
+        "content_filtered": "content_filter",
+        "guardrail_intervened": "content_filter",
+    }.get(stop, "stop")
     return {
         "id": "chatcmpl-runnerlink",
         "object": "chat.completion",

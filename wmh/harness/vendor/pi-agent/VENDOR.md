@@ -13,7 +13,7 @@ into this repo so the harness search runs the real agent's source rather than a 
 | Files | 56 (byte-identical to upstream `packages/agent`) |
 | Upstream license | MIT (© 2025 Mario Zechner) |
 
-The tag is a convenience label; **the commit SHA is the pin**. `tools/vendor_pi.sh` fetches upstream
+The tag is a convenience label; **the commit SHA is the pin**. `wmh/harness/vendor/vendor_pi.sh` fetches upstream
 at that SHA, re-materializes this tree, and regenerates `wmh/harness/vendor/manifest.sha256`
 (the per-file integrity ledger). Re-running it must produce zero diff against the committed copy —
 that is how anyone re-verifies this vendoring from scratch.
@@ -26,7 +26,7 @@ pinned commit. See it for the full MIT text and copyright.
 
 ## Do not edit in place
 
-These files are upstream bytes and must stay that way — `tools/vendor_pi.sh` and the checksum gate
+These files are upstream bytes and must stay that way — `wmh/harness/vendor/vendor_pi.sh` and the checksum gate
 both assume byte-identity with upstream. The harness *searches over* this source by loading it into
 `code:` surfaces (`wmh/harness/pi_vendor.py`) and mutating those surfaces through audited
 `HarnessDelta`s; the mutations live in stored `HarnessDoc` versions, never as edits to this tree.

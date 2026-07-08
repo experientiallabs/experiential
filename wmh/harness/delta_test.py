@@ -238,3 +238,51 @@ def test_delta_id_is_deterministic_and_content_addressed() -> None:
     assert compute_delta_id(parent.doc_hash, ops_a) == compute_delta_id(parent.doc_hash, ops_a)
     assert compute_delta_id(parent.doc_hash, ops_a) != compute_delta_id(parent.doc_hash, ops_b)
     assert compute_delta_id(parent.doc_hash, ops_a) != compute_delta_id("other", ops_a)
+
+
+def _pi_parent() -> HarnessDoc:
+    """A pi-node doc with a pathful code surface, like the vendored pi harness the search edits."""
+    from wmh.harness.doc import RUNTIME_KIND_ID
+
+    return HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(
+                id="code:src-agent-ts", kind=SurfaceKind.CODE, path="src/agent.ts", content="// v1"
+            ),
+        ],
+    )
+
+
+def test_apply_preserves_code_surface_path_on_replace() -> None:
+    # Editing a vendored pi code surface must keep its path — else the child is a path-less CODE
+    # surface and construction rejects it (the search could never mutate pi source before this fix).
+    parent = _pi_parent()
+    src = parent.surface("code:src-agent-ts")
+    assert src is not None
+    ops = [SurfaceOp(op="replace", surface_id="code:src-agent-ts", content="// v2", rationale="r")]
+    delta = _delta(ops, parent=parent, preconditions={"code:src-agent-ts": src.content_hash})
+    child = apply_delta(parent, delta, "child")
+    edited = child.surface("code:src-agent-ts")
+    assert edited is not None
+    assert edited.content == "// v2" and edited.path == "src/agent.ts"
+
+
+def test_apply_add_pathful_code_surface() -> None:
+    parent = _pi_parent()
+    ops = [
+        SurfaceOp(
+            op="add",
+            surface_id="code:src-b-ts",
+            kind=SurfaceKind.CODE,
+            path="src/b.ts",
+            content="// b",
+            rationale="r",
+        )
+    ]
+    child = apply_delta(parent, _delta(ops, parent=parent), "child")
+    added = child.surface("code:src-b-ts")
+    assert added is not None and added.path == "src/b.ts"

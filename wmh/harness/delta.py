@@ -52,6 +52,10 @@ class SurfaceOp(BaseModel):
     kind: SurfaceKind | None = None  # required on add; on replace must match the existing kind
     content: str | None = None  # the full new content (component rewrite, never a line diff)
     budget: int | None = Field(default=None, ge=1)  # replace: None inherits the existing budget
+    # File path for multi-file CODE surfaces (e.g. vendored pi `code:src-...`): on replace, None
+    # inherits the existing surface's path (so editing pi source keeps it a valid pathful surface);
+    # required to introduce a brand-new pathful code surface.
+    path: str | None = None
     rationale: str  # why THIS op, bound to the op — not one motivation string for the whole delta
 
     @model_validator(mode="after")
@@ -102,7 +106,9 @@ class HarnessDelta(BaseModel):
 def compute_delta_id(parent_doc_hash: str, ops: list[SurfaceOp]) -> str:
     """Deterministic delta identity: what it does to what, independent of when it was proposed."""
     joined = parent_doc_hash + "".join(
-        f"\x00{op.op}\x00{op.surface_id}\x00{op.content or ''}\x00{op.budget or ''}" for op in ops
+        f"\x00{op.op}\x00{op.surface_id}\x00{op.content or ''}"
+        f"\x00{op.budget or ''}\x00{op.path or ''}"
+        for op in ops
     )
     return hashlib.blake2b(joined.encode("utf-8"), digest_size=16).hexdigest()
 
@@ -128,10 +134,13 @@ def apply_delta(parent: HarnessDoc, delta: HarnessDelta, child_name: str) -> Har
         # add/replace carry content, and _check_ops guarantees replace targets exist.
         kind = op.kind if op.kind is not None else existing.kind if existing else None
         budget = op.budget if op.budget is not None else existing.budget if existing else None
+        # Carry the file path: a replace inherits the existing surface's path unless overridden,
+        # so mutating a vendored pi `code:src-...` surface stays a valid pathful CODE surface.
+        path = op.path if op.path is not None else existing.path if existing else None
         if kind is None or op.content is None:
             raise ValueError(f"malformed {op.op} of {op.surface_id!r}")
         surfaces[op.surface_id] = Surface(
-            id=op.surface_id, kind=kind, content=op.content, budget=budget
+            id=op.surface_id, kind=kind, content=op.content, budget=budget, path=path
         )
 
     child = HarnessDoc(name=child_name, surfaces=list(surfaces.values()))
