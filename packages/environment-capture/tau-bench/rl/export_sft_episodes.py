@@ -33,7 +33,8 @@ _HERE = Path(__file__).resolve().parent
 _MODEL_DIR = _HERE.parent / "models" / "tau-bench"
 _TRACES_PATH = _HERE.parent / "traces.otel.jsonl"
 _EVAL_SCENARIOS = _HERE / "scenarios_eval.jsonl"
-_DEFAULT_OUT = _HERE.parents[2] / ".wmh" / "rl" / "sft_episodes.jsonl"
+# _HERE = .../packages/environment-capture/tau-bench/rl -> parents[3] = repo root.
+_DEFAULT_OUT = _HERE.parents[3] / ".wmh" / "rl" / "sft_episodes.jsonl"
 
 
 class SftStep(BaseModel):

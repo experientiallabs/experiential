@@ -46,4 +46,4 @@ checkpoint). The figure renders with
 `uv run python .agents/scripts/plot_fidelity_transfer.py --out
 docs/research/fidelity_transfer_curve.png`; the paired-Δ computation is inside that
 script (mean per-episode reward delta over the paired intersection with the base row).
-Full program context: `packages/environment-capture/tau-bench/rl/results.md` and PR #73.
+Full program context: `.agents/docs/research/bench_b2_results.md` and PR #73.

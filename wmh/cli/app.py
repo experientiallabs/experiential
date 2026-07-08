@@ -651,6 +651,12 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     judge_provider: str = typer.Option(
         "bedrock", "--judge-provider", help="Provider for --judge-model."
     ),
+    judge_region: str | None = typer.Option(
+        None,
+        "--judge-region",
+        help="AWS region for --judge-model (default: --region). Pin it when serve cells "
+        "vary --region, or the 'pinned' judge still changes region per cell.",
+    ),
     sample_turns: str | None = typer.Option(
         None, help="Turns scored per trace: all | sampled (5). Default: all, or suite config."
     ),
@@ -753,6 +759,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             judge=judge,
             judge_model=judge_model,
             judge_provider=judge_provider,
+            judge_region=judge_region,
             sample_turns=sample_turns,
             seed=seed,
             top_k=top_k,
@@ -784,6 +791,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         region=region,
         judge_model=judge_model,
         judge_provider=judge_provider,
+        judge_region=judge_region,
     )
     _print_eval_report(report)
     if out:
@@ -877,6 +885,7 @@ def _eval_run_suite(
     judge: str | None,
     judge_model: str | None,
     judge_provider: str,
+    judge_region: str | None,
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
@@ -923,6 +932,7 @@ def _eval_run_suite(
             "region": region,
             "judge_model": judge_model,
             "judge_provider": judge_provider if judge_model else None,
+            "judge_region": (judge_region or region) if judge_model else None,
             "prompt": options.prompt_file,
             "files": [str(path) for path in files],
             "train_split": options.train_split,
@@ -1000,6 +1010,7 @@ def _run_eval_files(
     chain: str | None = None,
     judge_model: str | None = None,
     judge_provider: str = "bedrock",
+    judge_region: str | None = None,
 ) -> EvalReport:
     for path in files:
         if not path.exists():
@@ -1025,7 +1036,11 @@ def _run_eval_files(
     # --judge-model additionally pins the judge to its OWN model: comparing fidelity
     # across serve backends requires a constant grader, or the judge changes with the cell.
     judge_llm = providers.get_provider(
-        ProviderConfig(kind=ProviderKind(judge_provider), model=judge_model, region=region)
+        ProviderConfig(
+            kind=ProviderKind(judge_provider),
+            model=judge_model,
+            region=judge_region or region,
+        )
         if judge_model
         else provider_config
     )
