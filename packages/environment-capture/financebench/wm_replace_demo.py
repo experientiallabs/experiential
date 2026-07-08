@@ -93,8 +93,7 @@ def _run_task(
             for s in real_run.steps
         ],
         "wm_transcript": [
-            {"command": s.action.arguments.get("command"), "output": s.output}
-            for s in wm_run.steps
+            {"command": s.action.arguments.get("command"), "output": s.output} for s in wm_run.steps
         ],
     }
 
@@ -146,8 +145,7 @@ def main() -> None:
     }
     print(
         f"\nagreement {agreement:.2f} over {n} tasks | mean reward real {real_mean:.2f} "
-        f"vs wm {wm_mean:.2f}"
-        + (f" | {len(failures)} task(s) failed" if failures else "")
+        f"vs wm {wm_mean:.2f}" + (f" | {len(failures)} task(s) failed" if failures else "")
     )
     runs_dir = _HERE / "runs"
     runs_dir.mkdir(exist_ok=True)

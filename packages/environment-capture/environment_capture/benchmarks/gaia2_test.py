@@ -127,7 +127,10 @@ def test_identifier_strings_with_leading_zeros_stay_distinct() -> None:
     assert score_actions(wrong, oracle) == 0.0
     assert score_actions(right, oracle) == 1.0
     # plain numeric equivalence still holds (int arg vs decimal string)
-    assert score_actions(
-        [_act("Contacts", "update_contact", contact_id="c1", age=25)],
-        [_act("Contacts", "update_contact", contact_id="c1", age="25.0")],
-    ) == 1.0
+    assert (
+        score_actions(
+            [_act("Contacts", "update_contact", contact_id="c1", age=25)],
+            [_act("Contacts", "update_contact", contact_id="c1", age="25.0")],
+        )
+        == 1.0
+    )

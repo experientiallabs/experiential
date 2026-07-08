@@ -163,6 +163,5 @@ def main() -> None:
     push_after_capture("crmarena", enabled=args.push_hub, private=args.hub_private)
 
 
-
 if __name__ == "__main__":
     main()
