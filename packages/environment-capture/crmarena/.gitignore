@@ -1,0 +1,5 @@
+crm.db
+crmarena_tasks.json
+schema.json
+runs/
+*.log

@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from wmh.config.settings import (
+    ModelRole,
+    ModelsSettings,
     ProjectSettings,
     ensure_telemetry_anonymous_id,
     load_settings,
@@ -50,3 +52,46 @@ def test_load_corrupt_settings_raises_friendly_error(tmp_path: Path) -> None:
     settings_path(root).write_text("not = = toml", encoding="utf-8")
     with pytest.raises(ValueError, match="not valid TOML"):
         load_settings(root)
+
+
+def test_model_roles_round_trip_through_toml(tmp_path: Path) -> None:
+    root = tmp_path / ".wmh"
+    settings = ProjectSettings(
+        models=ModelsSettings(
+            worker=ModelRole(provider="azure", model="gpt-5.4", endpoint="https://x.example/v1"),
+            judge=ModelRole(
+                provider="bedrock", model="us.anthropic.claude-opus-4-8", region="us-east-2"
+            ),
+        )
+    )
+    save_settings(settings, root)
+    loaded = load_settings(root)
+    assert loaded.models.worker is not None
+    assert loaded.models.worker.model == "gpt-5.4"
+    assert loaded.models.judge is not None
+    assert loaded.models.judge.region == "us-east-2"
+    assert "[models.worker]" in settings_path(root).read_text(encoding="utf-8")
+
+
+def test_resolve_falls_back_to_worker_for_unset_roles() -> None:
+    worker = ModelRole(provider="azure", model="gpt-5.4")
+    models = ModelsSettings(worker=worker)
+    assert models.resolve("judge") is worker
+    assert models.resolve("summary") is worker
+    assert models.resolve("worker") is worker
+    assert ModelsSettings().resolve("judge") is None
+
+
+def test_resolve_prefers_the_configured_role_over_worker() -> None:
+    models = ModelsSettings(
+        worker=ModelRole(provider="azure", model="gpt-5.4"),
+        summary=ModelRole(provider="azure", model="gpt-5.4-mini"),
+    )
+    resolved = models.resolve("summary")
+    assert resolved is not None
+    assert resolved.model == "gpt-5.4-mini"
+
+
+def test_resolve_rejects_unknown_role() -> None:
+    with pytest.raises(ValueError, match="unknown model role"):
+        ModelsSettings().resolve("teacher")

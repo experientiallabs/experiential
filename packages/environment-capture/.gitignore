@@ -1,0 +1,12 @@
+# Benchmark data payloads are Hub-hosted, not committed: each publishable benchmark's trace
+# corpus AND its task data / gold sidecars / evidence dirs live in a public dataset under
+# https://huggingface.co/experiential-labs (wmh-<benchmark>-traces). Capture and fetch_data
+# write them here locally; `uv run python -m environment_capture.hub fetch <benchmark>|all`
+# materializes everything after a fresh clone. appworld additionally has its own stricter
+# ignore (its license forbids plain-text redistribution entirely).
+*/traces.otel.jsonl
+*/data/
+*/gold/
+*/corpus/
+*/datafiles/
+*/schemas/

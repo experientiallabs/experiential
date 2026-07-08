@@ -1,4 +1,4 @@
-"""AWS Bedrock provider (Claude 4.8). Reads AWS_REGION + AWS credentials from the environment."""
+"""AWS Bedrock provider (Claude 4.8 / Amazon Nova). Reads AWS credentials from the environment."""
 
 from __future__ import annotations
 
@@ -43,6 +43,33 @@ class _BedrockResponse(TypedDict):
 
 class _TitanEmbedResponse(TypedDict):
     embedding: list[float]
+
+
+class _NovaContentBlock(TypedDict):
+    text: str
+
+
+class _NovaMessage(TypedDict):
+    content: list[_NovaContentBlock]
+
+
+class _NovaOutput(TypedDict):
+    message: _NovaMessage
+
+
+class _NovaUsage(TypedDict):
+    inputTokens: int
+    outputTokens: int
+
+
+class _NovaResponse(TypedDict):
+    output: _NovaOutput
+    usage: _NovaUsage
+
+
+def _is_nova(model_id: str) -> bool:
+    """Whether `model_id` is an Amazon Nova model (e.g. `us.amazon.nova-lite-v1:0`)."""
+    return ".nova-" in model_id or model_id.startswith("amazon.nova-")
 
 
 class BedrockProvider:
@@ -93,6 +120,15 @@ class BedrockProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
+        if _is_nova(self.config.model):
+            return self._complete_nova(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+        if "anthropic" not in self.config.model:
+            # Kimi, DeepSeek, and other third-party models: the model-agnostic Converse API.
+            return self._complete_converse(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
         # Claude 4.8 rejects sampling params, so temperature is intentionally not forwarded.
         body = {
             "anthropic_version": _ANTHROPIC_BEDROCK_VERSION,
@@ -106,6 +142,66 @@ class BedrockProvider:
         usage = TokenUsage(
             input_tokens=data["usage"]["input_tokens"],
             output_tokens=data["usage"]["output_tokens"],
+        )
+        return Completion(text=text, usage=usage)
+
+    def _complete_converse(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Completion:
+        """Complete via the Converse API (model-agnostic: Kimi, DeepSeek, ...).
+
+        Converse normalizes request/response shapes across vendors; thinking models may emit
+        `reasoningContent` blocks, which are skipped — callers get the visible text only.
+        """
+        kwargs: dict[str, JsonValue] = {
+            "modelId": self.config.model,
+            "messages": [
+                {"role": m.role, "content": [{"text": m.content}]} for m in messages
+            ],
+            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
+        }
+        if system:
+            kwargs["system"] = [{"text": system}]
+        response = self._get_client().converse(**kwargs)
+        blocks = response["output"]["message"]["content"]
+        text = "".join(block["text"] for block in blocks if "text" in block)
+        usage = TokenUsage(
+            input_tokens=int(response["usage"]["inputTokens"]),
+            output_tokens=int(response["usage"]["outputTokens"]),
+        )
+        return Completion(text=text, usage=usage)
+
+    def _complete_nova(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Completion:
+        """Complete via an Amazon Nova model (different request/response schema than Anthropic).
+
+        Nova wraps message content in `[{"text": ...}]` blocks, takes sampling params under
+        `inferenceConfig`, and returns the reply under `output.message`. Unlike the Claude path,
+        `temperature` IS forwarded — Nova accepts it.
+        """
+        body: dict[str, JsonValue] = {
+            "messages": [{"role": m.role, "content": [{"text": m.content}]} for m in messages],
+            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
+        }
+        if system:
+            body["system"] = [{"text": system}]
+        raw = self._get_client().invoke_model(modelId=self.config.model, body=json.dumps(body))
+        data = cast("_NovaResponse", json.loads(raw["body"].read()))
+        text = "".join(block["text"] for block in data["output"]["message"]["content"])
+        usage = TokenUsage(
+            input_tokens=data["usage"]["inputTokens"],
+            output_tokens=data["usage"]["outputTokens"],
         )
         return Completion(text=text, usage=usage)
 

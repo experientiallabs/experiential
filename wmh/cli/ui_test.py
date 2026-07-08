@@ -239,11 +239,12 @@ def test_step_selection_navigates_wraps_and_accepts() -> None:
 
 def test_build_wizard_collects_all_inputs() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
-    # Prompts in order: name, file, provider (select), model (select), region (bedrock only),
-    # budget, embedder (select). No embed-model (hashing default) and no phi-dim prompt.
+    # Prompts in order: name, trace source (select), file, provider (select), model (select),
+    # region (bedrock only), budget, embedder (select). No embed-model (hashing) or phi-dim prompt.
     reader = _scripted_reader(
         [
             "tau2-airline",
+            "",  # trace source: accept the default (otel-genai)
             "/tmp/traces.jsonl",
             "bedrock",
             "us.anthropic.claude-opus-4-8",
@@ -275,7 +276,7 @@ def test_build_wizard_select_by_number() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # Provider/model/embedder are numbered pickers; choosing by index must work. Pick anthropic (2),
     # its second model, no region prompt (not bedrock), budget 8, hashing embedder (1).
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "2", "2", "", "8", "1"])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "2", "2", "", "8", "1"])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -294,7 +295,7 @@ def test_build_wizard_collects_provider_embedder() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # A provider-backed embedder adds an embeddings-model picker; phi dim keeps its default.
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "openai", "gpt-5.5", "", "8", "openai", "text-embedding-3-large"]
+        ["m", "", "/tmp/t.jsonl", "openai", "gpt-5.5", "", "8", "openai", "text-embedding-3-large"]
     )
     params = run_build_wizard(
         console,
@@ -385,7 +386,7 @@ def test_build_wizard_dashes_spaces_in_name() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # Whitespace is dash-joined rather than rejected: typing "tau bench" quietly becomes
     # "tau-bench", with a dim note showing the name actually used.
-    reader = _scripted_reader(["tau bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["tau bench", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -401,7 +402,7 @@ def test_build_wizard_reprompts_on_invalid_name() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # A name normalization can't rescue ("tau/bench" has a path separator) must re-prompt with
     # the friendly validation message, not escape as a ValueError traceback.
-    reader = _scripted_reader(["tau/bench", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["tau/bench", "tau-bench", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -417,7 +418,7 @@ def test_build_wizard_normalizes_flag_name_in_default() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # A whitespace-y --name flag becomes the normalized bracketed default, acceptable via Enter
     # on the first prompt (no validation error, no re-prompt).
-    reader = _scripted_reader(["", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="tau bench"),
@@ -433,7 +434,7 @@ def test_build_wizard_drops_invalid_flag_name_from_default() -> None:
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     # An unrescuable --name flag must not become the bracketed Enter-default (it could never be
     # accepted); blank input then means "no name yet" and re-prompts until a valid one arrives.
-    reader = _scripted_reader(["", "tau-bench", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["", "tau-bench", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="tau/bench"),
@@ -458,10 +459,11 @@ def test_build_wizard_aborts_cleanly_on_eof() -> None:
 
 
 def test_build_wizard_reprompts_on_blank_trace_source() -> None:
-    # A blank traces path must re-ask, not crash. After a name, blank the file once, then give a
-    # real path; remaining prompts (provider/model/region/budget/embedder) take defaults.
+    # A blank traces path must re-ask, not crash. After a name and the trace-source select, blank
+    # the file once, then give a real path; remaining prompts (provider/model/region/budget/
+    # embedder) take defaults.
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["mymodel", "", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["mymodel", "", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -484,9 +486,9 @@ def test_build_wizard_prompts_for_missing_credentials_and_saves(
     monkeypatch.chdir(tmp_path)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(
-        # name, file, provider, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (skip),
-        # model, region, budget, embedder
-        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "", "8", "1"]
+        # name, trace source, file, provider, AWS_REGION, AWS_ACCESS_KEY_ID,
+        # AWS_SECRET_ACCESS_KEY (skip), model, region, budget, embedder
+        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "", "8", "1"]
     )
     params = run_build_wizard(
         console,
@@ -519,7 +521,7 @@ def test_build_wizard_keeps_session_creds_when_persistence_fails(
     monkeypatch.setattr(ui_module, "upsert_env_var", refuse)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "", "8", "1"]
+        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "", "8", "1"]
     )
     params = run_build_wizard(
         console,
@@ -544,7 +546,7 @@ def test_build_wizard_verifies_provider_and_retries_on_failure() -> None:
         return VerifyResult(ok=ok, kind=cfg.kind, model=cfg.model, detail="" if ok else "bad key")
 
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "anthropic", "", "", "", ""])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "openai", "", "anthropic", "", "", "", ""])
     params = run_build_wizard(
         console, BuildParams(name="default"), reader=reader, verify=flaky, verify_embed=_ok_verify
     )
@@ -565,7 +567,7 @@ def test_build_wizard_verifies_embedder_with_embed_config() -> None:
 
     console = Console(force_terminal=False, no_color=True, width=100)
     reader = _scripted_reader(
-        ["m", "/tmp/t.jsonl", "openai", "", "", "", "openai", "text-embedding-3-large"]
+        ["m", "", "/tmp/t.jsonl", "openai", "", "", "", "openai", "text-embedding-3-large"]
     )
     run_build_wizard(
         console,
@@ -584,7 +586,7 @@ def test_build_wizard_defaults_to_first_provider_with_creds(monkeypatch) -> None
     # bedrock, azure order) whose creds are present — here anthropic, once openai's key is gone.
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "", "", "", "", ""])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "", "", "", "", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -600,7 +602,7 @@ def test_build_wizard_annotates_providers_that_have_keys(monkeypatch) -> None:  
     # Providers whose creds are present are labeled in the picker; cleared ones are not.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
-    reader = _scripted_reader(["m", "/tmp/t.jsonl", "openai", "", "", "", ""])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "openai", "", "", "", ""])
     run_build_wizard(
         console,
         BuildParams(name="default"),

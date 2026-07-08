@@ -26,12 +26,15 @@ A frontier LLM acts as the *environment* your agent steps against, reconstructed
 1. **Build** from your OTel traces: ingest → normalize → split train/held-out → index a replay buffer → evolve the env prompt with GEPA against the held-out split.
 2. **Serve**: agents call `WorldModel.step(action)` (in-process or via the local HTTP backend). Each step retrieves the most similar past `(state, action) → observation` examples and predicts the next observation.
 
+Already have traces in **Braintrust, Arize Phoenix, Langfuse, LangSmith, PostHog, or Mastra** — or just chat/tool-call logs? Pick the source right in `wmh build` (`--source <name>` with `--file` or `--pull`, or choose it in the wizard); it's normalized into the harness's trace format via one pluggable interface, no separate step. See [`docs/ingest.md`](./docs/ingest.md).
+
 ## Try it
 
 ```bash
 uv run wmh examples list          # swe-bench, tau-bench, terminal-tasks
 uv run wmh eval list              # eval suites shipped with the examples
 uv run wmh eval run tau-bench     # replay + score reconstruction fidelity
+uv run wmh scenarios build --file traces.otel.jsonl   # traces -> judgeable eval scenarios
 uv run wmh play                   # step into the environment yourself
 uv run wmh serve                  # local HTTP backend on :8000
 ```
@@ -70,14 +73,14 @@ One interface, four backends, verified on startup. Credentials are read from the
 ## The monorepo
 
 This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/):
-`wmh` is the flagship package at the root (the quickstart above), and sibling packages live as
-top-level directories, each installable on its own:
+`wmh` is the flagship package at the root (the quickstart above), and sibling packages live under
+`packages/`, each installable on its own:
 
 | Package | What it does | Get it |
 |---|---|---|
 | **wmh** (root) | Agent traces → a faithful world model of your environment | the quickstart above |
-| [`llm-waterfall/`](./llm-waterfall) | Pool LLM quota across models, providers, and AWS accounts: stateless failover that spills only on capacity errors, returning cost + the full attempt trail | `pip install "llm-waterfall @ git+https://github.com/experientiallabs/world-model-harness#subdirectory=llm-waterfall"` *(PyPI release pending)* |
-| `environment-capture/` *(in progress)* | Point it at any agent benchmark: integrate via a small adapter, smoke-test it, capture real-run traces as OTel GenAI JSONL | — |
+| [`packages/llm-waterfall/`](./packages/llm-waterfall) | Pool LLM quota across models, providers, and AWS accounts: stateless failover that spills only on capacity errors, returning cost + the full attempt trail | `pip install "llm-waterfall @ git+https://github.com/experientiallabs/world-model-harness#subdirectory=packages/llm-waterfall"` *(PyPI release pending)* |
+| [`packages/environment-capture/`](./packages/environment-capture) | Point it at any agent benchmark: integrate via a small adapter, capture every real agent-environment transition as OTel GenAI JSONL; 27k+ transitions already published on the [Hub](https://huggingface.co/experiential-labs) | `pip install environment-capture` |
 
 One clone, one `uv sync`, one gate (`just gate`); each package is built and released independently.
 

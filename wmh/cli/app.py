@@ -13,6 +13,7 @@ import logging
 import random
 import subprocess
 import time
+import urllib.error
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,9 +22,16 @@ from uuid import uuid4
 
 import typer
 import uvicorn
+from environment_capture.hub import (
+    CORPORA,
+    corpus_path,
+    fetch_corpus,
+    published_corpora,
+)
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
 from rich.table import Table
 
 import wmh.providers as providers
@@ -37,6 +45,7 @@ from wmh.cli.ui import (
     run_build_wizard,
     run_play_repl,
     select_model,
+    select_option,
     select_provider_and_model,
 )
 from wmh.config import (
@@ -65,14 +74,23 @@ from wmh.engine.eval_suites import (
 )
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
+from wmh.env.llm_agent import LLMAgent
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
-from wmh.ingest import VendorPull
+from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
-from wmh.providers.base import EmbedderKind
+from wmh.providers.base import Embedder, EmbedderKind, Provider
 from wmh.providers.fallback import _is_capacity_error
 from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
+from wmh.scenarios import (
+    ChecklistJudge,
+    FacetExtractor,
+    ScenarioBuildConfig,
+    ScenarioSet,
+    build_scenario_set,
+    verify_scenarios,
+)
 from wmh.serving.server import create_app
 from wmh.telemetry import (
     BuildTelemetryStats,
@@ -94,9 +112,14 @@ examples_app = typer.Typer(
     help="List and launch self-contained task examples.", no_args_is_help=True
 )
 config_app = typer.Typer(help="Manage local harness config.", no_args_is_help=True)
+scenarios_app = typer.Typer(
+    help="Construct and verify representative eval scenario sets from traces.",
+    no_args_is_help=True,
+)
 app.add_typer(providers_app, name="providers")
 app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
+app.add_typer(scenarios_app, name="scenarios")
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
@@ -104,6 +127,9 @@ _CHECK = "[green]✓[/green]"
 _EVAL_TOKENS = typer.Argument(
     None,
     help="Trace files to score, or eval flow: list | run <suite> | results optional-suite.",
+)
+_DOWNLOAD_BENCHMARKS = typer.Argument(
+    None, help="Benchmark bundles to download, or 'all'. Omit for a picker."
 )
 
 
@@ -221,8 +247,23 @@ def examples_run(
 @app.command("build")
 def build(
     name: str = typer.Option(None, "--name", help="Name for this world model."),
-    file: str = typer.Option(None, "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
-    vendor: str = typer.Option(None, "--vendor", help="Vendor name to pull traces via SDK."),
+    source: str = typer.Option(
+        "otel-genai",
+        "--source",
+        help="Trace source adapter: otel-genai, chat-json, braintrust, phoenix, langfuse, "
+        "langsmith, posthog, mastra.",
+    ),
+    file: str = typer.Option(None, "--file", help="Path to an exported traces file for --source."),
+    pull: bool = typer.Option(
+        False, "--pull", help="Pull traces live from the source's vendor API (instead of --file)."
+    ),
+    project: str = typer.Option(None, "--project", help="Vendor project/workspace id (--pull)."),
+    api_key: str = typer.Option(None, "--api-key", help="Vendor API key (else env var)."),
+    since: str = typer.Option(None, "--since", help="Only pull traces since this ISO timestamp."),
+    limit: int = typer.Option(None, "--limit", help="Max number of traces to pull."),
+    vendor: str = typer.Option(
+        None, "--vendor", help="[deprecated] alias for --source <name> --pull."
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
     provider: str = typer.Option(
         None, "--provider", help="Provider that serves the model (default: bedrock)."
@@ -255,15 +296,26 @@ def build(
     With no `--name`/`--file` on an interactive terminal, this launches a guided creation wizard;
     pass `--no-interactive` (or any of those flags) to stay fully scriptable.
     """
+    # `--vendor <name>` is the deprecated alias for `--source <name> --pull`: it names the source
+    # adapter and implies a live pull.
+    if vendor:
+        source = vendor
+        pull = True
+
     # Decide whether to run the wizard: explicit flag wins; otherwise auto when at a TTY and the
-    # essential inputs (a name and a trace source) were not supplied.
-    needs_input = name is None or (file is None and vendor is None)
+    # essential inputs (a name and a trace source — a file or a live pull) were not supplied.
+    needs_input = name is None or (file is None and not pull)
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
     params = BuildParams(
         name=name or DEFAULT_MODEL_NAME,
+        source=source,
         file=file,
-        vendor=vendor,
+        pull=pull,
+        project=project,
+        api_key=api_key,
+        since=since,
+        limit=limit,
         provider=provider,
         model=model,
         region=region,
@@ -276,8 +328,16 @@ def build(
     )
     if use_wizard:
         params = run_build_wizard(_console, params)
-    elif name is None and file is None and vendor is None:
-        raise typer.BadParameter("provide --file (or --vendor), or run `wmh build` interactively")
+    elif name is None and file is None and not pull:
+        raise typer.BadParameter(
+            "provide --file <export> or --pull (with --source), or run `wmh build` interactively"
+        )
+    if params.file and params.pull:
+        raise typer.BadParameter("pass either --file or --pull, not both")
+    if params.source not in list_adapters():
+        raise typer.BadParameter(
+            f"unknown --source {params.source!r}; choose one of: {', '.join(list_adapters())}"
+        )
     # The wizard always resolves a provider; the flag path keeps its historical default.
     params.provider = params.provider or "bedrock"
 
@@ -321,6 +381,7 @@ def build(
         gepa_budget=params.gepa_budget,
         train_split=params.train_split,
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
+        trace_adapter=params.source,
     )
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
@@ -348,8 +409,17 @@ def build(
     with tracker.timed(), RichBuildReporter(_console, params.name) as reporter:
         result = run_build(
             config,
-            file=params.file,
-            vendor=VendorPull() if params.vendor else None,
+            file=None if params.pull else params.file,
+            vendor=(
+                VendorPull(
+                    api_key=params.api_key,
+                    project=params.project,
+                    since=params.since,
+                    limit=params.limit,
+                )
+                if params.pull
+                else None
+            ),
             root=model_dir,
             serve_provider=metered,
             judge_provider=metered_judge,
@@ -424,6 +494,81 @@ def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list
         _console.print("[yellow]no world models built yet[/yellow]; run `wmh build --name <name>`")
         return
     _console.print(models_table(infos))
+
+
+@app.command("download")
+def download(
+    benchmarks: list[str] = _DOWNLOAD_BENCHMARKS,
+    force: bool = typer.Option(False, "--force", help="Overwrite existing local files."),
+) -> None:
+    """Download benchmark data bundles (trace corpus + task data) from the Hub.
+
+    With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
+    picker. Bundles land in `packages/environment-capture/<benchmark>/`; existing local files
+    are kept unless `--force`.
+    """
+    selected = list(benchmarks or [])
+    if selected == ["all"]:
+        selected = sorted(CORPORA)
+    if not selected:
+        try:
+            published = published_corpora()
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"could not list the Hub's published datasets ({exc.reason}); check the "
+                "connection, or pass benchmark names directly, e.g. `wmh download bird-sql`"
+            ) from exc
+        if not published:
+            raise typer.BadParameter(
+                "no published corpora found on the Hub; "
+                "pass benchmark names directly, e.g. `wmh download bird-sql`"
+            )
+        notes = {}
+        for corpus in published:
+            local = (corpus_path(corpus.benchmark)).exists()
+            state = "local copy present" if local else "not downloaded"
+            when = f", updated {corpus.last_modified}" if corpus.last_modified else ""
+            notes[corpus.benchmark] = f"{state}{when}"
+        choices = [corpus.benchmark for corpus in published]
+        picked = select_option(
+            _console, "Download which data bundle?", [*choices, "all"], notes=notes
+        )
+        selected = choices if picked == "all" else [picked]
+    for name in selected:
+        existing = corpus_path(name).exists()
+        try:
+            path = _fetch_with_progress(name, force=force)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        except urllib.error.HTTPError as exc:
+            raise typer.BadParameter(
+                f"{name}: the Hub answered {exc.code} for {exc.url}; the dataset may not be "
+                "published yet — `wmh download` with no arguments lists what is"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"{name}: could not reach the Hub ({exc.reason}); check the connection and re-run"
+                " — fetches resume file-by-file"
+            ) from exc
+        state = "kept local" if existing and not force else "fetched"
+        _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+
+
+def _fetch_with_progress(name: str, *, force: bool) -> Path:
+    """fetch_corpus with a live byte progress bar (hidden when nothing needs downloading)."""
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        console=_console,
+        transient=True,
+    ) as progress:
+        task_id = progress.add_task(f"downloading {name}", total=None, visible=False)
+
+        def on_progress(done: int, total: int) -> None:
+            progress.update(task_id, completed=done, total=total or None, visible=True)
+
+        return fetch_corpus(name, force=force, on_progress=on_progress)
 
 
 @app.command("serve")
@@ -520,20 +665,17 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
       (e.g. world-model vs real environment) — the outcome-agreement validity check.
     """
     args = tokens or []
-    suite_root = str(_examples_root()) if examples_root is None else examples_root
+    suite_roots = (
+        [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
+    )
     if mode not in ("open-loop", "closed-loop"):
         raise typer.BadParameter(f"unknown --mode {mode!r}; choose open-loop or closed-loop")
     if mode == "closed-loop":
         if len(args) != 1 or args[0] in ("list", "run", "results", "agreement"):
             raise typer.BadParameter("usage: wmh eval <tasks.jsonl> --mode closed-loop")
         run_closed_loop(
-            _console,
-            tasks_file=args[0],
-            name=name,
-            root=root,
-            k=k,
-            max_turns=max_turns,
-            out=out,
+            _console, tasks_file=args[0], name=name, root=root, k=k,
+            max_turns=max_turns, out=out,
         )
         return
     if args and args[0] == "agreement":
@@ -544,20 +686,20 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     if args and args[0] == "list":
         if len(args) != 1:
             raise typer.BadParameter("usage: wmh eval list")
-        _eval_list(suite_root)
+        _eval_list(suite_roots)
         return
     if args and args[0] == "results":
         if len(args) > 2:
             raise typer.BadParameter("usage: wmh eval results [suite]")
         suite_filter = args[1] if len(args) == 2 else None
-        _eval_results(results_root, suite_root, suite_filter, limit=limit)
+        _eval_results(results_root, suite_roots, suite_filter, limit=limit)
         return
     if args and args[0] == "run":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval run <suite>")
         _eval_run_suite(
             args[1],
-            examples_root=suite_root,
+            examples_roots=suite_roots,
             results_root=results_root,
             prompt_file=prompt_file,
             provider=provider,
@@ -612,8 +754,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
 
 
-def _eval_list(examples_root: str) -> None:
-    suites = discover_eval_suites(examples_root)
+def _eval_list(examples_roots: list[str]) -> None:
+    suites = discover_eval_suites(examples_roots)
     if not suites:
         _console.print("[yellow]no eval suites found[/yellow]")
         return
@@ -636,7 +778,7 @@ def _eval_list(examples_root: str) -> None:
 
 def _eval_results(
     results_root: str,
-    examples_root: str,
+    examples_roots: list[str],
     suite_filter: str | None,
     *,
     limit: int,
@@ -644,7 +786,7 @@ def _eval_results(
     resolved_suite = suite_filter
     if suite_filter is not None:
         try:
-            resolved_suite = resolve_eval_suite(suite_filter, examples_root).id
+            resolved_suite = resolve_eval_suite(suite_filter, examples_roots).id
         except ValueError:
             resolved_suite = suite_filter
     summaries = list_eval_results(results_root, resolved_suite, limit=limit)
@@ -675,7 +817,7 @@ def _eval_results(
 def _eval_run_suite(
     selector: str,
     *,
-    examples_root: str,
+    examples_roots: list[str],
     results_root: str,
     prompt_file: str | None,
     provider: str,
@@ -690,7 +832,7 @@ def _eval_run_suite(
     top_k: int | None,
     out: str | None,
 ) -> None:
-    suite = resolve_eval_suite(selector, examples_root)
+    suite = resolve_eval_suite(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -849,6 +991,234 @@ def _eval_report_payload(report: EvalReport) -> dict[str, object]:
         "total_steps": report.total_steps,
         "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
     }
+
+
+@scenarios_app.command("build")
+def scenarios_build(
+    file: str = typer.Option(..., "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
+    out: str = typer.Option("scenarios.json", "--out", help="Where to write the scenario set."),
+    budget: int = typer.Option(20, help="Number of scenarios to construct."),
+    k: int = typer.Option(None, help="Cluster count (default: sqrt(corpus size))."),
+    limit: int = typer.Option(None, help="Only use the first N ingested traces (cost control)."),
+    provider: str = typer.Option(
+        None,
+        "--provider",
+        help=(
+            "Pin ONE LLM for every role (facets/naming/synthesis/validation). When omitted, "
+            "roles resolve from .wmh/settings.toml [models.worker|judge|summary]."
+        ),
+    ),
+    model: str = typer.Option(None, help="Model id (pins all roles, like --provider)."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    embed_provider: str = typer.Option(
+        "hashing",
+        help=(
+            "Facet embedder: hashing (offline but lexical-only — clusters by wording, not "
+            "meaning; prefer a semantic embedder for real corpora) | bedrock | openai | "
+            "azure_openai."
+        ),
+    ),
+    embed_model: str = typer.Option(None, help="Embeddings model id / Azure deployment."),
+    embed_dim: int = typer.Option(512, help="Embedding dimensionality."),
+    seed: int = typer.Option(0, help="Clustering seed."),
+) -> None:
+    """Distill a trace corpus into a representative scenario set (facets -> cluster -> select).
+
+    Writes a `ScenarioSet` JSON: scenarios (task, seed state, checklist, weight, provenance),
+    the named clusters they came from, and the corpus-coverage number that justifies them.
+    """
+    traces = get_adapter("otel-genai").from_file(file)
+    if limit is not None:
+        traces = traces[:limit]
+    if not traces:
+        raise typer.BadParameter(f"no traces ingested from {file}")
+    summary_llm, worker_llm, judge_llm = _scenario_role_llms(provider, model, region)
+    embedder = _resolve_scenario_embedder(embed_provider, embed_model, embed_dim, region)
+
+    _console.print(f"extracting facets for {len(traces)} traces…")
+    facets = FacetExtractor(summary_llm).extract_all(traces)
+    config = ScenarioBuildConfig(budget=budget, k=k, seed=seed)
+    scenario_set = build_scenario_set(
+        traces, facets, worker_llm, embedder, config, judge_provider=judge_llm
+    )
+    scenario_set.save(out)
+
+    table = Table(title="Scenario set")
+    table.add_column("Cluster", no_wrap=True)
+    table.add_column("Scenario task")
+    table.add_column("Weight", justify="right")
+    table.add_column("Source", no_wrap=True)
+    for scenario in scenario_set.scenarios:
+        source = scenario.failure_category or scenario.source_outcome.value
+        table.add_row(scenario.cluster_name, scenario.task[:80], f"{scenario.weight:.3f}", source)
+    _console.print(table)
+    _console.print(
+        f"{len(scenario_set.scenarios)} scenarios from {scenario_set.corpus_traces} traces; "
+        f"coverage {scenario_set.corpus_coverage:.0%} at tau={scenario_set.coverage_tau} -> {out}"
+    )
+
+
+@scenarios_app.command("verify")
+def scenarios_verify(
+    scenarios_file: str = typer.Argument(..., help="Scenario set JSON from `wmh scenarios build`."),
+    file: str = typer.Option(..., "--file", help="Source trace corpus (for back-agreement)."),
+    name: str = typer.Option(None, "--name", help="World model to roll against."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models."),
+    provider: str = typer.Option(None, "--provider", help="Override serve provider kind."),
+    model: str = typer.Option(None, help="Override serve model id (e.g. a small/cheap model)."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    max_steps: int = typer.Option(12, help="Rollout step budget per scenario."),
+    drop: bool = typer.Option(False, "--drop", help="Write back only verified scenarios."),
+) -> None:
+    """Closed-loop verification: back-agreement on source traces + solvability rollouts.
+
+    Loads the world model (optionally overriding its serve provider with a cheaper model), rolls a
+    baseline LLM agent on every scenario, and grades episodes against each scenario's checklist.
+    With `--drop`, unverified scenarios are removed from the set in place.
+    """
+    scenario_set = ScenarioSet.load(scenarios_file)
+    traces = get_adapter("otel-genai").from_file(file)
+    if provider is not None or model is not None:
+        store = WorldModelStore(root)
+        model_dir = store.resolve(_resolve_name(store, name))
+        override = _provider_config(
+            provider or "bedrock", model or "us.anthropic.claude-opus-4-8", region
+        )
+        llm = RetryingProvider(providers.get_provider(override))
+        world_model = WorldModel.load(str(model_dir), llm)
+    else:
+        world_model, _resolved_name, llm = _load_model(name, root)
+
+    # The rollout agent takes the worker role and the grader the judge role when configured in
+    # settings (judge should differ in family from the generator); both fall back to the world
+    # model's serve provider, which was the only behavior before roles existed.
+    worker_config = _role_provider_config("worker", region)
+    judge_config = _role_provider_config("judge", region)
+    agent_llm = providers.get_provider(worker_config) if worker_config else llm
+    judge_llm = providers.get_provider(judge_config) if judge_config else llm
+    report = verify_scenarios(
+        scenario_set,
+        traces,
+        world_model,
+        LLMAgent(agent_llm),
+        ChecklistJudge(judge_llm),
+        max_steps=max_steps,
+    )
+    table = Table(title="Scenario verification")
+    table.add_column("Scenario", no_wrap=True)
+    table.add_column("Back-agree")
+    table.add_column("Solvable")
+    table.add_column("Pass rate", justify="right")
+    for verdict in report.verdicts:
+        if verdict.back_agreement is None:
+            agree = "-"
+        else:
+            agree = "yes" if verdict.back_agreement else "NO"
+        table.add_row(
+            verdict.scenario_id,
+            agree,
+            "yes" if verdict.solvable else "NO",
+            f"{verdict.rollout_pass_rate:.2f}",
+        )
+    _console.print(table)
+    _console.print(
+        f"back-agreement {report.back_agreement_rate:.0%}, solvable {report.solvable_rate:.0%} "
+        f"over {len(report.verdicts)} scenarios"
+    )
+    if drop:
+        verified = {v.scenario_id for v in report.verdicts if v.ok}
+        scenario_set.retain(verified)
+        scenario_set.save(scenarios_file)
+        _console.print(
+            f"kept {len(scenario_set.scenarios)} verified scenarios "
+            f"(weights renormalized, coverage reset) -> {scenarios_file}"
+        )
+
+
+def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
+    try:
+        kind = ProviderKind(provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in ProviderKind)
+        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+    return ProviderConfig(kind=kind, model=model, region=region)
+
+
+_SCENARIO_DEFAULT_PROVIDER = "bedrock"
+_SCENARIO_DEFAULT_MODEL = "us.anthropic.claude-opus-4-8"
+
+
+def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
+    """ProviderConfig for a settings-defined model role, or None when the role isn't configured.
+
+    Roles live in `.wmh/settings.toml` under `[models.worker|judge|summary]`; unset judge/summary
+    fall back to worker (see `ModelsSettings.resolve`). A role's stored region wins over the
+    generic `--region` flag — the flag also feeds the embedder, and e.g. a judge pinned to the
+    one region where its model is enabled must not follow it.
+    """
+    configured = load_settings().models.resolve(role)
+    if configured is None:
+        return None
+    config = _provider_config(configured.provider, configured.model, configured.region or region)
+    return config.model_copy(
+        update={"endpoint": configured.endpoint, "deployment": configured.deployment}
+    )
+
+
+def _scenario_role_llms(
+    provider: str | None, model: str | None, region: str | None
+) -> tuple[Provider, Provider, Provider]:
+    """(summary, worker, judge) providers for scenario construction.
+
+    Explicit `--provider`/`--model` flags pin ALL roles to that one model (the pre-roles
+    behavior). Otherwise each role resolves from `.wmh/settings.toml`, falling back to worker,
+    then to the built-in default. Judging benefits from a different family than the worker —
+    a same-family judge carries self-preference bias toward the generator's outputs.
+    """
+    if provider is not None or model is not None:
+        config = _provider_config(
+            provider or _SCENARIO_DEFAULT_PROVIDER, model or _SCENARIO_DEFAULT_MODEL, region
+        )
+        llm = providers.get_provider(config)
+        return llm, llm, llm
+    default = _provider_config(_SCENARIO_DEFAULT_PROVIDER, _SCENARIO_DEFAULT_MODEL, region)
+    cache: dict[str, Provider] = {}
+    by_role: dict[str, Provider] = {}
+    for role in ("summary", "worker", "judge"):
+        config = _role_provider_config(role, region) or default
+        key = f"{config.kind.value}:{config.model}:{config.endpoint}:{config.region}"
+        if key not in cache:
+            cache[key] = providers.get_provider(config)
+        by_role[role] = cache[key]
+    return by_role["summary"], by_role["worker"], by_role["judge"]
+
+
+def _resolve_scenario_embedder(
+    embed_provider: str, embed_model: str | None, embed_dim: int, region: str | None
+) -> Embedder:
+    try:
+        kind = EmbedderKind(embed_provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in EmbedderKind)
+        raise typer.BadParameter(
+            f"unknown embed provider {embed_provider!r}; choose one of: {kinds}"
+        ) from None
+    if kind is EmbedderKind.HASHING:
+        return HashingEmbedder(dim=embed_dim)
+    if not embed_model:
+        raise typer.BadParameter(
+            f"--embed-provider {kind.value} requires --embed-model "
+            "(the embeddings model id / Azure embedding deployment)"
+        )
+    return providers.get_provider(
+        ProviderConfig(
+            kind=kind.provider_kind(),
+            model=embed_model,
+            embed_model=embed_model,
+            embed_dim=embed_dim,
+            region=region,
+        )
+    )
 
 
 @app.command("demo")
@@ -1097,22 +1467,25 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _examples_root() -> Path:
-    """Repo-local examples directory."""
-    return Path(__file__).resolve().parents[2] / "examples"
+def _benchmark_roots() -> tuple[Path, ...]:
+    """Every root holding self-contained task dirs: examples/ + the capture member's data dirs."""
+    repo = Path(__file__).resolve().parents[2]
+    return (repo / "examples", repo / "packages" / "environment-capture")
 
 
 def _discover_examples() -> list[Path]:
-    root = _examples_root()
-    if not root.exists():
-        return []
-    return sorted(
-        path
-        for path in root.iterdir()
-        if path.is_dir()
-        and _is_safe_example_name(path.name)
-        and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
-    )
+    found: list[Path] = []
+    for root in _benchmark_roots():
+        if not root.exists():
+            continue
+        found.extend(
+            path
+            for path in root.iterdir()
+            if path.is_dir()
+            and _is_safe_example_name(path.name)
+            and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
+        )
+    return sorted(found)
 
 
 def _is_safe_example_name(name: str) -> bool:
@@ -1128,11 +1501,16 @@ def _resolve_example(name: str) -> Path:
     # An unsafe segment (spaces, path separators, ...) is simply not an example name; fall
     # through to the same "unknown example" usage error instead of a ValueError traceback.
     try:
-        example_dir = _examples_root() / validate_name(name)
+        safe = validate_name(name)
     except ValueError:
-        example_dir = None
-    if example_dir is not None and example_dir.is_dir():
-        return example_dir
+        safe = None
+    if safe is not None:
+        matches = [root / safe for root in _benchmark_roots() if (root / safe).is_dir()]
+        if len(matches) > 1:
+            found = ", ".join(str(path) for path in matches)
+            raise typer.BadParameter(f"example {name!r} exists in multiple roots: {found}")
+        if matches:
+            return matches[0]
     available = ", ".join(path.name for path in _discover_examples())
     hint = f" (available: {available})" if available else ""
     raise typer.BadParameter(f"unknown example {name!r}{hint}")

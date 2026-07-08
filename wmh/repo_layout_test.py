@@ -7,6 +7,7 @@ Skipped outside a git checkout (e.g. an installed sdist).
 from __future__ import annotations
 
 import functools
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -27,9 +28,7 @@ ALLOWED_TOP_DIRS = {
     ".agents",
     ".claude",
     ".github",
-    # Monorepo workspace members (AGENTS.md § Monorepo):
-    "llm-waterfall",
-    "environment-capture",
+    "packages",  # monorepo workspace members live here (AGENTS.md § Monorepo)
 }
 
 
@@ -139,7 +138,12 @@ def test_root_gate_covers_every_python_member() -> None:
     with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
         root = tomllib.load(fh)
     testpaths = set(root["tool"]["pytest"]["ini_options"]["testpaths"])
-    missing = [d.name for d in _workspace_member_dirs() if d.name not in testpaths]
+
+    def covered(member: Path) -> bool:
+        rel = member.relative_to(REPO_ROOT)
+        return any(rel == Path(tp) or Path(tp) in rel.parents for tp in testpaths)
+
+    missing = [str(d.relative_to(REPO_ROOT)) for d in _workspace_member_dirs() if not covered(d)]
     assert not missing, (
         f"workspace members {missing} are not in [tool.pytest.ini_options].testpaths; the root "
         "gate must cover every Python member (AGENTS.md § Monorepo)"
@@ -167,4 +171,14 @@ def test_top_level_files_are_allowlisted() -> None:
     assert not unexpected, (
         f"top-level files {sorted(unexpected)} are not allowlisted; config belongs in "
         "pyproject.toml, tasks in the justfile, and everything else under an allowlisted dir"
+    )
+
+
+def test_no_finder_duplicate_files_are_tracked() -> None:
+    """macOS Finder copies ("foo 2.py") dodge pytest collection and imports, so they rot
+    silently; 24 of them once shipped in a PR before anyone noticed."""
+    duplicates = [p for p in _tracked_files() if re.search(r" \d+\.\w+$", p)]
+    assert not duplicates, (
+        f"tracked Finder-style duplicate files {sorted(duplicates)}; delete the copies "
+        "(they are never imported or collected) and keep the originals"
     )

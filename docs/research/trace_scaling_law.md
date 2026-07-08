@@ -55,4 +55,4 @@ uv run --with matplotlib python .agents/scripts/plot_trace_scaling.py \
 ```
 
 Each corpus was captured live from its real benchmark; see the capture tooling and READMEs under
-`examples/tau-bench/`, `examples/terminal-tasks/`, and `examples/swe-bench/`.
+`packages/environment-capture/tau-bench/`, `packages/environment-capture/terminal-tasks/`, and `packages/environment-capture/swe-bench/`.
