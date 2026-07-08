@@ -154,6 +154,9 @@ def test_evaluate_files_excludes_invalid_judgements_from_overall(tmp_path) -> No
     assert report.overall_fidelity == 0.6
     assert report.total_invalid == 1
     assert report.total_steps > 0
+    assert report.total_valid == report.total_steps - 1
+    # Every reporting surface must disclose the shrunken denominator.
+    assert "1 judge-invalid excluded" in report.summary()
 
 
 def test_evaluate_files_empty_when_no_traces(tmp_path) -> None:  # noqa: ANN001 - fixture
