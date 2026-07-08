@@ -275,7 +275,7 @@ def build(
         None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
-    chain: str = typer.Option(
+    chain: str | None = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
     ),
     gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
@@ -749,6 +749,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             train_split=train_split,
             embed_dim=embed_dim,
             rag=rag,
+            chain=chain,
             judge=judge,
             judge_model=judge_model,
             judge_provider=judge_provider,
@@ -872,6 +873,7 @@ def _eval_run_suite(
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
+    chain: str | None,
     judge: str | None,
     judge_model: str | None,
     judge_provider: str,
@@ -899,6 +901,7 @@ def _eval_run_suite(
         provider=provider,
         model=model,
         region=region,
+        chain=chain,
         judge_model=judge_model,
         judge_provider=judge_provider,
     )
@@ -1007,7 +1010,7 @@ def _run_eval_files(
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
     provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
-    llm = providers.provider_or_chain(provider_config)
+    llm = providers.provider_or_chain(provider_config, chain=chain)
     if isinstance(llm, providers.WaterfallProvider):
         _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
     prompt = (
