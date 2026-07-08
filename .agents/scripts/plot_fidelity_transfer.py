@@ -28,8 +28,8 @@ _REPO = Path(__file__).resolve().parents[2]
 _CELLS = _REPO / ".agents/docs/research/tau_fidelity_cells"
 _ROWS = _REPO / ".agents/docs/research/real_tau_eval_results"
 
-_INK = "#111"
-_GRID = "#e5e5e5"
+_INK = "#0a0a0a"
+_GRID = "#ececec"
 _BLUE = "#0070f3"
 _RED = "#e00"
 
@@ -57,6 +57,10 @@ def paired_delta(arm: Path, base: dict[tuple[str, int], dict]) -> tuple[float, i
     """Mean per-episode reward delta vs base over the paired intersection."""
     a = _rows(arm)
     common = sorted(set(base) & set(a))
+    if not common:
+        raise SystemExit(
+            f"no paired episodes between {arm.name} and the base row — wrong save tag?"
+        )
     return sum(a[k]["reward"] - base[k]["reward"] for k in common) / len(common), len(common)
 
 
@@ -128,10 +132,10 @@ def main() -> None:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out)
-    print(f"wrote {out}")
+    print(f"wrote {out}")  # noqa: T201 - CLI output
     for x, y, label in zip(xs, ys, labels, strict=True):
-        print(f"  {label:24} fidelity={x:.3f} pairedΔ={y:+.3f}")
-    print(f"  {COLLAPSED[0]:24} fidelity={cx:.3f} pairedΔ={cy:+.3f}")
+        print(f"  {label:24} fidelity={x:.3f} pairedΔ={y:+.3f}")  # noqa: T201
+    print(f"  {COLLAPSED[0]:24} fidelity={cx:.3f} pairedΔ={cy:+.3f}")  # noqa: T201
 
 
 if __name__ == "__main__":

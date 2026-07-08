@@ -194,26 +194,29 @@ def _chat(
     raise RuntimeError(f"chat/completions failed after {_HTTP_ATTEMPTS} attempts: {last_exc}")
 
 
-def _assistant_dict(message: _AssistantMessage) -> JsonObject:
+def _assistant_dict(
+    message: _AssistantMessage, parsed_calls: list[tuple[str | None, str]]
+) -> JsonObject:
     """Re-serialize an assistant message for appending back into the running messages list.
 
-    Arguments are NORMALIZED to clean JSON of the parsed command rather than echoed
-    verbatim: WM-trained checkpoints sometimes emit malformed argument JSON, and vLLM's
-    chat template json-decodes replayed tool_calls — echoing the raw string 400s every
-    subsequent turn of the episode (observed: 18/56 episodes on the first trained ckpt).
+    Arguments are NORMALIZED to clean JSON of the (already-)parsed command rather than
+    echoed verbatim: WM-trained checkpoints sometimes emit malformed argument JSON, and
+    vLLM's chat template json-decodes replayed tool_calls — echoing the raw string 400s
+    every subsequent turn of the episode (observed: 18/56 episodes on the first trained
+    ckpt). ``parsed_calls`` aligns 1:1 with ``message.tool_calls``.
     """
     out: JsonObject = {"role": "assistant", "content": message.content or ""}
     if message.tool_calls:
         out["tool_calls"] = [
             {
-                "id": tc.id,
+                "id": call_id,
                 "type": "function",
                 "function": {
                     "name": tc.function.name,
-                    "arguments": json.dumps({"command": _parse_command(tc.function.arguments)}),
+                    "arguments": json.dumps({"command": command}),
                 },
             }
-            for tc in message.tool_calls
+            for tc, (call_id, command) in zip(message.tool_calls, parsed_calls, strict=True)
         ]
     return out
 
@@ -263,7 +266,10 @@ def run_policy_loop(
             tools=tools,
             temperature=temperature,
         )
-        messages.append(_assistant_dict(message))
+        parsed_calls = [
+            (tc.id, _parse_command(tc.function.arguments)) for tc in message.tool_calls or []
+        ]
+        messages.append(_assistant_dict(message, parsed_calls))
         if not message.tool_calls:
             if nudged:
                 break  # second toolless turn in a row -> the policy is done (or stuck)
@@ -271,8 +277,7 @@ def run_policy_loop(
             nudged = True
             continue
         nudged = False
-        for tc in message.tool_calls:
-            command = _parse_command(tc.function.arguments)
+        for call_id, command in parsed_calls:
             output, code = execute(command)
             # Cap per-command output: unbounded dumps (cat of large files, verbose
             # installs) overflow the policy's context and 400 the endpoint (observed:
@@ -294,7 +299,7 @@ def run_policy_loop(
                     observation=Observation(content=content, is_error=code != 0),
                 )
             )
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
     return steps
 
 
@@ -325,15 +330,48 @@ def _docker(args: list[str], *, timeout: int) -> tuple[str, int]:
         return "(timed out)", 124
 
 
+PROVISIONED_IMAGE = "wmh-realterm-base:latest"
+
+
+def _ensure_provisioned_image() -> None:
+    """Build the tools image ONCE per host: base image + SETUP, committed locally.
+
+    Per-episode ``apt-get install`` runs put 30-60s of mirror traffic on every episode's
+    critical path (56 installs per row); provisioning once and committing removes it.
+    The provisioning container is named uniquely and exec'd BY NAME — on a cold host the
+    first ``docker run`` mixes pull progress into the combined output, so a parsed id
+    is unreliable (observed as 'No such container' on fresh boxes).
+    """
+    _out, rc = _docker(["docker", "image", "inspect", PROVISIONED_IMAGE], timeout=60)
+    if rc == 0:
+        return
+    name = f"wmh-realterm-provision-{uuid.uuid4().hex[:12]}"
+    out, rc = _docker(["docker", "run", "-d", "--name", name, IMAGE, "sleep", "3600"], timeout=600)
+    if rc != 0:
+        raise RuntimeError(f"docker run (provision) failed: {out}")
+    try:
+        out, rc = _docker(["docker", "exec", name, "sh", "-c", SETUP], timeout=600)
+        if rc != 0:
+            raise RuntimeError(f"tool install failed: {out}")
+        out, rc = _docker(["docker", "commit", name, PROVISIONED_IMAGE], timeout=120)
+        if rc != 0:
+            raise RuntimeError(f"docker commit failed: {out}")
+    finally:
+        _docker(["docker", "rm", "-f", name], timeout=60)
+
+
 def _start_container() -> str:
-    """Start a fresh tools container; return its id. Caller must ``docker rm -f`` it."""
+    """Start a fresh pre-provisioned container; returns its NAME (stable exec handle).
+
+    Caller must ``docker rm -f`` it.
+    """
     name = f"wmh-realterm-{uuid.uuid4().hex[:12]}"
-    out, rc = _docker(["docker", "run", "-d", "--name", name, IMAGE, "sleep", "3600"], timeout=120)
+    out, rc = _docker(
+        ["docker", "run", "-d", "--name", name, PROVISIONED_IMAGE, "sleep", "3600"], timeout=120
+    )
     if rc != 0:
         raise RuntimeError(f"docker run failed: {out}")
-    cid = out.strip()
-    _docker(["docker", "exec", cid, "sh", "-c", SETUP], timeout=300)  # best-effort tool install
-    return cid
+    return name
 
 
 def _exec_in(cid: str, command: str) -> tuple[str, int]:
@@ -393,30 +431,23 @@ def run_real_episode(
 
 
 def _record(
-    scenario_id: str, rollout_index: int, score: EpisodeScore, n_steps: int
+    scenario_id: str,
+    rollout_index: int,
+    *,
+    score: EpisodeScore | None = None,
+    n_steps: int = 0,
+    error: Exception | None = None,
 ) -> EpisodeRecord:
-    """A successful-episode record."""
+    """One paired-analysis record; crash defaults apply when ``score`` is None."""
     return EpisodeRecord(
         scenario_id=scenario_id,
         rollout_index=rollout_index,
-        reward=score.reward,
-        success=score.success,
-        critique=score.critique,
+        reward=score.reward if score else 0.0,
+        success=bool(score.success) if score else False,
+        critique=score.critique if score else "",
         steps=n_steps,
-        errors=[],
-    )
-
-
-def _error_record(scenario_id: str, rollout_index: int, exc: Exception) -> EpisodeRecord:
-    """A crashed-episode record (docker/HTTP/judge failure); excluded from the summary."""
-    return EpisodeRecord(
-        scenario_id=scenario_id,
-        rollout_index=rollout_index,
-        reward=0.0,
-        success=False,
-        critique="",
-        steps=0,
-        errors=[f"{type(exc).__name__}: {exc}"],
+        errors=[] if error is None else [f"{type(error).__name__}: {error}"],
+        env="real-terminal",
     )
 
 
@@ -447,9 +478,9 @@ def evaluate(
             scenario_id, rollout_index = futures[future]
             try:
                 score, steps = future.result()
-                records.append(_record(scenario_id, rollout_index, score, len(steps)))
+                records.append(_record(scenario_id, rollout_index, score=score, n_steps=len(steps)))
             except Exception as exc:  # noqa: BLE001 - one crashed episode is a record, not a stop
-                records.append(_error_record(scenario_id, rollout_index, exc))
+                records.append(_record(scenario_id, rollout_index, error=exc))
     records.sort(key=lambda r: (r.scenario_id, r.rollout_index))
     return records
 
@@ -482,6 +513,7 @@ def main() -> None:
 
     scenarios = load_scenarios(Path(args.scenarios))
     tools = load_tool_specs(DEFAULT_TOOLS)
+    _ensure_provisioned_image()
     judge = EpisodeRewardJudge(judge_provider())
     client = httpx.Client()
 

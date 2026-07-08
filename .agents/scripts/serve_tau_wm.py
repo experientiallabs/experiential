@@ -36,6 +36,7 @@ from pathlib import Path
 
 import uvicorn
 
+from wmh.config.dotenv import load_env_file
 from wmh.engine.world_model import WorldModel
 from wmh.providers import get_provider
 from wmh.providers.base import (
@@ -101,7 +102,7 @@ class FallbackProvider:
         return self._chain[0].verify()
 
 
-def _fallback_chain(config: ProviderConfig) -> Provider:
+def _fallback_chain(config: ProviderConfig, *, cross_provider: bool = False) -> Provider:
     """Same-model failover: a second same-region instance, then us-west-2 for Bedrock.
 
     The cross-region link rides through regional brownouts (observed live:
@@ -114,7 +115,10 @@ def _fallback_chain(config: ProviderConfig) -> Provider:
     # Cross-PROVIDER last resort for Opus 4.8: the Anthropic direct API (own quota pool,
     # rides through Bedrock-wide storms). Key distributed to the box .envs (Silen ack'd
     # direct-key use after the D68 OpenAI termination).
-    if "opus-4-8" in config.model and os.environ.get("ANTHROPIC_API_KEY"):
+    # Cross-provider is opt-in and reserved for the JUDGE chain: letting the ENV chain
+    # hop providers would silently serve part of a fidelity-curve point from a different
+    # backend than the one the point claims to measure.
+    if cross_provider and "opus-4-8" in config.model and os.environ.get("ANTHROPIC_API_KEY"):
         chain.append(
             get_provider(ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-opus-4-8"))
         )
@@ -154,27 +158,14 @@ class PinnedTemperatureProvider:
         return self._inner.verify()
 
 
-def _load_dotenv() -> None:
-    """Minimal .env loader: KEY=VALUE lines, optional `export `, optional quotes."""
-    env_path = REPO_ROOT / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip().removeprefix("export ").strip()
-        value = value.strip().strip("'\"")
-        os.environ.setdefault(key, value)
-
-
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] not in ("train", "eval"):
         raise SystemExit(f"usage: {sys.argv[0]} train|eval [port]")
     mode = sys.argv[1]
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
-    _load_dotenv()  # OPENAI/ANTHROPIC keys for backend swaps + the direct-API opus link
+    load_env_file(
+        REPO_ROOT / ".env"
+    )  # OPENAI/ANTHROPIC keys for backend swaps + the direct-API opus link
 
     top_k: int | None = None
     if mode == "train":
@@ -182,14 +173,14 @@ def main() -> None:
         # backend per curve point; the reward judge stays PINNED on the haiku chain so
         # points differ by environment fidelity only. WMH_TOP_K=0 = the no-RAG point.
         haiku = ProviderConfig(kind=ProviderKind.BEDROCK, model=HAIKU_MODEL, region="us-east-1")
-        reward_provider = _fallback_chain(haiku)
+        reward_provider = _fallback_chain(haiku, cross_provider=True)
         env_model = os.environ.get("WMH_ENV_MODEL")
         env_kind = ProviderKind(os.environ.get("WMH_ENV_PROVIDER", "bedrock"))
         if env_model is None:
             serve_provider = reward_provider
         else:
             if env_kind is ProviderKind.OPENAI:
-                _load_dotenv()
+                load_env_file(REPO_ROOT / ".env")
             serve_provider = _fallback_chain(
                 ProviderConfig(
                     kind=env_kind,
@@ -204,7 +195,7 @@ def main() -> None:
         if env_temp is not None:
             serve_provider = PinnedTemperatureProvider(serve_provider, float(env_temp))
     else:
-        _load_dotenv()
+        load_env_file(REPO_ROOT / ".env")
         if not os.environ.get("OPENAI_API_KEY"):
             raise SystemExit(
                 "OPENAI_API_KEY missing: put it in the gitignored .env at the repo root"
@@ -213,7 +204,8 @@ def main() -> None:
             ProviderConfig(kind=ProviderKind.OPENAI, model=EVAL_ENV_MODEL)
         )
         reward_provider = _fallback_chain(
-            ProviderConfig(kind=ProviderKind.BEDROCK, model=JUDGE_MODEL, region="us-east-1")
+            ProviderConfig(kind=ProviderKind.BEDROCK, model=JUDGE_MODEL, region="us-east-1"),
+            cross_provider=True,
         )
 
     wm = WorldModel.load(

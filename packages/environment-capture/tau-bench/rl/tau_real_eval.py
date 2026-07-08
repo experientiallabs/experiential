@@ -13,7 +13,7 @@ each scenario's provenance trace id -> the corpus trace's ``wmh.trace.metadata``
 (domain, task_id). Nothing here derives its own split (D67).
 
 Runs the ``tau2`` CLI via subprocess, so it needs the tau2 venv from
-``packages/environment-capture/tau-bench/README.md`` on PATH (or ``--tau2-bin``) but imports nothing beyond
+the tau-bench README on PATH (or ``--tau2-bin``) but imports nothing beyond
 stdlib itself. The policy is any OpenAI-compatible endpoint (vLLM serve of a spliced
 checkpoint); the user-simulator LLM is PINNED by default so every checkpoint row faces
 the same simulated customers.
@@ -73,9 +73,19 @@ def resolve_tasks(scenarios_path: Path, corpus_path: Path) -> list[dict]:
                         "domain": md["domain"],
                         "task_id": str(md["task_id"]),
                     }
+            if len(resolved) == len(wanted):
+                break  # the corpus is ~100MB; stop once every pinned id is resolved
     missing = wanted - set(resolved)
     if missing:
         raise SystemExit(f"unresolved provenance ids (corpus mismatch?): {sorted(missing)}")
+    # by_task in main() keys records by (domain, task_id); two pinned scenarios sharing a
+    # task_id would silently merge their rows and break the 1:1 WM-eval pairing.
+    pairs = [(r["domain"], r["task_id"]) for r in resolved.values()]
+    dupes = {pair for pair in pairs if pairs.count(pair) > 1}
+    if dupes:
+        raise SystemExit(
+            f"pinned scenarios share (domain, task_id) — pairing ambiguous: {sorted(dupes)}"
+        )
     return [resolved[s["provenance"][0]] | {"scenario_domain": s["domain"]} for s in scenarios]
 
 
