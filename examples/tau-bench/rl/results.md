@@ -316,3 +316,16 @@ D12 fidelity metric (which replays recorded actions) cannot see. The real shell 
 so forgiving. Implication for WM training: fidelity on recorded actions is not
 sufficient; error-path fidelity (does the WM push back on garbage actions the way the
 real env does?) is a distinct, load-bearing dimension.
+
+## Cross-benchmark replication: swe-bench train-side (D67 leg 3, eval blocked)
+
+R++ n=4 vs the swe WM (haiku env, temp-0, 150 pinned scenarios): **no trainable signal
+at 9B smoke scale** — base reward on the WM was 0.14 over the first 60 episodes (the
+policy rarely solves swe tasks even simulated), advantages were uniform-failure from the
+start, and the run collapsed to a no-tool policy by ~episode 250 (stopped at 290/600).
+Together with tau's saturation (~0.80 base on train) this brackets the operating band
+for group-relative RL against WMs: **base success must sit in the informative middle;
+swe sits at the floor, tau v1 sat at the ceiling, and the hard-curriculum/temp-0 work
+was about engineering the middle.** Checkpoints banked
+(wm_swe_manual_early @ step 239 + periodic drains) for real-env rows once the swe
+container harness (B3) exists; WM-side rows wait on the D71 eval-env re-pin.
