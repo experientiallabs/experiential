@@ -18,16 +18,19 @@ const outPath = join(here, "..", "src", "data", "index.json");
 
 function modelRoots() {
   // .wmh (the writable build root) comes FIRST so serveCommand() lists it first - that is where
-  // `wmh serve` writes server-side builds and uploads; putting a committed examples/ dir first
+  // `wmh serve` writes server-side builds and uploads; putting a committed corpus dir first
   // would send build artifacts into the git tree.
   const roots = [];
   const local = join(repoRoot, ".wmh", "models");
   if (existsSync(local)) roots.push({ serveRoot: ".wmh", modelsDir: local });
-  const examples = join(repoRoot, "examples");
-  if (existsSync(examples)) {
-    for (const task of readdirSync(examples).sort()) {
-      const dir = join(examples, task, "models");
-      if (existsSync(dir)) roots.push({ serveRoot: join("examples", task), modelsDir: dir });
+  // Bundled corpora live under packages/environment-capture/<task>/models (WS-B2 layout).
+  const captures = join(repoRoot, "packages", "environment-capture");
+  if (existsSync(captures)) {
+    for (const task of readdirSync(captures).sort()) {
+      const dir = join(captures, task, "models");
+      if (existsSync(dir)) {
+        roots.push({ serveRoot: join("packages", "environment-capture", task), modelsDir: dir });
+      }
     }
   }
   return roots;

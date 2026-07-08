@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-04T03:09:33.719Z",
+  "generated_at": "2026-07-08T07:23:44.023Z",
   "models": [
     {
       "card": {
@@ -30,9 +30,9 @@
           "swe-bench"
         ]
       },
-      "dir": "examples/swe-bench/models/swe-bench",
+      "dir": "packages/environment-capture/swe-bench/models/swe-bench",
       "held_out_accuracy": 0.7947619047619047,
-      "serve_root": "examples/swe-bench",
+      "serve_root": "packages/environment-capture/swe-bench",
       "preview": [
         {
           "action": "bash {\"command\":\"cd /testbed && cat astropy/modeling/separable.py\"}",
@@ -852,9 +852,9 @@
           "customer-service"
         ]
       },
-      "dir": "examples/tau-bench/models/tau-bench",
+      "dir": "packages/environment-capture/tau-bench/models/tau-bench",
       "held_out_accuracy": 0.19285714285714284,
-      "serve_root": "examples/tau-bench",
+      "serve_root": "packages/environment-capture/tau-bench",
       "preview": [
         {
           "action": "get_user_details {\"user_id\":\"raj_sanchez_7340\"}",
@@ -1245,9 +1245,9 @@
           "gepa"
         ]
       },
-      "dir": "examples/tau-bench/models/tau-telecom",
+      "dir": "packages/environment-capture/tau-bench/models/tau-telecom",
       "held_out_accuracy": 0.6750769230769231,
-      "serve_root": "examples/tau-bench",
+      "serve_root": "packages/environment-capture/tau-bench",
       "preview": [
         {
           "action": "get_customer_by_phone {\"phone_number\":\"555-123-2002\"}",
@@ -1871,9 +1871,9 @@
           "terminal"
         ]
       },
-      "dir": "examples/terminal-tasks/models/terminal-tasks",
+      "dir": "packages/environment-capture/terminal-tasks/models/terminal-tasks",
       "held_out_accuracy": 0.37214285714285705,
-      "serve_root": "examples/terminal-tasks",
+      "serve_root": "packages/environment-capture/terminal-tasks",
       "preview": [
         {
           "action": "bash {\"command\":\"curl -s \\\"https://api.coingecko.com/api/v3/simple/price?id…",
