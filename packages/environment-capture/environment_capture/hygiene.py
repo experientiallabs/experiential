@@ -74,7 +74,7 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("openai-api-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}")),
     ("huggingface-token", re.compile(r"\bhf_[A-Za-z0-9]{16,}")),
     ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{16,}")),
-    ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}")),
+    ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})")),
     # An `env`/`printenv` dump line for a credential-shaped variable whose VALUE is itself
     # secret-shaped: >=16 chars of key/token alphabet. The length+alphabet guard keeps ordinary
     # benchmark output like `PRIMARY_KEY=1001` or `BUILD_TOKEN=github_runner` from being dropped.

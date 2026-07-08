@@ -309,6 +309,7 @@ def test_secret_values_in_observation_are_flagged() -> None:
         "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
         "your key is sk-ant-api03-abcDEF123456_gh-ijkl",
         "token=hf_abcdefghijklmnopqrstuvwxyz012345",
+        "GH_TOKEN=github_pat_11ABCDEFG0abcdefghij_KLMNOPqrstuvwxyz0123456789",
         "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         "export ANTHROPIC_API_KEY=sk-ant-secretbody",
     ):
