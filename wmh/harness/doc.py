@@ -224,32 +224,15 @@ class HarnessDoc(BaseModel):
     def runtime(self, provider: Provider, *, backend: str = "local") -> Runtime:
         """The configured agent runtime this document describes.
 
-        `backend` chooses WHERE the harness executes, defaulting to `local` (this process):
-        `e2b` runs a code-bearing harness inside an E2B microVM instead, with the world model
-        answering tool calls from the host (opt-in; needs only the user's E2B key). `param:
-        runtime-kind` = "pi-node" dispatches the vendored-pi checkout runner. Otherwise: a
-        `code:runtime` surface drives episodes with the harness's own in-process program; with
-        neither, the fixed baseline loop runs. All expose the same
-        `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
+        `backend` chooses WHERE the harness executes; only `local` (this process) is built in here.
+        `param:runtime-kind` = "pi-node" dispatches the vendored-pi runner (over the SSH shim, or
+        the RunnerLink frame transport when PI_TRANSPORT=link). Otherwise a `code:runtime` surface
+        drives episodes with the harness's own in-process program; with neither, the fixed baseline
+        loop runs. All expose the same `run(task_id, instruction, environment) -> RunResult` shape
+        closed-loop eval drives.
         """
-        if backend == "e2b":
-            code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
-            if not code_files:
-                raise ValueError("backend='e2b' needs a code-bearing harness (no code surfaces)")
-            from wmh.harness.e2b_runtime import E2BSandboxRuntime
-
-            skills = SkillLibrary(self.skills())
-            return E2BSandboxRuntime(
-                provider,
-                files=code_files,
-                tools=resolve_tools(self.tools()),
-                temperature=self.temperature(),
-                skills=skills,
-                system_prompt=self._assembled_prompt(skills),
-                max_turns=self.max_turns(),
-            )
         if backend != "local":
-            raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
+            raise ValueError(f"unknown backend {backend!r}; choose local")
         if self.runtime_kind() == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}

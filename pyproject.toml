@@ -32,9 +32,6 @@ dependencies = [
 otel = ["opentelemetry-proto>=1.24"]
 # Plotting/figures for research runs; kept out of the core install.
 viz = ["seaborn>=0.13", "matplotlib>=3.8"]
-# E2B sandbox: hosts the (code) harness in a microVM so searched harness code runs isolated,
-# while the world model still answers every tool call. Only the sandbox runtime needs it.
-e2b = ["e2b>=2.0"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",

@@ -1,8 +1,8 @@
 """RunnerLink: the transport that replaces per-episode SSH + reverse tunnel for the pi runner.
 
 The control plane (this process) holds the model credentials and the world-model session state; a
-long-lived pi *runner* — local, on nucbox, or inside an E2B sandbox — dials the host and blocks
-reading frames. One episode is driven over one bidirectional frame channel: the host sends an
+long-lived pi *runner* — local, on nucbox, or any remote box — dials the host and blocks reading
+frames. One episode is driven over one bidirectional frame channel: the host sends an
 `episode_start`, then answers the two callbacks the runner pushes up — `llm_request` (the worker
 LLM completion, produced host-side so no creds ever reach the runner) and `tool_request` (the
 environment tool call, routed to the `AgentEnvironment` / world model) — until `done`.
@@ -10,8 +10,7 @@ environment tool call, routed to the `AgentEnvironment` / world model) — until
 Frames are length-prefixed JSON (4-byte big-endian length + UTF-8 body) over a raw socket, so the
 transport adds ZERO dependency on either side (Python stdlib here; Node stdlib in the runner). The
 episode-driving logic is decoupled from the socket behind the `Channel` protocol so a scripted
-in-process peer can exercise the whole broker offline (see runner_link_test.py) — the same seam the
-E2B fake-sandbox test used.
+in-process peer can exercise the whole broker offline (see runner_link_test.py).
 
 Only the frame transport is new; the worker-LLM translation (`openai_to_bedrock`,
 `bedrock_to_completion`) and the tool budget/step recording (`HostEpisode`) are the same logic the

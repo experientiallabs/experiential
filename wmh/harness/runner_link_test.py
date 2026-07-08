@@ -2,9 +2,8 @@
 
 No socket, no node, no Bedrock. A `FakeChannel` plays the runner side (emits tool_request /
 llm_request / done frames and records what the host sent back); a fake `AgentEnvironment` stands in
-for the world model; `worker_fn` is injected so the worker-LLM callback needs no provider. This is
-the same seam the E2B fake-sandbox test used, now for the frame protocol. The frame codec and the
-Bedrock translation (shared with the SSH shim) are unit-tested directly.
+for the world model; `worker_fn` is injected so the worker-LLM callback needs no provider. The
+frame codec and the Bedrock translation (shared with the SSH shim) are unit-tested directly.
 """
 
 from __future__ import annotations
