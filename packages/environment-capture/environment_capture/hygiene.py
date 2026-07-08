@@ -49,9 +49,10 @@ _CMD_ESCAPE_RE = re.compile(
 _RELATIVE_TRAVERSAL_RE = re.compile(r"(?:\.\.[/\\]){2,}")
 
 # Environment dumps that never target task data: `env` / `env | grep ...` / `printenv [VAR]`.
-# `env VAR=value cmd` (setting env for one command) is legitimate and is NOT matched — only the
-# dumping forms are, via the negative lookahead for an assignment argument.
-_ENV_DUMP_RE = re.compile(r"(?:^|[\s;&|(`])(?:printenv\b|env\b(?!\s+[A-Za-z_]\S*=))")
+# `env` used to run a command with a modified environment is legitimate and is NOT matched: the
+# negative lookahead skips a following assignment (`env VAR=value cmd`) or option flag (`env -u
+# VAR cmd`, `env -i cmd`). Only the bare dumping forms remain.
+_ENV_DUMP_RE = re.compile(r"(?:^|[\s;&|(`])(?:printenv\b|env\b(?!\s+(?:-|[A-Za-z_]\S*=)))")
 
 # References to credential-shaped environment variables (`echo $AWS_SECRET_ACCESS_KEY`,
 # `printf %s "$HF_TOKEN"`); the surrounding `${...}` braces are stripped by _normalize_command.
@@ -157,15 +158,19 @@ def _identity_regexes() -> tuple[re.Pattern[str], ...]:
     return _identity_regexes_cache
 
 
-def _normalize_command(command: str) -> str:
-    """Strip `${VAR}` braces so `${HOME}`/`${AWS_SECRET_ACCESS_KEY}` read as `$HOME`/`$AWS_...`.
+_BRACE_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+
+def _normalize_command(command: str) -> str:
+    """Rewrite `${VAR}` to `$VAR` so `${HOME}`/`${AWS_SECRET_ACCESS_KEY}` read as bare `$VAR`.
+
+    Only variable-brace syntax is rewritten (brace expansion like `cp f{,.bak}` is left intact).
     Quotes and redirection operators are NOT rewritten — they are handled by the leading-boundary
     class in `_CMD_ESCAPE_RE`, which distinguishes a quoted absolute host path (an escape) from a
     simulated filesystem's quoted `~/` API argument (content). This is screening, not a shell
     parser.
     """
-    return command.replace("{", "").replace("}", "")
+    return _BRACE_VAR_RE.sub(r"$\1", command)
 
 
 def _match_host_command(command: str) -> str | None:

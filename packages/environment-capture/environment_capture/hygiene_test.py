@@ -292,8 +292,11 @@ def test_env_dumps_and_secret_var_reads_are_flagged() -> None:
         assert command_targets_host(command), command
     for command in (
         "env FOO=bar python3 analyze.py",
+        "env -u AWS_SECRET_ACCESS_KEY python3 analyze.py",
+        "env -i bash run.sh",
         "ls data/ && cat data/manual.md",
         "grep -r pattern src/",
+        "cp results.csv results{,.bak}",
     ):
         assert not command_targets_host(command), command
 
