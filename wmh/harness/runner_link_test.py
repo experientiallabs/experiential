@@ -189,6 +189,38 @@ def test_episode_error_frame_reports_error() -> None:
     assert "pi fatal" in result.steps[-1].observation.content
 
 
+def test_tools_bound_at_construction_satisfy_runtime_contract() -> None:
+    # RunnerLink(tools=...) is a drop-in runtime: run(task_id, instruction, env), no tools kwarg.
+    env = _Env()
+    script = [
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {"command": "ls"}},
+        {"type": "done", "answer": "done"},
+    ]
+    ch = _FakeChannel(script)
+    link = RunnerLink(ch, tools=_tools(), worker_fn=lambda body: {"choices": [{"message": {}}]})
+    result = link.run("t1", "do it", env)  # no tools= : uses the constructor's
+    assert result.stop_reason is StopReason.SUBMITTED
+    assert [a.name for a in env.actions] == ["bash"]
+    assert {t["name"] for t in _sent(ch, "episode_start")[0]["tools"]} >= {"bash", "submit"}
+
+
+def test_multiple_episodes_over_one_channel() -> None:
+    # A persistent channel drives episodes sequentially (what closed-loop eval / the search do).
+    script = [
+        {"type": "done", "answer": "a1"},  # episode 1
+        {"type": "done", "answer": "a2"},  # episode 2
+    ]
+    ch = _FakeChannel(script)
+    link = _link(ch, tools=_tools())
+    r1 = link.run("t1", "first", _Env())
+    r2 = link.run("t2", "second", _Env())
+    assert (r1.answer, r2.answer) == ("a1", "a2")
+    starts = _sent(ch, "episode_start")
+    assert len(starts) == 2
+    assert starts[0]["episode_id"] != starts[1]["episode_id"]  # fresh id per episode
+    assert (starts[0]["instruction"], starts[1]["instruction"]) == ("first", "second")
+
+
 # --- shared Bedrock translation (offline) ---
 def test_openai_to_bedrock_maps_tools_and_tool_results() -> None:
     body: JsonObject = {

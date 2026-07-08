@@ -320,6 +320,7 @@ class RunnerLink:
         self,
         channel: Channel,
         *,
+        tools: list[ToolSpec] | None = None,
         worker: WorkerConfig | None = None,
         worker_fn: WorkerFn | None = None,
         files: dict[str, str] | None = None,
@@ -327,6 +328,10 @@ class RunnerLink:
         max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS,
     ) -> None:
         self._channel = channel
+        # Tools bound at construction make RunnerLink satisfy the runtime contract closed-loop eval
+        # drives — `run(task_id, instruction, environment)` — while `run(..., tools=...)` still lets
+        # a caller (or the conformance tests) override per episode.
+        self._tools = tools or []
         cfg = worker or WorkerConfig()
         self._worker_cfg = cfg
         # worker_fn lets tests answer llm_request without a real provider; defaults to the real one.
@@ -341,11 +346,11 @@ class RunnerLink:
         instruction: str,
         environment: AgentEnvironment,
         *,
-        tools: list[ToolSpec],
+        tools: list[ToolSpec] | None = None,
     ) -> RunResult:
         episode = HostEpisode(
             instruction=instruction,
-            tools=tools,
+            tools=tools if tools is not None else self._tools,
             environment=environment,
             max_env_actions=self._max_env_actions,
         )
