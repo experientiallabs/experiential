@@ -14,6 +14,11 @@ from wmh.providers.base import (
     ProviderKind,
     VerifyResult,
 )
+from wmh.providers.fallback import (
+    FallbackProvider,
+    anthropic_direct_id,
+    with_anthropic_fallover,
+)
 from wmh.providers.registry import get_provider, verify_all, verify_embedder
 
 __all__ = [
@@ -25,6 +30,9 @@ __all__ = [
     "Completion",
     "Message",
     "VerifyResult",
+    "FallbackProvider",
+    "anthropic_direct_id",
+    "with_anthropic_fallover",
     "get_provider",
     "verify_all",
     "verify_embedder",

@@ -73,11 +73,11 @@ from wmh.engine.eval_suites import (
     resolve_eval_suite,
     result_path,
 )
-from wmh.engine.grid import GridResult, ModelSpec, merge_results, run_grid
-from wmh.engine.grid_plot import plot_grid, plot_grid_heatmap
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
 from wmh.env.llm_agent import LLMAgent
+from wmh.evals.grid import GridResult, ModelSpec, merge_results, run_grid
+from wmh.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import LLMJudge, RubricJudge

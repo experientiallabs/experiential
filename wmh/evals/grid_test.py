@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wmh.engine.grid import (
+from wmh.evals.grid import (
     CONDITIONS,
     GridCell,
     GridResult,
@@ -179,15 +179,6 @@ def test_bedrock_judge_and_target_get_fallback_chains() -> None:
     assert not isinstance(single, FallbackProvider)
 
 
-def test_anthropic_equiv_maps_bedrock_ids_to_direct_api() -> None:
-    from wmh.engine.grid import _anthropic_equiv
-
-    assert _anthropic_equiv("us.anthropic.claude-opus-4-8") == "claude-opus-4-8"
-    assert _anthropic_equiv("us.anthropic.claude-haiku-4-5-20251001-v1:0") == "claude-haiku-4-5"
-    assert _anthropic_equiv("us.anthropic.claude-opus-4-6-v1") == "claude-opus-4-6"
-    assert _anthropic_equiv("gpt-5.5") is None  # non-Anthropic -> no direct equivalent
-
-
 def _cell(model: str, condition: str, fidelity: float) -> GridCell:
     return GridCell(
         model_label=model,
@@ -202,7 +193,7 @@ def _cell(model: str, condition: str, fidelity: float) -> GridCell:
 
 
 def test_capped_provider_clamps_target_max_tokens() -> None:
-    from wmh.engine.grid import CappedProvider
+    from wmh.evals.grid import CappedProvider
 
     seen: dict[str, int] = {}
 

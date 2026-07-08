@@ -18,17 +18,16 @@ with `OPENAI_BASE_URL` in the environment.
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
-from wmh.evals import EvalReport, evaluate_files
+from wmh.evals.open_loop import EvalReport, evaluate_files
 from wmh.optimize.judge import Judge, LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, get_provider
 from wmh.providers.base import Completion, Message, Provider
-from wmh.providers.fallback import FallbackProvider
+from wmh.providers.fallback import FallbackProvider, anthropic_direct_id
 from wmh.retrieval import HashingEmbedder
 from wmh.tracking import MeteredProvider, RunTracker
 from wmh.tracking.pricing import price_for
@@ -167,24 +166,6 @@ def merge_results(results: list[GridResult]) -> GridResult:
     return merged
 
 
-def _anthropic_equiv(bedrock_model: str) -> str | None:
-    """The direct-Anthropic-API model id equivalent to a Bedrock Anthropic model id, or None.
-
-    A capacity-throttled Bedrock target/judge fails over to the SAME model on the direct Anthropic
-    API (whose key is not Bedrock-rate-limited), so what's measured stays identical — only the
-    endpoint changes. Strips the `us.anthropic.`/`anthropic.` prefix and any dated/versioned tail:
-    `us.anthropic.claude-opus-4-8` -> `claude-opus-4-8`;
-    `us.anthropic.claude-haiku-4-5-20251001-v1:0` -> `claude-haiku-4-5`.
-    """
-    for prefix in ("us.anthropic.", "anthropic."):
-        if bedrock_model.startswith(prefix):
-            m = bedrock_model[len(prefix) :]
-            m = re.sub(r"-\d{8}.*$", "", m)  # drop a -YYYYMMDD... date+version tail
-            m = re.sub(r"-v\d+(:\d+)?$", "", m)  # drop a -v1 / -v1:0 tail
-            return m
-    return None
-
-
 def _fallback(factory, configs: list[ProviderConfig]) -> Provider:  # noqa: ANN001 - factory injectable
     """A FallbackProvider over `configs` (a single-element chain returns a plain provider)."""
     chain = [factory(c) for c in configs]
@@ -209,7 +190,7 @@ def _make_judge(
         # Fail over first to the SAME judge model on the direct Anthropic API (unlimited key), so a
         # throttled Bedrock Opus judge stays Opus rather than dropping to a different Bedrock model;
         # only then to the Bedrock resilience models.
-        direct = _anthropic_equiv(judge_model)
+        direct = anthropic_direct_id(judge_model)
         if direct is not None:
             configs.append(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
         configs += [
@@ -231,7 +212,7 @@ def _make_target(spec: ModelSpec, factory) -> Provider:  # noqa: ANN001 - factor
         # Then fail over to the SAME model on the direct Anthropic API (unlimited key), so a target
         # throttled across all Bedrock regions still produces real predictions on the identical
         # model instead of scoring the step 0 — critical for Opus 4.8 under Bedrock load.
-        direct = _anthropic_equiv(spec.model)
+        direct = anthropic_direct_id(spec.model)
         if direct is not None:
             configs.append(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
         return _fallback(factory, configs)

@@ -22,6 +22,7 @@ from wmh.evals.closed_loop import (
     evaluate_with_env,
 )
 from wmh.evals.gold import GoldJudge, GoldVerdict
+from wmh.evals.grid import GridCell, GridResult, ModelSpec, merge_results, run_grid
 from wmh.evals.open_loop import EvalReport, OpenLoopEval, evaluate_files
 from wmh.evals.tasks import TaskSpec, load_tasks
 
@@ -34,6 +35,9 @@ __all__ = [
     "Evaluation",
     "GoldJudge",
     "GoldVerdict",
+    "GridCell",
+    "GridResult",
+    "ModelSpec",
     "OpenLoopEval",
     "TaskOutcome",
     "TaskSpec",
@@ -43,4 +47,6 @@ __all__ = [
     "evaluate_files",
     "evaluate_with_env",
     "load_tasks",
+    "merge_results",
+    "run_grid",
 ]

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wmh.engine.grid import CONDITIONS, GridResult
+from wmh.evals.grid import CONDITIONS, GridResult
 
 _TITLE = "World-Model Harness Fidelity"
 

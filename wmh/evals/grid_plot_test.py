@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from wmh.engine.grid import GridCell, GridResult
-from wmh.engine.grid_plot import plot_grid, plot_grid_heatmap
+from wmh.evals.grid import GridCell, GridResult
+from wmh.evals.grid_plot import plot_grid, plot_grid_heatmap
 
 pytest.importorskip("matplotlib")  # viz extra; skip cleanly when absent
 

@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmh.providers.fallback import FallbackProvider, _is_capacity_error
+from wmh.providers.fallback import (
+    FallbackProvider,
+    _is_capacity_error,
+    anthropic_direct_id,
+    with_anthropic_fallover,
+)
 
 
 class _StubProvider:
@@ -109,3 +114,32 @@ def test_capacity_classifier_falls_back_to_markers_for_transport_errors() -> Non
     assert _is_capacity_error(RuntimeError("throttled"))
     # A plain bad-request with no code and no capacity phrasing must NOT be treated as capacity.
     assert not _is_capacity_error(ValueError("malformed request: bad field"))
+
+
+def test_anthropic_direct_id_maps_bedrock_ids() -> None:
+    assert anthropic_direct_id("us.anthropic.claude-opus-4-8") == "claude-opus-4-8"
+    assert anthropic_direct_id("us.anthropic.claude-haiku-4-5-20251001-v1:0") == "claude-haiku-4-5"
+    assert anthropic_direct_id("us.anthropic.claude-opus-4-6-v1") == "claude-opus-4-6"
+    assert anthropic_direct_id("gpt-5.5") is None  # non-Anthropic -> no direct equivalent
+
+
+def test_with_anthropic_fallover_wraps_bedrock_only() -> None:
+    built: list[str] = []
+
+    def factory(config: ProviderConfig) -> _StubProvider:
+        built.append(f"{config.kind.value}:{config.model}")
+        return _StubProvider(config.model)
+
+    # Bedrock Anthropic model -> FallbackProvider [bedrock, direct-anthropic same model].
+    p = with_anthropic_fallover(
+        ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8"), factory
+    )
+    assert isinstance(p, FallbackProvider)
+    assert built == ["bedrock:us.anthropic.claude-opus-4-8", "anthropic:claude-opus-4-8"]
+
+    # Non-Bedrock (or non-Anthropic) -> a single provider, no fallover.
+    built.clear()
+    single = with_anthropic_fallover(
+        ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5"), factory
+    )
+    assert not isinstance(single, FallbackProvider)

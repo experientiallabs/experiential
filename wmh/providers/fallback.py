@@ -11,11 +11,15 @@ the preferred one is capacity-constrained, instead of aborting the whole (expens
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+
 from wmh.providers.base import (
     Completion,
     Message,
     Provider,
     ProviderConfig,
+    ProviderKind,
     VerifyResult,
     verify_via_ping,
 )
@@ -106,3 +110,41 @@ class FallbackProvider:
 
     def verify(self) -> VerifyResult:
         return verify_via_ping(self)
+
+
+def anthropic_direct_id(bedrock_model: str) -> str | None:
+    """The direct-Anthropic-API model id for a Bedrock Anthropic model id, or None otherwise.
+
+    Bedrock Anthropic models are heavily capacity-constrained; the direct Anthropic API is the SAME
+    model on a different endpoint (and a key that isn't Bedrock-rate-limited), so failing over to it
+    keeps what's measured identical. Strips the `us.anthropic.`/`anthropic.` prefix and any
+    dated/versioned tail: `us.anthropic.claude-opus-4-8` -> `claude-opus-4-8`;
+    `us.anthropic.claude-haiku-4-5-20251001-v1:0` -> `claude-haiku-4-5`.
+    """
+    for prefix in ("us.anthropic.", "anthropic."):
+        if bedrock_model.startswith(prefix):
+            m = bedrock_model[len(prefix) :]
+            m = re.sub(r"-\d{8}.*$", "", m)  # drop a -YYYYMMDD... date+version tail
+            m = re.sub(r"-v\d+(:\d+)?$", "", m)  # drop a -v1 / -v1:0 tail
+            return m
+    return None
+
+
+def with_anthropic_fallover(
+    config: ProviderConfig,
+    factory: Callable[[ProviderConfig], Provider],
+) -> Provider:
+    """A provider for `config` that fails over to the SAME model on the direct Anthropic API when
+    `config` is a Bedrock Anthropic model, else the plain provider.
+
+    The reusable form of "don't let Bedrock Opus throttling zero a result" — any eval/serve path can
+    wrap a Bedrock config with it. `factory` builds a provider from a config (`get_provider`, or a
+    fake in tests). Compose it into a longer chain manually when extra hops are wanted (e.g. region
+    spread), since this only adds the single direct-Anthropic hop.
+    """
+    base = factory(config)
+    direct = anthropic_direct_id(config.model) if config.kind is ProviderKind.BEDROCK else None
+    if direct is None:
+        return base
+    alt = factory(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
+    return FallbackProvider([base, alt])

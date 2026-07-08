@@ -19,3 +19,4 @@ file here must justify its existence in the table below; a doc that can't gets d
 | `research/trace_scaling_law.md` | The repo's first completed scaling-law result and a load-bearing product claim: fidelity saturates at ~10 traces, so the leverage is prompt/optimization, not trace count. Cited by launch material and the benchmark work. |
 | `research/trace_scaling_law.png` | The figure the writeup renders; also the brand-system visual reference cited by AGENTS.md rule 15. |
 | `reference/eval_suites.md` | The reproducibility contract every benchmark number in this repo rests on (`examples/<task>/evals/*.toml` + `wmh eval`); commands verified against `main` at promotion. |
+| `reference/eval_grid.md` | `wmh eval grid` — the model × condition fidelity grid (base/+RAG/+GEPA/+GEPA+RAG across models, one pinned judge, target-side cost); the reference run's artifacts live in `.agents/docs/research/benchmark-grid/`. |
