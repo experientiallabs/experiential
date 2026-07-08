@@ -7,8 +7,8 @@ description: Iteratively improve the RubricJudge (or any LLM scorer) against a h
 
 An iterative calibration loop against a hand-labeled dataset. Never tweak the judge from
 intuition: every change starts from a disagreement you can point at and ends with a case that
-would catch its regression. Deep background and worked example:
-`.agents/docs/reference/judge-meta-eval-playbook.md`.
+would catch its regression. Deep background and worked example, if it still exists (`.agents/`
+is prunable): `.agents/docs/reference/judge-meta-eval-playbook.md`.
 
 The loop (repeat until a full pass produces no new disagreements you'd act on):
 
@@ -16,12 +16,29 @@ The loop (repeat until a full pass produces no new disagreements you'd act on):
 
 The dataset is `JUDGE_QUALITY_CASES` in `wmh/optimize/judge_quality.py`: hand-labeled
 (action, actual, predicted) triples with the score band a sound judge must land in. Run it
-against the pinned judge model (never a failover chain — chains make scores incomparable):
+against the pinned judge model (never a failover chain — chains make scores incomparable).
+The stable entry point is the Python API (write run outputs somewhere UNCOMMITTED — `.wmh/` or
+`/tmp` — they are working data, not repo content):
 
 ```bash
-uv run python .agents/scripts/run_judge_quality.py -v \
-  --out .agents/docs/research/raw/judge-iter-$(date +%Y%m%d).json
+uv run python - <<'PY'
+import json
+from wmh.optimize.judge import RubricJudge
+from wmh.optimize.judge_quality import run_judge_quality
+from wmh.providers import ProviderConfig, ProviderKind, get_provider
+
+judge = RubricJudge(get_provider(ProviderConfig(
+    kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8")))
+report = run_judge_quality(judge, concurrency=4)
+for v in report.verdicts:
+    print("PASS" if v.passed else "FAIL", v.case_id, f"{v.score:.3f}", v.failures or v.critique[:90])
+print(report.summary())
+open("/tmp/judge-iter.json", "w").write(report.model_dump_json(indent=2))
+PY
 ```
+
+(`.agents/scripts/run_judge_quality.py` is a convenience driver for the same thing — use it if
+it's still around, but don't depend on it.)
 
 If the concern came from real eval runs, ALSO pull disagreements from the wild: read per-step
 scorecards from a recent `wmh eval` result (`.wmh/evals/**.json` carries `predicted`, `actual`,
@@ -72,10 +89,11 @@ fail. Then run exactly one experiment matched to the layer:
   provably inert elsewhere (the weighted mean was chosen so all-equal-dimension replies score
   identically to before). Guard against overcorrection with a counter-control (e.g.
   `right-facts-wrong-shape` stops the headline collapsing into factuality-only).
-- **Model** — sweep candidates with the same suite and rank by CALIBRATION, not pass rate
-  (control mean → 1.0, hard-defect mean → 0.0, and their separation):
-  `uv run python .agents/scripts/run_judge_quality.py --model <id> [--provider openai] --out m.json`.
-  Switching judge models re-baselines every fidelity number — say so explicitly.
+- **Model** — sweep candidates with the same suite (the snippet above with a different
+  `ProviderConfig`) and rank by CALIBRATION, not pass rate: control mean → 1.0, hard-defect
+  mean → 0.0, and their separation. Switching judge models re-baselines every fidelity number —
+  say so explicitly, and bump `JUDGE_VERSION` in `wmh/optimize/judge.py` for any change to
+  scoring semantics so persisted results stay distinguishable.
 - **Context** — change what the judge sees: payload fields (documented IN the prompt),
   truncation head/tail limits, retry feedback wording, `max_tokens`.
 
@@ -83,11 +101,14 @@ fail. Then run exactly one experiment matched to the layer:
 
 - Full suite green, **controls unmoved** — a fix that shifts controls is an overcorrection.
 - Rerun once more for stability (one green run can be luck; two is a result).
-- If scoring semantics changed (weights, prompt rules): rerun the frozen-prediction regression
-  (`.agents/scripts/run_judge_regression.py` — cached predictions, both judges) and report
-  Spearman + shift sliced by factuality band; the shift must concentrate where the defect was.
-- Commit the new cases with the fix, append the run JSONs to `.agents/docs/research/raw/`, and
-  note the iteration in `.agents/docs/research/` so the next loop starts from your evidence.
+- If scoring semantics changed (weights, prompt rules): rerun a frozen-prediction regression —
+  generate world-model predictions ONCE on a seeded step sample, cache them to a file, score the
+  same cache with the old judge (snapshot its prompt/aggregation from git) and the new one, and
+  report Spearman + shift sliced by factuality band; the shift must concentrate where the defect
+  was. (A ready-made driver may exist at `.agents/scripts/run_judge_regression.py`.)
+- Commit the new cases with the fix and bump `JUDGE_VERSION` if semantics changed. Run outputs
+  are working data: keep them out of git (`.wmh/`, `/tmp`); commit only the few small, stable
+  result JSONs a finished writeup actually cites.
 
 Stop when step 1 + a fresh scorecard sample produce no disagreement worth a case. Do not stop
 on a green suite alone — the suite only contains yesterday's disagreements.

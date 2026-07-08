@@ -358,8 +358,33 @@ def test_adapter_all_invalid_judgements_fall_back_to_full_reflection() -> None:
     reflective = adapter.make_reflective_dataset(
         {ENV_PROMPT_COMPONENT: "P"}, out, [ENV_PROMPT_COMPONENT]
     )
-    # An empty reflective dataset would break GEPA's mutation step; fall back to everything.
-    assert len(reflective[ENV_PROMPT_COMPONENT]) == 2
+    # An empty reflective dataset would break GEPA's mutation step; fall back to everything —
+    # but with the judge-noise critiques scrubbed so reflection never chases parse errors.
+    records = reflective[ENV_PROMPT_COMPONENT]
+    assert len(records) == 2
+    assert all("Unparseable" not in str(r["Feedback"]) for r in records)
+
+
+def test_adapter_judge_exception_is_invalid_not_a_world_model_zero() -> None:
+    # A judge call that RAISES (throttle, 5xx) is judge infrastructure, not world-model signal:
+    # it must flow through the same valid=False machinery as a malformed reply, and the
+    # successfully generated prediction must be kept.
+    class RaisingJudge(FakeJudge):
+        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("ThrottlingException: judge is down")
+            return JudgeResult(score=0.8, critique="ok")
+
+    adapter = WorldModelGEPAAdapter(FakeProvider(), RaisingJudge())
+    out = adapter.evaluate(_eval_batch(_trace("t", n=2)), {ENV_PROMPT_COMPONENT: "P"}, True)
+    # The judge-exception step is imputed like any invalid judgement, not scored 0.0.
+    assert out.scores == [0.8, 0.8]
+    assert out.trajectories is not None
+    failed = [t for t in out.trajectories if not t.valid]
+    assert len(failed) == 1
+    assert "Judge call failed" in failed[0].critique
+    assert failed[0].predicted.content  # the prediction was kept, not replaced by an error stub
 
 
 def test_eval_steps_retrieves_demos_without_same_trace_leakage() -> None:

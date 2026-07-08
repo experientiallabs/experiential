@@ -29,8 +29,11 @@ sample_turns = "all"
 seed = 0
 ```
 
-There is no judge knob: every suite is scored by the single `RubricJudge` (a pre-overhaul
-`judge = "..."` line in a suite file is rejected with an error saying to delete it).
+There is no judge knob: every suite is scored by the single `RubricJudge`. A pre-overhaul
+`judge = "..."` line makes the suite fail validation: loading the file directly (`wmh eval
+run path/to/suite.toml`) raises an error saying to delete the line, while name-based discovery
+skips the suite with that same message as a warning on stderr — if a suite is missing from
+`wmh eval list`, check the warnings.
 
 ## Running
 

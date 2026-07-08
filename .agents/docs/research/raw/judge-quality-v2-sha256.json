@@ -1,0 +1,202 @@
+{
+  "judge_model": "us.anthropic.claude-opus-4-8",
+  "report": {
+    "verdicts": [
+      {
+        "case_id": "exact-json-lookup",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Prediction matches the actual observation exactly, including all reservation fields and flight details.",
+        "failures": []
+      },
+      {
+        "case_id": "cosmetic-reordering",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "All fields and values match exactly (user_id, reservation_id, route, flights, prices); only key ordering differs, which is immaterial for JSON.",
+        "failures": []
+      },
+      {
+        "case_id": "volatile-pid-differs",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "PID is volatile; predicted a different but plausible PID with identical format, length, and success flag.",
+        "failures": []
+      },
+      {
+        "case_id": "wrong-computed-values",
+        "defect": "control",
+        "passed": true,
+        "score": 0.41000000000000003,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.2,
+          "consistency": 0.7,
+          "realism": 1.0,
+          "quality": 0.2
+        },
+        "critique": "Format and structure match (12 version strings, correct length), but this is deterministic file content and most values diverge from the actual versions.",
+        "failures": []
+      },
+      {
+        "case_id": "fabricated-lookup-data",
+        "defect": "control",
+        "passed": true,
+        "score": 0.25000000000000006,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.0,
+          "consistency": 0.4,
+          "realism": 0.9,
+          "quality": 0.1
+        },
+        "critique": "Correct JSON shape and reservation_id, but all deterministic values (user_id, origin, destination, flight_type, cabin, flights) are wrong \u2014 a fabricated reservation that doesn't match the actual data.",
+        "failures": []
+      },
+      {
+        "case_id": "right-facts-wrong-shape",
+        "defect": "control",
+        "passed": true,
+        "score": 0.47,
+        "dimensions": {
+          "format": 0.1,
+          "factuality": 0.7,
+          "consistency": 0.5,
+          "realism": 0.2,
+          "quality": 0.2
+        },
+        "critique": "The prediction conveys the correct facts (user, route, flights, prices) but is a prose summary rather than the JSON object the environment actually returns, failing on format and realism.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-nonempty-actual",
+        "defect": "empty-prediction",
+        "passed": true,
+        "score": 0.0,
+        "dimensions": {
+          "format": 0.0,
+          "factuality": 0.0,
+          "consistency": 0.0,
+          "realism": 0.0,
+          "quality": 0.0
+        },
+        "critique": "Predicted content is empty while the actual observation returned a list of version numbers; the prediction omitted the environment's response entirely.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-empty-actual",
+        "defect": "both-empty",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Both contents are empty, matching exactly; redirected curl output produces no stdout as expected.",
+        "failures": []
+      },
+      {
+        "case_id": "error-flipped-to-pretty-success",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.07,
+        "dimensions": {
+          "format": 0.3,
+          "factuality": 0.0,
+          "consistency": 0.0,
+          "realism": 0.4,
+          "quality": 0.0
+        },
+        "critique": "Flipped outcome: actual returned an error 'User not found' but prediction fabricated a successful user_id lookup.",
+        "failures": []
+      },
+      {
+        "case_id": "success-flipped-to-error",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.05000000000000001,
+        "dimensions": {
+          "format": 0.1,
+          "factuality": 0.0,
+          "consistency": 0.0,
+          "realism": 0.4,
+          "quality": 0.0
+        },
+        "critique": "Predicted an error/not-found while the actual returned a full valid reservation JSON \u2014 flipped outcome and wrong format.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-identical",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Visible content, length (34889), and SHA-256 hashes all match exactly, so the full contents are identical including the omitted middle.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-divergent-tail",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 0.29000000000000004,
+        "dimensions": {
+          "format": 0.9,
+          "factuality": 0.1,
+          "consistency": 0.4,
+          "realism": 0.9,
+          "quality": 0.1
+        },
+        "critique": "The prediction invented FAIL/corrupted lines for items 1900-1999, but the actual output shows all items OK through 1999; the tail diverges completely, hashes differ, and content_length differs (36089 vs 34889).",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-divergent-middle",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 0.6299999999999999,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.5,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 0.4
+        },
+        "critique": "Visible head and tail match exactly with identical content_length and structure, but the content_sha256 differs so the omitted middle (~22.9k chars) is an unverifiable divergence, capping factuality and quality.",
+        "failures": []
+      }
+    ]
+  }
+}

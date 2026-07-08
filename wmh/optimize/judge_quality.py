@@ -64,7 +64,7 @@ class CaseVerdict(BaseModel):
 
 
 class JudgeQualityReport(BaseModel):
-    """Aggregate meta-eval result over a case suite."""
+    """Aggregate meta-eval result over a case suite (satisfies `wmh.evals.base.EvalResult`)."""
 
     verdicts: list[CaseVerdict] = Field(default_factory=list)
 
@@ -75,6 +75,11 @@ class JudgeQualityReport(BaseModel):
     @property
     def n_passed(self) -> int:
         return sum(1 for v in self.verdicts if v.passed)
+
+    @property
+    def headline(self) -> float:
+        """Pass fraction in [0, 1], so shared eval tooling can consume the meta-eval too."""
+        return self.n_passed / self.n_total if self.n_total else 0.0
 
     def failed(self) -> list[CaseVerdict]:
         return [v for v in self.verdicts if not v.passed]
@@ -200,6 +205,12 @@ _LONG_STDOUT = "\n".join(_LONG_LINES)
 _LONG_STDOUT_BAD_TAIL = "\n".join(
     _LONG_LINES[:1900] + [f"{i:04d} FAIL item-{i} corrupted" for i in range(1900, 2000)]
 )
+# Same length as _LONG_STDOUT, same head and tail, character-swapped middle: invisible to the
+# truncated view, exposed only by the content_sha256 mismatch.
+_LONG_STDOUT_BAD_MIDDLE = "\n".join(
+    line if i < 700 or i >= 1300 else line.replace("OK", "KO") for i, line in enumerate(_LONG_LINES)
+)
+del _LONG_LINES  # only the joined fixtures are needed at runtime
 _LIST_ACTION = Action(
     kind=ActionKind.TOOL_CALL,
     name="bash",
@@ -331,5 +342,18 @@ JUDGE_QUALITY_CASES: tuple[JudgeCase, ...] = (
         actual=Observation(content=_LONG_STDOUT),
         predicted=Observation(content=_LONG_STDOUT_BAD_TAIL),
         expected=ScoreBand(lo=0.0, hi=0.65),
+    ),
+    JudgeCase(
+        id="long-output-divergent-middle",
+        defect="long-observation",
+        rationale="Equal length, identical head and tail, fabricated middle: truncation hides "
+        "the divergence, so only the content_sha256 mismatch can expose it. The judge cannot "
+        "see HOW divergent the hidden region is, so unlike the visible-tail case the label only "
+        "demands it never reads as a verified match (pre-hash this scored ~1.0).",
+        action=_LIST_ACTION,
+        actual=Observation(content=_LONG_STDOUT),
+        predicted=Observation(content=_LONG_STDOUT_BAD_MIDDLE),
+        expected=ScoreBand(lo=0.0, hi=0.65),
+        expected_dimensions={"factuality": ScoreBand(lo=0.0, hi=0.5)},
     ),
 )

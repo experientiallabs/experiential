@@ -115,14 +115,24 @@ def load_eval_suite(path: str | Path) -> EvalSuite:
     try:
         config = EvalSuiteConfig.model_validate(raw)
     except ValidationError as exc:
-        if isinstance(raw, dict) and "judge" in raw:
+        has_judge = isinstance(raw, dict) and "judge" in raw
+        if has_judge and exc.error_count() == 1:
             # Pre-overhaul suites (and the old shipped defaults) carried this knob; the generic
-            # schema error would never say it was removed or what to do.
+            # schema error would never say it was removed or what to do. Only replace the error
+            # when `judge` is the sole problem — otherwise the full listing must surface so the
+            # user fixes everything in one pass.
             raise ValueError(
                 f"{suite_path} sets `judge`, an option that no longer exists — the harness has a "
                 "single judge (the 5-dimension rubric); delete the `judge` line from the suite file"
             ) from exc
-        raise ValueError(f"{suite_path} does not match the eval suite schema ({exc})") from exc
+        hint = (
+            " (note: the `judge` option no longer exists; delete that line too)"
+            if has_judge
+            else ""
+        )
+        raise ValueError(
+            f"{suite_path} does not match the eval suite schema ({exc}){hint}"
+        ) from exc
     example = (
         suite_path.parent.parent.name
         if suite_path.parent.name == "evals"

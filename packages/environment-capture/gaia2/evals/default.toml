@@ -4,4 +4,3 @@ files = ["../traces.otel.jsonl"]
 train_split = 0.7
 sample_turns = "all"
 seed = 0
-judge = "rubric"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from wmh.core.types import Action, ActionKind, Observation, Step
@@ -232,3 +234,21 @@ def test_short_content_is_never_truncated() -> None:
     prompt = _build_judge_prompt(Observation(content="short"), Observation(content=content), _ctx())
     assert "characters omitted" not in prompt
     assert content in prompt
+    assert "content_sha256" not in prompt  # hash only accompanies truncated content
+
+
+def test_truncated_payloads_carry_a_hash_so_middle_divergence_is_visible() -> None:
+    # Two equal-length observations diverging ONLY in the omitted middle produce identical
+    # visible text and identical content_length — the hash is the only remaining tell, and the
+    # prompt instructs the judge to use it.
+    head, tail = "x" * 7000, "y" * 7000
+    actual = head + "REAL-MIDDLE-" + "a" * 4000 + tail
+    predicted = head + "FAKE-MIDDLE-" + "b" * 4000 + tail
+    assert len(actual) == len(predicted)
+    prompt = _build_judge_prompt(
+        Observation(content=predicted), Observation(content=actual), _ctx()
+    )
+    hashes = re.findall(r'"content_sha256": "([0-9a-f]{64})"', prompt)
+    assert len(hashes) == 2
+    assert hashes[0] != hashes[1]  # differing hashes expose the hidden divergence
+    assert "content_sha256" in JUDGE_SYSTEM  # the prompt explains the field

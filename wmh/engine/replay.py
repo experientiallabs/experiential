@@ -16,6 +16,7 @@ step's own trace.
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from statistics import fmean, pstdev
 
@@ -166,12 +167,12 @@ def _score_step(
     )
 
 
-def valid_scores(results: list[StepResult]) -> list[float]:
+def valid_scores(results: Iterable[StepResult]) -> list[float]:
     """Scores of validly-judged steps — the one rule for fidelity aggregation.
 
     Judge failures (valid=False) say nothing about the prediction, so every fidelity aggregate
-    (here, `wmh.engine.eval`) excludes them rather than counting spurious zeros. Kept as the
-    single shared filter so aggregation sites cannot drift.
+    (here and `wmh.evals.open_loop.evaluate_files`) excludes them rather than counting spurious
+    zeros. Kept as the single shared filter so aggregation sites cannot drift.
     """
     return [r.score for r in results if r.valid]
 

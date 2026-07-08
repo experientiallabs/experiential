@@ -41,10 +41,16 @@ class EvalReport(BaseModel):
         """The `EvalResult` headline: per-step reconstruction fidelity."""
         return self.overall_fidelity
 
+    @property
+    def total_valid(self) -> int:
+        """Steps that actually back the fidelity mean (judge-invalid ones excluded)."""
+        return self.total_steps - self.total_invalid
+
     def summary(self) -> str:
+        invalid = f", {self.total_invalid} judge-invalid excluded" if self.total_invalid else ""
         return (
             f"fidelity={self.overall_fidelity:.3f}±{self.overall_std:.3f} "
-            f"({self.total_steps} steps, {len(self.per_file)} file(s))"
+            f"({self.total_steps} steps, {len(self.per_file)} file(s){invalid})"
         )
 
 
@@ -92,7 +98,7 @@ def evaluate_files(
 
     # Step-weighted aggregate over every validly-judged step across files (judge failures are
     # counted in total_invalid, never as spurious zeros — see replay.valid_scores).
-    step_scores = valid_scores([r for rep in per_file.values() for r in rep.results])
+    step_scores = valid_scores(r for rep in per_file.values() for r in rep.results)
     overall = fmean(step_scores) if step_scores else 0.0
     overall_std = pstdev(step_scores) if len(step_scores) > 1 else 0.0
     return EvalReport(

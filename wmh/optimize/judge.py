@@ -14,6 +14,7 @@ dimensions is retried once and, if still bad, flagged with `JudgeResult.valid=Fa
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
@@ -26,6 +27,11 @@ from wmh.providers.base import Message, Provider
 # (wmh.tracking.metered). Kept as a named constant so the prompt and the classifier never drift:
 # JUDGE_SYSTEM must always contain JUDGE_MARKER (pinned by judge_test.py).
 JUDGE_MARKER = "grade a world model"
+
+# Bumped whenever scoring semantics change (prompt rules, weights, validity, truncation), so
+# persisted eval results record which judge produced them and cross-version rows are never
+# silently compared. "rubric-v2": factuality-weighted headline + validity + middle truncation.
+JUDGE_VERSION = "rubric-v2"
 
 # The five fidelity dimensions, scored independently in 0..1. Modeled on Qwen-AgentWorld
 # (arXiv 2606.24597) "AgentWorldBench" rubric.
@@ -70,6 +76,12 @@ Each observation is a JSON object with fields:
 - content: the observation text. Very long content is truncated in the middle, marked by
   "[... N characters omitted ...]"; judge what is visible and do not treat the marker as content.
 - content_length: the exact FULL length of content in characters (even when truncated).
+- content_sha256: present only when content was truncated — the hash of the FULL untruncated
+  content. If the two hashes are EQUAL the full contents are identical even where omitted; if
+  they DIFFER while the visible text matches, the divergence hides in the omitted middle — the
+  prediction is NOT a verified match there. For deterministic content that hidden divergence is
+  an unverifiable factual gap: factuality must not exceed 0.5 and quality must not exceed 0.4
+  (an output whose middle cannot be trusted is not usable as a stand-in).
 - empty_content / empty_sentinel: set when content is the empty string ("<EMPTY_PREDICTION>" /
   "<EMPTY_ACTUAL_OBSERVATION>"). The sentinel is a label, not content.
 
@@ -126,13 +138,19 @@ def _build_judge_prompt(predicted: Observation, actual: Observation, context: St
 
 
 def _observation_payload(observation: Observation, *, empty_sentinel: str) -> JsonObject:
-    return {
+    truncated = len(observation.content) > OBSERVATION_HEAD_CHARS + OBSERVATION_TAIL_CHARS
+    payload: JsonObject = {
         "is_error": observation.is_error,
         "content_length": len(observation.content),
         "content": _truncate_middle(observation.content),
         "empty_content": observation.content == "",
         "empty_sentinel": empty_sentinel if observation.content == "" else None,
     }
+    if truncated:
+        # Without this, two equal-length observations diverging only in the omitted middle are
+        # byte-identical to the judge; the hash is the remaining tell (see JUDGE_SYSTEM).
+        payload["content_sha256"] = sha256(observation.content.encode("utf-8")).hexdigest()
+    return payload
 
 
 def _truncate_middle(content: str) -> str:

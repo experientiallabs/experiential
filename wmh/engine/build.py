@@ -157,8 +157,10 @@ def build(
     def _on_rollout(done: int, score: float | None) -> None:
         report.rollout(done, metric_total["calls"], score)
 
-    # Optimize against the SAME scorer we evaluate with (RubricJudge), so GEPA hill-climbs the
-    # metric we actually report rather than a proxy objective.
+    # Optimize against the SAME rubric we evaluate with (RubricJudge). NOTE: the judge MODEL may
+    # differ — config.judge_model defaults to a cheap per-provider model for GEPA cost, while
+    # `wmh eval` pins the judge to the requested serve-grade model — so held_out_accuracy is only
+    # directly comparable to eval fidelity when --judge-model matches the eval judge.
     optimizer = GEPAOptimizer(
         provider,
         RubricJudge(judge_provider),

@@ -80,7 +80,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.env.llm_agent import LLMAgent
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull, get_adapter, list_adapters
-from wmh.optimize.judge import RubricJudge
+from wmh.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
 from wmh.providers.retry import RetryingProvider
@@ -772,7 +772,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     capture_eval_completed(
         mode="ad_hoc",
         file_count=len(args),
-        scored_step_count=report.total_steps - report.total_invalid,
+        scored_step_count=report.total_valid,
         rag_enabled=options.use_rag,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
@@ -904,7 +904,7 @@ def _eval_run_suite(
     capture_eval_completed(
         mode="suite",
         file_count=len(files),
-        scored_step_count=report.total_steps - report.total_invalid,
+        scored_step_count=report.total_valid,
         rag_enabled=options.use_rag,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
@@ -966,7 +966,7 @@ def _run_eval_files(
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
     provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
-    llm = providers.provider_or_chain(provider_config)
+    llm = providers.provider_or_chain(provider_config, chain=chain)
     if isinstance(llm, providers.WaterfallProvider):
         _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
     prompt = (
@@ -1013,6 +1013,7 @@ def _write_ad_hoc_eval_report(path: Path, report: EvalReport) -> None:
 
 def _eval_report_payload(report: EvalReport) -> JsonObject:
     return {
+        "judge_version": JUDGE_VERSION,
         "overall_fidelity": report.overall_fidelity,
         "overall_std": report.overall_std,
         "total_steps": report.total_steps,
