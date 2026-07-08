@@ -24,6 +24,7 @@ updates work.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from enum import StrEnum
 
@@ -250,12 +251,36 @@ class HarnessDoc(BaseModel):
         if backend != "local":
             raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
         if self.runtime_kind() == "pi-node":
+            skills = SkillLibrary(self.skills())
+            code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
+            # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
+            # host set via runner_link.set_active_channel) instead of the per-episode SSH shim; the
+            # default (unset / "ssh") keeps PiRuntime. The worker LLM reads the same PI_AGENT_* env.
+            if os.environ.get("PI_TRANSPORT") == "link":
+                from wmh.harness.runner_link import (
+                    RunnerLink,
+                    active_channel,
+                    worker_config_from_env,
+                )
+
+                channel = active_channel()
+                if channel is None:
+                    raise RuntimeError(
+                        "PI_TRANSPORT=link but no active runner channel; call "
+                        "runner_link.set_active_channel(channel) before running episodes"
+                    )
+                return RunnerLink(
+                    channel,
+                    tools=resolve_tools(self.tools()),
+                    worker=worker_config_from_env(),
+                    system_prompt=self._assembled_prompt(skills),
+                    files=code_files,
+                )
             from wmh.harness.pi_runtime import PiRuntime  # circular: pi_runtime imports doc
 
-            skills = SkillLibrary(self.skills())
             return PiRuntime(
                 provider,
-                files={s.path: s.content for s in self.code_files() if s.path is not None},
+                files=code_files,
                 tools=resolve_tools(self.tools()),
                 temperature=self.temperature(),
                 skills=skills,

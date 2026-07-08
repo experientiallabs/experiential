@@ -105,6 +105,36 @@ class WorkerConfig:
     key_env: str = ""
 
 
+def worker_config_from_env() -> WorkerConfig:
+    """Build the worker config from the same PI_AGENT_* env knobs PiRuntime reads.
+
+    So `doc.runtime()` under PI_TRANSPORT=link answers the worker LLM the same way the SSH shim
+    does (e.g. PI_AGENT_BACKEND=bedrock + PI_AGENT_MODEL=<Haiku profile>).
+    """
+    return WorkerConfig(
+        backend=os.environ.get("PI_AGENT_BACKEND", "openai"),
+        model=os.environ.get("PI_AGENT_MODEL", ""),
+        region=os.environ.get("PI_AGENT_REGION", os.environ.get("AWS_REGION", "us-east-1")),
+        base_url=os.environ.get("PI_AGENT_BASE_URL", ""),
+        key_env=os.environ.get("PI_AGENT_KEY_ENV", ""),
+    )
+
+
+# The process-wide runner channel doc.runtime(PI_TRANSPORT=link) drives. A search/eval sets it once
+# (its runner connection is process-scoped infra), so create_harness's internal doc.runtime() calls
+# reach the runner without threading a channel through every signature; cleared at teardown.
+_ACTIVE_CHANNEL: Channel | None = None
+
+
+def set_active_channel(channel: Channel | None) -> None:
+    global _ACTIVE_CHANNEL
+    _ACTIVE_CHANNEL = channel
+
+
+def active_channel() -> Channel | None:
+    return _ACTIVE_CHANNEL
+
+
 def worker_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
     """Answer one worker-LLM request, returning a single OpenAI chat.completion object.
 

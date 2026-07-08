@@ -249,6 +249,54 @@ def test_openai_to_bedrock_maps_tools_and_tool_results() -> None:
     assert any("toolResult" in b for b in blocks)
 
 
+def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
+    import os as _os
+
+    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
+    from wmh.harness.runner_link import RunnerLink, set_active_channel
+    from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+
+    class _P:
+        config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+
+        def complete(self, *a, **k) -> object:  # noqa: ANN002, ANN003
+            raise NotImplementedError
+
+        def embed(self, texts) -> list:  # noqa: ANN001
+            return [[0.0] for _ in texts]
+
+        def verify(self) -> object:
+            raise NotImplementedError
+
+    doc = HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+        ],
+    )
+    provider = cast(Provider, _P())
+    prev = _os.environ.get("PI_TRANSPORT")
+    _os.environ["PI_TRANSPORT"] = "link"
+    try:
+        set_active_channel(None)
+        try:
+            doc.runtime(provider)
+            raise AssertionError("expected RuntimeError with no active channel")
+        except RuntimeError as exc:
+            assert "no active runner channel" in str(exc)
+        set_active_channel(_FakeChannel([]))
+        assert isinstance(doc.runtime(provider), RunnerLink)
+    finally:
+        set_active_channel(None)
+        if prev is None:
+            _os.environ.pop("PI_TRANSPORT", None)
+        else:
+            _os.environ["PI_TRANSPORT"] = prev
+
+
 def test_bedrock_to_completion_shape() -> None:
     resp: JsonObject = {
         "output": {
