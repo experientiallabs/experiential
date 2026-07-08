@@ -28,6 +28,7 @@ from environment_capture.hub import (
     fetch_corpus,
     published_corpora,
 )
+from llm_waterfall import is_capacity_error
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -81,7 +82,6 @@ from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
-from wmh.providers.fallback import _is_capacity_error
 from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
 from wmh.scenarios import (
@@ -1351,7 +1351,7 @@ def demo(
                     _NARRATOR.detach()
             break
         except Exception as exc:  # noqa: BLE001 - classified below
-            if not _is_capacity_error(exc) or not _console.is_terminal:
+            if not is_capacity_error(exc) or not _console.is_terminal:
                 raise
             # Retries are exhausted and the backend is still down: offer to re-point the model
             # at a different provider (same picker as the build wizard) and RESUME from the

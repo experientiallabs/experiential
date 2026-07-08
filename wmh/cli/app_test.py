@@ -604,6 +604,7 @@ def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None
     assert worker is judge
     assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"
 
+
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     fetched: list[tuple[str, bool]] = []
 

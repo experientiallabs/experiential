@@ -194,10 +194,15 @@ def test_build_judge_stays_on_the_judge_provider(tmp_path) -> None:  # noqa: ANN
             {"key": "gen_ai.tool.message", "value": {"stringValue": "found u1"}},
         ],
     }
+    # Four copies of the trace under distinct trace ids: the 3-way split (train/val/test) must
+    # leave a non-empty val set, or GEPA never scores a candidate and the judge is never called.
+    lines: list[str] = []
+    for i in range(4):
+        trace_id = f"{i:x}" * 32
+        lines.append(json.dumps({**span_llm, "traceId": trace_id, "spanId": f"s1-{i}"}))
+        lines.append(json.dumps({**span_tool, "traceId": trace_id, "spanId": f"s2-{i}"}))
     traces_file = tmp_path / "traces.jsonl"
-    traces_file.write_text(
-        json.dumps(span_llm) + "\n" + json.dumps(span_tool) + "\n", encoding="utf-8"
-    )
+    traces_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     serve, judge = FakeProvider(), FakeProvider()
     config = HarnessConfig(
         providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],

@@ -88,14 +88,14 @@ class BedrockProvider:
 
             # Bound each request so a stalled connection RAISES instead of blocking forever. Without
             # this, a single hung InvokeModel wedges the whole run (long GEPA/eval jobs never
-            # finish) and a FallbackProvider can't fail over — it only reacts to raised errors.
+            # finish) and a failover chain can't fail over — it only reacts to raised errors.
             # `read_timeout` is generous because reasoning models can generate for a while at up to
             # `max_tokens` (a mid-generation cutoff wastes the whole call and, under a fallback
             # chain, silently substitutes a different model into an eval).
             #
             # `total_max_attempts=1` disables botocore's OWN retries on purpose (it counts the
             # initial request; botocore's `max_attempts` counts retries AFTER it): throttling/5xx/
-            # timeouts should surface IMMEDIATELY to the caller, where FallbackProvider owns retry
+            # timeouts should surface IMMEDIATELY to the caller, where the failover chain owns retry
             # policy (fail over to the next model). Leaving botocore's adaptive retries on would
             # stack 3 internal attempts per model UNDER our 4-model failover — up to 12 backend
             # calls with back-off for one throttled request — turning graceful degradation into a
@@ -161,9 +161,7 @@ class BedrockProvider:
         """
         kwargs: dict[str, JsonValue] = {
             "modelId": self.config.model,
-            "messages": [
-                {"role": m.role, "content": [{"text": m.content}]} for m in messages
-            ],
+            "messages": [{"role": m.role, "content": [{"text": m.content}]} for m in messages],
             "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
         }
         if system:
