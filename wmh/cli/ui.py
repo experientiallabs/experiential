@@ -952,6 +952,20 @@ def models_table(infos: list[ModelInfo]) -> Table:
     return table
 
 
+def providers_credential_table() -> Table:
+    """Offline credential presence for every provider backend (`wmh providers list`)."""
+    table = Table(title="Providers")
+    table.add_column("provider", style="bold")
+    table.add_column("configured")
+    table.add_column("env vars")
+    for kind, env_vars in PROVIDER_ENV_VARS.items():
+        provider = kind.value
+        configured = _has_credentials(provider)
+        mark = "[green]yes[/green]" if configured else "[dim]no[/dim]"
+        table.add_row(provider, mark, ", ".join(env_vars))
+    return table
+
+
 # --- interactive play REPL -----------------------------------------------------------------------
 
 _PLAY_HELP = (
