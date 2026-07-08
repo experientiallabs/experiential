@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Render the judge-overhaul figure (docs/research/judge_overhaul.png), brand system per AGENTS.md.
+"""Render the judge-overhaul figure (.agents/docs/research/judge_overhaul.png), brand system per AGENTS.md.
 
 Three panels from the raw runs in .agents/docs/research/raw/:
   A. Judge-quality meta-eval per case: expected band, baseline score, overhauled score.
@@ -29,7 +29,7 @@ AMBER = "#f5a623"
 RED = "#ee0000"
 
 RAW = Path(".agents/docs/research/raw")
-OUT = Path("docs/research/judge_overhaul.png")
+OUT = Path(".agents/docs/research/judge_overhaul.png")
 
 
 def _style(ax: plt.Axes) -> None:

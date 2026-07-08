@@ -18,7 +18,5 @@ file here must justify its existence in the table below; a doc that can't gets d
 | `README.md` | The manifest that makes the justification rule enforceable. |
 | `research/trace_scaling_law.md` | The repo's first completed scaling-law result and a load-bearing product claim: fidelity saturates at ~10 traces, so the leverage is prompt/optimization, not trace count. Cited by launch material and the benchmark work. |
 | `research/trace_scaling_law.png` | The figure the writeup renders; also the brand-system visual reference cited by AGENTS.md rule 15. |
-| `research/judge_overhaul.md` | Why every fidelity number after the judge overhaul means what it says: the single weighted judge, the meta-eval that makes judge changes provable, the old→new comparability break quantified on identical predictions, and the judge-model sweep behind pinning Opus 4.8. |
-| `research/judge_overhaul.png` | The figure the writeup renders: meta-eval bands before/after, old-vs-new scatter by factuality band, judge-model separation sweep. |
 | `reference/eval_suites.md` | The reproducibility contract every benchmark number in this repo rests on (`examples/<task>/evals/*.toml` + `wmh eval`); commands verified against `main` at promotion. |
 | `reference/failover.md` | The `.wmh/fallback.toml` failover contract: which calls ride the chain (world-model) and which never do (the judge), plus the cross-account ladder format; verified live against both AWS accounts. |
