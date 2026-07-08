@@ -1035,15 +1035,20 @@ def _run_eval_files(
     # incomparable across steps. World-model prediction calls (above) may fail over freely.
     # --judge-model additionally pins the judge to its OWN model: comparing fidelity
     # across serve backends requires a constant grader, or the judge changes with the cell.
-    judge_llm = providers.get_provider(
-        ProviderConfig(
-            kind=ProviderKind(judge_provider),
-            model=judge_model,
-            region=judge_region or region,
+    if judge_model:
+        try:
+            judge_kind = ProviderKind(judge_provider)
+        except ValueError:
+            kinds = ", ".join(k.value for k in ProviderKind)
+            raise typer.BadParameter(
+                f"unknown --judge-provider {judge_provider!r}; choose one of: {kinds}"
+            ) from None
+        judge_config = ProviderConfig(
+            kind=judge_kind, model=judge_model, region=judge_region or region
         )
-        if judge_model
-        else provider_config
-    )
+    else:
+        judge_config = provider_config
+    judge_llm = providers.get_provider(judge_config)
     scorer = RubricJudge(judge_llm) if options.judge == "rubric" else LLMJudge(judge_llm)
     evaluation = OpenLoopEval(
         files,
