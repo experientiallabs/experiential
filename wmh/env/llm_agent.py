@@ -13,18 +13,23 @@ import json
 from pydantic import BaseModel, ValidationError
 
 from wmh.core.parsing import extract_json_object
-from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Step
+from wmh.core.render import render_agent_messages
+from wmh.core.types import Action, ActionKind, EnvState, HarnessContext, JsonObject, Step
 from wmh.env.episode import DONE_SIGNAL
 from wmh.providers.base import Message, Provider
 
-AGENT_SYSTEM = """You are an agent operating in a tool environment to complete a task.
-
-Each turn, respond with ONLY a JSON object, no prose around it — one of:
+# The reply protocol is separate from the persona so a captured harness system prompt can replace
+# the persona while the parseable contract stays intact (`act` parses exactly this shape).
+REPLY_PROTOCOL = """Each turn, respond with ONLY a JSON object, no prose around it — one of:
 {"tool": "<tool name>", "arguments": {...}}         to act,
 {"done": true, "summary": "<what you achieved>"}    when the task is complete or impossible.
 
 Choose tool names and arguments consistent with the environment's responses so far. Work
 efficiently: no redundant calls, finish as soon as the task is done."""
+
+AGENT_SYSTEM = f"""You are an agent operating in a tool environment to complete a task.
+
+{REPLY_PROTOCOL}"""
 
 _MAX_HISTORY_CHARS = 500
 
@@ -39,16 +44,28 @@ class _AgentReply(BaseModel):
 
 
 class LLMAgent:
-    """`Agent`-protocol adapter around a provider: history in, one JSON tool call out."""
+    """`Agent`-protocol adapter around a provider: history in, one JSON tool call out.
 
-    def __init__(self, provider: Provider, *, temperature: float = 0.0) -> None:
+    Pass `harness` (e.g. `world_model.harness`) to run the agent under the system prompt and tool
+    definitions the corpus' real agent had — token-realistic rollouts — with the JSON reply
+    protocol appended so replies stay parseable.
+    """
+
+    def __init__(
+        self,
+        provider: Provider,
+        *,
+        temperature: float = 0.0,
+        harness: HarnessContext | None = None,
+    ) -> None:
         self._provider = provider
         self._temperature = temperature
+        self._system = _agent_system(harness)
 
     def act(self, task: str | None, state: EnvState, history: list[Step]) -> Action:
         prompt = _render_turn(task, state, history)
         completion = self._provider.complete(
-            AGENT_SYSTEM,
+            self._system,
             [Message(role="user", content=prompt)],
             temperature=self._temperature,
             max_tokens=1024,
@@ -66,6 +83,14 @@ class LLMAgent:
         # Unparseable reply: surface it as a message action; the env will answer and the episode
         # continues rather than crashing the batch.
         return Action(kind=ActionKind.MESSAGE, content=completion.text.strip()[:_MAX_HISTORY_CHARS])
+
+
+def _agent_system(harness: HarnessContext | None) -> str:
+    """The captured harness system prompt (+ tools) with the reply protocol, or the baseline."""
+    if harness is None or not harness:
+        return AGENT_SYSTEM
+    realistic, _task = render_agent_messages(harness, "")
+    return f"{realistic}\n\n{REPLY_PROTOCOL}"
 
 
 def _render_turn(task: str | None, state: EnvState, history: list[Step]) -> str:

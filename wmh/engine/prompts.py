@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from wmh.core.render import build_env_prompt as _build_env_prompt
 from wmh.core.render import render_demo
-from wmh.core.types import Action, Session, Step
+from wmh.core.types import Action, HarnessContext, Session, Step
 
 # Layer (a): the env-agnostic base prompt. GEPA (layer b) evolves a specialized version of this.
 # Tuned via replay-fidelity measurement across example traces:
@@ -70,11 +70,13 @@ def build_env_prompt(
     session: Session,
     action: Action,
     demos: list[Step],
+    harness: HarnessContext | None = None,
 ) -> tuple[str, str]:
     """Return (system, user) text for a world-model completion.
 
     Mirrors M_exp(R_t | {(s_i,a_i)}, {d_j}, tau): base+task -> system, history+demos+action -> user.
-    Delegates to the shared renderer, supplying the session's task, state, and history.
+    Delegates to the shared renderer, supplying the session's task, state, and history — plus the
+    agent harness captured with the corpus, when the model has one.
     """
     return _build_env_prompt(
         base_prompt,
@@ -83,6 +85,7 @@ def build_env_prompt(
         action,
         history=session.history,
         demos=demos,
+        harness=harness,
     )
 
 

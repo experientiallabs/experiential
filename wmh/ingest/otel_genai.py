@@ -41,7 +41,17 @@ from pathlib import Path
 import httpx
 from pydantic import BaseModel, Field, JsonValue
 
-from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step, Trace
+from wmh.core.types import (
+    Action,
+    ActionKind,
+    EnvState,
+    HarnessContext,
+    JsonObject,
+    Observation,
+    Step,
+    ToolDefinition,
+    Trace,
+)
 from wmh.ingest.adapter import VendorPull, register_adapter
 
 # `gen_ai.operation.name` values, per the OTel GenAI semantic conventions.
@@ -76,6 +86,14 @@ _TOOL_OUTPUT_KEYS = (
 _STATE_STRUCTURED_KEY = "wmh.state.structured"
 _STATE_SCRATCHPAD_KEY = "wmh.state.scratchpad"
 _TRACE_METADATA_KEY = "wmh.trace.metadata"
+
+# Opt-in semconv attributes carrying the agent-side harness. `gen_ai.system_instructions` is the
+# system prompt the harness assembled (a plain string, or the semconv's array of content parts);
+# `gen_ai.tool.definitions` is the tool list the harness advertised (JSON array of objects with
+# `name` / `description` / `parameters`). The first span carrying each wins, so a capture stamps
+# them once per trace. Together they become `Trace.harness` (see `wmh.core.types.HarnessContext`).
+_SYSTEM_INSTRUCTIONS_KEY = "gen_ai.system_instructions"
+_TOOL_DEFINITIONS_KEY = "gen_ai.tool.definitions"
 
 # Env vars the (placeholder) vendor pull reads. The real query semantics are vendor-specific; see
 # the TODO in `from_vendor`.
@@ -330,6 +348,86 @@ def _state_before(span: _ParsedSpan) -> EnvState:
     )
 
 
+def _decoded_json(value: JsonValue) -> JsonValue:
+    """A JSON-typed attribute value: already-structured values pass through, strings are parsed."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _system_prompt_text(value: JsonValue) -> str:
+    """Decode `gen_ai.system_instructions`: a plain string or an array of content parts.
+
+    Part objects follow the semconv shape `{"type": "text", "content": ...}`; text parts are
+    joined in order with blank lines. A plain string that isn't a JSON array stays as-is.
+    """
+    decoded = _decoded_json(value)
+    if isinstance(decoded, str):
+        return decoded
+    if isinstance(decoded, list):
+        parts: list[str] = []
+        for part in decoded:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                content = part.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+        return "\n\n".join(p for p in parts if p)
+    return ""
+
+
+def _tool_definitions(value: JsonValue) -> list[ToolDefinition]:
+    """Decode `gen_ai.tool.definitions` into `ToolDefinition`s, skipping malformed entries."""
+    decoded = _decoded_json(value)
+    if not isinstance(decoded, list):
+        return []
+    tools: list[ToolDefinition] = []
+    for entry in decoded:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        description = entry.get("description")
+        parameters = entry.get("parameters")
+        tools.append(
+            ToolDefinition(
+                name=name,
+                description=description if isinstance(description, str) else "",
+                parameters=parameters if isinstance(parameters, dict) else {},
+            )
+        )
+    return tools
+
+
+def _trace_harness(spans: list[_ParsedSpan]) -> HarnessContext | None:
+    """The agent-side harness recorded on a trace's spans, or None when absent.
+
+    The first span carrying `gen_ai.system_instructions` supplies the system prompt and the first
+    carrying `gen_ai.tool.definitions` supplies the tools — a capture stamps them once, and an
+    agent's harness doesn't change mid-episode.
+    """
+    system_prompt = ""
+    tools: list[ToolDefinition] = []
+    for span in spans:
+        if not system_prompt:
+            raw = span.attributes.get(_SYSTEM_INSTRUCTIONS_KEY)
+            if raw is not None:
+                system_prompt = _system_prompt_text(raw)
+        if not tools:
+            raw = span.attributes.get(_TOOL_DEFINITIONS_KEY)
+            if raw is not None:
+                tools = _tool_definitions(raw)
+        if system_prompt and tools:
+            break
+    harness = HarnessContext(system_prompt=system_prompt, tools=tools)
+    return harness if harness else None
+
+
 def _trace_metadata(spans: list[_ParsedSpan]) -> JsonObject:
     """First `wmh.trace.metadata` object across a trace's spans (benchmark name, gold, ...)."""
     for span in spans:
@@ -417,6 +515,7 @@ def _spans_to_traces(spans: list[_ParsedSpan], source: str) -> list[Trace]:
             steps=_build_steps(group),
             source=source,
             metadata=_trace_metadata(group),
+            harness=_trace_harness(group),
         )
         ordered.append((group[0].start_nano, trace))
     ordered.sort(key=lambda pair: pair[0])

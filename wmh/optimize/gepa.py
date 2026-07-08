@@ -29,7 +29,15 @@ from pydantic import BaseModel, Field
 
 from wmh.core.parsing import parse_observation
 from wmh.core.render import build_env_prompt, encode_state_action
-from wmh.core.types import Action, EnvState, JsonValue, Observation, Step, Trace
+from wmh.core.types import (
+    Action,
+    EnvState,
+    HarnessContext,
+    JsonValue,
+    Observation,
+    Step,
+    Trace,
+)
 from wmh.optimize.judge import Judge
 from wmh.providers.base import DEFAULT_MAX_TOKENS, Message, Provider
 from wmh.retrieval import Retriever
@@ -85,6 +93,7 @@ def predict_observation(
     action: Action,
     demos: list[Step],
     history: list[Step] | None = None,
+    harness: HarnessContext | None = None,
 ) -> Observation:
     """Predict the observation for (state, action) under `prompt`, using only a Provider.
 
@@ -96,7 +105,9 @@ def predict_observation(
     Rollouts run deterministically: the providers (Opus 4.8 / GPT 5.5) reject sampling params, so no
     temperature is forwarded.
     """
-    system, user = build_env_prompt(prompt, task, state, action, history=history, demos=demos)
+    system, user = build_env_prompt(
+        prompt, task, state, action, history=history, demos=demos, harness=harness
+    )
     completion = provider.complete(
         system, [Message(role="user", content=user)], temperature=0.0, max_tokens=DEFAULT_MAX_TOKENS
     )
@@ -121,6 +132,7 @@ class _EvalStep:
     step: Step
     demos: list[Step]
     history: list[Step]
+    harness: HarnessContext | None = None  # the corpus' agent harness, matching serving
 
 
 @dataclass
@@ -186,6 +198,7 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
                     step.action,
                     demos=item.demos,
                     history=item.history,
+                    harness=item.harness,
                 )
                 result = self._judge.score(predicted, step.observation, step)
                 return predicted, result.score, result.critique
@@ -552,7 +565,12 @@ def _eval_steps(traces: list[Trace], demos: DemoRetriever) -> list[_EvalStep]:
     recorded prefix, which is the context the real environment actually had.
     """
     return [
-        _EvalStep(step=step, demos=demos.demos_for(trace.trace_id, step), history=trace.steps[:i])
+        _EvalStep(
+            step=step,
+            demos=demos.demos_for(trace.trace_id, step),
+            history=trace.steps[:i],
+            harness=trace.harness,
+        )
         for trace in traces
         for i, step in enumerate(trace.steps)
     ]

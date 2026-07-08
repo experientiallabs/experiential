@@ -6,14 +6,15 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from wmh.core.types import EnvState
+from wmh.core.render import render_agent_messages
+from wmh.core.types import EnvState, HarnessContext
 from wmh.env.scenarios import Scenario
 from wmh.scenarios.mining.clustering import TraceCluster
 from wmh.scenarios.mining.facets import Outcome
 
 
 class EvalScenario(BaseModel):
-    """One reusable eval scenario distilled from a real trace."""
+    """One reusable eval scenario: distilled from a real trace, or created from a task."""
 
     scenario_id: str
     task: str  # self-contained task statement handed to the agent
@@ -24,10 +25,24 @@ class EvalScenario(BaseModel):
     weight: float = 0.0  # fraction of the corpus this scenario represents
     source_outcome: Outcome = Outcome.UNKNOWN
     failure_category: str | None = None
+    harness: HarnessContext | None = None  # agent-side system prompt + tools, when captured
 
     def to_scenario(self) -> Scenario:
         """The minimal `Scenario` view consumed by existing rollout code."""
         return Scenario(task=self.task, provenance=list(self.provenance))
+
+    def render_messages(self) -> tuple[str, str]:
+        """The token-realistic (system, user) messages a fresh agent would receive.
+
+        Requires the scenario to carry a harness context; scenarios distilled from corpora whose
+        traces recorded no `gen_ai.system_instructions` have none.
+        """
+        if self.harness is None:
+            raise ValueError(
+                f"scenario {self.scenario_id} has no harness context; build it from a corpus "
+                "whose traces record gen_ai.system_instructions / gen_ai.tool.definitions"
+            )
+        return render_agent_messages(self.harness, self.task)
 
 
 class ScenarioSet(BaseModel):

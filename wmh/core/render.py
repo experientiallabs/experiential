@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 
-from wmh.core.types import Action, EnvState, JsonObject, Step
+from wmh.core.types import Action, EnvState, HarnessContext, JsonObject, Step
 
 
 def render_json(value: JsonObject) -> str:
@@ -64,6 +64,45 @@ def render_demo(step: Step) -> str:
     )
 
 
+def render_harness(harness: HarnessContext) -> str:
+    """Render an agent harness (system prompt + tool definitions) as an evidence block.
+
+    Used inside the env prompt: the world model reads the harness the agent runs under so its
+    predictions honor the real contract — tool argument schemas (what a malformed call's
+    validation error looks like), the tools that exist at all, and the conventions the system
+    prompt establishes.
+    """
+    lines: list[str] = []
+    if harness.system_prompt:
+        lines.append("AGENT SYSTEM PROMPT:")
+        lines.append(harness.system_prompt)
+    if harness.tools:
+        lines.append("TOOLS THE AGENT CAN CALL:")
+        for tool in harness.tools:
+            suffix = f": {tool.description}" if tool.description else ""
+            lines.append(f"- {tool.name}{suffix}")
+            if tool.parameters:
+                lines.append(f"  parameters: {render_json(tool.parameters)}")
+    return "\n".join(lines)
+
+
+def render_agent_messages(harness: HarnessContext, task: str) -> tuple[str, str]:
+    """The (system, user) messages a fresh agent would receive for `task` under `harness`.
+
+    Token-realistic by construction: the system text is the captured system prompt verbatim,
+    followed by the tool definitions serialized as the JSON schemas a harness advertises; the
+    user message is the task exactly as the user would type it. (A real harness passes tools via
+    the API's tools parameter rather than in-text; this is the closest single-text equivalent.)
+    """
+    system = harness.system_prompt
+    if harness.tools:
+        tools_json = json.dumps(
+            [tool.model_dump() for tool in harness.tools], indent=2, sort_keys=True
+        )
+        system = f"{system}\n\n# Tools\n{tools_json}" if system else f"# Tools\n{tools_json}"
+    return system, task
+
+
 def build_env_prompt(
     base_prompt: str,
     task: str | None,
@@ -72,6 +111,7 @@ def build_env_prompt(
     *,
     history: list[Step] | None = None,
     demos: list[Step] | None = None,
+    harness: HarnessContext | None = None,
 ) -> tuple[str, str]:
     """Assemble the (system, user) world-model completion that predicts the next observation.
 
@@ -79,7 +119,8 @@ def build_env_prompt(
     the system message; the task, current state, recent history, retrieved demos, and the incoming
     action form the user message. This is the *single* assembly used by both the serving engine
     (`wmh.engine.prompts`) and the GEPA optimizer, so prompts are evolved against exactly what the
-    world model serves.
+    world model serves. A non-empty `harness` (the agent's captured system prompt + tools) leads
+    the user message: it is evidence about the environment's contract, not instructions.
     """
     system = base_prompt
     demo_block = (
@@ -94,7 +135,14 @@ def build_env_prompt(
         if history
         else "(start of session)"
     )
+    harness_block = (
+        f"AGENT HARNESS (the system prompt and tools the agent operates under):\n"
+        f"{render_harness(harness)}\n\n"
+        if harness
+        else ""
+    )
     user = (
+        f"{harness_block}"
         f"TASK:\n{task or '(none)'}\n\n"
         f"INTERACTION HISTORY:\n{history_block}\n\n"
         f"SIMILAR PAST EXAMPLES:\n{demo_block}\n\n"

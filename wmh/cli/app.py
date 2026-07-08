@@ -63,7 +63,7 @@ from wmh.config import (
     validate_name,
 )
 from wmh.engine.build import build as run_build
-from wmh.engine.build import ingest
+from wmh.engine.build import ingest, modal_harness
 from wmh.engine.demo import run_demo
 from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.engine.eval_suites import (
@@ -88,6 +88,7 @@ from wmh.scenarios import (
     ScenarioBuildConfig,
     ScenarioSet,
     build_scenario_set,
+    scenario_from_task,
     verify_scenarios,
 )
 from wmh.serving.server import create_app
@@ -640,9 +641,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     """
     args = tokens or []
     suite_roots = (
-        [str(root) for root in _benchmark_roots()]
-        if examples_root is None
-        else [examples_root]
+        [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
     )
     if args and args[0] == "list":
         if len(args) != 1:
@@ -1060,7 +1059,9 @@ def scenarios_verify(
         scenario_set,
         traces,
         world_model,
-        LLMAgent(agent_llm),
+        # The baseline agent rolls under the corpus' captured harness when there is one, so
+        # solvability is judged on token-realistic rollouts.
+        LLMAgent(agent_llm, harness=world_model.harness),
         ChecklistJudge(judge_llm),
         max_steps=max_steps,
     )
@@ -1093,6 +1094,114 @@ def scenarios_verify(
             f"kept {len(scenario_set.scenarios)} verified scenarios "
             f"(weights renormalized, coverage reset) -> {scenarios_file}"
         )
+
+
+# Corpus steps handed to `scenario_from_task` as grounding (seed-state facts, checklist realism).
+_CREATE_EXAMPLE_STEPS = 8
+
+
+@scenarios_app.command("create")
+def scenarios_create(
+    task: str = typer.Option(
+        None, "--task", help="Task description — becomes the agent's user message, verbatim."
+    ),
+    task_file: str = typer.Option(
+        None, "--task-file", help="Read the task description from a file instead."
+    ),
+    name: str = typer.Option(
+        None, "--name", help="World model whose captured harness + corpus ground the scenario."
+    ),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    file: str = typer.Option(
+        None, "--file", help="Take the harness from a trace corpus instead of a built model."
+    ),
+    out: str = typer.Option(
+        "scenario.json", "--out", help="Where to write the (one-scenario) scenario set."
+    ),
+    provider: str = typer.Option(
+        None,
+        "--provider",
+        help="LLM for seed-state/checklist synthesis (default: settings worker role).",
+    ),
+    model: str = typer.Option(None, help="Model id for synthesis (with --provider)."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+) -> None:
+    """Create a token-realistic eval scenario from a task description alone.
+
+    The scenario reproduces what running the task under the corpus' real agent harness looks
+    like: the captured system prompt and tool definitions, the task as the verbatim user message,
+    and the corpus' modal structured seed state. An LLM synthesizes only the parts it is good at
+    — plausible initial-state facts and a judgeable checklist — grounded in real corpus steps.
+    Step it with `wmh play --task ...` or grade a rollout with `wmh scenarios verify`.
+    """
+    task_text = _task_text(task, task_file)
+    _summary_llm, worker_llm, _judge_llm = _scenario_role_llms(provider, model, region)
+    if file is not None:
+        traces = get_adapter("otel-genai").from_file(file)
+        harness = modal_harness(traces)
+        examples = [step for trace in traces for step in trace.steps][:_CREATE_EXAMPLE_STEPS]
+        source = file
+    else:
+        wm, resolved_name, _provider_, _model_root = _load_model_any(name, root)
+        harness = wm.harness
+        examples = wm.sample_steps(_CREATE_EXAMPLE_STEPS)
+        source = resolved_name
+    if harness is None:
+        raise typer.BadParameter(
+            f"{source} has no captured agent harness — its traces record no "
+            "gen_ai.system_instructions / gen_ai.tool.definitions attributes. Re-capture the "
+            "corpus with those attributes (and rebuild), or point --file at a corpus that has "
+            "them; without the real system prompt a token-realistic scenario can't be assembled."
+        )
+
+    scenario = scenario_from_task(task_text, harness, worker_llm, examples=examples)
+    scenario_set = ScenarioSet(scenarios=[scenario])
+    scenario_set.save(out)
+
+    system_msg, user_msg = scenario.render_messages()
+    _console.print(
+        Panel(
+            escape(system_msg),
+            title="[dim]system message — the harness the agent runs under[/dim]",
+            border_style="bright_black",
+        )
+    )
+    _console.print(
+        Panel(
+            escape(user_msg),
+            title="[dim]user message — the task, verbatim[/dim]",
+            border_style="bright_black",
+        )
+    )
+    if scenario.seed_state.structured or scenario.seed_state.scratchpad:
+        _console.print(
+            f"seed state: [cyan]{escape(json.dumps(scenario.seed_state.structured))}[/cyan] "
+            f"[dim]{escape(scenario.seed_state.scratchpad)}[/dim]"
+        )
+    for item in scenario.checklist:
+        _console.print(f"  {_CHECK} {escape(item)}")
+    _console.print(f"scenario [bold]{scenario.scenario_id}[/bold] -> {out}")
+    _console.print(
+        '[dim]next: `wmh play --name <model> --task "…"` steps it against the world model '
+        "turn by turn; `wmh scenarios verify` grades a baseline-agent rollout.[/dim]"
+    )
+
+
+def _task_text(task: str | None, task_file: str | None) -> str:
+    """The task description from exactly one of --task / --task-file, stripped and non-empty."""
+    if (task is None) == (task_file is None):
+        raise typer.BadParameter("pass exactly one of --task or --task-file")
+    if task is not None:
+        text = task.strip()
+    else:
+        assert task_file is not None  # the xor guard above leaves exactly this branch
+        path = Path(task_file)
+        if not path.exists():
+            raise typer.BadParameter(f"--task-file {task_file} does not exist")
+        text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise typer.BadParameter("the task description is empty")
+    return text
 
 
 def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
@@ -1314,10 +1423,22 @@ def _first_prompt(wm: WorldModel, trace) -> str:  # noqa: ANN001 - core Trace
 def play(
     name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
+    task_file: str = typer.Option(
+        None, "--task-file", help="Read the task from a file (alternative to --task)."
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
 ) -> None:
     """Step into the environment yourself: type actions, the world model returns observations."""
+    if task_file is not None:
+        if task is not None:
+            raise typer.BadParameter("pass --task or --task-file, not both")
+        task = _task_text(None, task_file)
     wm, resolved_name, _provider, _model_root = _load_model_any(name, root)
+    if wm.harness is not None:
+        _console.print(
+            f"[dim]harness captured with this model: system prompt + "
+            f"{len(wm.harness.tools)} tool definitions ride along in every env prompt[/dim]"
+        )
     suggestions = _action_suggestions(wm)
     run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
 

@@ -155,9 +155,97 @@ def test_traces_without_wmh_attributes_keep_empty_state_and_metadata() -> None:
     traces = OtelGenAIAdapter().from_file(str(_TESTDATA / "sample_otlp.json"))
 
     assert traces[0].metadata == {}
+    assert traces[0].harness is None  # no harness attributes -> no harness context
     for step in traces[0].steps:
         assert step.state_before.structured == {}
         assert step.state_before.scratchpad == ""
+
+
+def test_harness_attributes_populate_trace_harness(tmp_path: Path) -> None:
+    # A span carrying the agent's system instructions + tool definitions (semconv opt-in attrs)
+    # yields a Trace.harness with the system prompt and tool schemas preserved verbatim.
+    tools = [
+        {
+            "type": "function",
+            "name": "bash",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+        {"type": "function", "name": "submit"},
+    ]
+    span = {
+        "traceId": "eeee",
+        "spanId": "01",
+        "name": "chat",
+        "startTimeUnixNano": 1,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.prompt", "value": {"stringValue": "build an app"}},
+            {"key": "gen_ai.completion", "value": {"stringValue": "on it"}},
+            {
+                "key": "gen_ai.system_instructions",
+                "value": {"stringValue": "You are a coding agent inside pi."},
+            },
+            {"key": "gen_ai.tool.definitions", "value": {"stringValue": json.dumps(tools)}},
+        ],
+    }
+    path = tmp_path / "harness.jsonl"
+    path.write_text(json.dumps(span) + "\n", encoding="utf-8")
+
+    traces = OtelGenAIAdapter().from_file(str(path))
+
+    assert len(traces) == 1
+    harness = traces[0].harness
+    assert harness is not None
+    assert harness.system_prompt == "You are a coding agent inside pi."
+    assert [t.name for t in harness.tools] == ["bash", "submit"]
+    assert harness.tools[0].description == "Run a shell command"
+    assert harness.tools[0].parameters["required"] == ["command"]
+    assert harness.tools[1].parameters == {}
+
+
+def test_system_instructions_parts_array_is_joined(tmp_path: Path) -> None:
+    # The semconv also allows an array of content parts; text parts are joined in order.
+    parts = [
+        {"type": "text", "content": "You are a coding agent."},
+        {"type": "text", "content": "Be concise."},
+    ]
+    span = {
+        "traceId": "ffff",
+        "spanId": "01",
+        "name": "chat",
+        "startTimeUnixNano": 1,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.completion", "value": {"stringValue": "ok"}},
+            {"key": "gen_ai.system_instructions", "value": {"stringValue": json.dumps(parts)}},
+        ],
+    }
+    path = tmp_path / "parts.jsonl"
+    path.write_text(json.dumps(span) + "\n", encoding="utf-8")
+
+    traces = OtelGenAIAdapter().from_file(str(path))
+
+    assert traces[0].harness is not None
+    assert traces[0].harness.system_prompt == "You are a coding agent.\n\nBe concise."
+
+
+def test_committed_pi_swe_corpus_carries_the_harness() -> None:
+    """The pi-swe example exists to demonstrate harness capture; every trace must carry it."""
+    traces = OtelGenAIAdapter().from_file(str(_EXAMPLES / "pi-swe" / "traces.otel.jsonl"))
+
+    assert len(traces) == 4
+    for trace in traces:
+        assert trace.harness is not None
+        assert "operating inside pi" in trace.harness.system_prompt
+        assert [t.name for t in trace.harness.tools] == ["read", "bash", "edit", "write"]
+        assert all(t.parameters for t in trace.harness.tools)  # real JSON schemas, not stubs
+        assert trace.steps
+        assert trace.steps[0].state_before.structured == {"cwd": "/workspace", "harness": "pi"}
 
 
 def test_committed_tau2_corpus_satisfies_the_replay_contract() -> None:

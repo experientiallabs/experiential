@@ -24,7 +24,12 @@ from wmh.scenarios.mining import (
     tool_signature,
     trace_digest,
 )
-from wmh.scenarios.synthesis import EvalScenario, ScenarioSet, ScenarioSynthesizer
+from wmh.scenarios.synthesis import (
+    EvalScenario,
+    ScenarioSet,
+    ScenarioSynthesizer,
+    scenario_from_task,
+)
 from wmh.scenarios.verification import (
     ChecklistJudge,
     ChecklistResult,
@@ -51,6 +56,7 @@ __all__ = [
     "cluster_facets",
     "hybrid_select",
     "name_clusters",
+    "scenario_from_task",
     "semdedup_keep",
     "tool_signature",
     "trace_digest",

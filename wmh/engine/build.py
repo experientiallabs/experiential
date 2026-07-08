@@ -10,7 +10,7 @@ import hashlib
 import json
 
 from wmh.config import ArtifactPaths, HarnessConfig, save_config
-from wmh.core.types import Trace
+from wmh.core.types import HarnessContext, Trace
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.reporting import BuildReporter, NullReporter
 from wmh.ingest import VendorPull, get_adapter
@@ -34,6 +34,24 @@ def ingest(
     if vendor is not None:
         return adapter.from_vendor(vendor)
     raise ValueError("ingest needs either a file path or a vendor pull")
+
+
+def modal_harness(traces: list[Trace]) -> HarnessContext | None:
+    """The most common harness context across `traces`, or None when none recorded one.
+
+    A corpus normally comes from one agent, so one context dominates; taking the mode keeps a few
+    stray traces (a different agent version, a foreign trace mixed in) from hijacking the artifact.
+    """
+    counts: dict[str, tuple[int, HarnessContext]] = {}
+    for trace in traces:
+        if trace.harness is None or not trace.harness:
+            continue
+        key = trace.harness.model_dump_json()
+        seen, harness = counts.get(key, (0, trace.harness))
+        counts[key] = (seen + 1, harness)
+    if not counts:
+        return None
+    return max(counts.values(), key=lambda pair: pair[0])[1]
 
 
 def _trace_fraction(trace: Trace) -> float:
@@ -175,7 +193,7 @@ def build(
         result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used
     )
 
-    _persist(paths, config, retriever, result)
+    _persist(paths, config, retriever, result, modal_harness(traces))
     return result
 
 
@@ -205,12 +223,15 @@ def _persist(
     config: HarnessConfig,
     retriever: EmbeddingRetriever,
     result: OptimizeResult,
+    harness: HarnessContext | None,
 ) -> None:
-    """Write config, prompts, frontier, metrics, and the retrieval index under `.wmh/`."""
+    """Write config, prompts, frontier, metrics, harness, and the retrieval index under `.wmh/`."""
     save_config(config, paths.root)
     paths.base_prompt.parent.mkdir(parents=True, exist_ok=True)
     paths.base_prompt.write_text(BASE_ENV_PROMPT, encoding="utf-8")
     paths.optimized_prompt.write_text(result.prompt, encoding="utf-8")
     paths.frontier.write_text(json.dumps(result.frontier, indent=2), encoding="utf-8")
     paths.metrics.write_text(result.metrics.model_dump_json(indent=2), encoding="utf-8")
+    if harness is not None:
+        paths.harness.write_text(harness.model_dump_json(indent=2), encoding="utf-8")
     retriever.save(paths.index)

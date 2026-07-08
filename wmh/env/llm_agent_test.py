@@ -12,6 +12,7 @@ class FakeProvider:
     def __init__(self, reply: str) -> None:
         self.config = ProviderConfig(kind=ProviderKind.ANTHROPIC, model="m")
         self._reply = reply
+        self.last_system: str | None = None
         self.last_user: str | None = None
 
     def complete(
@@ -22,6 +23,7 @@ class FakeProvider:
         temperature: float = 0.7,
         max_tokens: int = 8192,
     ) -> Completion:
+        self.last_system = system
         self.last_user = messages[0].content
         return Completion(text=self._reply)
 
@@ -52,6 +54,27 @@ def test_agent_surfaces_garbage_as_message() -> None:
     action = agent.act("find x", EnvState(), [])
     assert action.kind is ActionKind.MESSAGE
     assert action.content == "I think I should search first"
+
+
+def test_agent_with_harness_runs_under_the_real_system_prompt() -> None:
+    from wmh.core.types import HarnessContext, ToolDefinition
+
+    provider = FakeProvider('{"done": true}')
+    harness = HarnessContext(
+        system_prompt="You are an expert coding assistant operating inside pi.",
+        tools=[ToolDefinition(name="bash", description="Run a shell command")],
+    )
+    LLMAgent(provider, harness=harness).act("build x", EnvState(), [])
+    system = provider.last_system or ""
+    # The captured system prompt leads; the JSON reply protocol still follows so parsing works.
+    assert system.startswith("You are an expert coding assistant operating inside pi.")
+    assert '"bash"' in system
+    assert '{"tool": "<tool name>", "arguments": {...}}' in system
+
+    # Without a harness the baseline system prompt is unchanged.
+    bare = FakeProvider('{"done": true}')
+    LLMAgent(bare).act("build x", EnvState(), [])
+    assert (bare.last_system or "").startswith("You are an agent operating in a tool environment")
 
 
 def test_agent_prompt_includes_task_state_and_history() -> None:

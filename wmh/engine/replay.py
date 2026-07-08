@@ -101,14 +101,14 @@ def replay(
     rng = random.Random(seed)
     # Materialize the (step, history) work list first — selection uses `rng` and must stay
     # sequential/deterministic; scoring each item is independent and order is restored below.
-    work: list[tuple[str, Step, list[Step]]] = []
+    work: list[tuple[Trace, Step, list[Step]]] = []
     for trace in held_out:
         for step_index in _select_step_indices(trace, sample_turns, rng):
-            work.append((trace.trace_id, trace.steps[step_index], trace.steps[:step_index]))
+            work.append((trace, trace.steps[step_index], trace.steps[:step_index]))
 
-    def _score(item: tuple[str, Step, list[Step]]) -> StepResult:
-        trace_id, step, history = item
-        return _score_step(prompt, trace_id, step, provider, judge, demos, history)
+    def _score(item: tuple[Trace, Step, list[Step]]) -> StepResult:
+        trace, step, history = item
+        return _score_step(prompt, trace, step, provider, judge, demos, history)
 
     if concurrency > 1 and len(work) > 1:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -130,7 +130,7 @@ def _select_step_indices(trace: Trace, sample_turns: str, rng: random.Random) ->
 
 def _score_step(
     prompt: str,
-    trace_id: str,
+    trace: Trace,
     step: Step,
     provider: Provider,
     judge: Judge,
@@ -144,12 +144,13 @@ def _score_step(
         step.task,
         step.state_before,
         step.action,
-        demos=demos.demos_for(trace_id, step),
+        demos=demos.demos_for(trace.trace_id, step),
         history=history,
+        harness=trace.harness,
     )
     verdict = judge.score(predicted, step.observation, step)
     return StepResult(
-        trace_id=trace_id,
+        trace_id=trace.trace_id,
         task=step.task,
         action=render_action(step.action),
         actual=step.observation.content,

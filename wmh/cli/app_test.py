@@ -40,6 +40,11 @@ class FakeProvider:
             return Completion(text="IMPROVED ENV PROMPT")
         if "grade a world model" in system:
             return Completion(text='{"score": 0.5, "critique": "be more specific"}')
+        if "prepare an evaluation scenario" in system:
+            return Completion(
+                text='{"initial_state": "An empty /workspace with python3 available.", '
+                '"checklist": ["A runnable app exists"]}'
+            )
         return Completion(text='{"output": "user u1 found", "is_error": false}')
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -75,6 +80,51 @@ def _traces_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture path
         ],
     }
     path = tmp_path / "traces.jsonl"
+    path.write_text(json.dumps(span_llm) + "\n" + json.dumps(span_tool) + "\n", encoding="utf-8")
+    return str(path)
+
+
+_PI_SYSTEM_PROMPT = "You are an expert coding assistant operating inside pi."
+
+
+def _harness_traces_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture path
+    """A corpus whose spans record the agent harness (system prompt + tool definitions)."""
+    tools = [
+        {
+            "name": "bash",
+            "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        }
+    ]
+    span_llm = {
+        "traceId": "c" * 32,
+        "spanId": "s1",
+        "name": "chat",
+        "startTimeUnixNano": 1,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.tool.name", "value": {"stringValue": "bash"}},
+            {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": '{"command": "ls"}'}},
+            {"key": "gen_ai.prompt", "value": {"stringValue": "make me a website"}},
+            {"key": "gen_ai.system_instructions", "value": {"stringValue": _PI_SYSTEM_PROMPT}},
+            {"key": "gen_ai.tool.definitions", "value": {"stringValue": json.dumps(tools)}},
+            {
+                "key": "wmh.state.structured",
+                "value": {"stringValue": '{"cwd": "/workspace", "harness": "pi"}'},
+            },
+        ],
+    }
+    span_tool = {
+        "traceId": "c" * 32,
+        "spanId": "s2",
+        "name": "execute_tool",
+        "startTimeUnixNano": 2,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+            {"key": "gen_ai.tool.message", "value": {"stringValue": "README.md"}},
+        ],
+    }
+    path = tmp_path / "harness_traces.jsonl"
     path.write_text(json.dumps(span_llm) + "\n" + json.dumps(span_tool) + "\n", encoding="utf-8")
     return str(path)
 
@@ -413,6 +463,144 @@ def test_play_repl_steps_and_quits(patched_provider, tmp_path) -> None:  # noqa:
     assert "user u1 found" in result.output
 
 
+def test_play_reads_the_task_from_a_file(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    _build(root, "default", tmp_path)
+    task_file = tmp_path / "task.txt"
+    task_file.write_text("build a python airbnb clone\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["play", "--root", str(root), "--task-file", str(task_file)],
+        input='get_user {"id": "u1"}\n:quit\n',
+    )
+    assert result.exit_code == 0, result.output
+    assert "user u1 found" in result.output
+
+    both = runner.invoke(
+        app,
+        ["play", "--root", str(root), "--task", "x", "--task-file", str(task_file)],
+    )
+    assert both.exit_code != 0
+    assert "not both" in both.output
+
+
+def _build_pi(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture paths
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            name,
+            "--file",
+            _harness_traces_file(tmp_path),
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+            "--gepa-budget",
+            "4",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_scenarios_create_writes_a_token_realistic_scenario(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture
+) -> None:
+    from wmh.scenarios import ScenarioSet
+
+    root = tmp_path / ".wmh"
+    _build_pi(root, "pi-swe", tmp_path)
+    out = tmp_path / "scenario.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "scenarios",
+            "create",
+            "--task",
+            "build a python airbnb clone",
+            "--name",
+            "pi-swe",
+            "--root",
+            str(root),
+            "--out",
+            str(out),
+            "--provider",
+            "bedrock",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    [scenario] = ScenarioSet.load(out).scenarios
+    assert scenario.task == "build a python airbnb clone"  # the user message, verbatim
+    assert scenario.harness is not None
+    assert scenario.harness.system_prompt == _PI_SYSTEM_PROMPT
+    assert [t.name for t in scenario.harness.tools] == ["bash"]
+    assert scenario.seed_state.structured == {"cwd": "/workspace", "harness": "pi"}
+    assert scenario.checklist == ["A runnable app exists"]
+    # The command shows the exact messages the agent would receive.
+    assert _PI_SYSTEM_PROMPT in result.output
+    assert "build a python airbnb clone" in result.output
+
+
+def test_scenarios_create_from_a_trace_corpus_directly(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture
+) -> None:
+    from wmh.scenarios import ScenarioSet
+
+    out = tmp_path / "scenario.json"
+    result = runner.invoke(
+        app,
+        [
+            "scenarios",
+            "create",
+            "--task",
+            "build a python airbnb clone",
+            "--file",
+            _harness_traces_file(tmp_path),
+            "--out",
+            str(out),
+            "--provider",
+            "bedrock",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    [scenario] = ScenarioSet.load(out).scenarios
+    assert scenario.harness is not None
+    assert scenario.harness.system_prompt == _PI_SYSTEM_PROMPT
+
+
+def test_scenarios_create_without_a_captured_harness_is_a_clean_error(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "scenarios",
+            "create",
+            "--task",
+            "build x",
+            "--file",
+            _traces_file(tmp_path),  # bare-semconv corpus: no harness attributes
+            "--provider",
+            "bedrock",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "gen_ai.system_instructions" in result.output
+
+
+def test_scenarios_create_requires_exactly_one_task_source(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["scenarios", "create", "--file", _traces_file(tmp_path)])
+    assert result.exit_code != 0
+    assert "--task" in result.output
+
+
 def test_build_interactive_wizard_creates_model(
     patched_provider,  # noqa: ANN001 - pytest fixture
     tmp_path,  # noqa: ANN001 - pytest fixture
@@ -572,6 +760,7 @@ def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None
     assert summary is worker
     assert worker is judge
     assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"
+
 
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     fetched: list[tuple[str, bool]] = []

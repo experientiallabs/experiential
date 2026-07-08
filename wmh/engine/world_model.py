@@ -15,7 +15,7 @@ from pathlib import Path
 
 from wmh.config import ArtifactPaths, load_config
 from wmh.core.parsing import parse_observation
-from wmh.core.types import Action, EnvState, Observation, Session, Step
+from wmh.core.types import Action, EnvState, HarnessContext, Observation, Session, Step
 from wmh.engine.prompts import BASE_ENV_PROMPT, build_env_prompt
 from wmh.optimize.reward import EpisodeRewardJudge, EpisodeScore
 from wmh.providers.base import Embedder, Message, Provider
@@ -34,11 +34,15 @@ class WorldModel:
         top_k: int = 5,
         telemetry_root: str | Path = ".wmh",
         reward_provider: Provider | None = None,
+        harness: HarnessContext | None = None,
     ) -> None:
         self._provider = provider
         self._retriever = retriever
         self._env_prompt = env_prompt
         self._top_k = top_k
+        # The agent-side harness captured with the corpus (system prompt + tool definitions).
+        # Included in every env prompt so predictions honor the real harness contract.
+        self._harness = harness
         self._telemetry_root = Path(telemetry_root)
         self._sessions: dict[str, Session] = {}
         # Per-session token/cost/time accounting (serve-time observability). One tracker per
@@ -81,6 +85,11 @@ class WorldModel:
         retriever = EmbeddingRetriever(embedder or get_embedder(config))
         if paths.index.exists():
             retriever.load(paths.index)
+        harness = (
+            HarnessContext.model_validate_json(paths.harness.read_text(encoding="utf-8"))
+            if paths.harness.exists()
+            else None
+        )
         return cls(
             provider,
             retriever,
@@ -88,7 +97,13 @@ class WorldModel:
             top_k=config.top_k,
             telemetry_root=telemetry_root or _default_telemetry_root(artifact_dir),
             reward_provider=reward_provider,
+            harness=harness,
         )
+
+    @property
+    def harness(self) -> HarnessContext | None:
+        """The agent harness the corpus was captured under, when the traces recorded one."""
+        return self._harness
 
     def new_session(self, task: str | None = None, seed_state: EnvState | None = None) -> Session:
         session = Session(id=uuid.uuid4().hex, task=task, state=seed_state or EnvState())
@@ -181,7 +196,7 @@ class WorldModel:
         """
         session = self._sessions[session_id]
         demos = self._retriever.topk(session.state, action, self._top_k)
-        system, user = build_env_prompt(self._env_prompt, session, action, demos)
+        system, user = build_env_prompt(self._env_prompt, session, action, demos, self._harness)
         return f"{system}\n\n=== USER ===\n{user}"
 
     def step(self, session_id: str, action: Action) -> Observation:
@@ -193,7 +208,7 @@ class WorldModel:
         demos = self._retriever.topk(session.state, action, self._top_k)
 
         # (2) assemble the env prompt and (3) predict the observation
-        system, user = build_env_prompt(self._env_prompt, session, action, demos)
+        system, user = build_env_prompt(self._env_prompt, session, action, demos, self._harness)
         try:
             completion = self._provider.complete(system, [_user_message(user)])
         except Exception:

@@ -63,6 +63,32 @@ class Step(BaseModel):
     raw_span_ids: list[str] = Field(default_factory=list)
 
 
+class ToolDefinition(BaseModel):
+    """One tool the agent's harness exposes: its name, description, and JSON-schema parameters."""
+
+    name: str
+    description: str = ""
+    parameters: JsonObject = Field(default_factory=dict)
+
+
+class HarnessContext(BaseModel):
+    """The agent-side harness captured from traces: the system prompt and the tool definitions.
+
+    This is what the original agent actually ran under — the system prompt its harness assembled
+    and the tool schemas it advertised. Carrying it through ingest -> build -> serve lets the
+    world model condition its predictions on the real harness contract (tool argument schemas,
+    validation errors, output formats), and lets a scenario render the token-realistic messages
+    a fresh agent would receive for a new task.
+    """
+
+    system_prompt: str = ""
+    tools: list[ToolDefinition] = Field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        """Empty contexts are falsy, so callers can gate sections on `if harness:`."""
+        return bool(self.system_prompt or self.tools)
+
+
 class Trace(BaseModel):
     """One full agent session: an ordered list of steps, plus provenance."""
 
@@ -70,6 +96,7 @@ class Trace(BaseModel):
     steps: list[Step] = Field(default_factory=list)
     source: str = "unknown"  # vendor name or file path
     metadata: JsonObject = Field(default_factory=dict)
+    harness: HarnessContext | None = None  # agent-side system prompt + tools, when captured
 
 
 class Session(BaseModel):

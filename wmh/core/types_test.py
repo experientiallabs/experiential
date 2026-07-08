@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from wmh.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
+from wmh.core.types import (
+    Action,
+    ActionKind,
+    EnvState,
+    HarnessContext,
+    Observation,
+    Session,
+    Step,
+    ToolDefinition,
+    Trace,
+)
 
 
 def test_types_instantiate() -> None:
@@ -13,3 +23,27 @@ def test_types_instantiate() -> None:
     session = Session(id="s1", task="poke around")
     assert trace.steps[0].action.name == "cd"
     assert session.history == []
+    assert trace.harness is None  # bare traces carry no harness context
+
+
+def test_harness_context_holds_system_prompt_and_tools() -> None:
+    harness = HarnessContext(
+        system_prompt="You are a coding agent.",
+        tools=[
+            ToolDefinition(
+                name="bash",
+                description="Run a shell command",
+                parameters={"type": "object", "properties": {"command": {"type": "string"}}},
+            )
+        ],
+    )
+    trace = Trace(trace_id="t1", harness=harness)
+    assert trace.harness is not None
+    assert trace.harness.tools[0].name == "bash"
+    assert not HarnessContext()  # empty context is falsy, so callers can gate on it
+
+
+def test_harness_context_truthiness() -> None:
+    assert HarnessContext(system_prompt="x")
+    assert HarnessContext(tools=[ToolDefinition(name="bash")])
+    assert not HarnessContext(system_prompt="", tools=[])

@@ -6,10 +6,20 @@ from wmh.core.render import (
     build_env_prompt,
     encode_state_action,
     render_action,
+    render_agent_messages,
     render_demo,
+    render_harness,
     render_json,
 )
-from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
+from wmh.core.types import (
+    Action,
+    ActionKind,
+    EnvState,
+    HarnessContext,
+    Observation,
+    Step,
+    ToolDefinition,
+)
 
 
 def test_render_json_is_order_independent() -> None:
@@ -70,3 +80,55 @@ def test_build_env_prompt_handles_empty_optional_blocks() -> None:
     assert "(no similar past examples)" in user
     assert "(start of session)" in user
     assert "scratchpad: (empty)" in user
+    assert "AGENT HARNESS" not in user  # no harness given -> no harness section
+
+
+_HARNESS = HarnessContext(
+    system_prompt="You are an expert coding assistant operating inside pi.",
+    tools=[
+        ToolDefinition(
+            name="bash",
+            description="Run a shell command",
+            parameters={"type": "object", "properties": {"command": {"type": "string"}}},
+        ),
+        ToolDefinition(name="submit"),
+    ],
+)
+
+
+def test_render_harness_lists_system_prompt_and_tools() -> None:
+    text = render_harness(_HARNESS)
+    assert "You are an expert coding assistant operating inside pi." in text
+    assert "bash" in text and "Run a shell command" in text
+    assert '"command"' in text  # tool parameter schemas are preserved verbatim
+    assert "submit" in text
+
+
+def test_build_env_prompt_includes_harness_section() -> None:
+    system, user = build_env_prompt(
+        "BASE",
+        "build an app",
+        EnvState(),
+        Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "ls"}),
+        harness=_HARNESS,
+    )
+    assert system == "BASE"  # harness context is evidence, not instructions
+    assert "AGENT HARNESS" in user
+    assert user.index("AGENT HARNESS") < user.index("TASK:")
+    assert "operating inside pi" in user
+    # An empty harness renders nothing.
+    _, bare = build_env_prompt(
+        "BASE",
+        "t",
+        EnvState(),
+        Action(kind=ActionKind.MESSAGE, content="hi"),
+        harness=HarnessContext(),
+    )
+    assert "AGENT HARNESS" not in bare
+
+
+def test_render_agent_messages_is_verbatim() -> None:
+    system, user = render_agent_messages(_HARNESS, "build a python airbnb clone")
+    assert system.startswith("You are an expert coding assistant operating inside pi.")
+    assert '"name": "bash"' in system or '"name":"bash"' in system
+    assert user == "build a python airbnb clone"  # the user message is the task, untouched

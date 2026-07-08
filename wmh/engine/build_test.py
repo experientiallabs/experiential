@@ -161,3 +161,90 @@ def test_build_writes_a_loadable_artifact(tmp_path) -> None:  # noqa: ANN001 - p
 
     wm = WorldModel.load(str(root), FakeProvider())
     assert wm.sample_steps(5)
+    # A bare-semconv corpus has no harness context: nothing persisted, nothing loaded.
+    assert not paths.harness.exists()
+    assert wm.harness is None
+
+
+def test_build_persists_the_corpus_harness_and_load_serves_it(tmp_path) -> None:  # noqa: ANN001
+    tools = [{"name": "bash", "description": "Run a command", "parameters": {"type": "object"}}]
+    span_llm = {
+        "traceId": "b" * 32,
+        "spanId": "s1",
+        "name": "chat",
+        "startTimeUnixNano": 1,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.tool.name", "value": {"stringValue": "bash"}},
+            {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": '{"command": "ls"}'}},
+            {"key": "gen_ai.prompt", "value": {"stringValue": "list files"}},
+            {
+                "key": "gen_ai.system_instructions",
+                "value": {"stringValue": "You are a coding agent inside pi."},
+            },
+            {"key": "gen_ai.tool.definitions", "value": {"stringValue": json.dumps(tools)}},
+        ],
+    }
+    span_tool = {
+        "traceId": "b" * 32,
+        "spanId": "s2",
+        "name": "execute_tool",
+        "startTimeUnixNano": 2,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+            {"key": "gen_ai.tool.message", "value": {"stringValue": "README.md"}},
+        ],
+    }
+    traces_file = tmp_path / "traces.jsonl"
+    traces_file.write_text(
+        json.dumps(span_llm) + "\n" + json.dumps(span_tool) + "\n", encoding="utf-8"
+    )
+
+    root = tmp_path / ".wmh"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=4,
+        train_split=0.5,
+    )
+    build(
+        config,
+        file=str(traces_file),
+        root=str(root),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+
+    paths = ArtifactPaths(root)
+    assert paths.harness.exists()
+
+    from wmh.engine.world_model import WorldModel
+
+    wm = WorldModel.load(str(root), FakeProvider())
+    assert wm.harness is not None
+    assert wm.harness.system_prompt == "You are a coding agent inside pi."
+    assert [t.name for t in wm.harness.tools] == ["bash"]
+    # The served env prompt carries the harness, so predictions honor the real contract.
+    session = wm.new_session(task="list files")
+    prompt = wm.render_step_prompt(
+        session.id, Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "ls"})
+    )
+    assert "AGENT HARNESS" in prompt
+    assert "You are a coding agent inside pi." in prompt
+
+
+def test_modal_harness_picks_the_most_common_context() -> None:
+    from wmh.core.types import HarnessContext, ToolDefinition
+    from wmh.engine.build import modal_harness
+
+    pi = HarnessContext(system_prompt="pi", tools=[ToolDefinition(name="bash")])
+    other = HarnessContext(system_prompt="other")
+    traces = [
+        Trace(trace_id="t1", harness=pi),
+        Trace(trace_id="t2", harness=pi),
+        Trace(trace_id="t3", harness=other),
+        Trace(trace_id="t4"),  # no harness recorded
+    ]
+    assert modal_harness(traces) == pi
+    assert modal_harness([Trace(trace_id="t5")]) is None

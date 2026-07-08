@@ -156,6 +156,11 @@ class ArtifactPaths:
     def metrics(self) -> Path:
         return self.root / "metrics.json"
 
+    @property
+    def harness(self) -> Path:
+        """The corpus' agent-side harness (system prompt + tools), when the traces recorded one."""
+        return self.root / "harness.json"
+
 
 def _strip_none(value: JsonValue) -> JsonValue:
     """Drop `None`-valued keys recursively so TOML (which has no null) can represent the config.
