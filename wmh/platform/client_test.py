@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 import pytest
@@ -57,43 +58,109 @@ def test_401_error_suggests_logging_in() -> None:
         client.whoami()
 
 
-def test_push_model_bundle_sends_multipart_file_and_meta() -> None:
+def test_push_model_bundle_runs_ticket_put_finalize(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "tau-bench.tar.gz"
+    bundle_path.write_bytes(b"bundle-bytes")
+    digest = hashlib.sha256(b"bundle-bytes").hexdigest()
     seen: dict[str, object] = {}
+    finalize_body: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["content_type"] = request.headers["content-type"]
-        seen["body"] = request.read()
+        if request.url.path.endswith("/bundle/uploads"):
+            return httpx.Response(
+                201,
+                json={
+                    "upload_url": "https://storage.test/upload/staging/cli/abc.tar.gz?token=t",
+                    "token": "t",
+                    "staging_path": "staging/cli/abc.tar.gz",
+                },
+            )
+        if request.url.host == "storage.test":
+            seen["put_body"] = request.read()
+            seen["put_method"] = request.method
+            return httpx.Response(200, json={"Key": "abc"})
+        finalize_body.update(json.loads(request.read()))
         return httpx.Response(201, json={"id": "wm-1", "name": "tau-bench", "status": "ready"})
 
     with _client(handler) as client:
         pushed = client.push_model_bundle(
-            "proj-1", "tau-bench", b"bundle-bytes", {"serve_provider": "anthropic"}
+            "proj-1",
+            "tau-bench",
+            bundle_path,
+            digest,
+            len(b"bundle-bytes"),
+            {"serve_provider": "anthropic"},
         )
 
     assert pushed.status == "ready"
-    assert "multipart/form-data" in str(seen["content_type"])
-    body = seen["body"]
-    assert isinstance(body, bytes)
-    assert b"bundle-bytes" in body
-    assert b'"serve_provider": "anthropic"' in body
+    assert seen["put_method"] == "PUT"
+    assert seen["put_body"] == b"bundle-bytes"
+    assert finalize_body["staging_path"] == "staging/cli/abc.tar.gz"
+    assert finalize_body["sha256"] == digest
+    assert finalize_body["meta"] == {"serve_provider": "anthropic"}
 
 
-def test_download_model_bundle_verifies_declared_digest() -> None:
-    content = b"bundle-bytes"
+def test_push_model_bundle_surfaces_storage_upload_failure(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "tau-bench.tar.gz"
+    bundle_path.write_bytes(b"bundle-bytes")
 
-    def good(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/bundle/uploads"):
+            return httpx.Response(
+                201,
+                json={
+                    "upload_url": "https://storage.test/upload/x?token=t",
+                    "token": "t",
+                    "staging_path": "staging/cli/x.tar.gz",
+                },
+            )
+        return httpx.Response(413, text="Payload too large")
+
+    with (
+        _client(handler) as client,
+        pytest.raises(PlatformError, match="upload to storage failed"),
+    ):
+        client.push_model_bundle("proj-1", "tau-bench", bundle_path, "0" * 64, 12, {})
+
+
+def _download_handler(
+    content: bytes, declared_sha256: str
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "storage.test":
+            return httpx.Response(200, content=content)
         return httpx.Response(
-            200, content=content, headers={"X-Bundle-Sha256": hashlib.sha256(content).hexdigest()}
+            200,
+            json={
+                "url": "https://storage.test/signed/bundle.tar.gz?token=t",
+                "sha256": declared_sha256,
+                "byte_size": len(content),
+                "artifact_id": "artifact-1",
+                "expires_in": 600,
+            },
         )
 
-    with _client(good) as client:
-        assert client.download_model_bundle("proj-1", "tau-bench") == content
+    return handler
 
-    def corrupted(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=content, headers={"X-Bundle-Sha256": "0" * 64})
 
-    with _client(corrupted) as client, pytest.raises(PlatformError, match="digest mismatch"):
-        client.download_model_bundle("proj-1", "tau-bench")
+def test_download_model_bundle_streams_and_verifies_digest(tmp_path: Path) -> None:
+    content = b"bundle-bytes"
+    dest = tmp_path / "tau-bench.tar.gz"
+
+    handler = _download_handler(content, hashlib.sha256(content).hexdigest())
+    with _client(handler) as client:
+        digest = client.download_model_bundle("proj-1", "tau-bench", dest)
+
+    assert dest.read_bytes() == content
+    assert digest == hashlib.sha256(content).hexdigest()
+
+
+def test_download_model_bundle_rejects_digest_mismatch(tmp_path: Path) -> None:
+    dest = tmp_path / "tau-bench.tar.gz"
+    handler = _download_handler(b"bundle-bytes", "0" * 64)
+    with _client(handler) as client, pytest.raises(PlatformError, match="digest mismatch"):
+        client.download_model_bundle("proj-1", "tau-bench", dest)
+    assert not dest.exists()
 
 
 def test_harness_round_trip_payloads() -> None:

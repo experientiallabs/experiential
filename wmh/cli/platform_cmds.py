@@ -9,6 +9,7 @@ exists locally (or remotely, for pulls).
 from __future__ import annotations
 
 import socket
+import tempfile
 import webbrowser
 from pathlib import Path
 from typing import Annotated
@@ -258,16 +259,24 @@ def _detect_remote_kind(client: PlatformClient, project_id: str, name: str) -> s
 
 
 def _push_model(client: PlatformClient, project_id: str, remote_name: str, model_dir: Path) -> None:
-    bundle = pack_model_dir(model_dir)
     meta = extract_push_meta(model_dir)
-    try:
-        pushed = client.push_model_bundle(project_id, remote_name, bundle.content, meta)
-    except PlatformError as error:
-        if error.status_code == 422 and "name" in str(error):
-            raise typer.BadParameter(
-                f"{error} — publish under a slug-safe name with --as"
-            ) from error
-        raise
+    with tempfile.TemporaryDirectory(prefix="wmh-push-") as staging:
+        bundle = pack_model_dir(model_dir, Path(staging) / f"{remote_name}.tar.gz")
+        try:
+            pushed = client.push_model_bundle(
+                project_id,
+                remote_name,
+                bundle.path,
+                bundle.sha256,
+                bundle.byte_size,
+                meta,
+            )
+        except PlatformError as error:
+            if error.status_code == 422 and "name" in str(error):
+                raise typer.BadParameter(
+                    f"{error} — publish under a slug-safe name with --as"
+                ) from error
+            raise
     _console.print(
         f"{_CHECK} Pushed world model [bold]{pushed.name}[/bold] "
         f"({bundle.byte_size:,} bytes, sha256 {bundle.sha256[:12]}…)"
@@ -302,12 +311,14 @@ def _push_harness(
 def _pull_model(
     client: PlatformClient, project_id: str, name: str, root: str, *, force: bool
 ) -> None:
-    content = client.download_model_bundle(project_id, name)
     dest_dir = WorldModelStore(root).model_dir(name)
-    try:
-        unpack_model_bundle(content, dest_dir, force=force)
-    except FileExistsError as error:
-        raise typer.BadParameter(str(error)) from error
+    with tempfile.TemporaryDirectory(prefix="wmh-pull-") as staging:
+        bundle_path = Path(staging) / f"{name}.tar.gz"
+        client.download_model_bundle(project_id, name, bundle_path)
+        try:
+            unpack_model_bundle(bundle_path, dest_dir, force=force)
+        except FileExistsError as error:
+            raise typer.BadParameter(str(error)) from error
     _console.print(f"{_CHECK} Pulled world model [bold]{name}[/bold] into {dest_dir}")
 
 

@@ -6,12 +6,15 @@ archive-relative member paths. Packing is an include-list — the model's
 `config.toml`, `metrics.json`, `card.json`, `prompts/`, and `index/` — so
 local `runs/` cost records and raw `traces/` (customer data) never leave the
 machine.
+
+Bundles can reach the platform's 1GB cap, so packing and unpacking are
+file-based: bytes stream between disk and the network without ever being held
+in memory whole.
 """
 
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import shutil
 import tarfile
@@ -27,11 +30,13 @@ from wmh.core.types import JsonValue
 _INCLUDED_FILES = ("config.toml", "metrics.json", "card.json")
 _INCLUDED_DIRS = ("prompts", "index")
 
+_HASH_CHUNK_BYTES = 1024 * 1024
+
 
 class PackedModelBundle(BaseModel):
-    """A packed model directory ready for upload."""
+    """A packed model bundle on disk, ready for upload."""
 
-    content: bytes
+    path: Path
     sha256: str
     byte_size: int
 
@@ -40,14 +45,24 @@ class BundleFormatError(ValueError):
     """The directory or bytes are not a valid world-model bundle."""
 
 
-def pack_model_dir(directory: Path) -> PackedModelBundle:
-    """Pack a model directory into the platform's bundle format.
+def sha256_file(path: Path) -> str:
+    """Digest a file's contents without loading it whole."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(_HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pack_model_dir(directory: Path, dest: Path) -> PackedModelBundle:
+    """Pack a model directory into the platform's bundle format at ``dest``.
 
     Args:
         directory: A built model directory (must contain `config.toml`).
+        dest: Where to write the gzipped tarball (parent must exist).
 
     Returns:
-        Bundle bytes plus integrity metadata; member order is sorted so
+        The bundle file plus integrity metadata; member order is sorted so
         identical inputs produce identical archives.
 
     Raises:
@@ -71,48 +86,45 @@ def pack_model_dir(directory: Path) -> PackedModelBundle:
             members.extend(sorted(path for path in root.rglob("*")))
             members.append(root)
 
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+    with tarfile.open(dest, mode="w:gz") as tar:
         for path in sorted(set(members)):
             tar.add(path, arcname=str(path.relative_to(directory)), recursive=False)
-    content = buffer.getvalue()
     return PackedModelBundle(
-        content=content,
-        sha256=hashlib.sha256(content).hexdigest(),
-        byte_size=len(content),
+        path=dest,
+        sha256=sha256_file(dest),
+        byte_size=dest.stat().st_size,
     )
 
 
-def unpack_model_bundle(content: bytes, dest_dir: Path, *, force: bool = False) -> None:
-    """Unpack pulled bundle bytes into a local model directory.
+def unpack_model_bundle(source: Path, dest_dir: Path, *, force: bool = False) -> None:
+    """Unpack a pulled bundle file into a local model directory.
 
     Extraction happens in a temporary sibling renamed into place, so a crashed
     unpack never leaves a half-written model that later loads as real.
 
     Args:
-        content: gzipped tarball bytes from the platform.
+        source: Downloaded gzipped tarball.
         dest_dir: Target model directory (`.wmh/models/<name>`).
         force: Replace an existing directory instead of refusing.
 
     Raises:
-        BundleFormatError: If the bytes are not a readable bundle or a member
+        BundleFormatError: If the file is not a readable bundle or a member
             would escape the destination.
         FileExistsError: If ``dest_dir`` exists and ``force`` is not set.
     """
-    if dest_dir.exists():
-        if not force:
-            msg = f"{dest_dir} already exists; pass --force to replace it"
-            raise FileExistsError(msg)
+    if dest_dir.exists() and not force:
+        msg = f"{dest_dir} already exists; pass --force to replace it"
+        raise FileExistsError(msg)
     staging_dir = dest_dir.with_name(f"{dest_dir.name}.pull-{uuid.uuid4().hex}")
     staging_dir.mkdir(parents=True)
     try:
-        with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as tar:
+        with tarfile.open(source, mode="r:gz") as tar:
             # The "data" filter rejects absolute paths, traversal, and special
             # members instead of writing them.
             tar.extractall(staging_dir, filter="data")
     except (tarfile.TarError, OSError) as error:
         shutil.rmtree(staging_dir, ignore_errors=True)
-        msg = f"bundle bytes could not be unpacked: {error}"
+        msg = f"bundle could not be unpacked: {error}"
         raise BundleFormatError(msg) from error
     if dest_dir.exists():
         shutil.rmtree(dest_dir, ignore_errors=True)

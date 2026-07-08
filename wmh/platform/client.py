@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from importlib import metadata
+from pathlib import Path
 
 import httpx
 from pydantic import BaseModel
@@ -143,6 +144,13 @@ class PlatformClient:
             timeout=_TIMEOUT_SECONDS,
             transport=transport,
         )
+        # Bundle bytes move directly against storage's signed URLs; that
+        # client carries no platform credential.
+        self._transfer = httpx.Client(
+            headers={"User-Agent": f"wmh/{version}"},
+            timeout=_TIMEOUT_SECONDS,
+            transport=transport,
+        )
 
     def __enter__(self) -> PlatformClient:
         return self
@@ -152,6 +160,7 @@ class PlatformClient:
 
     def close(self) -> None:
         self._client.close()
+        self._transfer.close()
 
     # -- identity ------------------------------------------------------------------------------
 
@@ -172,28 +181,84 @@ class PlatformClient:
         self,
         project_id: str,
         name: str,
-        content: bytes,
+        bundle_path: Path,
+        sha256: str,
+        byte_size: int,
         meta: dict[str, JsonValue],
     ) -> RemoteWorldModel:
-        response = self._client.post(
-            f"/api/projects/{project_id}/world-models/{name}/bundle",
-            files={"file": (f"{name}.tar.gz", content, "application/gzip")},
-            data={"meta": json.dumps(meta)},
-        )
-        self._raise_for_error(response)
-        return RemoteWorldModel.model_validate(response.json())
+        """Push a packed bundle file: ticket, direct PUT to storage, finalize.
 
-    def download_model_bundle(self, project_id: str, name: str) -> bytes:
-        """Fetch a model's bundle bytes, verifying the declared digest."""
+        The bundle bytes stream from disk straight to the signed staging URL;
+        only the finalize declaration (digest + size + serve metadata) goes
+        through the API.
+        """
+        ticket_response = self._client.post(
+            f"/api/projects/{project_id}/world-models/{name}/bundle/uploads"
+        )
+        self._raise_for_error(ticket_response)
+        ticket = ticket_response.json()
+        upload_url = str(ticket["upload_url"])
+        with bundle_path.open("rb") as fh:
+            upload_response = self._transfer.put(
+                upload_url,
+                content=fh,
+                headers={
+                    "Content-Type": "application/gzip",
+                    "x-upsert": "false",
+                    "Authorization": f"Bearer {ticket.get('token', '')}",
+                },
+            )
+        if not upload_response.is_success:
+            msg = (
+                f"bundle upload to storage failed with HTTP {upload_response.status_code}: "
+                f"{upload_response.text[:200]}"
+            )
+            raise PlatformError(msg, status_code=upload_response.status_code)
+
+        finalize = self._client.post(
+            f"/api/projects/{project_id}/world-models/{name}/bundle",
+            json={
+                "staging_path": ticket["staging_path"],
+                "sha256": sha256,
+                "byte_size": byte_size,
+                "meta": meta,
+            },
+        )
+        self._raise_for_error(finalize)
+        return RemoteWorldModel.model_validate(finalize.json())
+
+    def download_model_bundle(self, project_id: str, name: str, dest: Path) -> str:
+        """Stream a model's bundle from storage to ``dest``, verifying its digest.
+
+        The API hands back an expiring signed URL plus the recorded sha256;
+        the bytes come straight from storage's CDN and are hashed as they
+        stream to disk.
+
+        Returns:
+            The verified sha256 hex digest.
+        """
         response = self._client.get(f"/api/projects/{project_id}/world-models/{name}/bundle")
         self._raise_for_error(response)
-        content = response.content
-        declared = response.headers.get("X-Bundle-Sha256")
-        actual = hashlib.sha256(content).hexdigest()
-        if declared is not None and declared != actual:
+        payload = response.json()
+        declared = str(payload["sha256"])
+
+        digest = hashlib.sha256()
+        part_path = dest.with_name(f"{dest.name}.part")
+        with self._transfer.stream("GET", str(payload["url"])) as stream:
+            if not stream.is_success:
+                msg = f"bundle download failed with HTTP {stream.status_code}"
+                raise PlatformError(msg, status_code=stream.status_code)
+            with part_path.open("wb") as fh:
+                for chunk in stream.iter_bytes():
+                    digest.update(chunk)
+                    fh.write(chunk)
+        actual = digest.hexdigest()
+        if actual != declared:
+            part_path.unlink(missing_ok=True)
             msg = f"bundle digest mismatch for {name}: expected {declared}, got {actual}"
             raise PlatformError(msg)
-        return content
+        part_path.replace(dest)
+        return actual
 
     # -- harnesses -----------------------------------------------------------------------------
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import tarfile
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from wmh.platform.transfer import (
     BundleFormatError,
     extract_push_meta,
     pack_model_dir,
+    sha256_file,
     unpack_model_bundle,
 )
 
@@ -32,9 +32,9 @@ def _model_dir(tmp_path: Path) -> Path:
 
 
 def test_pack_includes_model_files_and_excludes_runs_and_traces(tmp_path: Path) -> None:
-    bundle = pack_model_dir(_model_dir(tmp_path))
+    bundle = pack_model_dir(_model_dir(tmp_path), tmp_path / "out.tar.gz")
 
-    with tarfile.open(fileobj=io.BytesIO(bundle.content), mode="r:gz") as tar:
+    with tarfile.open(bundle.path, mode="r:gz") as tar:
         names = set(tar.getnames())
 
     assert "config.toml" in names
@@ -42,7 +42,8 @@ def test_pack_includes_model_files_and_excludes_runs_and_traces(tmp_path: Path) 
     assert "prompts/base.txt" in names
     assert "index/steps.jsonl" in names
     assert not any(name.startswith(("runs", "traces")) for name in names)
-    assert bundle.byte_size == len(bundle.content)
+    assert bundle.byte_size == bundle.path.stat().st_size
+    assert bundle.sha256 == sha256_file(bundle.path)
 
 
 def test_pack_requires_config_toml(tmp_path: Path) -> None:
@@ -50,28 +51,30 @@ def test_pack_requires_config_toml(tmp_path: Path) -> None:
     directory.mkdir()
 
     with pytest.raises(BundleFormatError, match="config.toml"):
-        pack_model_dir(directory)
+        pack_model_dir(directory, tmp_path / "out.tar.gz")
     with pytest.raises(BundleFormatError, match="does not exist"):
-        pack_model_dir(tmp_path / "absent")
+        pack_model_dir(tmp_path / "absent", tmp_path / "out.tar.gz")
 
 
 def test_round_trip_and_force_semantics(tmp_path: Path) -> None:
-    bundle = pack_model_dir(_model_dir(tmp_path))
+    bundle = pack_model_dir(_model_dir(tmp_path), tmp_path / "out.tar.gz")
     dest = tmp_path / "pulled" / "tau-bench"
 
-    unpack_model_bundle(bundle.content, dest)
+    unpack_model_bundle(bundle.path, dest)
     assert (dest / "config.toml").read_text(encoding="utf-8") == "embed_dim = 64\n"
     assert (dest / "prompts" / "base.txt").is_file()
 
     with pytest.raises(FileExistsError, match="--force"):
-        unpack_model_bundle(bundle.content, dest)
-    unpack_model_bundle(bundle.content, dest, force=True)
+        unpack_model_bundle(bundle.path, dest)
+    unpack_model_bundle(bundle.path, dest, force=True)
     assert (dest / "config.toml").is_file()
 
 
 def test_unpack_rejects_garbage_bytes(tmp_path: Path) -> None:
+    garbage = tmp_path / "garbage.tar.gz"
+    garbage.write_bytes(b"not a tarball")
     with pytest.raises(BundleFormatError, match="unpacked"):
-        unpack_model_bundle(b"not a tarball", tmp_path / "dest")
+        unpack_model_bundle(garbage, tmp_path / "dest")
     assert not (tmp_path / "dest").exists()
 
 
