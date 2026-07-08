@@ -1,7 +1,7 @@
 # kimi-gui-control GUI-control trace corpus
 
 This directory converts a **screenpipe `gui-control` agent** trace dump into the world-model-harness
-trace corpus (`examples/kimi-gui-control/traces.otel.jsonl`).
+trace corpus (`.agents/docs/research/benchmark-grid/corpus/kimi-gui-control/traces.otel.jsonl`).
 
 The dataset is a set of agent trajectories that drive macOS GUI apps (Safari, Chrome, Notes, Finder,
 Calculator, …) through the macOS Accessibility API plus a shell, produced by **Kimi-K2.6 via
@@ -39,6 +39,6 @@ The committed corpus is limited to ~60 trajectories (enough for the 30 train / 8
 benchmark split):
 
 ```bash
-cd examples/kimi-gui-control
+cd .agents/docs/research/benchmark-grid/corpus/kimi-gui-control
 python convert_to_wmh.py /path/to/traces_kimi_k26_1000.jsonl --out traces.otel.jsonl --limit 60
 ```
