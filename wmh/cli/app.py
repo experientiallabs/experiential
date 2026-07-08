@@ -62,6 +62,7 @@ from wmh.config import (
     settings_path,
     validate_name,
 )
+from wmh.core.types import HarnessSource
 from wmh.engine.build import build as run_build
 from wmh.engine.build import ingest, modal_harness
 from wmh.engine.demo import run_demo
@@ -88,6 +89,7 @@ from wmh.scenarios import (
     ScenarioBuildConfig,
     ScenarioSet,
     build_scenario_set,
+    infer_harness,
     scenario_from_task,
     verify_scenarios,
 )
@@ -1098,6 +1100,10 @@ def scenarios_verify(
 
 # Corpus steps handed to `scenario_from_task` as grounding (seed-state facts, checklist realism).
 _CREATE_EXAMPLE_STEPS = 8
+# Corpus steps mined as evidence when the harness must be predicted (tool inventory, argument
+# shapes, validation errors). Deterministic prefix of the buffer; generous because sparse
+# corpora reveal their contract slowly (a validation error may appear once in hundreds of steps).
+_INFER_EVIDENCE_STEPS = 400
 
 
 @scenarios_app.command("create")
@@ -1128,41 +1134,70 @@ def scenarios_create(
 ) -> None:
     """Create a token-realistic eval scenario from a task description alone.
 
-    The scenario reproduces what running the task under the corpus' real agent harness looks
-    like: the captured system prompt and tool definitions, the task as the verbatim user message,
-    and the corpus' modal structured seed state. An LLM synthesizes only the parts it is good at
-    — plausible initial-state facts and a judgeable checklist — grounded in real corpus steps.
-    Step it with `wmh play --task ...` or grade a rollout with `wmh scenarios verify`.
+    The scenario reproduces what running the task under the corpus' agent harness looks like:
+    the system prompt and tool definitions (captured verbatim from traces when recorded;
+    otherwise predicted from the corpus' observed behavior), the task as the verbatim user
+    message, and the corpus' modal structured seed state. An LLM synthesizes only the parts it
+    is good at — plausible initial-state facts and a judgeable checklist — grounded in real
+    corpus steps. Step it with `wmh play --task ...` or grade with `wmh scenarios verify`.
     """
     task_text = _task_text(task, task_file)
     _summary_llm, worker_llm, _judge_llm = _scenario_role_llms(provider, model, region)
+    model_dir: Path | None = None
     if file is not None:
         traces = get_adapter("otel-genai").from_file(file)
+        if not traces:
+            raise typer.BadParameter(f"no traces ingested from {file}")
         harness = modal_harness(traces)
-        examples = [step for trace in traces for step in trace.steps][:_CREATE_EXAMPLE_STEPS]
+        all_steps = [step for trace in traces for step in trace.steps]
+        examples = all_steps[:_CREATE_EXAMPLE_STEPS]
+        evidence = all_steps[:_INFER_EVIDENCE_STEPS]
         source = file
     else:
-        wm, resolved_name, _provider_, _model_root = _load_model_any(name, root)
+        wm, resolved_name, _provider_, model_root = _load_model_any(name, root)
+        model_dir = WorldModelStore(str(model_root)).resolve(resolved_name)
         harness = wm.harness
         examples = wm.sample_steps(_CREATE_EXAMPLE_STEPS)
+        evidence = wm.sample_steps(_INFER_EVIDENCE_STEPS)
         source = resolved_name
     if harness is None:
-        raise typer.BadParameter(
-            f"{source} has no captured agent harness — its traces record no "
-            "gen_ai.system_instructions / gen_ai.tool.definitions attributes. Re-capture the "
-            "corpus with those attributes (and rebuild), or point --file at a corpus that has "
-            "them; without the real system prompt a token-realistic scenario can't be assembled."
+        # Sparse-corpus path: no gen_ai.system_instructions / gen_ai.tool.definitions recorded.
+        # Predict the harness from what the traces leak (tool inventory, argument shapes,
+        # validation errors); a re-capture that records the real attributes replaces it.
+        if not evidence:
+            raise typer.BadParameter(
+                f"{source} has no captured harness and no steps to predict one from; "
+                "ingest a corpus with recorded transitions first"
+            )
+        _console.print(
+            f"[yellow]no captured harness in {source}[/yellow] — predicting it from "
+            f"{len(evidence)} corpus steps…"
         )
+        harness = infer_harness(evidence, worker_llm)
+        if model_dir is not None:
+            ArtifactPaths(model_dir).harness.write_text(
+                harness.model_dump_json(indent=2), encoding="utf-8"
+            )
+            _console.print(
+                "[dim]predicted harness saved to the model artifact (harness.json, "
+                "source=inferred) — play/serve/verify now use it; a rebuild from traces that "
+                "capture the real one replaces it[/dim]"
+            )
 
     scenario = scenario_from_task(task_text, harness, worker_llm, examples=examples)
     scenario_set = ScenarioSet(scenarios=[scenario])
     scenario_set.save(out)
 
+    harness_label = (
+        "the harness the agent runs under"
+        if harness.source is HarnessSource.CAPTURED
+        else "predicted harness (no capture in the traces)"
+    )
     system_msg, user_msg = scenario.render_messages()
     _console.print(
         Panel(
             escape(system_msg),
-            title="[dim]system message — the harness the agent runs under[/dim]",
+            title=f"[dim]system message — {harness_label}[/dim]",
             border_style="bright_black",
         )
     )

@@ -127,6 +127,14 @@ def test_build_env_prompt_includes_harness_section() -> None:
     assert "AGENT HARNESS" not in bare
 
 
+def test_render_harness_labels_inferred_contexts() -> None:
+    from wmh.core.types import HarnessSource
+
+    inferred = _HARNESS.model_copy(update={"source": HarnessSource.INFERRED})
+    assert "reconstructed from the corpus' observed behavior" in render_harness(inferred)
+    assert "reconstructed" not in render_harness(_HARNESS)  # captured stays unlabeled
+
+
 def test_render_agent_messages_is_verbatim() -> None:
     system, user = render_agent_messages(_HARNESS, "build a python airbnb clone")
     assert system.startswith("You are an expert coding assistant operating inside pi.")

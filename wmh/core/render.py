@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 
-from wmh.core.types import Action, EnvState, HarnessContext, JsonObject, Step
+from wmh.core.types import Action, EnvState, HarnessContext, HarnessSource, JsonObject, Step
 
 
 def render_json(value: JsonObject) -> str:
@@ -73,6 +73,11 @@ def render_harness(harness: HarnessContext) -> str:
     prompt establishes.
     """
     lines: list[str] = []
+    if harness.source is HarnessSource.INFERRED:
+        lines.append(
+            "(reconstructed from the corpus' observed behavior — approximate, not a verbatim "
+            "capture)"
+        )
     if harness.system_prompt:
         lines.append("AGENT SYSTEM PROMPT:")
         lines.append(harness.system_prompt)

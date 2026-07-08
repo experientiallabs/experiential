@@ -28,6 +28,7 @@ from wmh.scenarios.synthesis import (
     EvalScenario,
     ScenarioSet,
     ScenarioSynthesizer,
+    infer_harness,
     scenario_from_task,
 )
 from wmh.scenarios.verification import (
@@ -55,6 +56,7 @@ __all__ = [
     "build_scenario_set",
     "cluster_facets",
     "hybrid_select",
+    "infer_harness",
     "name_clusters",
     "scenario_from_task",
     "semdedup_keep",

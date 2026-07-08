@@ -160,9 +160,7 @@ class BedrockProvider:
         """
         kwargs: dict[str, JsonValue] = {
             "modelId": self.config.model,
-            "messages": [
-                {"role": m.role, "content": [{"text": m.content}]} for m in messages
-            ],
+            "messages": [{"role": m.role, "content": [{"text": m.content}]} for m in messages],
             "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
         }
         if system:

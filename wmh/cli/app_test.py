@@ -45,6 +45,13 @@ class FakeProvider:
                 text='{"initial_state": "An empty /workspace with python3 available.", '
                 '"checklist": ["A runnable app exists"]}'
             )
+        if "reconstruct an AI agent's harness" in system:
+            return Completion(
+                text='{"system_prompt": "You are a support agent with a get_user tool.", '
+                '"tools": [{"name": "get_user", "description": "Look up a user", '
+                '"parameters": {"type": "object", "properties": {"id": {"type": "string"}}, '
+                '"required": ["id"]}}]}'
+            )
         return Completion(text='{"output": "user u1 found", "is_error": false}')
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -574,25 +581,70 @@ def test_scenarios_create_from_a_trace_corpus_directly(
     assert scenario.harness.system_prompt == _PI_SYSTEM_PROMPT
 
 
-def test_scenarios_create_without_a_captured_harness_is_a_clean_error(
+def test_scenarios_create_predicts_the_harness_when_none_was_captured(
     patched_provider,  # noqa: ANN001 - pytest fixture
     tmp_path,  # noqa: ANN001 - pytest fixture
 ) -> None:
+    from wmh.core.types import HarnessSource
+    from wmh.scenarios import ScenarioSet
+
+    out = tmp_path / "scenario.json"
     result = runner.invoke(
         app,
         [
             "scenarios",
             "create",
             "--task",
-            "build x",
+            "find user u1's account",
             "--file",
             _traces_file(tmp_path),  # bare-semconv corpus: no harness attributes
+            "--out",
+            str(out),
             "--provider",
             "bedrock",
         ],
     )
-    assert result.exit_code != 0
-    assert "gen_ai.system_instructions" in result.output
+    assert result.exit_code == 0, result.output
+    assert "predicting it from" in result.output
+    assert "predicted harness" in result.output
+
+    [scenario] = ScenarioSet.load(out).scenarios
+    assert scenario.harness is not None
+    assert scenario.harness.source is HarnessSource.INFERRED
+    assert [t.name for t in scenario.harness.tools] == ["get_user"]  # observed tool only
+    assert scenario.task == "find user u1's account"
+
+
+def test_scenarios_create_persists_the_predicted_harness_into_the_model(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture
+) -> None:
+    root = tmp_path / ".wmh"
+    _build(root, "bare", tmp_path)  # built from the bare-semconv corpus: no harness.json
+    harness_path = root / "models" / "bare" / "harness.json"
+    assert not harness_path.exists()
+
+    result = runner.invoke(
+        app,
+        [
+            "scenarios",
+            "create",
+            "--task",
+            "find user u1's account",
+            "--name",
+            "bare",
+            "--root",
+            str(root),
+            "--out",
+            str(tmp_path / "scenario.json"),
+            "--provider",
+            "bedrock",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # The prediction is cached in the artifact so play/serve/verify pick it up on next load.
+    assert harness_path.exists()
+    assert '"inferred"' in harness_path.read_text(encoding="utf-8")
 
 
 def test_scenarios_create_requires_exactly_one_task_source(tmp_path) -> None:  # noqa: ANN001
