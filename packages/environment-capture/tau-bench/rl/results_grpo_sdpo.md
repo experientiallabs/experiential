@@ -1,0 +1,115 @@
+# GRPO + SDPO vs the tau world model (BENCH-B3)
+
+*Fold into `results.md` when PR #73 (SFT/PPO/R++ rows) merges — same protocol, same base row.*
+
+## Protocol
+
+Pinned shared eval (DECISIONS.md D30/D33): all 20 test-split scenarios
+(`scenarios_eval.jsonl`) × 2 episodes = 40 episodes/checkpoint; policy temperature 1.0,
+max_steps 20, max_tokens 6000; env = pinned **GPT-5.5**-backed WM; reward judge =
+**Opus 4.8** (Bedrock, cross-geo waterfall — same dated model in every link); success =
+episode-end judge. Judge cost reported separately from WM serve cost (D12). Policy:
+Qwen3.5-9B; training env = **Haiku 4.5**-backed WM (different family from the eval WM —
+the strongest circularity blunting available; caveat stated regardless).
+
+## Rows (success rate, n=40 unless noted)
+
+| arm | overall | airline (n=14) | retail (n=16) | telecom (n=10) | wandb |
+|---|---|---|---|---|---|
+| base (B2 v3) | 0.550 | 0.286 | 0.500 | 1.000 | wm_tau-eval-base-v3 |
+| SFT / PPO / R++ (B2) | ~flat vs base | | | | PR #73 |
+| SDPO n=1, smoke ckpt (20 scen × 1 epoch) | 0.575 | **0.714** | 0.375 | 0.700 | b3-eval-sdpo-n1-ckpt |
+| **GRPO, smoke ckpt (20 scen × 1 epoch)** | **0.650** | 0.429 | 0.625 | 1.000 | b3-eval-grpo-ckpt-final3 |
+| GRPO, scale ckpt @48 scen (~107 steps) | 0.525 | 0.429 | 0.312 | 1.000 | b3-eval-grpo-scale48-ckpt |
+| **SDPO n=8 (sibling demos), smoke ckpt** | **0.650** | 0.500 | 0.562 | 1.000 | chain-wm_tau_sdpo_n8 |
+
+Mean rewards track success closely (base 0.568, SDPO-n1 0.573, GRPO 0.649).
+
+## Findings
+
+1. **GRPO is the first arm that moves, and it moves cleanly**: +10.0 pts overall from a
+   one-epoch, 20-scenario smoke — +14.3 airline, +12.5 retail, telecom held at ceiling.
+   SFT/PPO/REINFORCE++ were flat at comparable scale. GRPO is exactly the method the
+   CLaaS paper had to exclude (single-rollout online learning cannot form groups); the
+   world model's cheap counterfactual rollouts (n=8 per scenario, ~$0.06/episode on the
+   Haiku WM) are what re-enable it. This is the headline claim, and the evidence so far
+   supports it at smoke scale.
+2. **SDPO with WM sibling demonstrations (n=8) ties GRPO at 0.650 with the best mean
+   reward of any row (0.670) — and eliminates the n=1 drift.** Per-domain vs base:
+   airline +21.4, retail +6.2, telecom held at 1.000 (n=1 had dropped it to 0.700).
+   Failed rollouts distilling toward a successful sibling's demonstration + critique is
+   both a lift and a stabilizer; the sibling channel only exists because WM group
+   rollouts are cheap. Both WM-enabled group methods now beat every classical arm.
+3. **SDPO n=1 specializes with drift**: +2.5 overall masking airline +42.8, retail −12.5,
+   telecom −30 (regressed from saturated). Critique-only self-distillation (the n=1 weak
+   form — the teacher is always the rollout itself + judge critique) is a specialization
+   knife, not a general lift: the paper's forgetting axis reproduced live. The n=8
+   sibling-demonstration variant (failed rollouts distill toward a successful sibling's
+   demonstration + critique — only cheap because of the WM) is queued as the fix.
+4. **The telecom "cross-domain probe" probes nothing at this difficulty**: base is
+   already at 1.000. It functions as a regression canary instead (SDPO-n1 tripped it;
+   GRPO did not).
+5. **GRPO overtrains past ~30–40 scenarios at the inherited hyperparameters — and the
+   training WM called it in real time.** The 97-scenario run peaked around scenario 35
+   (rolling WM success 71.5% vs the 61% no-training baseline), drifted (KL 0.2→3.7,
+   grads →3.8), and was killed at scenario 53 under pre-declared criteria (rolling
+   success 42.5%). Its near-peak checkpoint (48 scenarios, ~107 steps) evals at 0.525 —
+   below base — with the damage concentrated in retail (0.312 vs smoke's 0.625), the
+   domain with the most train scenarios (61/97 = most gradient exposure). The eval
+   ordering (smoke 0.650 > base 0.550 > scale48 0.525) matches the training-WM rolling
+   success ordering exactly: **the WM doubles as a live overfitting meter** — you watch
+   transfer degrade before paying for an eval. Rerun prescription: lr ≤1e-5 or KL coef
+   ≥0.05, checkpoint every ~10 scenarios, buffer sized to avoid uid-group ring-splits.
+6. **In-run training signal predicted the eval result**: the GRPO smoke's second-half
+   per-scenario reward deltas (+0.067) exceeded first-half (+0.029) vs a no-training
+   identical-seed run, with the biggest gains exactly on high-variance rollout groups
+   (e.g. the audited exchange scenario: half-failing → 0.975). Group advantage std held
+   0.28–0.30 with mean≈0; KL ≈ 9e-5.
+
+## Interim Opus-env re-eval + the arm pin (D65–D68)
+
+After the OpenAI account deactivation froze the pinned GPT-5.5 env, all arms were
+re-evaluated on an interim Opus-4.8-backed WM env (same judge; within-env comparisons
+only; n=40 clean each): base 0.600/0.634, GRPO-smoke 0.600/0.643, SDPO-n8 0.550/0.596,
+GRPO-v2@0090 0.550/0.590, GRPO-v2@0097 0.575/0.610.
+
+**Cross-env paired Δ vs base** — GRPO-smoke: +0.101 (GPT-5.5, replicated n=79) and
++0.009 (Opus), the only arm non-negative on both; SDPO-n8: +0.102 but −0.045 on Opus
+(env-specific gains); stabilized v2 scale checkpoints never beat the smoke on either env.
+
+**📌 Family-best arm: GRPO, smoke checkpoint (`wm_tau_grpo_0020`), pinned-protocol row
+0.658 (n=79).** Two findings ride along: (1) arm separations are eval-env-sensitive —
+the motivating exhibit for the fidelity→transfer curve; (2) at tau scale the short
+regime (20 scenarios × 1 epoch) is the sweet spot — more training, even fully
+stabilized (KL ≤3e-3, zero collapse across 97 scenarios), does not improve transfer.
+
+## Reward-integrity audits (AGENTS rule 12)
+
+- **Training rollouts** (haiku WM + judge): within a group with identical tool
+  *sequences*, the judge scored 0.95 vs 0.30 by *outcome* (right vs wrong booking, named
+  in the critique). 1.0-reward rollouts executed the task's mutating action; low-reward
+  rollouts did lookups then quit — critiques say exactly that.
+- **Eval episodes** (GPT-5.5 WM + Opus judge): top-reward episodes are verified
+  multi-step resolutions (diagnose → act → in-environment verification, e.g. speed test
+  confirming a data refuel); zero-reward episodes are genuine policy mistakes
+  (transfer-instead-of-decline; unauthorized cancellation) with the judge citing the
+  specific policy grounds. No verbosity/sycophancy gaming pattern observed in either.
+
+## Caveats (stated plainly)
+
+- n=40/checkpoint (airline n=14): single-domain deltas carry wide CIs; the +10 overall
+  is directional evidence, not a tight estimate. Pass-to-pass variance observed
+  (a partial pass's clean subset read 0.609 for GRPO).
+- Eval env is itself a world model (GPT-5.5-backed). Family-different from the training
+  WM, but a real-env spot check remains the follow-on validation for a positive result.
+- Judge = Opus 4.8 across arms; identical for every row, so relative deltas stand even
+  if the judge has absolute biases.
+
+## Ops appendix (what it took — full ledger in DECISIONS.md D34–D57)
+
+Trainer: FSDP2 dangling lm_head pointer; CPU-offload bake; entropy_checkpointing
+full-logits gate; expanded-zero-grad contiguity (upstream verl bug); target_modules
+schema narrowed vs upstream. Serving: cross-region + cross-geo judge waterfalls (a
+US-wide Opus brownout mid-eval); score timeout ≥ the full waterfall budget; never bounce
+the eval WM under a live sequential pass. Checkpoints: drained LoRA adapter →
+merge-into-text-model → splice-over-base-snapshot → vLLM with `qwen3_xml` parser.
