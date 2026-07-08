@@ -20,7 +20,7 @@ _ADAPTERS: dict[str, Callable[[Backend], Adapter]] = {
     "bedrock": BedrockAdapter,
     "openai": OpenAIAdapter,
     "anthropic": AnthropicAdapter,
-    "azure_openai": AzureOpenAIAdapter,  # stub: raises NotImplementedError at construction
+    "azure_openai": AzureOpenAIAdapter,  # real; construction validates endpoint/api_version
     "aws_mantle": AwsMantleAdapter,  # stub: raises NotImplementedError at construction
 }
 

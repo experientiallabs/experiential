@@ -73,8 +73,28 @@ strings, each a task instruction. No prose."""
 _FENCE_RE = re.compile(r"```(?:bash|sh)?\s*\n(.*?)```", re.DOTALL)
 
 
+# Capacity/transient error codes worth retrying — same set as environment_capture.agent. A bad
+# request or auth error must RAISE immediately: retrying it 6x with backoff only hides the bug.
+_THROTTLE_CODES = {
+    "ThrottlingException",
+    "TooManyRequestsException",
+    "ServiceUnavailableException",
+    "ModelTimeoutException",
+    "InternalServerException",
+}
+
+
+def _retriable(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    code = response.get("Error", {}).get("Code") if isinstance(response, dict) else None
+    if code is not None:
+        return code in _THROTTLE_CODES
+    transient = {"ReadTimeoutError", "ConnectTimeoutError", "EndpointConnectionError"}
+    return type(exc).__name__ in transient
+
+
 def _converse(client: Any, model: str, system: str, messages: list[dict[str, str]], max_tokens: int) -> str:  # noqa: ANN401, E501
-    """One Bedrock converse call -> assistant text (retries on throttling)."""
+    """One Bedrock converse call -> assistant text (retries throttling/transient errors ONLY)."""
     conv = [{"role": m["role"], "content": [{"text": m["content"]}]} for m in messages]
     last_err: Exception | None = None
     for attempt in range(6):
@@ -86,7 +106,9 @@ def _converse(client: Any, model: str, system: str, messages: list[dict[str, str
                 inferenceConfig={"maxTokens": max_tokens},
             )
             return r["output"]["message"]["content"][0]["text"]
-        except Exception as e:  # noqa: BLE001 - retry throttling/transient errors
+        except Exception as e:  # noqa: BLE001 - classified just below
+            if not _retriable(e):
+                raise
             last_err = e
             _sleep(2.0 * (attempt + 1))
     raise RuntimeError(f"converse failed after retries: {last_err}")

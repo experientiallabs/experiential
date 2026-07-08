@@ -160,10 +160,14 @@ class Waterfall:
         for round_index in range(1, self._retry.rounds + 1):
             backoff = self._retry.backoff_before_round(round_index)
             if backoff > 0:
-                # Jittered, but never above the configured cap — callers size outer timeouts
-                # from backoff_max_s.
-                jittered = backoff + random.uniform(0, 0.34 * backoff)  # noqa: S311 - jitter
-                _sleep(min(jittered, self._retry.backoff_max_s))
+                # Jittered, and never above the configured cap — callers size outer timeouts
+                # from backoff_max_s. The jitter span is reserved BELOW the cap: capping after
+                # adding jitter would collapse every concurrent caller onto exactly
+                # backoff_max_s once exponential backoff saturates, synchronizing the very
+                # retries jitter exists to spread.
+                span = 0.34 * backoff
+                base = min(backoff, self._retry.backoff_max_s - span)
+                _sleep(base + random.uniform(0, span))  # noqa: S311 - jitter
             capacity_this_round = False
             for backend, adapter in zip(self._backends, self._adapters, strict=True):
                 start = time.monotonic()

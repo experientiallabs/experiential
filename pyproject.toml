@@ -26,6 +26,11 @@ dependencies = [
     "anthropic>=0.39",
     "openai>=1.40",
     "boto3>=1.34",
+    # Failover chains across backends/accounts (wmh.providers.waterfall wraps llm-waterfall);
+    # core for the same reason as the SDKs above: `wmh.providers` imports it unconditionally.
+    # Resolves from the workspace member in-repo ([tool.uv.sources]); RELEASE ORDER: publish
+    # llm-waterfall to PyPI before any wmh release, like environment-capture.
+    "llm-waterfall",
 ]
 
 [project.optional-dependencies]
@@ -41,9 +46,10 @@ dev = [
 
 [dependency-groups]
 # Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
-# gate covers their tests. llm-waterfall stays dev-only (no wmh code imports it);
-# environment-capture graduated to [project.dependencies] when `wmh download` started consuming
-# it — see the RELEASE ORDER note there. The dev group adds the members' heavy extras.
+# gate covers their tests. Both members have graduated to [project.dependencies] —
+# environment-capture when `wmh download` started consuming it, llm-waterfall when
+# wmh.providers.waterfall did (see the RELEASE ORDER notes there). The dev group adds the
+# members' heavy extras.
 dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]

@@ -189,9 +189,7 @@ def test_bare_username_word_does_not_flag() -> None:
 def test_own_workspace_tempdir_path_does_not_flag() -> None:
     """macOS workspaces live under /var/folders — an observation echoing the workspace's own
     absolute path (pwd, tracebacks, sqlite errors) is not a host escape and must not be dropped."""
-    own_path = _trajectory(
-        "pwd", "/var/folders/wy/l2n7bpj15sgb25k6ylm9txkh0000gn/T/envcap-abc123"
-    )
+    own_path = _trajectory("pwd", "/var/folders/wy/l2n7bpj15sgb25k6ylm9txkh0000gn/T/envcap-abc123")
     assert host_escape_findings(own_path) == []
 
 
@@ -241,11 +239,21 @@ def test_scan_tolerates_non_object_tool_arguments(tmp_path: Path) -> None:
     instead of crashing — and still catches a leak inside one."""
     path = tmp_path / "traces.otel.jsonl"
     spans = [
-        {"traceId": "s1", "attributes": [
-            {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": "[1, 2]"}}]},
-        {"traceId": "s2", "attributes": [
-            {"key": "gen_ai.tool.call.arguments",
-             "value": {"stringValue": json.dumps("cat /Users/someone/.zshrc")}}]},
+        {
+            "traceId": "s1",
+            "attributes": [
+                {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": "[1, 2]"}}
+            ],
+        },
+        {
+            "traceId": "s2",
+            "attributes": [
+                {
+                    "key": "gen_ai.tool.call.arguments",
+                    "value": {"stringValue": json.dumps("cat /Users/someone/.zshrc")},
+                }
+            ],
+        },
     ]
     path.write_text("\n".join(json.dumps(s) for s in spans) + "\n")
     flagged = scan_spans_jsonl(path)

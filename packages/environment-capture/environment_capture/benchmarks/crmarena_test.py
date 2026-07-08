@@ -100,7 +100,7 @@ def test_open_env_stages_db_tool_and_schema_never_gold(data_root: Path) -> None:
         assert "query.py" in listing
         assert "schema.md" in listing
         # The agent can actually query the staged org and see real rows.
-        result = env.execute('python3 query.py "SELECT Id FROM User WHERE FirstName = \'Ada\'"')
+        result = env.execute("python3 query.py \"SELECT Id FROM User WHERE FirstName = 'Ada'\"")
         assert "005A" in result.output
         assert result.returncode == 0
         # schema.md lists the real tables and row counts.

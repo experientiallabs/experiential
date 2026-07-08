@@ -24,8 +24,7 @@ def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
     def http_json_page(url: str, *, token: str | None) -> tuple[object, None]:
         assert "/api/datasets/" in url and "/tree/main?recursive=true" in url
         listing = [
-            {"type": "file", "path": path, "size": len(content)}
-            for path, content in files.items()
+            {"type": "file", "path": path, "size": len(content)} for path, content in files.items()
         ]
         return listing, None
 

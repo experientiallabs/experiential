@@ -21,3 +21,4 @@ file here must justify its existence in the table below; a doc that can't gets d
 | `research/fidelity_transfer_curve.md` | Completed BENCH-B2 research result: training-WM fidelity does not measurably change real-env transfer at smoke scale, but high-fidelity envs destabilize training (the fidelity/stability trade-off, 3× replicated). Grounds the "cheap WMs are enough for training" product claim. |
 | `research/fidelity_transfer_curve.png` | The figure the writeup renders. |
 | `reference/eval_suites.md` | The reproducibility contract every benchmark number in this repo rests on (`examples/<task>/evals/*.toml` + `wmh eval`); commands verified against `main` at promotion. |
+| `reference/failover.md` | The `.wmh/fallback.toml` failover contract: which calls ride the chain (world-model) and which never do (the judge), plus the cross-account ladder format; verified live against both AWS accounts. |

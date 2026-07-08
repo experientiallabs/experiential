@@ -62,9 +62,7 @@ DIR_BLURBS: dict[str, str] = {
 def _dataset_card(spec: CorpusSpec) -> str:
     """The dataset card (README.md with Hub YAML frontmatter) for one corpus."""
     extra = f"\n{spec.extra_terms}\n" if spec.extra_terms else ""
-    data_dir_lines = "".join(
-        f"- `{d}/` — {DIR_BLURBS[d]}\n" for d in spec.data_dirs
-    )
+    data_dir_lines = "".join(f"- `{d}/` — {DIR_BLURBS[d]}\n" for d in spec.data_dirs)
     return f"""---
 license: {spec.license_id}
 pretty_name: "{spec.benchmark} agent-environment traces (world-model-harness)"

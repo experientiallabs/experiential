@@ -351,9 +351,10 @@ class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
         newurl: str,
     ) -> urllib.request.Request | None:
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(
-            req.full_url
-        ).netloc:
+        if (
+            new is not None
+            and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc
+        ):
             new.headers.pop("Authorization", None)
         return new
 
@@ -417,9 +418,7 @@ def _repo_tree(repo_id: str, revision: str, *, token: str | None) -> list[tuple[
     for entry in listing:
         if isinstance(entry, dict) and entry.get("type") == "file":
             size = entry.get("size")
-            files.append(
-                (str(entry.get("path", "")), size if isinstance(size, int) else 0)
-            )
+            files.append((str(entry.get("path", "")), size if isinstance(size, int) else 0))
     return files
 
 

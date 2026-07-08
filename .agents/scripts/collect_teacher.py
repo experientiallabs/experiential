@@ -30,9 +30,9 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
-from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, RetryProvider, bedrock  # noqa: E402
-
 import os  # noqa: E402
+
+from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, _retrying, bedrock  # noqa: E402
 
 from wmh.core.parsing import extract_json_object  # noqa: E402
 from wmh.core.types import ActionKind, Trace  # noqa: E402
@@ -85,9 +85,7 @@ def _load_gemini_key() -> None:
     """
     labs = REPO.parent
     if not os.environ.get("WMH_ENDPOINT_API_KEY"):
-        value = _read_env_value(
-            labs / "world-model-harness" / ".env.local", "AZURE_FOUNDRY_API_KEY"
-        )
+        value = _read_env_value(labs / "world-model-harness" / ".env.local", "AZURE_FOUNDRY_API_KEY")
         if value is None:
             value = _read_env_value(labs / "platform" / ".env.local", "GEMINI_API_KEY")
         if value is None:
@@ -105,10 +103,8 @@ FOUNDRY_ENDPOINT = "https://silen-resource.services.ai.azure.com/openai/v1/"
 def foundry(model: str) -> Provider:
     """A model on the user's Azure AI Foundry resource (OpenAI-compatible)."""
     _load_gemini_key()
-    return RetryProvider(
-        get_provider(
-            ProviderConfig(kind=ProviderKind.OPENAI, model=model, endpoint=FOUNDRY_ENDPOINT)
-        )
+    return _retrying(
+        get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model, endpoint=FOUNDRY_ENDPOINT))
     )
 
 
@@ -124,14 +120,12 @@ def opus_judge() -> Provider:
 def openai_direct(model: str) -> Provider:
     """A model on the OpenAI API directly (reads OPENAI_API_KEY)."""
     _load_gemini_key()
-    return RetryProvider(get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model)))
+    return _retrying(get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model)))
 
 
 def gemini(model: str) -> Provider:
-    return RetryProvider(
-        get_provider(
-            ProviderConfig(kind=ProviderKind.OPENAI, model=model, endpoint=GEMINI_ENDPOINT)
-        )
+    return _retrying(
+        get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model, endpoint=GEMINI_ENDPOINT))
     )
 
 
@@ -183,13 +177,17 @@ def run_teacher_episode(
                 arguments=data.get("arguments") or {},
             )
             observation = env.step(action)
-            turns.append(TeacherTurn(think, action.name, action.arguments, observation.content))
+            turns.append(
+                TeacherTurn(think, action.name, action.arguments, observation.content)
+            )
     finally:
         env.close()
     return turns, summary, stop
 
 
-def _render_teacher_turn(scenario: EvalScenario, reference: str, turns: list[TeacherTurn]) -> str:
+def _render_teacher_turn(
+    scenario: EvalScenario, reference: str, turns: list[TeacherTurn]
+) -> str:
     lines = [f"TASK: {scenario.task}"]
     if scenario.seed_state.scratchpad:
         lines.append(f"ENVIRONMENT NOTES: {scenario.seed_state.scratchpad}")
@@ -229,9 +227,7 @@ def to_qwen_messages(
                 "content": f"<think>{turn.think}</think>\n<tool_call>{call}</tool_call>",
             }
         )
-        messages.append(
-            {"role": "user", "content": f"<tool_response>{turn.observation}</tool_response>"}
-        )
+        messages.append({"role": "user", "content": f"<tool_response>{turn.observation}</tool_response>"})
     messages.append({"role": "assistant", "content": summary or "Task complete."})
     return messages
 
@@ -277,9 +273,7 @@ def main() -> None:
         ]
         done_ids = {r["scenario_id"] for r in existing_records}
         scenarios = [s for s in scenarios if s.scenario_id not in done_ids]
-        print(
-            f"resume: {len(existing_records)} episodes kept already; {len(scenarios)} scenarios to go"
-        )
+        print(f"resume: {len(existing_records)} episodes kept already; {len(scenarios)} scenarios to go")
     traces = get_adapter("otel-genai").from_file(str(TRACES))
     traces_by_id = {t.trace_id: t for t in traces}
 
@@ -287,9 +281,7 @@ def main() -> None:
         bedrock("us.amazon.nova-pro-v1:0") if args.teacher == "nova-pro" else gemini(TEACHER_MODEL)
     )
     judge = ChecklistJudge(gemini(JUDGE_MODEL))
-    world_model = WorldModel.load(
-        str(WM_DIR), bedrock(NOVA_LITE), telemetry_root=str(REPO / ".wmh")
-    )
+    world_model = WorldModel.load(str(WM_DIR), bedrock(NOVA_LITE), telemetry_root=str(REPO / ".wmh"))
 
     kept_records: list[dict] = []
     stats: dict[str, dict[str, float]] = defaultdict(lambda: {"attempts": 0, "kept": 0})
@@ -348,7 +340,8 @@ def main() -> None:
         kept = candidates[:KEEP_PER_SCENARIO]
         stats[scenario.scenario_id]["kept"] = len(kept)
         print(
-            f"  {scenario.scenario_id}: kept {len(kept)}/{args.samples} ({time.time() - t0:.0f}s)",
+            f"  {scenario.scenario_id}: kept {len(kept)}/{args.samples} "
+            f"({time.time() - t0:.0f}s)",
             flush=True,
         )
         return kept
