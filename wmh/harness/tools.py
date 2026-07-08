@@ -44,9 +44,18 @@ SUBMIT = ToolSpec(
     description="Finish the task and submit your answer/result summary. This ends the run.",
     arguments={"answer": "your final answer or a summary of what you did"},
 )
+READ_SKILL = ToolSpec(
+    name="read_skill",
+    description="Read the full body of a skill from your library (the prompt lists only names).",
+    arguments={"name": "the skill name to read"},
+)
 
-TOOL_REGISTRY: dict[str, ToolSpec] = {t.name: t for t in (BASH, READ_FILE, WRITE_FILE, SUBMIT)}
+TOOL_REGISTRY: dict[str, ToolSpec] = {
+    t.name: t for t in (BASH, READ_FILE, WRITE_FILE, SUBMIT, READ_SKILL)
+}
 
+# `read_skill` is only useful when a harness ships skills, so it is not a default tool; the runtime
+# adds it automatically when constructed with a non-empty skill library.
 DEFAULT_TOOLS = [t.name for t in (BASH, READ_FILE, WRITE_FILE, SUBMIT)]
 
 

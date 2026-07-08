@@ -17,8 +17,10 @@ from pydantic import BaseModel, Field
 
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
+from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import (
     DEFAULT_TOOLS,
+    READ_SKILL,
     SUBMIT,
     ToolCall,
     parse_tool_call,
@@ -94,12 +96,19 @@ class AgentRuntime:
         tools: list[str] | None = None,
         max_turns: int = DEFAULT_MAX_TURNS,
         temperature: float = 0.7,
+        skills: SkillLibrary | None = None,
     ) -> None:
         if max_turns < 1:
             raise ValueError("max_turns must be >= 1")
         self._provider = provider
         self._system_prompt = system_prompt
-        self._tools = resolve_tools(tools if tools is not None else list(DEFAULT_TOOLS))
+        self._skills = skills if skills is not None else SkillLibrary()
+        tool_names = list(tools) if tools is not None else list(DEFAULT_TOOLS)
+        # A skill-bearing harness needs read_skill for progressive disclosure; add it implicitly so
+        # harness config files don't have to remember the plumbing tool.
+        if len(self._skills) and READ_SKILL.name not in tool_names:
+            tool_names.append(READ_SKILL.name)
+        self._tools = resolve_tools(tool_names)
         self._max_turns = max_turns
         self._temperature = temperature
 
@@ -144,14 +153,26 @@ class AgentRuntime:
     def _dispatch(
         self, call: ToolCall, environment: AgentEnvironment
     ) -> tuple[Action, Observation]:
-        """Route one non-submit call to the environment, rejecting unconfigured tools."""
+        """Route one non-submit call: read_skill handled here, env tools to the environment."""
         action = to_action(call)
-        if call.tool not in {t.name for t in self._tools} or not is_env_action(action):
+        if call.tool not in {t.name for t in self._tools}:
+            return action, Observation(content=f"tool {call.tool!r} not available", is_error=True)
+        if call.tool == READ_SKILL.name:
+            name = _str_arg(call, "name")
+            skill = self._skills.get(name)
+            if skill is None:
+                return action, Observation(content=f"no skill named {name!r}", is_error=True)
+            return action, Observation(content=skill.body)
+        if not is_env_action(action):
             return action, Observation(content=f"tool {call.tool!r} not available", is_error=True)
         return action, environment.execute(action)
 
     def _full_system_prompt(self) -> str:
-        return f"{self._system_prompt}\n\n## Tools\n{render_tools(self._tools)}"
+        prompt = f"{self._system_prompt}\n\n## Tools\n{render_tools(self._tools)}"
+        index = self._skills.render_index()
+        if index:
+            prompt += f"\n\n## Your skills (read a body with read_skill)\n{index}"
+        return prompt
 
     def _result(
         self,

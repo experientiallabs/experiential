@@ -36,6 +36,7 @@ from rich.table import Table
 
 import wmh.providers as providers
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
+from wmh.cli.harness_app import harness_app
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
@@ -120,6 +121,7 @@ app.add_typer(providers_app, name="providers")
 app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
 app.add_typer(scenarios_app, name="scenarios")
+app.add_typer(harness_app, name="harness")
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
@@ -645,9 +647,14 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     k: int = typer.Option(
         3, min=1, help="Closed-loop passes per task (means reported, never 1-pass)."
     ),
-    max_turns: int = typer.Option(20, min=1, help="Closed-loop agent turn cap per task."),
+    max_turns: int | None = typer.Option(
+        None, min=1, help="Closed-loop agent turn cap (default: 20, or the harness's own)."
+    ),
     threshold: float = typer.Option(
         0.5, help="Agreement pass threshold on a task's k-pass success rate."
+    ),
+    harness: str | None = typer.Option(
+        None, "--harness", help="Stored harness to run for `closed-loop` (default: baseline)."
     ),
 ) -> None:
     """Score reconstruction fidelity, or run named example-local eval suites.
@@ -674,8 +681,14 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         if len(args) != 1 or args[0] in ("list", "run", "results", "agreement"):
             raise typer.BadParameter("usage: wmh eval <tasks.jsonl> --mode closed-loop")
         run_closed_loop(
-            _console, tasks_file=args[0], name=name, root=root, k=k,
-            max_turns=max_turns, out=out,
+            _console,
+            tasks_file=args[0],
+            name=name,
+            root=root,
+            k=k,
+            max_turns=max_turns,
+            out=out,
+            harness=harness,
         )
         return
     if args and args[0] == "agreement":

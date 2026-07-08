@@ -101,6 +101,34 @@ def test_unavailable_tool_is_an_error_observation_not_a_crash() -> None:
     assert env.actions == []  # and never reached the environment
 
 
+def test_read_skill_returns_body_and_index_is_in_prompt() -> None:
+    from wmh.harness.skills import Skill, SkillLibrary
+
+    provider = ScriptedProvider(
+        [
+            '{"tool": "read_skill", "arguments": {"name": "count-words"}}',
+            '{"tool": "submit", "arguments": {"answer": "ok"}}',
+        ]
+    )
+    library = SkillLibrary(
+        [Skill(name="count-words", description="count words", body="wc -w <path>")]
+    )
+    env = RecordingEnv()
+    result = AgentRuntime(provider, skills=library).run("t", "x", env)
+    # read_skill is handled by the runtime (never reaches the env) and returns the body.
+    assert result.steps[0].observation.content == "wc -w <path>"
+    assert env.actions == []
+    # Unknown skill -> error observation.
+    provider2 = ScriptedProvider(
+        [
+            '{"tool": "read_skill", "arguments": {"name": "ghost"}}',
+            '{"tool": "submit", "arguments": {"answer": "ok"}}',
+        ]
+    )
+    result2 = AgentRuntime(provider2, skills=library).run("t", "x", RecordingEnv())
+    assert result2.steps[0].observation.is_error
+
+
 def test_transcript_shows_actions_and_observations() -> None:
     provider = ScriptedProvider(
         [
