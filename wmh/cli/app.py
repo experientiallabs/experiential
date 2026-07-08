@@ -38,6 +38,7 @@ from rich.table import Table
 import wmh.providers as providers
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmh.cli.harness_app import harness_app
+from wmh.cli.platform_cmds import register as register_platform_commands
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
@@ -122,6 +123,7 @@ app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
 app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
+register_platform_commands(app)
 _console = Console()
 _CHECK = "[green]✓[/green]"
 

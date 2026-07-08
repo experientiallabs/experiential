@@ -134,7 +134,9 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    assert names == {"build", "list", "serve", "demo", "eval", "play", "download"}
+    core = {"build", "list", "serve", "demo", "eval", "play", "download"}
+    platform = {"login", "logout", "status", "push", "pull"}
+    assert names == core | platform
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
