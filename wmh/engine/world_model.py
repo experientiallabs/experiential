@@ -240,6 +240,11 @@ class WorldModel:
         scalar reward/success (GRPO, PPO, REINFORCE++), `step_rewards` (dense diagnostics), and
         `critique` (SDPO's teacher feedback). Raises `KeyError` for an unknown session id.
 
+        `rubric` — the scenario's pinned success criteria (see the per-benchmark scenario files'
+        `rubric` field) — anchors the verdict; without it the judge re-infers success conditions
+        from the task text per call, which varies run to run (D65). Pass it whenever the scenario
+        carries one.
+
         Judge usage is metered onto the session's tracker under `Phase.JUDGE`, so `session_usage`
         keeps reward cost separate from the world model's SERVE cost.
         """

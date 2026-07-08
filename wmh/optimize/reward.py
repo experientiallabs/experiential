@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field, ValidationError
 from wmh.core.parsing import extract_json_object
 from wmh.core.render import render_action
 from wmh.core.types import Step
-from wmh.providers.base import Message, Provider
+from wmh.providers.base import DEFAULT_MAX_TOKENS, Message, Provider
 
 REWARD_JUDGE_SYSTEM = """You are a strict evaluator of agent rollouts in a simulated environment.
 You are given a TASK and the sequence of steps an agent took (each step: the agent's action and
@@ -77,7 +77,9 @@ class EpisodeRewardJudge:
         anchors the verdict: without it the judge infers success conditions from the task text
         alone, and that interpretation varies run to run (D65 source 2: the same pinned-world
         rollout judged 0.75 and 0.0 across sessions on a date-semantics reading). The rubric names
-        WHAT must be true; the judge still never sees a gold trajectory of HOW.
+        the success CRITERIA — which, for benchmarks whose real grader is action-based (tau2's
+        evaluation criteria list required actions), may include required actions. The judge still
+        never sees a recorded trajectory or reference observations.
         """
         if not steps:
             return EpisodeScore(
@@ -85,7 +87,13 @@ class EpisodeRewardJudge:
             )
         user = _build_reward_prompt(task, steps, rubric)
         completion = self._provider.complete(
-            REWARD_JUDGE_SYSTEM, [Message(role="user", content=user)], temperature=0.0
+            REWARD_JUDGE_SYSTEM,
+            [Message(role="user", content=user)],
+            temperature=0.0,
+            # Explicit: a judge reply spans step_rewards for up to ~20 steps plus a critique,
+            # and some provider wrappers default complete() far below the provider default —
+            # a truncated reply parses as a flagged 0.0 that looks like a real failure.
+            max_tokens=DEFAULT_MAX_TOKENS,
         )
         return _parse_episode_score(completion.text, n_steps=len(steps))
 

@@ -49,7 +49,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.env import DONE_SIGNAL, Scenario, WorldModelEnv, run_episode
 from wmh.optimize.reward import EpisodeScore
 from wmh.providers.base import Message, Provider, ProviderConfig, ProviderKind
-from wmh.providers.fallback import FallbackProvider
+from wmh.providers.waterfall import WaterfallProvider
 from wmh.providers.registry import get_provider
 
 _HERE = Path(__file__).resolve().parent
@@ -277,14 +277,10 @@ def _build_wm(kind: str) -> WorldModel:
         judge = env_provider  # cheap critiques while collecting memory / dev
     elif kind == "gpt-5.5":
         env_provider = get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5"))
-        judge = FallbackProvider(
+        judge = WaterfallProvider(
             [
-                get_provider(
-                    ProviderConfig(
-                        kind=ProviderKind.BEDROCK, model=OPUS, region=region, aws_profile=profile
-                    )
-                )
-                for profile, region in JUDGE_POOLS
+                ProviderConfig(kind=ProviderKind.BEDROCK, model=OPUS, region=region)
+                for _profile, region in JUDGE_POOLS
             ]
         )
     else:

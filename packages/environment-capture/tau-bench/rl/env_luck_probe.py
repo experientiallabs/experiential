@@ -33,7 +33,7 @@ from wmh.core.types import Action, EnvState, Trace
 from wmh.engine import ingest, split_traces_3way
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.providers.fallback import FallbackProvider
+from wmh.providers.waterfall import WaterfallProvider
 from wmh.providers.registry import get_provider
 
 _HERE = Path(__file__).resolve().parent
@@ -55,13 +55,8 @@ def _build_wm() -> WorldModel:
     env_provider = get_provider(
         ProviderConfig(kind=ProviderKind.BEDROCK, model=HAIKU, region="us-east-1")
     )
-    judge = FallbackProvider(
-        [
-            get_provider(
-                ProviderConfig(kind=ProviderKind.BEDROCK, model=OPUS, region=r, aws_profile=p)
-            )
-            for p, r in JUDGE_POOLS
-        ]
+    judge = WaterfallProvider(
+        [ProviderConfig(kind=ProviderKind.BEDROCK, model=OPUS, region=r) for _p, r in JUDGE_POOLS]
     )
     return WorldModel.load(str(_MODEL_DIR), env_provider, reward_provider=judge)
 

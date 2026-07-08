@@ -184,34 +184,3 @@ def test_live_titan_embed() -> None:  # pragma: no cover - network
     # Distinct inputs should not produce identical embeddings.
     assert vectors[0] != vectors[1]
 
-
-def test_aws_profile_selects_a_named_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ProviderConfig.aws_profile must reach boto3 as the session profile (multi-account quota)."""
-    import boto3
-
-    captured: dict[str, object] = {}
-
-    class _FakeSession:
-        def __init__(self, profile_name: str | None = None) -> None:
-            captured["profile"] = profile_name
-
-        def client(
-            self, service: str, region_name: str | None = None, config: object = None
-        ) -> object:
-            captured["service"] = service
-            captured["region"] = region_name
-            return object()
-
-    monkeypatch.setattr(boto3, "Session", _FakeSession)
-
-    provider = BedrockProvider(
-        ProviderConfig(
-            kind=ProviderKind.BEDROCK,
-            model="us.anthropic.claude-opus-4-8",
-            region="us-east-1",
-            aws_profile="stackwise-agent",
-        )
-    )
-    provider._get_client()
-    assert captured["profile"] == "stackwise-agent"
-    assert captured["region"] == "us-east-1"
