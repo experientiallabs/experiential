@@ -21,10 +21,44 @@ class TelemetrySettings(BaseModel):
     anonymous_id: str | None = None
 
 
+class ModelRole(BaseModel):
+    """One named model role: which provider/model handles this class of work."""
+
+    provider: str  # a ProviderKind value ("bedrock", "azure", "openai", ...)
+    model: str
+    region: str | None = None  # AWS Bedrock region
+    endpoint: str | None = None  # Azure OpenAI / custom base URL
+    deployment: str | None = None  # Azure OpenAI deployment name
+
+
+class ModelsSettings(BaseModel):
+    """Role-based model defaults for this project (`.wmh/settings.toml`, `[models.<role>]`).
+
+    Three roles keep the surface small: `worker` does quality-critical generation (scenario
+    synthesis, cluster naming, agent rollouts); `judge` grades (checklist judging, inline
+    validity gates) and should be a different model family from `worker` so the grader carries
+    no self-preference bias toward the generator's outputs; `summary` does high-volume cheap
+    extraction (trace facets/digests). Unset `judge`/`summary` fall back to `worker`; explicit
+    CLI flags override everything.
+    """
+
+    worker: ModelRole | None = None
+    judge: ModelRole | None = None
+    summary: ModelRole | None = None
+
+    def resolve(self, role: str) -> ModelRole | None:
+        """The configured role, with unset `judge`/`summary` falling back to `worker`."""
+        if role not in ("worker", "judge", "summary"):
+            raise ValueError(f"unknown model role {role!r}; expected worker, judge, or summary")
+        configured: ModelRole | None = getattr(self, role)
+        return configured or self.worker
+
+
 class ProjectSettings(BaseModel):
     """Settings that are local to one harness project root."""
 
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
+    models: ModelsSettings = Field(default_factory=ModelsSettings)
 
 
 def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:

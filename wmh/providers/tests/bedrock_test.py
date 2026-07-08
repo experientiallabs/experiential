@@ -205,4 +205,4 @@ def test_client_config_keeps_connections_alive(monkeypatch: pytest.MonkeyPatch) 
     assert options["tcp_keepalive"] is True
     assert options["connect_timeout"] == 15
     assert options["read_timeout"] == 600
-    assert options["retries"] == {"max_attempts": 1}
+    assert options["retries"] == {"max_attempts": 1, "mode": "standard"}

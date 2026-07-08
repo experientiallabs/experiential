@@ -9,7 +9,11 @@ models are named (`--name`), stored under `<root>/models/<name>/`, and listed wi
 from __future__ import annotations
 
 import json
+import logging
+import random
 import subprocess
+import time
+import urllib.error
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,18 +22,32 @@ from uuid import uuid4
 
 import typer
 import uvicorn
+from environment_capture.hub import (
+    CORPORA,
+    corpus_path,
+    fetch_corpus,
+    published_corpora,
+)
 from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
 from rich.table import Table
 
 import wmh.providers as providers
+from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
+from wmh.cli.harness_app import harness_app
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
     build_summary_panel,
+    judge_model_default,
     models_table,
     run_build_wizard,
     run_play_repl,
     select_model,
+    select_option,
+    select_provider_and_model,
 )
 from wmh.config import (
     ARTIFACT_DIR,
@@ -39,27 +57,41 @@ from wmh.config import (
     HarnessConfig,
     WorldModelStore,
     load_config,
+    load_env_file,
     load_settings,
+    normalize_name,
     set_telemetry_enabled,
     settings_path,
     validate_name,
 )
 from wmh.engine.build import build as run_build
+from wmh.engine.build import ingest
 from wmh.engine.demo import run_demo
-from wmh.engine.eval import EvalReport, evaluate_files
 from wmh.engine.eval_suites import (
     discover_eval_suites,
     list_eval_results,
     resolve_eval_suite,
     result_path,
 )
-from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import VendorPull
+from wmh.engine.world_model import WorldModel
+from wmh.env.llm_agent import LLMAgent
+from wmh.evals.open_loop import EvalReport, OpenLoopEval
+from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
-from wmh.providers.base import EmbedderKind
+from wmh.providers.base import Embedder, EmbedderKind, Provider
+from wmh.providers.fallback import _is_capacity_error
+from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
+from wmh.scenarios import (
+    ChecklistJudge,
+    FacetExtractor,
+    ScenarioBuildConfig,
+    ScenarioSet,
+    build_scenario_set,
+    verify_scenarios,
+)
 from wmh.serving.server import create_app
 from wmh.telemetry import (
     BuildTelemetryStats,
@@ -74,14 +106,22 @@ app = typer.Typer(
     help="World Model Harness: a frontier LLM acts as your agent's environment.",
     no_args_is_help=True,
 )
+
+
 providers_app = typer.Typer(help="Manage and verify LLM providers.", no_args_is_help=True)
 examples_app = typer.Typer(
     help="List and launch self-contained task examples.", no_args_is_help=True
 )
 config_app = typer.Typer(help="Manage local harness config.", no_args_is_help=True)
+scenarios_app = typer.Typer(
+    help="Construct and verify representative eval scenario sets from traces.",
+    no_args_is_help=True,
+)
 app.add_typer(providers_app, name="providers")
 app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
+app.add_typer(scenarios_app, name="scenarios")
+app.add_typer(harness_app, name="harness")
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
@@ -89,6 +129,9 @@ _CHECK = "[green]✓[/green]"
 _EVAL_TOKENS = typer.Argument(
     None,
     help="Trace files to score, or eval flow: list | run <suite> | results optional-suite.",
+)
+_DOWNLOAD_BENCHMARKS = typer.Argument(
+    None, help="Benchmark bundles to download, or 'all'. Omit for a picker."
 )
 
 
@@ -206,18 +249,38 @@ def examples_run(
 @app.command("build")
 def build(
     name: str = typer.Option(None, "--name", help="Name for this world model."),
-    file: str = typer.Option(None, "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
-    vendor: str = typer.Option(None, "--vendor", help="Vendor name to pull traces via SDK."),
+    source: str = typer.Option(
+        "otel-genai",
+        "--source",
+        help="Trace source adapter: otel-genai, chat-json, braintrust, phoenix, langfuse, "
+        "langsmith, posthog, mastra.",
+    ),
+    file: str = typer.Option(None, "--file", help="Path to an exported traces file for --source."),
+    pull: bool = typer.Option(
+        False, "--pull", help="Pull traces live from the source's vendor API (instead of --file)."
+    ),
+    project: str = typer.Option(None, "--project", help="Vendor project/workspace id (--pull)."),
+    api_key: str = typer.Option(None, "--api-key", help="Vendor API key (else env var)."),
+    since: str = typer.Option(None, "--since", help="Only pull traces since this ISO timestamp."),
+    limit: int = typer.Option(None, "--limit", help="Max number of traces to pull."),
+    vendor: str = typer.Option(
+        None, "--vendor", help="[deprecated] alias for --source <name> --pull."
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
-    provider: str = typer.Option("bedrock", "--provider", help="Provider that serves the model."),
+    provider: str = typer.Option(
+        None, "--provider", help="Provider that serves the model (default: bedrock)."
+    ),
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Serve provider model id."),
+    judge_model: str = typer.Option(
+        None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
+    ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
-    gepa_budget: int = typer.Option(50, help="GEPA rollout budget."),
+    gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
     ),
     embed_provider: str = typer.Option(
-        "hashing", help="phi embedder: hashing (offline) | bedrock | openai | azure_openai."
+        "hashing", help="phi embedder: hashing (offline) | bedrock | openai | azure."
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure embedding deployment."),
     embed_dim: int = typer.Option(512, help="phi dimensionality (index + query must agree)."),
@@ -235,30 +298,57 @@ def build(
     With no `--name`/`--file` on an interactive terminal, this launches a guided creation wizard;
     pass `--no-interactive` (or any of those flags) to stay fully scriptable.
     """
+    # `--vendor <name>` is the deprecated alias for `--source <name> --pull`: it names the source
+    # adapter and implies a live pull.
+    if vendor:
+        source = vendor
+        pull = True
+
     # Decide whether to run the wizard: explicit flag wins; otherwise auto when at a TTY and the
-    # essential inputs (a name and a trace source) were not supplied.
-    needs_input = name is None or (file is None and vendor is None)
+    # essential inputs (a name and a trace source — a file or a live pull) were not supplied.
+    needs_input = name is None or (file is None and not pull)
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
     params = BuildParams(
         name=name or DEFAULT_MODEL_NAME,
+        source=source,
         file=file,
-        vendor=vendor,
+        pull=pull,
+        project=project,
+        api_key=api_key,
+        since=since,
+        limit=limit,
         provider=provider,
         model=model,
         region=region,
         gepa_budget=gepa_budget,
         train_split=train_split,
+        judge_model=judge_model,
         embed_provider=embed_provider,
         embed_model=embed_model,
         embed_dim=embed_dim,
     )
     if use_wizard:
         params = run_build_wizard(_console, params)
-    elif name is None and file is None and vendor is None:
-        raise typer.BadParameter("provide --file (or --vendor), or run `wmh build` interactively")
+    elif name is None and file is None and not pull:
+        raise typer.BadParameter(
+            "provide --file <export> or --pull (with --source), or run `wmh build` interactively"
+        )
+    if params.file and params.pull:
+        raise typer.BadParameter("pass either --file or --pull, not both")
+    if params.source not in list_adapters():
+        raise typer.BadParameter(
+            f"unknown --source {params.source!r}; choose one of: {', '.join(list_adapters())}"
+        )
+    # The wizard always resolves a provider; the flag path keeps its historical default.
+    params.provider = params.provider or "bedrock"
 
-    validate_name(params.name)
+    # Flag-supplied names get the same whitespace-to-dash normalization as the wizard.
+    params.name = normalize_name(params.name)
+    try:
+        validate_name(params.name)
+    except ValueError as err:
+        raise typer.BadParameter(str(err)) from None
     try:
         serve_provider = ProviderKind(params.provider)
     except ValueError:
@@ -292,11 +382,15 @@ def build(
         embed_dim=params.embed_dim,
         gepa_budget=params.gepa_budget,
         train_split=params.train_split,
+        judge_model=params.judge_model or judge_model_default(params.provider, params.model),
+        trace_adapter=params.source,
     )
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
     # silently swallows it and "succeeds" with a useless held-out-0.0 model.
-    _verify_or_abort(config)
+    if not use_wizard:
+        # The wizard already live-pinged the serve provider and embedder inline.
+        _verify_or_abort(config)
 
     # Meter the build at the provider boundary: the one serve provider drives GEPA rollouts,
     # reflection, and the judge, so wrapping it captures all build LLM cost/tokens without touching
@@ -307,14 +401,30 @@ def build(
         tracker,
         classify=classify_build_call,
     )
+    metered_judge = metered
+    if config.judge_model and config.judge_model != config.serve_provider_config().model:
+        judge_cfg = config.serve_provider_config().model_copy(update={"model": config.judge_model})
+        metered_judge = MeteredProvider(
+            providers.get_provider(judge_cfg), tracker, classify=classify_build_call
+        )
     build_stats = BuildTelemetryStats()
     with tracker.timed(), RichBuildReporter(_console, params.name) as reporter:
         result = run_build(
             config,
-            file=params.file,
-            vendor=VendorPull() if params.vendor else None,
+            file=None if params.pull else params.file,
+            vendor=(
+                VendorPull(
+                    api_key=params.api_key,
+                    project=params.project,
+                    since=params.since,
+                    limit=params.limit,
+                )
+                if params.pull
+                else None
+            ),
             root=model_dir,
             serve_provider=metered,
+            judge_provider=metered_judge,
             embedder=get_embedder(config),
             reporter=TelemetryBuildReporter(reporter, build_stats),
         )
@@ -344,22 +454,12 @@ def build(
             )
 
 
-# The `uv sync` extra that installs each provider's SDK, surfaced when a verify ping fails with a
-# missing module so the fix is one copy-paste away.
-_PROVIDER_EXTRA: dict[ProviderKind, str] = {
-    ProviderKind.ANTHROPIC: "anthropic",
-    ProviderKind.BEDROCK: "bedrock",
-    ProviderKind.OPENAI: "openai",
-    ProviderKind.AZURE_OPENAI: "openai",
-}
-
-
 def _verify_or_abort(config: HarnessConfig) -> None:
     """Ping the serve provider (and any provider-backed embedder) and abort on failure.
 
     Runs before any rollouts so a missing SDK or bad creds fails loudly and immediately, instead of
     being swallowed inside GEPA and yielding a useless model. Raises `typer.Exit(1)` with an
-    actionable hint (the `uv sync` extra for a missing SDK; "check creds / model id" otherwise).
+    actionable hint (`uv sync` for a missing SDK; "check creds / model id" otherwise).
     """
     checks = [(config.serve_provider_config(), False)]
     if config.embed_provider is not EmbedderKind.HASHING:
@@ -376,8 +476,8 @@ def _verify_or_abort(config: HarnessConfig) -> None:
         failed = True
         _console.print(f"  [red]✗ {label} ({result.model}) failed[/red]: {result.detail}")
         if "No module named" in result.detail:
-            extra = _PROVIDER_EXTRA.get(cfg.kind, cfg.kind.value)
-            _console.print(f"    [yellow]run `uv sync --extra {extra}` to install the SDK[/yellow]")
+            # SDKs are core deps; a missing module means the env is stale or hand-rolled.
+            _console.print("    [yellow]run `uv sync` to install the provider SDKs[/yellow]")
         else:
             envs = ", ".join(PROVIDER_ENV_VARS.get(cfg.kind, []))
             hint = f" ({envs})" if envs else ""
@@ -398,6 +498,81 @@ def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list
     _console.print(models_table(infos))
 
 
+@app.command("download")
+def download(
+    benchmarks: list[str] = _DOWNLOAD_BENCHMARKS,
+    force: bool = typer.Option(False, "--force", help="Overwrite existing local files."),
+) -> None:
+    """Download benchmark data bundles (trace corpus + task data) from the Hub.
+
+    With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
+    picker. Bundles land in `packages/environment-capture/<benchmark>/`; existing local files
+    are kept unless `--force`.
+    """
+    selected = list(benchmarks or [])
+    if selected == ["all"]:
+        selected = sorted(CORPORA)
+    if not selected:
+        try:
+            published = published_corpora()
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"could not list the Hub's published datasets ({exc.reason}); check the "
+                "connection, or pass benchmark names directly, e.g. `wmh download bird-sql`"
+            ) from exc
+        if not published:
+            raise typer.BadParameter(
+                "no published corpora found on the Hub; "
+                "pass benchmark names directly, e.g. `wmh download bird-sql`"
+            )
+        notes = {}
+        for corpus in published:
+            local = (corpus_path(corpus.benchmark)).exists()
+            state = "local copy present" if local else "not downloaded"
+            when = f", updated {corpus.last_modified}" if corpus.last_modified else ""
+            notes[corpus.benchmark] = f"{state}{when}"
+        choices = [corpus.benchmark for corpus in published]
+        picked = select_option(
+            _console, "Download which data bundle?", [*choices, "all"], notes=notes
+        )
+        selected = choices if picked == "all" else [picked]
+    for name in selected:
+        existing = corpus_path(name).exists()
+        try:
+            path = _fetch_with_progress(name, force=force)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        except urllib.error.HTTPError as exc:
+            raise typer.BadParameter(
+                f"{name}: the Hub answered {exc.code} for {exc.url}; the dataset may not be "
+                "published yet — `wmh download` with no arguments lists what is"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"{name}: could not reach the Hub ({exc.reason}); check the connection and re-run"
+                " — fetches resume file-by-file"
+            ) from exc
+        state = "kept local" if existing and not force else "fetched"
+        _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+
+
+def _fetch_with_progress(name: str, *, force: bool) -> Path:
+    """fetch_corpus with a live byte progress bar (hidden when nothing needs downloading)."""
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        console=_console,
+        transient=True,
+    ) as progress:
+        task_id = progress.add_task(f"downloading {name}", total=None, visible=False)
+
+        def on_progress(done: int, total: int) -> None:
+            progress.update(task_id, completed=done, total=total or None, visible=True)
+
+        return fetch_corpus(name, force=force, on_progress=on_progress)
+
+
 @app.command("serve")
 def serve(
     name: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
@@ -412,12 +587,24 @@ def serve(
     `/world_models/{name}/sessions` and `.../step`.
     """
     names = list(name) if name else None
-    uvicorn.run(create_app(root, names=names), host="127.0.0.1", port=port)
+    # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
+    # not a traceback; load the models before uvicorn takes over the process.
+    try:
+        server_app = create_app(root, names=names)
+    except (ValueError, FileNotFoundError) as err:
+        raise typer.BadParameter(str(err)) from None
+    uvicorn.run(server_app, host="127.0.0.1", port=port)
 
 
 @app.command("eval")
 def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin isn't used here
     tokens: list[str] | None = _EVAL_TOKENS,
+    mode: str = typer.Option(
+        "open-loop",
+        "--mode",
+        help="open-loop: replay traces, score per-step fidelity (default). "
+        "closed-loop: a live agent runs tasks with the world model as its environment.",
+    ),
     prompt_file: str | None = typer.Option(
         None, "--prompt", help="Prompt file; default=BASE_ENV_PROMPT."
     ),
@@ -460,34 +647,81 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
     ),
     limit: int = typer.Option(20, help="Rows to show for `wmh eval results`."),
+    name: str | None = typer.Option(
+        None, "--name", help="World model for --mode closed-loop (default: the only built one)."
+    ),
+    root: str = typer.Option(
+        ARTIFACT_DIR, help="Project dir holding world models (--mode closed-loop)."
+    ),
+    k: int = typer.Option(
+        3, min=1, help="Closed-loop passes per task (means reported, never 1-pass)."
+    ),
+    max_turns: int | None = typer.Option(
+        None, min=1, help="Closed-loop agent turn cap (default: 20, or the harness's own)."
+    ),
+    threshold: float = typer.Option(
+        0.5, help="Agreement pass threshold on a task's k-pass success rate."
+    ),
+    harness: str | None = typer.Option(
+        None, "--harness", help="Stored harness to run for `closed-loop` (default: baseline)."
+    ),
 ) -> None:
     """Score reconstruction fidelity, or run named example-local eval suites.
 
     Flows:
-    - `wmh eval <trace files...>`: ad hoc replay scoring.
+    - `wmh eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
+      default mode).
+    - `wmh eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
+      as its environment; score task success against gold assertions
+      (see docs/reference/closed_loop.md).
     - `wmh eval list`: list named suites under `examples/<task>/evals/`.
     - `wmh eval run <suite>`: run a suite and save a local JSON result.
     - `wmh eval results optional-suite`: summarize local suite results.
+    - `wmh eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
+      (e.g. world-model vs real environment) — the outcome-agreement validity check.
     """
     args = tokens or []
-    suite_root = str(_examples_root()) if examples_root is None else examples_root
+    suite_roots = (
+        [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
+    )
+    if mode not in ("open-loop", "closed-loop"):
+        raise typer.BadParameter(f"unknown --mode {mode!r}; choose open-loop or closed-loop")
+    if mode == "closed-loop":
+        if len(args) != 1 or args[0] in ("list", "run", "results", "agreement"):
+            raise typer.BadParameter("usage: wmh eval <tasks.jsonl> --mode closed-loop")
+        run_closed_loop(
+            _console,
+            tasks_file=args[0],
+            name=name,
+            root=root,
+            k=k,
+            max_turns=max_turns,
+            out=out,
+            harness=harness,
+        )
+        return
+    if args and args[0] == "agreement":
+        if len(args) != 3:
+            raise typer.BadParameter("usage: wmh eval agreement <report_a.json> <report_b.json>")
+        run_agreement(_console, report_a=args[1], report_b=args[2], threshold=threshold)
+        return
     if args and args[0] == "list":
         if len(args) != 1:
             raise typer.BadParameter("usage: wmh eval list")
-        _eval_list(suite_root)
+        _eval_list(suite_roots)
         return
     if args and args[0] == "results":
         if len(args) > 2:
             raise typer.BadParameter("usage: wmh eval results [suite]")
         suite_filter = args[1] if len(args) == 2 else None
-        _eval_results(results_root, suite_root, suite_filter, limit=limit)
+        _eval_results(results_root, suite_roots, suite_filter, limit=limit)
         return
     if args and args[0] == "run":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval run <suite>")
         _eval_run_suite(
             args[1],
-            examples_root=suite_root,
+            examples_roots=suite_roots,
             results_root=results_root,
             prompt_file=prompt_file,
             provider=provider,
@@ -546,8 +780,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
 
 
-def _eval_list(examples_root: str) -> None:
-    suites = discover_eval_suites(examples_root)
+def _eval_list(examples_roots: list[str]) -> None:
+    suites = discover_eval_suites(examples_roots)
     if not suites:
         _console.print("[yellow]no eval suites found[/yellow]")
         return
@@ -570,7 +804,7 @@ def _eval_list(examples_root: str) -> None:
 
 def _eval_results(
     results_root: str,
-    examples_root: str,
+    examples_roots: list[str],
     suite_filter: str | None,
     *,
     limit: int,
@@ -578,7 +812,7 @@ def _eval_results(
     resolved_suite = suite_filter
     if suite_filter is not None:
         try:
-            resolved_suite = resolve_eval_suite(suite_filter, examples_root).id
+            resolved_suite = resolve_eval_suite(suite_filter, examples_roots).id
         except ValueError:
             resolved_suite = suite_filter
     summaries = list_eval_results(results_root, resolved_suite, limit=limit)
@@ -609,7 +843,7 @@ def _eval_results(
 def _eval_run_suite(
     selector: str,
     *,
-    examples_root: str,
+    examples_roots: list[str],
     results_root: str,
     prompt_file: str | None,
     provider: str,
@@ -626,7 +860,7 @@ def _eval_run_suite(
     top_k: int | None,
     out: str | None,
 ) -> None:
-    suite = resolve_eval_suite(selector, examples_root)
+    suite = resolve_eval_suite(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -768,7 +1002,7 @@ def _run_eval_files(
         else llm
     )
     scorer = RubricJudge(judge_llm) if options.judge == "rubric" else LLMJudge(judge_llm)
-    return evaluate_files(
+    evaluation = OpenLoopEval(
         files,
         prompt,
         llm,
@@ -779,6 +1013,7 @@ def _run_eval_files(
         sample_turns=options.sample_turns,
         seed=options.seed,
     )
+    return evaluation.run()
 
 
 def _print_eval_report(report: EvalReport) -> None:
@@ -807,30 +1042,457 @@ def _eval_report_payload(report: EvalReport) -> dict[str, object]:
     }
 
 
+@scenarios_app.command("build")
+def scenarios_build(
+    file: str = typer.Option(..., "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
+    out: str = typer.Option("scenarios.json", "--out", help="Where to write the scenario set."),
+    budget: int = typer.Option(20, help="Number of scenarios to construct."),
+    k: int = typer.Option(None, help="Cluster count (default: sqrt(corpus size))."),
+    limit: int = typer.Option(None, help="Only use the first N ingested traces (cost control)."),
+    provider: str = typer.Option(
+        None,
+        "--provider",
+        help=(
+            "Pin ONE LLM for every role (facets/naming/synthesis/validation). When omitted, "
+            "roles resolve from .wmh/settings.toml [models.worker|judge|summary]."
+        ),
+    ),
+    model: str = typer.Option(None, help="Model id (pins all roles, like --provider)."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    embed_provider: str = typer.Option(
+        "hashing",
+        help=(
+            "Facet embedder: hashing (offline but lexical-only — clusters by wording, not "
+            "meaning; prefer a semantic embedder for real corpora) | bedrock | openai | "
+            "azure_openai."
+        ),
+    ),
+    embed_model: str = typer.Option(None, help="Embeddings model id / Azure deployment."),
+    embed_dim: int = typer.Option(512, help="Embedding dimensionality."),
+    seed: int = typer.Option(0, help="Clustering seed."),
+) -> None:
+    """Distill a trace corpus into a representative scenario set (facets -> cluster -> select).
+
+    Writes a `ScenarioSet` JSON: scenarios (task, seed state, checklist, weight, provenance),
+    the named clusters they came from, and the corpus-coverage number that justifies them.
+    """
+    traces = get_adapter("otel-genai").from_file(file)
+    if limit is not None:
+        traces = traces[:limit]
+    if not traces:
+        raise typer.BadParameter(f"no traces ingested from {file}")
+    summary_llm, worker_llm, judge_llm = _scenario_role_llms(provider, model, region)
+    embedder = _resolve_scenario_embedder(embed_provider, embed_model, embed_dim, region)
+
+    _console.print(f"extracting facets for {len(traces)} traces…")
+    facets = FacetExtractor(summary_llm).extract_all(traces)
+    config = ScenarioBuildConfig(budget=budget, k=k, seed=seed)
+    scenario_set = build_scenario_set(
+        traces, facets, worker_llm, embedder, config, judge_provider=judge_llm
+    )
+    scenario_set.save(out)
+
+    table = Table(title="Scenario set")
+    table.add_column("Cluster", no_wrap=True)
+    table.add_column("Scenario task")
+    table.add_column("Weight", justify="right")
+    table.add_column("Source", no_wrap=True)
+    for scenario in scenario_set.scenarios:
+        source = scenario.failure_category or scenario.source_outcome.value
+        table.add_row(scenario.cluster_name, scenario.task[:80], f"{scenario.weight:.3f}", source)
+    _console.print(table)
+    _console.print(
+        f"{len(scenario_set.scenarios)} scenarios from {scenario_set.corpus_traces} traces; "
+        f"coverage {scenario_set.corpus_coverage:.0%} at tau={scenario_set.coverage_tau} -> {out}"
+    )
+
+
+@scenarios_app.command("verify")
+def scenarios_verify(
+    scenarios_file: str = typer.Argument(..., help="Scenario set JSON from `wmh scenarios build`."),
+    file: str = typer.Option(..., "--file", help="Source trace corpus (for back-agreement)."),
+    name: str = typer.Option(None, "--name", help="World model to roll against."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models."),
+    provider: str = typer.Option(None, "--provider", help="Override serve provider kind."),
+    model: str = typer.Option(None, help="Override serve model id (e.g. a small/cheap model)."),
+    region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    max_steps: int = typer.Option(12, help="Rollout step budget per scenario."),
+    drop: bool = typer.Option(False, "--drop", help="Write back only verified scenarios."),
+) -> None:
+    """Closed-loop verification: back-agreement on source traces + solvability rollouts.
+
+    Loads the world model (optionally overriding its serve provider with a cheaper model), rolls a
+    baseline LLM agent on every scenario, and grades episodes against each scenario's checklist.
+    With `--drop`, unverified scenarios are removed from the set in place.
+    """
+    scenario_set = ScenarioSet.load(scenarios_file)
+    traces = get_adapter("otel-genai").from_file(file)
+    if provider is not None or model is not None:
+        store = WorldModelStore(root)
+        model_dir = store.resolve(_resolve_name(store, name))
+        override = _provider_config(
+            provider or "bedrock", model or "us.anthropic.claude-opus-4-8", region
+        )
+        llm = RetryingProvider(providers.get_provider(override))
+        world_model = WorldModel.load(str(model_dir), llm)
+    else:
+        world_model, _resolved_name, llm = _load_model(name, root)
+
+    # The rollout agent takes the worker role and the grader the judge role when configured in
+    # settings (judge should differ in family from the generator); both fall back to the world
+    # model's serve provider, which was the only behavior before roles existed.
+    worker_config = _role_provider_config("worker", region)
+    judge_config = _role_provider_config("judge", region)
+    agent_llm = providers.get_provider(worker_config) if worker_config else llm
+    judge_llm = providers.get_provider(judge_config) if judge_config else llm
+    report = verify_scenarios(
+        scenario_set,
+        traces,
+        world_model,
+        LLMAgent(agent_llm),
+        ChecklistJudge(judge_llm),
+        max_steps=max_steps,
+    )
+    table = Table(title="Scenario verification")
+    table.add_column("Scenario", no_wrap=True)
+    table.add_column("Back-agree")
+    table.add_column("Solvable")
+    table.add_column("Pass rate", justify="right")
+    for verdict in report.verdicts:
+        if verdict.back_agreement is None:
+            agree = "-"
+        else:
+            agree = "yes" if verdict.back_agreement else "NO"
+        table.add_row(
+            verdict.scenario_id,
+            agree,
+            "yes" if verdict.solvable else "NO",
+            f"{verdict.rollout_pass_rate:.2f}",
+        )
+    _console.print(table)
+    _console.print(
+        f"back-agreement {report.back_agreement_rate:.0%}, solvable {report.solvable_rate:.0%} "
+        f"over {len(report.verdicts)} scenarios"
+    )
+    if drop:
+        verified = {v.scenario_id for v in report.verdicts if v.ok}
+        scenario_set.retain(verified)
+        scenario_set.save(scenarios_file)
+        _console.print(
+            f"kept {len(scenario_set.scenarios)} verified scenarios "
+            f"(weights renormalized, coverage reset) -> {scenarios_file}"
+        )
+
+
+def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
+    try:
+        kind = ProviderKind(provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in ProviderKind)
+        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+    return ProviderConfig(kind=kind, model=model, region=region)
+
+
+_SCENARIO_DEFAULT_PROVIDER = "bedrock"
+_SCENARIO_DEFAULT_MODEL = "us.anthropic.claude-opus-4-8"
+
+
+def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
+    """ProviderConfig for a settings-defined model role, or None when the role isn't configured.
+
+    Roles live in `.wmh/settings.toml` under `[models.worker|judge|summary]`; unset judge/summary
+    fall back to worker (see `ModelsSettings.resolve`). A role's stored region wins over the
+    generic `--region` flag — the flag also feeds the embedder, and e.g. a judge pinned to the
+    one region where its model is enabled must not follow it.
+    """
+    configured = load_settings().models.resolve(role)
+    if configured is None:
+        return None
+    config = _provider_config(configured.provider, configured.model, configured.region or region)
+    return config.model_copy(
+        update={"endpoint": configured.endpoint, "deployment": configured.deployment}
+    )
+
+
+def _scenario_role_llms(
+    provider: str | None, model: str | None, region: str | None
+) -> tuple[Provider, Provider, Provider]:
+    """(summary, worker, judge) providers for scenario construction.
+
+    Explicit `--provider`/`--model` flags pin ALL roles to that one model (the pre-roles
+    behavior). Otherwise each role resolves from `.wmh/settings.toml`, falling back to worker,
+    then to the built-in default. Judging benefits from a different family than the worker —
+    a same-family judge carries self-preference bias toward the generator's outputs.
+    """
+    if provider is not None or model is not None:
+        config = _provider_config(
+            provider or _SCENARIO_DEFAULT_PROVIDER, model or _SCENARIO_DEFAULT_MODEL, region
+        )
+        llm = providers.get_provider(config)
+        return llm, llm, llm
+    default = _provider_config(_SCENARIO_DEFAULT_PROVIDER, _SCENARIO_DEFAULT_MODEL, region)
+    cache: dict[str, Provider] = {}
+    by_role: dict[str, Provider] = {}
+    for role in ("summary", "worker", "judge"):
+        config = _role_provider_config(role, region) or default
+        key = f"{config.kind.value}:{config.model}:{config.endpoint}:{config.region}"
+        if key not in cache:
+            cache[key] = providers.get_provider(config)
+        by_role[role] = cache[key]
+    return by_role["summary"], by_role["worker"], by_role["judge"]
+
+
+def _resolve_scenario_embedder(
+    embed_provider: str, embed_model: str | None, embed_dim: int, region: str | None
+) -> Embedder:
+    try:
+        kind = EmbedderKind(embed_provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in EmbedderKind)
+        raise typer.BadParameter(
+            f"unknown embed provider {embed_provider!r}; choose one of: {kinds}"
+        ) from None
+    if kind is EmbedderKind.HASHING:
+        return HashingEmbedder(dim=embed_dim)
+    if not embed_model:
+        raise typer.BadParameter(
+            f"--embed-provider {kind.value} requires --embed-model "
+            "(the embeddings model id / Azure embedding deployment)"
+        )
+    return providers.get_provider(
+        ProviderConfig(
+            kind=kind.provider_kind(),
+            model=embed_model,
+            embed_model=embed_model,
+            embed_dim=embed_dim,
+            region=region,
+        )
+    )
+
+
 @app.command("demo")
 def demo(
-    name: str = typer.Option(None, "--name", help="World model to demo (default: the only one)."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    name: str = typer.Option(None, "--name", help="World model to demo (default: pick one)."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    steps: int = typer.Option(5, help="Max scenario steps to replay."),
+    traces: str = typer.Option(
+        None, "--traces", help="Trace file to sample the scenario from (default: the model's)."
+    ),
+    seed: int = typer.Option(None, help="Seed for the scenario sample (default: random)."),
+    show_prompt: bool = typer.Option(
+        True,
+        "--show-prompt/--no-prompt",
+        help="Print the exact env prompt the world model sees for the first step.",
+    ),
 ) -> None:
-    """Demo the harness: an LLM agent makes a tool call vs the world model; show prompt+output."""
-    wm, _resolved_name, provider = _load_model(name, root)
-    # Seed the demo agent from whatever steps the index holds.
-    examples = wm.sample_steps(3)
-    result = run_demo(wm, provider, examples)
-    _console.print(f"[bold]agent action[/bold]: {result.agent_action.model_dump()}")
-    _console.print(f"[bold]env prompt[/bold]:\n{result.env_prompt}")
-    _console.print(f"[bold]observation[/bold]: {result.observation.model_dump()}")
+    """Replay a randomly sampled recorded scenario against the world model, open loop."""
+    wm, resolved_name, _provider, model_root = _load_model_any(name, root)
+    traces_file = Path(traces) if traces else _traces_for_root(model_root)
+    if traces_file is None or not traces_file.exists():
+        raise typer.BadParameter(
+            f"no trace file found for {resolved_name!r} under {model_root}; pass --traces"
+        )
+    model_dir = WorldModelStore(str(model_root)).resolve(resolved_name)
+    config = load_config(model_dir)  # the model dir holds its own HarnessConfig
+    candidates = [t for t in ingest(config, file=str(traces_file)) if t.steps]
+    if not candidates:
+        raise typer.BadParameter(f"{traces_file} contains no replayable traces")
+    trace = random.Random(seed).choice(candidates)
+
+    total = min(steps, len(trace.steps))
+    _console.print(
+        f"replaying scenario [bold]{trace.trace_id}[/bold] against [bold]{resolved_name}[/bold] "
+        f"(open loop, {total} of {len(trace.steps)} steps)…"
+    )
+    if trace.steps[0].task:
+        _console.print(f"[dim]task: {escape(trace.steps[0].task)}[/dim]")
+    if show_prompt:
+        _console.print(
+            Panel(
+                escape(_first_prompt(wm, trace)),
+                title="[dim]env prompt (step 1) — what the world model sees[/dim]",
+                border_style="bright_black",
+            )
+        )
+
+    done: list = []  # DemoStep results stream in as each prediction lands
+
+    def _print_result(i: int, n: int, demo_step) -> None:  # noqa: ANN001 - engine DemoStep
+        done.append(demo_step)
+        action = demo_step.action
+        call = (
+            f"{action.name} {json.dumps(action.arguments)}"
+            if action.name
+            else (action.content or "")[:120]
+        )
+        verdict = (
+            "[green]exact match[/green]" if demo_step.exact_match else "[yellow]differs[/yellow]"
+        )
+        _console.print(f"\n[bold]step {i}/{n}[/bold]  [cyan]{escape(call)}[/cyan]  {verdict}")
+        _console.print(f"  [green]predicted[/green]: {escape(demo_step.predicted.content)}")
+        _console.print(f"  [dim]actual[/dim]:    {escape(demo_step.actual.content)}")
+        note = demo_step.predicted.metadata.get("state_note")
+        if isinstance(note, str) and note.strip():
+            _console.print(f"  [dim]model note: {escape(note.strip())}[/dim]")
+
+    while True:
+        try:
+            busy = "[dim]world model predicting…[/dim]"
+            with _console.status(busy, spinner="dots") as status:
+                _NARRATOR.attach(status, busy)
+
+                def _on_step(i: int, n: int) -> None:
+                    text = f"[dim]world model predicting step {i}/{n}…[/dim]"
+                    _NARRATOR.busy = text
+                    status.update(text)
+
+                try:
+                    run_demo(
+                        wm,
+                        trace,
+                        max_steps=steps,
+                        on_step=_on_step,
+                        on_result=_print_result,
+                        skip=len(done),
+                    )
+                finally:
+                    _NARRATOR.detach()
+            break
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not _is_capacity_error(exc) or not _console.is_terminal:
+                raise
+            # Retries are exhausted and the backend is still down: offer to re-point the model
+            # at a different provider (same picker as the build wizard) and RESUME from the
+            # failed step — completed steps stay done.
+            _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
+            _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
+            provider_name, model_id, region = select_provider_and_model(
+                _console,
+                lambda text: _console.input(text),
+                lambda text: _console.input(text, password=True),
+                default_provider=None,
+                default_model=None,
+                default_region=None,
+                interactive=True,
+                check=lambda cfg: verify_all([cfg])[0],
+            )
+            switched = ProviderConfig(
+                kind=ProviderKind(provider_name), model=model_id, region=region
+            )
+            provider = RetryingProvider(
+                providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
+            )
+            wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
+            _console.print(
+                f"[dim]resuming from step {len(done) + 1} with {provider_name} ({model_id})…[/dim]"
+            )
+    matches = sum(1 for d in done if d.exact_match)
+    _console.print(f"\n{matches}/{len(done)} exact matches (run `wmh eval` for judged fidelity)")
+
+
+def _first_prompt(wm: WorldModel, trace) -> str:  # noqa: ANN001 - core Trace
+    """Render the first step's env prompt on a throwaway session (display only)."""
+    probe = wm.new_session(task=trace.steps[0].task)
+    try:
+        return wm.render_step_prompt(probe.id, trace.steps[0].action)
+    finally:
+        wm.end_session(probe.id)
 
 
 @app.command("play")
 def play(
-    name: str = typer.Option(None, "--name", help="World model to play (default: the only one)."),
+    name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
 ) -> None:
     """Step into the environment yourself: type actions, the world model returns observations."""
-    wm, resolved_name, _provider = _load_model(name, root)
-    run_play_repl(_console, wm, resolved_name, task)
+    wm, resolved_name, _provider, _model_root = _load_model_any(name, root)
+    suggestions = _action_suggestions(wm)
+    run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
+
+
+def _traces_for_root(model_root: Path) -> Path | None:
+    """The trace corpus that built the models under `model_root`, when it ships alongside."""
+    candidate = model_root / "traces.otel.jsonl"
+    return candidate if candidate.exists() else None
+
+
+def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
+    """Real action lines sampled from the model's corpus, to seed the play prompt."""
+    suggestions: list[str] = []
+    for step in wm.sample_steps(8):
+        action = step.action
+        if action.name:
+            args = json.dumps(action.arguments) if action.arguments else ""
+            line = f"{action.name} {args}".strip()
+        elif action.content:
+            line = f"say {action.content[:60]}"
+        else:
+            continue
+        if line not in suggestions:
+            suggestions.append(line)
+        if len(suggestions) >= n:
+            break
+    return suggestions
+
+
+def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider, Path)
+    """Resolve a model across the project dir AND shipped examples, then load it.
+
+    An explicit non-default `--root` keeps the old single-root behavior. Otherwise the picker
+    spans `<root>/models/*` plus `examples/*/models/*`, labeling each with its source.
+    """
+    if root != ARTIFACT_DIR:
+        wm, resolved, provider = _load_model(name, root)
+        return wm, resolved, provider, Path(root)
+
+    candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
+    local = WorldModelStore(root)
+    candidates.extend((f"{n} (local)", Path(root), n) for n in local.list_names())
+    for example_dir in _discover_examples():
+        example_store = WorldModelStore(example_dir)
+        candidates.extend(
+            (f"{n} ({example_dir.name} example)", example_dir, n)
+            for n in example_store.list_names()
+        )
+
+    if name is not None:
+        matched = [c for c in candidates if c[2] == name]
+        if not matched:
+            have = ", ".join(c[2] for c in candidates) or "none built"
+            raise typer.BadParameter(f"no world model named {name!r} (have: {have})")
+        # Prefer the local build over a same-named example artifact.
+        label, store_root, resolved = matched[0]
+    elif not candidates:
+        raise typer.BadParameter(
+            "no world models found; run `wmh build` or try an example (examples/tau-bench)"
+        )
+    elif len(candidates) == 1:
+        label, store_root, resolved = candidates[0]
+    elif _console.is_terminal:
+        labels = [c[0] for c in candidates]
+        chosen = _select_from(labels)
+        label, store_root, resolved = candidates[labels.index(chosen)]
+    else:
+        have = ", ".join(c[2] for c in candidates)
+        raise typer.BadParameter(f"multiple world models ({have}); pass --name")
+
+    wm, resolved, provider = _load_model(resolved, str(store_root))
+    return wm, resolved, provider, store_root
+
+
+def _select_from(labels: list[str]) -> str:
+    """Interactive picker over pre-rendered labels (arrow keys on a TTY)."""
+    from wmh.cli import ui as _ui  # package-internal: reuse the wizard's picker machinery
+
+    return _ui._select(
+        _console,
+        lambda text: _console.input(text),
+        "Select a world model",
+        labels,
+        None,
+        interactive=True,
+    )
 
 
 def _resolve_name(store: WorldModelStore, name: str | None) -> str:
@@ -854,44 +1516,158 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _examples_root() -> Path:
-    """Repo-local examples directory."""
-    return Path(__file__).resolve().parents[2] / "examples"
+def _benchmark_roots() -> tuple[Path, ...]:
+    """Every root holding self-contained task dirs: examples/ + the capture member's data dirs."""
+    repo = Path(__file__).resolve().parents[2]
+    return (repo / "examples", repo / "packages" / "environment-capture")
 
 
 def _discover_examples() -> list[Path]:
-    root = _examples_root()
-    if not root.exists():
-        return []
-    return sorted(
-        path
-        for path in root.iterdir()
-        if path.is_dir() and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
-    )
+    found: list[Path] = []
+    for root in _benchmark_roots():
+        if not root.exists():
+            continue
+        found.extend(
+            path
+            for path in root.iterdir()
+            if path.is_dir()
+            and _is_safe_example_name(path.name)
+            and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
+        )
+    return sorted(found)
+
+
+def _is_safe_example_name(name: str) -> bool:
+    """Whether `name` would resolve via `wmh examples run` — keeps list/hint/run in agreement."""
+    try:
+        validate_name(name)
+    except ValueError:
+        return False
+    return True
 
 
 def _resolve_example(name: str) -> Path:
-    example_dir = _examples_root() / validate_name(name)
-    if example_dir.is_dir():
-        return example_dir
+    # An unsafe segment (spaces, path separators, ...) is simply not an example name; fall
+    # through to the same "unknown example" usage error instead of a ValueError traceback.
+    try:
+        safe = validate_name(name)
+    except ValueError:
+        safe = None
+    if safe is not None:
+        matches = [root / safe for root in _benchmark_roots() if (root / safe).is_dir()]
+        if len(matches) > 1:
+            found = ", ".join(str(path) for path in matches)
+            raise typer.BadParameter(f"example {name!r} exists in multiple roots: {found}")
+        if matches:
+            return matches[0]
     available = ", ".join(path.name for path in _discover_examples())
     hint = f" (available: {available})" if available else ""
     raise typer.BadParameter(f"unknown example {name!r}{hint}")
 
 
+def _short_error(exc: Exception) -> str:
+    """The error's code + service message, without transport chatter.
+
+    botocore's text ("... (reached max retries: 1) ...") reads as OUR retry state and confuses
+    the narration; the structured code + message is what the user needs.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error", {})
+        code, message = error.get("Code"), error.get("Message") or ""
+        if code:
+            return f"{code}: {message}".rstrip(": ")[:110]
+    return str(exc).splitlines()[0][:110]
+
+
+class _RetryNarrator:
+    """Console narration for RetryingProvider: hiccup lines + an inline countdown.
+
+    The hiccup line prints only when the failure CHANGES (a stream of identical throttles says
+    it once); while a rich status is attached (demo), the wait counts down in place as
+    "retry k/3 — waiting Ns…" and then hands the spinner back to the busy text.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._status = None  # rich Status while a spinner context is active
+        self.busy = ""
+        self._last_error: str | None = None
+        self._attempt = 0
+        self._total = 0
+
+    def attach(self, status, busy: str) -> None:  # noqa: ANN001 - rich Status
+        self._status = status
+        self.busy = busy
+
+    def detach(self) -> None:
+        self._status = None
+        self._last_error = None
+
+    def on_retry(self, attempt: int, total: int, delay: float, exc: Exception) -> None:
+        detail = _short_error(exc)
+        if detail != self._last_error:
+            self._console.print(f"  [yellow]provider hiccup: {escape(detail)}[/yellow]")
+            self._last_error = detail
+        self._attempt, self._total = attempt, total
+        if self._status is None:
+            self._console.print(f"  [yellow]retry {attempt}/{total} in {delay:.0f}s…[/yellow]")
+
+    def sleep(self, delay: float) -> None:
+        remaining = int(delay)
+        while remaining > 0:
+            if self._status is not None:
+                self._status.update(
+                    f"[yellow]retry {self._attempt}/{self._total} — waiting {remaining}s…[/yellow]"
+                )
+            time.sleep(1)
+            remaining -= 1
+        if self._status is not None:
+            self._status.update(self.busy)
+
+
+_NARRATOR = _RetryNarrator(_console)
+
+
 def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider)
     """Resolve + load a named world model (or the single built one) with its serve provider.
 
-    Returns `(world_model, resolved_name, provider)` so callers can reuse the provider without
-    re-reading config / reconstructing it.
+    The serve provider comes from the MODEL'S OWN config (the one it was built to serve on),
+    wrapped so transient capacity errors retry with narrated exponential backoff instead of
+    dying. Returns `(world_model, resolved_name, provider)`.
     """
     store = WorldModelStore(root)
     resolved_name = _resolve_name(store, name)
-    world_model, provider = load_world_model(
-        store.resolve(resolved_name), telemetry_root=store.root
+    model_dir = store.resolve(resolved_name)
+    config = load_config(model_dir)
+    provider = RetryingProvider(
+        providers.get_provider(config.serve_provider_config()),
+        on_retry=_NARRATOR.on_retry,
+        sleep=_NARRATOR.sleep,
     )
+    world_model = WorldModel.load(str(model_dir), provider, telemetry_root=store.root)
     return world_model, resolved_name, provider
 
 
 if __name__ == "__main__":
+    app()
+
+
+def _quiet_http_logs() -> None:
+    """Cap noisy per-request loggers at WARNING.
+
+    The openai SDK (via httpx) logs one INFO line per API call; logging handlers write to the
+    real stderr and bypass the live display's redirection, so during a build each request would
+    scroll the GEPA activity region and litter orphaned frame headers across the terminal.
+    """
+    for name in ("httpx", "httpcore", "openai", "botocore", "urllib3", "anthropic"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def main() -> None:
+    """CLI entry point: load `.env` from the working directory (so wizard-saved provider keys
+    persist across sessions), then dispatch. Kept out of import time so importing the module
+    never mutates os.environ."""
+    load_env_file()
+    _quiet_http_logs()
     app()

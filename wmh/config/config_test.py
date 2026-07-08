@@ -11,6 +11,11 @@ from wmh.config.config import HarnessConfig, load_config, save_config
 from wmh.providers.base import EmbedderKind, ProviderConfig, ProviderKind
 
 
+def test_gepa_budget_default_is_modest() -> None:
+    # 10 iterations ~= 700 metric calls with the capped valset; 50 was ~3.4k calls (hours).
+    assert HarnessConfig().gepa_budget == 10
+
+
 def test_save_then_load_round_trips(tmp_path: Path) -> None:
     config = HarnessConfig(
         providers=[

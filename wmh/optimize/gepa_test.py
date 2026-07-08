@@ -157,6 +157,22 @@ def test_optimize_runs_bounded_loop_and_returns_valid_frontier() -> None:
     assert judge.calls > 0
 
 
+def test_optimize_reports_real_metric_call_budget_via_on_budget() -> None:
+    # Progress bars must be sized by the TRANSLATED metric-call budget, not the iteration count:
+    # sizing by iterations made `wmh build` show 100% while GEPA was still burning valset calls.
+    from wmh.optimize.gepa import _metric_call_budget
+
+    seen: list[int] = []
+    opt = GEPAOptimizer(FakeProvider(), FakeJudge(score=0.5), on_budget=seen.append)
+    budget = 5
+
+    opt.optimize([_trace("tr1"), _trace("tr2")], [_trace("te1")], "BASE", budget)
+
+    # trainset = 2 traces x 2 steps -> minibatch 3; valset = 1 trace x 2 steps.
+    assert seen == [_metric_call_budget(budget, valset_size=2, minibatch=3)]
+    assert seen[0] > budget  # the whole point: the real total exceeds the iteration count
+
+
 def test_optimize_can_retrieve_from_separate_rag_corpus() -> None:
     from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
@@ -240,6 +256,45 @@ def test_predict_observation_runs_deterministically() -> None:
         provider, "P", task=None, state=EnvState(), action=Action(kind=ActionKind.MESSAGE), demos=[]
     )
     assert provider.rollout_temps == [0.0]
+
+
+def test_activity_logger_forwards_first_lines_and_drops_prompt_bodies() -> None:
+    from wmh.optimize.gepa import _ActivityLogger
+
+    seen: list[str] = []
+    logger = _ActivityLogger(seen.append)
+    logger.log("Iteration 1: Selected program 0 score: 0.5")
+    logger.log("Iteration 1: Proposed new text for env_prompt: You are an env\nbody line\nmore")
+    logger.log("Linear pareto front program index: 0")  # every message's first line streams
+    logger.log("   \n")  # blank messages drop
+    assert seen == [
+        "Iteration 1: Selected program 0 score: 0.5",
+        "Iteration 1: Proposed new text for env_prompt: You are an env",
+        "Linear pareto front program index: 0",
+    ]
+
+
+def test_reflection_lm_brackets_the_call_in_activity() -> None:
+    from wmh.optimize.gepa import _reflection_lm
+
+    lines: list[str] = []
+    call = _reflection_lm(FakeProvider(), lines.append)
+    call("improve this prompt")
+    assert lines[0] == "reflection: proposing an improved env prompt…"
+    assert lines[1].startswith("reflection: proposal ready (")
+
+
+def test_adapter_evaluate_streams_per_step_activity() -> None:
+    lines: list[str] = []
+    adapter = WorldModelGEPAAdapter(FakeProvider(), FakeJudge(score=0.5), on_activity=lines.append)
+    from wmh.retrieval.leakfree import DemoRetriever
+
+    steps = _eval_steps([_trace("t1")], DemoRetriever(None, []))
+    adapter.evaluate(steps, {ENV_PROMPT_COMPONENT: "BASE"})
+    # A batch-start line, then one line per step as each rollout+judge lands.
+    assert lines[0] == "evaluating candidate on 2 steps…"
+    assert len(lines) == 3
+    assert all("fidelity 0.50" in line for line in lines[1:])
 
 
 def test_adapter_evaluate_scores_and_captures_traces() -> None:

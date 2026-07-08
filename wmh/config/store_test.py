@@ -7,7 +7,7 @@ import json
 import pytest
 
 from wmh.config import ArtifactPaths, HarnessConfig, save_config
-from wmh.config.store import DEFAULT_MODEL_NAME, WorldModelStore, validate_name
+from wmh.config.store import DEFAULT_MODEL_NAME, WorldModelStore, normalize_name, validate_name
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 
@@ -33,6 +33,14 @@ def test_validate_name_accepts_safe_names_and_rejects_traversal() -> None:
     for bad in ["../escape", "a/b", ".", "", ".hidden", "with space"]:
         with pytest.raises(ValueError, match="invalid world model name"):
             validate_name(bad)
+
+
+def test_normalize_name_dash_joins_whitespace() -> None:
+    assert normalize_name("tau bench") == "tau-bench"
+    assert normalize_name("  tau   bench  ") == "tau-bench"
+    assert normalize_name("tau-bench") == "tau-bench"  # already safe: unchanged
+    with pytest.raises(ValueError, match="invalid world model name"):
+        validate_name(normalize_name("tau/bench"))  # normalization never rescues separators
 
 
 def test_list_names_and_info(tmp_path) -> None:  # noqa: ANN001 - pytest fixture

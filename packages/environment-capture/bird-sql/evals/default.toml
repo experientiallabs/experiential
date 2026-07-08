@@ -1,0 +1,7 @@
+title = "BIRD-SQL default replay"
+description = "Open-loop reconstruction fidelity over the bird-sql trace corpus (train-split real runs)."
+files = ["../traces.otel.jsonl"]
+train_split = 0.7
+sample_turns = "all"
+seed = 0
+judge = "rubric"

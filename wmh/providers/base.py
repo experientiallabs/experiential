@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 class ProviderKind(StrEnum):
     ANTHROPIC = "anthropic"  # Opus 4.8 direct
     BEDROCK = "bedrock"  # Claude 4.8 via AWS
-    AZURE_OPENAI = "azure_openai"  # GPT 5.5 via Azure
+    AZURE_OPENAI = "azure"  # GPT 5.5 via the Azure OpenAI service
     OPENAI = "openai"  # GPT 5.5 direct
     OPENAI_RESPONSES = "openai_responses"  # GPT 5.x direct via the Responses API
 
@@ -27,7 +27,7 @@ class EmbedderKind(StrEnum):
     HASHING = "hashing"  # offline HashingEmbedder (default)
     BEDROCK = "bedrock"  # Titan on AWS Bedrock
     OPENAI = "openai"  # OpenAI embeddings
-    AZURE_OPENAI = "azure_openai"  # Azure OpenAI embedding deployment
+    AZURE_OPENAI = "azure"  # Azure OpenAI embedding deployment
 
     def provider_kind(self) -> ProviderKind:
         """The ProviderKind backing this embedder. Raises for `HASHING` (no provider)."""
@@ -123,16 +123,22 @@ class Provider(Protocol):
 # One read-only instance reused across every verify() ping (complete() never mutates messages).
 _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 
+# Ping output budget. Reasoning models (GPT-5.x) spend output tokens on reasoning before any
+# visible text, and OpenAI 400s ("max_tokens or model output limit was reached") when the budget
+# can't cover it — which reads like bad credentials. Non-reasoning models stop after a token or
+# two regardless, so the headroom costs nothing there.
+PING_MAX_TOKENS = 2048
+
 
 def verify_via_ping(provider: Provider) -> VerifyResult:
-    """Shared `verify()`: one cheap 1-token completion, reporting failure as ok=False.
+    """Shared `verify()`: one cheap short completion, reporting failure as ok=False.
 
     Every backend's verify() is identical apart from its kind/model (both on the config), so they
     all delegate here. Never raises — `verify_all` relies on that to not crash startup.
     """
     cfg = provider.config
     try:
-        provider.complete("", _PING_MESSAGES, max_tokens=1)
+        provider.complete("", _PING_MESSAGES, max_tokens=PING_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001 - verify reports failure, never raises
         return VerifyResult(ok=False, kind=cfg.kind, model=cfg.model, detail=str(exc))
     return VerifyResult(ok=True, kind=cfg.kind, model=cfg.model)

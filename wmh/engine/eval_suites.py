@@ -7,12 +7,16 @@ the suite file. Generated run results are local artifacts, normally written unde
 from __future__ import annotations
 
 import json
+import logging
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+
+logger = logging.getLogger(__name__)
 
 SampleTurns = Literal["all", "sampled"]
 JudgeName = Literal["rubric", "match"]
@@ -76,15 +80,29 @@ class EvalResultSummary:
     total_steps: int
 
 
-def discover_eval_suites(examples_root: str | Path) -> list[EvalSuite]:
-    """Find every example-local suite under `examples_root/*/evals/*.toml`."""
-    root = Path(examples_root)
-    if not root.exists():
-        return []
+def discover_eval_suites(examples_root: str | Path | Iterable[str | Path]) -> list[EvalSuite]:
+    """Find every example-local suite under `<root>/*/evals/*.toml` across one or more roots.
+
+    A malformed suite file is skipped with a warning naming the file and the parse error —
+    one broken benchmark dir must not take down listing/resolution for every other suite.
+    Loading the broken suite directly (by path) still raises the full error.
+    """
     suites: list[EvalSuite] = []
-    for path in sorted(root.glob("*/evals/*.toml")):
-        suites.append(load_eval_suite(path))
+    for root in _as_roots(examples_root):
+        if not root.exists():
+            continue
+        for path in sorted(root.glob("*/evals/*.toml")):
+            try:
+                suites.append(load_eval_suite(path))
+            except ValueError as exc:
+                logger.warning("skipping eval suite %s: %s", path, exc)
     return suites
+
+
+def _as_roots(examples_root: str | Path | Iterable[str | Path]) -> list[Path]:
+    if isinstance(examples_root, (str, Path)):
+        return [Path(examples_root)]
+    return [Path(root) for root in examples_root]
 
 
 def load_eval_suite(path: str | Path) -> EvalSuite:
@@ -114,7 +132,9 @@ def load_eval_suite(path: str | Path) -> EvalSuite:
     )
 
 
-def resolve_eval_suite(selector: str, examples_root: str | Path) -> EvalSuite:
+def resolve_eval_suite(
+    selector: str, examples_root: str | Path | Iterable[str | Path]
+) -> EvalSuite:
     """Resolve `selector` as `example/suite`, `example` for default, or a direct TOML path."""
     direct = Path(selector)
     if direct.suffix == ".toml" and direct.exists():
@@ -122,6 +142,9 @@ def resolve_eval_suite(selector: str, examples_root: str | Path) -> EvalSuite:
 
     suites = discover_eval_suites(examples_root)
     exact = [suite for suite in suites if suite.id == selector]
+    if len(exact) > 1:
+        paths = ", ".join(str(suite.path) for suite in exact)
+        raise ValueError(f"eval suite {selector!r} exists in multiple roots: {paths}")
     if exact:
         return exact[0]
     aliased = [suite for suite in suites if selector in suite.aliases]

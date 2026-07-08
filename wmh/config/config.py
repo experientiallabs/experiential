@@ -32,13 +32,15 @@ class HarnessConfig(BaseModel):
     providers: list[ProviderConfig] = Field(default_factory=list)
     serve_provider: ProviderKind = ProviderKind.ANTHROPIC  # serves the live world model
     # Which embedder supplies phi for retrieval. Defaults to the offline HashingEmbedder (no creds);
-    # set to a provider-backed kind (bedrock/openai/azure_openai) for semantic phi.
+    # set to a provider-backed kind (bedrock/openai/azure) for semantic phi.
     embed_provider: EmbedderKind = EmbedderKind.HASHING
     embed_dim: int = 512  # phi dimensionality; index + query embedder must agree on this
     top_k: int = 5  # demos retrieved per step (DreamGym k)
     # train/held-out ratio for GEPA; a proper fraction so both splits can be non-empty
     train_split: float = Field(default=0.8, gt=0.0, lt=1.0)
-    gepa_budget: int = 50  # rollout budget for prompt evolution
+    gepa_budget: int = 10  # GEPA iterations; ~valset_cap calls each (see _cap_gepa_valset)
+    # Model id the GEPA judge runs on (same provider kind as serve). None = the serve model.
+    judge_model: str | None = None
     trace_adapter: str = "otel-genai"
 
     def provider_config(self, kind: ProviderKind) -> ProviderConfig:
@@ -77,6 +79,8 @@ class HarnessConfig(BaseModel):
         embed_dim: int,
         gepa_budget: int,
         train_split: float = 0.8,
+        judge_model: str | None = None,
+        trace_adapter: str = "otel-genai",
     ) -> HarnessConfig:
         """Assemble a build config from the choices `wmh build` collects.
 
@@ -108,6 +112,8 @@ class HarnessConfig(BaseModel):
             embed_dim=embed_dim,
             gepa_budget=gepa_budget,
             train_split=train_split,
+            judge_model=judge_model,
+            trace_adapter=trace_adapter,
         )
 
 

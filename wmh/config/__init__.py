@@ -8,6 +8,7 @@ from wmh.config.config import (
     load_config,
     save_config,
 )
+from wmh.config.dotenv import load_env_file, upsert_env_var
 from wmh.config.settings import (
     ProjectSettings,
     TelemetrySettings,
@@ -21,6 +22,7 @@ from wmh.config.store import (
     DEFAULT_MODEL_NAME,
     ModelInfo,
     WorldModelStore,
+    normalize_name,
     validate_name,
 )
 
@@ -36,10 +38,13 @@ __all__ = [
     "WorldModelStore",
     "ensure_telemetry_anonymous_id",
     "load_config",
+    "load_env_file",
     "load_settings",
+    "normalize_name",
     "save_config",
     "save_settings",
     "set_telemetry_enabled",
     "settings_path",
+    "upsert_env_var",
     "validate_name",
 ]

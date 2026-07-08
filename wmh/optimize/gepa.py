@@ -19,6 +19,7 @@ against what is actually deployed.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -36,6 +37,9 @@ from wmh.retrieval.leakfree import DemoRetriever
 
 # The single named component GEPA evolves: the specialized env (system) prompt.
 ENV_PROMPT_COMPONENT = "env_prompt"
+
+# Concurrent rollout+judge calls per GEPA evaluation batch (I/O bound; modest for rate limits).
+_EVAL_CONCURRENCY = 4
 
 # Called once per judged rollout: (rollouts_done, mean_score_so_far). Used to drive build progress.
 RolloutCallback = Callable[[int, float | None], None]
@@ -140,15 +144,20 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
     RAG-aware: each step is evaluated with the SAME retrieved demos the serving world model would
     use (DreamGym top-k), so GEPA optimizes the prompt under serving conditions rather than a
     zero-shot one. Retrieval depends on (state, action) — not on the candidate prompt — so demos are
-    precomputed once (see `GEPAOptimizer._eval_steps`) and reused across every candidate.
+    precomputed once (see the module-level `_eval_steps`) and reused across every candidate.
     """
 
     def __init__(
-        self, provider: Provider, judge: Judge, on_rollout: RolloutCallback | None = None
+        self,
+        provider: Provider,
+        judge: Judge,
+        on_rollout: RolloutCallback | None = None,
+        on_activity: Callable[[str], None] | None = None,
     ) -> None:
         self._provider = provider
         self._judge = judge
         self._on_rollout = on_rollout
+        self._on_activity = on_activity
         self._rollouts = 0
         self._score_sum = 0.0
 
@@ -159,10 +168,14 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
         capture_traces: bool = False,
     ) -> EvaluationBatch[_StepTrajectory, Observation]:
         prompt = candidate[ENV_PROMPT_COMPONENT]
-        outputs: list[Observation] = []
-        scores: list[float] = []
-        trajectories: list[_StepTrajectory] | None = [] if capture_traces else None
-        for item in batch:
+        if not batch:
+            return EvaluationBatch(
+                outputs=[], scores=[], trajectories=[] if capture_traces else None
+            )
+        if self._on_activity is not None:
+            self._on_activity(f"evaluating candidate on {len(batch)} steps…")
+
+        def eval_one(item: _EvalStep) -> tuple[Observation, float, str]:
             step = item.step
             try:
                 predicted = predict_observation(
@@ -175,17 +188,37 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
                     history=item.history,
                 )
                 result = self._judge.score(predicted, step.observation, step)
-                score, critique = result.score, result.critique
+                return predicted, result.score, result.critique
             except Exception as exc:  # noqa: BLE001 - per-example failure must not abort the run
-                predicted = Observation(content="", is_error=True)
-                score, critique = 0.0, f"Rollout failed: {exc}"
-            outputs.append(predicted)
-            scores.append(score)
-            self._note_rollout(score)
-            if trajectories is not None:
-                trajectories.append(
-                    _StepTrajectory(step=step, predicted=predicted, score=score, critique=critique)
-                )
+                return Observation(content="", is_error=True), 0.0, f"Rollout failed: {exc}"
+
+        # Rollout+judge calls are I/O bound; evaluate the batch concurrently (order preserved by
+        # index) and emit callbacks from THIS thread as results land — the live display and the
+        # run tracker see a serial stream.
+        results: list[tuple[Observation, float, str] | None] = [None] * len(batch)
+        with ThreadPoolExecutor(max_workers=min(_EVAL_CONCURRENCY, len(batch))) as pool:
+            futures = {pool.submit(eval_one, item): i for i, item in enumerate(batch)}
+            landed = 0
+            for future in as_completed(futures):
+                index = futures[future]
+                outcome = future.result()
+                results[index] = outcome
+                landed += 1
+                _, score, critique = outcome
+                self._note_rollout(score)
+                if self._on_activity is not None:
+                    note = f" — {critique.strip()[:110]}" if critique.strip() else ""
+                    self._on_activity(f"[{landed}/{len(batch)}] fidelity {score:.2f}{note}")
+
+        outputs = [r[0] for r in results if r is not None]
+        scores = [r[1] for r in results if r is not None]
+        trajectories: list[_StepTrajectory] | None = None
+        if capture_traces:
+            trajectories = [
+                _StepTrajectory(step=item.step, predicted=r[0], score=r[1], critique=r[2])
+                for item, r in zip(batch, results, strict=True)
+                if r is not None
+            ]
         return EvaluationBatch(outputs=outputs, scores=scores, trajectories=trajectories)
 
     def make_reflective_dataset(
@@ -194,6 +227,9 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
         eval_batch: EvaluationBatch[_StepTrajectory, Observation],
         components_to_update: list[str],
     ) -> Mapping[str, Sequence[Mapping[str, JsonValue]]]:
+        if self._on_activity is not None:
+            count = len(eval_batch.trajectories or [])
+            self._on_activity(f"distilling {count} scored steps into reflection examples…")
         records: list[Mapping[str, JsonValue]] = []
         for traj in eval_batch.trajectories or []:
             # The same canonical (state, action) text the model saw at prediction time.
@@ -289,17 +325,27 @@ memorizing that example.
 Provide the full improved prompt (existing prompt + your additions) within ``` blocks."""
 
 
-def _reflection_lm(provider: Provider):  # noqa: ANN202 - returns gepa's LanguageModel callable
-    """Wrap a Provider as GEPA's reflection LM: `(str | list[dict]) -> str`."""
+def _reflection_lm(  # noqa: ANN202 - returns gepa's LanguageModel callable
+    provider: Provider, on_activity: Callable[[str], None] | None = None
+):
+    """Wrap a Provider as GEPA's reflection LM: `(str | list[dict]) -> str`.
+
+    The reflection call is the longest silent gap in an iteration, so it brackets itself in the
+    activity stream ("proposing…" / "proposal ready").
+    """
 
     def call(prompt: str | list[dict[str, JsonValue]]) -> str:
         text = prompt if isinstance(prompt, str) else _flatten_chat(prompt)
+        if on_activity is not None:
+            on_activity("reflection: proposing an improved env prompt…")
         completion = provider.complete(
             _REFLECTION_SYSTEM,
             [Message(role="user", content=text)],
             temperature=1.0,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
+        if on_activity is not None:
+            on_activity(f"reflection: proposal ready ({len(completion.text)} chars)")
         return completion.text
 
     return call
@@ -317,6 +363,23 @@ def _flatten_chat(messages: list[dict[str, JsonValue]]) -> str:
 # --- the optimizer -------------------------------------------------------------------------------
 
 
+class _ActivityLogger:
+    """gepa `LoggerProtocol` sink that forwards narration to `on_activity`.
+
+    Every message contributes its FIRST line (selection, proposal, subsample verdicts, pareto
+    and merge updates all narrate this way); the proposed-prompt message continues with the full
+    multi-line prompt body, which would flood a fixed-height window, so continuations drop.
+    """
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+
+    def log(self, message: str) -> None:
+        line = message.split("\n", 1)[0].strip()
+        if line:
+            self._emit(line[:240])
+
+
 class GEPAOptimizer:
     """Reflective prompt evolution against the held-out trace split (drives the `gepa` engine)."""
 
@@ -327,10 +390,17 @@ class GEPAOptimizer:
         retriever: Retriever | None = None,
         on_rollout: RolloutCallback | None = None,
         *,
+        on_budget: Callable[[int], None] | None = None,
+        on_activity: Callable[[str], None] | None = None,
         seed: int = 0,
     ) -> None:
         self._provider = provider
         self._judge = judge
+        # `on_budget` receives the REAL translated max_metric_calls right before the run starts —
+        # callers reporting progress must size their bar with it, not with `budget` (iterations),
+        # or the bar finishes while GEPA is still burning valset calls.
+        self._on_budget = on_budget
+        self._on_activity = on_activity
         # Optional retriever for RAG-aware evaluation. When None, GEPA evaluates zero-shot.
         self._retriever = retriever
         self._on_rollout = on_rollout
@@ -406,14 +476,29 @@ class GEPAOptimizer:
             hard_val = [es for es in valset if hard_step_filter(es.step)]
             if hard_val:
                 valset = hard_val
-        adapter = WorldModelGEPAAdapter(self._provider, self._judge, self._on_rollout)
+        adapter = WorldModelGEPAAdapter(
+            self._provider, self._judge, self._on_rollout, on_activity=self._on_activity
+        )
+        # Route gepa's own narration (iteration selections, proposed prompt edits, subsample
+        # scores) into the activity stream; the default StdOutLogger would fight a live display.
+        logger = _ActivityLogger(self._on_activity) if self._on_activity is not None else None
         minibatch = min(3, len(trainset))
+        metric_calls = _metric_call_budget(budget, len(valset), minibatch)
+        if self._on_budget is not None:
+            self._on_budget(metric_calls)
+        if self._on_activity is not None:
+            # First line lands before any LLM call: the activity window must never sit empty
+            # while the (long) seed valset evaluation runs.
+            self._on_activity(
+                f"scoring the seed prompt on {len(valset)} valset steps "
+                f"({metric_calls} metric calls budgeted)…"
+            )
         result = gepa.optimize(
             seed_candidate={ENV_PROMPT_COMPONENT: base_prompt},
             trainset=trainset,
             valset=valset,
             adapter=adapter,
-            reflection_lm=_reflection_lm(self._provider),
+            reflection_lm=_reflection_lm(self._provider, self._on_activity),
             reflection_prompt_template=_REFLECTION_PROMPT_TEMPLATE,
             candidate_selection_strategy="pareto",
             # Merge is a headline GEPA feature: combine complementary lessons from two Pareto-front
@@ -421,10 +506,11 @@ class GEPAOptimizer:
             # in the library; we enable it so knowledge accumulated on different failure modes
             # composes instead of competing.
             use_merge=True,
-            max_metric_calls=_metric_call_budget(budget, len(valset), minibatch),
+            max_metric_calls=metric_calls,
             reflection_minibatch_size=minibatch,
             display_progress_bar=False,
             raise_on_exception=False,
+            logger=logger,
             seed=self._seed,
         )
 

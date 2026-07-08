@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -12,6 +14,10 @@ from typer.testing import CliRunner
 
 from wmh.cli import app
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, verify_via_ping
+
+# `wmh.cli`'s `app` attribute (the Typer object) shadows the `wmh.cli.app` submodule on
+# plain `import wmh.cli.app as ...`; go through importlib to monkeypatch module globals.
+cli_app_module = importlib.import_module("wmh.cli.app")
 
 runner = CliRunner()
 
@@ -119,7 +125,7 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    assert names == {"build", "list", "serve", "demo", "eval", "play"}
+    assert names == {"build", "list", "serve", "demo", "eval", "play", "download"}
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -131,6 +137,120 @@ def test_bare_invocation_shows_help(args: list[str]) -> None:
     # Bare invocation keeps the usage-error exit code (click >=8.2), unlike explicit --help
     # which exits 0 — scripts can still tell "asked for help" from "forgot the command".
     assert result.exit_code == 2
+
+
+def test_build_rejects_invalid_name_flag_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app,
+        ["build", "--name", "tau/bench", "--file", _traces_file(tmp_path), "--no-interactive"],
+    )
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "invalid world model name" in result.output
+
+
+def test_examples_run_rejects_invalid_name_with_friendly_error() -> None:
+    result = runner.invoke(app, ["examples", "run", "tau bench"])
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "unknown example" in result.output
+
+
+def test_serve_rejects_invalid_name_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["serve", "--name", "tau bench", "--root", str(tmp_path / ".wmh")])
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "invalid world model name" in result.output
+
+
+def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A dir whose name validate_name rejects can never be run, so list (and the "available:"
+    # hint in the unknown-example error) must not advertise it.
+    for dirname in ("good-example", "tau bench"):
+        example = tmp_path / dirname
+        example.mkdir()
+        (example / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+
+    listed = runner.invoke(app, ["examples", "list"])
+    assert listed.exit_code == 0, listed.output
+    assert "good-example" in listed.output
+    assert "tau bench" not in listed.output
+
+    unknown = runner.invoke(app, ["examples", "run", "nope"])
+    assert unknown.exit_code == 2
+    assert "available: good-example" in unknown.output
+
+
+def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # The persistence half of the wizard's credential flow: keys saved to .env must be back in
+    # os.environ on the next `wmh` invocation (main), and importing the module must NOT load.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("WMH_TEST_MAIN_VAR=loaded\n", encoding="utf-8")
+    monkeypatch.delenv("WMH_TEST_MAIN_VAR", raising=False)
+    monkeypatch.setattr(cli_app_module, "app", lambda: None)
+    cli_app_module.main()
+    assert os.environ["WMH_TEST_MAIN_VAR"] == "loaded"
+
+
+def test_demo_replays_a_sampled_scenario_open_loop(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    _build(root, "demo-model", tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--seed",
+            "0",
+            "--steps",
+            "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "replaying scenario" in result.output
+    assert "predicted" in result.output
+    assert "actual" in result.output
+    assert "exact matches" in result.output
+
+
+def test_retry_narrator_dedupes_identical_failures_and_counts_down(monkeypatch) -> None:  # noqa: ANN001
+    from rich.console import Console as RichConsole
+
+    _RetryNarrator = cli_app_module._RetryNarrator
+
+    console = RichConsole(force_terminal=False, no_color=True, width=100)
+
+    class Boto(Exception):
+        def __init__(self, code: str) -> None:
+            super().__init__("An error occurred (reached max retries: 1)")
+            self.response = {"Error": {"Code": code, "Message": "Bedrock is unable"}}
+
+    class FakeStatus:
+        def __init__(self) -> None:
+            self.updates: list[str] = []
+
+        def update(self, text: str) -> None:
+            self.updates.append(text)
+
+    monkeypatch.setattr(cli_app_module.time, "sleep", lambda _s: None)
+    narrator = _RetryNarrator(console)
+    status = FakeStatus()
+    narrator.attach(status, "busy")
+    with console.capture() as cap:
+        narrator.on_retry(1, 3, 1.0, Boto("ServiceUnavailableException"))
+        narrator.sleep(1.0)
+        narrator.on_retry(2, 3, 3.0, Boto("ServiceUnavailableException"))  # same failure: silent
+        narrator.sleep(3.0)
+        narrator.on_retry(3, 3, 9.0, Boto("ThrottlingException"))  # different: printed
+    out = cap.get()
+    assert out.count("provider hiccup") == 2  # deduped consecutive identical failures
+    assert "ServiceUnavailableException: Bedrock is unable" in out
+    assert "reached max retries" not in out  # transport chatter stripped
+    assert "retry 2/3 — waiting 3s…" in " ".join(status.updates)  # inline countdown
+    assert status.updates[-1] == "busy"  # spinner text restored after the wait
 
 
 def test_providers_subcommand_is_registered() -> None:
@@ -180,9 +300,9 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
 
     assert result.exit_code == 0, result.output
     command = cast(list[str], seen["command"])
-    assert command[0].endswith("examples/tau-bench/run.sh")
+    assert command[0].endswith("environment-capture/tau-bench/run.sh")
     assert command[1:] == ["--trace", "0"]
-    assert str(seen["cwd"]).endswith("examples/tau-bench")
+    assert str(seen["cwd"]).endswith("environment-capture/tau-bench")
     assert seen["check"] is False
 
 
@@ -325,19 +445,27 @@ def test_play_repl_steps_and_quits(patched_provider, tmp_path) -> None:  # noqa:
     assert "user u1 found" in result.output
 
 
-def test_build_interactive_wizard_creates_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
+def test_build_interactive_wizard_creates_model(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+) -> None:
     root = tmp_path / ".wmh"
+    for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(var, "test-cred")  # creds present: no interactive key prompts
     # --interactive forces the wizard even under CliRunner (non-TTY); feed each answer line in
-    # prompt order: name, file, provider (select), model (select), region (bedrock only), budget,
-    # embedder (select). The offline 'hashing' embedder skips the embed-model prompt; phi dim isn't
-    # prompted. Provider/model/embedder are picked by index against their option lists.
+    # prompt order: name, trace source (select), file, provider (select), model (select), region
+    # (bedrock only), judge model (select), budget, embedder (select). The offline 'hashing'
+    # embedder skips the embed-model prompt; phi dim isn't prompted. Selects pick by index.
     answers = "\n".join(
         [
             "wizard-built",
+            "",  # trace source: accept the default (otel-genai)
             _traces_file(tmp_path),
-            "1",  # provider: bedrock
+            "3",  # provider: bedrock (order: openai, anthropic, bedrock, azure, ...)
             "1",  # model: us.anthropic.claude-opus-4-8
             "us-east-1",
+            "",  # judge model: accept the bedrock default (dated haiku)
             "4",  # gepa budget
             "1",  # embedder: hashing
         ]
@@ -383,7 +511,7 @@ def test_build_aborts_when_provider_sdk_missing(monkeypatch, tmp_path) -> None: 
         app, ["build", "--name", "x", "--file", _traces_file(tmp_path), "--root", str(root)]
     )
     assert result.exit_code == 1
-    assert "uv sync --extra bedrock" in result.output
+    assert "run `uv sync` to install the provider SDKs" in result.output
     # Aborted before building: no artifact written.
     assert not (root / "models" / "x" / "config.toml").exists()
 
@@ -426,3 +554,114 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
+
+
+def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001
+    from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    made: list[ProviderConfig] = []
+
+    def fake_get_provider(config: ProviderConfig) -> ProviderConfig:
+        made.append(config)
+        return config  # identity provider: assertions read the config directly
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", fake_get_provider)
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings",
+        lambda: ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(provider="azure", model="gpt-5.4", endpoint="https://x/v1"),
+                judge=ModelRole(
+                    provider="bedrock", model="us.anthropic.claude-opus-4-8", region="us-east-2"
+                ),
+            )
+        ),
+    )
+    summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
+    assert summary is worker  # unset summary falls back to the worker role
+    assert cast(ProviderConfig, worker).model == "gpt-5.4"
+    assert cast(ProviderConfig, worker).endpoint == "https://x/v1"
+    assert cast(ProviderConfig, judge).model == "us.anthropic.claude-opus-4-8"
+    assert cast(ProviderConfig, judge).region == "us-east-2"
+    assert len(made) == 2  # worker constructed once and shared with summary
+
+
+def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
+    assert summary is worker
+    assert worker is judge
+    assert cast(ProviderConfig, worker).model == "some-model"
+
+
+def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None:  # noqa: ANN001
+    from wmh.config.settings import ProjectSettings
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
+    assert summary is worker
+    assert worker is judge
+    assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"
+
+def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    fetched: list[tuple[str, bool]] = []
+
+    def fake_fetch(name: str, *, force: bool = False, on_progress=None) -> Path:  # noqa: ANN001
+        fetched.append((name, force))
+        return tmp_path / name / "traces.otel.jsonl"
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fake_fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "bird-sql", "dabstep", "--force"])
+    assert result.exit_code == 0, result.output
+    assert fetched == [("bird-sql", True), ("dabstep", True)]
+    assert "fetched" in result.output
+
+
+def test_download_all_expands_to_the_manifest(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    fetched: list[str] = []
+    monkeypatch.setattr(
+        cli_app_module,
+        "fetch_corpus",
+        lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
+    )
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "all"])
+    assert result.exit_code == 0, result.output
+    assert fetched == sorted(cli_app_module.CORPORA)
+
+
+def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "nope"])
+    assert result.exit_code != 0
+    assert "no published corpus" in result.output
+
+
+def test_download_picker_lists_published_and_fetches_choice(
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+) -> None:
+    from environment_capture.hub import PublishedCorpus
+
+    published = [
+        PublishedCorpus(
+            benchmark="gaia2",
+            repo_id="experiential-labs/wmh-gaia2-traces",
+            last_modified="2026-07-06",
+        )
+    ]
+    fetched: list[str] = []
+    monkeypatch.setattr(cli_app_module, "published_corpora", lambda: published)
+    monkeypatch.setattr(
+        cli_app_module,
+        "fetch_corpus",
+        lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
+    )
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download"], input="1\n")
+    assert result.exit_code == 0, result.output
+    assert fetched == ["gaia2"]
+    assert "not downloaded" in result.output  # picker showed local status

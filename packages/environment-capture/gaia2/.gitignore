@@ -1,0 +1,9 @@
+# The benchmark-local ARE engine venv and heavy re-fetchable scenario universes stay local.
+# traces.otel.jsonl and data/{train,test}.jsonl ARE committed (GAIA2 is CC-BY-4.0); only the large,
+# re-fetchable scenario JSONs and per-run scratch are ignored. See README.md.
+.venv/
+datafiles/
+runs_state/
+runs/
+experiments/
+*.log

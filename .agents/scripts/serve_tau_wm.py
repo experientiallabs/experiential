@@ -54,7 +54,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # WMH_MODEL_DIR/WMH_WM_NAME swap the served artifact for the D67 cross-benchmark
 # smokes (terminal/swe/gui reuse this script unchanged apart from these two).
 MODEL_DIR = Path(
-    os.environ.get("WMH_MODEL_DIR", REPO_ROOT / "examples" / "tau-bench" / "models" / "tau-bench")
+    os.environ.get("WMH_MODEL_DIR", REPO_ROOT / "packages" / "environment-capture" / "tau-bench" / "models" / "tau-bench")
 )
 WM_NAME = os.environ.get("WMH_WM_NAME", "tau-bench")
 HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # dated profile id (required)

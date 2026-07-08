@@ -7,7 +7,7 @@ import json
 import pytest
 
 from wmh.config import ArtifactPaths, HarnessConfig
-from wmh.core.types import Trace
+from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.engine.build import build, split_traces, split_traces_3way
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import HashingEmbedder
@@ -84,6 +84,26 @@ def test_split_traces_3way_rejects_degenerate_fractions() -> None:
         split_traces_3way(traces, 0.7, 0.4)  # sums to > 1 -> empty test
     with pytest.raises(ValueError, match="train_frac"):
         split_traces_3way(traces, 0.0, 0.5)
+
+
+def test_cap_gepa_valset_bounds_steps_and_keeps_at_least_one_trace() -> None:
+    from wmh.engine.build import _GEPA_VAL_STEP_CAP, _cap_gepa_valset
+
+    def trace_with_steps(tid: str, n: int) -> Trace:
+        step = Step(
+            action=Action(kind=ActionKind.TOOL_CALL, name="get", arguments={}),
+            observation=Observation(content="ok"),
+        )
+        return Trace(trace_id=tid, steps=[step.model_copy() for _ in range(n)])
+
+    many = [trace_with_steps(f"t{i}", 2) for i in range(200)]  # 400 steps uncapped
+    capped = _cap_gepa_valset(many)
+    assert sum(len(t.steps) for t in capped) <= _GEPA_VAL_STEP_CAP
+    assert capped == many[: len(capped)]  # stable prefix of the (already shuffled) split
+
+    # A single over-cap trace still passes through: never starve GEPA of a valset entirely.
+    huge = trace_with_steps("huge", _GEPA_VAL_STEP_CAP + 10)
+    assert _cap_gepa_valset([huge]) == [huge]
 
 
 def test_build_writes_a_loadable_artifact(tmp_path) -> None:  # noqa: ANN001 - pytest fixture

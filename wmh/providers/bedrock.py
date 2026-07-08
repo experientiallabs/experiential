@@ -1,4 +1,4 @@
-"""AWS Bedrock provider (Claude 4.8). Reads AWS_REGION + AWS credentials from the environment."""
+"""AWS Bedrock provider (Claude 4.8 / Amazon Nova). Reads AWS credentials from the environment."""
 
 from __future__ import annotations
 
@@ -45,6 +45,33 @@ class _TitanEmbedResponse(TypedDict):
     embedding: list[float]
 
 
+class _NovaContentBlock(TypedDict):
+    text: str
+
+
+class _NovaMessage(TypedDict):
+    content: list[_NovaContentBlock]
+
+
+class _NovaOutput(TypedDict):
+    message: _NovaMessage
+
+
+class _NovaUsage(TypedDict):
+    inputTokens: int
+    outputTokens: int
+
+
+class _NovaResponse(TypedDict):
+    output: _NovaOutput
+    usage: _NovaUsage
+
+
+def _is_nova(model_id: str) -> bool:
+    """Whether `model_id` is an Amazon Nova model (e.g. `us.amazon.nova-lite-v1:0`)."""
+    return ".nova-" in model_id or model_id.startswith("amazon.nova-")
+
+
 class BedrockProvider:
     """Claude 4.8 via the Bedrock Runtime (InvokeModel with the Anthropic Messages body)."""
 
@@ -72,15 +99,18 @@ class BedrockProvider:
             # stack 3 internal attempts per model UNDER our 4-model failover — up to 12 backend
             # calls with back-off for one throttled request — turning graceful degradation into a
             # slow crawl.
-            # `tcp_keepalive` guards the other stall mode: a keep-alive connection the LB
-            # silently dropped during an idle gap. Without it, the next call on that socket
-            # hangs until read_timeout (observed as ~10-minute stalls on the FIRST call after
-            # idle — turn-1 WM steps, sparse judge calls); with it, the OS detects the dead
-            # peer and the call fails fast into the FallbackProvider.
+            # Two independent stall modes, one Config (D77 reconcile):
+            # - "standard" retry mode makes max_attempts mean TOTAL attempts (legacy mode
+            #   sneaks in one internal retry — a long silent stall before the CLI's own
+            #   narrated backoff can react).
+            # - `tcp_keepalive` guards dead keep-alive connections the LB silently dropped
+            #   during an idle gap; without it the next call hangs until read_timeout
+            #   (observed as ~10-minute stalls on the FIRST call after idle), with it the
+            #   OS detects the dead peer and the call fails fast into the FallbackProvider.
             client_config = Config(
                 connect_timeout=15,
                 read_timeout=600,
-                retries={"max_attempts": 1},
+                retries={"max_attempts": 1, "mode": "standard"},
                 tcp_keepalive=True,
             )
             self._client = boto3.client(
@@ -96,6 +126,15 @@ class BedrockProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
+        if _is_nova(self.config.model):
+            return self._complete_nova(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+        if "anthropic" not in self.config.model:
+            # Kimi, DeepSeek, and other third-party models: the model-agnostic Converse API.
+            return self._complete_converse(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
         # Claude 4.8 rejects sampling params, so temperature is intentionally not forwarded.
         body = {
             "anthropic_version": _ANTHROPIC_BEDROCK_VERSION,
@@ -109,6 +148,66 @@ class BedrockProvider:
         usage = TokenUsage(
             input_tokens=data["usage"]["input_tokens"],
             output_tokens=data["usage"]["output_tokens"],
+        )
+        return Completion(text=text, usage=usage)
+
+    def _complete_converse(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Completion:
+        """Complete via the Converse API (model-agnostic: Kimi, DeepSeek, ...).
+
+        Converse normalizes request/response shapes across vendors; thinking models may emit
+        `reasoningContent` blocks, which are skipped — callers get the visible text only.
+        """
+        kwargs: dict[str, JsonValue] = {
+            "modelId": self.config.model,
+            "messages": [
+                {"role": m.role, "content": [{"text": m.content}]} for m in messages
+            ],
+            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
+        }
+        if system:
+            kwargs["system"] = [{"text": system}]
+        response = self._get_client().converse(**kwargs)
+        blocks = response["output"]["message"]["content"]
+        text = "".join(block["text"] for block in blocks if "text" in block)
+        usage = TokenUsage(
+            input_tokens=int(response["usage"]["inputTokens"]),
+            output_tokens=int(response["usage"]["outputTokens"]),
+        )
+        return Completion(text=text, usage=usage)
+
+    def _complete_nova(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Completion:
+        """Complete via an Amazon Nova model (different request/response schema than Anthropic).
+
+        Nova wraps message content in `[{"text": ...}]` blocks, takes sampling params under
+        `inferenceConfig`, and returns the reply under `output.message`. Unlike the Claude path,
+        `temperature` IS forwarded — Nova accepts it.
+        """
+        body: dict[str, JsonValue] = {
+            "messages": [{"role": m.role, "content": [{"text": m.content}]} for m in messages],
+            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
+        }
+        if system:
+            body["system"] = [{"text": system}]
+        raw = self._get_client().invoke_model(modelId=self.config.model, body=json.dumps(body))
+        data = cast("_NovaResponse", json.loads(raw["body"].read()))
+        text = "".join(block["text"] for block in data["output"]["message"]["content"])
+        usage = TokenUsage(
+            input_tokens=data["usage"]["inputTokens"],
+            output_tokens=data["usage"]["outputTokens"],
         )
         return Completion(text=text, usage=usage)
 
