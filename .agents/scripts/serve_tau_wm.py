@@ -11,9 +11,10 @@ cannot diverge between the training env and the eval env:
   0.95} (stdev 0.34) across fresh sessions, which drowns group-relative advantages in
   environment luck. Pinning ~0 makes same-actions → same-verdict, so within-group
   reward differences reflect the policy again.
-- ``eval`` (D30): env on the pinned GPT-5.5 (OpenAI; strongest circularity blunting vs
-  the haiku training env), reward judge on Opus 4.8 (D12/D21 — third family vs both WM
-  backends). Requires OPENAI_API_KEY, read from the gitignored ``.env`` at the repo root.
+- ``eval`` (D71/D76 sonnet-era; supersedes the D30 GPT-5.5 env, terminated D68): env on
+  Bedrock sonnet-5 (+ the artifact's RAG), reward judge on Opus 4.8, rubrics passed by
+  the caller where the benchmark pins them. Rows from this env are labeled sonnet-era
+  and never compared to gpt5-era absolutes.
 
 Both providers are wrapped in same-model FallbackProvider chains (D18): throttles fail
 over instantly; a hung read fails over at the bedrock client's 600s bound instead of
@@ -59,7 +60,8 @@ _DEFAULT_MODEL_DIR = (
 MODEL_DIR = Path(os.environ.get("WMH_MODEL_DIR", _DEFAULT_MODEL_DIR))
 WM_NAME = os.environ.get("WMH_WM_NAME", "tau-bench")
 HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # dated profile id (required)
-EVAL_ENV_MODEL = "gpt-5.5"
+# D71/D76 sonnet-era eval env (GPT-5.5 terminated, D68); label rows sonnet-era.
+EVAL_ENV_MODEL = "us.anthropic.claude-sonnet-5"
 JUDGE_MODEL = "us.anthropic.claude-opus-4-8"  # the artifact's own serve model id
 
 
@@ -196,12 +198,8 @@ def main() -> None:
             serve_provider = PinnedTemperatureProvider(serve_provider, float(env_temp))
     else:
         load_env_file(REPO_ROOT / ".env")
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise SystemExit(
-                "OPENAI_API_KEY missing: put it in the gitignored .env at the repo root"
-            )
         serve_provider = _fallback_chain(
-            ProviderConfig(kind=ProviderKind.OPENAI, model=EVAL_ENV_MODEL)
+            ProviderConfig(kind=ProviderKind.BEDROCK, model=EVAL_ENV_MODEL, region="us-east-1")
         )
         reward_provider = _fallback_chain(
             ProviderConfig(kind=ProviderKind.BEDROCK, model=JUDGE_MODEL, region="us-east-1"),
