@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from wmh.config import ArtifactPaths, load_config
@@ -45,6 +47,10 @@ class WorldModel:
         # Reward judging (`score_session`) defaults to the serve provider; pass `reward_provider`
         # to judge with a different model than the one simulating the environment.
         self._reward_provider = reward_provider or provider
+        # Online index enrichment (DreamGym-style): serving sessions feed generated steps back
+        # into retrieval. Evaluation rollouts must NOT (see `frozen`), or one episode's
+        # predictions become another's retrieved demos and results turn order-dependent.
+        self._enrich_index = True
 
     @classmethod
     def load(
@@ -84,8 +90,19 @@ class WorldModel:
             reward_provider=reward_provider,
         )
 
-    def new_session(self, task: str | None = None, seed_state: EnvState | None = None) -> Session:
-        session = Session(id=uuid.uuid4().hex, task=task, state=seed_state or EnvState())
+    def new_session(
+        self,
+        task: str | None = None,
+        seed_state: EnvState | None = None,
+        *,
+        enrich: bool = True,
+    ) -> Session:
+        """Open a session. `enrich=False` keeps its steps out of the shared retrieval buffer —
+        required for evaluation rollouts, whose PREDICTED observations must not become demos for
+        later rollouts (order-dependent, self-reinforcing scores otherwise)."""
+        session = Session(
+            id=uuid.uuid4().hex, task=task, state=seed_state or EnvState(), enrich=enrich
+        )
         self._sessions[session.id] = session
         tracker = RunTracker(run_id=session.id, kind="serve")
         tracker.start()
@@ -151,6 +168,22 @@ class WorldModel:
         if session.history:
             session.history[-1].observation.reward = score.reward
         return score
+
+    @contextmanager
+    def frozen(self) -> Iterator[WorldModel]:
+        """Suspend online index enrichment for the duration of the block.
+
+        Evaluation rollouts (scenario verification, score matrices) step the world model many
+        times; if those generated steps were indexed, later episodes would retrieve earlier
+        episodes' predictions instead of only the built trace corpus — results would depend on
+        evaluation order. Serving resumes enrichment when the block exits.
+        """
+        previous = self._enrich_index
+        self._enrich_index = False
+        try:
+            yield self
+        finally:
+            self._enrich_index = previous
 
     def render_step_prompt(self, session_id: str, action: Action) -> str:
         """Assemble the exact (system + user) env prompt `step` would send, without calling the LLM.
@@ -247,7 +280,10 @@ class WorldModel:
         )
         session.history.append(step)
         self._update_state(session, step)
-        self._retriever.add(step)
+        # Enrich the shared retrieval buffer only when the model enriches online AND this session
+        # opts in — eval/closed-loop rollouts pass enrich=False so predicted steps never leak in.
+        if self._enrich_index and session.enrich:
+            self._retriever.add(step)
 
     def _update_state(self, session: Session, step: Step) -> None:
         """Fold the step's effect into session.state (the env's free-text scratchpad "database").

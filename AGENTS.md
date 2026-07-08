@@ -20,6 +20,10 @@ uv run pytest -q
 - Every Python file must have a module docstring.
 - Write Google-style docstrings for all classes and functions with significant logic. Use plain
   one-line docstrings for simple/self-explanatory classes and functions.
+- **Never `print`.** All diagnostic/progress output goes through a module logger
+  (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
+  The one exception is deliberate user-facing CLI presentation, which goes through the rich
+  `Console` in `wmh/cli/ui.py` (that is product output, not logging).
 
 ## Rules
 
@@ -62,7 +66,11 @@ uv run pytest -q
      worktrees and chats) but exempt from the gate, from review standards, and from any
      stability expectation: it is pruned periodically and nothing may import from it or link to
      it as if it were permanent. `.agents/docs/` is organized as `reference/`,
-     `design-decisions/`, `research/` (incl. raw results), `proposals/`. When work matures, its
+     `design-decisions/`, `research/` (analysis prose plus small, stable result JSONs
+     that finished writeups cite, e.g. `trace_scaling_results/`; bulky or churning experiment
+     data — the distill/ablation program's pools, episodes, and eval JSONs — is never
+     committed and goes to the Notion experiments area under Research with a SHA-256
+     manifest, enforced by .gitignore on `research/distill/`), `proposals/`. When work matures, its
      product is promoted out (writeup → `docs/research/`, verified how-to → `docs/reference/`,
      reusable code → `wmh/`, dataset tooling → `examples/<task>/`) and the scraps die here.
    - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
@@ -71,15 +79,23 @@ uv run pytest -q
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `packages/` — every workspace member lives here, one dir per package:
-     `packages/llm-waterfall/` (stateless LLM failover), `packages/environment-capture/`
-     (pre-authorized; lands via its own PR — benchmark adapters + real-run trace capture
-     emitting OTel GenAI JSONL). Each is its own PyPI package.
+- `packages/` — every workspace member lives here, one dir per package:
+     `packages/llm-waterfall/` (stateless LLM failover) and `packages/environment-capture/`
+     (benchmark adapters + real-run trace capture emitting OTel GenAI JSONL). Each is its own
+     PyPI package. Per-benchmark data dirs (`packages/environment-capture/<benchmark>/`) follow
+     the examples/ discipline: Hub-hosted data bundles (trace corpus + task data/gold dirs as
+     public datasets under the experiential-labs org; gitignored here, fetched via
+     `environment_capture.hub`) + provenance/license README + thin
+     scripts; heavy deps and cloned upstreams in local gitignored venvs (out-of-process
+     `backend/` scripts ty-excluded; the three pre-contract dirs — tau-bench, terminal-tasks,
+     swe-bench — keep their examples-era ruff/ty exemption).
 
-6. **Keep dataset-specific logic inside examples.** SWE-bench, tau-bench, terminal-task, and similar
-   dataset-specific launch or conversion logic belongs under `examples/<task>/`. A standard example
-   folder should be self-contained, with `traces.otel.jsonl`, optional `evals/*.toml` definitions,
-   and task-local helpers if needed. Launch task helpers through `wmh examples run <task> -- <args>`.
+6. **Keep dataset-specific logic inside its benchmark dir.** Benchmark launch/capture/conversion
+   logic belongs under `packages/environment-capture/<benchmark>/` (all ten benchmark integrations live
+   there — tau-bench, terminal-tasks, swe-bench included); non-benchmark task examples belong
+   under `examples/<task>/`. Either way a dir is self-contained: `traces.otel.jsonl`, optional
+   `evals/*.toml`, task-local helpers. Launch helpers through `wmh examples run <task> -- <args>`
+   (discovery spans both roots).
 
 7. **Route reusable workflows through `wmh`.** Avoid parallel top-level scripts for harness actions.
    If a workflow is generally useful outside one example dataset, implement it in `wmh/` and expose

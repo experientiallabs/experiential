@@ -1,9 +1,9 @@
 """Model-comparison grid: run one eval suite across many (model x condition) cells.
 
 A "grid" answers a single question for a benchmark: how do different serving models fare, each under
-base / +RAG / +GEPA / +GEPA+RAG, on the SAME held-out split, scored by the SAME judge? It reuses the
-open-loop eval (`wmh.engine.eval.evaluate_files`) once per cell and rolls the per-file report into a
-`GridCell`. Two invariants make cells comparable:
+base / +RAG / +GEPA / +GEPA+RAG, on the SAME held-out split, scored by the SAME judge? It reuses
+the open-loop eval (`wmh.evals.open_loop.evaluate_files`) once per cell and rolls the per-file
+report into a `GridCell`. Two invariants make cells comparable:
 
 - The **judge is pinned** (a single Bedrock Opus 4.8 rubric judge) across every cell, independent of
   the target model — a Qwen target must not be judged by Qwen.
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
-from wmh.engine.eval import EvalReport, evaluate_files
+from wmh.evals import EvalReport, evaluate_files
 from wmh.optimize.judge import Judge, LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, get_provider
 from wmh.providers.base import Completion, Message, Provider

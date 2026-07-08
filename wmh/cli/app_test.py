@@ -125,7 +125,7 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    assert names == {"build", "list", "serve", "demo", "eval", "play"}
+    assert names == {"build", "list", "serve", "demo", "eval", "play", "download"}
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -167,7 +167,7 @@ def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> N
         example = tmp_path / dirname
         example.mkdir()
         (example / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setattr(cli_app_module, "_examples_root", lambda: tmp_path)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
 
     listed = runner.invoke(app, ["examples", "list"])
     assert listed.exit_code == 0, listed.output
@@ -300,9 +300,9 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
 
     assert result.exit_code == 0, result.output
     command = cast(list[str], seen["command"])
-    assert command[0].endswith("examples/tau-bench/run.sh")
+    assert command[0].endswith("environment-capture/tau-bench/run.sh")
     assert command[1:] == ["--trace", "0"]
-    assert str(seen["cwd"]).endswith("examples/tau-bench")
+    assert str(seen["cwd"]).endswith("environment-capture/tau-bench")
     assert seen["check"] is False
 
 
@@ -522,3 +522,114 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
+
+
+def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001
+    from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    made: list[ProviderConfig] = []
+
+    def fake_get_provider(config: ProviderConfig) -> ProviderConfig:
+        made.append(config)
+        return config  # identity provider: assertions read the config directly
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", fake_get_provider)
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings",
+        lambda: ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(provider="azure", model="gpt-5.4", endpoint="https://x/v1"),
+                judge=ModelRole(
+                    provider="bedrock", model="us.anthropic.claude-opus-4-8", region="us-east-2"
+                ),
+            )
+        ),
+    )
+    summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
+    assert summary is worker  # unset summary falls back to the worker role
+    assert cast(ProviderConfig, worker).model == "gpt-5.4"
+    assert cast(ProviderConfig, worker).endpoint == "https://x/v1"
+    assert cast(ProviderConfig, judge).model == "us.anthropic.claude-opus-4-8"
+    assert cast(ProviderConfig, judge).region == "us-east-2"
+    assert len(made) == 2  # worker constructed once and shared with summary
+
+
+def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
+    assert summary is worker
+    assert worker is judge
+    assert cast(ProviderConfig, worker).model == "some-model"
+
+
+def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None:  # noqa: ANN001
+    from wmh.config.settings import ProjectSettings
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
+    assert summary is worker
+    assert worker is judge
+    assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"
+
+def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    fetched: list[tuple[str, bool]] = []
+
+    def fake_fetch(name: str, *, force: bool = False, on_progress=None) -> Path:  # noqa: ANN001
+        fetched.append((name, force))
+        return tmp_path / name / "traces.otel.jsonl"
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fake_fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "bird-sql", "dabstep", "--force"])
+    assert result.exit_code == 0, result.output
+    assert fetched == [("bird-sql", True), ("dabstep", True)]
+    assert "fetched" in result.output
+
+
+def test_download_all_expands_to_the_manifest(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    fetched: list[str] = []
+    monkeypatch.setattr(
+        cli_app_module,
+        "fetch_corpus",
+        lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
+    )
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "all"])
+    assert result.exit_code == 0, result.output
+    assert fetched == sorted(cli_app_module.CORPORA)
+
+
+def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "nope"])
+    assert result.exit_code != 0
+    assert "no published corpus" in result.output
+
+
+def test_download_picker_lists_published_and_fetches_choice(
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+) -> None:
+    from environment_capture.hub import PublishedCorpus
+
+    published = [
+        PublishedCorpus(
+            benchmark="gaia2",
+            repo_id="experiential-labs/wmh-gaia2-traces",
+            last_modified="2026-07-06",
+        )
+    ]
+    fetched: list[str] = []
+    monkeypatch.setattr(cli_app_module, "published_corpora", lambda: published)
+    monkeypatch.setattr(
+        cli_app_module,
+        "fetch_corpus",
+        lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
+    )
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download"], input="1\n")
+    assert result.exit_code == 0, result.output
+    assert fetched == ["gaia2"]
+    assert "not downloaded" in result.output  # picker showed local status

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, cast
 
+from openai import BadRequestError
+
 from wmh.providers.base import Completion, Message, TokenUsage
 
 if TYPE_CHECKING:
@@ -62,12 +64,24 @@ def complete(
             max_completion_tokens=max_tokens,
         )
     else:
-        response = chat_completions.create(
-            model=model,
-            messages=to_messages(system, messages),
-            max_completion_tokens=max_tokens,
-            temperature=temperature,
-        )
+        try:
+            response = chat_completions.create(
+                model=model,
+                messages=to_messages(system, messages),
+                max_completion_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except BadRequestError as exc:
+            # Reasoning-model deployments (GPT-5.x behind Azure/custom endpoints) reject any
+            # non-default temperature with a 400 unsupported_value. The caller can't know which
+            # models sample; degrade to the model's default rather than failing the request.
+            if "temperature" not in str(exc):
+                raise
+            response = chat_completions.create(
+                model=model,
+                messages=to_messages(system, messages),
+                max_completion_tokens=max_tokens,
+            )
     if not response.choices:
         # Content filtering (and some error modes) can return zero choices; surface it clearly
         # rather than letting choices[0] raise a bare IndexError.
