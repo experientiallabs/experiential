@@ -65,6 +65,7 @@ from wmh.config import (
     settings_path,
     validate_name,
 )
+from wmh.core.types import JsonObject
 from wmh.engine.build import build as run_build
 from wmh.engine.build import ingest
 from wmh.engine.demo import run_demo
@@ -79,7 +80,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.env.llm_agent import LLMAgent
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull, get_adapter, list_adapters
-from wmh.optimize.judge import LLMJudge, RubricJudge
+from wmh.optimize.judge import RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
 from wmh.providers.retry import RetryingProvider
@@ -141,7 +142,6 @@ class _EvalOptions:
     train_split: float
     embed_dim: int
     use_rag: bool
-    judge: str
     sample_turns: str
     seed: int
     top_k: int
@@ -639,9 +639,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     rag: bool | None = typer.Option(
         None, "--rag/--no-rag", help="Enable retrieval, or disable it for zero-shot replay."
     ),
-    judge: str | None = typer.Option(
-        None, help="Scorer: rubric (5-dim) | match (functional). Default: rubric, or suite config."
-    ),
     sample_turns: str | None = typer.Option(
         None, help="Turns scored per trace: all | sampled (5). Default: all, or suite config."
     ),
@@ -740,7 +737,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             train_split=train_split,
             embed_dim=embed_dim,
             rag=rag,
-            judge=judge,
             sample_turns=sample_turns,
             seed=seed,
             top_k=top_k,
@@ -758,7 +754,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         train_split=train_split,
         embed_dim=embed_dim,
         rag=rag,
-        judge=judge,
         sample_turns=sample_turns,
         seed=seed,
         top_k=top_k,
@@ -777,9 +772,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     capture_eval_completed(
         mode="ad_hoc",
         file_count=len(args),
-        scored_step_count=report.total_steps,
+        scored_step_count=report.total_steps - report.total_invalid,
         rag_enabled=options.use_rag,
-        judge_mode=options.judge,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
         top_k=options.top_k,
@@ -796,14 +790,12 @@ def _eval_list(examples_roots: list[str]) -> None:
     table.add_column("Suite", no_wrap=True)
     table.add_column("Files")
     table.add_column("Split")
-    table.add_column("Scorer")
     table.add_column("Description")
     for suite in suites:
         table.add_row(
             suite.id,
             ", ".join(suite.config.files),
             f"{suite.config.train_split:.2f}",
-            suite.config.judge,
             suite.config.description or "",
         )
     _console.print(table)
@@ -835,13 +827,16 @@ def _eval_results(
     table.add_column("Steps", justify="right")
     table.add_column("Path")
     for summary in summaries:
+        steps = str(summary.total_steps)
+        if summary.total_invalid:
+            steps += f" ({summary.total_invalid} inv)"
         table.add_row(
             summary.suite,
             summary.run_id[:8],
             summary.started_at,
             summary.model,
             f"{summary.overall_fidelity:.3f}±{summary.overall_std:.3f}",
-            str(summary.total_steps),
+            steps,
             str(summary.path),
         )
     _console.print(table)
@@ -859,7 +854,6 @@ def _eval_run_suite(
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
-    judge: str | None,
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
@@ -872,7 +866,6 @@ def _eval_run_suite(
         train_split=train_split if train_split is not None else suite.config.train_split,
         embed_dim=embed_dim if embed_dim is not None else suite.config.embed_dim,
         rag=rag if rag is not None else not suite.config.no_rag,
-        judge=judge or suite.config.judge,
         sample_turns=sample_turns or suite.config.sample_turns,
         seed=seed if seed is not None else suite.config.seed,
         top_k=top_k if top_k is not None else suite.config.top_k,
@@ -902,7 +895,6 @@ def _eval_run_suite(
             "sample_turns": options.sample_turns,
             "seed": options.seed,
             "rag": options.use_rag,
-            "judge": options.judge,
             "embed_dim": options.embed_dim,
         },
         "report": _eval_report_payload(report),
@@ -912,9 +904,8 @@ def _eval_run_suite(
     capture_eval_completed(
         mode="suite",
         file_count=len(files),
-        scored_step_count=report.total_steps,
+        scored_step_count=report.total_steps - report.total_invalid,
         rag_enabled=options.use_rag,
-        judge_mode=options.judge,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
         top_k=options.top_k,
@@ -928,7 +919,6 @@ def _eval_options(
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
-    judge: str | None,
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
@@ -936,7 +926,6 @@ def _eval_options(
     split = 0.7 if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
     retrieval = True if rag is None else rag
-    scorer = "rubric" if judge is None else judge
     turns = "all" if sample_turns is None else sample_turns
     rng_seed = 0 if seed is None else seed
     demos = 5 if top_k is None else top_k
@@ -946,8 +935,6 @@ def _eval_options(
         raise typer.BadParameter("--embed-dim must be positive")
     if demos < 0:
         raise typer.BadParameter("--top-k must be >= 0")
-    if scorer not in {"rubric", "match"}:
-        raise typer.BadParameter("--judge must be one of: rubric, match")
     if turns not in {"all", "sampled"}:
         raise typer.BadParameter("--sample-turns must be one of: all, sampled")
     return _EvalOptions(
@@ -955,7 +942,6 @@ def _eval_options(
         train_split=split,
         embed_dim=dim,
         use_rag=retrieval,
-        judge=scorer,
         sample_turns=turns,
         seed=rng_seed,
         top_k=demos,
@@ -992,8 +978,7 @@ def _run_eval_files(
     # The judge is the metric: it stays PINNED to the single requested backend and never rides
     # the failover chain — a judge that silently switches models mid-run makes fidelity numbers
     # incomparable across steps. World-model prediction calls (above) may fail over freely.
-    judge_llm = providers.get_provider(provider_config)
-    scorer = RubricJudge(judge_llm) if options.judge == "rubric" else LLMJudge(judge_llm)
+    scorer = RubricJudge(providers.get_provider(provider_config))
     evaluation = OpenLoopEval(
         files,
         prompt,
@@ -1011,9 +996,10 @@ def _run_eval_files(
 def _print_eval_report(report: EvalReport) -> None:
     for name, rep in report.per_file.items():
         _console.print(f"  {name:28} {rep.summary()}")
+    invalid = f" ({report.total_invalid} judge-invalid excluded)" if report.total_invalid else ""
     _console.print(
         f"[bold]OVERALL[/bold] fidelity={report.overall_fidelity:.3f}±{report.overall_std:.3f} "
-        f"over {report.total_steps} held-out steps"
+        f"over {report.total_steps} held-out steps{invalid}"
     )
 
 
@@ -1025,11 +1011,12 @@ def _write_ad_hoc_eval_report(path: Path, report: EvalReport) -> None:
     _console.print(f"wrote full report -> {path}")
 
 
-def _eval_report_payload(report: EvalReport) -> dict[str, object]:
+def _eval_report_payload(report: EvalReport) -> JsonObject:
     return {
         "overall_fidelity": report.overall_fidelity,
         "overall_std": report.overall_std,
         "total_steps": report.total_steps,
+        "total_invalid": report.total_invalid,
         "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
     }
 

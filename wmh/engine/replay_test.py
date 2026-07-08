@@ -177,6 +177,42 @@ def test_replay_sample_turns_all_scores_every_step() -> None:
     assert report.n_steps == 10
 
 
+class InvalidOnceJudge:
+    """First call is an invalid judgement (judge failure), the rest score 0.8."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        self.calls += 1
+        if self.calls == 1:
+            return JudgeResult(score=0.0, critique="judge broke", valid=False)
+        return JudgeResult(score=0.8, critique="ok")
+
+
+def test_replay_excludes_invalid_judgements_from_fidelity() -> None:
+    provider = FakeProvider('{"output": "real-0", "is_error": false}')
+    report = replay("BASE", [_trace("h", n=2)], provider, InvalidOnceJudge())
+    assert report.n_steps == 2
+    assert report.n_invalid == 1
+    # The judge failure is excluded from the mean, not recorded as a 0.0 prediction score.
+    assert report.mean_score == 0.8
+    assert report.results[0].valid is False
+    assert "invalid" in report.summary()
+
+
+def test_replay_all_invalid_judgements_report_zero_with_count() -> None:
+    class AlwaysInvalid:
+        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+            return JudgeResult(score=0.0, critique="judge broke", valid=False)
+
+    provider = FakeProvider('{"output": "x"}')
+    report = replay("BASE", [_trace("h", n=2)], provider, AlwaysInvalid())
+    assert report.n_steps == 2
+    assert report.n_invalid == 2
+    assert report.mean_score == 0.0
+
+
 def test_replay_concurrency_preserves_results_and_order() -> None:
     # PerActionJudge scores by step index, so the per-step result sequence is order-sensitive:
     # concurrent scoring must return the identical ordered results as serial.

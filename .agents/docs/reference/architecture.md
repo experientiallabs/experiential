@@ -43,8 +43,10 @@ serving         engine          │   │
 - **`retrieval`** — the DreamGym replay buffer. `EmbeddingRetriever` (cosine top-k over phi),
   pluggable `Embedder`s (`embedders.py`, incl. the offline `HashingEmbedder`), and `leakfree.py`
   (`DemoRetriever` — train-only, never-own-trace retrieval shared by GEPA and eval).
-- **`optimize`** — `LLMJudge` (the fitness signal) and `GEPAOptimizer` (drives the `gepa` package
-  to evolve the env prompt). Provider-only, so it never imports `engine` (avoids a cycle).
+- **`optimize`** — `RubricJudge` (the single judge: 5-dim rubric, factuality-weighted headline;
+  fitness signal and eval scorer), its judge-quality meta-eval (`judge_quality.py`), and
+  `GEPAOptimizer` (drives the `gepa` package to evolve the env prompt). Provider-only, so it
+  never imports `engine` (avoids a cycle).
 - **`engine`** — the heart. `WorldModel` (`step`: retrieve → assemble prompt → predict → parse →
   advance → enrich), `build` (the ingest→split→index→GEPA→persist pipeline), `loader` (the one
   artifact-dir→live-model path), and the operator flows `replay`/`eval`, `demo`, `play`.
@@ -62,7 +64,7 @@ serving         engine          │   │
 
 **Build** (`wmh build` → `engine.build.build`):
 `ingest` traces → `split_traces` (deterministic train/held-out) → `EmbeddingRetriever.index` →
-`GEPAOptimizer.optimize` (replays held-out steps with leak-free RAG, scores with `LLMJudge`,
+`GEPAOptimizer.optimize` (replays held-out steps with leak-free RAG, scores with `RubricJudge`,
 reflects to mutate the prompt) → persist prompt + frontier + index + metrics under
 `.wmh/models/<name>/`.
 

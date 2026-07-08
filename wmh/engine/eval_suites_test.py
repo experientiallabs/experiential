@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from wmh.engine.eval_suites import discover_eval_suites, resolve_eval_suite
+from wmh.engine.eval_suites import discover_eval_suites, load_eval_suite, resolve_eval_suite
 
 
 def _write_suite(root: Path, example: str, name: str = "default") -> Path:
@@ -70,3 +70,35 @@ def test_discover_skips_malformed_suite_with_warning(
         suites = discover_eval_suites(root)
     assert [s.id for s in suites] == ["alpha/default"]
     assert any("broken" in record.message for record in caplog.records)
+
+
+# --- TOML loading / validation errors (judge overhaul) --------------------------------------
+
+
+def _write_suite_body(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "solo" / "evals" / "default.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_load_eval_suite_parses_a_minimal_suite(tmp_path: Path) -> None:
+    path = _write_suite_body(tmp_path, 'description = "d"\nfiles = ["../traces.otel.jsonl"]\n')
+    suite = load_eval_suite(path)
+    assert suite.name == "default"
+    assert suite.config.description == "d"
+
+
+def test_removed_judge_option_gets_an_actionable_error(tmp_path: Path) -> None:
+    # Pre-overhaul suite TOMLs (including the old shipped defaults) carried `judge = "rubric"`.
+    # The generic "does not match the eval suite schema" pydantic error never says the knob was
+    # removed or what to do — the message must.
+    path = _write_suite_body(tmp_path, 'judge = "rubric"\n')
+    with pytest.raises(ValueError, match="no longer exists.*delete the `judge` line"):
+        load_eval_suite(path)
+
+
+def test_unknown_key_still_gets_the_schema_error(tmp_path: Path) -> None:
+    path = _write_suite_body(tmp_path, "not_a_real_option = 1\n")
+    with pytest.raises(ValueError, match="does not match the eval suite schema"):
+        load_eval_suite(path)

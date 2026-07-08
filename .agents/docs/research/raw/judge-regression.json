@@ -1,0 +1,1232 @@
+{
+  "judge_model": "us.anthropic.claude-opus-4-8",
+  "wm_model": "us.anthropic.claude-opus-4-7",
+  "seed": 7,
+  "mean_old": 0.7006808510638298,
+  "mean_new": 0.5835106382978723,
+  "spearman": 0.9630550611711328,
+  "steps": [
+    {
+      "corpus": "tau-bench",
+      "trace_id": "796c55f5f6ac673754a3d03a8d4e2f68",
+      "index": 3,
+      "action": "get_details_by_id",
+      "len_actual": 128,
+      "old_score": 0.47999999999999987,
+      "old_dims": {
+        "format": 0.7,
+        "factuality": 0.1,
+        "consistency": 0.5,
+        "realism": 0.8,
+        "quality": 0.3
+      },
+      "new_score": 0.30000000000000004,
+      "new_dims": {
+        "format": 0.6,
+        "factuality": 0.1,
+        "consistency": 0.7,
+        "realism": 0.8,
+        "quality": 0.2
+      },
+      "new_valid": true,
+      "old_critique": "Correct plan_id and data_limit_gb, but field names differ (plan_name vs name, monthly_price vs price_per_month) and the plan name ('Standard Plan' vs 'Premium Plan'), price (60 vs 65), and structure (missing data_refueling_price_per_gb, added roaming/mms/hotspot fields) are all wrong.",
+      "new_critique": "Field names and values diverge substantially: predicted uses different keys (plan_name/monthly_price vs name/price_per_month), wrong name ('Standard' vs 'Premium'), wrong price (60 vs 65), and omits the actual data_refueling_price_per_gb field while inventing extra fields."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "b3784a91163a012b1436090a9c478912",
+      "index": 1,
+      "action": "get_details_by_id",
+      "len_actual": 327,
+      "old_score": 0.56,
+      "old_dims": {
+        "format": 0.7,
+        "factuality": 0.3,
+        "consistency": 0.6,
+        "realism": 0.8,
+        "quality": 0.4
+      },
+      "new_score": 0.44,
+      "new_dims": {
+        "format": 0.7,
+        "factuality": 0.3,
+        "consistency": 0.6,
+        "realism": 0.8,
+        "quality": 0.4
+      },
+      "new_valid": true,
+      "old_critique": "Correct line_id, plan_id, and status, but many fields diverge: wrong phone_number, wrong data_used_gb, wrong roaming_enabled, and invented/mismatched schema fields (customer_id, device, sim_type, data_limit_gb, activation_date) while omitting real ones (device_id, data_refueling_gb, contract_end_date, etc.).",
+      "new_critique": "Correct line_id/plan_id and Active status, but many fields diverge: wrong phone_number, roaming flag, data_used, and the schema uses different/invented field names (customer_id, device, sim_type, data_limit_gb) while omitting actual fields like contract_end_date and refueling."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "09703eb0f8b08c845aa4992fe569cb16",
+      "index": 2,
+      "action": "get_details_by_id",
+      "len_actual": 335,
+      "old_score": 0.8300000000000001,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.6,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.65
+      },
+      "new_score": 0.7200000000000001,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.6,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.65
+      },
+      "new_valid": true,
+      "old_critique": "Structure and core fields (line_id, phone, status, plan, device, data usage) match, but several deterministic values diverge: roaming_enabled (true vs false), contract_end_date, last_plan_change_date, and last_sim_replacement_date are all wrong.",
+      "new_critique": "Structure and most fields match, but several deterministic values diverge: roaming_enabled (true vs false), contract_end_date, last_plan_change_date, and last_sim_replacement_date (null vs actual date) are all wrong."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "93c31373f47d3dc3c3554753c456c2ad",
+      "index": 0,
+      "action": "get_customer_by_phone",
+      "len_actual": 574,
+      "old_score": 0.5,
+      "old_dims": {
+        "format": 0.7,
+        "factuality": 0.2,
+        "consistency": 0.6,
+        "realism": 0.7,
+        "quality": 0.3
+      },
+      "new_score": 0.33,
+      "new_dims": {
+        "format": 0.5,
+        "factuality": 0.2,
+        "consistency": 0.6,
+        "realism": 0.6,
+        "quality": 0.3
+      },
+      "new_valid": true,
+      "old_critique": "Correctly returned a customer record with matching name/phone and no error, but the schema and computed fields diverge heavily (wrong customer_id, invented plan/data/location fields, missing address, payment_methods, line_ids, bill_ids, etc.).",
+      "new_critique": "Correctly returned a matching customer with the right name and phone, but the schema is entirely different (invented fields like plan/roaming/location, wrong customer_id, missing address/payment_methods/line_ids/bill_ids), so most salient data diverges."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "182d0811b7d08de20d90bc1a3f8595fb",
+      "index": 1,
+      "action": "get_user_details",
+      "len_actual": 397,
+      "old_score": 0.6599999999999999,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.3,
+        "consistency": 0.8,
+        "realism": 0.9,
+        "quality": 0.4
+      },
+      "new_score": 0.49000000000000005,
+      "new_dims": {
+        "format": 0.9,
+        "factuality": 0.3,
+        "consistency": 0.8,
+        "realism": 0.9,
+        "quality": 0.4
+      },
+      "new_valid": true,
+      "old_critique": "Structure and shape match, but the predicted content diverges on deterministic data: wrong address (157 Hickory vs 317 Elm), wrong email, wrong payment method (credit_card vs paypal), different orders, and it omits the user_id field.",
+      "new_critique": "Name, city, state, zip match, but address1/address2, email, payment method (predicted credit_card vs actual paypal), order IDs, and the missing user_id field all diverge from the deterministic actual values."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "062912cc0d4f38fffff4f1453ce97307",
+      "index": 1,
+      "action": "get_user_details",
+      "len_actual": 396,
+      "old_score": 0.6399999999999999,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.2,
+        "consistency": 0.9,
+        "realism": 0.9,
+        "quality": 0.3
+      },
+      "new_score": 0.48000000000000004,
+      "new_dims": {
+        "format": 0.9,
+        "factuality": 0.3,
+        "consistency": 0.8,
+        "realism": 0.9,
+        "quality": 0.35
+      },
+      "new_valid": true,
+      "old_critique": "Correct structure and name/city/state/zip matched, but address1/2, email, payment method (paypal vs credit_card), and order list are all wrong deterministic values; also omitted the top-level user_id field.",
+      "new_critique": "Structure and name match, but address, email, payment method, and order list are all fabricated (wrong deterministic values); also missing the top-level user_id field."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "a6e81d8bbdab50d8dabc46895f80094b",
+      "index": 2,
+      "action": "get_details_by_id",
+      "len_actual": 334,
+      "old_score": 0.8699999999999999,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.7,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.75
+      },
+      "new_score": 0.7999999999999999,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.7,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.75
+      },
+      "new_valid": true,
+      "old_critique": "Structure and salient fields (line_id, phone, status, plan, device, data usage, roaming) match exactly, but several date fields diverge: contract_end_date, last_plan_change_date, and last_sim_replacement_date (null vs actual date) are wrong deterministic values.",
+      "new_critique": "Structure and most fields match exactly, but the deterministic date fields diverge: contract_end_date, last_plan_change_date, and last_sim_replacement_date are all wrong."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "16a3db00374348ca059aa8cd6dab251d",
+      "index": 4,
+      "action": "get_order_details",
+      "len_actual": 737,
+      "old_score": 0.5599999999999999,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.15,
+        "consistency": 0.5,
+        "realism": 0.9,
+        "quality": 0.25
+      },
+      "new_score": 0.33000000000000007,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.1,
+        "consistency": 0.5,
+        "realism": 0.9,
+        "quality": 0.2
+      },
+      "new_valid": true,
+      "old_critique": "Format and user/address match, but the predicted items, status (delivered vs pending), fulfillments, and payment amount are all wrong deterministic values \u2014 the real order has a single Desk Lamp at 153.23 with pending status.",
+      "new_critique": "Correct user_id, address, and payment method, but items, status (delivered vs pending), fulfillments, and payment amount are all wrong \u2014 the deterministic order contents diverge entirely."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "5384ab190d9ff4ec70e92f25b2518c82",
+      "index": 1,
+      "action": "get_details_by_id",
+      "len_actual": 327,
+      "old_score": 0.65,
+      "old_dims": {
+        "format": 0.85,
+        "factuality": 0.4,
+        "consistency": 0.7,
+        "realism": 0.8,
+        "quality": 0.5
+      },
+      "new_score": 0.46,
+      "new_dims": {
+        "format": 0.7,
+        "factuality": 0.3,
+        "consistency": 0.8,
+        "realism": 0.8,
+        "quality": 0.4
+      },
+      "new_valid": true,
+      "old_critique": "Correctly predicted line_id, plan_id, status Active, and roaming_enabled false, but diverged on many fields: wrong phone_number, wrong data_used_gb, and invented fields (customer_id, device object, data_limit_gb) while omitting actual fields like device_id, data_refueling_gb, contract_end_date.",
+      "new_critique": "Correct JSON shape and matching line_id/plan_id/status/roaming, but many field names diverge (device object, customer_id, activation_date vs actual's device_id, contract_end_date, etc.) and computed values like phone_number and data_used_gb are wrong."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "669c67a1c0bff48602cbb9b1fe275def",
+      "index": 6,
+      "action": "refuel_data",
+      "len_actual": 120,
+      "old_score": 0.82,
+      "old_dims": {
+        "format": 0.7,
+        "factuality": 0.85,
+        "consistency": 0.9,
+        "realism": 0.85,
+        "quality": 0.8
+      },
+      "new_score": 0.865,
+      "new_dims": {
+        "format": 0.7,
+        "factuality": 0.9,
+        "consistency": 0.95,
+        "realism": 0.9,
+        "quality": 0.8
+      },
+      "new_valid": true,
+      "old_critique": "Correctly captured the successful refuel with 2 GB and $4.00 charge, but field names diverge (added 'success'/'gb_refueled', renamed 'new_data_refueling_gb' to 'total_refueling_gb') and message wording differs from the actual schema.",
+      "new_critique": "Correct outcome, charge ($4.00), and GB amount match; but field names differ (added success/gb_refueled/total_refueling_gb vs actual new_data_refueling_gb), and types are numeric vs the actual string-encoded values."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "833fcb9fb230b74ed2adf8b52a76c636",
+      "index": 0,
+      "action": "find_user_id_by_name_zip",
+      "len_actual": 15,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction exactly matches the actual observation, including the correct user ID and all metadata fields.",
+      "new_critique": "Prediction exactly matches the actual observation including the user id and error flag."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "d70bc209747072002242361ae42e3252",
+      "index": 1,
+      "action": "get_details_by_id",
+      "len_actual": 327,
+      "old_score": 0.43999999999999995,
+      "old_dims": {
+        "format": 0.7,
+        "factuality": 0.1,
+        "consistency": 0.4,
+        "realism": 0.7,
+        "quality": 0.3
+      },
+      "new_score": 0.36,
+      "new_dims": {
+        "format": 0.6,
+        "factuality": 0.2,
+        "consistency": 0.7,
+        "realism": 0.7,
+        "quality": 0.3
+      },
+      "new_valid": true,
+      "old_critique": "Envelope shape matches and status/line_id are correct, but the predicted schema invents many wrong fields (customer_id, plan_type, monthly_cost, nested device) and diverges on phone_number and data_used_gb while omitting the actual fields like plan_id, device_id, roaming_enabled, and contract dates.",
+      "new_critique": "Correct JSON shape and matching line_id/status, but the field schema diverges heavily (invented customer_id, plan_type, monthly_cost, device object) and several actual fields like plan_id, data_refueling_gb, contract_end_date are missing; phone_number and data_used_gb values are wrong."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "f4298311aaff6d33f164d6c0b7796ca5",
+      "index": 2,
+      "action": "get_details_by_id",
+      "len_actual": 345,
+      "old_score": 0.6399999999999999,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.3,
+        "consistency": 0.6,
+        "realism": 0.9,
+        "quality": 0.4
+      },
+      "new_score": 0.49500000000000005,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.3,
+        "consistency": 0.7,
+        "realism": 0.95,
+        "quality": 0.4
+      },
+      "new_valid": true,
+      "old_critique": "Format and structure match perfectly, but salient deterministic values diverge: status (Suspended vs Active), roaming, data_used_gb, dates, and suspension_start_date are all wrong, which would mislead the agent.",
+      "new_critique": "Structure and phone/plan/device ids match, but salient deterministic fields diverge: status is Suspended not Active, roaming, data_used, dates all wrong, and suspension_start_date is populated in actual but null in prediction."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "8a036f7d5cd8db835fdfc028d7478131",
+      "index": 3,
+      "action": "get_reservation_details",
+      "len_actual": 856,
+      "old_score": 0.58,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.2,
+        "consistency": 0.5,
+        "realism": 0.9,
+        "quality": 0.3
+      },
+      "new_score": 0.44,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.2,
+        "consistency": 0.8,
+        "realism": 1.0,
+        "quality": 0.3
+      },
+      "new_valid": true,
+      "old_critique": "Format and structure match perfectly, but nearly all salient computed data diverges: wrong destination (SEA vs CLT), different flights/dates/prices, wrong passenger (Sophia Silva vs Harper Jackson), wrong payment amount, baggage count, and insurance value.",
+      "new_critique": "Correct JSON shape and matching reservation_id/user_id/payment_id, but nearly all deterministic data diverges: destination, flights, dates, passengers, baggage count, and insurance are all wrong."
+    },
+    {
+      "corpus": "tau-bench",
+      "trace_id": "72c60af4f5dbf1b6610ffa2cca3b348d",
+      "index": 5,
+      "action": "modify_pending_order_address",
+      "len_actual": 1448,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction matches the actual observation exactly, including updated address, all items, and content_length of 1448.",
+      "new_critique": "Prediction is character-for-character identical to the actual observation, correctly reflecting the updated address and full order state."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "6389540efe580c5db9f037cfd4f96495",
+      "index": 9,
+      "action": "bash",
+      "len_actual": 5,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction exactly matches the actual observation in all fields.",
+      "new_critique": "Prediction exactly matches the actual output 'done\\n' with identical length and error flag."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "6389540efe580c5db9f037cfd4f96495",
+      "index": 5,
+      "action": "bash",
+      "len_actual": 11,
+      "old_score": 0.38,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.6,
+        "quality": 0.2
+      },
+      "new_score": 0.11000000000000001,
+      "new_dims": {
+        "format": 0.3,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.4,
+        "quality": 0.1
+      },
+      "new_valid": true,
+      "old_critique": "The prediction assumed the command completed successfully returning '0', but the actual environment timed out (is_error true, '(timed out)') due to the 300-second sleep exceeding the timeout limit.",
+      "new_critique": "The 300s sleep exceeds typical command timeout, so the actual result was a timeout error; the prediction wrongly returns successful output '0' with is_error false, a flipped outcome."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "c4db4117dc1ec976cc9191666f5f161a",
+      "index": 0,
+      "action": "bash",
+      "len_actual": 6,
+      "old_score": 0.74,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.3,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.4
+      },
+      "new_score": 0.53,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.3,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.4
+      },
+      "new_valid": true,
+      "old_critique": "Format and structure match perfectly, but the predicted version 3.23.8 differs from the actual latest 4.4.3, and the content_length is wrong (7 vs 6).",
+      "new_critique": "Format and structure match a version string, but the predicted latest version (3.23.8) is a deterministic lookup that differs from the actual 4.4.3."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "1da544207bebeef9c0384ea82c4c6db1",
+      "index": 4,
+      "action": "bash",
+      "len_actual": 612,
+      "old_score": 0.998,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.99
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction matches the directory tree and file contents exactly; only trivial divergence is the missing trailing newline (content_length 611 vs 612).",
+      "new_critique": "Prediction matches the actual output exactly, differing only by a trailing newline (length 611 vs 612), which is negligible."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "74244ce305b105a2c3c5113c970c05d2",
+      "index": 1,
+      "action": "bash",
+      "len_actual": 11,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction exactly matches the actual observation, including content, length, and all fields.",
+      "new_critique": "Prediction matches the actual observation exactly, including content, length, and error flag."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "543787014efa14c0eb4c55049dd6a6db",
+      "index": 0,
+      "action": "bash",
+      "len_actual": 853,
+      "old_score": 0.37999999999999995,
+      "old_dims": {
+        "format": 0.7,
+        "factuality": 0.1,
+        "consistency": 0.3,
+        "realism": 0.6,
+        "quality": 0.2
+      },
+      "new_score": 0.19,
+      "new_dims": {
+        "format": 0.7,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.8,
+        "quality": 0.1
+      },
+      "new_valid": true,
+      "old_critique": "Prediction assumed default branch 'main' and a successful merge, but the actual environment used 'master' as the default branch, so 'git checkout main' failed with a pathspec error and the command exited with is_error=true. The predicted success flow, hint text omission, and is_error=false are all wrong.",
+      "new_critique": "The prediction assumed the initial branch was 'main' and simulated a successful merge, but the actual environment defaults to 'master', so `git checkout main` failed with a pathspec error (is_error true); the outcome is flipped and the salient failure is entirely missed."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "6389540efe580c5db9f037cfd4f96495",
+      "index": 6,
+      "action": "bash",
+      "len_actual": 11,
+      "old_score": 0.4,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.7,
+        "quality": 0.2
+      },
+      "new_score": 0.11000000000000001,
+      "new_dims": {
+        "format": 0.3,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.4,
+        "quality": 0.1
+      },
+      "new_valid": true,
+      "old_critique": "The actual command timed out (is_error true, '(timed out)'), but the prediction assumed successful completion with normal output; format is close but outcome and error state are wrong.",
+      "new_critique": "The actual command timed out (is_error true, '(timed out)'), but the prediction shows successful output with is_error false \u2014 a flipped outcome and wrong content."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "d26c68e3eb6f31132b56a12145207cec",
+      "index": 1,
+      "action": "bash",
+      "len_actual": 564,
+      "old_score": 0.76,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.5,
+        "consistency": 0.8,
+        "realism": 0.9,
+        "quality": 0.6
+      },
+      "new_score": 0.66,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.5,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.6
+      },
+      "new_valid": true,
+      "old_critique": "Format and structure match perfectly, but the file contents diverge: predicted includes an extra License line and different Python version list (3.9-3.13 vs actual 3.10-3.15), plus wrong content_length. This is deterministic file content that must match exactly.",
+      "new_critique": "Correct structure and many matching classifier lines, but the predicted content diverges on deterministic details: it adds a License line and extra Python versions (3, 3.9) while omitting the actual 3.14/3.15 entries."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "5c4614935814a8415299014525f44561",
+      "index": 0,
+      "action": "bash",
+      "len_actual": 45,
+      "old_score": 0.24,
+      "old_dims": {
+        "format": 0.7,
+        "factuality": 0.0,
+        "consistency": 0.1,
+        "realism": 0.3,
+        "quality": 0.1
+      },
+      "new_score": 0.05,
+      "new_dims": {
+        "format": 0.2,
+        "factuality": 0.0,
+        "consistency": 0.0,
+        "realism": 0.3,
+        "quality": 0.0
+      },
+      "new_valid": true,
+      "old_critique": "The prediction assumed successful tokenization output, but the actual environment threw a heredoc syntax error (is_error true), so the outcome, error status, and content all diverged.",
+      "new_critique": "The prediction assumed successful tokenization output, but the actual environment returned a shell syntax error (is_error true) \u2014 a flipped outcome that makes the prediction unusable."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "a20f85368b790f5bcf9424187a023919",
+      "index": 0,
+      "action": "bash",
+      "len_actual": 84,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction is an exact match: correct computed totals (5.00, 5.00, 18.00), matching content_length and all fields.",
+      "new_critique": "Prediction exactly matches the actual computed CSV output including all totals and length."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "1da544207bebeef9c0384ea82c4c6db1",
+      "index": 0,
+      "action": "bash",
+      "len_actual": 0,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "mkdir -p succeeds silently with empty output; prediction correctly matches the empty, non-error observation.",
+      "new_critique": "Both empty with no error, matching mkdir's silent success."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "473371dc9480d0b4874bb342b6fdfb59",
+      "index": 4,
+      "action": "bash",
+      "len_actual": 583,
+      "old_score": 0.73,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.5,
+        "consistency": 0.85,
+        "realism": 0.8,
+        "quality": 0.6
+      },
+      "new_score": 0.62,
+      "new_dims": {
+        "format": 0.9,
+        "factuality": 0.5,
+        "consistency": 0.8,
+        "realism": 0.8,
+        "quality": 0.6
+      },
+      "new_valid": true,
+      "old_critique": "Prediction correctly captured the general shape of a GitHub embedded JSON payload with type=code and no results, but diverged on the specific script index, payload fields, and omitted the empty results array / result_count that reveal the search returned nothing to a logged-out user.",
+      "new_critique": "Prediction correctly captures a GitHub embedded JSON script blob with payload/title structure, but the specific JSON content differs substantially \u2014 the actual shows the real code-search payload with empty results array and sign-in paths, while the predicted invents a minimal payload and picks Script 0 instead of Script 5."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "473371dc9480d0b4874bb342b6fdfb59",
+      "index": 3,
+      "action": "bash",
+      "len_actual": 173,
+      "old_score": 0.62,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.3,
+        "consistency": 0.7,
+        "realism": 0.8,
+        "quality": 0.4
+      },
+      "new_score": 0.44000000000000006,
+      "new_dims": {
+        "format": 0.8,
+        "factuality": 0.3,
+        "consistency": 0.6,
+        "realism": 0.7,
+        "quality": 0.4
+      },
+      "new_valid": true,
+      "old_critique": "Format and structure match plausibly, and the sign-in note aligns; but the actual output showed code snippets and a JSON results payload rather than fabricated result counts, so the salient extracted data diverges.",
+      "new_critique": "Both are plausible parsed outputs with the sign-in note matching, but the predicted output invents result counts ('537') and misses the actual code-snippet echoes and 'Found JSON results payload' line."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "52191dd911169c08e1af338b7a3c97fd",
+      "index": 2,
+      "action": "bash",
+      "len_actual": 38,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Exact match on all fields including content, length, and error status.",
+      "new_critique": "Exact match on content, length, and error flag."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "52191dd911169c08e1af338b7a3c97fd",
+      "index": 0,
+      "action": "bash",
+      "len_actual": 22,
+      "old_score": 0.42000000000000004,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.8,
+        "quality": 0.2
+      },
+      "new_score": 0.16999999999999998,
+      "new_dims": {
+        "format": 0.6,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.7,
+        "quality": 0.1
+      },
+      "new_valid": true,
+      "old_critique": "Format is plausible but the prediction assumes a successful install whereas the real environment lacks pip ('pip: not found'), so the outcome is entirely wrong.",
+      "new_critique": "Predicted a successful install, but the actual environment had no pip binary ('pip: not found') \u2014 a flipped outcome and wrong salient result."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "473371dc9480d0b4874bb342b6fdfb59",
+      "index": 6,
+      "action": "bash",
+      "len_actual": 115002,
+      "old_score": 0.656,
+      "old_dims": {
+        "format": 0.98,
+        "factuality": 0.4,
+        "consistency": 0.95,
+        "realism": 0.95,
+        "quality": 0.0
+      },
+      "new_score": 0.7150000000000001,
+      "new_dims": {
+        "format": 0.95,
+        "factuality": 0.6,
+        "consistency": 0.9,
+        "realism": 0.9,
+        "quality": 0.7
+      },
+      "new_valid": true,
+      "old_critique": "Format and structure match perfectly, and total_count (43926) plus the first repo name coincide. However, the live API returns different results (correct stars for the first repo is 206 not 412, and the other 4 repositories differ entirely \u2014 including the notorious Bee Movie script repo danderfer/Comp_Sci_Sem_2), so the salient computed data diverges substantially.",
+      "new_critique": "Prediction nails the echo preamble, JSON structure, and total_count (43926), but the specific repository results, stars, and descriptions diverge from the actual volatile API results; notably it omits the anomalous Bee Movie script description that appeared in the real output."
+    },
+    {
+      "corpus": "terminal-tasks",
+      "trace_id": "889e43d3d3be69f9667eefb8da46b98f",
+      "index": 0,
+      "action": "bash",
+      "len_actual": 147911,
+      "old_score": 0.58,
+      "old_dims": {
+        "format": 0.85,
+        "factuality": 0.2,
+        "consistency": 0.7,
+        "realism": 0.75,
+        "quality": 0.4
+      },
+      "new_score": 0.56,
+      "new_dims": {
+        "format": 0.85,
+        "factuality": 0.4,
+        "consistency": 0.85,
+        "realism": 0.8,
+        "quality": 0.55
+      },
+      "new_valid": true,
+      "old_critique": "The prediction is a well-formed deployments JSON array with plausible field structure, but the actual data diverges substantially: real deployments use preview-env-* environments, non-production, human creators, and include a rich performed_via_github_app block that the prediction omits entirely. IDs, SHAs, environments, and creators are all fabricated and wrong for this deterministic lookup.",
+      "new_critique": "Correct JSON array-of-deployments shape and success status, but the prediction uses simplified/abbreviated objects (missing performed_via_github_app block, full user URL fields), and all volatile values (IDs, SHAs, environments as production/staging vs preview-env-*, creator docs-bot vs real users, dates) differ from the actual data."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "0ef4cc8135387ea8fe1d59f6b47b8ca5",
+      "index": 19,
+      "action": "bash",
+      "len_actual": 7,
+      "old_score": 0.96,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.9,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.9
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Correctly predicted the str-Enum behavior outputting 'MyStr.A'; only diverged by including a trailing newline (length 8 vs actual stripped 7).",
+      "new_critique": "Prediction matches actual output 'MyStr.A' exactly; the trailing newline is a trivial incidental difference from print's newline."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "19dbc4a428ad60cc0f49465818663d67",
+      "index": 78,
+      "action": "bash",
+      "len_actual": 1360,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "The prediction matches the actual observation exactly, including all four SQL statements and PASS results down to identical content_length.",
+      "new_critique": "Prediction is character-for-character identical to the actual observation, including all four SQL queries and PASS results."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "3e83e8f191d886d8ed7ac61cbf307e52",
+      "index": 13,
+      "action": "bash",
+      "len_actual": 988,
+      "old_score": 0.9879999999999999,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.97,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.97
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction matches the diff content and structure nearly exactly; only minor divergences in the volatile git blob hashes and one hunk header line number (@@ -305 vs -306), which don't affect the salient change.",
+      "new_critique": "Prediction captures both diff hunks (IGNORECASE flag and v.upper() == \"NO\") accurately; only volatile differences are the git blob hashes and a one-line hunk offset, which are incidental."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "68e28791cb13491e6bd5c474fd46fec4",
+      "index": 31,
+      "action": "bash",
+      "len_actual": 890,
+      "old_score": 0.6399999999999999,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.3,
+        "consistency": 0.7,
+        "realism": 0.8,
+        "quality": 0.4
+      },
+      "new_score": 0.445,
+      "new_dims": {
+        "format": 0.85,
+        "factuality": 0.3,
+        "consistency": 0.7,
+        "realism": 0.6,
+        "quality": 0.4
+      },
+      "new_valid": true,
+      "old_critique": "Format is correct and plausible, but the predicted file paths differ from the actual ones and it omits the 'grep terminated by signal 13' messages (from head closing the pipe) that appear in the real output. The specific filenames listed are wrong computed content.",
+      "new_critique": "Format is a plausible list of file paths, but the specific files listed diverge entirely from actual, and the prediction omits the 'grep terminated by signal 13' noise the real command produced from the head pipe."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "3e83e8f191d886d8ed7ac61cbf307e52",
+      "index": 10,
+      "action": "bash",
+      "len_actual": 124,
+      "old_score": 1.0,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_score": 1.0,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 1.0,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 1.0
+      },
+      "new_valid": true,
+      "old_critique": "Prediction matches exactly except for a trailing newline (125 vs 124 chars); all column names and values are identical.",
+      "new_critique": "Prediction matches actual output exactly, differing only by a trailing newline (125 vs 124 chars)."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "76ef5b90e2dc287bc7ab73fd90d1cb73",
+      "index": 12,
+      "action": "bash",
+      "len_actual": 221,
+      "old_score": 0.6,
+      "old_dims": {
+        "format": 0.9,
+        "factuality": 0.4,
+        "consistency": 0.6,
+        "realism": 0.6,
+        "quality": 0.5
+      },
+      "new_score": 0.0,
+      "new_dims": {
+        "format": 0.0,
+        "factuality": 0.0,
+        "consistency": 0.0,
+        "realism": 0.0,
+        "quality": 0.0
+      },
+      "new_valid": true,
+      "old_critique": "Predicted empty output but the actual returned a pip root-user warning; format matches but the salient warning content was missed. An empty result is plausible if asgiref were already satisfied, but here pip emitted a warning.",
+      "new_critique": "Predicted empty content while the actual output was a non-empty pip root-user warning; the prediction omitted the environment's response entirely."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "3ed4044f4e66032f77ee61e2ebd78caf",
+      "index": 1,
+      "action": "bash",
+      "len_actual": 366,
+      "old_score": 0.8,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.5,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.6
+      },
+      "new_score": 0.5900000000000001,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.4,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.5
+      },
+      "new_valid": true,
+      "old_critique": "Format is correct grep output and the key matches (split_exclude call and definition present), but line numbers differ and the prediction missed several comment-line occurrences the actual output included.",
+      "new_critique": "Format and grep structure are correct with plausible line matches, but the prediction misses several actual matches (lines 163, 1255, 2106) and reports different line numbers, making the computed content inaccurate."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "9b34d711831d847094cd99db9288e93b",
+      "index": 52,
+      "action": "bash",
+      "len_actual": 428,
+      "old_score": 0.36,
+      "old_dims": {
+        "format": 0.8,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.7,
+        "quality": 0.1
+      },
+      "new_score": 0.15000000000000002,
+      "new_dims": {
+        "format": 0.4,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.7,
+        "quality": 0.1
+      },
+      "new_valid": true,
+      "old_critique": "Predicted a successful test run, but the actual output was a ModuleNotFoundError because Django isn't installed. The format matches a test-runner style output but the outcome is entirely wrong.",
+      "new_critique": "Predicted a successful test run, but the actual environment failed with a ModuleNotFoundError because Django isn't installed \u2014 a flipped outcome and completely wrong content."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "d8bd9183d1119aa2e571882ae1aa4ce7",
+      "index": 2,
+      "action": "bash",
+      "len_actual": 126,
+      "old_score": 0.82,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.6,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.6
+      },
+      "new_score": 0.7300000000000001,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.6,
+        "consistency": 0.9,
+        "realism": 1.0,
+        "quality": 0.7
+      },
+      "new_valid": true,
+      "old_critique": "Correctly predicted expressions.py and query.py, but missed __init__.py and fields/__init__.py which also reference OuterRef.",
+      "new_critique": "Correct format and no error flag, but the prediction omitted two files (__init__.py and fields/__init__.py) that actually contain OuterRef references, making the file list incomplete."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "3ed4044f4e66032f77ee61e2ebd78caf",
+      "index": 12,
+      "action": "bash",
+      "len_actual": 2484,
+      "old_score": 0.3,
+      "old_dims": {
+        "format": 0.6,
+        "factuality": 0.0,
+        "consistency": 0.1,
+        "realism": 0.7,
+        "quality": 0.1
+      },
+      "new_score": 0.060000000000000005,
+      "new_dims": {
+        "format": 0.2,
+        "factuality": 0.0,
+        "consistency": 0.1,
+        "realism": 0.3,
+        "quality": 0.0
+      },
+      "new_valid": true,
+      "old_critique": "The prediction assumed the script ran successfully, but the actual run failed at migrate with an ImproperlyConfigured error about DATABASES NAME, so the outcome, error state, and content diverge entirely.",
+      "new_critique": "Predicted a successful run, but the actual output is a traceback failing at migrate due to improperly configured DATABASES \u2014 a flipped outcome and wrong content."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "014dd41fc09729f6a1dad41bc08c4a35",
+      "index": 14,
+      "action": "bash",
+      "len_actual": 382,
+      "old_score": 0.9800000000000001,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.95,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.95
+      },
+      "new_score": 0.9649999999999999,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.95,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.95
+      },
+      "new_valid": true,
+      "old_critique": "Test counts, failures, errors, and diff output match exactly; only volatile values (git stash commit hash and timing) differ plausibly.",
+      "new_critique": "Prediction matches the actual test results (613 tests, 1 failure, 10 errors, 7 skipped) and translation diff exactly; only volatile details differ (commit hash/message, timing), which is acceptable."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "6ca77ed7cfab6751346e4886d9652274",
+      "index": 4,
+      "action": "bash",
+      "len_actual": 1003,
+      "old_score": 0.55,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.2,
+        "consistency": 0.4,
+        "realism": 0.85,
+        "quality": 0.3
+      },
+      "new_score": 0.4,
+      "new_dims": {
+        "format": 0.9,
+        "factuality": 0.2,
+        "consistency": 0.7,
+        "realism": 0.9,
+        "quality": 0.25
+      },
+      "new_valid": true,
+      "old_critique": "Correct JSON shape and plausible-looking Django source, but the actual code uses a single-tzname helper (_convert_tzname_to_sql) with different signatures, whereas the prediction invented a two-tzname variant (_convert_tznames_to_sql) and different function-call forms, so the computed file contents diverge substantially.",
+      "new_critique": "Correct file-slice format and plausible Django source style, but the predicted content diverges substantially: it invents a different _convert_tznames_to_sql helper and different method signatures/bodies than the actual lines shown."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "0ef4cc8135387ea8fe1d59f6b47b8ca5",
+      "index": 4,
+      "action": "bash",
+      "len_actual": 75,
+      "old_score": 0.5599999999999999,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.2,
+        "consistency": 0.4,
+        "realism": 0.9,
+        "quality": 0.3
+      },
+      "new_score": 0.42000000000000004,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.2,
+        "consistency": 0.7,
+        "realism": 0.9,
+        "quality": 0.3
+      },
+      "new_valid": true,
+      "old_critique": "Format and realism are fine, but the grep pattern only matched __init__/__setattr__/__set__, whereas the prediction invented many unrelated dunder methods (__new__, __repr__, __eq__, etc.) and wrong line numbers; only the __init__ line concept overlaps, and even that has a mismatched line number.",
+      "new_critique": "Format and grep style are correct, but the predicted lines don't match the actual output \u2014 the grep only matched __init__ and super().__init__() lines, whereas the prediction fabricated many unmatched dunder methods and wrong line numbers."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "9b34d711831d847094cd99db9288e93b",
+      "index": 71,
+      "action": "bash",
+      "len_actual": 33,
+      "old_score": 0.9,
+      "old_dims": {
+        "format": 1.0,
+        "factuality": 0.7,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.8
+      },
+      "new_score": 0.8099999999999999,
+      "new_dims": {
+        "format": 1.0,
+        "factuality": 0.7,
+        "consistency": 1.0,
+        "realism": 1.0,
+        "quality": 0.8
+      },
+      "new_valid": true,
+      "old_critique": "Format and structure match; the class name is correct but the predicted line number (1035) differs from the actual (950), which is deterministic lookup content.",
+      "new_critique": "Format and structure match exactly; the class definition text matches, but the predicted line number (1035) differs from the actual (950), a computed value that is wrong."
+    },
+    {
+      "corpus": "swe-bench",
+      "trace_id": "76ef5b90e2dc287bc7ab73fd90d1cb73",
+      "index": 15,
+      "action": "bash",
+      "len_actual": 680,
+      "old_score": 0.33999999999999997,
+      "old_dims": {
+        "format": 0.6,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.7,
+        "quality": 0.2
+      },
+      "new_score": 0.19,
+      "new_dims": {
+        "format": 0.7,
+        "factuality": 0.0,
+        "consistency": 0.2,
+        "realism": 0.8,
+        "quality": 0.1
+      },
+      "new_valid": true,
+      "old_critique": "Predicted a clean test-pass, but the actual run raised a TypeError during test discovery (module.__file__ is None); the outcome diverges entirely.",
+      "new_critique": "Predicted a successful test run, but the actual output is a TypeError traceback from test discovery failing; outcome is flipped."
+    }
+  ]
+}

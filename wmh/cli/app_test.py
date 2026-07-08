@@ -41,7 +41,12 @@ class FakeProvider:
         if "improve the system prompt" in system:
             return Completion(text="IMPROVED ENV PROMPT")
         if "grade a world model" in system:
-            return Completion(text='{"score": 0.5, "critique": "be more specific"}')
+            return Completion(
+                text=(
+                    '{"format": 0.5, "factuality": 0.5, "consistency": 0.5, '
+                    '"realism": 0.5, "quality": 0.5, "critique": "be more specific"}'
+                )
+            )
         return Completion(text='{"output": "user u1 found", "is_error": false}')
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -318,7 +323,7 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
 def test_eval_trace_file_command_still_scores(patched_provider, tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(
         app,
-        ["eval", _traces_file(tmp_path), "--judge", "match", "--no-rag"],
+        ["eval", _traces_file(tmp_path), "--no-rag"],
     )
 
     assert result.exit_code == 0, result.output
@@ -362,7 +367,6 @@ def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  #
             [
                 'description = "Tiny deterministic suite"',
                 'files = ["../traces.otel.jsonl"]',
-                'judge = "match"',
                 "train_split = 0.5",
             ]
         ),

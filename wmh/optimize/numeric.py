@@ -1,6 +1,6 @@
 """NumericJudge: deterministic scoring for structured, measurement-style observations.
 
-Semantic judges (`LLMJudge`, `RubricJudge`) grade text equivalence; corpora whose observations are
+The semantic judge (`RubricJudge`) grades text equivalence; corpora whose observations are
 measurements (robot poses, memory footprints, latencies) need exact structural comparison instead.
 The judge flattens both observations' JSON content into leaf fields, scores numeric leaves by
 relative error and every other leaf (bools, strings, nulls) by exact match, and reports the mean —

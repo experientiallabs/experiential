@@ -1,0 +1,187 @@
+{
+  "judge_model": "us.anthropic.claude-opus-4-8",
+  "report": {
+    "verdicts": [
+      {
+        "case_id": "exact-json-lookup",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Prediction is an exact character-for-character match of the actual observation.",
+        "failures": []
+      },
+      {
+        "case_id": "cosmetic-reordering",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "All fields and flight values match exactly; only key ordering differs, which is irrelevant for JSON.",
+        "failures": []
+      },
+      {
+        "case_id": "volatile-pid-differs",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "PID is volatile; predicted a plausible PID with correct format, matching the actual output structure exactly.",
+        "failures": []
+      },
+      {
+        "case_id": "wrong-computed-values",
+        "defect": "control",
+        "passed": true,
+        "score": 0.4000000000000001,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.1,
+          "consistency": 0.9,
+          "realism": 1.0,
+          "quality": 0.3
+        },
+        "critique": "Format and structure match perfectly (version list, same length, correct count), but this is deterministic file content and most of the actual version values differ from the prediction.",
+        "failures": []
+      },
+      {
+        "case_id": "fabricated-lookup-data",
+        "defect": "control",
+        "passed": true,
+        "score": 0.25000000000000006,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.0,
+          "consistency": 0.4,
+          "realism": 0.9,
+          "quality": 0.1
+        },
+        "critique": "Format and structure match perfectly, but all deterministic reservation data (user_id, origin, destination, flight_type, cabin, flights) is fabricated and wrong.",
+        "failures": []
+      },
+      {
+        "case_id": "right-facts-wrong-shape",
+        "defect": "control",
+        "passed": true,
+        "score": 0.555,
+        "dimensions": {
+          "format": 0.1,
+          "factuality": 0.85,
+          "consistency": 0.6,
+          "realism": 0.1,
+          "quality": 0.25
+        },
+        "critique": "The predicted content conveys the correct facts (user, route, flights, prices) but is prose rather than the JSON object the environment returns, breaking format and realism.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-nonempty-actual",
+        "defect": "empty-prediction",
+        "passed": true,
+        "score": 0.0,
+        "dimensions": {
+          "format": 0.0,
+          "factuality": 0.0,
+          "consistency": 0.0,
+          "realism": 0.0,
+          "quality": 0.0
+        },
+        "critique": "Predicted content is empty while the actual observation returned a full list of version strings; the prediction omitted the environment's response entirely.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-empty-actual",
+        "defect": "both-empty",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Both observations are empty, matching exactly; the command redirects output to a file so no stdout is expected.",
+        "failures": []
+      },
+      {
+        "case_id": "error-flipped-to-pretty-success",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.08000000000000002,
+        "dimensions": {
+          "format": 0.3,
+          "factuality": 0.0,
+          "consistency": 0.1,
+          "realism": 0.4,
+          "quality": 0.0
+        },
+        "critique": "The actual environment returned an error that the user was not found, but the prediction fabricated a successful user_id lookup \u2014 a flipped outcome and factuality failure.",
+        "failures": []
+      },
+      {
+        "case_id": "success-flipped-to-error",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.04,
+        "dimensions": {
+          "format": 0.1,
+          "factuality": 0.0,
+          "consistency": 0.0,
+          "realism": 0.3,
+          "quality": 0.0
+        },
+        "critique": "Predicted an error/not-found while the actual returned a full valid reservation record; flipped outcome and completely wrong content.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-identical",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Prediction is byte-for-byte identical to the actual observation, including the same content_length, truncation marker, and all 2000 OK item lines.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-divergent-tail",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 0.53,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.4,
+          "consistency": 0.6,
+          "realism": 0.9,
+          "quality": 0.4
+        },
+        "critique": "Format and OK-line structure match perfectly, but the prediction fabricated 100 FAIL/corrupted entries (items 1900-1999) whereas the actual output shows all items as OK, a salient factual divergence.",
+        "failures": []
+      }
+    ]
+  }
+}

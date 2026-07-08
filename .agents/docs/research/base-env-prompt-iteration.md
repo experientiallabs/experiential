@@ -7,6 +7,8 @@ migrated: 2026-07-02
 
 # Iterating on BASE_ENV_PROMPT with replay fidelity
 
+> **Stale commands (2026-07-02):** the `--judge` flag, the suite `judge` key, and `LLMJudge` were removed in PR #83 (single weighted RubricJudge). Commands below reproduce results only at their original commit; drop `--judge ...` to run on current main (absolute fidelity levels differ under the new judge).
+
 `BASE_ENV_PROMPT` (`wmh/engine/prompts.py`) is layer (a): the env-agnostic prompt GEPA evolves from.
 We want it both **general** (works across domains) and a **strong GEPA starting surface** (high
 zero-/few-shot reconstruction fidelity before any evolution). We tune it by measuring, not guessing.

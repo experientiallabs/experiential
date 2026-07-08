@@ -27,7 +27,7 @@ from pathlib import Path
 from wmh.engine.eval_suites import resolve_eval_suite
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.ingest import get_adapter
-from wmh.optimize.judge import Judge, LLMJudge, RubricJudge
+from wmh.optimize.judge import Judge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, get_provider
 from wmh.providers.base import Embedder, Provider
 from wmh.research import TraceScalingAblation, run_ablation
@@ -53,7 +53,6 @@ def _make_backends(
     region: str | None,
     embed_dim: int,
     no_rag: bool,
-    judge: str,
 ) -> Callable[[], tuple[Provider, Judge, Embedder | None]]:
     """Factory the ablation calls per run for (provider, judge, embedder).
 
@@ -68,7 +67,7 @@ def _make_backends(
     judge_provider: Provider = get_provider(
         ProviderConfig(kind=ProviderKind.BEDROCK, model=judge_model, region=region)
     )
-    scorer: Judge = RubricJudge(judge_provider) if judge == "rubric" else LLMJudge(judge_provider)
+    scorer: Judge = RubricJudge(judge_provider)
     embedder: Embedder | None = None if no_rag else HashingEmbedder(dim=embed_dim)
 
     def factory() -> tuple[Provider, Judge, Embedder | None]:
@@ -100,7 +99,7 @@ def _run(args: argparse.Namespace) -> AblationReport:
         traces,
         BASE_ENV_PROMPT,
         make_backends=_make_backends(
-            args.judge_model, args.opt_model, args.region, args.embed_dim, args.no_rag, args.judge
+            args.judge_model, args.opt_model, args.region, args.embed_dim, args.no_rag
         ),
         counts=_parse_ints(args.counts),
         modes=_parse_strs(args.modes),
@@ -123,7 +122,7 @@ def _run(args: argparse.Namespace) -> AblationReport:
     )
     print(
         f"counts={ablation.counts}, modes={args.modes}, seeds={seeds}, budget={args.budget}\n"
-        f"opt-model={args.opt_model}, judge={args.judge} ({args.judge_model})\n"
+        f"opt-model={args.opt_model}, judge={args.judge_model}\n"
     )
 
     def _progress(condition: Condition, seed: int, score: float) -> None:
@@ -176,7 +175,6 @@ def main() -> None:
     parser.add_argument("--region", default="us-east-1", help="AWS region (Bedrock).")
     parser.add_argument("--embed-dim", type=int, default=512, help="phi dim (offline embedder).")
     parser.add_argument("--no-rag", action="store_true", help="Disable retrieval (zero-shot).")
-    parser.add_argument("--judge", default="rubric", help="Scorer: rubric (5-dim) | match.")
     parser.add_argument("--out", default=None, help="Path to write the AblationReport JSON.")
     args = parser.parse_args()
 

@@ -1,0 +1,178 @@
+{
+  "judge_model": "us.anthropic.claude-opus-4-8",
+  "report": {
+    "verdicts": [
+      {
+        "case_id": "exact-json-lookup",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Prediction is an exact match to the actual observation across all fields including content, length, and flags.",
+        "failures": []
+      },
+      {
+        "case_id": "cosmetic-reordering",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "All salient fields (user, route, flights, prices, cabin) match exactly; only key ordering differs, which is immaterial, and content_length matches.",
+        "failures": []
+      },
+      {
+        "case_id": "volatile-pid-differs",
+        "defect": "control",
+        "passed": true,
+        "score": 0.97,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.9,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 0.95
+        },
+        "critique": "PID is volatile; predicted value differs but is plausible with correct format and length.",
+        "failures": []
+      },
+      {
+        "case_id": "wrong-computed-values",
+        "defect": "control",
+        "passed": false,
+        "score": 0.6599999999999999,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.1,
+          "consistency": 1.0,
+          "realism": 0.9,
+          "quality": 0.3
+        },
+        "critique": "Format and structure match exactly (version list, same length), but this is deterministic file content and nearly all the specific version numbers differ from the actual values.",
+        "failures": [
+          "score 0.660 outside [0.0, 0.6]"
+        ]
+      },
+      {
+        "case_id": "fabricated-lookup-data",
+        "defect": "control",
+        "passed": false,
+        "score": 0.52,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.0,
+          "consistency": 0.5,
+          "realism": 0.9,
+          "quality": 0.2
+        },
+        "critique": "Format and structure match perfectly, but this is deterministic stored reservation data and nearly every field diverges (user_id, origin, destination, flight_type, cabin, flights).",
+        "failures": [
+          "score 0.520 outside [0.0, 0.4]"
+        ]
+      },
+      {
+        "case_id": "empty-pred-nonempty-actual",
+        "defect": "empty-prediction",
+        "passed": false,
+        "score": 0.38,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.0,
+          "consistency": 0.3,
+          "realism": 0.4,
+          "quality": 0.2
+        },
+        "critique": "Format matches the environment's schema, but the predicted empty content diverges entirely from the actual file containing 12 version numbers.",
+        "failures": [
+          "score 0.380 outside [0.0, 0.25]"
+        ]
+      },
+      {
+        "case_id": "empty-pred-empty-actual",
+        "defect": "both-empty",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Command redirects stdout to a file, producing empty terminal output; prediction correctly matches the empty, non-error observation.",
+        "failures": []
+      },
+      {
+        "case_id": "error-flipped-to-pretty-success",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.32,
+        "dimensions": {
+          "format": 0.7,
+          "factuality": 0.0,
+          "consistency": 0.2,
+          "realism": 0.6,
+          "quality": 0.1
+        },
+        "critique": "The prediction fabricated a successful user lookup with an invented user_id, but the actual environment returned an error indicating the user was not found; the outcome and is_error flag are both wrong.",
+        "failures": []
+      },
+      {
+        "case_id": "success-flipped-to-error",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.26000000000000006,
+        "dimensions": {
+          "format": 0.4,
+          "factuality": 0.0,
+          "consistency": 0.2,
+          "realism": 0.6,
+          "quality": 0.1
+        },
+        "critique": "Predicted an error/not-found result, but the actual observation returned a full valid reservation record; completely wrong outcome and salient data.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-identical",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Prediction matches the actual observation exactly: all 2000 lines (item-0 through item-1999, all OK), identical content_length of 34889, and matching flags.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-divergent-tail",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 0.5599999999999999,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.4,
+          "consistency": 0.5,
+          "realism": 0.9,
+          "quality": 0.0
+        },
+        "critique": "Format and structure match perfectly, but the prediction fabricated 100 'FAIL ... corrupted' lines for items 1900-1999 whereas the actual output shows all 2000 items as 'OK'; content_length also differs (36089 vs 34889).",
+        "failures": []
+      }
+    ]
+  }
+}

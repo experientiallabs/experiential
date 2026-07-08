@@ -158,8 +158,7 @@ def build(
         report.rollout(done, metric_total["calls"], score)
 
     # Optimize against the SAME scorer we evaluate with (RubricJudge), so GEPA hill-climbs the
-    # metric we actually report. The coarser LLMJudge here would let GEPA improve a proxy objective
-    # that doesn't move the reported rubric fidelity.
+    # metric we actually report rather than a proxy objective.
     optimizer = GEPAOptimizer(
         provider,
         RubricJudge(judge_provider),

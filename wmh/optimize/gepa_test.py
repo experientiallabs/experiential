@@ -323,6 +323,45 @@ def test_adapter_evaluate_survives_rollout_failure() -> None:
     assert out.trajectories is not None and "failed" in out.trajectories[0].critique
 
 
+def test_adapter_imputes_neutral_score_for_invalid_judgements() -> None:
+    # A judge failure (valid=False) says nothing about the prediction: it must not become a
+    # phantom 0.0 in GEPA's fitness, and its parse-error critique must not reach reflection.
+    class InvalidOnSecondJudge(FakeJudge):
+        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+            self.calls += 1
+            if self.calls == 2:
+                return JudgeResult(score=0.0, critique="Unparseable judge reply", valid=False)
+            return JudgeResult(score=0.8, critique="ok")
+
+    adapter = WorldModelGEPAAdapter(FakeProvider(), InvalidOnSecondJudge())
+    out = adapter.evaluate(_eval_batch(_trace("t", n=3)), {ENV_PROMPT_COMPONENT: "P"}, True)
+    # The invalid step gets the mean of the valid scores (neutral), not 0.0.
+    assert out.scores == [0.8, 0.8, 0.8]
+
+    reflective = adapter.make_reflective_dataset(
+        {ENV_PROMPT_COMPONENT: "P"}, out, [ENV_PROMPT_COMPONENT]
+    )
+    records = reflective[ENV_PROMPT_COMPONENT]
+    assert len(records) == 2  # the judge-noise record is excluded from reflection
+    assert all("Unparseable" not in str(r["Feedback"]) for r in records)
+
+
+def test_adapter_all_invalid_judgements_fall_back_to_full_reflection() -> None:
+    class AlwaysInvalidJudge(FakeJudge):
+        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+            return JudgeResult(score=0.0, critique="Unparseable judge reply", valid=False)
+
+    adapter = WorldModelGEPAAdapter(FakeProvider(), AlwaysInvalidJudge())
+    out = adapter.evaluate(_eval_batch(_trace("t", n=2)), {ENV_PROMPT_COMPONENT: "P"}, True)
+    # No valid score to impute from: keep the raw zeros rather than inventing a signal.
+    assert out.scores == [0.0, 0.0]
+    reflective = adapter.make_reflective_dataset(
+        {ENV_PROMPT_COMPONENT: "P"}, out, [ENV_PROMPT_COMPONENT]
+    )
+    # An empty reflective dataset would break GEPA's mutation step; fall back to everything.
+    assert len(reflective[ENV_PROMPT_COMPONENT]) == 2
+
+
 def test_eval_steps_retrieves_demos_without_same_trace_leakage() -> None:
     from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
     from wmh.retrieval.leakfree import DemoRetriever
