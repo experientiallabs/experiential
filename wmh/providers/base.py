@@ -52,6 +52,10 @@ class TokenUsage(BaseModel):
 class Completion(BaseModel):
     text: str
     usage: TokenUsage = Field(default_factory=TokenUsage)
+    # The model that actually served, when the provider is a failover chain and a fallback took
+    # the call. None (the norm) means "the configured model" — metering falls back to config.
+    # min_length=1 keeps "" impossible, so `completion.model or config.model` is exact.
+    model: str | None = Field(default=None, min_length=1)
 
 
 DEFAULT_MAX_TOKENS = 8192

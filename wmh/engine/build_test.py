@@ -18,6 +18,7 @@ class FakeProvider:
 
     def __init__(self) -> None:
         self.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+        self.systems: list[str] = []  # system prompt of every complete() call, for assertions
 
     def complete(
         self,
@@ -27,10 +28,16 @@ class FakeProvider:
         temperature: float = 0.7,
         max_tokens: int = 8192,
     ) -> Completion:
+        self.systems.append(system)
         if "improve the system prompt" in system:
             return Completion(text="IMPROVED ENV PROMPT")
         if "grade a world model" in system:  # the judge
-            return Completion(text='{"score": 0.5, "critique": "be more specific"}')
+            return Completion(
+                text=(
+                    '{"format": 0.5, "factuality": 0.5, "consistency": 0.5, '
+                    '"realism": 0.5, "quality": 0.5, "critique": "be more specific"}'
+                )
+            )
         return Completion(text='{"output": "ok", "is_error": false}')
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -161,3 +168,58 @@ def test_build_writes_a_loadable_artifact(tmp_path) -> None:  # noqa: ANN001 - p
 
     wm = WorldModel.load(str(root), FakeProvider())
     assert wm.sample_steps(5)
+
+
+def test_build_judge_stays_on_the_judge_provider(tmp_path) -> None:  # noqa: ANN001 - fixture
+    # The serve provider may be a failover chain; the judge (GEPA's fitness metric) must run on
+    # the separately supplied pinned provider so optimization is scored by one model throughout.
+    span_llm = {
+        "traceId": "b" * 32,
+        "spanId": "s1",
+        "name": "chat",
+        "startTimeUnixNano": 1,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.tool.name", "value": {"stringValue": "get_user"}},
+            {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": '{"id": "u1"}'}},
+        ],
+    }
+    span_tool = {
+        "traceId": "b" * 32,
+        "spanId": "s2",
+        "name": "execute_tool",
+        "startTimeUnixNano": 2,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+            {"key": "gen_ai.tool.message", "value": {"stringValue": "found u1"}},
+        ],
+    }
+    # Four copies of the trace under distinct trace ids: the 3-way split (train/val/test) must
+    # leave a non-empty val set, or GEPA never scores a candidate and the judge is never called.
+    lines: list[str] = []
+    for i in range(4):
+        trace_id = f"{i:x}" * 32
+        lines.append(json.dumps({**span_llm, "traceId": trace_id, "spanId": f"s1-{i}"}))
+        lines.append(json.dumps({**span_tool, "traceId": trace_id, "spanId": f"s2-{i}"}))
+    traces_file = tmp_path / "traces.jsonl"
+    traces_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    serve, judge = FakeProvider(), FakeProvider()
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=4,
+        train_split=0.5,
+    )
+    result = build(
+        config,
+        file=str(traces_file),
+        root=str(tmp_path / ".wmh"),
+        serve_provider=serve,
+        judge_provider=judge,
+        embedder=HashingEmbedder(dim=64),
+    )
+    assert result.prompt
+    assert all("grade a world model" not in s for s in serve.systems)
+    assert any("grade a world model" in s for s in judge.systems)
+    assert all("grade a world model" in s for s in judge.systems)  # judge does ONLY judging

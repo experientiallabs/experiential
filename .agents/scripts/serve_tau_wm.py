@@ -47,19 +47,58 @@ from wmh.providers.base import (
     ProviderKind,
     VerifyResult,
 )
-from wmh.providers.fallback import FallbackProvider
 from wmh.serving.server import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # WMH_MODEL_DIR/WMH_WM_NAME swap the served artifact for the D67 cross-benchmark
 # smokes (terminal/swe/gui reuse this script unchanged apart from these two).
-MODEL_DIR = Path(
-    os.environ.get("WMH_MODEL_DIR", REPO_ROOT / "packages" / "environment-capture" / "tau-bench" / "models" / "tau-bench")
+_DEFAULT_MODEL_DIR = (
+    REPO_ROOT / "packages" / "environment-capture" / "tau-bench" / "models" / "tau-bench"
 )
+MODEL_DIR = Path(os.environ.get("WMH_MODEL_DIR", _DEFAULT_MODEL_DIR))
 WM_NAME = os.environ.get("WMH_WM_NAME", "tau-bench")
 HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # dated profile id (required)
 EVAL_ENV_MODEL = "gpt-5.5"
 JUDGE_MODEL = "us.anthropic.claude-opus-4-8"  # the artifact's own serve model id
+
+
+class FallbackProvider:
+    """Sequential same-call failover that FORWARDS temperature (unlike WaterfallProvider,
+    which drops sampling params by design). The temperature pass-through is load-bearing
+    here: WMH_ENV_TEMPERATURE (D62/D64) and the judge's explicit temperature=0.0 must
+    reach the backend or the training substrate silently changes.
+    """
+
+    def __init__(self, chain: list[Provider]) -> None:
+        if not chain:
+            raise ValueError("FallbackProvider needs at least one provider")
+        self._chain = chain
+        self.config = chain[0].config
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Completion:
+        last: Exception | None = None
+        for provider in self._chain:
+            try:
+                return provider.complete(
+                    system, messages, temperature=temperature, max_tokens=max_tokens
+                )
+            except Exception as exc:  # noqa: BLE001 - any backend failure moves down the chain
+                last = exc
+        assert last is not None
+        raise last
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._chain[0].embed(texts)
+
+    def verify(self) -> VerifyResult:
+        return self._chain[0].verify()
 
 
 def _fallback_chain(config: ProviderConfig) -> Provider:

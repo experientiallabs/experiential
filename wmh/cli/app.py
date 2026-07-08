@@ -28,6 +28,7 @@ from environment_capture.hub import (
     fetch_corpus,
     published_corpora,
 )
+from llm_waterfall import is_capacity_error
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -81,7 +82,6 @@ from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import LLMJudge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
-from wmh.providers.fallback import _is_capacity_error
 from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
 from wmh.scenarios import (
@@ -275,6 +275,9 @@ def build(
         None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    chain: str = typer.Option(
+        None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
+    ),
     gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
@@ -390,14 +393,16 @@ def build(
     # silently swallows it and "succeeds" with a useless held-out-0.0 model.
     if not use_wizard:
         # The wizard already live-pinged the serve provider and embedder inline.
-        _verify_or_abort(config)
+        _verify_or_abort(config, chain=chain)
 
-    # Meter the build at the provider boundary: the one serve provider drives GEPA rollouts,
-    # reflection, and the judge, so wrapping it captures all build LLM cost/tokens without touching
-    # the optimizer. `classify_build_call` splits judge vs GEPA by system prompt.
+    # Meter the build at the provider boundary; `classify_build_call` splits judge vs GEPA by
+    # system prompt. Rollouts/reflection may ride the failover chain, but the judge (GEPA's
+    # fitness metric) is PINNED to the single configured backend — a judge that silently switches
+    # models mid-build scores candidates on different scales. Both wrappers share one tracker,
+    # so cost/tokens still land in a single run record.
     tracker = RunTracker(run_id=uuid.uuid4().hex, kind="build")
     metered = MeteredProvider(
-        providers.get_provider(config.serve_provider_config()),
+        providers.provider_or_chain(config.serve_provider_config(), chain=chain),
         tracker,
         classify=classify_build_call,
     )
@@ -454,7 +459,7 @@ def build(
             )
 
 
-def _verify_or_abort(config: HarnessConfig) -> None:
+def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
     """Ping the serve provider (and any provider-backed embedder) and abort on failure.
 
     Runs before any rollouts so a missing SDK or bad creds fails loudly and immediately, instead of
@@ -468,8 +473,19 @@ def _verify_or_abort(config: HarnessConfig) -> None:
     failed = False
     for cfg, is_embed in checks:
         label = f"embed:{cfg.kind.value}" if is_embed else cfg.kind.value
-        _console.print(f"verifying {label}…")
-        result = verify_embedder(cfg) if is_embed else verify_all([cfg])[0]
+        serve_provider = None if is_embed else providers.provider_or_chain(cfg, chain=chain)
+        if is_embed:
+            _console.print(f"verifying {label}…")
+            result = verify_embedder(cfg)
+        elif isinstance(serve_provider, providers.WaterfallProvider):
+            # Verify the provider the build will actually use — with a chain active, that means
+            # pinging every rung (a broken fallback must fail here, not hours into the build).
+            label = f"{label} chain (.wmh/fallback.toml)"
+            _console.print(f"verifying {label}…")
+            result = serve_provider.verify()
+        else:
+            _console.print(f"verifying {label}…")
+            result = verify_all([cfg])[0]
         if result.ok:
             _console.print(f"  {_CHECK} {label} ({result.model}) reachable")
             continue
@@ -611,6 +627,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
+    chain: str | None = typer.Option(
+        None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
+    ),
     train_split: float | None = typer.Option(
         None, help="Train/holdout ratio per file (default: 0.7, or suite config)."
     ),
@@ -760,6 +779,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         options,
         provider=provider,
         model=model,
+        chain=chain,
         region=region,
         judge_model=judge_model,
         judge_provider=judge_provider,
@@ -974,6 +994,7 @@ def _run_eval_files(
     provider: str,
     model: str,
     region: str | None,
+    chain: str | None = None,
     judge_model: str | None = None,
     judge_provider: str = "bedrock",
 ) -> EvalReport:
@@ -985,21 +1006,25 @@ def _run_eval_files(
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    llm = providers.get_provider(ProviderConfig(kind=serve_provider, model=model, region=region))
+    provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
+    llm = providers.provider_or_chain(provider_config)
+    if isinstance(llm, providers.WaterfallProvider):
+        _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
     prompt = (
         Path(options.prompt_file).read_text(encoding="utf-8")
         if options.prompt_file
         else BASE_ENV_PROMPT
     )
     embedder = HashingEmbedder(dim=options.embed_dim) if options.use_rag else None
-    # A pinned judge keeps the grader constant when fidelity is compared across serve
-    # backends; without it the judge changes with the cell and the numbers don't compare.
-    judge_llm = (
-        providers.get_provider(
-            ProviderConfig(kind=ProviderKind(judge_provider), model=judge_model, region=region)
-        )
+    # The judge is the metric: it stays PINNED to the single requested backend and never rides
+    # the failover chain — a judge that silently switches models mid-run makes fidelity numbers
+    # incomparable across steps. World-model prediction calls (above) may fail over freely.
+    # --judge-model additionally pins the judge to its OWN model: comparing fidelity
+    # across serve backends requires a constant grader, or the judge changes with the cell.
+    judge_llm = providers.get_provider(
+        ProviderConfig(kind=ProviderKind(judge_provider), model=judge_model, region=region)
         if judge_model
-        else llm
+        else provider_config
     )
     scorer = RubricJudge(judge_llm) if options.judge == "rubric" else LLMJudge(judge_llm)
     evaluation = OpenLoopEval(
@@ -1359,7 +1384,7 @@ def demo(
                     _NARRATOR.detach()
             break
         except Exception as exc:  # noqa: BLE001 - classified below
-            if not _is_capacity_error(exc) or not _console.is_terminal:
+            if not is_capacity_error(exc) or not _console.is_terminal:
                 raise
             # Retries are exhausted and the backend is still down: offer to re-point the model
             # at a different provider (same picker as the build wizard) and RESUME from the

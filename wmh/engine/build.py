@@ -105,8 +105,11 @@ def build(
 
     `serve_provider` / `embedder` are injectable for testing; in production they are constructed
     from `config` (serve provider via the registry, embedder = offline HashingEmbedder sized to
-    `config.embed_dim`). `reporter` receives progress events (defaults to a no-op). Returns the
-    GEPA OptimizeResult (also persisted).
+    `config.embed_dim`). `judge_provider`, when given, runs the judge separately from the serve
+    provider: pass a pinned single backend when `serve_provider` is a failover chain, so GEPA's
+    fitness metric is scored by one model throughout even while rollouts fail over. `reporter`
+    receives progress events (defaults to a no-op). Returns the GEPA OptimizeResult (also
+    persisted).
     """
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)

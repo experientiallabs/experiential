@@ -140,6 +140,37 @@ def test_step_meters_usage_per_session() -> None:
     assert usage.total.cost_usd == pytest.approx(0.0027)
 
 
+class _FailedOverProvider(_UsageProvider):
+    """Mimics a failover chain: config reports the primary, Completion reports who served."""
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        completion = super().complete(
+            system, messages, temperature=temperature, max_tokens=max_tokens
+        )
+        return completion.model_copy(update={"model": "claude-haiku-4-5"})
+
+
+def test_step_meters_usage_at_serving_model_rate() -> None:
+    # Regression: serve-path metering must price a failed-over call at the SERVING model's
+    # rate (haiku 1/5 per Mtok), not the configured primary's (opus 5/25) — a 5x over-report.
+    provider = _FailedOverProvider('{"output": "ok", "is_error": false}')
+    provider.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="claude-opus-4-8")
+    wm = WorldModel(provider, _retriever_with([]), top_k=1)
+    session = wm.new_session(task="t")
+
+    wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="f", arguments={}))
+
+    usage = wm.session_usage(session.id)
+    assert usage.total.cost_usd == pytest.approx((120 * 1.0 + 30 * 5.0) / 1_000_000)
+
+
 def test_step_telemetry_counts_steps_without_content(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

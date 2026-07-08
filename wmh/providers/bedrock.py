@@ -88,25 +88,26 @@ class BedrockProvider:
 
             # Bound each request so a stalled connection RAISES instead of blocking forever. Without
             # this, a single hung InvokeModel wedges the whole run (long GEPA/eval jobs never
-            # finish) and a FallbackProvider can't fail over — it only reacts to raised errors.
+            # finish) and a failover chain can't fail over — it only reacts to raised errors.
             # `read_timeout` is generous because reasoning models can generate for a while at up to
             # `max_tokens` (a mid-generation cutoff wastes the whole call and, under a fallback
             # chain, silently substitutes a different model into an eval).
             #
-            # `max_attempts=1` disables botocore's OWN retries on purpose: throttling / 5xx /
-            # timeouts should surface IMMEDIATELY to the caller, where FallbackProvider owns retry
+            # `total_max_attempts=1` disables botocore's OWN retries on purpose (it counts the
+            # initial request; botocore's `max_attempts` counts retries AFTER it): throttling/5xx/
+            # timeouts should surface IMMEDIATELY to the caller, where the failover chain owns retry
             # policy (fail over to the next model). Leaving botocore's adaptive retries on would
             # stack 3 internal attempts per model UNDER our 4-model failover — up to 12 backend
             # calls with back-off for one throttled request — turning graceful degradation into a
             # slow crawl.
-            # Two independent stall modes, one Config (D77 reconcile):
-            # - "standard" retry mode makes max_attempts mean TOTAL attempts (legacy mode
-            #   sneaks in one internal retry — a long silent stall before the CLI's own
-            #   narrated backoff can react).
-            # - `tcp_keepalive` guards dead keep-alive connections the LB silently dropped
-            #   during an idle gap; without it the next call hangs until read_timeout
-            #   (observed as ~10-minute stalls on the FIRST call after idle), with it the
-            #   OS detects the dead peer and the call fails fast into the FallbackProvider.
+            # "standard" mode makes max_attempts mean TOTAL attempts (legacy mode still
+            # sneaks in one internal retry, which showed up as a long silent stall before the
+            # CLI's own narrated backoff could react).
+            # `tcp_keepalive` guards the other stall mode: a keep-alive connection the LB
+            # silently dropped during an idle gap. Without it, the next call on that socket
+            # hangs until read_timeout (observed as ~10-minute stalls on the FIRST call after
+            # idle — turn-1 WM steps, sparse judge calls); with it, the OS detects the dead
+            # peer and the call fails fast into the failover chain.
             client_config = Config(
                 connect_timeout=15,
                 read_timeout=600,
@@ -166,9 +167,7 @@ class BedrockProvider:
         """
         kwargs: dict[str, JsonValue] = {
             "modelId": self.config.model,
-            "messages": [
-                {"role": m.role, "content": [{"text": m.content}]} for m in messages
-            ],
+            "messages": [{"role": m.role, "content": [{"text": m.content}]} for m in messages],
             "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
         }
         if system:

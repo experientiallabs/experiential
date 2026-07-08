@@ -184,7 +184,11 @@ def _collect_source(
     # A pull-capable vendor with no file already given: offer file-vs-pull.
     if can_pull and not file and not pull:
         mode = _select(
-            console, ask, "Read traces from", ["exported file", "live API pull"], None,
+            console,
+            ask,
+            "Read traces from",
+            ["exported file", "live API pull"],
+            None,
             interactive=interactive,
         )
         pull = mode == "live API pull"

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from wmh.config import load_config
 from wmh.engine.world_model import WorldModel
-from wmh.providers import get_provider
+from wmh.providers import provider_or_chain
 from wmh.providers.base import Provider
 
 
@@ -24,5 +24,5 @@ def load_world_model(
     LLM agent against the same provider) don't re-read the config or reconstruct it.
     """
     config = load_config(str(model_dir))
-    provider = get_provider(config.serve_provider_config())
+    provider = provider_or_chain(config.serve_provider_config())
     return WorldModel.load(str(model_dir), provider, telemetry_root=telemetry_root), provider

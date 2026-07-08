@@ -9,7 +9,7 @@ the finished transcript is scored by wmh's `EpisodeRewardJudge` — the SAME jud
 scores WM-side rows, so the two are directly comparable. Records are keyed by each scenario's source
 trace id (``provenance[0]``) so they pair 1:1 with the WM-eval rows.
 
-The terminal counterpart of ``packages/environment-capture/tau-bench/rl/real_eval.py``. Unlike the tau harness (which
+The terminal counterpart of the tau-bench rl real-env harness. Unlike the tau harness (which
 shells out to the ``tau2`` CLI and imports nothing but stdlib), this one imports wmh for the judge
 and drives the policy loop itself over httpx; docker is the only external process it shells out to.
 
@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
@@ -40,7 +39,7 @@ from wmh.core.types import Action, ActionKind, JsonObject, Observation, Step
 from wmh.optimize.reward import EpisodeRewardJudge, EpisodeScore
 from wmh.providers import get_provider
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
-from wmh.providers.fallback import FallbackProvider
+from wmh.providers.retry import RetryingProvider
 
 _HERE = Path(__file__).resolve().parent
 DEFAULT_SCENARIOS = _HERE / "scenarios_eval.jsonl"
@@ -52,7 +51,7 @@ JUDGE_MODEL = "us.anthropic.claude-opus-4-8"
 JUDGE_REGION = "us-east-1"
 
 IMAGE = "debian:bookworm-slim"
-# Mirrors packages/environment-capture/terminal-tasks/capture_terminal.py so the eval shell matches the captured one.
+# Mirrors ../capture_terminal.py so the eval shell matches the captured one.
 SETUP = (
     "apt-get update -qq && "
     "apt-get install -y -qq curl python3 jq git ca-certificates >/dev/null 2>&1"
@@ -345,20 +344,14 @@ def _exec_in(cid: str, command: str) -> tuple[str, int]:
 
 
 def judge_provider() -> Provider:
-    """Bedrock Opus 4.8 wrapped in the standard same-model failover chain (D18/D68 shape).
+    """Bedrock Opus 4.8 behind retries, pinned to one model (D67 comparability).
 
-    Two same-region links (rides throttles), then a us-west-2 link (rides regional brownouts), then
-    the Anthropic direct API as a cross-provider last resort when a key is present.
+    RetryingProvider forwards the judge's explicit ``temperature=0.0`` (the repo's chain
+    provider deliberately drops sampling params, which would silently change the judge);
+    per-episode error records absorb anything retries can't ride out.
     """
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model=JUDGE_MODEL, region=JUDGE_REGION)
-    chain: list[Provider] = [get_provider(config), get_provider(config)]
-    if config.region != "us-west-2":
-        chain.append(get_provider(config.model_copy(update={"region": "us-west-2"})))
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        chain.append(
-            get_provider(ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-opus-4-8"))
-        )
-    return FallbackProvider(chain)
+    return RetryingProvider(get_provider(config))
 
 
 def run_real_episode(
