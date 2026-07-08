@@ -319,10 +319,28 @@ def test_secret_values_in_observation_are_flagged() -> None:
     assert host_escape_findings(key_leak, generic_path_markers=False)
 
 
-def test_ordinary_observation_with_key_shaped_word_is_not_flagged() -> None:
-    """A lowercase data value that merely contains 'key' is not a credential dump."""
-    clean = _trajectory("cat data/rows.csv", "row primary_key = 5\nother_value = 12")
-    assert host_escape_findings(clean) == []
+def test_ordinary_key_shaped_assignments_are_not_flagged() -> None:
+    """Neither lowercase data nor an UPPERCASE config/db assignment with a short, non-secret
+    value is a credential dump — only a secret-shaped value (>=16 chars) drops the trajectory."""
+    for output in (
+        "row primary_key = 5\nother_value = 12",
+        "PRIMARY_KEY=1001",
+        "BUILD_TOKEN=github_runner",
+        "API_KEY=none",
+    ):
+        assert host_escape_findings(_trajectory("cat data/rows.csv", output)) == [], output
+    # ...but a genuine long secret value on such a line is still caught.
+    leak = _trajectory("cat data/rows.csv", "GENERIC_API_KEY=A1b2C3d4E5f6G7h8J9k0")
+    findings = host_escape_findings(leak)
+    assert findings and findings[0].marker == "env-dump-secret"
+
+
+def test_single_relative_reference_after_cd_is_not_flagged() -> None:
+    """A single `../` can legitimately reach a workspace-internal sibling after `cd`; only
+    multi-level traversal (which must leave a freshly-rooted workspace) is flagged."""
+    assert not command_targets_host("cd data && cat ../manual.md")
+    assert not command_targets_host("diff ./actual/out.txt ../expected/out.txt")
+    assert command_targets_host("cat ../../../root/.ssh/id_rsa")
 
 
 def test_scan_names_the_corrupt_line(tmp_path: Path) -> None:

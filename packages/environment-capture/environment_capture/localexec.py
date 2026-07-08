@@ -32,7 +32,10 @@ _BLOCKED_MESSAGE = (
 # The capture process holds live provider credentials (AWS/Anthropic/HF keys and tokens). The
 # workspace subprocess must never inherit them, so it is given an explicit allowlist of
 # operational variables only — an agent that runs `env`, `printenv`, or `echo $VAR` finds no
-# secret to read. This is the actual boundary; `command_targets_host` is defense-in-depth.
+# secret to read. This is the actual boundary; `command_targets_host` is defense-in-depth. The
+# Python/venv/conda variables keep in-tree imports and non-system interpreters working (they are
+# not credentials); provider secret variables are conventionally *_KEY/*_TOKEN/*_SECRET and are
+# absent here by construction.
 _ENV_ALLOWLIST = frozenset(
     {
         "PATH",
@@ -52,6 +55,11 @@ _ENV_ALLOWLIST = frozenset(
         "LC_MESSAGES",
         "LC_NUMERIC",
         "LC_TIME",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "CONDA_DEFAULT_ENV",
     }
 )
 

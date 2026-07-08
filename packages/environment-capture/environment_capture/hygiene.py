@@ -42,9 +42,11 @@ _CMD_ESCAPE_RE = re.compile(
     + r"(~(?:[/\s]|$)|cd\s+\.\.|(?:find|ls|tree|du)\s+(?:-[^\s]+\s+)*/(?:\s|$))"
 )
 
-# Relative traversal out of the workspace (`cat ../../../root/.ssh/id_rsa`). `cd ..` is already
-# covered by _CMD_ESCAPE_RE; this catches any `../` component regardless of the leading command.
-_RELATIVE_TRAVERSAL_RE = re.compile(r"\.\.(?:/|\\)")
+# Multi-level relative traversal out of the workspace (`cat ../../../root/.ssh/id_rsa`). A SINGLE
+# `../` can legitimately reference a workspace-internal sibling after a `cd` (e.g. `cd data && cat
+# ../manual.md`), so only two-or-more consecutive `../` components — which cannot stay inside a
+# freshly-rooted workspace — are flagged. `cd ..` is already covered by _CMD_ESCAPE_RE.
+_RELATIVE_TRAVERSAL_RE = re.compile(r"(?:\.\.[/\\]){2,}")
 
 # Environment dumps that never target task data: `env` / `env | grep ...` / `printenv [VAR]`.
 # `env VAR=value cmd` (setting env for one command) is legitimate and is NOT matched — only the
@@ -72,12 +74,15 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("huggingface-token", re.compile(r"\bhf_[A-Za-z0-9]{16,}")),
     ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{16,}")),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}")),
+    # An `env`/`printenv` dump line for a credential-shaped variable whose VALUE is itself
+    # secret-shaped: >=16 chars of key/token alphabet. The length+alphabet guard keeps ordinary
+    # benchmark output like `PRIMARY_KEY=1001` or `BUILD_TOKEN=github_runner` from being dropped.
     (
         "env-dump-secret",
         re.compile(
             r"(?m)^[ \t]*(?:export[ \t]+)?"
             r"[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*"
-            r"[ \t]*=[ \t]*\S"
+            r"[ \t]*=[ \t]*['\"]?[A-Za-z0-9+/=_-]{16,}"
         ),
     ),
 )
