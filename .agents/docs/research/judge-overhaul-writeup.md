@@ -69,6 +69,15 @@ every failure; the defect was aggregation.
 After the fixes: **12/12**, all verdicts valid, controls unmoved — and a second run reproduces
 it within ±0.09 on every case.
 
+**rubric-v2 addendum (2026-07-08).** Reconciling with main surfaced a truncation blind spot:
+two equal-length observations diverging only in the omitted middle were byte-identical to the
+judge (a hidden-middle fabrication scored ~1.0). Truncated payloads now carry `content_sha256`
+and the prompt caps factuality ≤ 0.5 / quality ≤ 0.4 when hashes differ while visible text
+matches; a 13th case (`long-output-divergent-middle`) pins it — 13/13 live on Opus 4.8 with
+all controls unmoved (equal hashes still verify to 1.0). Judge exceptions (throttle/5xx) now
+route through `valid=False` in GEPA instead of scoring 0.0, and `JUDGE_VERSION = "rubric-v2"`
+is persisted in eval results so cross-version rows are never silently compared.
+
 ## Fidelity numbers: a targeted correction, not a regression
 
 The weighted headline changes what `overall_fidelity` means, so the shift was measured by
