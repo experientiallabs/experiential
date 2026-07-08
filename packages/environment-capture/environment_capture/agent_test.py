@@ -207,6 +207,31 @@ def test_run_records_the_agent_contract(tmp_path) -> None:  # noqa: ANN001
     }
 
 
+def test_recorded_tools_are_isolated_from_the_module_config(tmp_path) -> None:  # noqa: ANN001
+    """Recorded tool specs are a deep copy: mutating them must not corrupt later runs' config."""
+    client = _StubClient([_tool_use("submit", {"answer": "done"})])
+    env = LocalBashEnv(workspace=tmp_path)
+    try:
+        first = BedrockBashAgent(model_id="m", client=client).run(
+            Task(task_id="t0", prompt="q", data={}), env
+        )
+    finally:
+        env.close()
+
+    assert isinstance(first.tools[0], dict)
+    first.tools[0]["toolSpec"]["name"] = "MUTATED"  # a consumer redacting/normalizing the trace
+
+    client2 = _StubClient([_tool_use("submit", {"answer": "done"})])
+    env2 = LocalBashEnv(workspace=tmp_path)
+    try:
+        second = BedrockBashAgent(model_id="m", client=client2).run(
+            Task(task_id="t1", prompt="q", data={}), env2
+        )
+    finally:
+        env2.close()
+    assert second.tools[0]["toolSpec"]["name"] == "bash"
+
+
 def test_plain_text_reply_is_the_final_answer(tmp_path) -> None:  # noqa: ANN001
     client = _StubClient(
         [

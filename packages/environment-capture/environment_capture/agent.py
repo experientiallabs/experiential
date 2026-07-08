@@ -8,6 +8,7 @@ propagate (fail fast).
 
 from __future__ import annotations
 
+import copy
 import time
 from typing import Protocol
 
@@ -199,7 +200,11 @@ class BedrockBashAgent:
             final_answer=final_answer,
             model=self.model_id,
             system_prompt=self.system_prompt,
-            tools=list(_TOOL_CONFIG["tools"]) if isinstance(_TOOL_CONFIG["tools"], list) else [],
+            # Deep-copy so a consumer that mutates a recorded tool spec (redaction, normalization)
+            # can never reach back into the module-level _TOOL_CONFIG and change later runs.
+            tools=copy.deepcopy(_TOOL_CONFIG["tools"])
+            if isinstance(_TOOL_CONFIG["tools"], list)
+            else [],
             harness=self._harness(),
         )
 
