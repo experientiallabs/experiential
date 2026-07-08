@@ -194,7 +194,27 @@ class BedrockBashAgent:
                 break
             messages.append({"role": "user", "content": tool_results})
 
-        return AgentRun(steps=steps, final_answer=final_answer, model=self.model_id)
+        return AgentRun(
+            steps=steps,
+            final_answer=final_answer,
+            model=self.model_id,
+            system_prompt=self.system_prompt,
+            tools=list(_TOOL_CONFIG["tools"]) if isinstance(_TOOL_CONFIG["tools"], list) else [],
+            harness=self._harness(),
+        )
+
+    def _harness(self) -> dict[str, JsonValue]:
+        """The contract this agent drove the env under: provider, model, and step/token budgets.
+
+        Recorded verbatim into the trace so a world model (or an analysis) can see exactly how the
+        rollout was produced, not just what it produced.
+        """
+        return {
+            "provider": "bedrock",
+            "model": self.model_id,
+            "max_steps": self.max_steps,
+            "inference": {"maxTokens": self.max_tokens},
+        }
 
 
 def _tool_uses(message: dict[str, JsonValue]) -> list[tuple[str, str, dict[str, JsonValue]]]:

@@ -35,6 +35,9 @@ def test_emitted_spans_ingest_as_the_same_steps(tmp_path: Path) -> None:
         reward=1.0,
         model="gpt-5.4",
         split="train",
+        system_prompt="You are an autonomous analyst agent.",
+        tools=[{"toolSpec": {"name": "bash"}}, {"toolSpec": {"name": "submit"}}],
+        harness={"provider": "bedrock", "model": "gpt-5.4", "max_steps": 12},
     )
     path = tmp_path / "traces.otel.jsonl"
     write_spans_jsonl(trajectory_to_spans(trajectory, benchmark="financebench"), path)
@@ -46,6 +49,11 @@ def test_emitted_spans_ingest_as_the_same_steps(tmp_path: Path) -> None:
     assert trace.metadata["task_id"] == "fb-train-0"
     assert trace.metadata["reward"] == 1.0
     assert len(trace.steps) == 2
+
+    # The agent contract survives the wire: capture -> OTel JSONL -> ingest -> normalized Trace.
+    assert trace.system_prompt == "You are an autonomous analyst agent."
+    assert trace.tools == [{"toolSpec": {"name": "bash"}}, {"toolSpec": {"name": "submit"}}]
+    assert trace.harness == {"provider": "bedrock", "model": "gpt-5.4", "max_steps": 12}
 
     first, second = trace.steps
     assert first.task == "What is 3M's FY2018 capex?"

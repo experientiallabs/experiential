@@ -40,7 +40,15 @@ class StepRecord:
 
 @dataclass(frozen=True)
 class Trajectory:
-    """A full agent run on one task: ordered steps plus the graded outcome."""
+    """A full agent run on one task: ordered steps plus the graded outcome.
+
+    Beyond the transitions, a trajectory records the *contract the agent ran under* so the corpus
+    preserves everything the agent was shown — essential for faithful world modeling:
+      - ``system_prompt``: the system instructions that framed the agent.
+      - ``tools``: the tool definitions the agent could call (name + schema).
+      - ``harness``: how the agent was driven (provider, model, step/token budgets, inference cfg).
+    All default empty, so a producer that doesn't set them emits exactly as before.
+    """
 
     task: Task
     steps: list[StepRecord]
@@ -49,3 +57,6 @@ class Trajectory:
     model: str = ""
     split: str = ""
     metadata: dict[str, JsonValue] = field(default_factory=dict)
+    system_prompt: str = ""
+    tools: list[JsonValue] = field(default_factory=list)
+    harness: dict[str, JsonValue] = field(default_factory=dict)

@@ -88,6 +88,52 @@ def test_trajectory_to_spans_emits_action_observation_pairs() -> None:
     assert tool1["status"] == {"code": "STATUS_CODE_ERROR"}
 
 
+def _attrs(span: Span) -> dict[str, str]:
+    raw = span["attributes"]
+    assert isinstance(raw, list)
+    out: dict[str, str] = {}
+    for attribute in raw:
+        assert isinstance(attribute, dict)
+        value = attribute["value"]
+        assert isinstance(value, dict)
+        key, string_value = attribute["key"], value["stringValue"]
+        assert isinstance(key, str) and isinstance(string_value, str)
+        out[key] = string_value
+    return out
+
+
+def test_agent_contract_rides_on_first_action_span_only() -> None:
+    trajectory = Trajectory(
+        task=Task(task_id="fb-train-0", prompt="q", data={}),
+        steps=[
+            StepRecord(action=ToolCall(name="bash", arguments={"command": "ls"}), output="a"),
+            StepRecord(action=ToolCall(name="bash", arguments={"command": "pwd"}), output="/w"),
+        ],
+        system_prompt="You are an analyst.",
+        tools=[{"toolSpec": {"name": "bash"}}],
+        harness={"provider": "bedrock", "max_steps": 12},
+    )
+    action0, _tool0, action1, _tool1 = trajectory_to_spans(trajectory, benchmark="financebench")
+
+    a0 = _attrs(action0)
+    assert a0["gen_ai.system_instructions"] == "You are an analyst."
+    assert json.loads(a0["wmh.agent.tools"]) == [{"toolSpec": {"name": "bash"}}]
+    assert json.loads(a0["wmh.agent.harness"]) == {"provider": "bedrock", "max_steps": 12}
+    # The contract is stamped once — later action spans don't repeat it.
+    a1 = _attrs(action1)
+    assert "gen_ai.system_instructions" not in a1
+    assert "wmh.agent.tools" not in a1
+    assert "wmh.agent.harness" not in a1
+
+
+def test_agent_contract_omitted_when_empty() -> None:
+    """A trajectory that records no contract emits exactly as before (strict superset)."""
+    a0 = _attrs(trajectory_to_spans(_trajectory(), benchmark="financebench")[0])
+    assert "gen_ai.system_instructions" not in a0
+    assert "wmh.agent.tools" not in a0
+    assert "wmh.agent.harness" not in a0
+
+
 def test_write_spans_jsonl_round_trips(tmp_path: Path) -> None:
     spans = trajectory_to_spans(_trajectory(), benchmark="financebench")
     out = tmp_path / "traces.otel.jsonl"

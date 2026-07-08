@@ -150,11 +150,47 @@ def test_state_and_metadata_attributes_populate_step_and_trace(tmp_path: Path) -
     assert step.observation.content == '{"ok": true}'
 
 
+def test_agent_contract_attributes_populate_trace(tmp_path: Path) -> None:
+    # The agent contract stamped on the first span maps onto the Trace: system prompt (semconv
+    # `gen_ai.system_instructions`) + tool definitions + harness config (`wmh.agent.*`).
+    span = {
+        "traceId": "eeee",
+        "spanId": "01",
+        "name": "chat",
+        "startTimeUnixNano": 1,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.tool.name", "value": {"stringValue": "bash"}},
+            {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": '{"command": "ls"}'}},
+            {"key": "gen_ai.system_instructions", "value": {"stringValue": "You are an analyst."}},
+            {
+                "key": "wmh.agent.tools",
+                "value": {"stringValue": '[{"toolSpec": {"name": "bash"}}]'},
+            },
+            {
+                "key": "wmh.agent.harness",
+                "value": {"stringValue": '{"provider": "bedrock", "max_steps": 12}'},
+            },
+        ],
+    }
+    path = tmp_path / "contract.jsonl"
+    path.write_text(json.dumps(span) + "\n", encoding="utf-8")
+
+    trace = OtelGenAIAdapter().from_file(str(path))[0]
+    assert trace.system_prompt == "You are an analyst."
+    assert trace.tools == [{"toolSpec": {"name": "bash"}}]
+    assert trace.harness == {"provider": "bedrock", "max_steps": 12}
+
+
 def test_traces_without_wmh_attributes_keep_empty_state_and_metadata() -> None:
     # Backward-compat: the bare-semconv corpus has no wmh.* attrs -> empty state/metadata, no error.
     traces = OtelGenAIAdapter().from_file(str(_TESTDATA / "sample_otlp.json"))
 
     assert traces[0].metadata == {}
+    # No agent-contract attrs either -> the contract fields default empty.
+    assert traces[0].system_prompt == ""
+    assert traces[0].tools == []
+    assert traces[0].harness == {}
     for step in traces[0].steps:
         assert step.state_before.structured == {}
         assert step.state_before.scratchpad == ""

@@ -5,6 +5,12 @@ the first one also carries the task prompt as ``gen_ai.prompt`` and the trace me
 ``wmh.trace.metadata``) followed by an `execute_tool` observation span (real output as
 ``gen_ai.tool.message``, error flag via span status). The final answer is NOT emitted as a span —
 it produces no environment observation — and rides in ``wmh.trace.metadata`` instead.
+
+The first action span also records the *contract the agent ran under* (so the corpus preserves
+everything the agent was shown, not just its transitions): the system prompt as
+``gen_ai.system_instructions`` (the OTel GenAI semconv key), the tool definitions as
+``wmh.agent.tools`` (JSON array), and the harness config as ``wmh.agent.harness`` (JSON object).
+Each is emitted only when present, so trajectories that don't record them parse exactly as before.
 """
 
 from __future__ import annotations
@@ -63,6 +69,13 @@ def trajectory_to_spans(trajectory: Trajectory, *, benchmark: str) -> list[Span]
             action_attrs.append(
                 _attr("wmh.trace.metadata", json.dumps(_trace_metadata(trajectory, benchmark)))
             )
+            # The agent contract (system prompt, tools, harness) rides once, on the first span.
+            if trajectory.system_prompt:
+                action_attrs.append(_attr("gen_ai.system_instructions", trajectory.system_prompt))
+            if trajectory.tools:
+                action_attrs.append(_attr("wmh.agent.tools", json.dumps(trajectory.tools)))
+            if trajectory.harness:
+                action_attrs.append(_attr("wmh.agent.harness", json.dumps(trajectory.harness)))
         spans.append(
             {
                 "traceId": trace_id,

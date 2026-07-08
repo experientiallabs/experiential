@@ -173,6 +173,39 @@ def test_run_capture_grades_after_env_close() -> None:
     assert sensing.graded_after_close == [True]
 
 
+def test_run_capture_threads_agent_contract_onto_trajectory() -> None:
+    """The contract the agent ran under (system prompt, tools, harness) must survive onto the
+    trajectory so the corpus records everything the agent was shown, not just its transitions."""
+    adapter = _FakeAdapter()
+
+    class _ContractAgent:
+        def run(self, task: Task, env: CommandEnv) -> AgentRun:
+            run = _OneShotAgent().run(task, env)
+            return AgentRun(
+                steps=run.steps,
+                final_answer=run.final_answer,
+                model=run.model,
+                system_prompt="You are an analyst.",
+                tools=[{"toolSpec": {"name": "bash"}}],
+                harness={"provider": "bedrock", "max_steps": 12},
+            )
+
+    result = run_capture(adapter, _ContractAgent(), split="train", limit=1)
+    trajectory = result.trajectories[0]
+    assert trajectory.system_prompt == "You are an analyst."
+    assert trajectory.tools == [{"toolSpec": {"name": "bash"}}]
+    assert trajectory.harness == {"provider": "bedrock", "max_steps": 12}
+
+
+def test_run_capture_defaults_agent_contract_empty() -> None:
+    """An agent that doesn't report the contract yields empty fields (backward compatible)."""
+    result = run_capture(_FakeAdapter(), _OneShotAgent(), split="train", limit=1)
+    trajectory = result.trajectories[0]
+    assert trajectory.system_prompt == ""
+    assert trajectory.tools == []
+    assert trajectory.harness == {}
+
+
 def test_run_capture_isolates_open_env_failures() -> None:
     """A backend that fails to BOOT for one task (readiness timeout, broken venv, missing
     fixture) is recorded as that task's failure — it must not abort the whole capture."""

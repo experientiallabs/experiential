@@ -30,6 +30,10 @@ BEFORE the action -> `Step.state_before`), and any span may carry `wmh.trace.met
 object -> `Trace.metadata`, e.g. the benchmark name + gold assertions a capture stamps on). These
 let a faithfully-captured benchmark trace feed open-loop replay, which scores the predicted
 observation for `(state_before, action)` against the recorded one.
+
+The agent contract is recorded once per trace and mapped onto the `Trace`: the system prompt from
+`gen_ai.system_instructions` -> `Trace.system_prompt`, the tool definitions from `wmh.agent.tools`
+-> `Trace.tools`, and the harness config from `wmh.agent.harness` -> `Trace.harness`.
 """
 
 from __future__ import annotations
@@ -76,6 +80,13 @@ _TOOL_OUTPUT_KEYS = (
 _STATE_STRUCTURED_KEY = "wmh.state.structured"
 _STATE_SCRATCHPAD_KEY = "wmh.state.scratchpad"
 _TRACE_METADATA_KEY = "wmh.trace.metadata"
+
+# The agent contract, recorded once per trace (any span may carry it; the first that does wins).
+# `gen_ai.system_instructions` is the OTel GenAI semconv key for the system prompt; the tool
+# definitions and harness config are wmh enrichments beyond the bare semconv.
+_SYSTEM_INSTRUCTIONS_KEY = "gen_ai.system_instructions"
+_AGENT_TOOLS_KEY = "wmh.agent.tools"
+_AGENT_HARNESS_KEY = "wmh.agent.harness"
 
 # Env vars the (placeholder) vendor pull reads. The real query semantics are vendor-specific; see
 # the TODO in `from_vendor`.
@@ -346,6 +357,43 @@ def _trace_metadata(spans: list[_ParsedSpan]) -> JsonObject:
     return {}
 
 
+def _first_attr(spans: list[_ParsedSpan], key: str) -> JsonValue:
+    """The first non-None value of `key` across a trace's spans (agent contract is stamped once)."""
+    for span in spans:
+        value = span.attributes.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _decode_json_attr(value: JsonValue) -> JsonValue:
+    """Attributes may arrive already-decoded (JSON value) or as a serialized JSON string."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value
+
+
+def _trace_system_prompt(spans: list[_ParsedSpan]) -> str:
+    """The system instructions the agent ran under (`gen_ai.system_instructions`)."""
+    value = _first_attr(spans, _SYSTEM_INSTRUCTIONS_KEY)
+    return value if isinstance(value, str) else ""
+
+
+def _trace_tools(spans: list[_ParsedSpan]) -> list[JsonValue]:
+    """The tool definitions the agent could call (`wmh.agent.tools`, a JSON array)."""
+    decoded = _decode_json_attr(_first_attr(spans, _AGENT_TOOLS_KEY))
+    return decoded if isinstance(decoded, list) else []
+
+
+def _trace_harness(spans: list[_ParsedSpan]) -> JsonObject:
+    """The harness config the rollout was produced under (`wmh.agent.harness`, a JSON object)."""
+    decoded = _decode_json_attr(_first_attr(spans, _AGENT_HARNESS_KEY))
+    return decoded if isinstance(decoded, dict) else {}
+
+
 def _build_steps(spans: list[_ParsedSpan]) -> list[Step]:
     """Pair ordered Action spans with their following Observation spans into Steps.
 
@@ -417,6 +465,9 @@ def _spans_to_traces(spans: list[_ParsedSpan], source: str) -> list[Trace]:
             steps=_build_steps(group),
             source=source,
             metadata=_trace_metadata(group),
+            system_prompt=_trace_system_prompt(group),
+            tools=_trace_tools(group),
+            harness=_trace_harness(group),
         )
         ordered.append((group[0].start_nano, trace))
     ordered.sort(key=lambda pair: pair[0])

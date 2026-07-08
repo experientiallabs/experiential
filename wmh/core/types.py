@@ -64,12 +64,21 @@ class Step(BaseModel):
 
 
 class Trace(BaseModel):
-    """One full agent session: an ordered list of steps, plus provenance."""
+    """One full agent session: an ordered list of steps, plus provenance.
+
+    `system_prompt`, `tools`, and `harness` record the contract the agent ran under (system
+    instructions, tool definitions, and how it was driven). They are populated when the source
+    trace carries them and default empty otherwise — a faithful capture preserves everything the
+    agent was shown, not just its transitions.
+    """
 
     trace_id: str
     steps: list[Step] = Field(default_factory=list)
     source: str = "unknown"  # vendor name or file path
     metadata: JsonObject = Field(default_factory=dict)
+    system_prompt: str = ""
+    tools: list[JsonValue] = Field(default_factory=list)
+    harness: JsonObject = Field(default_factory=dict)
 
 
 class Session(BaseModel):

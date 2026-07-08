@@ -175,6 +175,38 @@ def test_custom_system_prompt_is_sent(tmp_path) -> None:  # noqa: ANN001
     assert client.calls[0]["system"] == [{"text": "Explore the SQLite db at ./database.db."}]
 
 
+def test_run_records_the_agent_contract(tmp_path) -> None:  # noqa: ANN001
+    """The run records the system prompt, tool definitions, and harness config it drove under, so
+    the trace preserves everything the agent was shown."""
+    client = _StubClient([_tool_use("submit", {"answer": "done"})])
+    agent = BedrockBashAgent(
+        model_id="us.anthropic.claude-opus-4-8",
+        client=client,
+        system_prompt="Explore the workspace.",
+        max_steps=9,
+        max_tokens=1234,
+    )
+    env = LocalBashEnv(workspace=tmp_path)
+    try:
+        run = agent.run(Task(task_id="t0", prompt="q", data={}), env)
+    finally:
+        env.close()
+
+    assert run.system_prompt == "Explore the workspace."
+    tool_names = {
+        spec["toolSpec"]["name"]
+        for spec in run.tools
+        if isinstance(spec, dict) and isinstance(spec.get("toolSpec"), dict)
+    }
+    assert tool_names == {"bash", "submit"}
+    assert run.harness == {
+        "provider": "bedrock",
+        "model": "us.anthropic.claude-opus-4-8",
+        "max_steps": 9,
+        "inference": {"maxTokens": 1234},
+    }
+
+
 def test_plain_text_reply_is_the_final_answer(tmp_path) -> None:  # noqa: ANN001
     client = _StubClient(
         [

@@ -13,10 +13,10 @@ real environment.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from environment_capture.trajectory import StepRecord, Task, Trajectory
+from environment_capture.trajectory import JsonValue, StepRecord, Task, Trajectory
 
 
 @dataclass(frozen=True)
@@ -52,11 +52,19 @@ class BenchmarkAdapter(Protocol):
 
 @dataclass(frozen=True)
 class AgentRun:
-    """What an agent produced on one task: the real steps taken and its final answer."""
+    """What an agent produced on one task: the real steps taken and its final answer.
+
+    ``system_prompt``, ``tools`` and ``harness`` record the contract the agent ran under (system
+    instructions, tool definitions, and how it was driven). They default empty so an agent that
+    doesn't report them produces the same trajectory as before.
+    """
 
     steps: list[StepRecord]
     final_answer: str
     model: str
+    system_prompt: str = ""
+    tools: list[JsonValue] = field(default_factory=list)
+    harness: dict[str, JsonValue] = field(default_factory=dict)
 
 
 class CaptureAgent(Protocol):
@@ -135,6 +143,9 @@ def run_capture(
                     reward=reward,
                     model=run.model,
                     split=split,
+                    system_prompt=run.system_prompt,
+                    tools=run.tools,
+                    harness=run.harness,
                 )
             )
             break
