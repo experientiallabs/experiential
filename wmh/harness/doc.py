@@ -34,7 +34,7 @@ from wmh.harness.code_runtime import (
     CodeRuntime,
     compile_harness_code,
 )
-from wmh.harness.runtime import DEFAULT_MAX_TURNS, DEFAULT_SYSTEM_PROMPT, AgentRuntime
+from wmh.harness.runtime import DEFAULT_MAX_TURNS, DEFAULT_SYSTEM_PROMPT, AgentRuntime, Runtime
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import DEFAULT_TOOLS, render_tools, resolve_tools
 from wmh.providers.base import Provider
@@ -46,7 +46,10 @@ _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 TOOL_POLICY_ID = "tool_policy:main"
 MAX_TURNS_ID = "param:max-turns"
 TEMPERATURE_ID = "param:temperature"
+RUNTIME_KIND_ID = "param:runtime-kind"  # absent/"kit-python" -> in-process; "pi-node" -> PiRuntime
 CODE_RUNTIME_ID = "code:runtime"
+
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 
 DEFAULT_TEMPERATURE = 0.7
 
@@ -65,6 +68,10 @@ class Surface(BaseModel):
     id: str  # "<kind>:<slug>"
     kind: SurfaceKind
     content: str
+    # For CODE surfaces of a vendored multi-file harness: the file path the content materializes
+    # to (relative, no traversal). A path-less CODE surface is the legacy in-process
+    # `code:runtime` module.
+    path: str | None = None
     # Optional size budget (characters). Enforced at construction: a surface that exceeds its
     # budget is invalid, so context cost is a schema property rather than a runtime surprise.
     budget: int | None = Field(default=None, ge=1)
@@ -76,6 +83,11 @@ class Surface(BaseModel):
             raise ValueError(
                 f"surface id {self.id!r} must be '{self.kind.value}:<kebab-slug>' matching its kind"
             )
+        if self.path is not None:
+            if self.kind is not SurfaceKind.CODE:
+                raise ValueError(f"surface {self.id!r}: only code surfaces may carry a path")
+            if not _SAFE_PATH_RE.match(self.path) or ".." in self.path.split("/"):
+                raise ValueError(f"surface {self.id!r}: unsafe path {self.path!r}")
         if self.budget is not None and len(self.content) > self.budget:
             raise ValueError(
                 f"surface {self.id!r} content is {len(self.content)} chars, "
@@ -125,12 +137,18 @@ class HarnessDoc(BaseModel):
                         f"{skill.name!r}; the slug and frontmatter name must match"
                     )
             elif surface.kind is SurfaceKind.CODE:
-                if surface.id != CODE_RUNTIME_ID:
-                    raise ValueError(
-                        f"code surface must be {CODE_RUNTIME_ID!r} (got {surface.id!r}); "
-                        "the runtime is a singleton"
-                    )
-                compile_harness_code(surface.content)
+                if surface.path is None:
+                    # The legacy in-process runtime module: a singleton, compile-checked here.
+                    if surface.id != CODE_RUNTIME_ID:
+                        raise ValueError(
+                            f"path-less code surface must be {CODE_RUNTIME_ID!r} "
+                            f"(got {surface.id!r}); vendored files carry a `path`"
+                        )
+                    compile_harness_code(surface.content)
+        paths = [s.path for s in self.surfaces if s.path is not None]
+        dup_paths = sorted({p for p in paths if paths.count(p) > 1})
+        if dup_paths:
+            raise ValueError(f"duplicate code surface path(s): {dup_paths}")
         return self
 
     # -- surface access ---------------------------------------------------------------------
@@ -194,13 +212,55 @@ class HarnessDoc(BaseModel):
             Skill.from_markdown(s.content) for s in self.surfaces if s.kind is SurfaceKind.SKILL
         ]
 
-    def runtime(self, provider: Provider) -> AgentRuntime | CodeRuntime:
+    def runtime_kind(self) -> str:
+        raw = self.surface(RUNTIME_KIND_ID)
+        return raw.content.strip() if raw is not None else "kit-python"
+
+    def code_files(self) -> list[Surface]:
+        """The vendored code surfaces (those carrying a file path), in id order."""
+        return [s for s in self.surfaces if s.kind is SurfaceKind.CODE and s.path is not None]
+
+    def runtime(self, provider: Provider, *, backend: str = "local") -> Runtime:
         """The configured agent runtime this document describes.
 
-        With a `code:runtime` surface the harness's own program drives episodes (budgeted and
-        kit-recorded); otherwise the fixed baseline loop runs. Both expose the same
+        `backend` chooses WHERE the harness executes, defaulting to `local` (this process):
+        `e2b` runs a code-bearing harness inside an E2B microVM instead, with the world model
+        answering tool calls from the host (opt-in; needs only the user's E2B key). `param:
+        runtime-kind` = "pi-node" dispatches the vendored-pi checkout runner. Otherwise: a
+        `code:runtime` surface drives episodes with the harness's own in-process program; with
+        neither, the fixed baseline loop runs. All expose the same
         `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
+        if backend == "e2b":
+            code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
+            if not code_files:
+                raise ValueError("backend='e2b' needs a code-bearing harness (no code surfaces)")
+            from wmh.harness.e2b_runtime import E2BSandboxRuntime
+
+            skills = SkillLibrary(self.skills())
+            return E2BSandboxRuntime(
+                provider,
+                files=code_files,
+                tools=resolve_tools(self.tools()),
+                temperature=self.temperature(),
+                skills=skills,
+                system_prompt=self._assembled_prompt(skills),
+                max_turns=self.max_turns(),
+            )
+        if backend != "local":
+            raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
+        if self.runtime_kind() == "pi-node":
+            from wmh.harness.pi_runtime import PiRuntime  # circular: pi_runtime imports doc
+
+            skills = SkillLibrary(self.skills())
+            return PiRuntime(
+                provider,
+                files={s.path: s.content for s in self.code_files() if s.path is not None},
+                tools=resolve_tools(self.tools()),
+                temperature=self.temperature(),
+                skills=skills,
+                system_prompt=self._assembled_prompt(skills),
+            )
         code = self.surface(CODE_RUNTIME_ID)
         skills = SkillLibrary(self.skills())
         if code is not None:

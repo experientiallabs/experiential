@@ -113,3 +113,53 @@ def test_json_roundtrip_preserves_identity() -> None:
     restored = HarnessDoc.model_validate_json(doc.model_dump_json())
     assert restored == doc
     assert restored.doc_hash == doc.doc_hash
+
+
+def test_runtime_backend_selector() -> None:
+    """backend='e2b' dispatches the sandbox runtime for a code-bearing harness; default is local."""
+    import pytest
+
+    from wmh.harness.code_runtime import CodeRuntime
+    from wmh.harness.doc import CODE_RUNTIME_ID, code_baseline
+    from wmh.harness.e2b_runtime import E2BSandboxRuntime
+    from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
+
+    class _P:
+        config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+
+        def complete(self, system: str, messages: list[Message], **k) -> Completion:  # noqa: ANN003
+            raise NotImplementedError
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[0.0] for _ in texts]
+
+        def verify(self) -> object:
+            raise NotImplementedError
+
+    from typing import cast
+
+    from wmh.providers.base import Provider
+
+    provider = cast("Provider", _P())
+
+    # A pi-shaped doc: code surface with a path -> e2b runs it in a sandbox.
+    doc = HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id="tool_policy:main", kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id="code:src-x", kind=SurfaceKind.CODE, path="src/x.ts", content="// x"),
+        ],
+    )
+    assert isinstance(doc.runtime(provider, backend="e2b"), E2BSandboxRuntime)
+
+    # Default backend is local; a code:runtime doc runs in-process.
+    coded = code_baseline("seed")
+    assert isinstance(coded.runtime(provider), CodeRuntime)
+    assert coded.surface(CODE_RUNTIME_ID) is not None
+
+    # e2b with no code surfaces is a usage error, and unknown backends are rejected.
+    with pytest.raises(ValueError, match="code-bearing"):
+        HarnessDoc.baseline("plain").runtime(provider, backend="e2b")
+    with pytest.raises(ValueError, match="unknown backend"):
+        coded.runtime(provider, backend="bogus")
