@@ -31,9 +31,9 @@ from __future__ import annotations
 import json
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 from fastapi.testclient import TestClient
 

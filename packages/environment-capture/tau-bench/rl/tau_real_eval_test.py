@@ -88,3 +88,27 @@ def test_collect_records_pairs_by_trace_id_and_counts_trials(tmp_path: Path) -> 
         ("aaa", 2, 0.0, False),
     ]
     assert records[2]["errors"]  # missing reward_info is an error record, not a silent 0
+
+
+def test_scenarios_v2_upgrade_joins_seed_state_and_gold_rubric() -> None:
+    """v2 adds {seed_state, rubric} from the corpus; identity and task stay byte-identical."""
+    from tau_scenarios_v2 import upgrade
+
+    from wmh.core.types import Action, ActionKind, Observation, Step, Trace
+
+    trace = Trace(
+        trace_id="abc",
+        steps=[
+            Step(
+                task="t",
+                action=Action(kind=ActionKind.TOOL_CALL, name="get_user", arguments={}),
+                observation=Observation(content="user is alice"),
+            )
+        ],
+        metadata={"gold": {"actions": ["refund"]}},
+    )
+    rows = [{"task": "t", "provenance": ["abc"], "domain": "airline", "rubric": None}]
+    (v2,) = upgrade(rows, {"abc": trace})
+    assert v2["task"] == "t" and v2["provenance"] == ["abc"]
+    assert "get_user -> user is alice" in v2["seed_state"]["scratchpad"]
+    assert json.loads(v2["rubric"]) == {"actions": ["refund"]}

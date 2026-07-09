@@ -28,12 +28,13 @@ import json
 import statistics
 from pathlib import Path
 
+from wmh.providers.fallback import FallbackProvider
+
 from wmh.config import load_config
 from wmh.core.types import Action, EnvState, Trace
 from wmh.engine import ingest, split_traces_3way
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.providers.fallback import FallbackProvider
 from wmh.providers.registry import get_provider
 
 _HERE = Path(__file__).resolve().parent
@@ -46,8 +47,20 @@ OPUS = "us.anthropic.claude-opus-4-8"
 JUDGE_POOLS = ((None, "us-east-1"), (None, "us-west-2"), (None, "us-east-2"))
 FACT_CHARS = 500  # per recorded observation folded into the seed scratchpad
 _WRITE_PREFIXES = (
-    "book_", "cancel_", "exchange_", "return_", "update_", "modify_", "transfer_",
-    "send_", "refuel", "enable_", "disable_", "set_", "toggle_", "pay_",
+    "book_",
+    "cancel_",
+    "exchange_",
+    "return_",
+    "update_",
+    "modify_",
+    "transfer_",
+    "send_",
+    "refuel",
+    "enable_",
+    "disable_",
+    "set_",
+    "toggle_",
+    "pay_",
 )
 
 
@@ -86,9 +99,7 @@ def _pick_probe_trace(min_steps: int, max_steps: int) -> tuple[str, Trace]:
             # The task must RESOLVE via tool calls: conversation-resolved tau episodes (e.g.
             # complaint negotiation) drop their resolution turns in conversion, so their
             # tool-call skeleton legitimately judges 0 in every world — a floor, not luck.
-            and any(
-                (st.action.name or "").startswith(_WRITE_PREFIXES) for st in trace.steps
-            )
+            and any((st.action.name or "").startswith(_WRITE_PREFIXES) for st in trace.steps)
         ):
             return scenario["task"], trace
     raise SystemExit(f"no pinned train scenario with a {min_steps}-{max_steps} step source trace")
@@ -158,8 +169,10 @@ def main() -> int:
         std = statistics.pstdev(rewards)
         shown = ", ".join(f"{r:.2f}" for r in rewards)
         print(f"{label:9s} rewards=[{shown}] mean={mean:.3f} stdev={std:.3f}")
-    print("\n(D62 baselines: stdev 0.34 @ temp 0.7, 0.24 @ temp 0; real tau2 scored this "
-          "episode reward=1.0)")
+    print(
+        "\n(D62 baselines: stdev 0.34 @ temp 0.7, 0.24 @ temp 0; real tau2 scored this "
+        "episode reward=1.0)"
+    )
     return 0
 
 
