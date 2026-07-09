@@ -33,6 +33,13 @@ run_arm() {
     ${modeldir:+--model-dir "$modeldir"} \
     --concurrency 3 --resume \
     --output "$RES/$name/predictions.jsonl") || { echo "[driver] $name INFER FAILED"; return 1; }
+  local pred_n jud_n
+  pred_n=$(wc -l < "$RES/$name/predictions.jsonl")
+  jud_n=$(wc -l < "$RES/$name/judged.jsonl" 2>/dev/null || echo 0)
+  if [ "$jud_n" -eq "$pred_n" ]; then
+    echo "[driver] === $name judge already complete ($jud_n rows) — skipping ==="
+    return 0
+  fi
   ensure_shim
   echo "[driver] === $name (judge, backgrounded) $(date) ==="
   (cd "$EVAL" && "$PY" eval.py judge \
