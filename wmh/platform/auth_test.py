@@ -14,7 +14,7 @@ from wmh.platform.auth import BrowserLogin
 
 @pytest.fixture
 def login_attempt() -> Iterator[BrowserLogin]:
-    attempt = BrowserLogin()
+    attempt = BrowserLogin("https://platform.test")
     attempt.start()
     yield attempt
     attempt.close()
@@ -56,7 +56,7 @@ def test_other_paths_404(login_attempt: BrowserLogin) -> None:
 
 
 def test_authorize_url_carries_state_port_and_name(login_attempt: BrowserLogin) -> None:
-    url = login_attempt.authorize_url("https://platform.test/", key_name="wmh on box")
+    url = login_attempt.authorize_url(key_name="wmh on box")
     assert url.startswith("https://platform.test/cli/auth?")
     assert f"state={login_attempt.state}" in url
     assert f"port={login_attempt.port}" in url
@@ -65,3 +65,14 @@ def test_authorize_url_carries_state_port_and_name(login_attempt: BrowserLogin) 
 
 def test_wait_times_out_to_none(login_attempt: BrowserLogin) -> None:
     assert login_attempt.wait(timeout=0.05) is None
+
+
+def test_success_page_redirects_back_to_the_platform(login_attempt: BrowserLogin) -> None:
+    """After the hand-off the browser is sent back to the platform's projects."""
+    url = f"http://127.0.0.1:{login_attempt.port}/callback?" + urlencode(
+        {"token": "xpl_abc", "state": login_attempt.state}
+    )
+    with urllib.request.urlopen(url) as response:
+        body = response.read().decode("utf-8")
+    assert "url=https://platform.test/projects" in body
+    assert login_attempt.wait(timeout=2) == "xpl_abc"

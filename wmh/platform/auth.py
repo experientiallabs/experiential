@@ -18,10 +18,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 LOGIN_TIMEOUT_SECONDS = 300.0
 
-_SUCCESS_PAGE = b"""<!doctype html>
-<html><body style="font-family: system-ui; padding: 48px; color: #171717;">
+_SUCCESS_PAGE_TEMPLATE = """<!doctype html>
+<html><head><meta http-equiv="refresh" content="1;url={projects_url}"></head>
+<body style="font-family: system-ui; padding: 48px; color: #171717;">
 <h1 style="font-size: 18px;">wmh is connected</h1>
-<p>The key was handed to your terminal. You can close this tab.</p>
+<p>The key was handed to your terminal — taking you back to
+<a href="{projects_url}">your projects</a>.</p>
 </body></html>"""
 
 _FAILURE_PAGE = b"""<!doctype html>
@@ -35,7 +37,8 @@ Re-run <code>wmh login</code> and use the URL it prints.</p>
 class BrowserLogin:
     """One login attempt: an ephemeral loopback listener plus its state nonce."""
 
-    def __init__(self) -> None:
+    def __init__(self, web_url: str) -> None:
+        self.web_url = web_url.rstrip("/")
         self.state = secrets.token_urlsafe(24)
         self._tokens: queue.Queue[str] = queue.Queue(maxsize=1)
         self._server: ThreadingHTTPServer | None = None
@@ -52,6 +55,11 @@ class BrowserLogin:
         """Bind 127.0.0.1 on an ephemeral port and serve callbacks in a daemon thread."""
         tokens = self._tokens
         expected_state = self.state
+        # After the hand-off the browser is stranded on the loopback page;
+        # send it back to the platform's projects instead.
+        success_page = _SUCCESS_PAGE_TEMPLATE.format(
+            projects_url=f"{self.web_url}/projects"
+        ).encode("utf-8")
 
         class _CallbackHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - http.server contract
@@ -72,7 +80,7 @@ class BrowserLogin:
                 except queue.Full:
                     self._respond(400, _FAILURE_PAGE)
                     return
-                self._respond(200, _SUCCESS_PAGE)
+                self._respond(200, success_page)
 
             def _respond(self, status: int, body: bytes) -> None:
                 self.send_response(status)
@@ -89,10 +97,10 @@ class BrowserLogin:
         self._thread.start()
         return self.port
 
-    def authorize_url(self, web_url: str, *, key_name: str) -> str:
+    def authorize_url(self, *, key_name: str) -> str:
         """The platform page the browser should open for this attempt."""
         query = urlencode({"state": self.state, "port": self.port, "name": key_name})
-        return f"{web_url.rstrip('/')}/cli/auth?{query}"
+        return f"{self.web_url}/cli/auth?{query}"
 
     def wait(self, timeout: float = LOGIN_TIMEOUT_SECONDS) -> str | None:
         """Block until the browser hands a token back, or return None on timeout."""

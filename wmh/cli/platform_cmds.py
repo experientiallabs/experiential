@@ -193,11 +193,11 @@ def pull(
 
 def _browser_login(web_url: str, *, open_browser: bool) -> str | None:
     """Run the loopback browser flow; fall back to a hidden paste prompt."""
-    login_attempt = BrowserLogin()
+    login_attempt = BrowserLogin(web_url)
     try:
         login_attempt.start()
         key_name = f"wmh on {socket.gethostname()}"
-        authorize_url = login_attempt.authorize_url(web_url, key_name=key_name)
+        authorize_url = login_attempt.authorize_url(key_name=key_name)
         _console.print(f"Approve the request in your browser:\n  [bold]{authorize_url}[/bold]")
         if open_browser:
             webbrowser.open(authorize_url)
