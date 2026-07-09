@@ -24,6 +24,7 @@ from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.platform.auth import BrowserLogin
 from wmh.platform.client import PlatformClient, PlatformError, WhoAmI, fetch_cli_config
 from wmh.platform.credentials import (
+    DEFAULT_WEB_URL,
     PlatformCredentials,
     clear_credentials,
     credentials_path,
@@ -37,7 +38,9 @@ _CHECK = "[green]✓[/green]"
 
 # Module-level singletons: typer.Option calls can't be defaults inline (ruff B008).
 # Annotated-style options carry no default here; the parameter's own `=` does.
-_LOGIN_URL = typer.Option("--url", help="Platform URL (defaults to the saved one).")
+_LOGIN_URL = typer.Option(
+    "--url", help="Platform URL (defaults to the saved one, then the hosted platform)."
+)
 _LOGIN_TOKEN = typer.Option(
     "--token", help="Paste an existing API key instead of using the browser."
 )
@@ -66,9 +69,7 @@ def login(
 ) -> None:
     """Connect this machine to a platform account."""
     credentials = load_credentials()
-    web_url = (url or credentials.web_url or "").rstrip("/")
-    if not web_url:
-        raise typer.BadParameter("pass --url https://your-platform (no saved platform URL yet)")
+    web_url = (url or credentials.web_url or DEFAULT_WEB_URL).rstrip("/")
 
     try:
         api_url = fetch_cli_config(web_url)

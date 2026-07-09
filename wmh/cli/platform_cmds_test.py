@@ -147,3 +147,20 @@ def test_resolve_kind_disambiguates() -> None:
         _resolve_kind("model", model=False, harness=True)
     with pytest.raises(typer.BadParameter, match="must be"):
         _resolve_kind("bundle", model=True, harness=False)
+
+
+def test_bare_login_targets_the_hosted_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`wmh login` with no --url and no saved platform uses the default."""
+    seen: dict[str, str] = {}
+
+    def fake_config(url: str) -> str:
+        seen["web_url"] = url
+        return "https://api.test"
+
+    monkeypatch.setattr("wmh.cli.platform_cmds.fetch_cli_config", fake_config)
+    monkeypatch.setattr("wmh.cli.platform_cmds.PlatformClient", _StubClient)
+
+    result = runner.invoke(app, ["login", "--token", "xpl_new"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["web_url"] == "https://experiential-platform-web.vercel.app"
