@@ -59,6 +59,38 @@ Domain → model mapping for `wm` mode (approximations noted):
 terminal → `terminal-tasks`, swe → `swe-bench`, mcp → `tau-bench` (tau ≈ MCP tool-calling; label
 the approximation in any table).
 
+## Full run (2026-07-10 — judge gpt-5.4-mini @ Azure, temp 0; NOT comparable to their gpt-5.2 table)
+
+All 2,170 benchmark rows + the 354-row terminal base ablation. Infer = Bedrock, serve model
+as built per WM (user decision 2026-07-09). Their `judge`+`score` stages unmodified via the
+Azure shim; **2,524/2,524 judged, 0 parse failures**. Normalized 0–100; Overall = macro-average
+over the 7 domains (their paper convention, NOT `eval.py score`'s micro-average):
+
+| domain | arm | serve model | n | format | fact. | consist. | realism | quality | **total** | infer $ |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| MCP | tau-bench WM (≈MCP, labeled approx.) | opus-4.8 | 286 | 75.61 | 39.86 | 57.34 | 49.21 | 47.99 | **54.00** | 55.20 |
+| Search | base prompt | opus-4.8 | 458 | 68.40 | 27.40 | 47.98 | 37.72 | 33.79 | **43.06** | 97.25 |
+| Terminal | terminal-tasks WM (opt+RAG) | opus-4.8 | 354 | 79.10 | 35.45 | 50.99 | 55.72 | 41.88 | **52.63** | 42.90 |
+| SWE | swe-bench WM (opt+RAG) | haiku-4.5 (as built) | 472 | 61.44 | 45.18 | 57.31 | 57.89 | 45.13 | **53.39** | 9.73 |
+| Android | base prompt | opus-4.8 | 200 | 99.25 | 46.88 | 48.00 | 63.62 | 45.63 | **60.68** | 37.24 |
+| Web | base prompt | opus-4.8 | 200 | 98.12 | 41.50 | 44.50 | 57.12 | 40.50 | **56.35** | 42.02 |
+| OS | base prompt | opus-4.8 | 200 | 95.00 | 37.38 | 38.25 | 57.75 | 36.75 | **53.02** | 44.82 |
+| **Macro Overall** | | | 2170 | | | | | | **53.30** | |
+| Terminal (ablation) | base prompt | opus-4.8 | 354 | 71.40 | 34.32 | 50.28 | 55.08 | 39.97 | **50.21** | 31.64 |
+
+- **Ablation (what the corpus buys on their metric)**: terminal WM 52.63 vs base 50.21 =
+  **+2.42 total**, positive on every dimension (format +7.7, factuality +1.1, quality +1.9).
+- Costs: infer **$360.80** total (Bedrock), judge **$41.14** (2,625 gpt-5.4-mini calls incl.
+  smoke re-judges; 50.5M in / 0.73M out tokens).
+- Reference only — different judge, do not rank against: their gpt-5.2-judged table reports
+  GPT-5.4 58.25 / Opus 4.8 56.59 / Qwen-AgentWorld-397B 58.71 Overall. gpt-5.4-mini is a
+  measurably harsher judge (same smoke predictions: 51.7 under 5.4-mini vs 76.7 under an
+  Opus stand-in), so cross-table comparisons are meaningless (D12).
+- Run notes: one overnight network outage wedged Bedrock sockets (no read-timeout kill) —
+  recovered via kill + `--resume`; search rows embed U+2028-class separators (newline-only
+  reading required); android source data has one duplicate `(id, turn_idx)` key (both rows
+  predicted + judged); swe-bench model serves haiku-4.5 by repo default (that's "as built").
+
 ## Smoke E2E result (2026-07-07 — plumbing proof, NOT comparable numbers)
 
 8 rows, judged by the STAND-IN judge (Opus 4.8 via the shim, temperature 0) — their pinned
