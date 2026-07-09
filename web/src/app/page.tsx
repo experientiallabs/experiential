@@ -43,7 +43,7 @@ function ModelTile({ entry }: { entry: IndexEntry }) {
     >
       <div className="flex items-center justify-between gap-2">
         <h2 className="truncate font-semibold tracking-tight">{card.title}</h2>
-        {/* starred = has a measured fidelity number */}
+        {/* starred = an evaluated model with a measured fidelity score (sorted to the front) */}
         <Star filled={card.fidelity != null} />
       </div>
       <TerminalPreview entry={entry} />
@@ -74,8 +74,16 @@ function BuildTile() {
   );
 }
 
+/** Highest measured fidelity first (these are the starred, evaluated models), then the rest. */
+function byFidelity(a: IndexEntry, b: IndexEntry): number {
+  const fa = a.card.fidelity?.score ?? -1;
+  const fb = b.card.fidelity?.score ?? -1;
+  if (fb !== fa) return fb - fa;
+  return a.card.name.localeCompare(b.card.name);
+}
+
 export default function GalleryPage() {
-  const models = allModels();
+  const models = [...allModels()].sort(byFidelity);
   return (
     <div className="flex flex-col gap-14">
       <section className="flex flex-col items-center gap-4 pt-14 text-center">
