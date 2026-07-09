@@ -150,12 +150,15 @@ def load_done(out: Path) -> dict[tuple[str, int], JsonObject]:
     """Rows already predicted (non-empty gen) in an existing output file."""
     done: dict[tuple[str, int], JsonObject] = {}
     if out.exists():
-        for line in out.read_text(encoding="utf-8").splitlines():
-            if not line:
-                continue
-            row = json.loads(line)
-            if row.get("gen"):
-                done[row_key(row)] = row
+        # Iterate the file (splits on \n only): rows can embed  -class separators that
+        # str.splitlines() would split mid-JSON-string (bit the search domain).
+        with out.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("gen"):
+                    done[row_key(row)] = row
     return done
 
 
@@ -174,11 +177,8 @@ def main() -> None:
     if args.mode == "wm" and not args.model_dir:
         parser.error("--mode wm requires --model-dir")
 
-    rows: list[JsonObject] = [
-        json.loads(line)
-        for line in Path(args.data).read_text(encoding="utf-8").splitlines()
-        if line
-    ]
+    with Path(args.data).open(encoding="utf-8") as f:  # \n-only splitting, see load_done
+        rows: list[JsonObject] = [json.loads(line) for line in f if line.strip()]
     if args.limit is not None:
         rows = rows[: args.limit]
 
