@@ -346,8 +346,9 @@ def test_normalized_openai_body_strips_stream_options_and_maps_max_tokens() -> N
     assert "stream_options" not in b
     assert b["max_tokens"] == 4096
     assert "max_completion_tokens" not in b
-    # an explicit max_tokens wins over the translated one
+    # an explicit max_tokens wins, and the unsupported field is dropped even then
     b2 = _normalized_openai_body({"max_completion_tokens": 10, "max_tokens": 7}, cfg)
     assert b2["max_tokens"] == 7
+    assert "max_completion_tokens" not in b2
     # the original body is never mutated
     assert body["stream"] is True and "stream_options" in body

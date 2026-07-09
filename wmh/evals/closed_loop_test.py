@@ -271,6 +271,44 @@ def test_rollout_exception_propagates_and_does_not_hang() -> None:
         )
 
 
+def test_rollout_exception_surfaces_while_other_cells_are_still_in_flight() -> None:
+    """Fail-fast must not drain in-flight cells: with sandbox rollouts those run for minutes.
+
+    One cell blocks on an event; another raises immediately. The exception must reach the
+    caller while the blocker is STILL blocked (shutdown(wait=False)) — then the blocker is
+    released so its thread exits cleanly.
+    """
+    release = threading.Event()
+    blocker_started = threading.Event()
+
+    class HalfStuckRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            if task_id == "stuck":
+                blocker_started.set()
+                release.wait(timeout=30)
+                return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="pass")
+            blocker_started.wait(timeout=30)  # raise only once the slow cell is truly in flight
+            raise RuntimeError("sandbox died")
+
+    tasks = [
+        TaskSpec(task_id="stuck", instruction="x", gold=["g"]),
+        TaskSpec(task_id="boom", instruction="y", gold=["g"]),
+    ]
+    try:
+        with pytest.raises(RuntimeError, match="sandbox died"):
+            evaluate_with_env(
+                tasks,
+                lambda task: _StaticEnv(),
+                HalfStuckRuntime(),
+                _AnswerJudge(),
+                k=1,
+                concurrency=0,
+            )
+        assert not release.is_set()  # the raise did not wait for the stuck cell to drain
+    finally:
+        release.set()  # let the worker thread exit
+
+
 def test_evaluate_closed_loop_passes_concurrency_through() -> None:
     provider = RoleProvider(judge_passes=True)
     tasks = [TaskSpec(task_id="q1", instruction="answer it", gold=["did it"])]

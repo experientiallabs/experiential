@@ -160,8 +160,10 @@ def _normalized_openai_body(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
         b["model"] = cfg.model
     b["stream"] = False
     b.pop("stream_options", None)
-    if "max_completion_tokens" in b and "max_tokens" not in b:
-        b["max_tokens"] = b.pop("max_completion_tokens")
+    # Always removed — strict backends 400 on the field itself; an explicit max_tokens wins.
+    max_completion = b.pop("max_completion_tokens", None)
+    if max_completion is not None and "max_tokens" not in b:
+        b["max_tokens"] = max_completion
     return b
 
 

@@ -264,7 +264,10 @@ def _run_cells_concurrently(
     caller can slice per task and aggregate deterministically. `on_progress` fires from THIS
     thread as futures land (gepa.py precedent: UI callbacks must be a serial stream). A rollout or
     judge call that raises is a real failure: pending cells are cancelled and the exception
-    propagates (fail-fast, scenario_fidelity precedent) — never swallowed into a verdict.
+    propagates IMMEDIATELY (fail-fast, scenario_fidelity precedent) — never swallowed into a
+    verdict, and never held back while in-flight cells (minutes-long sandbox rollouts) drain:
+    the pool is shut down with wait=False, so still-running cells finish on their own threads
+    and release their environments through `_run_once`'s finally.
     """
     cells = [(task, attempt) for task in tasks for attempt in range(k)]
     if not cells:
@@ -276,20 +279,21 @@ def _run_cells_concurrently(
         result = _run_once(task, make_env, runtime)
         return judge.score(task.instruction, result.answer, result.transcript(), task.gold)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {pool.submit(run_cell, task): i for i, (task, _attempt) in enumerate(cells)}
-        try:
-            for future in as_completed(futures):
-                index = futures[future]
-                verdict = future.result()  # a raised rollout/judge exception propagates here
-                slots[index] = verdict
-                if on_progress is not None:
-                    task, attempt = cells[index]
-                    on_progress(task.task_id, attempt + 1, verdict)
-        except BaseException:
-            for pending in futures:
-                pending.cancel()
-            raise
+        for future in as_completed(futures):
+            index = futures[future]
+            verdict = future.result()  # a raised rollout/judge exception propagates here
+            slots[index] = verdict
+            if on_progress is not None:
+                task, attempt = cells[index]
+                on_progress(task.task_id, attempt + 1, verdict)
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
     verdicts: list[GoldVerdict] = []
     for slot in slots:
         if slot is None:  # pragma: no cover - every future completed, or we raised above
