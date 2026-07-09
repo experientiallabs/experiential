@@ -29,6 +29,23 @@ HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # dated profile id 
 REGIONS = ("us-east-1", "us-west-2", "us-east-2")
 
 
+class _Temp0Provider:
+    """Delegate that pins env-step completions to temperature 0 (D66/D78 substrate floor)."""
+
+    def __init__(self, inner) -> None:  # noqa: ANN001 - provider protocol
+        self._inner = inner
+        self.config = inner.config
+
+    def complete(self, system, messages, *, temperature=0.7, max_tokens=2048):  # noqa: ANN001
+        return self._inner.complete(system, messages, temperature=0.0, max_tokens=max_tokens)
+
+    def embed(self, texts):  # noqa: ANN001
+        return self._inner.embed(texts)
+
+    def verify(self):  # noqa: ANN001
+        return self._inner.verify()
+
+
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     chain = [
@@ -36,7 +53,7 @@ def main() -> None:
         for r in REGIONS
     ]
     provider = FallbackProvider(chain)
-    wm = WorldModel.load(str(MODEL_DIR), provider, reward_provider=provider)
+    wm = WorldModel.load(str(MODEL_DIR), _Temp0Provider(provider), reward_provider=provider)
     app = create_app(world_models={"gui-tasks": wm})
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 
