@@ -24,15 +24,22 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from wmh.engine.world_model import WorldModel
-from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_loop
+from wmh.evals.closed_loop import (
+    DEFAULT_K,
+    ClosedLoopReport,
+    evaluate_closed_loop,
+    evaluate_with_env,
+)
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.e2b_env import e2b_env_factory
 from wmh.harness.mutate import propose_delta, render_evidence
 from wmh.providers.base import Provider
 
@@ -271,7 +278,7 @@ def create_harness(
     name: str,
     seed_doc: HarnessDoc,
     tasks: list[TaskSpec],
-    world_model: WorldModel,
+    world_model: WorldModel | None,
     agent_provider: Provider,
     meta_provider: Provider,
     judge: GoldJudge,
@@ -280,6 +287,9 @@ def create_harness(
     k: int = DEFAULT_K,
     holdout: list[TaskSpec] | None = None,
     confirm_narrow_vetoes: bool = True,
+    env_backend: Literal["sim", "e2b"] = "sim",
+    eval_concurrency: int | None = None,
+    e2b_template: str | None = None,
     on_progress: CreateProgress | None = None,
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
@@ -287,6 +297,14 @@ def create_harness(
     Scores the seed first, then runs `iterations` propose-apply-SCREEN-score-gate steps. An
     iteration whose proposal is unusable or fails atomic application is skipped (counted in
     `skipped`; an invalid delta is still archived with its rejection verdict), never fatal.
+
+    `env_backend` picks where rollouts execute: `sim` (the default) scores against the world
+    model exactly as before — `world_model` must be provided; `e2b` runs every rollout in a
+    fresh real E2B sandbox (`e2b_env_factory` + `doc.runtime(backend="e2b")`) and never touches
+    the world model, so `world_model=None` is allowed. `eval_concurrency` is how many
+    (task, attempt) cells run at once; `None` means the backend default — 1 (sequential) for
+    sim, 0 (every cell at once, one sandbox each) for e2b. `e2b_template` names a prebaked
+    sandbox template (node 22 + the pi runner deps) so e2b rollouts skip bootstrap installs.
 
     Verification is staged by cost: a child is first SCREENED on its own trigger cluster (the
     2-3 failing tasks its delta claims to fix, k passes) — if the cluster did not improve over
@@ -302,6 +320,14 @@ def create_harness(
     re-measured — child AND champion, at 2k — and the re-measurement decides. The verdict records
     the retrial either way, so the archive shows which accepts needed confirmation.
     """
+    if env_backend not in ("sim", "e2b"):
+        raise ValueError(f"unknown env_backend {env_backend!r}; choose sim or e2b")
+    if env_backend == "sim" and world_model is None:
+        raise ValueError(
+            "env_backend='sim' scores rollouts against the world model; pass one "
+            "(world_model=None is only valid with env_backend='e2b')"
+        )
+
     docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
     reports: dict[str, ClosedLoopReport] = {}
     holdout_reports: dict[str, ClosedLoopReport] = {}
@@ -314,13 +340,28 @@ def create_harness(
     def _score(
         doc: HarnessDoc, split: list[TaskSpec], *, k_override: int | None = None
     ) -> ClosedLoopReport:
+        k_eff = k if k_override is None else k_override
+        if env_backend == "e2b":
+            # One fresh sandbox per (task, attempt) cell; default = every cell at once.
+            return evaluate_with_env(
+                split,
+                e2b_env_factory(template=e2b_template),
+                doc.runtime(agent_provider, backend="e2b", e2b_template=e2b_template),
+                judge,
+                label=doc.name,
+                k=k_eff,
+                concurrency=eval_concurrency if eval_concurrency is not None else 0,
+            )
+        if world_model is None:  # unreachable: validated at entry; narrows the type for the call
+            raise ValueError("env_backend='sim' requires a world model")
         return evaluate_closed_loop(
             split,
             world_model,
             agent_provider,
             judge,
             label=doc.name,
-            k=k if k_override is None else k_override,
+            k=k_eff,
+            concurrency=eval_concurrency if eval_concurrency is not None else 1,
             runtime=doc.runtime(agent_provider),
         )
 

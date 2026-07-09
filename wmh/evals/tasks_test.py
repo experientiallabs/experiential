@@ -30,6 +30,20 @@ def test_load_tasks_empty_raises(tmp_path: Path) -> None:
         load_tasks(path)
 
 
+def test_setup_defaults_empty_and_roundtrips_through_load_tasks(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.jsonl"
+    path.write_text(
+        '{"task_id": "t1", "instruction": "x", "setup": ["apt-get install -y jq", "mkdir /data"]}\n'
+        '{"task_id": "t2", "instruction": "y"}\n',
+        encoding="utf-8",
+    )
+    tasks = load_tasks(path)
+    assert tasks[0].setup == ["apt-get install -y jq", "mkdir /data"]
+    assert tasks[1].setup == []  # absent in JSONL -> default, sim path can ignore it
+    # And the field survives a serialize/parse round trip unchanged.
+    assert TaskSpec.model_validate_json(tasks[0].model_dump_json()) == tasks[0]
+
+
 def test_load_tasks_duplicate_ids_raise(tmp_path: Path) -> None:
     path = tmp_path / "dup.jsonl"
     path.write_text(

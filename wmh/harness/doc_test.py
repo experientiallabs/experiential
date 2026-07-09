@@ -149,3 +149,49 @@ def test_runtime_backend_selector() -> None:
     # Unknown backends are rejected.
     with pytest.raises(ValueError, match="unknown backend"):
         coded.runtime(provider, backend="bogus")
+
+
+def test_runtime_e2b_backend_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """backend='e2b': pi-node docs get E2BPiRuntime; other kinds keep their local runtimes."""
+    from typing import cast
+
+    from wmh.harness.code_runtime import CodeRuntime
+    from wmh.harness.doc import RUNTIME_KIND_ID, code_baseline
+    from wmh.harness.pi_e2b import E2BPiRuntime
+    from wmh.harness.runtime import AgentRuntime
+    from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
+
+    class _P:
+        config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+
+        def complete(self, system: str, messages: list[Message], **k) -> Completion:  # noqa: ANN003
+            raise NotImplementedError
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[0.0] for _ in texts]
+
+        def verify(self) -> object:
+            raise NotImplementedError
+
+    provider = cast("Provider", _P())
+    pi_doc = HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+        ],
+    )
+    # The pi agent must run inside the rollout's sandbox; the template comes from the env.
+    monkeypatch.setenv("WMH_E2B_TEMPLATE", "wmh-pi-tmpl")
+    runtime = pi_doc.runtime(provider, backend="e2b")
+    assert isinstance(runtime, E2BPiRuntime)
+    assert runtime._template == "wmh-pi-tmpl"  # noqa: SLF001 - pins the WMH_E2B_TEMPLATE wiring
+    # An explicit template (e.g. the --e2b-template flag) beats the env var.
+    explicit = pi_doc.runtime(provider, backend="e2b", e2b_template="flag-tmpl")
+    assert isinstance(explicit, E2BPiRuntime)
+    assert explicit._template == "flag-tmpl"  # noqa: SLF001 - pins the flag > env precedence
+    # Non-pi kinds are env-agnostic: the e2b backend returns the same runtime objects as local.
+    assert isinstance(code_baseline("c").runtime(provider, backend="e2b"), CodeRuntime)
+    assert isinstance(HarnessDoc.baseline("b").runtime(provider, backend="e2b"), AgentRuntime)

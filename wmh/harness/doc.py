@@ -221,21 +221,41 @@ class HarnessDoc(BaseModel):
         """The vendored code surfaces (those carrying a file path), in id order."""
         return [s for s in self.surfaces if s.kind is SurfaceKind.CODE and s.path is not None]
 
-    def runtime(self, provider: Provider, *, backend: str = "local") -> Runtime:
+    def runtime(
+        self, provider: Provider, *, backend: str = "local", e2b_template: str | None = None
+    ) -> Runtime:
         """The configured agent runtime this document describes.
 
-        `backend` chooses WHERE the harness executes; only `local` (this process) is built in here.
-        `param:runtime-kind` = "pi-node" dispatches the vendored-pi runner (over the SSH shim, or
-        the RunnerLink frame transport when PI_TRANSPORT=link). Otherwise a `code:runtime` surface
-        drives episodes with the harness's own in-process program; with neither, the fixed baseline
-        loop runs. All expose the same `run(task_id, instruction, environment) -> RunResult` shape
-        closed-loop eval drives.
+        `backend` chooses WHERE the harness executes: `local` runs in/from this process; `e2b`
+        runs rollouts in real E2B sandboxes. Under `e2b`, `param:runtime-kind` = "pi-node"
+        dispatches `E2BPiRuntime` (the vendored pi agent runs INSIDE the rollout's sandbox; the
+        worker LLM is answered host-side from the PI_AGENT_* env); every other kind returns the
+        same runtime object as `local` — those loops are env-agnostic and only their tool calls
+        execute in the sandbox. `e2b_template` names a prebaked sandbox template whose bootstrap
+        (node 22 + pi's npm deps) is already done; default is $WMH_E2B_TEMPLATE. Under `local`,
+        "pi-node" uses the SSH shim (or the RunnerLink frame transport when PI_TRANSPORT=link);
+        otherwise a `code:runtime` surface drives episodes with the harness's own in-process
+        program; with neither, the fixed baseline loop runs. All expose the same
+        `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
-        if backend != "local":
-            raise ValueError(f"unknown backend {backend!r}; choose local")
+        if backend not in ("local", "e2b"):
+            raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
         if self.runtime_kind() == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
+            if backend == "e2b":
+                # Lazy: the e2b backend is an optional extra; `local` must import none of it.
+                from wmh.harness.e2b_env import E2B_TEMPLATE_ENV
+                from wmh.harness.pi_e2b import E2BPiRuntime
+                from wmh.harness.runner_link import worker_config_from_env
+
+                return E2BPiRuntime(
+                    worker=worker_config_from_env(),
+                    files=code_files,
+                    tools=resolve_tools(self.tools()),
+                    system_prompt=self._assembled_prompt(skills),
+                    template=e2b_template or os.environ.get(E2B_TEMPLATE_ENV),
+                )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
             # host set via runner_link.set_active_channel) instead of the per-episode SSH shim; the
             # default (unset / "ssh") keeps PiRuntime. The worker LLM reads the same PI_AGENT_* env.

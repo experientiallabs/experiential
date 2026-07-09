@@ -14,11 +14,16 @@ from pydantic import BaseModel, Field
 
 
 class TaskSpec(BaseModel):
-    """One task: what the agent must do, and the assertions that must hold afterwards."""
+    """One task: what the agent must do, and the assertions that must hold afterwards.
+
+    `setup` holds shell commands a REAL environment runs before the episode (sandbox
+    provisioning: install packages, seed files). Simulated (world-model) environments ignore it.
+    """
 
     task_id: str
     instruction: str
     gold: list[str] = Field(default_factory=list)  # assertions that define success
+    setup: list[str] = Field(default_factory=list)  # pre-episode shell commands (real envs only)
 
 
 def load_tasks(path: str | Path) -> list[TaskSpec]:

@@ -15,10 +15,12 @@ from collections.abc import Callable
 
 import pytest
 
+from wmh.core.types import Action, Observation
 from wmh.engine.world_model import WorldModel
-from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
+from wmh.evals.closed_loop import ClosedLoopReport, EnvFactory, TaskOutcome
 from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
+from wmh.harness import create as create_module
 from wmh.harness.create import (
     CreateResult,
     PoolEntry,
@@ -27,7 +29,8 @@ from wmh.harness.create import (
     select_parent,
 )
 from wmh.harness.doc import HarnessDoc
-from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmh.harness.runtime import Runtime
+from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
 _CAREFUL_PROMPT = "You are a careful agent. Verify the state of the system before submitting."
@@ -559,3 +562,191 @@ def test_confirmed_suite_overturn_still_faces_the_holdout_tier() -> None:
     # The holdout tier was measured (not bypassed) and its regression is the rejection.
     assert delta.verdict.holdout_delta is not None and delta.verdict.holdout_delta < 0
     assert result.best_score == pytest.approx(0.5)  # champion stayed the seed
+
+
+# -- env backends: sim (world model) vs e2b (real sandboxes) -------------------------------------
+
+
+class _EchoEnv:
+    """A fake real environment: any tool call succeeds; lifecycle is recorded."""
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def execute(self, action: Action) -> Observation:
+        return Observation(content="ok")
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def _canned_report(rate: float, *, k: int = 3) -> ClosedLoopReport:
+    outcome = TaskOutcome(task_id="t1", success_rate=rate, mean_fraction=rate, passes=k)
+    return ClosedLoopReport(
+        label="x", success_rate=rate, mean_fraction=rate, k=k, per_task={"t1": outcome}
+    )
+
+
+def test_sim_backend_requires_a_world_model() -> None:
+    provider = RoleProvider()
+    with pytest.raises(ValueError, match="world_model=None is only valid"):
+        create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            None,
+            provider,
+            provider,
+            GoldJudge(provider),
+        )
+
+
+def test_unknown_env_backend_is_rejected() -> None:
+    from typing import Literal, cast
+
+    provider = RoleProvider()
+    # Dynamic callers (the platform's optimizer passes a plain str) can hand in anything;
+    # the runtime guard, not the type annotation, is what this test pins.
+    bogus = cast("Literal['sim', 'e2b']", "banana")
+    with pytest.raises(ValueError, match="choose sim or e2b"):
+        create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            env_backend=bogus,
+        )
+
+
+def test_e2b_backend_never_touches_the_world_model_and_defaults_to_full_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """env_backend='e2b' scores through the env factory: no world model, concurrency 0.
+
+    The env factory is faked (no sandboxes in unit tests); `evaluate_with_env` is the real one,
+    wrapped only to record the concurrency each eval was asked for. `world_model=None` proves the
+    e2b path never needs (or touches) a world model — any access would raise.
+    """
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    concurrencies: list[int] = []
+    real_evaluate = create_module.evaluate_with_env
+
+    def spying_evaluate(
+        tasks: list[TaskSpec],
+        make_env: EnvFactory,
+        runtime: Runtime,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+    ) -> ClosedLoopReport:
+        concurrencies.append(concurrency)
+        return real_evaluate(
+            tasks, make_env, runtime, judge, label=label, k=k, concurrency=concurrency
+        )
+
+    envs: list[_EchoEnv] = []
+    templates: list[str | None] = []
+
+    def fake_factory(*, template: str | None = None) -> EnvFactory:
+        templates.append(template)
+
+        def make(task: TaskSpec) -> _EchoEnv:
+            env = _EchoEnv()
+            envs.append(env)
+            return env
+
+        return make
+
+    monkeypatch.setattr(create_module, "evaluate_with_env", spying_evaluate)
+    monkeypatch.setattr(create_module, "e2b_env_factory", fake_factory)
+
+    result = create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        None,  # the e2b path must work with no world model at all
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=1,
+        k=3,
+        env_backend="e2b",
+        e2b_template="tmpl-1",
+    )
+
+    # The search genuinely ran end to end on the real-env path (seed 0.0 -> careful child 1.0).
+    assert result.best_score == 1.0
+    assert result.best.system_prompt() == _CAREFUL_PROMPT
+    # Every eval (seed, screen, child full split) ran all cells at once (the e2b default) and
+    # carried the template through to the env factory.
+    assert concurrencies == [0, 0, 0]
+    assert templates == ["tmpl-1", "tmpl-1", "tmpl-1"]
+    # One fresh env per (task, attempt) cell, each closed exactly once.
+    assert len(envs) == 9  # 3 evals x 1 task x k=3
+    assert all(env.closed == 1 for env in envs)
+
+
+def test_eval_concurrency_overrides_both_backend_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit eval_concurrency reaches the scorer; unset sim keeps the sequential default."""
+    provider = RoleProvider()
+    seed = HarnessDoc.baseline("seed")
+    sim_concurrencies: list[int] = []
+    e2b_concurrencies: list[int] = []
+
+    def fake_sim_evaluate(
+        tasks: list[TaskSpec],
+        world_model: WorldModel,
+        agent_provider: Provider,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+        runtime: Runtime | None = None,
+    ) -> ClosedLoopReport:
+        sim_concurrencies.append(concurrency)
+        return _canned_report(1.0, k=k)
+
+    def fake_e2b_evaluate(
+        tasks: list[TaskSpec],
+        make_env: EnvFactory,
+        runtime: Runtime,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+    ) -> ClosedLoopReport:
+        e2b_concurrencies.append(concurrency)
+        return _canned_report(1.0, k=k)
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", fake_sim_evaluate)
+    monkeypatch.setattr(create_module, "evaluate_with_env", fake_e2b_evaluate)
+
+    def run(*, env_backend: str, eval_concurrency: int | None) -> None:
+        create_harness(
+            "winner",
+            seed,
+            _tasks(),
+            _wm(provider) if env_backend == "sim" else None,
+            provider,
+            provider,
+            GoldJudge(provider),
+            iterations=0,  # score the seed only: one eval call per run
+            env_backend="sim" if env_backend == "sim" else "e2b",
+            eval_concurrency=eval_concurrency,
+        )
+
+    run(env_backend="sim", eval_concurrency=None)
+    run(env_backend="sim", eval_concurrency=4)
+    run(env_backend="e2b", eval_concurrency=2)
+    assert sim_concurrencies == [1, 4]  # sim default stays the sequential world-model loop
+    assert e2b_concurrencies == [2]  # an explicit cap replaces the all-at-once default
