@@ -63,7 +63,7 @@ def _link(channel: _FakeChannel, **kw) -> RunnerLink:  # noqa: ANN003
 
 def _sent(channel: _FakeChannel, kind: str) -> list:
     # cast to Any so deep-indexing assertions on frame payloads stay readable in tests.
-    return [cast(Any,f) for f in channel.sent if f.get("type") == kind]
+    return [cast(Any, f) for f in channel.sent if f.get("type") == kind]
 
 
 # --- frame codec ---
@@ -241,9 +241,9 @@ def test_openai_to_bedrock_maps_tools_and_tool_results() -> None:
     system, msgs, tool_config = openai_to_bedrock(body)
     assert system == [{"text": "be nice"}]
     assert tool_config is not None
-    assert cast(Any,tool_config)["tools"][0]["toolSpec"]["name"] == "get_user"
+    assert cast(Any, tool_config)["tools"][0]["toolSpec"]["name"] == "get_user"
     # assistant toolUse + tool result present
-    blocks = [b for m in cast(Any,msgs) for b in m["content"]]
+    blocks = [b for m in cast(Any, msgs) for b in m["content"]]
     assert any("toolUse" in b for b in blocks)
     assert any("toolResult" in b for b in blocks)
 
@@ -308,7 +308,7 @@ def test_bedrock_to_completion_shape() -> None:
         },
         "stopReason": "tool_use",
     }
-    completion = cast(Any,bedrock_to_completion(resp))
+    completion = cast(Any, bedrock_to_completion(resp))
     choice = completion["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["content"] == "sure"

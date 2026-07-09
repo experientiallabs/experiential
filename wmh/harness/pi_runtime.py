@@ -329,8 +329,11 @@ class PiRuntime:
             # The worker LLM proxy failed (auth/outage/HTTP error); entry.ts still POSTs /done, but
             # this is infrastructure failure, not an agent submission — never count it as SUBMITTED.
             return self._error_result(
-                task_id, episode, instruction,
-                f"worker LLM proxy error: {episode.proxy_error}", StopReason.ERROR,
+                task_id,
+                episode,
+                instruction,
+                f"worker LLM proxy error: {episode.proxy_error}",
+                StopReason.ERROR,
             )
         return RunResult(
             task_id=task_id,
@@ -382,9 +385,7 @@ class PiRuntime:
         result = _ssh(remote, input_bytes=blob.encode("utf-8"))
         if result.returncode != 0:
             detail = (result.stderr or b"").decode("utf-8", "replace").strip()[-300:]
-            raise _MaterializeError(
-                f"remote materialize failed (rc={result.returncode}): {detail}"
-            )
+            raise _MaterializeError(f"remote materialize failed (rc={result.returncode}): {detail}")
 
     def _run_node(self) -> tuple[int, str]:
         """Run entry.ts on the runner with a reverse tunnel back to the local shim."""

@@ -479,9 +479,7 @@ class RunnerLink:
             )
 
     @staticmethod
-    def _error_result(
-        task_id: str, episode: HostEpisode, instruction: str, note: str
-    ) -> RunResult:
+    def _error_result(task_id: str, episode: HostEpisode, instruction: str, note: str) -> RunResult:
         stop = StopReason.MAX_TURNS if episode.steps else StopReason.ERROR
         episode.steps.append(
             Step(
