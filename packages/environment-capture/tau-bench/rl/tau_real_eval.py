@@ -119,6 +119,7 @@ def run_domain(args: argparse.Namespace, domain: str, task_ids: list[str], save_
                 if args.agent_api_base
                 else {}
             )
+            | (json.loads(args.agent_llm_extra) if args.agent_llm_extra else {})
         ),
         "--user-llm",
         args.user_llm,
@@ -172,6 +173,13 @@ def main() -> None:
     parser.add_argument("--agent-api-base", default=None)
     parser.add_argument("--agent-api-key", default="dummy")
     parser.add_argument("--agent-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--agent-llm-extra",
+        default=None,
+        help="JSON merged into --agent-llm-args (e.g. vLLM extra_body: think-free checkpoints "
+        'need \'{"extra_body": {"chat_template_kwargs": {"enable_thinking": false}}}\' '
+        "or they emit immediate EOS — the v1 SFT trap, D70/D30 notes).",
+    )
     parser.add_argument("--user-llm", default=DEFAULT_USER_LLM)
     parser.add_argument("--trials", type=int, default=2, help="episodes per task (D30: 2)")
     parser.add_argument("--concurrency", type=int, default=4)
