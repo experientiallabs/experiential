@@ -180,3 +180,36 @@ def test_eval_rejects_unknown_env(tmp_path: Path) -> None:
     result = _invoke(tmp_path, "--env", "banana")
     assert result.exit_code == 2  # usage error, not a traceback
     assert "choose sim or e2b" in result.output
+
+
+def test_eval_env_sim_rejects_parallel_pi_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local pi runtimes are single-episode resources: sim + --eval-concurrency>1 must not run."""
+    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
+
+    pi_doc = HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+        ],
+    )
+
+    class _FakeStore:
+        def __init__(self, root: str) -> None:
+            self.root = root
+
+        def resolve(self, name: str | None) -> Path:
+            return Path("/models/wm-alpha")
+
+    monkeypatch.setattr(eval_cl_module, "WorldModelStore", _FakeStore)
+    monkeypatch.setattr(eval_cl_module, "load_world_model", lambda d: (object(), _Provider()))
+    monkeypatch.setattr(eval_cl_module, "_load_harness", lambda name, root: pi_doc)
+
+    result = _invoke(tmp_path, "--harness", "pi", "--eval-concurrency", "2")
+
+    assert result.exit_code == 2  # usage error, before any rollout
+    assert "one episode at a time" in result.output

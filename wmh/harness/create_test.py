@@ -601,6 +601,37 @@ def test_sim_backend_requires_a_world_model() -> None:
         )
 
 
+def test_sim_backend_rejects_parallel_pi_node_scoring() -> None:
+    """Local pi runtimes are single-episode (one port/workdir/channel): sim must stay sequential.
+
+    The guard fires per-doc at scoring time, before any rollout, so a parallel request fails
+    loudly instead of colliding episodes.
+    """
+    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, Surface, SurfaceKind
+
+    provider = RoleProvider()
+    pi_seed = HarnessDoc(
+        name="seed",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+        ],
+    )
+    with pytest.raises(ValueError, match="one episode at a time"):
+        create_harness(
+            "winner",
+            pi_seed,
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            eval_concurrency=2,
+        )
+
+
 def test_unknown_env_backend_is_rejected() -> None:
     from typing import Literal, cast
 

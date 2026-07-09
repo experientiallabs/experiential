@@ -341,6 +341,16 @@ def create_harness(
         doc: HarnessDoc, split: list[TaskSpec], *, k_override: int | None = None
     ) -> ClosedLoopReport:
         k_eff = k if k_override is None else k_override
+        if env_backend == "sim" and doc.runtime_kind() == "pi-node":
+            # Local pi runtimes are single-episode resources (one runner port/workdir, or one
+            # RunnerLink channel): parallel cells would collide. Checked per-doc because a delta
+            # can flip param:runtime-kind mid-search.
+            sim_concurrency = eval_concurrency if eval_concurrency is not None else 1
+            if sim_concurrency != 1:
+                raise ValueError(
+                    "pi-node harnesses run one episode at a time under env_backend='sim' "
+                    "(single runner port/channel); use eval_concurrency=1 or env_backend='e2b'"
+                )
         if env_backend == "e2b":
             # One fresh sandbox per (task, attempt) cell; default = every cell at once.
             return evaluate_with_env(

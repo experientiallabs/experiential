@@ -129,6 +129,18 @@ def run_closed_loop(
         console.print(f"  {task_id} #{attempt}: {mark} ({verdict.rationale})")
 
     if loaded_harness is not None:
+        if (
+            env == "sim"
+            and loaded_harness.runtime_kind() == "pi-node"
+            and eval_concurrency is not None
+            and eval_concurrency != 1
+        ):
+            # Local pi runtimes are single-episode resources (one runner port/workdir, or one
+            # RunnerLink channel): parallel cells would collide.
+            raise typer.BadParameter(
+                "pi-node harnesses run one episode at a time under --env sim; "
+                "drop --eval-concurrency or use --env e2b"
+            )
         if max_turns is not None and max_turns != loaded_harness.max_turns():
             console.print(
                 f"  note: --max-turns {max_turns} overrides the harness's own "
