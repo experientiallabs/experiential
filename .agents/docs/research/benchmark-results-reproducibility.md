@@ -7,8 +7,6 @@ migrated: 2026-07-02
 
 # Benchmark results: reproducibility
 
-> **Stale commands (2026-07-02):** the `--judge` flag, the suite `judge` key, and `LLMJudge` were removed in PR #83 (single weighted RubricJudge). Commands below reproduce results only at their original commit; drop `--judge ...` to run on current main (absolute fidelity levels differ under the new judge).
-
 > **Dated snapshot (June 2026).** These numbers were measured on the then-committed 66-trace tau2
 > corpus; the corpus has since grown to 1033 traces and the repo layout changed (PR #38: paths are
 > now `examples/tau-bench/...`, and the committed per-step report JSONs under `benchmarks/results/`

@@ -1,7 +1,12 @@
 #!/usr/bin/env python
 """Render the judge-overhaul figure (.agents/docs/research/judge_overhaul.png), brand system per AGENTS.md.
 
-Three panels from the raw runs in .agents/docs/research/raw/:
+Three panels. Panel A/C read the committed meta-eval runs in .agents/docs/research/raw/;
+panel B (and the "fixed" run) read bulky outputs that are NOT committed — regenerate them first:
+    uv run python .agents/scripts/run_judge_quality.py --out .agents/docs/research/raw/judge-quality-fixed.json
+    uv run python .agents/scripts/run_judge_regression.py \
+        --cache .wmh/judge-regression-preds.json --out .agents/docs/research/raw/judge-regression.json
+Panels:
   A. Judge-quality meta-eval per case: expected band, baseline score, overhauled score.
   B. Old vs new judge on 47 identical real predictions, colored by new-judge factuality band.
   C. Judge-model sweep: high-band control mean vs hard-defect mean per candidate (separation).

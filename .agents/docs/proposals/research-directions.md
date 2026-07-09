@@ -66,10 +66,9 @@ band (experiment 1): an effect smaller than the across-seed std is noise.
   estimate stability — interacts with corpus size.
 - **Reflection minibatch size.** GEPA's `reflection_minibatch_size` is currently `min(3, len(...))`.
   Larger minibatches = steadier reflection signal at higher cost.
-- **Rubric weights as fitness signal.** GEPA optimizes against `RubricJudge`'s factuality-weighted
-  headline (`RUBRIC_WEIGHTS`). Does varying the weights (e.g. uniform vs factuality-dominant)
-  change the winning prompt or its held-out fidelity? (The single-judge collapse removed the old
-  `LLMJudge`-vs-rubric comparison; the weight vector is the remaining knob.)
+- **Judge choice as fitness signal.** GEPA optimizes against `LLMJudge` (functional equivalence).
+  Does optimizing against the 5-dimension `RubricJudge` instead change the winning prompt or its
+  held-out fidelity? (Distinct from *scoring* with the rubric, which experiment 1 already does.)
 - **Base-prompt sensitivity.** Hold everything fixed and vary the GEPA seed prompt. How much does the
   starting point determine the winner — i.e. how much of the fidelity is GEPA vs. the hand-tuned
   base?

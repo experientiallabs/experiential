@@ -7,8 +7,6 @@ migrated: 2026-07-02
 
 # GEPA optimization research
 
-> **Stale commands (2026-07-02):** the `--judge` flag, the suite `judge` key, and `LLMJudge` were removed in PR #83 (single weighted RubricJudge). Commands below reproduce results only at their original commit; drop `--judge ...` to run on current main (absolute fidelity levels differ under the new judge).
-
 This is the **research surface** for the harness's optimization trajectory: prompt optimization
 (GEPA) today, heavier training methods tomorrow. It exists to try optimization directions
 *empirically* — change a knob, measure reconstruction fidelity, record the result — rather than

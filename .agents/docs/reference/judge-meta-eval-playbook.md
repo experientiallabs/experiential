@@ -93,8 +93,8 @@ world-model predictions ONCE, cache them, then score the same cache with old and
 
 ```bash
 uv run python .agents/scripts/run_judge_regression.py \
-  --cache .agents/docs/research/raw/judge-regression-preds.json \
-  --out   .agents/docs/research/raw/judge-regression.json
+  --cache .wmh/judge-regression-preds.json \
+  --out   .wmh/judge-regression.json
 ```
 
 Report three things: **rank agreement** (Spearman; ours 0.963), **shift sliced by the

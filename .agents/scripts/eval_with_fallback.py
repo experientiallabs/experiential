@@ -100,7 +100,7 @@ def main() -> None:
         if flagged
         else None
     )
-    scores = [r.score for r in entry.results if r.valid]  # exclude judge-invalid
+    scores = [r.score for r in entry.results]
     mean = sum(scores) / len(scores) if scores else 0.0
     var = sum((s - mean) ** 2 for s in scores) / len(scores) if scores else 0.0
     out = {
