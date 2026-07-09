@@ -13,6 +13,8 @@ from typing import Any, cast
 from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness.runner_link import (
     RunnerLink,
+    WorkerConfig,
+    _normalized_openai_body,
     bedrock_to_completion,
     openai_to_bedrock,
     read_frame,
@@ -315,3 +317,37 @@ def test_bedrock_to_completion_shape() -> None:
     tc = choice["message"]["tool_calls"][0]
     assert tc["function"]["name"] == "get_user"
     assert tc["function"]["arguments"] == '{"id": "u1"}'
+
+
+def test_normalized_openai_body_strips_stream_options_and_maps_max_tokens() -> None:
+    """pi asks for a stream; the framed transport sends ONE non-streaming request.
+
+    DeepSeek 400s on `stream_options` without `stream=true` (live-observed), and
+    `max_completion_tokens` is translated to the widely supported `max_tokens`.
+    """
+    cfg = WorkerConfig(
+        backend="openai",
+        model="deepseek-chat",
+        region="us-east-1",
+        base_url="https://api.deepseek.com/v1",
+        key_env="DEEPSEEK_API_KEY",
+    )
+    body: JsonObject = {
+        "model": "worker",
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "store": False,
+        "max_completion_tokens": 4096,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    b = _normalized_openai_body(body, cfg)
+    assert b["model"] == "deepseek-chat"
+    assert b["stream"] is False
+    assert "stream_options" not in b
+    assert b["max_tokens"] == 4096
+    assert "max_completion_tokens" not in b
+    # an explicit max_tokens wins over the translated one
+    b2 = _normalized_openai_body({"max_completion_tokens": 10, "max_tokens": 7}, cfg)
+    assert b2["max_tokens"] == 7
+    # the original body is never mutated
+    assert body["stream"] is True and "stream_options" in body

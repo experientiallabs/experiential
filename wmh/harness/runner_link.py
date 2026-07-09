@@ -147,13 +147,28 @@ def worker_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
     return _openai_completion(body, cfg)
 
 
-def _openai_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
-    import urllib.request
+def _normalized_openai_body(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
+    """The runner's request body rewritten for a single non-streaming worker call.
 
+    The runner's pi client asks for a stream (`stream: true` + `stream_options`), but the frame
+    transport carries exactly one finished completion, so the request must be non-streaming —
+    and strict OpenAI-compatible servers (DeepSeek) 400 on `stream_options` without
+    `stream=true`. `max_completion_tokens` is translated to the widely supported `max_tokens`.
+    """
     b = dict(body)
     if cfg.model:
         b["model"] = cfg.model
     b["stream"] = False
+    b.pop("stream_options", None)
+    if "max_completion_tokens" in b and "max_tokens" not in b:
+        b["max_tokens"] = b.pop("max_completion_tokens")
+    return b
+
+
+def _openai_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
+    import urllib.request
+
+    b = _normalized_openai_body(body, cfg)
     key = os.environ.get(cfg.key_env, "") if cfg.key_env else ""
     req = urllib.request.Request(
         cfg.base_url.rstrip("/") + "/chat/completions",
