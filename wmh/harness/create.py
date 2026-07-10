@@ -377,7 +377,7 @@ def create_harness(
                 # still route to the world model — the environment is sim regardless of backend.
                 concurrency = eval_concurrency if eval_concurrency is not None else 0
                 runtime = doc.runtime(agent_provider, backend="e2b", e2b_pool=sandbox_pool)
-            return evaluate_closed_loop(
+            report = evaluate_closed_loop(
                 split,
                 world_model,
                 agent_provider,
@@ -387,6 +387,11 @@ def create_harness(
                 concurrency=concurrency,
                 runtime=runtime,
             )
+            # Tally the pi worker's self-metered tokens across every score wave (seed, screens,
+            # full splits, holdout, confirmations): its LLM calls bypass the Provider, so this is
+            # the only record. None on backends whose runtimes don't self-meter (local).
+            worker_usages.append(report.worker_usage)
+            return report
 
         seed_report = _score(seed_doc, tasks)
         reports[seed_doc.doc_hash] = seed_report

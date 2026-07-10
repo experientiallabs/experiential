@@ -853,3 +853,84 @@ def test_eval_concurrency_overrides_both_backend_defaults(
     run(HarnessDoc.baseline("seed"), harness_backend="local", eval_concurrency=4)
     run(_pi_seed(), harness_backend="e2b", eval_concurrency=2)
     assert concurrencies == [1, 4, 2]  # local defaults sequential; explicit caps pass through
+
+
+def test_create_sums_worker_usage_across_score_waves(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """CreateResult.worker_usage is the sum of every score wave's report.worker_usage.
+
+    Regression: the pi worker path self-meters tokens on each ClosedLoopReport, but the search
+    dropped them on the floor (the accumulator list was declared and summed, never appended to),
+    so CreateResult.worker_usage came back None and the platform's worker cost booked $0.00
+    despite real agent LLM spend. Seed + one screened child = two waves here.
+    """
+    from wmh.harness.runtime import TokenUsage
+
+    provider = RoleProvider(meta_reply=_meta_reply(HarnessDoc.baseline("seed"), _CAREFUL_PROMPT))
+
+    def fake_evaluate(
+        tasks: list[TaskSpec],
+        world_model: WorldModel,
+        agent_provider: Provider,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+        runtime: Runtime | None = None,
+    ) -> ClosedLoopReport:
+        report = _canned_report(0.5, k=k)
+        return report.model_copy(
+            update={"worker_usage": TokenUsage(input_tokens=100, output_tokens=10, calls=2)}
+        )
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", fake_evaluate)
+
+    result = create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=1,
+        harness_backend="e2b",
+    )
+
+    # Before the fix this was None (each wave's usage was never accumulated); now it sums
+    # every wave. At least the seed wave ran (2 calls / 100in / 10out per wave), and the totals
+    # hold that exact per-call ratio however many waves the search took.
+    assert result.worker_usage is not None
+    assert result.worker_usage.calls >= 2
+    assert result.worker_usage.calls % 2 == 0
+    assert result.worker_usage.input_tokens == 50 * result.worker_usage.calls
+    assert result.worker_usage.output_tokens == 5 * result.worker_usage.calls
+
+
+def test_create_worker_usage_is_none_when_no_wave_reports_it(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """Local runtimes don't self-meter: worker_usage stays None (never a zero-token TokenUsage)."""
+    provider = RoleProvider()
+
+    monkeypatch.setattr(
+        create_module,
+        "evaluate_closed_loop",
+        lambda *a, **k: _canned_report(1.0, k=k.get("k", 3)),
+    )
+
+    result = create_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=0,
+        harness_backend="local",
+    )
+
+    assert result.worker_usage is None
