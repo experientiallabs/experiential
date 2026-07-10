@@ -30,6 +30,7 @@ from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation
 from wmh.harness.environment import AgentEnvironment, is_env_action
 from wmh.harness.runtime import RunResult, StopReason
 from wmh.harness.tools import ToolSpec
+from wmh.providers.base import ProviderConfig, ProviderKind
 
 DEFAULT_MAX_ENV_ACTIONS = 40
 
@@ -104,6 +105,15 @@ class WorkerConfig:
     key_env: str = ""
 
 
+_PI_AGENT_ENV_VARS = (
+    "PI_AGENT_BACKEND",
+    "PI_AGENT_MODEL",
+    "PI_AGENT_REGION",
+    "PI_AGENT_BASE_URL",
+    "PI_AGENT_KEY_ENV",
+)
+
+
 def worker_config_from_env() -> WorkerConfig:
     """Build the worker config from the same PI_AGENT_* env knobs PiRuntime reads.
 
@@ -119,6 +129,27 @@ def worker_config_from_env() -> WorkerConfig:
         base_url=os.environ.get("PI_AGENT_BASE_URL", "https://api.deepseek.com/v1"),
         key_env=os.environ.get("PI_AGENT_KEY_ENV", "DEEPSEEK_API_KEY"),
     )
+
+
+def worker_config_for(config: ProviderConfig) -> WorkerConfig:
+    """The worker config for an eval, preferring explicit env over provider derivation.
+
+    Precedence: any PI_AGENT_* env var set -> `worker_config_from_env` exactly as before (the
+    operator asked for a specific worker). Otherwise, a Bedrock agent provider is fully derivable
+    (model id + region; AWS creds stay host-side as always) — this is what lets the hosted
+    platform point pi at the agent's catalog model with zero env plumbing. Any other kind keeps
+    the env defaults: their auth shapes (Azure api-version query strings, deployment paths) do
+    not fit the single openai-completions POST `worker_completion` sends.
+    """
+    if any(os.environ.get(name) for name in _PI_AGENT_ENV_VARS):
+        return worker_config_from_env()
+    if config.kind is ProviderKind.BEDROCK and config.model:
+        return WorkerConfig(
+            backend="bedrock",
+            model=config.model,
+            region=config.region or os.environ.get("AWS_REGION", "us-east-1"),
+        )
+    return worker_config_from_env()
 
 
 # The process-wide runner channel doc.runtime(PI_TRANSPORT=link) drives. A search/eval sets it once

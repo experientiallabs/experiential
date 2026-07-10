@@ -258,10 +258,12 @@ class HarnessDoc(BaseModel):
             if backend == "e2b":
                 # Lazy: the e2b backend is an optional extra; `local` must import none of it.
                 from wmh.harness.pi_e2b import E2BPiRuntime
-                from wmh.harness.runner_link import worker_config_from_env
+                from wmh.harness.runner_link import worker_config_for
 
                 return E2BPiRuntime(
-                    worker=worker_config_from_env(),
+                    # Explicit PI_AGENT_* env wins; else a Bedrock `provider` is derived so the
+                    # worker LLM is the agent model the caller already chose (hosted platform).
+                    worker=worker_config_for(provider.config),
                     files=code_files,
                     tools=resolve_tools(self.tools()),
                     system_prompt=self._assembled_prompt(skills),

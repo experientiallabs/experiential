@@ -352,3 +352,45 @@ def test_normalized_openai_body_strips_stream_options_and_maps_max_tokens() -> N
     assert "max_completion_tokens" not in b2
     # the original body is never mutated
     assert body["stream"] is True and "stream_options" in body
+
+
+def test_worker_config_for_prefers_env_then_derives_bedrock(
+    monkeypatch: __import__("pytest").MonkeyPatch,
+) -> None:
+    """Explicit PI_AGENT_* env wins; a Bedrock provider derives; others keep env defaults."""
+    import pytest
+
+    from wmh.harness.runner_link import worker_config_for
+    from wmh.providers.base import ProviderConfig, ProviderKind
+
+    monkeypatch.delenv("PI_AGENT_BACKEND", raising=False)
+    monkeypatch.delenv("PI_AGENT_MODEL", raising=False)
+    monkeypatch.delenv("PI_AGENT_REGION", raising=False)
+    monkeypatch.delenv("PI_AGENT_BASE_URL", raising=False)
+    monkeypatch.delenv("PI_AGENT_KEY_ENV", raising=False)
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+
+    bedrock = ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-haiku-4-5")
+    derived = worker_config_for(bedrock)
+    assert derived.backend == "bedrock"
+    assert derived.model == "us.anthropic.claude-haiku-4-5"
+    assert derived.region == "eu-west-1"
+
+    # An explicit region on the provider beats the env region.
+    pinned = worker_config_for(bedrock.model_copy(update={"region": "us-west-2"}))
+    assert pinned.region == "us-west-2"
+
+    # Any PI_AGENT_* env var set -> the operator's env config wins wholesale.
+    monkeypatch.setenv("PI_AGENT_MODEL", "deepseek-chat")
+    env_won = worker_config_for(bedrock)
+    assert env_won.backend == "openai"
+    assert env_won.model == "deepseek-chat"
+    monkeypatch.delenv("PI_AGENT_MODEL")
+
+    # Non-bedrock kinds keep the env-default contract (their auth shapes don't map).
+    if hasattr(ProviderKind, "AZURE_OPENAI"):
+        azure = ProviderConfig(kind=ProviderKind.AZURE_OPENAI, model="gpt-5.5")
+        assert worker_config_for(azure).backend == "openai"
+        assert worker_config_for(azure).model == "deepseek-chat"
+    else:  # pragma: no cover - kind set varies; the bedrock/env branches above are the contract
+        pytest.skip("no non-bedrock kind available to exercise the fallback")
