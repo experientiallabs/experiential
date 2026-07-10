@@ -305,6 +305,12 @@ class Session {
 						return { content: [{ type: "text", text: "interrupted" }], details: {}, terminate: false };
 					}
 					const r = await this.conn.request("tool_request", { name: t.name, arguments: params });
+					// A host-side failure (budget exhausted, unknown tool, executor error) must reach
+					// the agent AS a failure: throw so pi records an error tool result, rather than
+					// letting the model reason from a failed action as if it succeeded.
+					if (r.is_error) {
+						throw new Error(String(r.content ?? "tool failed"));
+					}
 					return { content: [{ type: "text", text: String(r.content ?? "") }], details: r, terminate: false };
 				},
 			}));
@@ -313,7 +319,11 @@ class Session {
 			label: "submit",
 			description: "Finish the task and submit your answer/result summary. This ends the run.",
 			parameters: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
-			execute: async (_id: string, params: { answer?: string }) => {
+			execute: async (_id: string, params: { answer?: string }, signal?: AbortSignal) => {
+				// Honor an interrupt racing a submit: don't emit a final submit for an aborted turn.
+				if (signal?.aborted) {
+					return { content: [{ type: "text", text: "interrupted" }], details: {}, terminate: false };
+				}
 				// The host emits the submit event; the run then ends (but the SESSION stays alive
 				// awaiting the next user message).
 				await this.conn.request("tool_request", { name: "submit", arguments: { answer: params.answer ?? "" } });
@@ -354,6 +364,10 @@ class Session {
 	handleAbort(_frame: Frame): void {
 		if (this.agent && this.running) {
 			this.interrupted = true;
+			// Interrupt cancels the WHOLE pending turn: clear any messages the user queued (via
+			// steer) before pressing Stop, so a follow-up typed just before the interrupt is not
+			// silently drained into the next prompt. New messages after this start a fresh turn.
+			this.agent.clearAllQueues?.();
 			this.agent.abort();
 		}
 	}
