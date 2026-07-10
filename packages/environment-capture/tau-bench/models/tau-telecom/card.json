@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "name": "tau-telecom",
+  "title": "τ²-bench telecom (GEPA-optimized)",
+  "description": "The telecom slice of τ²-bench with a GEPA-evolved environment prompt (317 optimization rollouts). Same customer-service tool surface as tau-bench, tuned for the telecom domain's device and plan workflows.",
+  "task": "tau-bench",
+  "corpus": {
+    "traces": 29,
+    "steps": 433,
+    "source": "traces.otel.jsonl"
+  },
+  "provider": "bedrock",
+  "model_id": "us.anthropic.claude-opus-4-8",
+  "fidelity": null,
+  "cost_per_step_usd": null,
+  "latency_per_step_s": null,
+  "built_at": "2026-06-29T15:21:47-07:00",
+  "license": null,
+  "tags": [
+    "tool-calls",
+    "customer-service",
+    "gepa"
+  ]
+}

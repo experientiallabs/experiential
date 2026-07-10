@@ -137,6 +137,31 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
     assert result.exit_code == 0, result.output
 
 
+def test_build_writes_model_card(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    from wmh.config.card import load_card
+
+    root = tmp_path / ".wmh"
+    _build(root, "tau2-airline", tmp_path)
+    card = load_card(root / "models" / "tau2-airline")
+    assert card is not None
+    assert card.name == "tau2-airline"
+    assert card.corpus.traces is not None and card.corpus.traces > 0
+    assert card.corpus.steps > 0
+    assert card.provider == "bedrock"
+    assert card.built_at is not None
+
+
+def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    # The card is additive metadata: a write failure must not fail an otherwise-complete build.
+    def _boom(card, model_dir) -> None:  # noqa: ANN001
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli_app_module, "save_card", _boom)
+    root = tmp_path / ".wmh"
+    _build(root, "tau2-airline", tmp_path)  # asserts exit_code == 0 internally
+    assert (root / "models" / "tau2-airline" / "config.toml").exists()
+
+
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
     core = {"build", "list", "serve", "demo", "eval", "play", "download"}

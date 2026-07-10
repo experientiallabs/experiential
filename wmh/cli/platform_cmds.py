@@ -47,7 +47,7 @@ _LOGIN_TOKEN = typer.Option(
 _LOGIN_NO_BROWSER = typer.Option(
     "--no-browser", help="Print the authorization URL instead of opening a browser."
 )
-_PROJECT = typer.Option("--project", help="Project id (defaults to the login's default project).")
+_ORG = typer.Option("--org", help="Organization id (defaults to the login's default organization).")
 _KIND = typer.Option(
     "--kind", help="Artifact kind: model or harness (auto-detected when unambiguous)."
 )
@@ -93,25 +93,23 @@ def login(
             raise typer.Exit(code=1) from error
 
     # A relogin may land on a different account: keep the saved default
-    # project only if the new identity can still see it.
-    visible_projects = {project.id for project in identity.projects}
-    default_project = (
-        credentials.default_project if credentials.default_project in visible_projects else None
-    )
-    if default_project is None and len(identity.projects) == 1:
-        default_project = identity.projects[0].id
+    # organization only if the new identity can still see it.
+    visible_orgs = {org.id for org in identity.orgs}
+    default_org = credentials.default_org if credentials.default_org in visible_orgs else None
+    if default_org is None and len(identity.orgs) == 1:
+        default_org = identity.orgs[0].id
     updated = credentials.model_copy(
         update={
             "web_url": web_url,
             "api_url": api_url,
             "token": token,
-            "default_project": default_project,
+            "default_org": default_org,
         }
     )
     path = save_credentials(updated)
     org_names = ", ".join(org.name for org in identity.orgs) or "no organizations"
     _console.print(f"{_CHECK} Connected to [bold]{org_names}[/bold] ({path})")
-    _print_projects(identity, updated.default_project)
+    _print_orgs(identity, updated.default_org)
 
 
 def logout() -> None:
@@ -127,7 +125,7 @@ def logout() -> None:
 
 
 def status() -> None:
-    """Show the platform connection: account, organizations, and projects."""
+    """Show the platform connection: account and organizations."""
     credentials = load_credentials()
     if not credentials.is_complete():
         _console.print(
@@ -142,14 +140,12 @@ def status() -> None:
             raise typer.Exit(code=1) from error
     _console.print(f"{_CHECK} Connected to [bold]{credentials.web_url}[/bold]")
     _console.print(f"  acting as: {identity.actor.kind} {identity.actor.id}")
-    for org in identity.orgs:
-        _console.print(f"  organization: {org.name} ({org.slug})")
-    _print_projects(identity, credentials.default_project)
+    _print_orgs(identity, credentials.default_org)
 
 
 def push(
     name: Annotated[str, typer.Argument(help="Local world model or harness name.")],
-    project: Annotated[str | None, _PROJECT] = None,
+    org: Annotated[str | None, _ORG] = None,
     kind: Annotated[str | None, _KIND] = None,
     push_as: Annotated[str | None, _PUSH_AS] = None,
     ref: Annotated[str | None, _PUSH_REF] = None,
@@ -161,17 +157,17 @@ def push(
     resolved_kind = _resolve_kind(kind, model=model_dir is not None, harness=harness_exists)
     remote_name = push_as or name
 
-    credentials, project_id = _require_connection(project)
+    credentials, org_id = _require_connection(org)
     with _client(credentials) as client:
         if resolved_kind == "model" and model_dir is not None:
-            _push_model(client, project_id, remote_name, model_dir)
+            _push_model(client, org_id, remote_name, model_dir)
         else:
-            _push_harness(client, project_id, remote_name, name, ref, root)
+            _push_harness(client, org_id, remote_name, name, ref, root)
 
 
 def pull(
     name: Annotated[str, typer.Argument(help="Remote world model or harness name.")],
-    project: Annotated[str | None, _PROJECT] = None,
+    org: Annotated[str | None, _ORG] = None,
     kind: Annotated[str | None, _KIND] = None,
     version: Annotated[int | None, _PULL_VERSION] = None,
     force: Annotated[bool, _PULL_FORCE] = False,
@@ -180,13 +176,13 @@ def pull(
     """Fetch a world model or harness from the platform registry."""
     if kind is not None and kind not in ("model", "harness"):
         raise typer.BadParameter("--kind must be 'model' or 'harness'")
-    credentials, project_id = _require_connection(project)
+    credentials, org_id = _require_connection(org)
     with _client(credentials) as client:
-        resolved_kind = kind or _detect_remote_kind(client, project_id, name)
+        resolved_kind = kind or _detect_remote_kind(client, org_id, name)
         if resolved_kind == "model":
-            _pull_model(client, project_id, name, root, force=force)
+            _pull_model(client, org_id, name, root, force=force)
         else:
-            _pull_harness(client, project_id, name, root, version=version)
+            _pull_harness(client, org_id, name, root, version=version)
 
 
 # -- helpers -------------------------------------------------------------------------------------
@@ -217,16 +213,16 @@ def _client(credentials: PlatformCredentials) -> PlatformClient:
     return PlatformClient(credentials.api_url, credentials.token)
 
 
-def _require_connection(project: str | None) -> tuple[PlatformCredentials, str]:
+def _require_connection(org: str | None) -> tuple[PlatformCredentials, str]:
     credentials = load_credentials()
     if not credentials.is_complete():
         raise typer.BadParameter("not connected to a platform; run `wmh login` first")
-    project_id = project or credentials.default_project
-    if not project_id:
+    org_id = org or credentials.default_org
+    if not org_id:
         raise typer.BadParameter(
-            "no project selected; pass --project <id> (see `wmh status` for your projects)"
+            "no organization selected; pass --org <id> (see `wmh status` for your organizations)"
         )
-    return credentials, project_id
+    return credentials, org_id
 
 
 def _resolve_kind(kind: str | None, *, model: bool, harness: bool) -> str:
@@ -247,25 +243,25 @@ def _resolve_kind(kind: str | None, *, model: bool, harness: bool) -> str:
     raise typer.BadParameter("no local world model or harness has this name")
 
 
-def _detect_remote_kind(client: PlatformClient, project_id: str, name: str) -> str:
-    model_names = {model.name for model in client.list_world_models(project_id)}
-    harness_names = {harness.name for harness in client.list_harnesses(project_id)}
+def _detect_remote_kind(client: PlatformClient, org_id: str, name: str) -> str:
+    model_names = {model.name for model in client.list_world_models(org_id)}
+    harness_names = {harness.name for harness in client.list_harnesses(org_id)}
     if name in model_names and name in harness_names:
         raise typer.BadParameter("both a model and a harness have this name remotely; pass --kind")
     if name in model_names:
         return "model"
     if name in harness_names:
         return "harness"
-    raise typer.BadParameter(f"the project has no world model or harness named {name!r}")
+    raise typer.BadParameter(f"the organization has no world model or harness named {name!r}")
 
 
-def _push_model(client: PlatformClient, project_id: str, remote_name: str, model_dir: Path) -> None:
+def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> None:
     meta = extract_push_meta(model_dir)
     with tempfile.TemporaryDirectory(prefix="wmh-push-") as staging:
         bundle = pack_model_dir(model_dir, Path(staging) / f"{remote_name}.tar.gz")
         try:
             pushed = client.push_model_bundle(
-                project_id,
+                org_id,
                 remote_name,
                 bundle.path,
                 bundle.sha256,
@@ -286,7 +282,7 @@ def _push_model(client: PlatformClient, project_id: str, remote_name: str, model
 
 def _push_harness(
     client: PlatformClient,
-    project_id: str,
+    org_id: str,
     remote_name: str,
     local_name: str,
     ref: str | None,
@@ -296,7 +292,7 @@ def _push_harness(
     if remote_name != local_name:
         doc = doc.model_copy(update={"name": remote_name})
     pushed = client.push_harness_version(
-        project_id, remote_name, doc.model_dump(mode="json"), doc.doc_hash
+        org_id, remote_name, doc.model_dump(mode="json"), doc.doc_hash
     )
     if pushed.created:
         _console.print(
@@ -309,13 +305,11 @@ def _push_harness(
         )
 
 
-def _pull_model(
-    client: PlatformClient, project_id: str, name: str, root: str, *, force: bool
-) -> None:
+def _pull_model(client: PlatformClient, org_id: str, name: str, root: str, *, force: bool) -> None:
     dest_dir = WorldModelStore(root).model_dir(name)
     with tempfile.TemporaryDirectory(prefix="wmh-pull-") as staging:
         bundle_path = Path(staging) / f"{name}.tar.gz"
-        client.download_model_bundle(project_id, name, bundle_path)
+        client.download_model_bundle(org_id, name, bundle_path)
         try:
             unpack_model_bundle(bundle_path, dest_dir, force=force)
         except FileExistsError as error:
@@ -324,14 +318,14 @@ def _pull_model(
 
 
 def _pull_harness(
-    client: PlatformClient, project_id: str, name: str, root: str, *, version: int | None
+    client: PlatformClient, org_id: str, name: str, root: str, *, version: int | None
 ) -> None:
     if version is None:
-        harness, _versions = client.get_harness(project_id, name)
+        harness, _versions = client.get_harness(org_id, name)
         if harness.latest_version < 1:
             raise typer.BadParameter(f"remote harness {name!r} has no versions yet")
         version = harness.latest_version
-    payload = client.get_harness_version(project_id, name, version)
+    payload = client.get_harness_version(org_id, name, version)
     doc = HarnessDoc.model_validate(payload.doc)
     if doc.doc_hash != payload.doc_hash:
         _console.print("[red]Pulled doc failed its integrity check; not saving.[/red]")
@@ -345,17 +339,17 @@ def _pull_harness(
     )
 
 
-def _print_projects(identity: WhoAmI, default_project: str | None) -> None:
-    if not identity.projects:
-        _console.print("  no projects visible to this key")
+def _print_orgs(identity: WhoAmI, default_org: str | None) -> None:
+    if not identity.orgs:
+        _console.print("  no organizations visible to this key")
         return
     table = Table(show_header=True, header_style="bold")
-    table.add_column("project")
+    table.add_column("organization")
     table.add_column("id")
     table.add_column("")
-    for project in identity.projects:
-        marker = "default" if project.id == default_project else ""
-        table.add_row(project.name, project.id, marker)
+    for org in identity.orgs:
+        marker = "default" if org.id == default_org else ""
+        table.add_row(org.name, org.id, marker)
     _console.print(table)
 
 

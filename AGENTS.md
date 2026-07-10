@@ -25,6 +25,12 @@ uv run pytest -q
   The one exception is deliberate user-facing CLI presentation, which goes through the rich
   `Console` in `wmh/cli/ui.py` (that is product output, not logging).
 
+## Writing
+
+- No em dashes in any writing: code, comments, docstrings, docs, UI copy, commit messages, or PR
+  descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
+  restructure the sentence.
+
 ## Rules
 
 1. **Clean tree before every commit.** Run `uv run ruff check .` and `uv run ty check` over the

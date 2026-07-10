@@ -17,7 +17,6 @@ API_URL = "https://api.test"
 _WHOAMI = {
     "actor": {"kind": "api_key", "id": "api-key:org-1"},
     "orgs": [{"id": "org-1", "slug": "acme", "name": "Acme"}],
-    "projects": [{"id": "proj-1", "org_id": "org-1", "slug": "alpha", "name": "Alpha"}],
 }
 
 
@@ -35,16 +34,16 @@ def test_whoami_parses_and_sends_bearer_token() -> None:
         identity = client.whoami()
 
     assert identity.actor.kind == "api_key"
-    assert identity.projects[0].slug == "alpha"
+    assert identity.orgs[0].slug == "acme"
 
 
 def test_error_payloads_become_platform_errors_with_status() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"error": "Project not found: p"})
+        return httpx.Response(404, json={"error": "Organization not found: o"})
 
     with (
         _client(handler) as client,
-        pytest.raises(PlatformError, match="Project not found") as info,
+        pytest.raises(PlatformError, match="Organization not found") as info,
     ):
         client.whoami()
     assert info.value.status_code == 404
@@ -66,7 +65,7 @@ def test_push_model_bundle_runs_ticket_put_finalize(tmp_path: Path) -> None:
     finalize_body: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/bundle/uploads"):
+        if request.url.path == "/api/orgs/org-1/world-models/tau-bench/bundle/uploads":
             return httpx.Response(
                 201,
                 json={
@@ -79,12 +78,13 @@ def test_push_model_bundle_runs_ticket_put_finalize(tmp_path: Path) -> None:
             seen["put_body"] = request.read()
             seen["put_method"] = request.method
             return httpx.Response(200, json={"Key": "abc"})
+        assert request.url.path == "/api/orgs/org-1/world-models/tau-bench/bundle"
         finalize_body.update(json.loads(request.read()))
         return httpx.Response(201, json={"id": "wm-1", "name": "tau-bench", "status": "ready"})
 
     with _client(handler) as client:
         pushed = client.push_model_bundle(
-            "proj-1",
+            "org-1",
             "tau-bench",
             bundle_path,
             digest,
@@ -120,7 +120,7 @@ def test_push_model_bundle_surfaces_storage_upload_failure(tmp_path: Path) -> No
         _client(handler) as client,
         pytest.raises(PlatformError, match="upload to storage failed"),
     ):
-        client.push_model_bundle("proj-1", "tau-bench", bundle_path, "0" * 64, 12, {})
+        client.push_model_bundle("org-1", "tau-bench", bundle_path, "0" * 64, 12, {})
 
 
 def _download_handler(
@@ -129,6 +129,7 @@ def _download_handler(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "storage.test":
             return httpx.Response(200, content=content)
+        assert request.url.path == "/api/orgs/org-1/world-models/tau-bench/bundle"
         return httpx.Response(
             200,
             json={
@@ -149,7 +150,7 @@ def test_download_model_bundle_streams_and_verifies_digest(tmp_path: Path) -> No
 
     handler = _download_handler(content, hashlib.sha256(content).hexdigest())
     with _client(handler) as client:
-        digest = client.download_model_bundle("proj-1", "tau-bench", dest)
+        digest = client.download_model_bundle("org-1", "tau-bench", dest)
 
     assert dest.read_bytes() == content
     assert digest == hashlib.sha256(content).hexdigest()
@@ -159,23 +160,25 @@ def test_download_model_bundle_rejects_digest_mismatch(tmp_path: Path) -> None:
     dest = tmp_path / "tau-bench.tar.gz"
     handler = _download_handler(b"bundle-bytes", "0" * 64)
     with _client(handler) as client, pytest.raises(PlatformError, match="digest mismatch"):
-        client.download_model_bundle("proj-1", "tau-bench", dest)
+        client.download_model_bundle("org-1", "tau-bench", dest)
     assert not dest.exists()
 
 
 def test_harness_round_trip_payloads() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
+            assert request.url.path == "/api/orgs/org-1/harnesses/agent/versions"
             payload = json.loads(request.read())
             assert payload["doc_hash"] == "a" * 32
             return httpx.Response(
                 201,
                 json={"name": "agent", "version": 3, "doc_hash": "a" * 32, "created": True},
             )
-        if request.url.path.endswith("/versions/3"):
+        if request.url.path == "/api/orgs/org-1/harnesses/agent/versions/3":
             return httpx.Response(
                 200, json={"version": 3, "doc": {"name": "agent"}, "doc_hash": "a" * 32}
             )
+        assert request.url.path == "/api/orgs/org-1/harnesses/agent"
         return httpx.Response(
             200,
             json={
@@ -185,15 +188,15 @@ def test_harness_round_trip_payloads() -> None:
         )
 
     with _client(handler) as client:
-        pushed = client.push_harness_version("proj-1", "agent", {"name": "agent"}, "a" * 32)
+        pushed = client.push_harness_version("org-1", "agent", {"name": "agent"}, "a" * 32)
         assert pushed.version == 3
         assert pushed.created
 
-        harness, versions = client.get_harness("proj-1", "agent")
+        harness, versions = client.get_harness("org-1", "agent")
         assert harness.latest_version == 3
         assert versions[0].doc_hash == "a" * 32
 
-        doc = client.get_harness_version("proj-1", "agent", 3)
+        doc = client.get_harness_version("org-1", "agent", 3)
         assert doc.doc == {"name": "agent"}
 
 

@@ -31,6 +31,7 @@ dependencies = [
     # Resolves from the workspace member in-repo ([tool.uv.sources]); RELEASE ORDER: publish
     # llm-waterfall to PyPI before any wmh release, like environment-capture.
     "llm-waterfall",
+    "python-multipart>=0.0.9",  # FastAPI UploadFile for the build-your-own traces upload
 ]
 
 [project.optional-dependencies]
