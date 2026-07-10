@@ -48,8 +48,17 @@ RolloutCallback = Callable[[int, float | None], None]
 class OptimizeMetrics(BaseModel):
     """Outcome metrics from an optimization run."""
 
-    held_out_accuracy: float = 0.0  # mean judge score on the held-out split
-    rollouts_used: int = 0
+    # Mean judge score on the SELECTION data, measured on the path that decided the run: GEPA's
+    # search-time valset aggregate when base won the search; the fresh paired re-check mean (over
+    # the valset, or the `recheck` set when supplied) when a non-base winner was accepted or
+    # reverted; the HARD-subset mean under `select_on_hard` when base won. Comparable across runs
+    # only at a fixed configuration - report a separate test-split score for cross-run numbers.
+    held_out_accuracy: float = 0.0
+    rollouts_used: int = 0  # search metric calls + the acceptance re-check's paired passes
+    # True when the search's winning candidate LOST the fresh base-vs-winner acceptance re-check
+    # and the base prompt was restored (see `GEPAOptimizer.optimize`). Surfaced so research runs
+    # can report how often GEPA's search wins fail to survive an independent evaluation.
+    reverted_to_base: bool = False
     # Reserved: judge self-consistency / human-agreement proxy. Populating it needs repeated or
     # independent judging (not yet implemented); `None` until then so it never reads as a real 0.0.
     judge_agreement: float | None = None
@@ -349,30 +358,53 @@ Current prompt:
 ```
 
 Below are examples where the current prompt was used, each with the action, the model's predicted \
-observation, the REAL observation, and feedback/score. Study the low-scoring ones closely — they \
-reveal what the model doesn't yet know about this environment:
+observation, the REAL observation, and feedback/score:
 
 <side_info>
 
-Write an improved prompt. Your goal is to teach the model the environment's behavior so it \
-predicts future observations more faithfully. Concretely:
+FIRST, diagnose. For each low-scoring example, classify what actually went wrong before writing \
+anything:
+  a. Wrong OUTCOME (predicted an error/empty where the real call succeeded, or vice versa);
+  b. Wrong SHAPE (fields, ordering, wrapping, formatting, missing envelope like returncode);
+  c. Wrong DERIVABLE value (the answer is computable from inputs present in the action/history -
+     e.g. counting words given in the command, echoing a value the session already established);
+  d. Wrong UNKNOWABLE value (live API data, uncaptured file contents - nothing in the prompt can
+     fix these; getting shape and outcome right is the ceiling);
+  e. Ignored EVIDENCE (retrieved examples or session history contained the exact or near-exact
+     answer and the model deviated from it).
+Only classes a, b, c, and e are fixable by prompt guidance. Do NOT write notes that try to fix \
+class d - say in one line why those examples are unknowable and move on.
+
+THEN improve the prompt, following these rules:
 
 - PRESERVE the existing prompt's rules and structure. Do not delete or reword working guidance — a \
 rewrite reliably regresses the many cases that already pass. Improve by ADDING, not replacing.
-- ACCUMULATE concrete, reusable knowledge distilled from the traces. Add specifics that will \
-generalize to unseen actions of the same kind, for example:
-  * Output conventions: exact JSON schema / field names / ordering, whether results are raw vs. \
-wrapped, how empty results and errors are formatted, what a success with no output looks like.
-  * Domain facts and patterns: id/code formats, value ranges, units, status enums, how a tool's \
-result relates to its arguments.
-  * Behavioral rules: which actions return deterministic vs. unknowable content, when a lookup \
-should be found vs. not-found, when a search legitimately returns an empty list.
-- Prefer a dedicated, growing section (e.g. "Environment-specific notes:") of short POINTERS so \
-knowledge compounds across rounds without disturbing the core rules.
-- Keep additions GENERAL: describe the class of situation and the rule, not one example's literal \
-ids/values (those change per episode). If a low score is caused by a value the model simply cannot \
-know, say so (predict plausible/consistent values, get the shape and outcome right) rather than \
-memorizing that example.
+- Make each addition TARGETED: a short note traceable to a diagnosed failure class above, \
+describing the class of situation and the rule - never one example's literal ids/values (those \
+change per episode). Add at most a handful of notes per round; quality over quantity.
+- Put every addition in a single dedicated, growing section at the END of the prompt (create it \
+if absent, e.g. "Environment-specific notes:") rather than interleaving with the core rules, so \
+knowledge compounds across rounds without disturbing working guidance.
+- Keep that notes section COMPACT: before adding a note, check whether an existing note already \
+covers it - extend or sharpen that note instead of adding a near-duplicate. A bloated prompt \
+dilutes the core rules and regresses cases that pass today.
+- EVIDENCE PRECEDENCE (the single most important behavior - never write a note that violates it): \
+when the interaction history, current state, or a retrieved similar example shows the exact or \
+near-exact answer for this action (same entity, same file, same query), REPRODUCE that evidence \
+verbatim. Distilled general knowledge is a fallback for when evidence is absent - it must never \
+override concrete evidence. Notes you add are hints for the evidence-free case only.
+- Never add a rule that flips OUTCOMES based on how often something happened in these examples. \
+That an environment often rate-limits, errors, or returns empty does NOT mean the current action \
+will - outcome must be decided from the current step's own evidence (state, history, the action \
+itself). "Usually fails/empty here" priors break every case that succeeds.
+- For VALUES, teach the model to distinguish and say which applies: (1) DERIVABLE from the action \
+itself or the session - compute or copy exactly, never approximate; (2) external and genuinely \
+unknowable - invent plausible, internally consistent values while keeping shape and outcome \
+right, defaulting to the modal SUCCESS result unless this step's own evidence says otherwise.
+- Reusable knowledge worth accumulating: output conventions (exact schema, field names, ordering, \
+raw vs wrapped, empty/error formats, what silent success looks like), domain facts (id/code \
+formats, value ranges, units, status enums, how results relate to arguments), and behavioral \
+rules (which actions are deterministic vs unknowable, found vs not-found).
 
 Provide the full improved prompt (existing prompt + your additions) within ``` blocks."""
 
@@ -470,6 +502,8 @@ class GEPAOptimizer:
         rag_corpus: list[Trace] | None = None,
         hard_step_filter: Callable[[Step], bool] | None = None,
         select_on_hard: bool = False,
+        recheck: list[Trace] | None = None,
+        minibatch_size: int = 3,
     ) -> OptimizeResult:
         """Run GEPA over optimization splits, optionally retrieving demos from another corpus.
 
@@ -499,6 +533,15 @@ class GEPAOptimizer:
         while using an independently chosen RAG/index split, instead of forcing the GEPA trainset to
         double as the retrieval corpus. When omitted, the historical behavior is preserved: demos
         come from the GEPA train source.
+        `recheck`, when supplied, is an INDEPENDENT trace set (disjoint from the valset) that the
+        stagnant-or-improve acceptance re-check evaluates on instead of the valset. A winner can
+        genuinely beat base on a small (possibly biased) selection valset and still not transfer;
+        re-checking on steps GEPA never selected against catches that without touching test data.
+        `minibatch_size` is the reflection minibatch (GEPA paper: ~8; historical default here: 3).
+        When most steps score perfectly, the chance a random minibatch contains zero failures - a
+        wasted "all subsample scores perfect, skipping" iteration - falls exponentially with this
+        size (~0.8^b), so raising it is the principled fix for skip-wasted budget. Capped at the
+        trainset size.
         """
         train_steps = [step for trace in train for step in trace.steps]
         val_steps = [step for trace in test for step in trace.steps]
@@ -520,6 +563,10 @@ class GEPAOptimizer:
             if hard:  # keep the full trainset if the filter would empty it (never starve GEPA)
                 trainset = hard
         valset = _eval_steps(val_src, demos)
+        # The acceptance re-check must run on the FULL validation distribution even when selection
+        # is hard-filtered below - re-checking base vs winner on base's known-failure steps would
+        # bias base_fresh low by construction and neutralize the guard.
+        full_valset = valset
         if select_on_hard and hard_step_filter is not None:
             # Select candidates on hard-step val fidelity, not the full (near-saturated) val set.
             # When most steps score ~perfectly, a candidate that genuinely fixes the few hard cases
@@ -534,7 +581,7 @@ class GEPAOptimizer:
         # Route gepa's own narration (iteration selections, proposed prompt edits, subsample
         # scores) into the activity stream; the default StdOutLogger would fight a live display.
         logger = _ActivityLogger(self._on_activity) if self._on_activity is not None else None
-        minibatch = min(3, len(trainset))
+        minibatch = min(minibatch_size, len(trainset))
         metric_calls = _metric_call_budget(budget, len(valset), minibatch)
         if self._on_budget is not None:
             self._on_budget(metric_calls)
@@ -568,14 +615,74 @@ class GEPAOptimizer:
 
         best = _candidate_text(result.candidates[result.best_idx])
         frontier = _frontier_prompts(result)
+        held_out = float(result.val_aggregate_scores[result.best_idx])
+        reverted = False
+        recheck_rollouts = 0
+        if best != base_prompt:
+            # Stagnant-or-improve acceptance re-check. GEPA promotes by argmax over SINGLE-sample
+            # valset evaluations, and rollout+judge scores are noisy run-to-run even at T=0 (the
+            # same base prompt measured 0.68-0.76 on one fixed 30-step valset across runs) - so
+            # argmax systematically favors noise-inflated candidates (the winner's curse), which is
+            # how an "optimized" prompt can leave a run WORSE than base. Re-evaluating base and
+            # winner on a fresh, PAIRED pass (same steps, same window - a stored earlier score
+            # would not control for temporal drift) breaks that correlation: keep the winner only
+            # if its win replicates. Costs two eval passes - small next to the search itself. With
+            # `recheck` traces, the re-check runs on that independent (valset-disjoint) sample
+            # instead, which also catches winners whose valset win is real but biased (e.g. a
+            # step-capped valset over-representing short traces). Always falls back to the FULL
+            # valset - never the hard-filtered selection subset - and to the full valset again if
+            # the recheck traces carry no steps (0.0-vs-0.0 would silently keep any winner).
+            recheck_steps = _eval_steps(recheck, demos) if recheck else full_valset
+            if not recheck_steps:
+                recheck_steps = full_valset
+            base_fresh = _mean_valset_score(adapter, recheck_steps, base_prompt)
+            best_fresh = _mean_valset_score(adapter, recheck_steps, best)
+            recheck_rollouts = 2 * len(recheck_steps)
+            if best_fresh < base_fresh:
+                best = base_prompt
+                reverted = True
+                held_out = base_fresh
+                # The re-check affirmatively rejected the search's winner: the returned prompt must
+                # lead the frontier, or a caller picking "the top frontier candidate" deploys the
+                # very prompt the check proved worse than base.
+                frontier = [base_prompt] + [p for p in frontier if p != base_prompt]
+            else:
+                held_out = best_fresh
         return OptimizeResult(
             prompt=best,
             frontier=frontier,
             metrics=OptimizeMetrics(
-                held_out_accuracy=float(result.val_aggregate_scores[result.best_idx]),
-                rollouts_used=int(result.total_metric_calls or 0),
+                # total_metric_calls covers the search only; the re-check's paired passes go
+                # through the same adapter (and tick the same progress callback), so count them.
+                held_out_accuracy=held_out,
+                rollouts_used=int(result.total_metric_calls or 0) + recheck_rollouts,
+                reverted_to_base=reverted,
             ),
         )
+
+
+def _mean_valset_score(
+    adapter: WorldModelGEPAAdapter, valset: list[_EvalStep], prompt: str
+) -> float:
+    """One fresh evaluation pass of `prompt` over `valset` -> mean judge score (0 if empty).
+
+    Raises on a total judge outage rather than returning 0.0: the acceptance re-check compares
+    two of these means, and an all-invalid pass (raw zeros, nothing to impute) would silently
+    revert a good winner or wave through a bad one on a number that says nothing about fidelity.
+    Same contract as `wmh.research.pipeline.score_prompt`.
+
+    Raises:
+        RuntimeError: if steps were scored but every judgement was invalid (judge outage).
+    """
+    batch = adapter.evaluate(valset, {ENV_PROMPT_COMPONENT: prompt}, True)
+    trajectories = batch.trajectories or []
+    if trajectories and all(not t.valid for t in trajectories):
+        raise RuntimeError(
+            f"judge outage during the acceptance re-check ({len(trajectories)} steps, zero valid "
+            "judgements) - the base-vs-winner comparison would be decided by noise; check the "
+            "judge model, quota, and region before rerunning"
+        )
+    return sum(batch.scores) / len(batch.scores) if batch.scores else 0.0
 
 
 def _metric_call_budget(iterations: int, valset_size: int, minibatch: int) -> int:

@@ -37,6 +37,16 @@ class Condition(BaseModel):
     params: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+def as_int(value: JsonValue) -> int:
+    """Narrow a `Condition.params` value the ablation wrote as an int back to `int`.
+
+    The keys an ablation owns are written as ints by its own `conditions()`, so this narrowing
+    only ever sees ints - but assert to fail loudly if a malformed condition slips in.
+    """
+    assert isinstance(value, int)
+    return value
+
+
 class SeedScore(BaseModel):
     """The scalar metric a single (condition, seed) run produced."""
 

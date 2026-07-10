@@ -126,6 +126,10 @@ def test_status_code_from_foreign_module_is_ignored() -> None:
         "model not ready yet",
         # botocore EndpointConnectionError — found live: an unreachable endpoint must spill.
         'Could not connect to the endpoint URL: "https://bedrock-runtime.x.amazonaws.com/"',
+        # botocore ConnectionClosedError - found live (killed a GEPA sweep mid-scoring): a
+        # connection that was ESTABLISHED and then dropped mid-response is transient by
+        # construction, unlike a bad request which never gets that far.
+        "Connection was closed before we received a valid response from endpoint URL",
     ],
 )
 def test_transport_messages_are_capacity(message: str) -> None:

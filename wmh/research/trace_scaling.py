@@ -29,7 +29,7 @@ from collections.abc import Sequence
 
 from wmh.core.types import JsonValue, Trace
 from wmh.optimize.judge import RubricDimension
-from wmh.research.ablation import Condition
+from wmh.research.ablation import Condition, as_int
 from wmh.research.pipeline import optimize_prompt, score_prompt
 from wmh.research.scaling_split import CorpusSplit, partition_corpus, subsample_train
 from wmh.research.seed_stability import BackendFactory
@@ -42,13 +42,6 @@ Mode = str
 BASE: Mode = "base"
 GEPA: Mode = "gepa"
 MODES: tuple[Mode, ...] = (BASE, GEPA)
-
-
-def _as_int(value: JsonValue) -> int:
-    # Condition.params is JsonValue; the keys this ablation owns are written as ints below, so this
-    # narrowing only ever sees ints — but assert to fail loudly if a malformed condition slips in.
-    assert isinstance(value, int)
-    return value
 
 
 def _as_mode(value: JsonValue) -> Mode:
@@ -121,7 +114,7 @@ class TraceScalingAblation:
         # Cap counts at the train pool and drop duplicates created by the cap, preserving order, so
         # a 1000-point sweep on a small corpus collapses cleanly to the few counts it can serve.
         pool = len(self._split.train_pool)
-        self._counts = _dedupe([min(c, pool) for c in counts if c > 0])
+        self._counts = list(dict.fromkeys(min(c, pool) for c in counts if c > 0))
 
     @property
     def split(self) -> CorpusSplit:
@@ -148,7 +141,7 @@ class TraceScalingAblation:
     def run(self, condition: Condition, seed: int) -> float:
         """Score one (mode, n_train) point at `seed` on the fixed test set; fidelity 0..1."""
         mode = _as_mode(condition.params["mode"])
-        n_train = _as_int(condition.params["n_train"])
+        n_train = as_int(condition.params["n_train"])
         train = subsample_train(self._split.train_pool, n_train, seed=seed)
         provider, judge, embedder = self._make_backends()
 
@@ -182,14 +175,3 @@ class TraceScalingAblation:
             retrieval_key=self._retrieval_key,
             score_dimension=self._score_dimension,
         )
-
-
-def _dedupe(values: list[int]) -> list[int]:
-    """Drop duplicates while preserving first-seen order."""
-    seen: set[int] = set()
-    out: list[int] = []
-    for v in values:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out

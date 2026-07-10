@@ -134,6 +134,62 @@ def test_score_prompt_rejects_unknown_score_dimension() -> None:
         )
 
 
+def test_optimize_prompt_forwards_hard_step_knobs(monkeypatch) -> None:  # noqa: ANN001
+    import wmh.research.pipeline as pl
+
+    seen: dict[str, object] = {}
+
+    class _FakeOptimizer:
+        def __init__(self, provider, judge, retriever=None, *, seed=0):  # noqa: ANN001, ANN204
+            seen["seed"] = seed
+
+        def optimize(  # noqa: ANN202
+            self,
+            train,  # noqa: ANN001
+            test,  # noqa: ANN001
+            base,  # noqa: ANN001
+            budget,  # noqa: ANN001
+            *,
+            hard_step_filter,  # noqa: ANN001
+            select_on_hard,  # noqa: ANN001
+            recheck,  # noqa: ANN001
+            minibatch_size,  # noqa: ANN001
+        ):
+            seen["budget"] = budget
+            seen["hard_step_filter"] = hard_step_filter
+            seen["select_on_hard"] = select_on_hard
+            seen["recheck"] = recheck
+            seen["minibatch_size"] = minibatch_size
+            return "RESULT"
+
+    monkeypatch.setattr(pl, "GEPAOptimizer", _FakeOptimizer)
+    marker = lambda step: True  # noqa: E731
+    recheck_traces = [_trace("rc1")]
+    result = pl.optimize_prompt(
+        [_trace("tr1")],
+        [_trace("te1")],
+        "BASE",
+        provider=FakeProvider(),
+        judge=FakeJudge(),
+        embedder=None,
+        budget=4,
+        seed=7,
+        hard_step_filter=marker,
+        select_on_hard=True,
+        recheck=recheck_traces,
+        minibatch_size=8,
+    )
+    assert result == "RESULT"
+    assert seen == {
+        "seed": 7,
+        "budget": 4,
+        "hard_step_filter": marker,
+        "select_on_hard": True,
+        "recheck": recheck_traces,
+        "minibatch_size": 8,
+    }
+
+
 def test_score_prompt_raises_on_total_judge_outage() -> None:
     # Every judgement invalid = a judge outage, not fidelity 0.0 — an ablation must not record it.
     class AlwaysInvalidJudge(FakeJudge):

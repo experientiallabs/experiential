@@ -1,0 +1,156 @@
+{
+  "name": "trace-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "base@0",
+        "params": {
+          "mode": "base",
+          "n_train": 0
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.6462560975609757
+        },
+        {
+          "seed": 1,
+          "score": 0.6365609756097561
+        }
+      ],
+      "mean": 0.6414085365853659,
+      "std": 0.004847560975609788
+    },
+    {
+      "condition": {
+        "label": "base@1",
+        "params": {
+          "mode": "base",
+          "n_train": 1
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8719512195121951
+        },
+        {
+          "seed": 1,
+          "score": 0.8161951219512195
+        }
+      ],
+      "mean": 0.8440731707317073,
+      "std": 0.02787804878048783
+    },
+    {
+      "condition": {
+        "label": "base@4",
+        "params": {
+          "mode": "base",
+          "n_train": 4
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8853658536585365
+        },
+        {
+          "seed": 1,
+          "score": 0.8895487804878048
+        }
+      ],
+      "mean": 0.8874573170731707,
+      "std": 0.002091463414634176
+    },
+    {
+      "condition": {
+        "label": "base@16",
+        "params": {
+          "mode": "base",
+          "n_train": 16
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8993170731707317
+        },
+        {
+          "seed": 1,
+          "score": 0.9052073170731708
+        }
+      ],
+      "mean": 0.9022621951219513,
+      "std": 0.0029451219512195426
+    },
+    {
+      "condition": {
+        "label": "base@64",
+        "params": {
+          "mode": "base",
+          "n_train": 64
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9085853658536586
+        },
+        {
+          "seed": 1,
+          "score": 0.9075243902439024
+        }
+      ],
+      "mean": 0.9080548780487805,
+      "std": 0.000530487804878077
+    },
+    {
+      "condition": {
+        "label": "base@256",
+        "params": {
+          "mode": "base",
+          "n_train": 256
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.926231707317073
+        },
+        {
+          "seed": 1,
+          "score": 0.9144268292682928
+        }
+      ],
+      "mean": 0.9203292682926829,
+      "std": 0.005902439024390138
+    },
+    {
+      "condition": {
+        "label": "base@648",
+        "params": {
+          "mode": "base",
+          "n_train": 648
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9283902439024391
+        },
+        {
+          "seed": 1,
+          "score": 0.9363048780487805
+        }
+      ],
+      "mean": 0.9323475609756098,
+      "std": 0.0039573170731707075
+    }
+  ]
+}

@@ -73,6 +73,7 @@ _TRANSPORT_MARKERS = (
     "connect timeout",
     "connection reset",
     "connection aborted",
+    "connection was closed",  # botocore ConnectionClosedError (dropped mid-response)
     "could not connect to the endpoint",  # botocore EndpointConnectionError (DNS/unreachable)
     "timed out",
     "service unavailable",

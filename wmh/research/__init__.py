@@ -22,6 +22,8 @@ Concrete experiments:
   scaling law), against a fixed held-out test set.
 - `concurrency_scaling` — how batch wall-clock scales with concurrency, for the world model vs. the
   real sandbox (the time differential T_real/T_world).
+- `gepa_scaling` - how reconstruction fidelity scales along GEPA's two knobs (iteration budget and
+  training traces), against the same fixed held-out test set.
 
 The train-vs-eval temperature sweep is parked because the shipped providers reject sampling params.
 """
@@ -44,6 +46,7 @@ from wmh.research.concurrency_scaling import (
     WorldBatch,
     run_concurrency_scaling,
 )
+from wmh.research.gepa_scaling import GepaScalingAblation
 from wmh.research.pipeline import optimize_prompt, score_prompt
 from wmh.research.scaling_split import CorpusSplit, partition_corpus, subsample_train
 from wmh.research.seed_stability import SeedStabilityAblation
@@ -54,6 +57,7 @@ __all__ = [
     "AblationReport",
     "Condition",
     "ConditionReport",
+    "GepaScalingAblation",
     "SeedScore",
     "SeedStabilityAblation",
     "TraceScalingAblation",

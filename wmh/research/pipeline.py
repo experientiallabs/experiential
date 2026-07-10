@@ -20,8 +20,9 @@ inert. It is parked pending a sampling-capable provider.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
-from wmh.core.types import Trace
+from wmh.core.types import Step, Trace
 from wmh.engine.replay import replay
 from wmh.optimize.gepa import GEPAOptimizer, OptimizeResult
 from wmh.optimize.judge import RUBRIC_DIMENSIONS, Judge, RubricDimension
@@ -41,15 +42,31 @@ def optimize_prompt(
     embedder: Embedder | None,
     budget: int,
     seed: int,
+    hard_step_filter: Callable[[Step], bool] | None = None,
+    select_on_hard: bool = False,
+    recheck: list[Trace] | None = None,
+    minibatch_size: int = 3,
 ) -> OptimizeResult:
     """Evolve `base_prompt` with GEPA at `seed` (RAG-aware when `embedder` is set).
 
     Mirrors `wmh.engine.build`: a fresh train-only retriever makes optimization leak-free. Returns
     the GEPA `OptimizeResult` (winning prompt + held-out accuracy + rollouts used).
+    `hard_step_filter`/`select_on_hard` forward to `GEPAOptimizer.optimize` so experiments can
+    concentrate reflection (and optionally candidate selection) on the steps with headroom - see
+    that method for the semantics and caveats.
     """
     retriever = EmbeddingRetriever(embedder) if embedder is not None else None
     optimizer = GEPAOptimizer(provider, judge, retriever=retriever, seed=seed)
-    return optimizer.optimize(train, test, base_prompt, budget)
+    return optimizer.optimize(
+        train,
+        test,
+        base_prompt,
+        budget,
+        hard_step_filter=hard_step_filter,
+        select_on_hard=select_on_hard,
+        recheck=recheck,
+        minibatch_size=minibatch_size,
+    )
 
 
 def score_prompt(
