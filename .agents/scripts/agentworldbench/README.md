@@ -91,6 +91,33 @@ over the 7 domains (their paper convention, NOT `eval.py score`'s micro-average)
   reading required); android source data has one duplicate `(id, turn_idx)` key (both rows
   predicted + judged); swe-bench model serves haiku-4.5 by repo default (that's "as built").
 
+## Anchor row: Qwen-AgentWorld-35B-A3B, same judge (2026-07-11)
+
+Their released model, served per their README (vLLM `--language-model-only --reasoning-parser
+qwen3 --max-model-len 262144`, TP=2 on h100_azure), run through **their shipped `eval.py infer`
+unmodified** (system_str + current_prompt — NO history, temp 0), judged by the SAME pinned
+gpt-5.4-mini as our rows. 2,170/2,170 inferred (7 empty gens), 2,162 judged valid. Judge $37.18.
+
+| domain | wmh (full history) | Qwen-AW-35B (their shipped protocol) |
+|---|---:|---:|
+| MCP | 54.00 (tau WM) | 44.83 |
+| Search | 43.06 (base) | 38.50 |
+| Terminal | 52.63 (WM) | 27.29 |
+| SWE | 53.39 (WM, haiku) | 44.66 |
+| Android | 60.68 (base) | 47.35 |
+| Web | 56.35 (base) | 52.88 |
+| OS | 53.02 (base) | 54.87 |
+| **Macro Overall** | **53.30** | **44.34** |
+
+**Read the confound before quoting**: this contrasts (model AND protocol) simultaneously —
+their shipped infer is history-blind, ours feeds full history. The wreckage concentrates
+exactly where session state matters (terminal consistency 17.93: eyeballed rows show the judge
+correctly flagging unknowable-without-history facts like file sizes and missing binaries).
+Fair conclusions: (a) under one judge + their own released pipeline, our wmh rows beat their
+released 35B by +8.96 macro; (b) most of that gap is plausibly the history protocol, not raw
+model quality — their published 56.39 (gpt-5.2 judge) is not comparable in either direction.
+The isolating experiment (their model + full-history prompts) is staged but not run.
+
 ## Smoke E2E result (2026-07-07 — plumbing proof, NOT comparable numbers)
 
 8 rows, judged by the STAND-IN judge (Opus 4.8 via the shim, temperature 0) — their pinned
