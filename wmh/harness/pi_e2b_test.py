@@ -129,6 +129,13 @@ class FakeSandbox:
         self.commands = _FakeCommands(handle)
         self.files = _FakeFiles()
         self.kills = 0
+        self.timeouts: list[int] = []
+        self.dead = False
+
+    def set_timeout(self, timeout: int) -> None:
+        if self.dead:
+            raise RuntimeError("sandbox not found")
+        self.timeouts.append(timeout)
 
     def kill(self) -> bool:
         self.kills += 1
@@ -472,3 +479,77 @@ def test_close_kills_a_private_pool_but_never_a_shared_one(
     assert made2[0].kills == 0  # closing the runtime must not kill the shared pool's sandboxes
     pool.close()
     assert made2[0].kills == 1
+
+
+def test_acquire_extends_the_lifetime_of_a_reused_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse restarts E2B's lifetime countdown so long searches outlive the creation cap."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    sandbox, channel = pool.acquire()
+    assert sandbox.timeouts == []  # fresh sandboxes carry their creation-time lifetime
+    pool.release(sandbox, channel, healthy=True)
+    again, _ = pool.acquire()
+    assert again is sandbox
+    assert sandbox.timeouts == [900]  # the reuse extended the countdown
+    pool.close()
+
+
+def test_acquire_replaces_a_dead_idle_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An idle sandbox past its lifetime fails the extension: retired, fresh one created."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}], [{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    sandbox, channel = pool.acquire()
+    pool.release(sandbox, channel, healthy=True)
+    sandbox.dead = True  # E2B killed it while idle
+
+    fresh, _ = pool.acquire()
+
+    assert fresh is not sandbox
+    assert sandbox.kills == 1  # the dead one was retired
+    assert len(made) == 2
+    assert pool.usage().count == 2
+    pool.close()
+
+
+def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped runner stream fails the attempt's sandbox and replays on a fresh one."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    # First runner dies right after hello (stream ends mid-episode -> transport RuntimeError);
+    # the second plays a full episode.
+    factory, made = _factory_for(
+        [
+            [{"type": "hello"}],
+            [
+                {"type": "hello"},
+                {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+                {"type": "done", "answer": "recovered"},
+            ],
+        ]
+    )
+    # hold_open applies to every scripted handle; kill the first stream by marking its
+    # handle exhausted after hello (script end without hold -> EOF -> RuntimeError).
+    original_factory = factory
+
+    def dying_first_factory() -> FakeSandbox:
+        fake = original_factory()
+        if len(made) == 1:
+            fake.commands._handle.hold_open = False  # noqa: SLF001 - first stream ends after hello
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=dying_first_factory)
+    runtime = _runtime(pool=pool)
+    env = _RecordingEnv()
+
+    result = runtime.run("t1", "do it", env)
+
+    assert result.stop_reason is StopReason.SUBMITTED
+    assert result.answer == "recovered"
+    assert len(made) == 2
+    assert made[0].kills == 1  # the dead attempt's sandbox was discarded, not reused
+    pool.close()

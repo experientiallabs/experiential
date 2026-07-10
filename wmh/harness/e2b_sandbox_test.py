@@ -60,6 +60,13 @@ class FakeSandbox:
         self.commands = _FakeCommands()
         self.files = _FakeFiles()
         self.kills = 0
+        self.timeouts: list[int] = []
+        self.dead = False
+
+    def set_timeout(self, timeout: int) -> None:
+        if self.dead:
+            raise RuntimeError("sandbox not found")
+        self.timeouts.append(timeout)
 
     def kill(self) -> bool:
         self.kills += 1

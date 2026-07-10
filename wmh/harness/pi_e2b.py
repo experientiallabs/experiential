@@ -34,6 +34,7 @@ from typing import cast
 
 from wmh.core.types import JsonObject
 from wmh.harness.e2b_sandbox import (
+    DEFAULT_SANDBOX_TIMEOUT_S,
     E2B_TEMPLATE_ENV,
     CommandHandle,
     SandboxFactory,
@@ -222,12 +223,27 @@ class E2BSandboxPool:
         self._retired_seconds = 0.0
 
     def acquire(self) -> tuple[SandboxHandle, E2BStdioChannel]:
-        """An idle (bootstrapped, hello-verified) sandbox+channel; creates one when none is free."""
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("E2BSandboxPool is closed")
-            if self._idle:
-                return self._idle.pop()
+        """An idle (bootstrapped, hello-verified) sandbox+channel; creates one when none is free.
+
+        Reused sandboxes get their lifetime EXTENDED first (`set_timeout` restarts E2B's
+        countdown): sandboxes created at a search's first wave must survive every later wave,
+        and a long search otherwise outlives the fixed creation-time cap — the runner stream
+        drops mid-episode ("Server disconnected"). A reused sandbox whose extension fails is
+        already dead (idle past its cap); it is retired and the next one is tried.
+        """
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("E2BSandboxPool is closed")
+                if not self._idle:
+                    break
+                sandbox, channel = self._idle.pop()
+            try:
+                sandbox.set_timeout(int(DEFAULT_SANDBOX_TIMEOUT_S))
+            except Exception:  # noqa: BLE001 - a dead idle sandbox is expected after long gaps
+                self._retire(sandbox)
+                continue
+            return sandbox, channel
         sandbox = create_sandbox(self._factory)
         with self._lock:
             self._created += 1
@@ -362,6 +378,20 @@ class E2BPiRuntime:
         )
 
     def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+        try:
+            return self._run_episode(task_id, instruction, environment)
+        except (RuntimeError, TimeoutError):
+            # Transport death (stream drop, sandbox lifetime, dead runner) — the failed
+            # attempt's sandbox was already discarded on release. Retry ONCE on a fresh
+            # sandbox: the environment session may replay the dead attempt's opening steps,
+            # which for the world-model sim beats failing a whole search wave over one
+            # dropped connection. pi-level failures come back as RunResults (episode_error),
+            # never as exceptions, so this retries infrastructure only.
+            return self._run_episode(task_id, instruction, environment)
+
+    def _run_episode(
+        self, task_id: str, instruction: str, environment: AgentEnvironment
+    ) -> RunResult:
         sandbox, channel = self._pool.acquire()
         healthy = False
         try:
