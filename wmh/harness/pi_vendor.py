@@ -27,7 +27,7 @@ PI_AGENT_ROOT = Path(__file__).parent / "vendor" / "pi-agent"
 _SOURCE_GLOB = "src/**/*.ts"
 
 
-def _surface_id(relpath: str) -> str:
+def code_surface_id(relpath: str) -> str:
     """A stable surface id from a path (`src/agent-loop.ts` -> `code:src-agent-loop-ts`)."""
     return "code:" + relpath.replace("/", "-").replace(".", "-")
 
@@ -59,7 +59,7 @@ def pi_agent_code_surfaces() -> list[Surface]:
         rel = p.relative_to(PI_AGENT_ROOT).as_posix()
         surfaces.append(
             Surface(
-                id=_surface_id(rel),
+                id=code_surface_id(rel),
                 kind=SurfaceKind.CODE,
                 path=rel,
                 content=p.read_text(encoding="utf-8"),

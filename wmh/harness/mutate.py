@@ -33,9 +33,12 @@ not shotgun many unrelated changes at once.
 
 Choose the lever that can actually EXPRESS the fix:
 - Structural/behavioral mechanisms (the agent claims without acting, loses context, wastes turns,
-  never verifies, mishandles errors) -> edit `code:runtime`, the agent loop program. This is the
-  strongest lever: loops, verification passes, retries, observation truncation, context
-  compaction, and answer checking are all code.
+  never verifies, mishandles errors) -> edit the agent's CODE. For an in-process harness that is
+  the singleton `code:runtime` program; for a real multi-file harness (e.g. the vendored pi
+  agent) it is the pathful `code:<...>` surface that owns the behavior — the agent's actual
+  source, shown to you above with its path. Edit the file where the mechanism lives (the turn
+  loop, context compaction, tool dispatch, answer checking). This is the strongest lever:
+  loops, verification passes, retries, observation truncation, and compaction are all code.
 - A missing technique on specific tasks -> ADD a `skill:<slug>` teaching it.
 - The agent misusing, missing, or not needing a tool -> edit `tool_policy:main`.
 - Erratic sampling or turn caps -> adjust a `param:*`.
@@ -61,8 +64,11 @@ Surface kinds:
 {", ".join(sorted(TOOL_REGISTRY))}. The `{SUBMIT.name}` tool is REQUIRED (without it a run \
 cannot end).
 - param — a scalar loop knob: `param:max-turns` (int >= 1), `param:temperature` (float in [0, 2]).
-- code — the agent loop program, singleton `code:runtime` (contract above). Must compile and
-  define `run`.
+- code — the agent's source. Either the singleton in-process `code:runtime` (contract above; must
+  compile and define `run`), OR the pathful `code:<...>` files of a real multi-file harness (the
+  vendored pi agent's own source). Editing a pathful `code:` surface REPLACES that file's whole
+  content; keep it a valid module and change only what the fix needs — you are editing the real
+  harness that runs, not a description of it.
 - skill — one reusable technique, shaped as:
   ---
   name: <kebab-slug matching the surface id>
