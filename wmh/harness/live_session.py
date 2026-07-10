@@ -173,6 +173,7 @@ class LiveSession:
         self._status: str = "starting"
         self._closed = False
         self._actions_this_turn = 0
+        self._aborting = False
         self._pending_ping: str | None = None
         self.worker_usage = TokenUsage()
 
@@ -258,11 +259,17 @@ class LiveSession:
                 return
             if isinstance(intent, _UserMessage):
                 self._actions_this_turn = 0
+                self._aborting = False  # a new user turn is not the aborted one
                 self._emit("user_message", {"msg_id": intent.msg_id, "text": intent.text})
                 self._safe_send(
                     {"type": "user_message", "msg_id": intent.msg_id, "text": intent.text}
                 )
             elif isinstance(intent, _Interrupt):
+                # Mark the current turn as aborting so a `submit` tool_request that was
+                # already in flight when the interrupt fired does not emit a final submit
+                # event: the host, not the runner, owns event emission, so this gate is
+                # the only place the race can be closed. Cleared at the next turn boundary.
+                self._aborting = True
                 self._safe_send({"type": "abort", "reason": intent.reason})
             else:  # _End
                 self._safe_send({"type": "abort", "reason": "shutdown"})
@@ -310,8 +317,12 @@ class LiveSession:
         call_id = uuid.uuid4().hex
 
         if name == SUBMIT.name:
-            answer = args.get("answer")
-            self._emit("submit", {"answer": answer if isinstance(answer, str) else ""})
+            # If the turn is being interrupted, do NOT emit a final submit for it —
+            # the answer belongs to a cancelled run. Still respond so the runner's
+            # submit tool does not hang; the aborted run ends via `state:idle`.
+            if not self._aborting:
+                answer = args.get("answer")
+                self._emit("submit", {"answer": answer if isinstance(answer, str) else ""})
             self._respond_tool(req_id, "submitted", is_error=False)
             return
 
@@ -358,6 +369,9 @@ class LiveSession:
         status = frame.get("status")
         if isinstance(status, str):
             self._status = status
+        # A state transition is a turn boundary: the aborting turn has ended, so
+        # the next turn's submit is not suppressed.
+        self._aborting = False
         payload: JsonObject = {"status": self._status}
         for key in ("turns", "reason", "msg_id"):
             if key in frame:
