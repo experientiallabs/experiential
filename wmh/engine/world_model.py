@@ -223,7 +223,9 @@ class WorldModel:
         usage_cost_usd: float | None = None
         tracker = self._trackers.get(session_id)
         if tracker is not None:
-            usage_event = tracker.record(Phase.SERVE, self._provider.config.model, completion.usage)
+            # Prefer the model that actually served (failover chains set completion.model).
+            served_model = completion.model or self._provider.config.model
+            usage_event = tracker.record(Phase.SERVE, served_model, completion.usage)
             usage_cost_usd = usage_event.cost_usd
 
         self._advance(session, action, observation)

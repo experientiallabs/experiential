@@ -16,6 +16,7 @@ step's own trace.
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from statistics import fmean, pstdev
 
@@ -50,6 +51,7 @@ class StepResult(BaseModel):
     critique: str = ""
     is_error_actual: bool = False
     is_error_predicted: bool = False
+    valid: bool = True  # False = the judge failed on this step; excluded from fidelity aggregates
 
 
 class ReplayReport(BaseModel):
@@ -59,12 +61,14 @@ class ReplayReport(BaseModel):
     score_std: float = 0.0  # spread of per-step scores across steps (uniform vs uneven fidelity)
     error_flag_accuracy: float = 0.0  # fraction where predicted is_error matched actual
     n_steps: int = 0
+    n_invalid: int = 0  # steps where the judge failed; kept in `results` but not in the mean/std
     results: list[StepResult] = Field(default_factory=list)
 
     def summary(self) -> str:
+        invalid = f" invalid={self.n_invalid}" if self.n_invalid else ""
         return (
             f"fidelity={self.mean_score:.3f}±{self.score_std:.3f} "
-            f"error_flag_acc={self.error_flag_accuracy:.3f} n={self.n_steps}"
+            f"error_flag_acc={self.error_flag_accuracy:.3f} n={self.n_steps}{invalid}"
         )
 
 
@@ -139,9 +143,16 @@ def _score_step(
 ) -> StepResult:
     """Predict the observation for one step and score it against the recorded observation.
 
-    A provider error (timeout, capacity, transient network) on this single step is scored as a
-    fidelity failure (0.0) rather than aborting the whole eval — one stalled request must not throw
-    away every other step's work. The failure is recorded in the critique for traceability.
+    Two failure modes are handled DIFFERENTLY on purpose:
+
+    - A *prediction* failure (the target times out / throttles / errors and never produces an
+      observation) is a genuine fidelity failure: it scores 0.0 with `valid=True` (counted in the
+      mean) rather than aborting the whole run — one stalled target request must not throw away
+      every other step. Only `predict_observation` is guarded, so this covers the target model.
+    - A *judge* failure is NOT caught here. A malformed reply already comes back as `valid=False`
+      (excluded from aggregates); a judge call that RAISES (throttle/5xx after its own fallover)
+      propagates and aborts the eval on purpose — a partially judged run would silently change what
+      the fidelity mean is over. The grid guards against this with the judge's same-model fallover.
     """
     try:
         predicted = predict_observation(
@@ -153,8 +164,7 @@ def _score_step(
             demos=demos.demos_for(trace_id, step),
             history=history,
         )
-        verdict = judge.score(predicted, step.observation, step)
-    except Exception as exc:  # noqa: BLE001 - a step-level failure is a 0, not a crash
+    except Exception as exc:  # noqa: BLE001 - a target failure is a 0, not a crash
         return StepResult(
             trace_id=trace_id,
             task=step.task,
@@ -162,10 +172,11 @@ def _score_step(
             actual=step.observation.content,
             predicted="",
             score=0.0,
-            critique=f"prediction/scoring failed: {type(exc).__name__}: {str(exc)[:200]}",
+            critique=f"prediction failed: {type(exc).__name__}: {str(exc)[:200]}",
             is_error_actual=step.observation.is_error,
             is_error_predicted=False,
         )
+    verdict = judge.score(predicted, step.observation, step)
     return StepResult(
         trace_id=trace_id,
         task=step.task,
@@ -177,18 +188,32 @@ def _score_step(
         critique=verdict.critique,
         is_error_actual=step.observation.is_error,
         is_error_predicted=predicted.is_error,
+        valid=verdict.valid,
     )
+
+
+def valid_scores(results: Iterable[StepResult]) -> list[float]:
+    """Scores of validly-judged steps — the one rule for fidelity aggregation.
+
+    Judge failures (valid=False) say nothing about the prediction, so every fidelity aggregate
+    (here and `wmh.evals.open_loop.evaluate_files`) excludes them rather than counting spurious
+    zeros. Kept as the single shared filter so aggregation sites cannot drift.
+    """
+    return [r.score for r in results if r.valid]
 
 
 def _aggregate(results: list[StepResult]) -> ReplayReport:
     if not results:
         return ReplayReport()
-    step_scores = [r.score for r in results]
+    # Error-flag accuracy compares recorded flags and is judge-independent, so unlike the
+    # fidelity mean/std it stays over every step.
+    step_scores = valid_scores(results)
     error_acc = fmean(1.0 if r.is_error_predicted == r.is_error_actual else 0.0 for r in results)
     return ReplayReport(
-        mean_score=fmean(step_scores),
+        mean_score=fmean(step_scores) if step_scores else 0.0,
         score_std=pstdev(step_scores) if len(step_scores) > 1 else 0.0,
         error_flag_accuracy=error_acc,
         n_steps=len(results),
+        n_invalid=len(results) - len(step_scores),
         results=results,
     )

@@ -14,6 +14,7 @@ reach the host through an interpreter — so corpora are additionally audited wi
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -27,6 +28,45 @@ _BLOCKED_MESSAGE = (
     "blocked: this environment is scoped to the task workspace; use relative paths "
     "(the task's files are inside the current directory)"
 )
+
+# The capture process holds live provider credentials (AWS/Anthropic/HF keys and tokens). The
+# workspace subprocess must never inherit them, so it is given an explicit allowlist of
+# operational variables only — an agent that runs `env`, `printenv`, or `echo $VAR` finds no
+# secret to read. This is the actual boundary; `command_targets_host` is defense-in-depth. The
+# Python/venv/conda variables keep in-tree imports and non-system interpreters working (they are
+# not credentials); provider secret variables are conventionally *_KEY/*_TOKEN/*_SECRET and are
+# absent here by construction.
+_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PWD",
+        "TMPDIR",
+        "TERM",
+        "TZ",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "CONDA_DEFAULT_ENV",
+    }
+)
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """The parent environment reduced to the non-secret operational allowlist."""
+    return {key: value for key, value in os.environ.items() if key in _ENV_ALLOWLIST}
 
 
 class LocalBashEnv:
@@ -58,6 +98,7 @@ class LocalBashEnv:
                 text=True,
                 errors="replace",  # binary output becomes a real observation, not a crash
                 timeout=self.timeout_s,
+                env=_scrubbed_env(),  # never expose the capture process's provider credentials
             )
         except subprocess.TimeoutExpired:
             return ExecResult(

@@ -5,8 +5,11 @@ base / +RAG / +GEPA / +GEPA+RAG, on the SAME held-out split, scored by the SAME 
 the open-loop eval (`wmh.evals.open_loop.evaluate_files`) once per cell and rolls the per-file
 report into a `GridCell`. Two invariants make cells comparable:
 
-- The **judge is pinned** (a single Bedrock Opus 4.8 rubric judge) across every cell, independent of
-  the target model — a Qwen target must not be judged by Qwen.
+- The **judge is pinned** (a single Bedrock Opus 4.8 `RubricJudge`) across every cell, independent
+  of the target model — a Qwen target must not be judged by Qwen — and it never switches models
+  (only to the SAME model on the direct Anthropic API under Bedrock throttling; see
+  `wmh.evals.failover`). Its `JUDGE_VERSION` is stamped on the result so numbers from different
+  judge generations are never silently compared.
 - Target token **cost is metered separately** from the judge (a `MeteredProvider` wraps only the
   target), so a cell reports target-side cost, not judge cost. Cost is `None` when the model has no
   pricing row (see `wmh.tracking.pricing.price_for`) rather than a misleading 0.
@@ -23,22 +26,14 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
+from wmh.evals.failover import anthropic_direct_id, same_model_chain
 from wmh.evals.open_loop import EvalReport, evaluate_files
-from wmh.optimize.judge import Judge, LLMJudge, RubricJudge
+from wmh.optimize.judge import JUDGE_VERSION, Judge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, get_provider
 from wmh.providers.base import Completion, Message, Provider
-from wmh.providers.fallback import FallbackProvider, anthropic_direct_id
 from wmh.retrieval import HashingEmbedder
 from wmh.tracking import MeteredProvider, RunTracker
 from wmh.tracking.pricing import price_for
-
-# Judge fallback chain: the pinned judge is Opus 4.8, but on a capacity error it fails over to these
-# so long grids don't stall on judge throttling. (Model waterfall, not accounts — endflow/stackwise
-# lack Bedrock access; the `default` profile reaches all of these.)
-_JUDGE_FALLBACK_MODELS = (
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-opus-4-6-v1",
-)
 
 # Regions a Bedrock TARGET fails over across (same model, so what's measured is unchanged — this
 # only spreads throttling load, it does not switch models).
@@ -129,7 +124,11 @@ class GridResult(BaseModel):
     suite: str
     judge_model: str
     judge_provider: str
+    # The rubric-judge version every cell was scored under. Stamped so results from different judge
+    # generations are never silently compared (rubric-v1 numbers run ~0.12 higher than rubric-v2).
+    judge_version: str = JUDGE_VERSION
     train_split: float
+    val_frac: float = 0.0  # validation fraction reserved for GEPA; test band = 1 - train - val
     top_k: int
     seed: int
     sample_turns: str
@@ -154,7 +153,9 @@ def merge_results(results: list[GridResult]) -> GridResult:
         suite=head.suite,
         judge_model=head.judge_model,
         judge_provider=head.judge_provider,
+        judge_version=head.judge_version,
         train_split=head.train_split,
+        val_frac=head.val_frac,
         top_k=head.top_k,
         seed=head.seed,
         sample_turns=head.sample_turns,
@@ -166,40 +167,27 @@ def merge_results(results: list[GridResult]) -> GridResult:
     return merged
 
 
-def _fallback(factory, configs: list[ProviderConfig]) -> Provider:  # noqa: ANN001 - factory injectable
-    """A FallbackProvider over `configs` (a single-element chain returns a plain provider)."""
-    chain = [factory(c) for c in configs]
-    return chain[0] if len(chain) == 1 else FallbackProvider(chain)
-
-
 def _make_judge(
     judge_provider: str,
     judge_model: str,
     region: str | None,
-    kind: str,
     factory,  # noqa: ANN001 - a Provider builder (ProviderConfig) -> Provider, injectable for tests
 ) -> Judge:
-    """Build the pinned judge as a FALLBACK chain (primary `judge_model`, then resilience models).
+    """Build the pinned `RubricJudge`. The judge NEVER switches to a different model.
 
-    The judge is never metered as target cost. For a Bedrock judge it fails over across
-    `_JUDGE_FALLBACK_MODELS` on a capacity error so a throttled Opus doesn't stall the whole grid.
+    A judge that silently swapped models mid-grid would score cells on different scales and make
+    fidelity numbers incomparable (see `docs/reference/failover.md`). The ONLY failover allowed is
+    to the SAME model on the direct Anthropic API (unlimited key) when the primary is a throttled
+    Bedrock Anthropic model — identical model, different endpoint — so what's measured is unchanged.
+    The judge is never metered as target cost.
     """
     kind_enum = ProviderKind(judge_provider)
     configs = [ProviderConfig(kind=kind_enum, model=judge_model, region=region)]
     if kind_enum is ProviderKind.BEDROCK:
-        # Fail over first to the SAME judge model on the direct Anthropic API (unlimited key), so a
-        # throttled Bedrock Opus judge stays Opus rather than dropping to a different Bedrock model;
-        # only then to the Bedrock resilience models.
         direct = anthropic_direct_id(judge_model)
         if direct is not None:
             configs.append(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
-        configs += [
-            ProviderConfig(kind=kind_enum, model=m, region=region)
-            for m in _JUDGE_FALLBACK_MODELS
-            if m != judge_model
-        ]
-    llm = _fallback(factory, configs)
-    return RubricJudge(llm) if kind == "rubric" else LLMJudge(llm)
+    return RubricJudge(same_model_chain(configs, factory))
 
 
 def _make_target(spec: ModelSpec, factory) -> Provider:  # noqa: ANN001 - factory injectable for tests
@@ -215,7 +203,7 @@ def _make_target(spec: ModelSpec, factory) -> Provider:  # noqa: ANN001 - factor
         direct = anthropic_direct_id(spec.model)
         if direct is not None:
             configs.append(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
-        return _fallback(factory, configs)
+        return same_model_chain(configs, factory)
     return factory(ProviderConfig(kind=kind, model=spec.model, region=spec.region))
 
 
@@ -245,12 +233,12 @@ def run_grid(
     judge_provider: str,
     judge_model: str,
     judge_region: str | None,
-    judge_kind: str,
     train_split: float,
     top_k: int,
     seed: int,
     sample_turns: str,
     embed_dim: int,
+    val_frac: float | None = None,
     max_holdout_traces: int | None = None,
     target_max_tokens: int = DEFAULT_TARGET_MAX_TOKENS,
     provider_factory=get_provider,  # noqa: ANN001 - injectable for tests (no network)
@@ -258,30 +246,39 @@ def run_grid(
     """Run every (model x condition) cell of the grid and return the rolled-up result.
 
     `gepa_prompts` maps a `ModelSpec.label` to an evolved-prompt file path; a model absent from it
-    skips the `gepa`/`gepa_rag` conditions. The judge is built once and shared across all cells.
+    skips the `gepa`/`gepa_rag` conditions. The judge is built once (a pinned `RubricJudge`) and
+    shared across all cells.
+
+    Cells are scored on the reserved **test** band of the SAME 3-way `train/val/test` split GEPA
+    used to evolve its prompts (`val_frac` defaults to `(1 - train_split) / 2`, matching
+    `wmh build`), so a `+GEPA` cell is never scored on the `val` traces its prompt was selected on.
     """
     from pathlib import Path
 
-    from wmh.engine.build import split_traces
+    from wmh.engine.build import split_traces_3way
     from wmh.ingest import get_adapter
 
-    judge = _make_judge(judge_provider, judge_model, judge_region, judge_kind, provider_factory)
+    if val_frac is None:
+        val_frac = (1.0 - train_split) / 2
+    judge = _make_judge(judge_provider, judge_model, judge_region, provider_factory)
     result = GridResult(
         suite=suite_name,
         judge_model=judge_model,
         judge_provider=judge_provider,
         train_split=train_split,
+        val_frac=val_frac,
         top_k=top_k,
         seed=seed,
         sample_turns=sample_turns,
     )
     paths = [Path(f) for f in files]
 
-    # Held-out trace count (for reporting) — the same split each cell scores, after any cap.
+    # Held-out trace count (for reporting) — the reserved TEST band each cell scores, after any cap.
+    # Uses the same 3-way split as the scorer so the count matches what is actually evaluated.
     adapter = get_adapter("otel-genai")
     for path in paths:
         traces = adapter.from_file(str(path))
-        _, holdout = split_traces(traces, train_split)
+        _, _, holdout = split_traces_3way(traces, train_split, val_frac)
         holdout = holdout or traces
         if max_holdout_traces is not None:
             holdout = holdout[:max_holdout_traces]
@@ -312,6 +309,7 @@ def run_grid(
                     judge,
                     embedder=embedder,
                     train_split=train_split,
+                    val_frac=val_frac,
                     top_k=top_k,
                     sample_turns=sample_turns,
                     seed=seed,

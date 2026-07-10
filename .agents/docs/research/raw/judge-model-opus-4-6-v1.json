@@ -1,0 +1,187 @@
+{
+  "judge_model": "us.anthropic.claude-opus-4-6-v1",
+  "report": {
+    "verdicts": [
+      {
+        "case_id": "exact-json-lookup",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The predicted observation is an exact match to the actual observation in every detail.",
+        "failures": []
+      },
+      {
+        "case_id": "cosmetic-reordering",
+        "defect": "control",
+        "passed": true,
+        "score": 0.97,
+        "dimensions": {
+          "format": 0.9,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 0.9,
+          "quality": 0.95
+        },
+        "critique": "The predicted observation contains all the same fields and values as the actual observation. The only difference is the ordering of keys in the JSON object (e.g., user_id before reservation_id, flight_type before origin). Since JSON objects are unordered by specification, this conveys identical information. The content_length matches exactly.",
+        "failures": []
+      },
+      {
+        "case_id": "volatile-pid-differs",
+        "defect": "control",
+        "passed": true,
+        "score": 0.88,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.8,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 0.9
+        },
+        "critique": "The PID is volatile/incidental content - the prediction shows a different but plausible PID value. Format, structure, and behavior are all correct. The exact PID number doesn't matter for correctness since it varies between runs.",
+        "failures": []
+      },
+      {
+        "case_id": "wrong-computed-values",
+        "defect": "control",
+        "passed": true,
+        "score": 0.29000000000000004,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.1,
+          "consistency": 0.5,
+          "realism": 0.6,
+          "quality": 0.15
+        },
+        "critique": "The format matches (same structure, newline-separated version strings, same length), but the actual version numbers are almost entirely wrong. Only '0.1.0' and '1.0.0' match. Since this is deterministic file content, the factual inaccuracy is severe. The prediction looks like a plausible list of versions but doesn't reflect the real data.",
+        "failures": []
+      },
+      {
+        "case_id": "fabricated-lookup-data",
+        "defect": "control",
+        "passed": true,
+        "score": 0.29000000000000004,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.1,
+          "consistency": 0.3,
+          "realism": 0.8,
+          "quality": 0.15
+        },
+        "critique": "The format and structure are correct (JSON with the same fields), but nearly every factual detail is wrong: wrong user_id, wrong origin/destination, wrong flight_type, wrong cabin, wrong flights, wrong prices. This is deterministic content that must match exactly, and essentially nothing does except the reservation_id.",
+        "failures": []
+      },
+      {
+        "case_id": "right-facts-wrong-shape",
+        "defect": "control",
+        "passed": true,
+        "score": 0.56,
+        "dimensions": {
+          "format": 0.2,
+          "factuality": 0.8,
+          "consistency": 0.7,
+          "realism": 0.2,
+          "quality": 0.25
+        },
+        "critique": "The prediction contains all the correct factual data (reservation ID, user, flights, prices, dates, cabin, route) but returns it as a natural language summary instead of the structured JSON format the environment actually produces. This makes it unusable as a faithful stand-in for the real observation since the agent would expect JSON to parse.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-nonempty-actual",
+        "defect": "empty-prediction",
+        "passed": true,
+        "score": 0.020000000000000004,
+        "dimensions": {
+          "format": 0.1,
+          "factuality": 0.0,
+          "consistency": 0.1,
+          "realism": 0.0,
+          "quality": 0.0
+        },
+        "critique": "The prediction is empty while the actual observation contains the file contents listing chalk versions. This is a complete miss \u2014 no content was produced where deterministic file content was expected.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-empty-actual",
+        "defect": "both-empty",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Both actual and predicted observations are empty with no error, which is the expected behavior when output is redirected to a file. Perfect match.",
+        "failures": []
+      },
+      {
+        "case_id": "error-flipped-to-pretty-success",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.13,
+        "dimensions": {
+          "format": 0.5,
+          "factuality": 0.0,
+          "consistency": 0.2,
+          "realism": 0.4,
+          "quality": 0.1
+        },
+        "critique": "The prediction returned a successful result with a user_id, but the actual environment returned an error indicating the user was not found. This is a flipped outcome \u2014 the predicted is_error is false while the actual is true, which is a fundamental factuality failure.",
+        "failures": []
+      },
+      {
+        "case_id": "success-flipped-to-error",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.08000000000000002,
+        "dimensions": {
+          "format": 0.3,
+          "factuality": 0.0,
+          "consistency": 0.1,
+          "realism": 0.4,
+          "quality": 0.0
+        },
+        "critique": "The prediction returned an error stating the reservation was not found, but the actual environment successfully returned detailed reservation data. This is a flipped outcome \u2014 predicted is_error is true while actual is false, making factuality 0.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-identical",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The predicted observation is identical to the actual observation in every respect: same content, same content_length (34889), same is_error flag, same format and structure throughout the entire inventory listing from item-0 to item-1999.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-divergent-tail",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 0.47000000000000003,
+        "dimensions": {
+          "format": 0.8,
+          "factuality": 0.4,
+          "consistency": 0.5,
+          "realism": 0.6,
+          "quality": 0.4
+        },
+        "critique": "The prediction matches the format and structure (numbered lines with status and item names) and correctly reproduces the first ~359 items as OK. However, it fabricates FAIL statuses for items 1900-1999 ('corrupted') when the actual output shows all 2000 items as OK. This is a significant factuality error that would mislead the agent into thinking there are corrupted items when none exist.",
+        "failures": []
+      }
+    ]
+  }
+}

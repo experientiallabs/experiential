@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
 from wmh.optimize.judge import JudgeResult
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
@@ -91,6 +93,23 @@ def test_score_prompt_delegates_to_replay_and_returns_mean() -> None:
     assert judge.calls == 3
     # replay scores each held-out step once, deterministically.
     assert provider.rollout_temps == [0.0, 0.0, 0.0]
+
+
+def test_score_prompt_raises_on_total_judge_outage() -> None:
+    # Every judgement invalid = a judge outage, not fidelity 0.0 — an ablation must not record it.
+    class AlwaysInvalidJudge(FakeJudge):
+        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+            return JudgeResult(score=0.0, critique="Unparseable judge reply", valid=False)
+
+    with pytest.raises(RuntimeError, match="judge outage"):
+        score_prompt(
+            "P",
+            [_trace("te1", n=2)],
+            provider=FakeProvider(),
+            judge=AlwaysInvalidJudge(),
+            embedder=None,
+            train=None,
+        )
 
 
 def test_score_prompt_empty_holdout_is_zero() -> None:

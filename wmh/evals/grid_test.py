@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from wmh.evals.failover import SameModelFailover
 from wmh.evals.grid import (
     CONDITIONS,
     GridCell,
@@ -16,7 +17,6 @@ from wmh.evals.grid import (
     run_grid,
 )
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmh.providers.fallback import FallbackProvider
 
 
 class _FakeProvider:
@@ -94,7 +94,6 @@ def test_run_grid_produces_a_cell_per_model_and_condition(tmp_path) -> None:  # 
         judge_provider="bedrock",
         judge_model="us.anthropic.claude-opus-4-8",
         judge_region=None,
-        judge_kind="rubric",
         train_split=0.7,
         top_k=5,
         seed=0,
@@ -127,7 +126,6 @@ def test_grid_cost_is_none_for_unpriced_model(tmp_path) -> None:  # noqa: ANN001
         judge_provider="bedrock",
         judge_model="us.anthropic.claude-opus-4-8",
         judge_region=None,
-        judge_kind="rubric",
         train_split=0.7,
         top_k=5,
         seed=0,
@@ -145,28 +143,29 @@ def test_grid_cost_is_none_for_unpriced_model(tmp_path) -> None:  # noqa: ANN001
     assert opus.n_steps == 1
 
 
-def test_bedrock_judge_and_target_get_fallback_chains() -> None:
+def test_bedrock_judge_and_target_get_same_model_chains() -> None:
     built: list[str] = []
 
     def tracking_factory(config: ProviderConfig) -> _FakeProvider:
         built.append(f"{config.model}@{config.region}")
         return _FakeProvider(config)
 
-    # Bedrock judge -> FallbackProvider: primary opus-4.8, then direct-Anthropic opus, then Bedrock
-    # resilience models.
-    judge = _make_judge(
-        "bedrock", "us.anthropic.claude-opus-4-8", "us-west-1", "rubric", tracking_factory
-    )
-    assert isinstance(judge._provider, FallbackProvider)  # noqa: SLF001 - inspect wrapped provider
-    assert "claude-opus-4-8@None" in built  # same model, direct Anthropic API (unlimited key)
-    assert any("sonnet" in b for b in built)  # then the Bedrock resilience model
+    # Bedrock judge -> SameModelFailover of EXACTLY [primary opus-4.8, direct-Anthropic opus-4.8].
+    # The judge NEVER switches to a different model (no resilience models) — only the same model on
+    # the unlimited direct API, so cells stay comparable.
+    judge = _make_judge("bedrock", "us.anthropic.claude-opus-4-8", "us-west-1", tracking_factory)
+    assert isinstance(judge._provider, SameModelFailover)  # noqa: SLF001 - inspect wrapped provider
+    assert built == [
+        "us.anthropic.claude-opus-4-8@us-west-1",  # pinned Bedrock primary
+        "claude-opus-4-8@None",  # SAME model, direct Anthropic API (unlimited key)
+    ]
 
     # Bedrock target -> region fallback (SAME model), then direct-Anthropic on the SAME model.
     built.clear()
     target = _make_target(
         ModelSpec("Opus", "bedrock", "us.anthropic.claude-opus-4-8", "us-west-1"), tracking_factory
     )
-    assert isinstance(target, FallbackProvider)
+    assert isinstance(target, SameModelFailover)
     assert built == [
         "us.anthropic.claude-opus-4-8@us-west-1",
         "us.anthropic.claude-opus-4-8@us-east-1",
@@ -176,7 +175,7 @@ def test_bedrock_judge_and_target_get_fallback_chains() -> None:
     # Non-Bedrock target -> a single provider (no fallback).
     built.clear()
     single = _make_target(ModelSpec("GPT", "openai", "gpt-5.5"), tracking_factory)
-    assert not isinstance(single, FallbackProvider)
+    assert not isinstance(single, SameModelFailover)
 
 
 def _cell(model: str, condition: str, fidelity: float) -> GridCell:
@@ -262,7 +261,6 @@ def test_grid_bar_label_uses_lowercase_wmh(tmp_path) -> None:  # noqa: ANN001 - 
         judge_provider="bedrock",
         judge_model="us.anthropic.claude-opus-4-8",
         judge_region=None,
-        judge_kind="rubric",
         train_split=0.7,
         top_k=5,
         seed=0,

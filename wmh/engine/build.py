@@ -105,8 +105,11 @@ def build(
 
     `serve_provider` / `embedder` are injectable for testing; in production they are constructed
     from `config` (serve provider via the registry, embedder = offline HashingEmbedder sized to
-    `config.embed_dim`). `reporter` receives progress events (defaults to a no-op). Returns the
-    GEPA OptimizeResult (also persisted).
+    `config.embed_dim`). `judge_provider`, when given, runs the judge separately from the serve
+    provider: pass a pinned single backend when `serve_provider` is a failover chain, so GEPA's
+    fitness metric is scored by one model throughout even while rollouts fail over. `reporter`
+    receives progress events (defaults to a no-op). Returns the GEPA OptimizeResult (also
+    persisted).
     """
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)
@@ -154,12 +157,10 @@ def build(
     def _on_rollout(done: int, score: float | None) -> None:
         report.rollout(done, metric_total["calls"], score)
 
-    # Optimize against the SAME scorer we evaluate with (RubricJudge), so GEPA hill-climbs the
-    # metric we actually report. The coarser LLMJudge here would let GEPA improve a proxy objective
-    # that doesn't move the reported rubric fidelity. When `judge_provider` is given, GEPA is scored
-    # by it instead of the serve model — use a pinned judge (e.g. Bedrock Opus) so a weaker/self-
-    # judging serve model can't zero out the fitness signal, and so GEPA optimizes exactly the
-    # metric a pinned-judge eval later reports.
+    # Optimize against the SAME rubric we evaluate with (RubricJudge). NOTE: the judge MODEL may
+    # differ — config.judge_model defaults to a cheap per-provider model for GEPA cost, while
+    # `wmh eval` pins the judge to the requested serve-grade model — so held_out_accuracy is only
+    # directly comparable to eval fidelity when --judge-model matches the eval judge.
     optimizer = GEPAOptimizer(
         provider,
         RubricJudge(judge_provider),

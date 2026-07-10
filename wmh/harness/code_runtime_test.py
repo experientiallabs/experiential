@@ -197,7 +197,7 @@ def test_doc_rejects_bad_code_surface_at_construction() -> None:
     with pytest.raises(ValueError, match="does not compile"):
         HarnessDoc(name="x", surfaces=[core, bad])
     misnamed = Surface(id="code:other", kind=SurfaceKind.CODE, content="def run(kit):\n    pass\n")
-    with pytest.raises(ValueError, match="singleton"):
+    with pytest.raises(ValueError, match="path-less code surface"):
         HarnessDoc(name="x", surfaces=[core, misnamed])
 
 

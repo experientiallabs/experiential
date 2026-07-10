@@ -15,8 +15,8 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
-from wmh.engine.build import split_traces
-from wmh.engine.replay import ReplayReport, replay
+from wmh.engine.build import split_traces, split_traces_3way
+from wmh.engine.replay import ReplayReport, replay, valid_scores
 from wmh.ingest import get_adapter
 from wmh.optimize.judge import Judge
 from wmh.providers.base import Embedder, Provider
@@ -31,19 +31,26 @@ class EvalReport(BaseModel):
     """
 
     per_file: dict[str, ReplayReport] = Field(default_factory=dict)
-    overall_fidelity: float = 0.0  # step-weighted mean of per-step scores across all files
-    overall_std: float = 0.0  # std of per-step scores across all files
-    total_steps: int = 0
+    overall_fidelity: float = 0.0  # step-weighted mean of valid per-step scores across all files
+    overall_std: float = 0.0  # std of valid per-step scores across all files
+    total_steps: int = 0  # all steps attempted, including judge-invalid ones
+    total_invalid: int = 0  # judge failures across files; excluded from fidelity/std
 
     @property
     def headline(self) -> float:
         """The `EvalResult` headline: per-step reconstruction fidelity."""
         return self.overall_fidelity
 
+    @property
+    def total_valid(self) -> int:
+        """Steps that actually back the fidelity mean (judge-invalid ones excluded)."""
+        return self.total_steps - self.total_invalid
+
     def summary(self) -> str:
+        invalid = f", {self.total_invalid} judge-invalid excluded" if self.total_invalid else ""
         return (
             f"fidelity={self.overall_fidelity:.3f}±{self.overall_std:.3f} "
-            f"({self.total_steps} steps, {len(self.per_file)} file(s))"
+            f"({self.total_steps} steps, {len(self.per_file)} file(s){invalid})"
         )
 
 
@@ -55,6 +62,7 @@ def evaluate_files(
     *,
     embedder: Embedder | None = None,
     train_split: float = 0.7,
+    val_frac: float | None = None,
     top_k: int = 5,
     sample_turns: str = "all",
     seed: int = 0,
@@ -68,6 +76,11 @@ def evaluate_files(
     `sample_turns`/`seed` are forwarded to `replay` (see its docstring). `max_holdout_traces` caps
     how many held-out traces are scored per file (a deterministic prefix by trace_id) — for cheap
     dry-runs; the train side stays full so retrieval is unaffected.
+
+    `val_frac` makes the split leak-free against a GEPA-evolved prompt: when set, the traces are cut
+    3-way (`train`/`val`/`test`) on the same hash line GEPA used, and only the reserved `test` band
+    is scored — so a prompt selected on `val` is never graded on those same traces. Retrieval still
+    draws from `train` only. `val_frac=None` keeps the plain 2-way `train`/held-out split.
     """
     adapter = get_adapter(adapter_name)
     per_file: dict[str, ReplayReport] = {}
@@ -75,7 +88,10 @@ def evaluate_files(
         traces = adapter.from_file(str(path))
         if not traces:
             continue
-        train, holdout = split_traces(traces, train_split)
+        if val_frac is not None:
+            train, _val, holdout = split_traces_3way(traces, train_split, val_frac)
+        else:
+            train, holdout = split_traces(traces, train_split)
         if not holdout:  # tiny corpus: evaluate on everything
             train, holdout = traces, traces
         if max_holdout_traces is not None:
@@ -94,15 +110,17 @@ def evaluate_files(
             seed=seed,
         )
 
-    # Step-weighted aggregate over every scored step across files.
-    step_scores = [r.score for rep in per_file.values() for r in rep.results]
+    # Step-weighted aggregate over every validly-judged step across files (judge failures are
+    # counted in total_invalid, never as spurious zeros — see replay.valid_scores).
+    step_scores = valid_scores(r for rep in per_file.values() for r in rep.results)
     overall = fmean(step_scores) if step_scores else 0.0
     overall_std = pstdev(step_scores) if len(step_scores) > 1 else 0.0
     return EvalReport(
         per_file=per_file,
         overall_fidelity=overall,
         overall_std=overall_std,
-        total_steps=len(step_scores),
+        total_steps=sum(rep.n_steps for rep in per_file.values()),
+        total_invalid=sum(rep.n_invalid for rep in per_file.values()),
     )
 
 

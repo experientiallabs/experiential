@@ -113,3 +113,39 @@ def test_json_roundtrip_preserves_identity() -> None:
     restored = HarnessDoc.model_validate_json(doc.model_dump_json())
     assert restored == doc
     assert restored.doc_hash == doc.doc_hash
+
+
+def test_runtime_backend_selector() -> None:
+    """Default backend is local (in-process); unknown backends are rejected."""
+    import pytest
+
+    from wmh.harness.code_runtime import CodeRuntime
+    from wmh.harness.doc import CODE_RUNTIME_ID, code_baseline
+    from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
+
+    class _P:
+        config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+
+        def complete(self, system: str, messages: list[Message], **k) -> Completion:  # noqa: ANN003
+            raise NotImplementedError
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[0.0] for _ in texts]
+
+        def verify(self) -> object:
+            raise NotImplementedError
+
+    from typing import cast
+
+    from wmh.providers.base import Provider
+
+    provider = cast("Provider", _P())
+
+    # Default backend is local; a code:runtime doc runs in-process.
+    coded = code_baseline("seed")
+    assert isinstance(coded.runtime(provider), CodeRuntime)
+    assert coded.surface(CODE_RUNTIME_ID) is not None
+
+    # Unknown backends are rejected.
+    with pytest.raises(ValueError, match="unknown backend"):
+        coded.runtime(provider, backend="bogus")

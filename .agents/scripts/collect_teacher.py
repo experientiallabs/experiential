@@ -30,9 +30,9 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / ".agents" / "scripts"))
 
-from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, RetryProvider, bedrock  # noqa: E402
-
 import os  # noqa: E402
+
+from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, _retrying, bedrock  # noqa: E402
 
 from wmh.core.parsing import extract_json_object  # noqa: E402
 from wmh.core.types import ActionKind, Trace  # noqa: E402
@@ -103,7 +103,7 @@ FOUNDRY_ENDPOINT = "https://silen-resource.services.ai.azure.com/openai/v1/"
 def foundry(model: str) -> Provider:
     """A model on the user's Azure AI Foundry resource (OpenAI-compatible)."""
     _load_gemini_key()
-    return RetryProvider(
+    return _retrying(
         get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model, endpoint=FOUNDRY_ENDPOINT))
     )
 
@@ -120,11 +120,11 @@ def opus_judge() -> Provider:
 def openai_direct(model: str) -> Provider:
     """A model on the OpenAI API directly (reads OPENAI_API_KEY)."""
     _load_gemini_key()
-    return RetryProvider(get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model)))
+    return _retrying(get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model)))
 
 
 def gemini(model: str) -> Provider:
-    return RetryProvider(
+    return _retrying(
         get_provider(ProviderConfig(kind=ProviderKind.OPENAI, model=model, endpoint=GEMINI_ENDPOINT))
     )
 

@@ -11,7 +11,6 @@ Usage (from the repo root):
 from __future__ import annotations
 
 import json
-import random
 import sys
 import time
 from collections import defaultdict
@@ -28,7 +27,13 @@ from wmh.engine.world_model import WorldModel  # noqa: E402
 from wmh.env.llm_agent import LLMAgent  # noqa: E402
 from wmh.ingest import get_adapter  # noqa: E402
 from wmh.providers import get_provider  # noqa: E402
-from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind  # noqa: E402
+from wmh.providers.base import (  # noqa: E402
+    Message,
+    Provider,
+    ProviderConfig,
+    ProviderKind,
+)
+from wmh.providers.retry import RetryingProvider  # noqa: E402
 from wmh.research.scenario_fidelity import (  # noqa: E402
     fidelity_report,
     random_subsets,
@@ -60,37 +65,15 @@ TRACES = REPO / "packages" / "environment-capture" / "tau-bench" / "traces.otel.
 WM_DIR = REPO / "packages" / "environment-capture" / "tau-bench" / "models" / "tau-bench"
 
 
-class RetryProvider:
-    """Wraps a provider with retry-on-throttle (botocore retries are disabled by design)."""
-
-    def __init__(self, inner: Provider, attempts: int = 5) -> None:
-        self.config = inner.config
-        self._inner = inner
-        self._attempts = attempts
-
-    def complete(self, system: str, messages: list[Message], **kwargs: object) -> Completion:
-        delay = 2.0
-        for attempt in range(self._attempts):
-            try:
-                return self._inner.complete(system, messages, **kwargs)  # type: ignore[arg-type]
-            except Exception as exc:  # noqa: BLE001
-                name = type(exc).__name__
-                retriable = "Throttl" in str(exc) or "Throttl" in name or "Timeout" in name
-                if not retriable or attempt == self._attempts - 1:
-                    raise
-                time.sleep(delay + random.random())
-                delay = min(delay * 2, 30.0)
-        raise RuntimeError("unreachable")
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        return self._inner.embed(texts)
-
-    def verify(self):  # noqa: ANN201
-        return self._inner.verify()
+def _retrying(inner: Provider) -> Provider:
+    """Retry capacity errors with llm-waterfall's classifier (string-matching "Throttl"/"Timeout"
+    against messages — the previous hand-rolled version here — misses httpx transients and
+    misclassifies e.g. ValidationException("timeout too large") as retriable)."""
+    return RetryingProvider(inner, delays=(2.0, 4.0, 8.0, 16.0))
 
 
 def bedrock(model: str, region: str = REGION) -> Provider:
-    return RetryProvider(
+    return _retrying(
         get_provider(ProviderConfig(kind=ProviderKind.BEDROCK, model=model, region=region))
     )
 

@@ -28,6 +28,7 @@ from environment_capture.hub import (
     fetch_corpus,
     published_corpora,
 )
+from llm_waterfall import is_capacity_error
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -37,6 +38,7 @@ from rich.table import Table
 import wmh.providers as providers
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmh.cli.harness_app import harness_app
+from wmh.cli.platform_cmds import register as register_platform_commands
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
@@ -64,6 +66,8 @@ from wmh.config import (
     settings_path,
     validate_name,
 )
+from wmh.config.card import make_build_card, save_card
+from wmh.core.types import JsonObject
 from wmh.engine.build import build as run_build
 from wmh.engine.build import ingest
 from wmh.engine.demo import run_demo
@@ -80,10 +84,9 @@ from wmh.evals.grid import GridResult, ModelSpec, merge_results, run_grid
 from wmh.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull, get_adapter, list_adapters
-from wmh.optimize.judge import LLMJudge, RubricJudge
+from wmh.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
-from wmh.providers.fallback import _is_capacity_error
 from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
 from wmh.scenarios import (
@@ -124,6 +127,7 @@ app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
 app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
+register_platform_commands(app)
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
@@ -143,7 +147,6 @@ class _EvalOptions:
     train_split: float
     embed_dim: int
     use_rag: bool
-    judge: str
     sample_turns: str
     seed: int
     top_k: int
@@ -277,6 +280,9 @@ def build(
         None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    chain: str = typer.Option(
+        None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
+    ),
     gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
@@ -392,14 +398,16 @@ def build(
     # silently swallows it and "succeeds" with a useless held-out-0.0 model.
     if not use_wizard:
         # The wizard already live-pinged the serve provider and embedder inline.
-        _verify_or_abort(config)
+        _verify_or_abort(config, chain=chain)
 
-    # Meter the build at the provider boundary: the one serve provider drives GEPA rollouts,
-    # reflection, and the judge, so wrapping it captures all build LLM cost/tokens without touching
-    # the optimizer. `classify_build_call` splits judge vs GEPA by system prompt.
+    # Meter the build at the provider boundary; `classify_build_call` splits judge vs GEPA by
+    # system prompt. Rollouts/reflection may ride the failover chain, but the judge (GEPA's
+    # fitness metric) is PINNED to the single configured backend — a judge that silently switches
+    # models mid-build scores candidates on different scales. Both wrappers share one tracker,
+    # so cost/tokens still land in a single run record.
     tracker = RunTracker(run_id=uuid.uuid4().hex, kind="build")
     metered = MeteredProvider(
-        providers.get_provider(config.serve_provider_config()),
+        providers.provider_or_chain(config.serve_provider_config(), chain=chain),
         tracker,
         classify=classify_build_call,
     )
@@ -432,6 +440,23 @@ def build(
         )
     record = tracker.record_summary()
     save_run(record, ArtifactPaths(model_dir).runs)
+    # The card is additive metadata; a write failure (disk full, permissions) must not make an
+    # otherwise-complete build exit non-zero and then block retries with "already exists".
+    try:
+        save_card(
+            make_build_card(
+                name=params.name,
+                provider=params.provider,
+                model_id=params.model,
+                traces=build_stats.input_trace_count,
+                steps=build_stats.input_step_count,
+                built_at=datetime.now(UTC).isoformat(),
+                source=Path(params.file).name if params.file else params.vendor,
+            ),
+            model_dir,
+        )
+    except OSError as err:
+        _console.print(f"[yellow]warning[/yellow]: could not write card.json: {err}")
     capture_build_completed(
         stats=build_stats,
         gepa_budget=params.gepa_budget,
@@ -456,7 +481,7 @@ def build(
             )
 
 
-def _verify_or_abort(config: HarnessConfig) -> None:
+def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
     """Ping the serve provider (and any provider-backed embedder) and abort on failure.
 
     Runs before any rollouts so a missing SDK or bad creds fails loudly and immediately, instead of
@@ -470,8 +495,19 @@ def _verify_or_abort(config: HarnessConfig) -> None:
     failed = False
     for cfg, is_embed in checks:
         label = f"embed:{cfg.kind.value}" if is_embed else cfg.kind.value
-        _console.print(f"verifying {label}…")
-        result = verify_embedder(cfg) if is_embed else verify_all([cfg])[0]
+        serve_provider = None if is_embed else providers.provider_or_chain(cfg, chain=chain)
+        if is_embed:
+            _console.print(f"verifying {label}…")
+            result = verify_embedder(cfg)
+        elif isinstance(serve_provider, providers.WaterfallProvider):
+            # Verify the provider the build will actually use — with a chain active, that means
+            # pinging every rung (a broken fallback must fail here, not hours into the build).
+            label = f"{label} chain (.wmh/fallback.toml)"
+            _console.print(f"verifying {label}…")
+            result = serve_provider.verify()
+        else:
+            _console.print(f"verifying {label}…")
+            result = verify_all([cfg])[0]
         if result.ok:
             _console.print(f"  {_CHECK} {label} ({result.model}) reachable")
             continue
@@ -581,18 +617,23 @@ def serve(
         None, "--name", help="World model(s) to serve. Repeatable; default: all built ones."
     ),
     port: int = typer.Option(8000, help="Port for the local backend."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir to serve from."),
+    root: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
+        [ARTIFACT_DIR],
+        "--root",
+        help="Project dir(s) to serve from. Repeatable; server-side builds land in the first.",
+    ),
 ) -> None:
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
-    Serves every built model by default, or just the `--name` ones. Routes are namespaced:
+    Serves every built model by default, or just the `--name` ones, from one or more roots
+    (e.g. `--root .wmh --root examples/tau-bench`). Routes are namespaced:
     `/world_models/{name}/sessions` and `.../step`.
     """
     names = list(name) if name else None
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
     # not a traceback; load the models before uvicorn takes over the process.
     try:
-        server_app = create_app(root, names=names)
+        server_app = create_app(list(root), names=names)
     except (ValueError, FileNotFoundError) as err:
         raise typer.BadParameter(str(err)) from None
     uvicorn.run(server_app, host="127.0.0.1", port=port)
@@ -613,17 +654,23 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
     model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
+    chain: str | None = typer.Option(
+        None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
+    ),
     train_split: float | None = typer.Option(
         None, help="Train/holdout ratio per file (default: 0.7, or suite config)."
+    ),
+    val_frac: float | None = typer.Option(
+        None,
+        "--val-frac",
+        help="`wmh eval grid`: validation fraction reserved for GEPA in a 3-way split so cells "
+        "score only the leak-free test band (default: (1 - train_split) / 2, matching `wmh build`).",
     ),
     embed_dim: int | None = typer.Option(
         None, help="phi dimensionality for the offline embedder (default: 512, or suite config)."
     ),
     rag: bool | None = typer.Option(
         None, "--rag/--no-rag", help="Enable retrieval, or disable it for zero-shot replay."
-    ),
-    judge: str | None = typer.Option(
-        None, help="Scorer: rubric (5-dim) | match (functional). Default: rubric, or suite config."
     ),
     sample_turns: str | None = typer.Option(
         None, help="Turns scored per trace: all | sampled (5). Default: all, or suite config."
@@ -744,7 +791,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             top_k=top_k,
             embed_dim=embed_dim,
             sample_turns=sample_turns,
-            judge=judge,
+            val_frac=val_frac,
             out=out,
         )
         return
@@ -776,7 +823,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             train_split=train_split,
             embed_dim=embed_dim,
             rag=rag,
-            judge=judge,
             sample_turns=sample_turns,
             seed=seed,
             top_k=top_k,
@@ -794,7 +840,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         train_split=train_split,
         embed_dim=embed_dim,
         rag=rag,
-        judge=judge,
         sample_turns=sample_turns,
         seed=seed,
         top_k=top_k,
@@ -804,6 +849,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         options,
         provider=provider,
         model=model,
+        chain=chain,
         region=region,
     )
     _print_eval_report(report)
@@ -812,9 +858,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     capture_eval_completed(
         mode="ad_hoc",
         file_count=len(args),
-        scored_step_count=report.total_steps,
+        scored_step_count=report.total_valid,
         rag_enabled=options.use_rag,
-        judge_mode=options.judge,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
         top_k=options.top_k,
@@ -831,14 +876,12 @@ def _eval_list(examples_roots: list[str]) -> None:
     table.add_column("Suite", no_wrap=True)
     table.add_column("Files")
     table.add_column("Split")
-    table.add_column("Scorer")
     table.add_column("Description")
     for suite in suites:
         table.add_row(
             suite.id,
             ", ".join(suite.config.files),
             f"{suite.config.train_split:.2f}",
-            suite.config.judge,
             suite.config.description or "",
         )
     _console.print(table)
@@ -870,13 +913,16 @@ def _eval_results(
     table.add_column("Steps", justify="right")
     table.add_column("Path")
     for summary in summaries:
+        steps = str(summary.total_steps)
+        if summary.total_invalid:
+            steps += f" ({summary.total_invalid} inv)"
         table.add_row(
             summary.suite,
             summary.run_id[:8],
             summary.started_at,
             summary.model,
             f"{summary.overall_fidelity:.3f}±{summary.overall_std:.3f}",
-            str(summary.total_steps),
+            steps,
             str(summary.path),
         )
     _console.print(table)
@@ -921,7 +967,7 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     top_k: int | None,
     embed_dim: int | None,
     sample_turns: str | None,
-    judge: str | None,
+    val_frac: float | None,
     out: str | None,
 ) -> None:
     """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
@@ -945,8 +991,8 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
         judge_provider="bedrock",
         judge_model=judge_model,
         judge_region=region,
-        judge_kind=judge or cfg.judge,
         train_split=train_split if train_split is not None else cfg.train_split,
+        val_frac=val_frac,
         top_k=top_k if top_k is not None else cfg.top_k,
         seed=seed if seed is not None else cfg.seed,
         sample_turns=sample_turns or cfg.sample_turns,
@@ -1034,7 +1080,6 @@ def _eval_run_suite(
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
-    judge: str | None,
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
@@ -1047,7 +1092,6 @@ def _eval_run_suite(
         train_split=train_split if train_split is not None else suite.config.train_split,
         embed_dim=embed_dim if embed_dim is not None else suite.config.embed_dim,
         rag=rag if rag is not None else not suite.config.no_rag,
-        judge=judge or suite.config.judge,
         sample_turns=sample_turns or suite.config.sample_turns,
         seed=seed if seed is not None else suite.config.seed,
         top_k=top_k if top_k is not None else suite.config.top_k,
@@ -1077,7 +1121,6 @@ def _eval_run_suite(
             "sample_turns": options.sample_turns,
             "seed": options.seed,
             "rag": options.use_rag,
-            "judge": options.judge,
             "embed_dim": options.embed_dim,
         },
         "report": _eval_report_payload(report),
@@ -1087,9 +1130,8 @@ def _eval_run_suite(
     capture_eval_completed(
         mode="suite",
         file_count=len(files),
-        scored_step_count=report.total_steps,
+        scored_step_count=report.total_valid,
         rag_enabled=options.use_rag,
-        judge_mode=options.judge,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
         top_k=options.top_k,
@@ -1103,7 +1145,6 @@ def _eval_options(
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
-    judge: str | None,
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
@@ -1111,7 +1152,6 @@ def _eval_options(
     split = 0.7 if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
     retrieval = True if rag is None else rag
-    scorer = "rubric" if judge is None else judge
     turns = "all" if sample_turns is None else sample_turns
     rng_seed = 0 if seed is None else seed
     demos = 5 if top_k is None else top_k
@@ -1121,8 +1161,6 @@ def _eval_options(
         raise typer.BadParameter("--embed-dim must be positive")
     if demos < 0:
         raise typer.BadParameter("--top-k must be >= 0")
-    if scorer not in {"rubric", "match"}:
-        raise typer.BadParameter("--judge must be one of: rubric, match")
     if turns not in {"all", "sampled"}:
         raise typer.BadParameter("--sample-turns must be one of: all, sampled")
     return _EvalOptions(
@@ -1130,7 +1168,6 @@ def _eval_options(
         train_split=split,
         embed_dim=dim,
         use_rag=retrieval,
-        judge=scorer,
         sample_turns=turns,
         seed=rng_seed,
         top_k=demos,
@@ -1144,6 +1181,7 @@ def _run_eval_files(
     provider: str,
     model: str,
     region: str | None,
+    chain: str | None = None,
 ) -> EvalReport:
     for path in files:
         if not path.exists():
@@ -1153,14 +1191,20 @@ def _run_eval_files(
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    llm = providers.get_provider(ProviderConfig(kind=serve_provider, model=model, region=region))
+    provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
+    llm = providers.provider_or_chain(provider_config, chain=chain)
+    if isinstance(llm, providers.WaterfallProvider):
+        _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
     prompt = (
         Path(options.prompt_file).read_text(encoding="utf-8")
         if options.prompt_file
         else BASE_ENV_PROMPT
     )
     embedder = HashingEmbedder(dim=options.embed_dim) if options.use_rag else None
-    scorer = RubricJudge(llm) if options.judge == "rubric" else LLMJudge(llm)
+    # The judge is the metric: it stays PINNED to the single requested backend and never rides
+    # the failover chain — a judge that silently switches models mid-run makes fidelity numbers
+    # incomparable across steps. World-model prediction calls (above) may fail over freely.
+    scorer = RubricJudge(providers.get_provider(provider_config))
     evaluation = OpenLoopEval(
         files,
         prompt,
@@ -1178,9 +1222,10 @@ def _run_eval_files(
 def _print_eval_report(report: EvalReport) -> None:
     for name, rep in report.per_file.items():
         _console.print(f"  {name:28} {rep.summary()}")
+    invalid = f" ({report.total_invalid} judge-invalid excluded)" if report.total_invalid else ""
     _console.print(
         f"[bold]OVERALL[/bold] fidelity={report.overall_fidelity:.3f}±{report.overall_std:.3f} "
-        f"over {report.total_steps} held-out steps"
+        f"over {report.total_steps} held-out steps{invalid}"
     )
 
 
@@ -1192,11 +1237,13 @@ def _write_ad_hoc_eval_report(path: Path, report: EvalReport) -> None:
     _console.print(f"wrote full report -> {path}")
 
 
-def _eval_report_payload(report: EvalReport) -> dict[str, object]:
+def _eval_report_payload(report: EvalReport) -> JsonObject:
     return {
+        "judge_version": JUDGE_VERSION,
         "overall_fidelity": report.overall_fidelity,
         "overall_std": report.overall_std,
         "total_steps": report.total_steps,
+        "total_invalid": report.total_invalid,
         "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
     }
 
@@ -1518,7 +1565,7 @@ def demo(
                     _NARRATOR.detach()
             break
         except Exception as exc:  # noqa: BLE001 - classified below
-            if not _is_capacity_error(exc) or not _console.is_terminal:
+            if not is_capacity_error(exc) or not _console.is_terminal:
                 raise
             # Retries are exhausted and the backend is still down: offer to re-point the model
             # at a different provider (same picker as the build wizard) and RESUME from the

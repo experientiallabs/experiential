@@ -27,6 +27,7 @@ class FakeProvider:
 
     def __init__(self) -> None:
         self.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="opus")
+        self.systems: list[str] = []  # system prompt of every complete() call, for assertions
 
     def complete(
         self,
@@ -36,10 +37,16 @@ class FakeProvider:
         temperature: float = 0.7,
         max_tokens: int = 8192,
     ) -> Completion:
+        self.systems.append(system)
         if "improve the system prompt" in system:
             return Completion(text="IMPROVED ENV PROMPT")
         if "grade a world model" in system:
-            return Completion(text='{"score": 0.5, "critique": "be more specific"}')
+            return Completion(
+                text=(
+                    '{"format": 0.5, "factuality": 0.5, "consistency": 0.5, '
+                    '"realism": 0.5, "quality": 0.5, "critique": "be more specific"}'
+                )
+            )
         return Completion(text='{"output": "user u1 found", "is_error": false}')
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -91,16 +98,23 @@ def patched_provider(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
 
     import wmh.providers as providers_pkg
     import wmh.providers.registry as registry
+    import wmh.providers.waterfall as waterfall_mod
 
     fake = FakeProvider()
     # `wmh.engine.__init__` rebinds the name `build` to the function, shadowing the submodule
     # attribute, so reach module objects through sys.modules rather than attribute access.
-    for module_name in ("wmh.engine.build", "wmh.engine.loader"):
-        monkeypatch.setattr(sys.modules[module_name], "get_provider", lambda config: fake)
+    monkeypatch.setattr(sys.modules["wmh.engine.build"], "get_provider", lambda config: fake)
+    # loader.py (serve/demo/play) and the CLI construct through the chain-aware seam.
+    monkeypatch.setattr(
+        sys.modules["wmh.engine.loader"], "provider_or_chain", lambda config, **kw: fake
+    )
     monkeypatch.setattr(providers_pkg, "get_provider", lambda config: fake)
+    monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: fake)
     # The pre-build verify guard pings via verify_all/verify_embedder, which construct providers
-    # through the registry's own get_provider — patch that too so the guard sees the fake.
+    # through the registry's own get_provider — patch that too so the guard sees the fake, and
+    # patch the name waterfall.py bound at import for its no-chain-file passthrough.
     monkeypatch.setattr(registry, "get_provider", lambda config: fake)
+    monkeypatch.setattr(waterfall_mod, "get_provider", lambda config: fake)
 
 
 def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture paths
@@ -123,9 +137,36 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
     assert result.exit_code == 0, result.output
 
 
+def test_build_writes_model_card(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    from wmh.config.card import load_card
+
+    root = tmp_path / ".wmh"
+    _build(root, "tau2-airline", tmp_path)
+    card = load_card(root / "models" / "tau2-airline")
+    assert card is not None
+    assert card.name == "tau2-airline"
+    assert card.corpus.traces is not None and card.corpus.traces > 0
+    assert card.corpus.steps > 0
+    assert card.provider == "bedrock"
+    assert card.built_at is not None
+
+
+def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    # The card is additive metadata: a write failure must not fail an otherwise-complete build.
+    def _boom(card, model_dir) -> None:  # noqa: ANN001
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli_app_module, "save_card", _boom)
+    root = tmp_path / ".wmh"
+    _build(root, "tau2-airline", tmp_path)  # asserts exit_code == 0 internally
+    assert (root / "models" / "tau2-airline" / "config.toml").exists()
+
+
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    assert names == {"build", "list", "serve", "demo", "eval", "play", "download"}
+    core = {"build", "list", "serve", "demo", "eval", "play", "download"}
+    platform = {"login", "logout", "status", "push", "pull"}
+    assert names == core | platform
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -309,12 +350,34 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
 def test_eval_trace_file_command_still_scores(patched_provider, tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(
         app,
-        ["eval", _traces_file(tmp_path), "--judge", "match", "--no-rag"],
+        ["eval", _traces_file(tmp_path), "--no-rag"],
     )
 
     assert result.exit_code == 0, result.output
     assert "OVERALL" in result.output
     assert "fidelity=0.500" in result.output
+
+
+def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    # World-model calls may fail over (provider_or_chain); the judge is the metric and must stay
+    # pinned to the single requested backend — a judge that silently switches models mid-run
+    # makes fidelity numbers incomparable.
+    import wmh.providers as providers_pkg
+
+    chain = FakeProvider()
+    pinned = FakeProvider()
+    monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: chain)
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: pinned)
+
+    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--no-rag"])
+
+    assert result.exit_code == 0, result.output
+    judge_systems_chain = [s for s in chain.systems if "grade a world model" in s]
+    judge_systems_pinned = [s for s in pinned.systems if "grade a world model" in s]
+    assert judge_systems_chain == []  # the chain never judges
+    assert judge_systems_pinned  # every judge call went to the pinned backend
+    prediction_systems = [s for s in chain.systems if "grade a world model" not in s]
+    assert prediction_systems  # predictions went through the chain
 
 
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -331,7 +394,6 @@ def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  #
             [
                 'description = "Tiny deterministic suite"',
                 'files = ["../traces.otel.jsonl"]',
-                'judge = "match"',
                 "train_split = 0.5",
             ]
         ),
@@ -572,6 +634,7 @@ def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None
     assert summary is worker
     assert worker is judge
     assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"
+
 
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     fetched: list[tuple[str, bool]] = []

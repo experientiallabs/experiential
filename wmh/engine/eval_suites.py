@@ -19,7 +19,6 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 logger = logging.getLogger(__name__)
 
 SampleTurns = Literal["all", "sampled"]
-JudgeName = Literal["rubric", "match"]
 
 
 class EvalSuiteConfig(BaseModel):
@@ -36,7 +35,6 @@ class EvalSuiteConfig(BaseModel):
     sample_turns: SampleTurns = "all"
     seed: int = 0
     no_rag: bool = False
-    judge: JudgeName = "rubric"
     embed_dim: int = Field(default=512, gt=0)
 
 
@@ -77,7 +75,8 @@ class EvalResultSummary:
     model: str
     overall_fidelity: float
     overall_std: float
-    total_steps: int
+    total_steps: int  # all steps attempted, including judge-invalid ones
+    total_invalid: int  # judge failures, excluded from overall_fidelity (0 for old results)
 
 
 def discover_eval_suites(examples_root: str | Path | Iterable[str | Path]) -> list[EvalSuite]:
@@ -116,7 +115,24 @@ def load_eval_suite(path: str | Path) -> EvalSuite:
     try:
         config = EvalSuiteConfig.model_validate(raw)
     except ValidationError as exc:
-        raise ValueError(f"{suite_path} does not match the eval suite schema ({exc})") from exc
+        has_judge = isinstance(raw, dict) and "judge" in raw
+        if has_judge and exc.error_count() == 1:
+            # Pre-overhaul suites (and the old shipped defaults) carried this knob; the generic
+            # schema error would never say it was removed or what to do. Only replace the error
+            # when `judge` is the sole problem — otherwise the full listing must surface so the
+            # user fixes everything in one pass.
+            raise ValueError(
+                f"{suite_path} sets `judge`, an option that no longer exists — the harness has a "
+                "single judge (the 5-dimension rubric); delete the `judge` line from the suite file"
+            ) from exc
+        hint = (
+            " (note: the `judge` option no longer exists; delete that line too)"
+            if has_judge
+            else ""
+        )
+        raise ValueError(
+            f"{suite_path} does not match the eval suite schema ({exc}){hint}"
+        ) from exc
     example = (
         suite_path.parent.parent.name
         if suite_path.parent.name == "evals"
@@ -209,6 +225,7 @@ def _read_result_summary(path: Path) -> EvalResultSummary | None:
         overall_fidelity=_as_float(report.get("overall_fidelity")),
         overall_std=_as_float(report.get("overall_std")),
         total_steps=_as_int(report.get("total_steps")),
+        total_invalid=_as_int(report.get("total_invalid")),
     )
 
 
