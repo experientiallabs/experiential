@@ -6,6 +6,7 @@ api_version come from ProviderConfig.deployment / ProviderConfig.api_version.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from wmh.providers import _openai_common
@@ -41,10 +42,21 @@ class AzureOpenAIProvider:
 
             from openai import AzureOpenAI
 
-            self._client = AzureOpenAI(
-                api_version=self.config.api_version,
-                azure_endpoint=endpoint,
-            )
+            if self.config.api_key_env is None:
+                self._client = AzureOpenAI(
+                    api_version=self.config.api_version,
+                    azure_endpoint=endpoint,
+                )
+            else:
+                api_key = os.environ.get(self.config.api_key_env)
+                if not api_key:
+                    msg = f"AzureOpenAIProvider needs {self.config.api_key_env} to be set."
+                    raise ValueError(msg)
+                self._client = AzureOpenAI(
+                    api_version=self.config.api_version,
+                    azure_endpoint=endpoint,
+                    api_key=api_key,
+                )
         return self._client
 
     def _deployment(self) -> str:

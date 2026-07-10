@@ -8,6 +8,7 @@ frame codec and the Bedrock translation (shared with the SSH shim) are unit-test
 
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 import pytest
@@ -16,6 +17,7 @@ from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness.runner_link import (
     RunnerLink,
     WorkerConfig,
+    _azure_completion,
     _normalized_openai_body,
     bedrock_to_completion,
     openai_to_bedrock,
@@ -356,10 +358,10 @@ def test_normalized_openai_body_strips_stream_options_and_maps_max_tokens() -> N
     assert body["stream"] is True and "stream_options" in body
 
 
-def test_worker_config_for_prefers_env_then_derives_bedrock(
+def test_worker_config_for_prefers_env_then_derives_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explicit PI_AGENT_* env wins; a Bedrock provider derives; others keep env defaults."""
+    """Explicit PI_AGENT_* env wins; Bedrock and fully configured Azure derive."""
     from wmh.harness.runner_link import worker_config_for
     from wmh.providers.base import ProviderConfig, ProviderKind
 
@@ -368,6 +370,7 @@ def test_worker_config_for_prefers_env_then_derives_bedrock(
     monkeypatch.delenv("PI_AGENT_REGION", raising=False)
     monkeypatch.delenv("PI_AGENT_BASE_URL", raising=False)
     monkeypatch.delenv("PI_AGENT_KEY_ENV", raising=False)
+    monkeypatch.delenv("PI_AGENT_API_VERSION", raising=False)
     monkeypatch.setenv("AWS_REGION", "eu-west-1")
 
     bedrock = ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-haiku-4-5")
@@ -387,13 +390,81 @@ def test_worker_config_for_prefers_env_then_derives_bedrock(
     assert env_won.model == "deepseek-chat"
     monkeypatch.delenv("PI_AGENT_MODEL")
 
-    # Non-bedrock kinds keep the env-default contract (their auth shapes don't map).
-    if hasattr(ProviderKind, "AZURE_OPENAI"):
-        azure = ProviderConfig(kind=ProviderKind.AZURE_OPENAI, model="gpt-5.5")
-        assert worker_config_for(azure).backend == "openai"
-        assert worker_config_for(azure).model == "deepseek-chat"
-    else:  # pragma: no cover - kind set varies; the bedrock/env branches above are the contract
-        pytest.skip("no non-bedrock kind available to exercise the fallback")
+    azure = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="kimi-k2-6",
+        deployment="kimi deployment",
+        endpoint="https://foundry.example.com",
+        api_version="2024-05-01-preview",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+    )
+    azure_worker = worker_config_for(azure)
+    assert azure_worker == WorkerConfig(
+        backend="azure",
+        model="kimi deployment",
+        base_url="https://foundry.example.com",
+        key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+    )
+
+    incomplete = azure.model_copy(update={"api_key_env": None})
+    with pytest.raises(ValueError, match="api_key_env"):
+        worker_config_for(incomplete)
+
+
+def test_azure_completion_uses_deployment_route_api_version_and_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The raw pi tool-calling request reaches Azure's deployment API without leaking its key."""
+    import urllib.request
+
+    requests: list[urllib.request.Request] = []
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+    def fake_urlopen(request: urllib.request.Request, *, timeout: int) -> _Response:
+        assert timeout == 180
+        requests.append(request)
+        return _Response()
+
+    monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "secret-test-key")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    cfg = WorkerConfig(
+        backend="azure",
+        model="kimi deployment",
+        base_url="https://foundry.example.com/",
+        key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+    )
+    body: JsonObject = {
+        "model": "placeholder",
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "bash"}}],
+    }
+
+    response = _azure_completion(body, cfg)
+
+    assert response["choices"]
+    (request,) = requests
+    assert request.full_url == (
+        "https://foundry.example.com/openai/deployments/kimi%20deployment/chat/completions"
+        "?api-version=2024-05-01-preview"
+    )
+    assert request.get_header("Api-key") == "secret-test-key"
+    sent = cast("dict[str, Any]", json.loads(cast("bytes", request.data)))
+    assert sent["model"] == "kimi deployment"
+    assert sent["stream"] is False
+    assert sent["tools"] == body["tools"]
 
 
 def test_worker_usage_accumulates_across_llm_requests() -> None:

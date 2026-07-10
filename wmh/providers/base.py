@@ -84,6 +84,7 @@ class ProviderConfig(BaseModel):
     region: str | None = None  # AWS Bedrock region
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
+    api_key_env: str | None = None  # non-default env var holding the provider API key
     reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
 
 

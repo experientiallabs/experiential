@@ -25,6 +25,7 @@ import struct
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
+from urllib.parse import quote, urlencode
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
@@ -98,11 +99,14 @@ class SocketChannel:
 class WorkerConfig:
     """How the host answers worker-LLM requests. Creds are read from the environment, host-side."""
 
-    backend: str = "openai"  # "openai": OpenAI-compatible endpoint | "bedrock": Converse via boto3
+    # openai: bearer-auth OpenAI-compatible endpoint; azure: Azure deployment route + api-key;
+    # bedrock: Converse via boto3.
+    backend: str = "openai"
     model: str = ""
     region: str = "us-east-1"
     base_url: str = ""
     key_env: str = ""
+    api_version: str = ""
 
 
 _PI_AGENT_ENV_VARS = (
@@ -111,6 +115,7 @@ _PI_AGENT_ENV_VARS = (
     "PI_AGENT_REGION",
     "PI_AGENT_BASE_URL",
     "PI_AGENT_KEY_ENV",
+    "PI_AGENT_API_VERSION",
 )
 
 
@@ -128,6 +133,7 @@ def worker_config_from_env() -> WorkerConfig:
         region=os.environ.get("PI_AGENT_REGION", os.environ.get("AWS_REGION", "us-east-1")),
         base_url=os.environ.get("PI_AGENT_BASE_URL", "https://api.deepseek.com/v1"),
         key_env=os.environ.get("PI_AGENT_KEY_ENV", "DEEPSEEK_API_KEY"),
+        api_version=os.environ.get("PI_AGENT_API_VERSION", ""),
     )
 
 
@@ -137,9 +143,9 @@ def worker_config_for(config: ProviderConfig) -> WorkerConfig:
     Precedence: any PI_AGENT_* env var set -> `worker_config_from_env` exactly as before (the
     operator asked for a specific worker). Otherwise, a Bedrock agent provider is fully derivable
     (model id + region; AWS creds stay host-side as always) — this is what lets the hosted
-    platform point pi at the agent's catalog model with zero env plumbing. Any other kind keeps
-    the env defaults: their auth shapes (Azure api-version query strings, deployment paths) do
-    not fit the single openai-completions POST `worker_completion` sends.
+    platform point pi at the agent's catalog model with zero env plumbing. Azure OpenAI is also
+    derivable when its provider config carries the deployment route, API version, endpoint, and
+    API-key env name. Other kinds keep the env defaults.
     """
     if any(os.environ.get(name) for name in _PI_AGENT_ENV_VARS):
         return worker_config_from_env()
@@ -148,6 +154,24 @@ def worker_config_for(config: ProviderConfig) -> WorkerConfig:
             backend="bedrock",
             model=config.model,
             region=config.region or os.environ.get("AWS_REGION", "us-east-1"),
+        )
+    if config.kind is ProviderKind.AZURE_OPENAI:
+        required = {
+            "deployment": config.deployment,
+            "endpoint": config.endpoint,
+            "api_version": config.api_version,
+            "api_key_env": config.api_key_env,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(f"Azure worker provider config is missing: {joined}")
+        return WorkerConfig(
+            backend="azure",
+            model=cast("str", config.deployment),
+            base_url=cast("str", config.endpoint),
+            key_env=cast("str", config.api_key_env),
+            api_version=cast("str", config.api_version),
         )
     return worker_config_from_env()
 
@@ -175,6 +199,8 @@ def worker_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
     """
     if cfg.backend == "bedrock":
         return _bedrock_completion(body, cfg)
+    if cfg.backend == "azure":
+        return _azure_completion(body, cfg)
     return _openai_completion(body, cfg)
 
 
@@ -210,6 +236,25 @@ def _openai_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=180) as resp:  # noqa: S310 - fixed https endpoint
+        return cast("JsonObject", json.loads(resp.read()))
+
+
+def _azure_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
+    """Call an Azure OpenAI deployment while keeping its API key host-side."""
+    import urllib.request
+
+    b = _normalized_openai_body(body, cfg)
+    key = os.environ.get(cfg.key_env, "") if cfg.key_env else ""
+    deployment = quote(cfg.model, safe="")
+    query = urlencode({"api-version": cfg.api_version})
+    url = f"{cfg.base_url.rstrip('/')}/openai/deployments/{deployment}/chat/completions?{query}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(b).encode("utf-8"),
+        headers={"Content-Type": "application/json", "api-key": key},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:  # noqa: S310 - configured Azure endpoint
         return cast("JsonObject", json.loads(resp.read()))
 
 
