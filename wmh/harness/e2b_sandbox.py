@@ -92,36 +92,6 @@ class SandboxFiles(Protocol):
     def read(self, path: str) -> str: ...
 
 
-class PtyHandle(Protocol):
-    """A running interactive PTY (e2b's pty handle): its pid identifies it for input/resize/kill."""
-
-    @property
-    def pid(self) -> int: ...
-
-
-class SandboxPty(Protocol):
-    """The `sandbox.pty` slice: an interactive terminal a user types into (live sessions only).
-
-    The eval backend never touches this — a PTY is the user's own scratch shell into a live
-    session's sandbox, streamed to the browser. `on_data` receives raw terminal bytes; `size` is
-    (rows, cols). Sliced so tests substitute a fake pty without importing the SDK.
-    """
-
-    def create(
-        self,
-        size: tuple[int, int],
-        on_data: Callable[[bytes], None],
-        *,
-        timeout: float | None = None,
-    ) -> PtyHandle: ...
-
-    def send_stdin(self, pid: int, data: bytes) -> object: ...
-
-    def resize(self, pid: int, size: tuple[int, int]) -> object: ...
-
-    def kill(self, pid: int) -> object: ...
-
-
 @runtime_checkable
 class SandboxHandle(Protocol):
     """The exact slice of `e2b.Sandbox` the harness uses, so tests substitute fakes."""
