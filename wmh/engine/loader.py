@@ -16,13 +16,21 @@ from wmh.providers.base import Provider
 
 
 def load_world_model(
-    model_dir: str | Path, *, telemetry_root: str | Path | None = None
+    model_dir: str | Path,
+    *,
+    telemetry_root: str | Path | None = None,
+    max_fidelity: bool = False,
 ) -> tuple[WorldModel, Provider]:
     """Load the world model under `model_dir`, returning it with the serve provider it was built on.
 
     The provider is returned alongside so callers that also need it (e.g. `wmh demo`, which runs an
     LLM agent against the same provider) don't re-read the config or reconstruct it.
+    `max_fidelity` turns on the online extras (the build-measured winner when the artifact has
+    one); a plain load runs pure RAG.
     """
     config = load_config(str(model_dir))
     provider = provider_or_chain(config.serve_provider_config())
-    return WorldModel.load(str(model_dir), provider, telemetry_root=telemetry_root), provider
+    wm = WorldModel.load(
+        str(model_dir), provider, telemetry_root=telemetry_root, max_fidelity=max_fidelity
+    )
+    return wm, provider

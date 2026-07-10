@@ -1,0 +1,44 @@
+[
+  {
+    "label": "base@200",
+    "seed": 0,
+    "run_id": "74cdfc3492184929843e878202f042f0",
+    "kind": "research",
+    "duration_seconds": 1837.8590178749873,
+    "total": {
+      "calls": 855,
+      "input_tokens": 2944185,
+      "output_tokens": 225906,
+      "cost_usd": 20.368574999999982
+    },
+    "by_phase": {
+      "serve": {
+        "calls": 855,
+        "input_tokens": 2944185,
+        "output_tokens": 225906,
+        "cost_usd": 20.368574999999982
+      }
+    }
+  },
+  {
+    "label": "base@200",
+    "seed": 1,
+    "run_id": "73fd6fd4a1084e729d71d4de504650bc",
+    "kind": "research",
+    "duration_seconds": 2025.3737972500385,
+    "total": {
+      "calls": 855,
+      "input_tokens": 2950521,
+      "output_tokens": 223003,
+      "cost_usd": 20.327680000000054
+    },
+    "by_phase": {
+      "serve": {
+        "calls": 855,
+        "input_tokens": 2950521,
+        "output_tokens": 223003,
+        "cost_usd": 20.327680000000054
+      }
+    }
+  }
+]

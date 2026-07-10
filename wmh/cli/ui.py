@@ -132,7 +132,7 @@ class BuildParams(BaseModel):
     # Canonical GEPA judge model type; None = pick the cheap per-provider default.
     judge_model: str | None = None
     region: str | None = None
-    gepa_budget: int = 10
+    fidelity: str = "medium"
     train_split: float = 0.8
     embed_provider: str = "hashing"
     embed_model: str | None = None
@@ -408,16 +408,25 @@ def run_build_wizard(
         console.print("  [yellow]pick a different judge model[/yellow]")
         judge_default = judge_model
 
-    gepa_budget = _prompt_int(
+    # Build effort is a tier, not an iteration count — raw budgets live in the Python API.
+    console.print(
+        "  [dim]low: RAG only · medium: +light prompt optimization + cheap-lever search · "
+        "high: +optimization + config search · max: deep optimization + full search[/dim]"
+    )
+    fidelity = _select(
         console,
         ask,
-        "GEPA iterations (each ~1 valset pass; more = better prompt, higher cost/time)",
-        defaults.gepa_budget,
+        "Fidelity",
+        ["low", "medium", "high", "max"],
+        defaults.fidelity,
+        interactive=interactive,
     )
 
-    # Retrieval phi embedder: default offline hashing (no creds). A provider-backed embedder is
-    # picked from the list and prompts for its embeddings-model id; phi dimensionality keeps its
-    # default (the index and query embedders must agree, so it is not a wizard knob).
+    # Retrieval phi embedder: offline lexical hashing is the measured-best default at EVERY
+    # tier (semantic phi lost to char-trigram hashing on all benchmarks — PR #72's matrix and
+    # the tier ladder's tau decline agree; command outputs are predicted by literal token
+    # overlap). Provider-backed semantic embeddings stay available as an explicit choice for
+    # experiments. Phi dimensionality keeps its default (index and query embedders must agree).
     embed_default = defaults.embed_provider
     while True:
         embed_provider = _select(
@@ -478,7 +487,7 @@ def run_build_wizard(
         model=model,
         judge_model=judge_model,
         region=region,
-        gepa_budget=gepa_budget,
+        fidelity=fidelity,
         train_split=defaults.train_split,
         embed_provider=embed_provider,
         embed_model=embed_model,

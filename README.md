@@ -116,6 +116,52 @@ at `/home/user/pi-run` to skip per-sandbox installs (~13 s cold episodes); `--ev
 caps the fan-out (default: every cell at once). Worker-LLM tokens and sandbox-seconds are metered
 on the results (`worker_usage`, `sandbox_usage`).
 
+## Agentic mode: knowledge base, reasoning, web grounding
+
+Beyond retrieval, a world model can act like an *agent* about its own environment (all opt-in):
+
+- **Knowledge base** — `wmh build --knowledge` extracts the environment's canonical facts
+  (business rules, state-dependent gates, entities, tool schemas) from the train traces into
+  `models/<name>/knowledge/*.md`. It's plain markdown: edit it in any editor (`wmh knowledge`
+  prints the path), read/write it over HTTP (`GET/PUT /world_models/{name}/knowledge`), and the
+  env keeps it in every prompt and appends its own cross-session notes to `learned.md`.
+- **Reasoning** — `--reasoning` switches the output contract to deliberate-then-answer: the env
+  checks the knowledge base's gates (auth, availability, preconditions) and the session history
+  before deciding success vs. error.
+- **Web grounding** — `--grounder brave` (env var `BRAVE_SEARCH_API_KEY`, free tier) lets the env
+  issue a bounded web search when an action references a real-world entity outside its traces
+  and knowledge — instead of hallucinating it; `--grounder fetch` (keyless) additionally
+  live-fetches the action's own read-only `curl` GET URLs. Results are cached into the knowledge
+  base; the default is `none`, so tests and evals never touch the network.
+- **Verify pass** — `--verify` adds a second self-check completion per step: the env re-examines
+  its draft against the gates, history, and exact computations before answering (~2× serve cost;
+  measured to pay off exactly where content prediction is hardest).
+
+## Fidelity: one knob at build, one switch at run
+
+Build effort is a **tier**, not an iteration count:
+
+```bash
+wmh build --fidelity low     # RAG only — index the traces, ship the base prompt (near-free)
+wmh build --fidelity medium  # + a light prompt-optimization (GEPA) pass        (default)
+wmh build --fidelity high    # + full GEPA + a cheap auto-config search
+wmh build --fidelity max     # deep GEPA + the full config ladder, to be certain
+```
+
+`high`/`max` additionally search the agentic configs (reason / +knowledge / +verify / +fetch)
+on the build's held-out split — candidates pruned by a zero-token corpus signature, ties going
+to the cheaper config — and record the winner in the artifact's `auto_fidelity.json`.
+
+At run time you either just run it (pure RAG, always), or ask for everything:
+
+```bash
+wmh serve --max-fidelity     # the build-measured winning config (or all extras if unmeasured)
+wmh play  --max-fidelity
+```
+
+Measure any configuration explicitly with `wmh eval run <suite> --knowledge --reasoning` (the
+eval seeds its knowledge from the train split only — never from held-out traces).
+
 ## Providers
 
 One interface, four backends, verified on startup. Credentials are read from the environment:

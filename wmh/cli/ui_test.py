@@ -250,7 +250,7 @@ def test_build_wizard_collects_all_inputs() -> None:
             "claude-opus-4-8",
             "us-east-1",
             "",  # judge model: accept the bedrock default (dated haiku)
-            "8",
+            "high",
             "hashing",
         ]
     )
@@ -267,7 +267,7 @@ def test_build_wizard_collects_all_inputs() -> None:
     assert params.provider == "bedrock"
     assert params.region == "us-east-1"
     assert params.judge_model == "claude-haiku-4-5"
-    assert params.gepa_budget == 8
+    assert params.fidelity == "high"
     assert params.embed_provider == "hashing"
     assert params.train_split == 0.5
 
@@ -276,7 +276,7 @@ def test_build_wizard_select_by_number() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # Provider/model/embedder are numbered pickers; choosing by index must work. Pick anthropic (2),
     # its second model, no region prompt (not bedrock), budget 8, hashing embedder (1).
-    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "2", "2", "", "8", "1"])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "2", "2", "", "1", "1"])
     params = run_build_wizard(
         console,
         BuildParams(name="default"),
@@ -295,7 +295,17 @@ def test_build_wizard_collects_provider_embedder() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # A provider-backed embedder adds an embeddings-model picker; phi dim keeps its default.
     reader = _scripted_reader(
-        ["m", "", "/tmp/t.jsonl", "openai", "gpt-5.5", "", "8", "openai", "text-embedding-3-large"]
+        [
+            "m",
+            "",
+            "/tmp/t.jsonl",
+            "openai",
+            "gpt-5.5",
+            "",
+            "max",
+            "openai",
+            "text-embedding-3-large",
+        ]
     )
     params = run_build_wizard(
         console,
@@ -314,13 +324,15 @@ def test_build_wizard_accepts_defaults_with_blank_input() -> None:
     # File provided (so that prompt is skipped); press Enter (blank) for every remaining prompt
     # (name/provider/model/region/budget/embedder) to accept the suggested defaults.
     reader = _scripted_reader(["", "", "", "", "", "", ""])
-    defaults = BuildParams(name="seeded", file="/tmp/t.jsonl", provider="bedrock", gepa_budget=50)
+    defaults = BuildParams(
+        name="seeded", file="/tmp/t.jsonl", provider="bedrock", fidelity="medium"
+    )
     params = run_build_wizard(
         console, defaults, reader=reader, verify=_ok_verify, verify_embed=_ok_verify
     )
     assert params.name == "seeded"  # blank kept the default
     assert params.provider == "bedrock"
-    assert params.gepa_budget == 50
+    assert params.fidelity == "medium"
     assert params.region == "us-east-1"  # bedrock default suggested + accepted
     assert params.embed_provider == "hashing"  # default embedder, no embed-model prompt
 
@@ -487,8 +499,8 @@ def test_build_wizard_prompts_for_missing_credentials_and_saves(
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(
         # name, trace source, file, provider, AWS_REGION, AWS_ACCESS_KEY_ID,
-        # AWS_SECRET_ACCESS_KEY (skip), model, region, budget, embedder
-        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "", "8", "1"]
+        # AWS_SECRET_ACCESS_KEY (skip), model, region, judge, fidelity, embedder
+        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "test-key-id", "", "1", "", "", "", "1"]
     )
     params = run_build_wizard(
         console,
@@ -521,7 +533,7 @@ def test_build_wizard_keeps_session_creds_when_persistence_fails(
     monkeypatch.setattr(ui_module, "upsert_env_var", refuse)
     console = Console(force_terminal=False, no_color=True, width=100, record=True)
     reader = _scripted_reader(
-        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "", "8", "1"]
+        ["m", "", "/tmp/t.jsonl", "bedrock", "us-east-1", "key-id", "secret", "1", "", "", "", "1"]
     )
     params = run_build_wizard(
         console,
@@ -674,12 +686,44 @@ def test_select_model_survives_unicode_digit_input() -> None:
     assert chosen == "airline"
 
 
-def test_build_wizard_reprompts_on_unicode_digit_budget() -> None:
-    # Same unicode-digit footgun in the int prompt: must re-ask, not crash. With file provided the
-    # prompts are name/provider/model/budget/embedder (no region: the creds-default provider is
-    # openai); blanks accept defaults, '²' is a bad budget that must be rejected and re-asked.
+def test_build_wizard_high_fidelity_keeps_hashing_default() -> None:
+    # Lexical hashing is the measured-best phi at EVERY tier (semantic lost on all benchmarks —
+    # PR #72's matrix + the tier ladder's tau decline), so high/max no longer nudge toward
+    # provider embeddings: a blank at the embedder prompt stays hashing, no model picker follows.
+    console = Console(force_terminal=False, no_color=True, width=100, record=True)
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "bedrock", "", "", "", "high", ""])
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
+    assert params.fidelity == "high"
+    assert params.embed_provider == "hashing"
+    assert params.embed_model is None
+    assert "semantic embeddings recommended" not in console.export_text()
+
+
+def test_build_wizard_low_fidelity_keeps_hashing_default() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(["", "", "", "", "²", "7", ""])
+    reader = _scripted_reader(["m", "", "/tmp/t.jsonl", "bedrock", "", "", "", "low", ""])
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
+    assert params.fidelity == "low"
+    assert params.embed_provider == "hashing"
+
+
+def test_build_wizard_reprompts_on_unicode_digit_fidelity() -> None:
+    # Same unicode-digit footgun in the fidelity picker: must re-ask, not crash. '²' is a bad
+    # pick that must be rejected and re-asked; '1' then selects low.
+    console = Console(force_terminal=False, no_color=True, width=100)
+    reader = _scripted_reader(["", "", "", "", "²", "1", ""])
     params = run_build_wizard(
         console,
         BuildParams(name="m", file="/tmp/t.jsonl"),
@@ -687,4 +731,4 @@ def test_build_wizard_reprompts_on_unicode_digit_budget() -> None:
         verify=_ok_verify,
         verify_embed=_ok_verify,
     )
-    assert params.gepa_budget == 7
+    assert params.fidelity == "low"

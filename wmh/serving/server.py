@@ -90,6 +90,17 @@ class NewBuildResponse(BaseModel):
     build_id: str
 
 
+class KnowledgeResponse(BaseModel):
+    """The model's knowledge base: enabled + every markdown file's content."""
+
+    enabled: bool
+    files: dict[str, str]
+
+
+class KnowledgeFileRequest(BaseModel):
+    content: str
+
+
 class UploadResponse(BaseModel):
     file: str
 
@@ -149,7 +160,7 @@ def _load_card_or_none(model_dir: Path) -> ModelCard | None:
 
 
 def _load_models(
-    artifact_dirs: Sequence[str], names: list[str] | None
+    artifact_dirs: Sequence[str], names: list[str] | None, *, max_fidelity: bool = False
 ) -> tuple[dict[str, WorldModel], dict[str, ModelCard | None], dict[str, Path]]:
     """Load the requested world models (or all built ones) plus their cards and dirs."""
     telemetry_root = artifact_dirs[0]
@@ -157,7 +168,9 @@ def _load_models(
     cards: dict[str, ModelCard | None] = {}
     dirs: dict[str, Path] = {}
     for name, model_dir in resolve_model_dirs(artifact_dirs, names).items():
-        world_model, _provider = load_world_model(model_dir, telemetry_root=telemetry_root)
+        world_model, _provider = load_world_model(
+            model_dir, telemetry_root=telemetry_root, max_fidelity=max_fidelity
+        )
         models[name] = world_model
         cards[name] = _load_card_or_none(model_dir)
         dirs[name] = model_dir
@@ -170,6 +183,7 @@ def create_app(
     world_models: dict[str, WorldModel] | None = None,
     cards: dict[str, ModelCard | None] | None = None,
     build_manager: BuildManager | None = None,
+    max_fidelity: bool = False,
 ) -> FastAPI:
     """Build the FastAPI app serving one or more named WorldModels.
 
@@ -177,7 +191,8 @@ def create_app(
     from every root in `artifact_dirs` with `names` selecting which to serve (default: all built
     ones). When loading from disk, server-side builds are enabled and land in the first root
     (the writable one, `.wmh` by convention); with injected models pass `build_manager`
-    explicitly or the build routes return 503.
+    explicitly or the build routes return 503. `max_fidelity` serves every disk-loaded model
+    with its online extras (the build-measured winner — see `WorldModel.load`).
     """
     app = FastAPI(title="World Model Harness")
     # The website (localhost:3000/6001/...) is a browser client of this API on another port.
@@ -194,7 +209,9 @@ def create_app(
         model_cards = cards if cards is not None else {}
         model_dirs: dict[str, Path] = {}
     else:
-        models, model_cards, model_dirs = _load_models(artifact_dirs, names)
+        models, model_cards, model_dirs = _load_models(
+            artifact_dirs, names, max_fidelity=max_fidelity
+        )
     downloader = TracesDownloader()
 
     def _register(name: str, model_dir: Path) -> None:
@@ -204,7 +221,9 @@ def create_app(
         the new model with a null card (readers key off `models`); any name they see already has
         its card entry.
         """
-        world_model, _provider = load_world_model(model_dir, telemetry_root=artifact_dirs[0])
+        world_model, _provider = load_world_model(
+            model_dir, telemetry_root=artifact_dirs[0], max_fidelity=max_fidelity
+        )
         model_cards[name] = _load_card_or_none(model_dir)
         model_dirs[name] = model_dir
         models[name] = world_model
@@ -375,6 +394,36 @@ def create_app(
         wm = _model_or_404(world_model_name)
         _session_or_404(wm, session_id)
         return wm.end_session(session_id)
+
+    @app.get("/world_models/{world_model_name}/knowledge", response_model=KnowledgeResponse)
+    def get_knowledge(world_model_name: str) -> KnowledgeResponse:
+        """Read the model's knowledge base (`enabled=False` for pre-knowledge artifacts)."""
+        kb = _model_or_404(world_model_name).knowledge
+        if kb is None:
+            return KnowledgeResponse(enabled=False, files={})
+        return KnowledgeResponse(enabled=True, files=kb.files())
+
+    @app.put(
+        "/world_models/{world_model_name}/knowledge/{file_name}",
+        response_model=KnowledgeResponse,
+    )
+    def put_knowledge(
+        world_model_name: str, file_name: str, req: KnowledgeFileRequest
+    ) -> KnowledgeResponse:
+        """Create/replace one knowledge markdown file (the HTTP face of 'edit the folder')."""
+        kb = _model_or_404(world_model_name).knowledge
+        if kb is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"world model {world_model_name!r} has no knowledge base; "
+                "build it with knowledge enabled (or create a knowledge/ dir in its artifact "
+                "and re-serve)",
+            )
+        try:
+            kb.write_file(file_name, req.content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return KnowledgeResponse(enabled=True, files=kb.files())
 
     @app.get("/world_models/{world_model_name}/traces", response_model=TracesResponse)
     def get_traces(world_model_name: str) -> TracesResponse:

@@ -27,7 +27,7 @@ import gepa
 from gepa.core.adapter import EvaluationBatch, GEPAAdapter
 from pydantic import BaseModel, Field
 
-from wmh.core.parsing import parse_observation
+from wmh.core.parsing import dumps_observation_contract, parse_observation
 from wmh.core.render import build_env_prompt, encode_state_action
 from wmh.core.types import Action, EnvState, JsonValue, Observation, Step, Trace
 from wmh.optimize.judge import Judge
@@ -95,6 +95,8 @@ def predict_observation(
     demos: list[Step],
     history: list[Step] | None = None,
     *,
+    knowledge: str | None = None,
+    reasoning: bool = False,
     max_retrieved_observation_chars: int | None = None,
 ) -> Observation:
     """Predict the observation for (state, action) under `prompt`, using only a Provider.
@@ -103,6 +105,8 @@ def predict_observation(
     shared `wmh.core.render.build_env_prompt` and parses the completion with the shared
     `parse_observation` — the exact assembly AND output contract the serving engine uses — so the
     predicted observation (content + is_error + state_note) matches what the world model produces.
+    `knowledge`/`reasoning` mirror the serving engine's agentic mode (grounding stays serve-only:
+    optimization and eval rollouts never touch the network beyond the provider).
 
     Rollouts run deterministically: the providers (Opus 4.8 / GPT 5.5) reject sampling params, so no
     temperature is forwarded.
@@ -114,12 +118,105 @@ def predict_observation(
         action,
         history=history,
         demos=demos,
+        knowledge=knowledge,
+        reasoning=reasoning,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
     completion = provider.complete(
         system, [Message(role="user", content=user)], temperature=0.0, max_tokens=DEFAULT_MAX_TOKENS
     )
     return parse_observation(completion.text)
+
+
+VERIFY_INSTRUCTION = (
+    "\n\nYOUR DRAFT RESPONSE:\n{draft}\n\n"
+    "Re-examine the draft against the evidence above before answering: the gates the environment"
+    " itself enforces, the interaction history, how similar commands behaved in the examples, and"
+    " any exact computations (counts, off-by-one, trailing newlines). If the draft is right,"
+    " return it unchanged — do not invent differences. Reply with ONLY the corrected JSON object"
+    " in the required format."
+)
+
+
+def verify_observation(
+    provider: Provider,
+    prompt: str,
+    task: str | None,
+    state: EnvState,
+    action: Action,
+    draft: Observation,
+    demos: list[Step],
+    history: list[Step] | None = None,
+    *,
+    knowledge: str | None = None,
+    reasoning: bool = False,
+    max_retrieved_observation_chars: int | None = None,
+) -> Observation:
+    """Second-pass self-check: re-present the full evidence plus the draft, return the revision.
+
+    The "adding steps" lever: one extra completion that audits the draft against gates, history,
+    examples, and arithmetic. Measured via the `reason+verify` ablation mode before any engine
+    adoption — it doubles the per-step provider cost, so it must earn its keep empirically.
+    """
+    system, user = build_env_prompt(
+        prompt,
+        task,
+        state,
+        action,
+        history=history,
+        demos=demos,
+        knowledge=knowledge,
+        reasoning=reasoning,
+        max_retrieved_observation_chars=max_retrieved_observation_chars,
+    )
+    verify_user = user + VERIFY_INSTRUCTION.format(draft=dumps_observation_contract(draft))
+    completion = provider.complete(
+        system,
+        [Message(role="user", content=verify_user)],
+        temperature=0.0,
+        max_tokens=DEFAULT_MAX_TOKENS,
+    )
+    return parse_observation(completion.text)
+
+
+PROFILE_SYSTEM = (
+    "You maintain the belief state of a simulated environment. From the interaction history you"
+    " are shown, write the CURRENT environment profile: what is running, installed, or existing"
+    " RIGHT NOW. This is a REVISED state, not an event log — a belief later contradicted by the"
+    " history must not appear (a killed server is DOWN, an overwritten file has its NEW content)."
+    " Cover: services/processes and their state, installed packages/versions, files created or"
+    " modified (with their current relevant content), auth/session state, and pending effects."
+    " At most 15 terse bullet lines. Reply with ONLY the bullets."
+)
+
+
+def distill_profile(
+    provider: Provider,
+    task: str | None,
+    history: list[Step],
+) -> str | None:
+    """One completion: revise the session history into a compact current-state belief profile.
+
+    The eval face of the `profile` lever (the serve face revises incrementally via the
+    `state_update` contract field): open-loop replay derives the profile from the teacher-forced
+    history each step. Returns None when there is no history to digest.
+    """
+    if not history:
+        return None
+    rendered = "\n".join(
+        f"{encode_state_action(h.state_before, h.action)}\n"
+        f"OBSERVATION (is_error={h.observation.is_error}): {h.observation.content}"
+        for h in history
+    )
+    user = f"TASK:\n{task or '(none)'}\n\nINTERACTION HISTORY:\n{rendered}"
+    completion = provider.complete(
+        PROFILE_SYSTEM,
+        [Message(role="user", content=user)],
+        temperature=0.0,
+        max_tokens=DEFAULT_MAX_TOKENS,
+    )
+    text = completion.text.strip()
+    return text or None
 
 
 # --- GEPA adapter --------------------------------------------------------------------------------

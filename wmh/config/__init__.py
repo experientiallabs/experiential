@@ -2,9 +2,12 @@
 
 from wmh.config.config import (
     ARTIFACT_DIR,
+    FIDELITY_TIERS,
     PROVIDER_ENV_VARS,
     ArtifactPaths,
+    FidelityTier,
     HarnessConfig,
+    TierSpec,
     load_config,
     save_config,
 )
@@ -29,6 +32,9 @@ from wmh.config.store import (
 __all__ = [
     "ARTIFACT_DIR",
     "DEFAULT_MODEL_NAME",
+    "FIDELITY_TIERS",
+    "FidelityTier",
+    "TierSpec",
     "PROVIDER_ENV_VARS",
     "ArtifactPaths",
     "HarnessConfig",

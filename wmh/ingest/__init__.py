@@ -33,11 +33,13 @@ from wmh.ingest.adapter import (
     register_adapter,
 )
 from wmh.ingest.base import BaseTraceAdapter
+from wmh.ingest.quality import drop_degenerate_traces
 
 __all__ = [
     "BaseTraceAdapter",
     "TraceAdapter",
     "VendorPull",
+    "drop_degenerate_traces",
     "get_adapter",
     "list_adapters",
     "register_adapter",

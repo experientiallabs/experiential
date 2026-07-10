@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from wmh.config.config import HarnessConfig, load_config, save_config
+from wmh.config.config import ArtifactPaths, HarnessConfig, load_config, save_config
 from wmh.providers.base import EmbedderKind, ProviderConfig, ProviderKind
 
 
@@ -67,6 +67,30 @@ def test_load_with_dir_but_no_config_raises_friendly_error(tmp_path: Path) -> No
 def test_defaults_round_trip(tmp_path: Path) -> None:
     save_config(HarnessConfig(), root=tmp_path / ".wmh")
     assert load_config(root=tmp_path / ".wmh") == HarnessConfig()
+
+
+def test_agentic_fields_default_off_so_old_configs_load(tmp_path: Path) -> None:
+    # A config.toml written before the agentic-mode fields existed must still validate, with the
+    # new behavior OFF (existing model artifacts serve unchanged).
+    config = HarnessConfig()
+    assert config.knowledge is False
+    assert config.reasoning is False
+    assert config.grounder == "none"
+    root = tmp_path / ".wmh"
+    save_config(config, root=root)
+    raw = (root / "config.toml").read_text(encoding="utf-8")
+    stripped = "\n".join(
+        line
+        for line in raw.splitlines()
+        if not line.startswith(("knowledge", "reasoning", "grounder"))
+    )
+    (root / "config.toml").write_text(stripped, encoding="utf-8")
+    assert load_config(root=root) == config
+
+
+def test_artifact_paths_knowledge_dir(tmp_path: Path) -> None:
+    paths = ArtifactPaths(tmp_path / ".wmh")
+    assert paths.knowledge == tmp_path / ".wmh" / "knowledge"
 
 
 def test_load_corrupt_toml_raises_friendly_error(tmp_path: Path) -> None:

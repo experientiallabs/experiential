@@ -16,6 +16,7 @@ from statistics import fmean, pstdev
 from pydantic import BaseModel, Field
 
 from wmh.engine.build import split_traces
+from wmh.engine.knowledge import seeded_knowledge_text
 from wmh.engine.replay import ReplayReport, replay, valid_scores
 from wmh.ingest import get_adapter
 from wmh.optimize.judge import Judge
@@ -66,12 +67,20 @@ def evaluate_files(
     sample_turns: str = "all",
     seed: int = 0,
     adapter_name: str = "otel-genai",
+    knowledge: bool = False,
+    reasoning: bool = False,
 ) -> EvalReport:
     """Replay-score each trace file's held-out split. `embedder=None` -> zero-shot (no retrieval).
 
     Each file is split deterministically; tiny corpora with no held-out trace fall back to scoring
     every trace. RAG, when enabled, retrieves from that file's own train split only (leak-free).
     `sample_turns`/`seed` are forwarded to `replay` (see its docstring).
+
+    `knowledge` seeds an ephemeral knowledge base from each file's TRAIN split (never the holdout —
+    the same leak-free discipline as RAG) and renders it into every prediction; `reasoning`
+    switches predictions to the deliberate-then-answer contract. Both mirror the serving engine's
+    agentic mode. Closed-loop evals get agentic mode from the ARTIFACT instead (the served
+    WorldModel's config / --max-fidelity winner), not from these flags.
     """
     adapter = get_adapter(adapter_name)
     per_file: dict[str, ReplayReport] = {}
@@ -83,6 +92,9 @@ def evaluate_files(
         if not holdout:  # tiny corpus: evaluate on everything
             train, holdout = traces, traces
         retriever = EmbeddingRetriever(embedder) if embedder is not None else None
+        # Ephemeral, per-file, train-only KB: rendered text only — nothing under models/ is read
+        # or written, so eval can never leak a serve-time learned.md into scoring.
+        knowledge_text = seeded_knowledge_text(train, provider) if knowledge else None
         name = _display_name(path)
         per_file[name] = replay(
             prompt,
@@ -94,6 +106,8 @@ def evaluate_files(
             top_k=top_k,
             sample_turns=sample_turns,
             seed=seed,
+            knowledge=knowledge_text,
+            reasoning=reasoning,
         )
 
     # Step-weighted aggregate over every validly-judged step across files (judge failures are
@@ -132,6 +146,8 @@ class OpenLoopEval:
         sample_turns: str = "all",
         seed: int = 0,
         adapter_name: str = "otel-genai",
+        knowledge: bool = False,
+        reasoning: bool = False,
     ) -> None:
         self._files = files
         self._prompt = prompt
@@ -143,6 +159,8 @@ class OpenLoopEval:
         self._sample_turns = sample_turns
         self._seed = seed
         self._adapter_name = adapter_name
+        self._knowledge = knowledge
+        self._reasoning = reasoning
 
     def run(self) -> EvalReport:
         return evaluate_files(
@@ -156,4 +174,6 @@ class OpenLoopEval:
             sample_turns=self._sample_turns,
             seed=self._seed,
             adapter_name=self._adapter_name,
+            knowledge=self._knowledge,
+            reasoning=self._reasoning,
         )

@@ -24,7 +24,19 @@ from pydantic import BaseModel, Field
 
 from wmh.core.render import render_action
 from wmh.core.types import Step, Trace
-from wmh.optimize.gepa import predict_observation
+from wmh.engine.grounding import (
+    Grounder,
+    SourceResolver,
+    prefetched_knowledge,
+    registry_grounded_knowledge,
+    source_grounded_knowledge,
+)
+from wmh.engine.workspace import (
+    RepoTreeResolver,
+    textop_grounded_knowledge,
+    tree_grounded_knowledge,
+)
+from wmh.optimize.gepa import distill_profile, predict_observation, verify_observation
 from wmh.optimize.judge import Judge
 from wmh.providers.base import Provider
 from wmh.retrieval import Retriever
@@ -51,6 +63,9 @@ class StepResult(BaseModel):
     critique: str = ""
     is_error_actual: bool = False
     is_error_predicted: bool = False
+    # The model's deliberation in reasoning mode (empty otherwise). Never part of the scored
+    # observation — carried so humans can read WHY the env decided success vs. error.
+    reasoning: str = ""
     valid: bool = True  # False = the judge failed on this step; excluded from fidelity aggregates
 
 
@@ -84,6 +99,15 @@ def replay(
     sample_turns: str = "all",
     seed: int = 0,
     concurrency: int = 1,
+    knowledge: str | None = None,
+    reasoning: bool = False,
+    grounder: Grounder | None = None,
+    verify: bool = False,
+    source: SourceResolver | None = None,
+    source_annotate_stale: bool = False,
+    tree: RepoTreeResolver | None = None,
+    profile: bool = False,
+    poll: bool = False,
     max_retrieved_observation_chars: int | None = None,
 ) -> ReplayReport:
     """Replay held-out steps, scoring predicted vs. actual observations.
@@ -92,6 +116,25 @@ def replay(
       (Qwen-AgentWorld's 5-turn protocol) using `seed` for reproducible turn selection.
     - `retriever` + `train` enable leak-free RAG (demos from the train corpus, never the own trace);
       omit either for zero-shot.
+    - `knowledge`/`reasoning`: the serving engine's agentic mode (rendered knowledge-base text +
+      the deliberate-then-answer contract). Callers own leak-freedom: `knowledge` must be derived
+      from TRAIN traces only (see `wmh.engine.knowledge.seed_knowledge`).
+    - `grounder`: prefetch a step's read-only `curl` GET URL live and put the real body in
+      context (mirrors the serving engine's prefetch). NON-HERMETIC — the web has moved since
+      capture — so it stays off everywhere except explicitly-labeled experiments.
+    - `verify`: a second self-check completion per step (draft re-examined against the evidence,
+      the revision is what gets scored). Doubles the per-step provider cost.
+    - `source`: ground FIRST-TOUCH file-read actions in the real pinned repo file (see
+      `SourceResolver`). Requires traces pinned by `instance_id`; steps on unpinned traces and
+      previously-touched paths are untouched.
+    - `profile`: one digest completion per step revises the teacher-forced history into a
+      current-state belief profile ("what is running NOW") injected alongside the knowledge —
+      the eval face of the serve-side `state_update` revision. Extra completion per step with
+      history.
+    - `poll`: two zero-completion grounding channels — live registry polls (PyPI/npm JSON for
+      `pip show/install` / `npm view` actions; NON-HERMETIC like `grounder`) and deterministic
+      text-op answers (wc/sort/uniq computed in pure Python over content the session itself
+      wrote; hermetic, refuses when the bytes aren't fully known).
     - `concurrency`: steps are independent (each a predict + judge round trip), so `concurrency > 1`
       scores them on a thread pool — the result is identical and order-preserving (only the wall
       clock changes). Default 1 keeps existing callers unchanged; raise it to cut latency on large
@@ -106,13 +149,17 @@ def replay(
     rng = random.Random(seed)
     # Materialize the (step, history) work list first — selection uses `rng` and must stay
     # sequential/deterministic; scoring each item is independent and order is restored below.
-    work: list[tuple[str, Step, list[Step]]] = []
+    work: list[tuple[str, str | None, Step, list[Step]]] = []
     for trace in held_out:
+        instance = trace.metadata.get("instance_id")
+        instance_id = instance if isinstance(instance, str) else None
         for step_index in _select_step_indices(trace, sample_turns, rng):
-            work.append((trace.trace_id, trace.steps[step_index], trace.steps[:step_index]))
+            work.append(
+                (trace.trace_id, instance_id, trace.steps[step_index], trace.steps[:step_index])
+            )
 
-    def _score(item: tuple[str, Step, list[Step]]) -> StepResult:
-        trace_id, step, history = item
+    def _score(item: tuple[str, str | None, Step, list[Step]]) -> StepResult:
+        trace_id, instance_id, step, history = item
         return _score_step(
             prompt,
             trace_id,
@@ -121,6 +168,16 @@ def replay(
             judge,
             demos,
             history,
+            knowledge=knowledge,
+            reasoning=reasoning,
+            grounder=grounder,
+            verify=verify,
+            source=source,
+            source_annotate_stale=source_annotate_stale,
+            tree=tree,
+            instance_id=instance_id,
+            profile=profile,
+            poll=poll,
             max_retrieved_observation_chars=max_retrieved_observation_chars,
         )
 
@@ -151,20 +208,69 @@ def _score_step(
     demos: DemoRetriever,
     history: list[Step],
     *,
+    knowledge: str | None = None,
+    reasoning: bool = False,
+    grounder: Grounder | None = None,
+    verify: bool = False,
+    source: SourceResolver | None = None,
+    source_annotate_stale: bool = False,
+    tree: RepoTreeResolver | None = None,
+    instance_id: str | None = None,
+    profile: bool = False,
+    poll: bool = False,
     max_retrieved_observation_chars: int | None = None,
 ) -> StepResult:
     """Predict the observation for one step and score it against the recorded observation."""
+    step_demos = demos.demos_for(trace_id, step)
+    step_knowledge = prefetched_knowledge(knowledge, step.action, grounder)
+    prior_actions = [h.action for h in history]
+    step_knowledge = source_grounded_knowledge(
+        step_knowledge,
+        step.action,
+        instance_id,
+        prior_actions,
+        source,
+        annotate_stale=source_annotate_stale,
+    )
+    step_knowledge = tree_grounded_knowledge(
+        step_knowledge, step.action, instance_id, prior_actions, tree, source
+    )
+    if poll:
+        step_knowledge = registry_grounded_knowledge(step_knowledge, step.action)
+        step_knowledge = textop_grounded_knowledge(step_knowledge, step.action, prior_actions)
+    if profile:
+        profile_text = distill_profile(provider, step.task, history)
+        if profile_text is not None:
+            block = f"## environment profile (revised from session history)\n{profile_text}"
+            step_knowledge = f"{step_knowledge}\n\n{block}" if step_knowledge else block
     predicted = predict_observation(
         provider,
         prompt,
         step.task,
         step.state_before,
         step.action,
-        demos=demos.demos_for(trace_id, step),
+        demos=step_demos,
         history=history,
+        knowledge=step_knowledge,
+        reasoning=reasoning,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
+    if verify:
+        predicted = verify_observation(
+            provider,
+            prompt,
+            step.task,
+            step.state_before,
+            step.action,
+            predicted,
+            demos=step_demos,
+            history=history,
+            knowledge=step_knowledge,
+            reasoning=reasoning,
+            max_retrieved_observation_chars=max_retrieved_observation_chars,
+        )
     verdict = judge.score(predicted, step.observation, step)
+    predicted_reasoning = predicted.metadata.get("reasoning")
     return StepResult(
         trace_id=trace_id,
         task=step.task,
@@ -176,6 +282,7 @@ def _score_step(
         critique=verdict.critique,
         is_error_actual=step.observation.is_error,
         is_error_predicted=predicted.is_error,
+        reasoning=predicted_reasoning if isinstance(predicted_reasoning, str) else "",
         valid=verdict.valid,
     )
 

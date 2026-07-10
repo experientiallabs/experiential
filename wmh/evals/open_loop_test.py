@@ -165,3 +165,49 @@ def test_evaluate_files_empty_when_no_traces(tmp_path) -> None:  # noqa: ANN001 
     report = evaluate_files([empty], "BASE", FakeProvider("{}"), FakeJudge(1.0))
     assert report.total_steps == 0
     assert report.overall_fidelity == 0.0
+
+
+class _AgenticFakeProvider(FakeProvider):
+    """Serves both the knowledge-seeding extraction call and the prediction calls."""
+
+    def __init__(self, reply: str) -> None:
+        super().__init__(reply)
+        self.seed_calls = 0
+        self.predict_users: list[str] = []
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        if "KNOWLEDGE BASE" in system:  # the seeding extraction pass
+            self.seed_calls += 1
+            return Completion(
+                text='{"rules": "- gate: lookups need a valid id", "entities": "", "schemas": ""}'
+            )
+        self.predict_users.append(messages[0].content)
+        return Completion(text=self._reply)
+
+
+def test_evaluate_files_knowledge_and_reasoning(tmp_path) -> None:  # noqa: ANN001 - fixture
+    corpus = tmp_path / "bench.otel.jsonl"
+    _write_corpus(corpus, n_traces=4)
+    provider = _AgenticFakeProvider('{"reasoning": "r", "output": "found u0", "is_error": false}')
+    report = evaluate_files(
+        [corpus],
+        "BASE",
+        provider,
+        FakeJudge(0.75),
+        embedder=HashingEmbedder(dim=32),
+        train_split=0.5,
+        knowledge=True,
+        reasoning=True,
+    )
+    assert report.total_steps > 0
+    assert provider.seed_calls >= 1  # KB was seeded (from the train split) before scoring
+    for user in provider.predict_users:
+        assert "gate: lookups need a valid id" in user  # every prediction saw the seeded KB
+        assert '"reasoning"' in user  # deliberate-then-answer contract requested

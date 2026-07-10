@@ -1,0 +1,32 @@
+{
+  "high": {
+    "fidelity": 0.8858170731707317,
+    "error_flag_accuracy": 0.9939024390243902,
+    "n_steps": 164,
+    "winner": "reason",
+    "considered": [
+      "base",
+      "reason"
+    ],
+    "embeddings": "semantic",
+    "gepa_budget": 8,
+    "serve_calls": 498,
+    "serve_cost_usd": 15.167
+  },
+  "max": {
+    "fidelity": 0.8815121951219513,
+    "error_flag_accuracy": 0.9939024390243902,
+    "n_steps": 164,
+    "winner": "reason+verify",
+    "considered": [
+      "base",
+      "reason",
+      "reason+kb",
+      "reason+verify"
+    ],
+    "embeddings": "semantic",
+    "gepa_budget": 16,
+    "serve_calls": 1181,
+    "serve_cost_usd": 47.509
+  }
+}

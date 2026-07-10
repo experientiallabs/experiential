@@ -1,0 +1,10 @@
+== terminal-tasks: 20 test traces
+  base    fidelity=0.851 error_flag_acc=0.961 n=51
+  reason  fidelity=0.875 error_flag_acc=0.980 n=51
+  error-flag flips base->reason: 1
+  [FIXED] action=tool_call bash({"command":"sleep 900 && date +%s"})
+    actual_is_error=True  reasoning: sleep 900 is 15 minutes. Previous long sleeps timed out. This will likely time out.
+== tau-bench: 20 test traces
+  base    fidelity=0.898 error_flag_acc=0.987 n=76
+  reason  fidelity=0.906 error_flag_acc=0.987 n=76
+  error-flag flips base->reason: 0

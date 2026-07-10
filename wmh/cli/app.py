@@ -55,8 +55,10 @@ from wmh.cli.ui import (
 from wmh.config import (
     ARTIFACT_DIR,
     DEFAULT_MODEL_NAME,
+    FIDELITY_TIERS,
     PROVIDER_ENV_VARS,
     ArtifactPaths,
+    FidelityTier,
     HarnessConfig,
     WorldModelStore,
     load_config,
@@ -78,6 +80,8 @@ from wmh.engine.eval_suites import (
     resolve_eval_suite,
     result_path,
 )
+from wmh.engine.grounding import GROUNDER_KINDS
+from wmh.engine.knowledge import KnowledgeBase
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
 from wmh.env.llm_agent import LLMAgent
@@ -183,6 +187,8 @@ class _EvalOptions:
     sample_turns: str
     seed: int
     top_k: int
+    knowledge: bool
+    reasoning: bool
 
 
 @config_app.command("telemetry")
@@ -313,10 +319,14 @@ def build(
         None, "--judge-model", help="Canonical GEPA judge model type (default: cheap per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    fidelity: str = typer.Option(
+        "medium",
+        help="Build effort: low (RAG only) | medium (+light GEPA + cheap-lever search) | "
+        "high (+GEPA + config search) | max (deep GEPA + full config search).",
+    ),
     chain: str = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
     ),
-    gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
     ),
@@ -325,6 +335,20 @@ def build(
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure embedding deployment."),
     embed_dim: int = typer.Option(512, help="phi dimensionality (index + query must agree)."),
+    knowledge: bool = typer.Option(
+        False,
+        "--knowledge/--no-knowledge",
+        help="Seed a knowledge base (rules/entities/schemas markdown) from the train traces.",
+    ),
+    reasoning: bool = typer.Option(
+        False,
+        "--reasoning/--no-reasoning",
+        help="Serve with the deliberate-then-answer output contract.",
+    ),
+    grounder: str = typer.Option(
+        "none",
+        help="Web grounding for unknown entities: none | brave (needs BRAVE_SEARCH_API_KEY).",
+    ),
     interactive: bool = typer.Option(
         None,
         "--interactive/--no-interactive",
@@ -362,7 +386,7 @@ def build(
         provider=provider,
         model=model,
         region=region,
-        gepa_budget=gepa_budget,
+        fidelity=fidelity,
         train_split=train_split,
         judge_model=judge_model,
         embed_provider=embed_provider,
@@ -390,6 +414,14 @@ def build(
         validate_name(params.name)
     except ValueError as err:
         raise typer.BadParameter(str(err)) from None
+    try:
+        tier = FidelityTier(params.fidelity)
+    except ValueError:
+        tiers = ", ".join(t.value for t in FidelityTier)
+        raise typer.BadParameter(
+            f"unknown fidelity {params.fidelity!r}; choose one of: {tiers}"
+        ) from None
+    spec = FIDELITY_TIERS[tier]
     try:
         serve_provider = ProviderKind(params.provider)
     except ValueError:
@@ -421,11 +453,20 @@ def build(
         embed_provider=embed_kind,
         embed_model=params.embed_model,
         embed_dim=params.embed_dim,
-        gepa_budget=params.gepa_budget,
+        gepa_budget=spec.gepa_budget,
         train_split=params.train_split,
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
         trace_adapter=params.source,
     )
+    if grounder not in GROUNDER_KINDS:
+        raise typer.BadParameter(
+            f"unknown grounder {grounder!r}; choose one of: {', '.join(GROUNDER_KINDS)}"
+        )
+    # Agentic-mode flags (CLI-only, not in the wizard): persisted to config.toml so serve/load
+    # pick them up; knowledge additionally seeds knowledge/ during this build.
+    config.knowledge = knowledge
+    config.reasoning = reasoning
+    config.grounder = grounder
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
     # silently swallows it and "succeeds" with a useless held-out-0.0 model.
@@ -470,6 +511,11 @@ def build(
             judge_provider=metered_judge,
             embedder=get_embedder(config),
             reporter=TelemetryBuildReporter(reporter, build_stats),
+            max_fidelity=spec.config_search,
+            fidelity_budget=spec.search_budget,
+            full_search=spec.full_ladder,
+            cheap_search=spec.cheap_frontier_only,
+            gepa_val_cap=spec.gepa_val_cap or None,
         )
     record = tracker.record_summary()
     save_run(record, ArtifactPaths(model_dir).runs)
@@ -492,7 +538,7 @@ def build(
         _console.print(f"[yellow]warning[/yellow]: could not write card.json: {err}")
     capture_build_completed(
         stats=build_stats,
-        gepa_budget=params.gepa_budget,
+        gepa_budget=spec.gepa_budget,
         rollouts_used=result.metrics.rollouts_used,
         frontier_size=len(result.frontier),
         record=record,
@@ -500,6 +546,15 @@ def build(
     )
 
     _console.print(build_summary_panel(store.info(params.name), model_dir))
+    auto_report = Path(model_dir) / "auto_fidelity.json"
+    if auto_report.exists():
+        auto = json.loads(auto_report.read_text(encoding="utf-8"))
+        scores = ", ".join(f"{k}={v:.3f}" for k, v in auto["scores"].items())
+        _console.print(
+            f"[bold]max-fidelity config[/bold]: [bold]{auto['winner_label']}[/bold] "
+            f"({scores}; {auto['val_traces']} held-out traces) — activate with "
+            f"`wmh serve --max-fidelity` / `wmh play --max-fidelity`"
+        )
     _console.print(
         f"[bold]run[/bold] {record.run_id[:8]}: {record.duration_seconds:.1f}s, "
         f"{record.total.total_tokens} tokens, ${record.total.cost_usd:.4f} "
@@ -655,6 +710,12 @@ def serve(
         "--root",
         help="Project dir(s) to serve from. Repeatable; server-side builds land in the first.",
     ),
+    max_fidelity: bool = typer.Option(
+        False,
+        "--max-fidelity",
+        help="Serve with the online extras on: the build-measured winning config when the "
+        "artifact has one, otherwise every extra it supports. Default: pure RAG.",
+    ),
 ) -> None:
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
@@ -666,7 +727,7 @@ def serve(
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
     # not a traceback; load the models before uvicorn takes over the process.
     try:
-        server_app = create_app(list(root), names=names)
+        server_app = create_app(list(root), names=names, max_fidelity=max_fidelity)
     except (ValueError, FileNotFoundError) as err:
         raise typer.BadParameter(str(err)) from None
     uvicorn.run(server_app, host="127.0.0.1", port=port)
@@ -705,6 +766,16 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     seed: int | None = typer.Option(None, help="Seed for reproducible turn sampling."),
     top_k: int | None = typer.Option(
         None, help="Retrieved demos per step (default: 5, or suite config)."
+    ),
+    knowledge: bool | None = typer.Option(
+        None,
+        "--knowledge/--no-knowledge",
+        help="Seed a knowledge base from the train split and render it into every prediction.",
+    ),
+    reasoning: bool | None = typer.Option(
+        None,
+        "--reasoning/--no-reasoning",
+        help="Deliberate-then-answer output contract (explicit reasoning pass).",
     ),
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
     examples_root: str | None = typer.Option(
@@ -826,6 +897,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             sample_turns=sample_turns,
             seed=seed,
             top_k=top_k,
+            knowledge=knowledge,
+            reasoning=reasoning,
             out=out,
         )
         return
@@ -843,6 +916,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         sample_turns=sample_turns,
         seed=seed,
         top_k=top_k,
+        knowledge=knowledge,
+        reasoning=reasoning,
     )
     report = _run_eval_files(
         [Path(f) for f in args],
@@ -943,6 +1018,8 @@ def _eval_run_suite(
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
+    knowledge: bool | None,
+    reasoning: bool | None,
     out: str | None,
 ) -> None:
     suite = resolve_eval_suite(selector, examples_roots)
@@ -955,6 +1032,8 @@ def _eval_run_suite(
         sample_turns=sample_turns or suite.config.sample_turns,
         seed=seed if seed is not None else suite.config.seed,
         top_k=top_k if top_k is not None else suite.config.top_k,
+        knowledge=knowledge if knowledge is not None else suite.config.knowledge,
+        reasoning=reasoning if reasoning is not None else suite.config.reasoning,
     )
     files = suite.resolve_files()
     report = _run_eval_files(files, options, provider=provider, model=model, region=region)
@@ -982,6 +1061,8 @@ def _eval_run_suite(
             "seed": options.seed,
             "rag": options.use_rag,
             "embed_dim": options.embed_dim,
+            "knowledge": options.knowledge,
+            "reasoning": options.reasoning,
         },
         "report": _eval_report_payload(report),
     }
@@ -1008,6 +1089,8 @@ def _eval_options(
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
+    knowledge: bool | None = None,
+    reasoning: bool | None = None,
 ) -> _EvalOptions:
     split = 0.7 if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
@@ -1031,6 +1114,8 @@ def _eval_options(
         sample_turns=turns,
         seed=rng_seed,
         top_k=demos,
+        knowledge=bool(knowledge),
+        reasoning=bool(reasoning),
     )
 
 
@@ -1070,6 +1155,8 @@ def _run_eval_files(
         top_k=options.top_k,
         sample_turns=options.sample_turns,
         seed=options.seed,
+        knowledge=options.knowledge,
+        reasoning=options.reasoning,
     )
     return evaluation.run()
 
@@ -1101,6 +1188,32 @@ def _eval_report_payload(report: EvalReport) -> JsonObject:
         "total_invalid": report.total_invalid,
         "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
     }
+
+
+@app.command("knowledge")
+def knowledge_(
+    name: str = typer.Option(None, "--name", help="World model (default: the only one)."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+) -> None:
+    """Show a model's knowledge base: the env's canonical facts, a folder of editable markdown.
+
+    The printed directory IS the editing interface — open it in any editor. `rules.md`/
+    `entities.md`/`schemas.md` are seeded at build (with knowledge enabled); `learned.md` collects
+    the env's own cross-session notes; `grounded.md` caches web-search groundings.
+    """
+    store = WorldModelStore(root)
+    resolved = _resolve_name(store, name)
+    kb = KnowledgeBase(ArtifactPaths(store.resolve(resolved)).knowledge)
+    _console.print(f"[bold]{kb.directory}[/bold]")
+    if kb.is_empty:
+        _console.print(
+            "(empty — enable knowledge at build, drop *.md files in this folder, "
+            "or PUT files via the serving API)"
+        )
+        return
+    for file_name, content in kb.files().items():
+        _console.print(f"\n[bold]## {file_name}[/bold]")
+        _console.print(content.strip())
 
 
 @scenarios_app.command("build")
@@ -1349,9 +1462,14 @@ def demo(
         "--show-prompt/--no-prompt",
         help="Print the exact env prompt the world model sees for the first step.",
     ),
+    max_fidelity: bool = typer.Option(
+        False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
+    ),
 ) -> None:
     """Replay a randomly sampled recorded scenario against the world model, open loop."""
-    wm, resolved_name, _provider, model_root = _load_model_any(name, root)
+    wm, resolved_name, _provider, model_root = _load_model_any(
+        name, root, max_fidelity=max_fidelity
+    )
     traces_file = Path(traces) if traces else _traces_for_root(model_root)
     if traces_file is None or not traces_file.exists():
         raise typer.BadParameter(
@@ -1468,9 +1586,14 @@ def play(
     name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    max_fidelity: bool = typer.Option(
+        False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
+    ),
 ) -> None:
     """Step into the environment yourself: type actions, the world model returns observations."""
-    wm, resolved_name, _provider, _model_root = _load_model_any(name, root)
+    wm, resolved_name, _provider, _model_root = _load_model_any(
+        name, root, max_fidelity=max_fidelity
+    )
     suggestions = _action_suggestions(wm)
     run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
 
@@ -1500,14 +1623,14 @@ def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
     return suggestions
 
 
-def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider, Path)
+def _load_model_any(name: str | None, root: str, *, max_fidelity: bool = False):  # noqa: ANN202
     """Resolve a model across the project dir AND shipped examples, then load it.
 
     An explicit non-default `--root` keeps the old single-root behavior. Otherwise the picker
     spans `<root>/models/*` plus `examples/*/models/*`, labeling each with its source.
     """
     if root != ARTIFACT_DIR:
-        wm, resolved, provider = _load_model(name, root)
+        wm, resolved, provider = _load_model(name, root, max_fidelity=max_fidelity)
         return wm, resolved, provider, Path(root)
 
     candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
@@ -1541,7 +1664,7 @@ def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel,
         have = ", ".join(c[2] for c in candidates)
         raise typer.BadParameter(f"multiple world models ({have}); pass --name")
 
-    wm, resolved, provider = _load_model(resolved, str(store_root))
+    wm, resolved, provider = _load_model(resolved, str(store_root), max_fidelity=max_fidelity)
     return wm, resolved, provider, store_root
 
 
@@ -1938,12 +2061,13 @@ class _RetryNarrator:
 _NARRATOR = _RetryNarrator(_console)
 
 
-def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider)
+def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # noqa: ANN202
     """Resolve + load a named world model (or the single built one) with its serve provider.
 
     The serve provider comes from the MODEL'S OWN config (the one it was built to serve on),
     wrapped so transient capacity errors retry with narrated exponential backoff instead of
-    dying. Returns `(world_model, resolved_name, provider)`.
+    dying. `max_fidelity` = the online extras (see `WorldModel.load`); default is pure RAG.
+    Returns `(world_model, resolved_name, provider)`.
     """
     store = WorldModelStore(root)
     resolved_name = _resolve_name(store, name)
@@ -1954,7 +2078,9 @@ def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, nam
         on_retry=_NARRATOR.on_retry,
         sleep=_NARRATOR.sleep,
     )
-    world_model = WorldModel.load(str(model_dir), provider, telemetry_root=store.root)
+    world_model = WorldModel.load(
+        str(model_dir), provider, telemetry_root=store.root, max_fidelity=max_fidelity
+    )
     return world_model, resolved_name, provider
 
 

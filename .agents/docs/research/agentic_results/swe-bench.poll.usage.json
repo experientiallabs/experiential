@@ -1,0 +1,44 @@
+[
+  {
+    "label": "reason+poll@24",
+    "seed": 0,
+    "run_id": "c661b917287f40ac8b0820260f8b6b6a",
+    "kind": "research",
+    "duration_seconds": 232.97666462502093,
+    "total": {
+      "calls": 106,
+      "input_tokens": 1259968,
+      "output_tokens": 54235,
+      "cost_usd": 7.655714999999999
+    },
+    "by_phase": {
+      "serve": {
+        "calls": 106,
+        "input_tokens": 1259968,
+        "output_tokens": 54235,
+        "cost_usd": 7.655714999999999
+      }
+    }
+  },
+  {
+    "label": "reason+poll@24",
+    "seed": 1,
+    "run_id": "4a17e38c5c3949c7b4ad0d8934a799fd",
+    "kind": "research",
+    "duration_seconds": 227.9057370829978,
+    "total": {
+      "calls": 106,
+      "input_tokens": 1325248,
+      "output_tokens": 51764,
+      "cost_usd": 7.9203399999999995
+    },
+    "by_phase": {
+      "serve": {
+        "calls": 106,
+        "input_tokens": 1325248,
+        "output_tokens": 51764,
+        "cost_usd": 7.9203399999999995
+      }
+    }
+  }
+]

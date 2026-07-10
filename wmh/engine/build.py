@@ -8,9 +8,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 
 from wmh.config import ArtifactPaths, HarnessConfig, save_config
 from wmh.core.types import Trace
+from wmh.engine.autoconfig import (
+    DEFAULT_VAL_CAP,
+    CorpusSignature,
+    search_max_fidelity,
+    select_candidates,
+)
+from wmh.engine.knowledge import KnowledgeBase, seed_knowledge
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.reporting import BuildReporter, NullReporter
 from wmh.ingest import VendorPull, get_adapter
@@ -100,6 +108,11 @@ def build(
     judge_provider: Provider | None = None,
     embedder: Embedder | None = None,
     reporter: BuildReporter | None = None,
+    max_fidelity: bool = False,
+    fidelity_budget: int = DEFAULT_VAL_CAP,
+    full_search: bool = False,
+    cheap_search: bool = False,
+    gepa_val_cap: int | None = None,
 ) -> OptimizeResult:
     """Ingest traces and run the full build, creating + persisting the artifact under `root`.
 
@@ -110,6 +123,14 @@ def build(
     fitness metric is scored by one model throughout even while rollouts fail over. `reporter`
     receives progress events (defaults to a no-op). Returns the GEPA OptimizeResult (also
     persisted).
+
+    `config.gepa_budget <= 0` skips prompt optimization entirely (the low fidelity tier: RAG
+    over the base prompt). `max_fidelity` runs the auto-configuration search after the build
+    (see `wmh.engine.autoconfig`): candidates — pruned by corpus signature unless
+    `full_search` — are replay-scored on `fidelity_budget` held-out traces with the prompt the
+    artifact will serve, and the result lands in `auto_fidelity.json`. The search never changes
+    the serve DEFAULTS (plain RAG unless flags were set explicitly): the winner activates at
+    runtime via `--max-fidelity`.
     """
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)
@@ -137,6 +158,17 @@ def build(
             judge_provider = provider
     embed = embedder or HashingEmbedder(dim=config.embed_dim)
 
+    # Optional knowledge base: extract canonical env facts (rules/gates, entities, schemas) from
+    # the TRAIN split only — the same leak-free discipline as retrieval — into human-editable
+    # markdown under knowledge/. Falls back to the full corpus only when the corpus is too small
+    # to split (mirrors the `test or train` GEPA fallback below).
+    # Known simplification: GEPA below still evolves the prompt under the BASE output contract,
+    # even when this artifact will serve with knowledge/reasoning. That composes — the evolved
+    # SYSTEM prompt never encodes the output contract (it is appended per-completion by
+    # build_env_prompt) — but the optimizer is not yet selecting under agentic-mode conditions.
+    if config.knowledge:
+        seed_knowledge(KnowledgeBase(paths.knowledge), train or traces, provider)
+
     # Serving index over the full corpus: at serve time we retrieve from everything we have seen.
     retriever = EmbeddingRetriever(embed)
     retriever.index(traces)
@@ -157,27 +189,77 @@ def build(
     def _on_rollout(done: int, score: float | None) -> None:
         report.rollout(done, metric_total["calls"], score)
 
-    # Optimize against the SAME rubric we evaluate with (RubricJudge). NOTE: the judge MODEL may
-    # differ — config.judge_model defaults to a cheap per-provider model for GEPA cost, while
-    # `wmh eval` pins the judge to the requested serve-grade model — so held_out_accuracy is only
-    # directly comparable to eval fidelity when --judge-model matches the eval judge.
-    optimizer = GEPAOptimizer(
-        provider,
-        RubricJudge(judge_provider),
-        retriever=EmbeddingRetriever(embed),
-        on_rollout=_on_rollout,
-        on_budget=_on_budget,
-        on_activity=report.activity,
-    )
-    # Every GEPA iteration re-scores the whole valset, so an uncapped held-out split multiplies
-    # wall-clock and spend by its step count for no selection benefit (fidelity saturates fast —
-    # see docs/trace_scaling_law.md). Candidate selection only needs a stable sample; the full
-    # held-out split still backs `wmh eval`.
-    gepa_val = _cap_gepa_valset(val or train)
-    result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
+    if config.gepa_budget <= 0:
+        # Low fidelity tier: no prompt optimization — the artifact serves the base prompt with
+        # RAG. OptimizeResult's zeroed metrics honestly say "nothing was optimized".
+        result = OptimizeResult(prompt=BASE_ENV_PROMPT)
+    else:
+        # Optimize against the SAME rubric we evaluate with (RubricJudge). NOTE: the judge MODEL
+        # may differ — config.judge_model defaults to a cheap per-provider model for GEPA cost,
+        # while `wmh eval` pins the judge to the requested serve-grade model — so
+        # held_out_accuracy is only directly comparable to eval fidelity when --judge-model
+        # matches the eval judge.
+        optimizer = GEPAOptimizer(
+            provider,
+            RubricJudge(judge_provider),
+            retriever=EmbeddingRetriever(embed),
+            on_rollout=_on_rollout,
+            on_budget=_on_budget,
+            on_activity=report.activity,
+        )
+        # Candidate selection only needs a stable, SMALL sample: every GEPA iteration re-scores
+        # the whole valset, and steps (not traces) are what bound cost — a long-trace corpus once
+        # turned a 4-iteration tier into $131. The default ceiling applies always; a fidelity
+        # tier may widen it (`gepa_val_cap`, in steps).
+        gepa_val = _cap_gepa_valset(val or train, gepa_val_cap or _GEPA_VAL_STEP_CAP)
+        result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
     report.optimize_done(
         result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used
     )
+
+    if max_fidelity:
+        # Score the candidate configs on the held-out split with the prompt the artifact will
+        # serve (leak-free: demos + candidate KB from train only; `test or train` mirrors GEPA's
+        # tiny-corpus fallback). The result is a RUNTIME menu, not a serve default: the report is
+        # persisted (plus the KB when the winner needs it) and `--max-fidelity` activates the
+        # winner when the model is run — plain runs stay pure RAG.
+        # The build's search considers only candidates the RUNTIME can activate — no
+        # source_pins here: the workspace candidate is research-measurable (the tiers runner
+        # passes pins), but serve-side activation doesn't exist yet, and a persisted winner
+        # the runtime can't serve would make auto_fidelity.json a lie.
+        # Seed the KB into the ARTIFACT before the search and hand its rendered text in, so a
+        # knowledge winner's score was measured on the exact KB that serves (and the extraction
+        # runs once, not once ephemeral + once to persist). If no knowledge candidate wins, the
+        # seeded dir is removed again — a plain artifact stays knowledge-free.
+        kb_seeded_for_search = False
+        signature = CorpusSignature.from_traces(train or traces)
+        menu = select_candidates(signature, full_ladder=full_search, cheap_only=cheap_search)
+        if any(c.knowledge for c in menu) and not paths.knowledge.is_dir():
+            seed_knowledge(KnowledgeBase(paths.knowledge), train or traces, provider)
+            kb_seeded_for_search = True
+        kb = KnowledgeBase(paths.knowledge)
+        auto = search_max_fidelity(
+            result.prompt,
+            train or traces,
+            test or train,
+            provider,
+            RubricJudge(judge_provider),
+            embed,
+            val_cap=fidelity_budget,
+            full_ladder=full_search,
+            cheap_only=cheap_search,
+            # Whatever the artifact's KB renders (even empty) is what candidates measure —
+            # passing None here would let the search re-extract a DIFFERENT ephemeral KB
+            # and crown a winner the shipped artifact cannot reproduce.
+            knowledge_text=kb.render() if paths.knowledge.is_dir() else None,
+        )
+        if kb_seeded_for_search and not auto.winner.knowledge and not config.knowledge:
+            # The search created the KB only to measure the kb candidate; a non-knowledge
+            # winner means the artifact should stay knowledge-free (a knowledge/ dir is a
+            # user-visible surface).
+            shutil.rmtree(paths.knowledge, ignore_errors=True)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.auto_fidelity.write_text(auto.model_dump_json(indent=2), encoding="utf-8")
 
     _persist(paths, config, retriever, result)
     return result

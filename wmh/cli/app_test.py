@@ -131,8 +131,8 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
             str(root),
             "--provider",
             "bedrock",
-            "--gepa-budget",
-            "4",
+            "--fidelity",
+            "low",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -165,9 +165,37 @@ def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_pa
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    core = {"build", "list", "serve", "demo", "eval", "play", "download"}
+    core = {"build", "list", "serve", "demo", "eval", "play", "download", "knowledge"}
     platform = {"login", "logout", "status", "push", "pull", "run"}
     assert names == core | platform
+
+
+def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture
+    from wmh.config import save_config
+    from wmh.config.config import HarnessConfig
+    from wmh.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmh"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(), root=model_dir)
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "knowledge" in result.output  # the folder path (the real editing surface)
+    assert "rules.md" in result.output
+    assert "gate: auth required" in result.output
+
+
+def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # noqa: ANN001
+    from wmh.config import save_config
+    from wmh.config.config import HarnessConfig
+
+    root = tmp_path / ".wmh"
+    save_config(HarnessConfig(), root=root / "models" / "airline")
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "empty" in result.output.lower()
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -512,7 +540,7 @@ def test_build_interactive_wizard_creates_model(
             "1",  # model: us.anthropic.claude-opus-4-8
             "us-east-1",
             "",  # judge model: accept the bedrock default (dated haiku)
-            "4",  # gepa budget
+            "1",  # fidelity: low (RAG only)
             "1",  # embedder: hashing
         ]
     )

@@ -29,6 +29,7 @@ _CAPACITY_ERROR_CODES = frozenset(
         "ModelNotReadyException",
         "ModelTimeoutException",
         "InternalServerException",  # transient 5xx, safe to fail over
+        "InternalFailure",  # botocore's generic 5xx code (killed a live full-slice eval run)
     }
 )
 
@@ -87,6 +88,22 @@ def _from_trusted_sdk(exc: Exception) -> bool:
     return module.split(".")[0] in _TRUSTED_SDK_MODULES
 
 
+# Botocore transport-failure base classes, matched anywhere in the exception's MRO by
+# (module, name) so subclasses we have never seen still classify without importing botocore.
+# Message matching alone lost this game twice: ConnectionClosedError and EndpointConnectionError
+# each killed a multi-dollar run before their phrasing joined _TRANSPORT_MARKERS.
+_BOTOCORE_TRANSPORT_BASES = frozenset({"ConnectionError", "HTTPClientError"})
+
+
+def _is_botocore_transport_error(exc: Exception) -> bool:
+    """Whether `exc` is any member of botocore's ConnectionError/HTTPClientError family."""
+    for klass in type(exc).__mro__:
+        module = getattr(klass, "__module__", "") or ""
+        if module.split(".")[0] == "botocore" and klass.__name__ in _BOTOCORE_TRANSPORT_BASES:
+            return True
+    return False
+
+
 def outcome_for(exc: Exception) -> Outcome:
     """Classify an exception raised by a backend attempt.
 
@@ -95,10 +112,12 @@ def outcome_for(exc: Exception) -> Outcome:
          by definition (outer waterfalls/retry loops must treat it as transient).
       2. Structured botocore error code — authoritative; a non-capacity code stops here so a
          message substring can never overrule it.
-      3. SDK exception type name, gated on the defining module.
-      4. HTTP status, from a `status_code` attribute on the exception or on its `.response`
+      3. Botocore's ConnectionError/HTTPClientError family, matched by MRO (module, name) —
+         transport failures whose subclasses carry no code and keep inventing new phrasings.
+      4. SDK exception type name, gated on the defining module.
+      5. HTTP status, from a `status_code` attribute on the exception or on its `.response`
          (httpx.HTTPStatusError carries it there), same module gate.
-      5. Conservative transport-phrase substrings for structureless errors.
+      6. Conservative transport-phrase substrings for structureless errors.
     """
     if isinstance(exc, WaterfallExhausted):
         return "capacity_error"
@@ -111,6 +130,9 @@ def outcome_for(exc: Exception) -> Outcome:
         code = error.get("Code") if isinstance(error, dict) else None
         if code is not None:
             return "capacity_error" if code in _CAPACITY_ERROR_CODES else "client_error"
+
+    if _is_botocore_transport_error(exc):
+        return "capacity_error"
 
     if _from_trusted_sdk(exc):
         if type(exc).__name__ in _SDK_CAPACITY_TYPE_NAMES:

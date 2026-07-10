@@ -23,7 +23,9 @@ import logging
 from collections.abc import Callable
 
 from wmh.core.types import Step, Trace
+from wmh.engine.grounding import Grounder, SourceResolver
 from wmh.engine.replay import replay
+from wmh.engine.workspace import RepoTreeResolver
 from wmh.optimize.gepa import GEPAOptimizer, OptimizeResult
 from wmh.optimize.judge import RUBRIC_DIMENSIONS, Judge, RubricDimension
 from wmh.providers.base import Embedder, Provider
@@ -84,6 +86,15 @@ def score_prompt(
     max_retrieved_observation_chars: int | None = None,
     retrieval_key: RetrievalKey = "state_action",
     score_dimension: RubricDimension | None = None,
+    knowledge: str | None = None,
+    reasoning: bool = False,
+    grounder: Grounder | None = None,
+    verify: bool = False,
+    source: SourceResolver | None = None,
+    source_annotate_stale: bool = False,
+    tree: RepoTreeResolver | None = None,
+    profile: bool = False,
+    poll: bool = False,
 ) -> float:
     """Replay-score `prompt`'s held-out fidelity, leak-free. Returns the mean judge score (0..1).
 
@@ -92,7 +103,9 @@ def score_prompt(
     (not a private loop) means the rubric/judge the rest of the harness uses scores ablations too.
     `sample_turns="sampled"` scores Qwen-AgentWorld's 5 turns per trace (cheaper on big test sets);
     `seed` makes that turn selection reproducible. `retrieval_key` selects what phi embeds:
-    "state_action" (full summary) or "action" (command-only).
+    "state_action" (full summary) or "action" (command-only). `knowledge`/`reasoning` are the
+    serving engine's agentic mode (knowledge must be train-derived — callers own that
+    discipline).
 
     `score_dimension` (a `RubricJudge` dimension, e.g. "factuality") returns that dimension's mean
     over validly-judged steps instead of the mean-of-dimensions headline. The headline is largely
@@ -125,6 +138,15 @@ def score_prompt(
         sample_turns=sample_turns,
         seed=seed,
         concurrency=concurrency,
+        knowledge=knowledge,
+        reasoning=reasoning,
+        grounder=grounder,
+        verify=verify,
+        source=source,
+        source_annotate_stale=source_annotate_stale,
+        tree=tree,
+        profile=profile,
+        poll=poll,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
     if report.n_steps and report.n_invalid == report.n_steps:

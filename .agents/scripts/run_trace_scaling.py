@@ -23,19 +23,22 @@ to Opus 4.8; `--opt-model` sets the model GEPA optimizes/serves with (4.6/4.7 ar
 from __future__ import annotations
 
 import argparse
+import uuid
+import json
 from collections.abc import Callable
 from pathlib import Path
 
 from wmh.engine.eval_suites import resolve_eval_suite
 from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import get_adapter
+from wmh.ingest import drop_degenerate_traces, get_adapter
 from wmh.optimize.judge import Judge, RubricJudge
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
+from wmh.providers import ProviderConfig, ProviderKind, get_provider, provider_or_chain
 from wmh.providers.base import Embedder, Provider
 from wmh.providers.retry import RetryingProvider
 from wmh.research import TraceScalingAblation, run_ablation
 from wmh.research.ablation import AblationReport, Condition
 from wmh.retrieval import HashingEmbedder
+from wmh.tracking import MeteredProvider, Phase, RunRecord, RunTracker
 
 
 # Default scaling ladder: log-spaced from a single trace up, capped at the corpus by the ablation
@@ -51,6 +54,21 @@ def _parse_strs(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
 
+class _CachedEmbedder:
+    """Memoize embeddings across runs: seeds re-index the SAME train steps."""
+
+    def __init__(self, inner: Embedder) -> None:
+        self._inner = inner
+        self._cache: dict[str, list[float]] = {}
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        missing = [t for t in texts if t not in self._cache]
+        if missing:
+            for text, vector in zip(missing, self._inner.embed(missing), strict=True):
+                self._cache[text] = vector
+        return [self._cache[t] for t in texts]
+
+
 def _build_embedder(args: argparse.Namespace) -> Embedder | None:
     """The phi embedder: None (--no-rag), offline hashing, or Azure ada-002 (--embedder azure).
 
@@ -59,6 +77,21 @@ def _build_embedder(args: argparse.Namespace) -> Embedder | None:
     """
     if args.no_rag:
         return None
+    if args.embedder == "titan":
+        # Bedrock Titan semantic phi — memoized: the search re-indexes the SAME train steps.
+        return _CachedEmbedder(
+            RetryingProvider(
+                get_provider(
+                    ProviderConfig(
+                        kind=ProviderKind.BEDROCK,
+                        model=args.opt_model,
+                        region=args.region,
+                        embed_model="amazon.titan-embed-text-v2:0",
+                        embed_dim=512,
+                    )
+                )
+            )
+        )
     if args.embedder == "azure":
         return RetryingProvider(
             get_provider(
@@ -75,8 +108,31 @@ def _build_embedder(args: argparse.Namespace) -> Embedder | None:
     return HashingEmbedder(dim=args.embed_dim)
 
 
+class _MeterBank:
+    """One fresh serve-side RunTracker per ablation run (target cost per cell; judge separate)."""
+
+    def __init__(self) -> None:
+        self._pending: RunTracker | None = None
+        self.by_run: list[tuple[str, int, RunRecord]] = []
+
+    def fresh(self) -> RunTracker:
+        tracker = RunTracker(run_id=uuid.uuid4().hex, kind="research")
+        tracker.start()
+        self._pending = tracker
+        return tracker
+
+    def take(self, label: str, seed: int) -> RunRecord | None:
+        if self._pending is None:
+            return None
+        record = self._pending.record_summary()
+        self.by_run.append((label, seed, record))
+        self._pending = None
+        return record
+
+
 def _make_backends(
     args: argparse.Namespace,
+    bank: _MeterBank,
 ) -> Callable[[], tuple[Provider, Judge, Embedder | None]]:
     """Factory the ablation calls per run for (provider, judge, embedder).
 
@@ -86,8 +142,11 @@ def _make_backends(
     transient Bedrock capacity errors. The embedder is offline hashing (default), Azure ada-002
     (`--embedder azure`, semantic), or None (`--no-rag`).
     """
-    serve: Provider = RetryingProvider(
-        get_provider(
+    # Serve rides the config-driven failover chain (.wmh/fallback.toml rungs incl. the
+    # Anthropic-direct last resort) inside retry backoff; the JUDGE stays pinned to a single
+    # backend — a judge that switches models mid-run scores steps on different scales.
+    serve_raw: Provider = RetryingProvider(
+        provider_or_chain(
             ProviderConfig(kind=ProviderKind.BEDROCK, model=args.opt_model, region=args.region)
         )
     )
@@ -100,7 +159,8 @@ def _make_backends(
     embedder = _build_embedder(args)
 
     def factory() -> tuple[Provider, Judge, Embedder | None]:
-        return serve, scorer, embedder
+        metered = MeteredProvider(serve_raw, bank.fresh(), base_phase=Phase.SERVE)
+        return metered, scorer, embedder
 
     return factory
 
@@ -118,16 +178,20 @@ def _load_corpus(args: argparse.Namespace) -> tuple[list, str]:  # noqa: ANN201 
     return adapter.from_file(args.file), Path(args.file).name
 
 
-def _run(args: argparse.Namespace) -> AblationReport:
+def _run(args: argparse.Namespace) -> tuple[AblationReport, _MeterBank]:
     traces, label = _load_corpus(args)
+    if args.drop_degenerate:
+        traces, dropped = drop_degenerate_traces(traces)
+        print(f"corpus hygiene: dropped {dropped} degenerate (all-empty-observation) traces")
     if not traces:
         raise SystemExit("no traces ingested")
 
+    bank = _MeterBank()
     seeds = _parse_ints(args.seeds)
     ablation = TraceScalingAblation(
         traces,
         BASE_ENV_PROMPT,
-        make_backends=_make_backends(args),
+        make_backends=_make_backends(args, bank),
         counts=_parse_ints(args.counts),
         modes=_parse_strs(args.modes),
         budget=args.budget,
@@ -140,6 +204,7 @@ def _run(args: argparse.Namespace) -> AblationReport:
         max_retrieved_observation_chars=args.max_retrieved_observation_chars,
         retrieval_key=args.retrieval_key,
         score_dimension=args.score_dimension,
+        source_pins=args.source_pins,
     )
     split = ablation.split
     scored = len(ablation.scored_test)
@@ -156,9 +221,17 @@ def _run(args: argparse.Namespace) -> AblationReport:
     )
 
     def _progress(condition: Condition, seed: int, score: float) -> None:
-        print(f"  {condition.label:14} seed={seed}  fidelity={score:.3f}", flush=True)
+        record = bank.take(condition.label, seed)
+        note = ""
+        if record is not None:
+            t = record.total
+            note = (
+                f"  serve: {t.calls} calls, {t.input_tokens}in/{t.output_tokens}out tok, "
+                f"${t.cost_usd:.3f}, {record.duration_seconds:.0f}s"
+            )
+        print(f"  {condition.label:14} seed={seed}  fidelity={score:.3f}{note}", flush=True)
 
-    return run_ablation(ablation, seeds, on_run=_progress)
+    return run_ablation(ablation, seeds, on_run=_progress), bank
 
 
 def main() -> None:
@@ -205,8 +278,9 @@ def main() -> None:
     parser.add_argument("--region", default="us-east-1", help="AWS region (Bedrock).")
     parser.add_argument("--embed-dim", type=int, default=512, help="phi dim (hashing embedder).")
     parser.add_argument(
-        "--embedder", default="hashing", choices=["hashing", "azure"],
-        help="Retrieval phi: hashing (lexical, offline) | azure (semantic ada-002).",
+        "--embedder", default="hashing", choices=["hashing", "azure", "titan"],
+        help="Retrieval phi: hashing (lexical, offline) | azure (semantic ada-002) | "
+        "titan (Bedrock semantic; memoized per process).",
     )
     parser.add_argument(
         "--embed-endpoint", default="https://endflow-southcentralus.openai.azure.com",
@@ -232,17 +306,46 @@ def main() -> None:
         help="Report one RubricJudge dimension (e.g. factuality) not the mean-of-5 headline.",
     )
     parser.add_argument("--no-rag", action="store_true", help="Disable retrieval (zero-shot).")
+    parser.add_argument(
+        "--source-pins", default=None,
+        help="instance_id->repo/base_commit JSON for source/workspace modes (e.g. "
+        "packages/environment-capture/swe-bench/instance_commits.json).",
+    )
+    parser.add_argument(
+        "--drop-degenerate", action="store_true",
+        help="Drop traces whose every observation is empty (failed captures) before splitting.",
+    )
     parser.add_argument("--out", default=None, help="Path to write the AblationReport JSON.")
     args = parser.parse_args()
 
-    report = _run(args)
+    report, bank = _run(args)
 
     print(f"\n=== {report.name} (seeds={report.seeds}) ===")
     for cell in report.conditions:
         print(f"  {cell.summary()}")
+    if bank.by_run:
+        print("\nserve-side usage per run (judge cost excluded):")
+        for label, seed, record in bank.by_run:
+            t = record.total
+            print(
+                f"  {label:14} seed={seed}  {t.calls} calls  "
+                f"{t.input_tokens}in/{t.output_tokens}out tok  ${t.cost_usd:.3f}  "
+                f"{record.duration_seconds:.0f}s"
+            )
     if args.out:
         Path(args.out).write_text(report.model_dump_json(indent=2), encoding="utf-8")
-        print(f"\nwrote report -> {args.out}")
+        usage_out = Path(args.out).with_suffix(".usage.json")
+        usage_out.write_text(
+            json.dumps(
+                [
+                    {"label": label, "seed": seed, **record.model_dump(mode="json")}
+                    for label, seed, record in bank.by_run
+                ],
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nwrote report -> {args.out} (+ {usage_out.name})")
 
 
 if __name__ == "__main__":

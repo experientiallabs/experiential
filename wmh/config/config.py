@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import tomllib
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 import tomli_w
@@ -16,6 +18,97 @@ from wmh.providers.base import EmbedderKind, ProviderConfig, ProviderKind
 from wmh.providers.models import resolve_provider_model
 
 ARTIFACT_DIR = ".wmh"
+
+
+class FidelityTier(StrEnum):
+    """Build-effort tiers: how much is spent making the artifact faithful.
+
+    The build command exposes ONLY this knob (raw iteration counts live in the Python API):
+    - low: RAG only — index the traces, ship the base prompt. Fast and near-free.
+    - medium: RAG + a light GEPA pass over the prompt.
+    - high: RAG + full GEPA + a cheap auto-config search (candidates pruned by corpus signature).
+    - max: RAG + deep GEPA + the full auto-config ladder, scored on more held-out traces.
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    MAX = "max"
+
+
+@dataclass(frozen=True)
+class TierSpec:
+    """What one fidelity tier spends: GEPA rollouts, the auto-config search, retrieval phi."""
+
+    # GEPA optimization ITERATIONS (candidates proposed+evaluated). Each iteration costs about
+    # `minibatch + gepa_val_cap` metric calls (predict+judge pairs), so cost is bounded per tier
+    # regardless of corpus size — an uncapped valset once turned "budget 50" into ~7000 calls,
+    # and a TRACE-denominated cap let one long-trace corpus (swe: ~7 huge steps/trace) burn $131
+    # on a single "4-iteration" tier. STEPS are the unit that actually bounds cost.
+    gepa_budget: int
+    gepa_val_cap: int  # STEPS GEPA selects candidates on (caps per-iteration cost)
+    config_search: bool
+    search_budget: int  # held-out traces scored per candidate
+    full_ladder: bool  # False = prune candidates by corpus signature
+    # True = search only the CHEAP frontier (base/reason/grounding class — levers that cost
+    # roughly nothing extra to serve). Tiers ration the expensive knobs (GEPA iterations,
+    # kb/verify scoring), but a nearly-free grounding win should be discoverable cheaply.
+    cheap_frontier_only: bool
+    # Recommend provider-backed semantic phi. Kept as a field for explicit opt-in experiments,
+    # but NO tier sets it: semantic retrieval was measured WORSE than lexical hashing on every
+    # benchmark (PR #72 matrix: ada-002 terminal 0.790 vs hashing 0.818, swe 0.635 vs 0.640 —
+    # command outputs are predicted by literal token overlap, which char-trigrams capture and
+    # semantics blur), and the tier ladder's only semantic cells coincide with tau's decline
+    # (medium 0.891 hashing -> high 0.886 / max 0.882 semantic).
+    semantic_embeddings: bool
+
+
+FIDELITY_TIERS: dict[FidelityTier, TierSpec] = {
+    FidelityTier.LOW: TierSpec(
+        gepa_budget=0,
+        gepa_val_cap=0,
+        config_search=False,
+        search_budget=0,
+        full_ladder=False,
+        cheap_frontier_only=False,
+        semantic_embeddings=False,
+    ),
+    # Medium still searches the CHEAP frontier: grounding levers serve at ~base cost and score
+    # in a handful of traces, so even a budget tier can discover a workspace/fetch win. What
+    # medium rations is the expensive knobs — GEPA iterations and kb/verify scoring.
+    FidelityTier.MEDIUM: TierSpec(
+        gepa_budget=4,
+        gepa_val_cap=24,
+        config_search=True,
+        search_budget=4,
+        full_ladder=False,
+        cheap_frontier_only=True,
+        semantic_embeddings=False,
+    ),
+    # High's GEPA stays at medium's 4 iterations: the 8-iteration increment measured ~noise
+    # on every benchmark once the config-search winners' known lifts are subtracted (ladder:
+    # tau -0.005, terminal +0.007, swe +0.006), and the GEPA scaling work (PR #97) found the
+    # base template's iteration lift ≈0 pre-fix. What high buys over medium: the full
+    # signature-pruned candidate menu (kb/verify) instead of the cheap frontier.
+    FidelityTier.HIGH: TierSpec(
+        gepa_budget=4,
+        gepa_val_cap=24,
+        config_search=True,
+        search_budget=4,
+        full_ladder=False,
+        cheap_frontier_only=False,
+        semantic_embeddings=False,
+    ),
+    FidelityTier.MAX: TierSpec(
+        gepa_budget=16,
+        gepa_val_cap=32,
+        config_search=True,
+        search_budget=12,
+        full_ladder=True,
+        cheap_frontier_only=False,
+        semantic_embeddings=False,
+    ),
+}
 
 # Env var names each provider backend reads its credentials from (documented for the user).
 PROVIDER_ENV_VARS: dict[ProviderKind, list[str]] = {
@@ -43,6 +136,17 @@ class HarnessConfig(BaseModel):
     # Model id the GEPA judge runs on (same provider kind as serve). None = the serve model.
     judge_model: str | None = None
     trace_adapter: str = "otel-genai"
+    # Agentic-mode flags (all default OFF: artifacts built before these fields serve unchanged).
+    # `knowledge`: seed a knowledge base from train traces at build and render it into the env
+    # prompt at serve. `reasoning`: deliberate-then-answer output contract. `grounder`: web-search
+    # backend for grounding unknown entities ("none" keeps everything hermetic; see
+    # `wmh.engine.grounding` for backends).
+    knowledge: bool = False
+    reasoning: bool = False
+    grounder: str = "none"
+    # Second self-check completion per step (draft re-examined against the evidence). ~2x serve
+    # cost; earns it only where content prediction is hardest (empirically: swe-style suites).
+    verify: bool = False
 
     def provider_config(self, kind: ProviderKind) -> ProviderConfig:
         """Return the configured ProviderConfig for `kind` (model + backend knobs)."""
@@ -166,6 +270,16 @@ class ArtifactPaths:
     @property
     def metrics(self) -> Path:
         return self.root / "metrics.json"
+
+    @property
+    def knowledge(self) -> Path:
+        """Cross-session knowledge base directory (optional; absent on pre-knowledge artifacts)."""
+        return self.root / "knowledge"
+
+    @property
+    def auto_fidelity(self) -> Path:
+        """The auto-config search report (present on high/max-tier builds)."""
+        return self.root / "auto_fidelity.json"
 
 
 def _strip_none(value: JsonValue) -> JsonValue:

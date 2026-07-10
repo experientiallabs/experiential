@@ -25,5 +25,7 @@ file here must justify its existence in the table below; a doc that can't gets d
 | `research/rag_optimization.png` | The optimized-vs-unoptimized trace-scaling figure the writeup renders. |
 | `research/gepa_scaling_law.md` | The optimization-side complement to the trace scaling law: how fidelity scales with GEPA iterations and training traces, and whether prompt optimization moves the benchmarks retrieval couldn't. Grounds the "prompt/optimization is the leverage" claim in measurements. |
 | `research/gepa_scaling_law.png` | The figure the writeup renders. |
+| `research/fidelity_tiers.md` | The design + evidence record for `wmh build --fidelity` and `--max-fidelity`: the tier ladder measured on all three benchmarks, the evidence audit that removed unproven ingredients (semantic phi, extra GEPA iterations), and the traps (runaway valset cost, judge pinning). The fidelity-tier UX is a product surface; this is its justification. |
+| `research/fidelity_tiers.png` | The figure `research/fidelity_tiers.md` renders (tier ladder, three benchmarks). |
 | `reference/eval_suites.md` | The reproducibility contract every benchmark number in this repo rests on (`examples/<task>/evals/*.toml` + `wmh eval`); commands verified against `main` at promotion. |
 | `reference/failover.md` | The `.wmh/fallback.toml` failover contract: which calls ride the chain (world-model) and which never do (the judge), plus the cross-account ladder format; verified live against both AWS accounts. |
