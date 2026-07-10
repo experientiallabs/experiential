@@ -369,12 +369,6 @@ def _request(url: str, token: str | None) -> urllib.request.Request:
     return urllib.request.Request(url, headers=headers)  # noqa: S310 - https-only constants
 
 
-def _http_json(url: str, *, token: str | None) -> JsonValue:
-    """GET one JSON document (first page only — use ``_http_json_pages`` for listings)."""
-    body, _next = _http_json_page(url, token=token)
-    return body
-
-
 def _http_json_pages(url: str, *, token: str | None) -> list[JsonValue]:
     """GET a paginated JSON listing, following RFC5988 Link rel="next" headers to the end."""
     items: list[JsonValue] = []
