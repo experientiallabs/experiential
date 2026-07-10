@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import pytest
+
 from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness.runner_link import (
     RunnerLink,
@@ -355,11 +357,9 @@ def test_normalized_openai_body_strips_stream_options_and_maps_max_tokens() -> N
 
 
 def test_worker_config_for_prefers_env_then_derives_bedrock(
-    monkeypatch: __import__("pytest").MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit PI_AGENT_* env wins; a Bedrock provider derives; others keep env defaults."""
-    import pytest
-
     from wmh.harness.runner_link import worker_config_for
     from wmh.providers.base import ProviderConfig, ProviderKind
 
