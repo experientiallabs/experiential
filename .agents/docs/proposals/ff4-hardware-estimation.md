@@ -110,7 +110,53 @@ real toolchain, `[acquire]` needs partner data or lab access.
 - **LLM API cost/latency** `[have-now — MeteredProvider already records it]` — model, prompt
   shape, batching → tokens, $, latency. *Useful:* free corpus from our own tracking data.
 
-### 6. Physical hardware & manufacturing — the wedge
+### 6. Search & decision loops — prediction gates an expensive evaluator
+
+Domains where the pre-run estimator's consumer is a search/decision loop, so ranking accuracy and
+decision regret matter more than absolute error. (Lit review sections: superoptimization,
+databases, broader map.)
+
+- **Kernel/code-optimization search** (KernelBench, STOKE, Souper) `[have-now via released
+  artifacts]` — candidate kernel/edit → correct?, speedup bucket. *Useful:* the measurement/
+  verification step bottlenecks the whole search; a learned gate cuts solver-bound
+  superoptimization ~2× (PrediPrune) and lets kernel search consider several× more candidates
+  per GPU budget (GPU Forecasters). GPU Forecasters ships 424 eval pairs + search logs we can
+  reuse directly.
+- **Query cardinality / cost / what-if index estimation** `[have-now]` — query or hypothetical
+  index → cardinality, latency, plan choice. *Useful:* cardinality misestimates cause
+  orders-of-magnitude plan slowdowns (up to 10⁸ underestimation; 40% of queries ≥2× slower —
+  Leis VLDB'15); what-if index advisors have shipped in production DBMSs since 1998 — the
+  25-year-old proof this product category works.
+- **LLM routing / cascade prediction** `[have-now — dogfood]` — query → will the cheap model
+  suffice? *Useful:* RouteLLM ~85% cost cut at 95% quality on MT-Bench (dataset-dependent;
+  enterprise reports 40–70%); pure pre-run estimation with instant, huge market resonance.
+- **Scaling-law loss forecasting** `[have-now small-scale]` — (params, tokens, compute) → final
+  loss. *Useful:* the purest existing pre-run estimator in ML — labs bet tens of millions per
+  frontier run on extrapolation from sub-1% cheap runs; a mis-provisioned recipe (pre-Chinchilla)
+  costs an entire wasted run.
+- **Predictive test selection / build-failure prediction** `[public precedent]` — diff → which
+  tests fail? *Useful:* Meta measured a 2× cut of total testing infra cost at >99.9% faulty-change
+  recall; Google runs 150M test executions/day, 99% of which pass. Self-labeling corpus at scale.
+- **A/B experiment outcome via surrogates** `[acquire]` — variant + early metrics → long-horizon
+  outcome. *Useful:* Netflix saw ~95% consistency predicting 63-day outcomes from 14 days —
+  multiplying experiment throughput; known elevated false-positive risk to manage.
+- **HPC queue-wait + runtime prediction** `[have-now precedent]` — job config → start time,
+  runtime. *Useful:* bad walltime estimates cripple backfill on machines costing tens of
+  millions; XGBoost hits 85%-within-60-min on production traces.
+- **Spot-eviction / capacity prediction** `[vendor-grade evidence]` — workload placement →
+  time-to-eviction. *Useful:* the up-to-90% spot discount is only safely capturable with eviction
+  lead-time; asymmetric-cost time-to-event prediction.
+- **Network config what-if** `[formal-tool incumbent]` — config change → forwarding behavior,
+  outage? *Useful:* an hour of downtime is >$300K for >90% of large enterprises (ITIC); Batfish
+  shows the market pays for guaranteed pre-deploy answers — a learned WM competes only on
+  heterogeneous breadth.
+- **Pre-silicon verification / tape-out risk** `[acquire]` — design state → respin? *Useful:*
+  mask sets alone are >$10M at 7nm, ~$40M at 3nm; the extreme end of the value curve where even
+  a mediocre estimator pays.
+- **Drug/materials screening triage** `[public-data]` — candidate → assay outcome. *Useful:*
+  discovery phase ~$430M/5–6 years; ML triage already gates which wet-lab experiments run.
+
+### 7. Physical hardware & manufacturing — the wedge
 
 All `[acquire]` unless noted; each iteration costs days-to-weeks and real money, which is exactly
 why a grounded estimator is valuable — and why v1 uses the cheapest-to-measure proxies above to
@@ -128,6 +174,24 @@ prove the method first.
   remaining useful life. *Useful:* the classic prognostics benchmark, reframed as WM estimation.
 - **Wet-lab / materials synthesis** — protocol parameters → yield, purity. *Useful:* the
   science-vertical version of the same loop.
+
+## Quantified value anchors (verified 2026-07-10; full sourced table in `.agents/docs/research/ff4-lit-review.md`)
+
+| Domain | The expensive loop | Verified value of prediction |
+|---|---|---|
+| ML training OOM/throughput (v1) | H100 ~$2–7/GPU-hr; runs = 100s–1000s GPU-hr | 30.7% of cluster jobs fail/killed = ~55% of GPU-time (Philly ATC'19); GPU-OOM = largest DL-specific failure, 8.8% of all failures (ICSE'20) |
+| LLM serving config (v1) | Full config sweep for LLaMA2-70B = 42K GPU-hr ≈ $218K | Simulator answers it in 1 CPU-hour (Vidur, MLSys'24, verbatim) |
+| FPGA/ASIC P&R (v1) | 30 min–6 hr per FPGA run; ASIC masks $1M (28nm) → ~$40M (3nm) | Respin tail-risk avoidance; iteration-latency compression |
+| CI / test selection | 150M test executions/day at Google; 99% pass | Meta: testing infra cost halved at >99.9% faulty-change recall (ICSE-SEIP'19) |
+| DB query plans | Bad cardinality → up to 10⁸ misestimates | 40% of queries ≥2× slower on estimates vs truth (Leis VLDB'15); Bao: >50% cloud cost + ~6.5× p99 cut |
+| Battery cycle-life | ~6 months per cell to end-of-life | Protocol search 500+ days → 16 days, >30× (Attia, Nature 2020) |
+| Kernel/code search | Verification/benchmarking bottlenecks search | ~2× verification cut (PrediPrune); several× more candidates per GPU budget (GPU Forecasters) |
+| LLM routing | Frontier-model inference cost | ~85% cost cut at 95% quality on MT-Bench (RouteLLM; dataset-dependent) |
+| PCB respins | $10K–$86K + 1–4 weeks per spin (vendor-grade sources — weakest provenance in this set) | ~50% of complex products need ≥1 extra iteration (Aberdeen via Siemens) |
+
+Corrections adopted: battery speedup is >30× (not "~15×"); "65% of DL failures are OOM" is a
+denominator conflation — the defensible number is 8.8% of ALL failures (largest DL-specific
+category). PCB dollar figures must be labeled vendor-estimates in any launch material.
 
 ## v1 choice (user, 2026-07-05): start with the simplest three and see how they perform
 
