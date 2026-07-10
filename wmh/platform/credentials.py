@@ -63,10 +63,13 @@ def load_credentials() -> PlatformCredentials:
     if path.exists():
         section = tomllib.loads(path.read_text(encoding="utf-8")).get("platform", {})
         data = {key: value for key, value in section.items() if isinstance(value, str)}
-        # Files written before the platform's org-only change carry the old key;
-        # read it as the org default (dropped on the next save).
-        if "default_project" in data:
-            data.setdefault("default_org", data.pop("default_project"))
+        # Files written before the platform's org-only change carry the old
+        # default_project key. A project id is NOT an org id, so carrying the
+        # value over would send a guaranteed-miss id to /api/orgs/{org_id}/...;
+        # discard it instead, so the user gets the clear "pass --org" prompt
+        # (or the sole-org auto-pick at the next login) rather than a
+        # confusing org-not-found. The stale key drops on the next save.
+        data.pop("default_project", None)
     credentials = PlatformCredentials.model_validate(data)
     overrides = {
         "web_url": os.environ.get(ENV_WEB_URL),

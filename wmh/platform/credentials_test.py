@@ -70,22 +70,27 @@ def test_env_alone_is_sufficient(monkeypatch: pytest.MonkeyPatch) -> None:
     assert load_credentials().is_complete()
 
 
-def test_legacy_default_project_key_reads_as_default_org() -> None:
-    """Files written before the platform's org-only change keep their default."""
+def test_legacy_default_project_key_is_discarded() -> None:
+    """Pre-org-collapse files load, but their project default is dropped.
+
+    A project id is not an org id: carrying it into default_org would send a
+    guaranteed-miss id to /api/orgs/{org_id}/..., so the stale key is
+    ignored and the user re-selects (or auto-picks) an organization.
+    """
     path = credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        '[platform]\napi_url = "https://api.test"\ntoken = "xpl_old"\ndefault_project = "org-1"\n',
+        '[platform]\napi_url = "https://api.test"\ntoken = "xpl_old"\ndefault_project = "proj-1"\n',
         encoding="utf-8",
     )
 
     loaded = load_credentials()
-    assert loaded.default_org == "org-1"
+    assert loaded.token == "xpl_old"
+    assert loaded.default_org is None
 
-    # The next save persists the new key only.
+    # The next save drops the stale key entirely.
     save_credentials(loaded)
     rewritten = path.read_text(encoding="utf-8")
-    assert "default_org" in rewritten
     assert "default_project" not in rewritten
 
 
