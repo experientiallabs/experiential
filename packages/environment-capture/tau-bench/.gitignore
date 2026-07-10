@@ -9,3 +9,5 @@ data/
 !rl/tools.json
 # ...and the committed model artifacts are not capture scratch, keep them trackable.
 !models/**/*.json
+conc.json
+conc.png

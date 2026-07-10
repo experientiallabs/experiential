@@ -36,13 +36,16 @@ dependencies = [
 
 [project.optional-dependencies]
 otel = ["opentelemetry-proto>=1.24"]
-# Plotting/figures for research runs; kept out of the core install.
-viz = ["seaborn>=0.13", "matplotlib>=3.8"]
+# Plotting/figures for research runs (wmh research plot-concurrency); kept out of the core install.
+# pandas backs the concurrency-scaling plot's tidy DataFrame.
+viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
 # pooled E2B microVMs while the environment stays the world model. Only those runs need it —
 # local runs stay sandbox-free — so it is an optional extra imported lazily
 # (wmh.harness.e2b_sandbox / wmh.harness.pi_e2b).
 e2b = ["e2b>=2.0"]
+# dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
+# project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",

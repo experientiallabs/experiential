@@ -13,6 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from wmh.cli import app
+from wmh.cli.app import _CONCURRENCY_ISOLATION_FLAGS
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, verify_via_ping
 
 # `wmh.cli`'s `app` attribute (the Typer object) shadows the `wmh.cli.app` submodule on
@@ -599,6 +600,64 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
+
+
+def test_research_concurrency_rejects_level_above_scenarios_fixed_n() -> None:
+    # Fixed-N: a level above --scenarios would silently cap concurrency at N and duplicate the
+    # N-worker point, so it must fail fast (guard fires before any suite/corpus resolution).
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "any-suite", "--scenarios", "4", "--levels", "1,2,4,8"],
+    )
+    assert result.exit_code != 0
+    assert "levels goes up to 8" in result.output
+
+
+def test_research_concurrency_allows_levels_up_to_scenarios() -> None:
+    # levels == scenarios is fine; the guard must not fire (a later stage may still fail).
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "any-suite", "--scenarios", "8", "--levels", "1,2,4,8"],
+    )
+    assert "levels goes up to" not in result.output
+
+
+def test_swe_bench_concurrency_forces_cache_shared() -> None:
+    # swe-bench's fixed-N sweep must force --cache-shared (build shared base+env once, cold-build
+    # the per-instance image each level) — NOT --no-family-purge, which would rebuild the base per
+    # scenario and let concurrent workers clobber each other's shared images.
+    forced = _CONCURRENCY_ISOLATION_FLAGS["swe-bench"]
+    assert "--cache-shared" in forced
+    assert "--no-family-purge" not in forced
+
+
+def test_research_concurrency_rejects_non_integer_levels() -> None:
+    # A typo in --levels must produce a friendly BadParameter, not a raw int() traceback.
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "any-suite", "--scenarios", "8", "--levels", "1,2,foo,8"],
+    )
+    assert result.exit_code != 0
+    assert "--levels must be a comma-separated list of integers" in result.output
+
+
+def test_research_concurrency_rejects_bad_select() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "concurrency",
+            "any-suite",
+            "--select",
+            "bogus",
+            "--scenarios",
+            "4",
+            "--levels",
+            "1,2,4",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--select must be one of" in result.output
 
 
 def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001

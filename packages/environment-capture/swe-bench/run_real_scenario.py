@@ -404,6 +404,11 @@ def main() -> None:
         default="auto",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--trace-id", default=None,
+        help="Replay the single trace with this exact trace_id (overrides --trace/--scenarios). "
+        "Pins the SAME scenario the world-model side ran, since index order differs between sides.",
+    )
     parser.add_argument("--train-split", type=float, default=0.7, help="Train/holdout ratio.")
     parser.add_argument(
         "--dataset", default="SWE-bench/SWE-bench_Verified", help="HF dataset for the build spec."
@@ -441,6 +446,28 @@ def main() -> None:
             "background (these images are multi-GB; a cold run re-creates them anyway)."
         ),
     )
+    parser.add_argument(
+        "--no-family-purge",
+        action="store_true",
+        help=(
+            "Still cold-fetch THIS instance's own image, but don't purge the whole swebench/sweb.* "
+            "family first. Required when several instances run concurrently (each is a distinct "
+            "per-instance image, so a family purge would delete the others' images mid-run)."
+        ),
+    )
+    parser.add_argument(
+        "--cache-shared",
+        action="store_true",
+        help=(
+            "Reuse the SHARED base + env images across runs (built once, kept), but always "
+            "cold-build the per-instance image (clone + checkout + install) and wind only IT down. "
+            "This is the correct mode for a fixed-N concurrency sweep, where the same scenarios "
+            "repeat at every level: --cache would cache the instance image after the first level and "
+            "later levels would rebuild nothing, while fully-cold redundantly rebuilds the shared "
+            "base 16x. --cache-shared measures the marginal per-scenario standup at EVERY level. "
+            "Implies no family purge (the shared images must survive)."
+        ),
+    )
     args = parser.parse_args()
     # Docker Desktop/remote daemons can support an older API than the locally installed Docker CLI.
     # Pin the client API unless the caller deliberately chose a different value.
@@ -448,28 +475,41 @@ def main() -> None:
 
     traces = _load_traces(Path(args.corpus))
     heldout = _holdout(traces, args.train_split)
-    if args.trace_pool == "all":
-        pool = traces
-        pool_name = "all"
-    elif args.trace_pool == "held-out":
-        pool = heldout
-        pool_name = "held-out"
+    if args.trace_id is not None:
+        # Pin by stable trace_id: replay EXACTLY the world side's scenario, ignoring pool/index
+        # ordering. Always a single scenario, so --scenarios is not consulted.
+        by_id = {t["trace_id"]: t for t in traces}
+        if args.trace_id not in by_id:
+            raise SystemExit(f"--trace-id {args.trace_id} not found in {args.corpus}")
+        selected = [(0, by_id[args.trace_id])]
     else:
-        pool = heldout or traces
-        pool_name = "held-out" if heldout else "all"
-    requested_end = args.trace + args.scenarios if args.trace >= 0 else args.scenarios
-    if args.trace_pool == "auto" and heldout and requested_end > len(pool) and requested_end <= len(traces):
-        print(
-            f"=== requested {args.scenarios} scenario(s) from trace {args.trace}, but only "
-            f"{len(pool)} held-out traces exist; using all {len(traces)} traces instead ==="
-        )
-        pool = traces
-        pool_name = "all"
-    if not pool:
-        raise SystemExit(f"no traces in {args.corpus}; nothing to run")
-    selected = _select_traces(pool, args.trace, args.scenarios, pool_name=pool_name)
-    if args.scenarios > 1:
-        raise SystemExit(_run_many(args, selected, pool_name=pool_name))
+        if args.trace_pool == "all":
+            pool = traces
+            pool_name = "all"
+        elif args.trace_pool == "held-out":
+            pool = heldout
+            pool_name = "held-out"
+        else:
+            pool = heldout or traces
+            pool_name = "held-out" if heldout else "all"
+        requested_end = args.trace + args.scenarios if args.trace >= 0 else args.scenarios
+        if (
+            args.trace_pool == "auto"
+            and heldout
+            and requested_end > len(pool)
+            and requested_end <= len(traces)
+        ):
+            print(
+                f"=== requested {args.scenarios} scenario(s) from trace {args.trace}, but only "
+                f"{len(pool)} held-out traces exist; using all {len(traces)} traces instead ==="
+            )
+            pool = traces
+            pool_name = "all"
+        if not pool:
+            raise SystemExit(f"no traces in {args.corpus}; nothing to run")
+        selected = _select_traces(pool, args.trace, args.scenarios, pool_name=pool_name)
+        if args.scenarios > 1:
+            raise SystemExit(_run_many(args, selected, pool_name=pool_name))
     trace = selected[0][1]
     instance_id, commands = trace["instance_id"], trace["commands"]
     if not instance_id:
@@ -477,6 +517,27 @@ def main() -> None:
 
     mode = _default_mode() if args.mode == "auto" else args.mode
 
+    # Truly-cold by default: evict the whole swebench image family BEFORE the clock starts, so shared
+    # base layers can't be reused and the timed standup is a full from-zero download/build. The
+    # eviction is teardown of PRIOR state, so it is deliberately not counted in the standup time.
+    # `--warm` skips it for a faster repeat run.
+    cold = not args.warm
+    if cold and not args.no_family_purge and not args.cache_shared:
+        print("=== cold standup: purging all local swebench/sweb.* images (no shared-layer reuse) ===")
+        n = _purge_swebench_images()
+        print(f"--- purged {n} swebench image(s); the standup below is a true cold download ---\n")
+    elif cold and args.cache_shared:
+        # Shared base+env are reused (built once); only the per-instance image is cold-built below.
+        print("=== cold standup (shared base+env reused; per-instance image built cold) ===")
+    elif cold:
+        # Concurrent-safe cold: this instance's own image is still removed + re-fetched below
+        # (no_cache), but we skip the family purge so sibling concurrent runs keep their images.
+        print("=== cold standup (this instance only; family purge skipped for concurrency) ===")
+
+    # Start the standup clock HERE — resolving the SWE-bench dataset spec (an HF download + parse on
+    # first use) is part of standing the environment up from nothing, so it must be timed, not
+    # excluded. (It was previously excluded, which under-counted the real standup by ~100s.)
+    start = time.monotonic()
     print(f"=== resolving SWE-bench dataset spec for {instance_id} (first run downloads it) ===")
     # Official SWE-bench build spec: the real base/env/instance Dockerfiles + setup scripts.
     try:
@@ -497,16 +558,6 @@ def main() -> None:
         f"\nREAL sandbox: {instance_id} ({len(commands)} commands) — standing up the env "
         f"[mode={mode}], then exec'ing the recorded commands\n"
     )
-    # Truly-cold by default: evict the whole swebench image family BEFORE the clock starts, so shared
-    # base layers can't be reused and the timed standup is a full from-zero download/build. The
-    # eviction is teardown of prior state, so it is deliberately not counted in the standup time.
-    # `--warm` skips it for a faster repeat run.
-    cold = not args.warm
-    if cold:
-        print("=== cold standup: purging all local swebench/sweb.* images (no shared-layer reuse) ===")
-        n = _purge_swebench_images()
-        print(f"--- purged {n} swebench image(s); the standup below is a true cold download ---\n")
-    start = time.monotonic()
     # Cold (the default) never reuses anything; --warm + --cache reuses build layers / the image.
     no_cache = cold or not args.cache
     created: list[str] = []  # images this run stood up (for the wind-down cleanup)
@@ -529,13 +580,22 @@ def main() -> None:
                 {"setup_repo.sh": spec.install_repo_script},
             ),
         ]
+        # --cache-shared: the base + env layers are shared build-once infra (reused across runs and
+        # never wound down); only the per-instance layer is cold-built each run and wound down. So a
+        # fixed-N sweep measures the marginal per-scenario standup at every level (see the flag help).
+        shared_tags = {spec.base_image_key, spec.env_image_key} if args.cache_shared else set()
         for label, tag, dockerfile, scripts in layers:
-            if args.cache and _exists(tag):
+            reuse = _exists(tag) and (args.cache or (args.cache_shared and tag in shared_tags))
+            if reuse:
                 print(f"--- {label}: {tag} already built (cached) ---\n")
                 continue
             print(f"=== building {label}: {tag} ===")
-            _docker_build(tag, dockerfile, scripts, spec.platform, no_cache=no_cache)
-            created.append(tag)
+            # Shared layers may reuse Docker's build cache (built once); the per-instance layer stays
+            # truly cold so its clone/checkout/install is a real from-scratch standup every run.
+            layer_no_cache = no_cache and tag not in shared_tags
+            _docker_build(tag, dockerfile, scripts, spec.platform, no_cache=layer_no_cache)
+            if tag not in shared_tags:  # shared base/env persist; only the instance is wound down
+                created.append(tag)
             print()
         run_image = spec.instance_image_key
     else:  # pull
