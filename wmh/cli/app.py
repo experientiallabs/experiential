@@ -664,7 +664,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         None,
         "--val-frac",
         help="`wmh eval grid`: validation fraction reserved for GEPA in a 3-way split so cells "
-        "score only the leak-free test band (default: (1 - train_split) / 2, matching `wmh build`).",
+        "score only the leak-free test band (default: (1 - train_split)/2, matching build).",
     ),
     embed_dim: int | None = typer.Option(
         None, help="phi dimensionality for the offline embedder (default: 512, or suite config)."
@@ -797,9 +797,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         return
     if args and args[0] == "grid-plot":
         if len(args) < 2:
-            raise typer.BadParameter(
-                "usage: wmh eval grid-plot <result.json> [<result.json>...]"
-            )
+            raise typer.BadParameter("usage: wmh eval grid-plot <result.json> [<result.json>...]")
         _eval_grid_plot(args[1:], out=out, dataset_label=dataset_label)
         return
     if args and args[0] == "grid-heatmap":
@@ -1022,18 +1020,14 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     _console.print(f"wrote grid chart  -> {png}")
 
 
-def _eval_grid_plot(
-    paths: list[str], *, out: str | None, dataset_label: str | None
-) -> None:
+def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | None) -> None:
     """Merge one or more grid result JSONs and render a single combined fidelity chart.
 
     Lets a self-hosted model's grid (run in its own process, since its OpenAI base URL is
     process-global) be combined with the API-model grid into one chart — and re-plots any saved
     result without re-running the eval.
     """
-    results = [
-        GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths
-    ]
+    results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
     merged = merge_results(results)
     for cell in merged.cells:
         cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""

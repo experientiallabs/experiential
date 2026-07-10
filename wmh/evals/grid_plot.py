@@ -14,6 +14,17 @@ from wmh.evals.grid import CONDITIONS, GridResult
 
 _TITLE = "World-Model Harness Fidelity"
 
+# Brand palette (AGENTS.md rule 15) — no ad-hoc colors. Ink for text/lines, a light gridline, and
+# one brand hue per condition so a bar's color reads its condition regardless of its sorted position.
+_INK = "#0a0a0a"
+_GRIDLINE = "#ececec"
+_BRAND_BY_CONDITION = {
+    "base": _INK,  # baseline is neutral; the wmh conditions carry the brand hues
+    "base_rag": "#0070f3",  # blue
+    "gepa": "#7928ca",  # purple
+    "gepa_rag": "#f5a623",  # amber
+}
+
 
 def plot_grid(
     result: GridResult,
@@ -38,11 +49,13 @@ def plot_grid(
         raise ValueError("grid result has no cells to plot")
     labels = [c.bar_label for c in cells]
     heights = [c.fidelity for c in cells]
+    colors = [_BRAND_BY_CONDITION.get(c.condition, _INK) for c in cells]
 
     sns.set_theme(style="whitegrid", context="talk")
-    palette = sns.color_palette("deep", len(cells))
     fig, ax = plt.subplots(figsize=(max(8, 1.6 * len(cells)), 6.5))
-    bars = ax.bar(range(len(cells)), heights, color=palette, edgecolor="white", linewidth=0.8)
+    ax.grid(axis="y", color=_GRIDLINE)
+    ax.set_axisbelow(True)
+    bars = ax.bar(range(len(cells)), heights, color=colors, edgecolor="white", linewidth=0.8)
 
     # Per-bar text: fidelity on top, target cost above it (omit the $ line when cost is None).
     for bar, cell in zip(bars, cells, strict=True):
@@ -57,8 +70,25 @@ def plot_grid(
                 ha="center",
                 va="bottom",
                 fontsize=10,
-                color="#444",
+                color=_INK,
             )
+
+    # One legend entry per condition present, in canonical order, using the same brand hues.
+    seen = {c.condition: c.condition_label for c in cells}
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=_BRAND_BY_CONDITION.get(cond, _INK))
+        for cond in CONDITIONS
+        if cond in seen
+    ]
+    ax.legend(
+        handles,
+        [seen[cond] for cond in CONDITIONS if cond in seen],
+        title="condition",
+        frameon=False,
+        fontsize=10,
+        title_fontsize=10,
+        loc="upper left",
+    )
 
     ax.set_xticks(range(len(cells)))
     ax.set_xticklabels(labels, fontsize=10)
@@ -79,7 +109,8 @@ def plot_grid(
         ha="center",
         va="bottom",
         fontsize=12,
-        color="#555",
+        color=_INK,
+        alpha=0.7,
     )
     sns.despine(ax=ax)
     fig.tight_layout()
@@ -109,9 +140,13 @@ def plot_grid_heatmap(
     import matplotlib.pyplot as plt
     import numpy as np
     import seaborn as sns
+    from matplotlib.colors import LinearSegmentedColormap
 
     if not results:
         raise ValueError("no grid results to plot")
+    # Sequential brand ramp (light gridline -> brand blue -> brand purple) so higher fidelity reads
+    # darker/brand-er; seaborn auto-picks light/dark annotation text per cell luminance.
+    brand_cmap = LinearSegmentedColormap.from_list("wmh-brand", [_GRIDLINE, "#0070f3", "#7928ca"])
     benchmarks = benchmark_order or list(results)
 
     # Row order: models in first-seen order, each followed by its four conditions.
@@ -142,7 +177,7 @@ def plot_grid_heatmap(
     sns.heatmap(
         matrix,
         ax=ax,
-        cmap="rocket",
+        cmap=brand_cmap,
         vmin=0.0,
         vmax=1.0,
         annot=True,
@@ -156,7 +191,7 @@ def plot_grid_heatmap(
     )
     # Separator lines between models (every 4 conditions) so the model blocks read as groups.
     for i in range(len(CONDITIONS), len(rows), len(CONDITIONS)):
-        ax.axhline(i, color="#333", linewidth=1.4)
+        ax.axhline(i, color=_INK, linewidth=1.4)
     ax.set_title(f"{_TITLE} — full grid", fontsize=17, fontweight="bold", pad=16)
     ax.tick_params(axis="y", labelsize=9, rotation=0)
     ax.tick_params(axis="x", labelsize=11)

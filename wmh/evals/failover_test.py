@@ -89,7 +89,8 @@ def test_same_model_chain_single_config_is_plain_provider() -> None:
         return _StubProvider(config.model)
 
     cfg = ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5")
-    assert not isinstance(same_model_chain([cfg], factory), SameModelFailover)  # single -> unwrapped
+    # single rung -> unwrapped plain provider
+    assert not isinstance(same_model_chain([cfg], factory), SameModelFailover)
     two = [cfg, ProviderConfig(kind=ProviderKind.ANTHROPIC, model="gpt-5.5")]
     assert isinstance(same_model_chain(two, factory), SameModelFailover)
 

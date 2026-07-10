@@ -22,7 +22,7 @@ import re
 
 from llm_waterfall import is_capacity_error
 
-from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
+from wmh.providers.base import Completion, Message, Provider, ProviderConfig
 
 
 def anthropic_direct_id(bedrock_model: str) -> str | None:
@@ -91,6 +91,6 @@ def same_model_chain(
     configs: list[ProviderConfig],
     factory,  # noqa: ANN001 - (ProviderConfig) -> Provider, injectable for tests
 ) -> Provider:
-    """Build a `SameModelFailover` over `configs`; a single-config chain returns a plain provider."""
+    """Build a `SameModelFailover` over `configs`; a single-config chain is returned unwrapped."""
     chain = [factory(c) for c in configs]
     return chain[0] if len(chain) == 1 else SameModelFailover(chain)
