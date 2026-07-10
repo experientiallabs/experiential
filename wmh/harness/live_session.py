@@ -259,7 +259,10 @@ class LiveSession:
                 return
             if isinstance(intent, _UserMessage):
                 self._actions_this_turn = 0
-                self._aborting = False  # a new user turn is not the aborted one
+                # NB: do not clear `_aborting` here — a new message can be drained before
+                # the cancelled turn's in-flight submit frame is read, and clearing now
+                # would let that stale submit emit. The runner's next `state` frame (the
+                # real turn boundary) clears it in `_on_state`.
                 self._emit("user_message", {"msg_id": intent.msg_id, "text": intent.text})
                 self._safe_send(
                     {"type": "user_message", "msg_id": intent.msg_id, "text": intent.text}
