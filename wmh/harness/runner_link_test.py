@@ -394,3 +394,44 @@ def test_worker_config_for_prefers_env_then_derives_bedrock(
         assert worker_config_for(azure).model == "deepseek-chat"
     else:  # pragma: no cover - kind set varies; the bedrock/env branches above are the contract
         pytest.skip("no non-bedrock kind available to exercise the fallback")
+
+
+def test_worker_usage_accumulates_across_llm_requests() -> None:
+    """Each answered llm_request adds its completion usage to RunResult.worker_usage."""
+    replies = iter(
+        [
+            {
+                "choices": [{"message": {"content": "a"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 7},
+            },
+            {"choices": [{"message": {"content": "b"}}]},  # no usage block: call counted, 0 tokens
+        ]
+    )
+    script = [
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "llm_request", "req_id": 2, "openai_body": {}},
+        {"type": "done", "answer": "fin"},
+    ]
+    ch = _FakeChannel(script)
+    result = RunnerLink(ch, worker_fn=lambda body: next(replies)).run(
+        "t1", "x", _Env(), tools=_tools()
+    )
+    assert result.worker_usage is not None
+    assert result.worker_usage.calls == 2
+    assert result.worker_usage.input_tokens == 100
+    assert result.worker_usage.output_tokens == 7
+    # No llm_request at all -> usage stays None (not zero: the runtime reported nothing).
+    quiet = RunnerLink(
+        _FakeChannel([{"type": "done", "answer": "ok"}]), worker_fn=lambda body: {}
+    ).run("t2", "x", _Env(), tools=_tools())
+    assert quiet.worker_usage is None
+
+
+def test_bedrock_to_completion_carries_usage() -> None:
+    resp: JsonObject = {
+        "output": {"message": {"content": [{"text": "hi"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 42, "outputTokens": 5},
+    }
+    completion = cast(Any, bedrock_to_completion(resp))
+    assert completion["usage"] == {"prompt_tokens": 42, "completion_tokens": 5}

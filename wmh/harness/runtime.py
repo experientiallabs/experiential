@@ -11,6 +11,7 @@ the same types the rest of the harness uses.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
@@ -72,6 +73,32 @@ class StopReason(StrEnum):
     BUDGET = "budget"  # harness code exhausted an episode budget (CodeRuntime episodes only)
 
 
+class TokenUsage(BaseModel):
+    """Worker-LLM token spend, aggregated over one or more episodes.
+
+    Populated by runtimes whose LLM calls bypass the `Provider` abstraction (the pi worker path
+    answers `llm_request` frames with raw native tool-calling requests), so callers can meter the
+    agent leg the way provider-wrapped runtimes are metered. `None` on a result means the runtime
+    does not report usage — not that the run was free.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    calls: int = 0
+
+
+def combine_usage(parts: Iterable[TokenUsage | None]) -> TokenUsage | None:
+    """Sum the reported usages; `None` when nothing reported (order-independent)."""
+    reported = [p for p in parts if p is not None]
+    if not reported:
+        return None
+    return TokenUsage(
+        input_tokens=sum(p.input_tokens for p in reported),
+        output_tokens=sum(p.output_tokens for p in reported),
+        calls=sum(p.calls for p in reported),
+    )
+
+
 class RunResult(BaseModel):
     """The outcome of one rollout: the transcript, why it stopped, and any answer."""
 
@@ -80,6 +107,7 @@ class RunResult(BaseModel):
     stop_reason: StopReason
     answer: str = ""
     turns: int = 0
+    worker_usage: TokenUsage | None = None  # set by runtimes that answer the worker LLM directly
 
     def transcript(self) -> str:
         """A compact judge-readable transcript of the run."""

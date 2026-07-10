@@ -16,6 +16,21 @@ import time
 from collections.abc import Callable, Iterator
 from typing import Protocol, cast, runtime_checkable
 
+from pydantic import BaseModel
+
+
+class SandboxUsage(BaseModel):
+    """E2B spend metrics for a pool: how many sandboxes ran, and their total lifetime seconds.
+
+    Seconds are wall-clock sandbox lifetimes (create -> kill; live sandboxes count up to now),
+    the unit E2B bills on. Pricing is the caller's concern (deployment-specific instance rates);
+    this is the raw meter.
+    """
+
+    count: int = 0
+    seconds: float = 0.0
+
+
 E2B_API_KEY_ENV = "E2B_API_KEY"
 E2B_TEMPLATE_ENV = "WMH_E2B_TEMPLATE"
 

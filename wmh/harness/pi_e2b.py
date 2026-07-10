@@ -38,6 +38,7 @@ from wmh.harness.e2b_sandbox import (
     CommandHandle,
     SandboxFactory,
     SandboxHandle,
+    SandboxUsage,
     create_sandbox,
     default_sandbox_factory,
 )
@@ -213,6 +214,12 @@ class E2BSandboxPool:
         self._idle: list[tuple[SandboxHandle, E2BStdioChannel]] = []
         self._all: list[SandboxHandle] = []
         self._closed = False
+        # Usage meter: lifetime seconds accumulate into _retired_seconds when a sandbox dies;
+        # live sandboxes are counted from their _started stamp. Keyed by id() — SandboxHandle is
+        # a protocol, not hashable-by-contract.
+        self._started: dict[int, float] = {}
+        self._created = 0
+        self._retired_seconds = 0.0
 
     def acquire(self) -> tuple[SandboxHandle, E2BStdioChannel]:
         """An idle (bootstrapped, hello-verified) sandbox+channel; creates one when none is free."""
@@ -222,17 +229,20 @@ class E2BSandboxPool:
             if self._idle:
                 return self._idle.pop()
         sandbox = create_sandbox(self._factory)
+        with self._lock:
+            self._created += 1
+            self._started[id(sandbox)] = time.monotonic()
         try:
             self._bootstrap(sandbox)
             channel = self._start_runner(sandbox)
         except BaseException:
-            _kill_quietly(sandbox)
+            self._retire(sandbox)
             raise
         with self._lock:
             if not self._closed:
                 self._all.append(sandbox)
                 return sandbox, channel
-        _kill_quietly(sandbox)  # closed while we were bootstrapping: don't leak the sandbox
+        self._retire(sandbox)  # closed while we were bootstrapping: don't leak the sandbox
         raise RuntimeError("E2BSandboxPool is closed")
 
     def release(self, sandbox: SandboxHandle, channel: E2BStdioChannel, *, healthy: bool) -> None:
@@ -245,7 +255,7 @@ class E2BSandboxPool:
         with self._lock:
             if sandbox in self._all:
                 self._all.remove(sandbox)
-        _kill_quietly(sandbox)
+        self._retire(sandbox)
 
     def close(self) -> None:
         """Kill every pooled sandbox; safe to call more than once."""
@@ -254,7 +264,22 @@ class E2BSandboxPool:
             sandboxes, self._all = self._all, []
             self._idle = []
         for sandbox in sandboxes:
-            _kill_quietly(sandbox)
+            self._retire(sandbox)
+
+    def usage(self) -> SandboxUsage:
+        """The pool's spend meter so far: sandbox count and total lifetime seconds."""
+        now = time.monotonic()
+        with self._lock:
+            live = sum(now - started for started in self._started.values())
+            return SandboxUsage(count=self._created, seconds=self._retired_seconds + live)
+
+    def _retire(self, sandbox: SandboxHandle) -> None:
+        """Finalize the sandbox's lifetime on the meter, then kill it (best-effort)."""
+        with self._lock:
+            started = self._started.pop(id(sandbox), None)
+            if started is not None:
+                self._retired_seconds += time.monotonic() - started
+        _kill_quietly(sandbox)
 
     def __enter__(self) -> E2BSandboxPool:
         return self

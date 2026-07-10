@@ -30,6 +30,7 @@ from wmh.harness.create import (
     select_parent,
 )
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.runtime import Runtime
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
@@ -635,6 +636,9 @@ class _FakePool:
         self.closes = 0
         _FakePool.instances.append(self)
 
+    def usage(self) -> SandboxUsage:
+        return SandboxUsage(count=len(self.channels), seconds=1.5 * len(self.channels))
+
     def acquire(self) -> tuple[object, _ScriptedPoolChannel]:
         channel = _ScriptedPoolChannel()
         self.channels.append(channel)
@@ -769,7 +773,11 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
     assert concurrencies == [0]  # e2b default: every (task, attempt) cell at once
     [pool] = fake_pool_cls.instances  # ONE shared pool for the whole search
     assert pool.template == "tmpl-1"
-    assert pool.closes == 1  # closed exactly once, when create_harness returned
+    # Closed on return (finalizing the usage meter) and again by the finally — the real pool's
+    # close is idempotent, so "at least once, before usage capture" is the contract.
+    assert pool.closes >= 1
+    assert result.sandbox_usage is not None
+    assert result.sandbox_usage.count == len(pool.channels)  # the fake meters per acquire
     assert len(pool.channels) == 3  # one pooled runner episode per (task, attempt) cell
     assert pool.releases == [True, True, True]  # healthy episodes return their sandboxes
     for channel in pool.channels:

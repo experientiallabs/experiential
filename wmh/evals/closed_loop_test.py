@@ -369,3 +369,37 @@ def test_gold_judge_scores_against_full_gold_list() -> None:
     verdict = GoldJudge(OneAssertionJudgeProvider()).score("t", "ans", "tr", ["a", "b"])
     assert not verdict.passed
     assert verdict.fraction == 0.5
+
+
+def test_report_aggregates_worker_usage_from_self_metering_runtimes() -> None:
+    """Cells that report worker usage sum into the report; none reported -> None."""
+    from wmh.harness.runtime import TokenUsage
+
+    class MeteredRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            return RunResult(
+                task_id=task_id,
+                stop_reason=StopReason.SUBMITTED,
+                answer="pass",
+                worker_usage=TokenUsage(input_tokens=10, output_tokens=3, calls=2),
+            )
+
+    tasks = [TaskSpec(task_id="a-pass", instruction="x", gold=["g"])]
+    for concurrency in (1, 0):  # both aggregation paths
+        report = evaluate_with_env(
+            tasks,
+            lambda task: _StaticEnv(),
+            MeteredRuntime(),
+            _AnswerJudge(),
+            k=2,
+            concurrency=concurrency,
+        )
+        assert report.worker_usage is not None
+        assert report.worker_usage.input_tokens == 20  # 2 cells x 10
+        assert report.worker_usage.output_tokens == 6
+        assert report.worker_usage.calls == 4
+    # Provider-wrapped runtimes report nothing -> the report says None, not zero.
+    silent = evaluate_with_env(
+        tasks, lambda task: _StaticEnv(), _ScriptedRuntime(), _AnswerJudge(), k=1
+    )
+    assert silent.worker_usage is None

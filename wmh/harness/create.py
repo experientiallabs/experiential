@@ -34,7 +34,9 @@ from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.mutate import propose_delta, render_evidence
+from wmh.harness.runtime import TokenUsage, combine_usage
 from wmh.providers.base import Provider
 
 if TYPE_CHECKING:
@@ -104,6 +106,12 @@ class CreateResult(BaseModel):
     skipped: int = 0  # iterations lost to unusable or invalid proposals
     screened: int = 0  # deltas rejected at the cheap trigger-cluster screen (no full eval spent)
     confirmations: int = 0  # narrow vetoes retried at higher k (see `narrow_failing_tiers`)
+    # Spend meters over the WHOLE search (seed, screens, full splits, holdout, confirmations).
+    # worker_usage: worker-LLM tokens from self-metering runtimes (the pi worker path; None on
+    # provider-wrapped runtimes, which are metered upstream). sandbox_usage: E2B sandbox count +
+    # lifetime seconds (None on the local backend).
+    worker_usage: TokenUsage | None = None
+    sandbox_usage: SandboxUsage | None = None
 
 
 def cluster_failures(report: ClosedLoopReport, tasks: list[TaskSpec]) -> list[FailureSignature]:
@@ -339,6 +347,7 @@ def create_harness(
 
     try:
         docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
+        worker_usages: list[TokenUsage | None] = []
         reports: dict[str, ClosedLoopReport] = {}
         holdout_reports: dict[str, ClosedLoopReport] = {}
         archive = DeltaArchive(seed=seed_doc)
@@ -532,6 +541,10 @@ def create_harness(
                 on_progress(i, child.name, child_report.success_rate, verdict.accepted)
 
         best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
+        sandbox_usage = None
+        if sandbox_pool is not None:
+            sandbox_pool.close()  # idempotent; finalize lifetimes so the meter is complete
+            sandbox_usage = sandbox_pool.usage()
         return CreateResult(
             best=best,
             best_score=reports[champion_hash].success_rate,
@@ -542,6 +555,8 @@ def create_harness(
             skipped=skipped,
             screened=screened,
             confirmations=confirmations,
+            worker_usage=combine_usage(worker_usages),
+            sandbox_usage=sandbox_usage,
         )
     finally:
         if sandbox_pool is not None:

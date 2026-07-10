@@ -26,7 +26,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.environment import AgentEnvironment
-from wmh.harness.runtime import AgentRuntime, RunResult, Runtime
+from wmh.harness.runtime import AgentRuntime, RunResult, Runtime, TokenUsage, combine_usage
 from wmh.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
@@ -87,6 +87,9 @@ class ClosedLoopReport(BaseModel):
     success_std: float = 0.0  # spread of per-task success rates
     k: int = DEFAULT_K
     per_task: dict[str, TaskOutcome] = Field(default_factory=dict)
+    # Aggregate worker-LLM spend from runtimes that meter it themselves (the pi worker path);
+    # None when every rollout came from a provider-wrapped runtime (metered upstream).
+    worker_usage: TokenUsage | None = None
 
     @property
     def headline(self) -> float:
@@ -123,11 +126,13 @@ def evaluate_with_env(
     if k < 1:
         raise ValueError("k must be >= 1 (metrics are means over k passes)")
     per_task: dict[str, TaskOutcome] = {}
+    usages: list[TokenUsage | None] = []
     if concurrency != 0 and concurrency <= 1:
         for task in tasks:
             verdicts: list[GoldVerdict] = []
             for attempt in range(k):
                 result = _run_once(task, make_env, runtime)
+                usages.append(result.worker_usage)
                 verdict = judge.score(
                     task.instruction, result.answer, result.transcript(), task.gold
                 )
@@ -143,7 +148,7 @@ def evaluate_with_env(
                 verdicts=verdicts,
             )
     else:
-        by_cell = _run_cells_concurrently(
+        by_cell, usages = _run_cells_concurrently(
             tasks,
             make_env,
             runtime,
@@ -171,6 +176,7 @@ def evaluate_with_env(
         success_std=pstdev(task_rates) if len(task_rates) > 1 else 0.0,
         k=k,
         per_task=per_task,
+        worker_usage=combine_usage(usages),
     )
 
 
@@ -270,7 +276,7 @@ def _run_cells_concurrently(
     k: int,
     concurrency: int,
     on_progress: Callable[[str, int, GoldVerdict], None] | None,
-) -> list[GoldVerdict]:
+) -> tuple[list[GoldVerdict], list[TokenUsage | None]]:
     """Run every (task, attempt) cell on a thread pool; verdicts return in cell order.
 
     Cell order is task-major, attempt-minor — the exact order the sequential loop visits — so the
@@ -284,21 +290,24 @@ def _run_cells_concurrently(
     """
     cells = [(task, attempt) for task in tasks for attempt in range(k)]
     if not cells:
-        return []
+        return [], []
     max_workers = len(cells) if concurrency == 0 else min(concurrency, len(cells))
     slots: list[GoldVerdict | None] = [None] * len(cells)
+    usage_slots: list[TokenUsage | None] = [None] * len(cells)
 
-    def run_cell(task: TaskSpec) -> GoldVerdict:
+    def run_cell(task: TaskSpec) -> tuple[GoldVerdict, TokenUsage | None]:
         result = _run_once(task, make_env, runtime)
-        return judge.score(task.instruction, result.answer, result.transcript(), task.gold)
+        verdict = judge.score(task.instruction, result.answer, result.transcript(), task.gold)
+        return verdict, result.worker_usage
 
     pool = ThreadPoolExecutor(max_workers=max_workers)
     try:
         futures = {pool.submit(run_cell, task): i for i, (task, _attempt) in enumerate(cells)}
         for future in as_completed(futures):
             index = futures[future]
-            verdict = future.result()  # a raised rollout/judge exception propagates here
+            verdict, usage = future.result()  # a raised rollout/judge exception propagates here
             slots[index] = verdict
+            usage_slots[index] = usage
             if on_progress is not None:
                 task, attempt = cells[index]
                 on_progress(task.task_id, attempt + 1, verdict)
@@ -312,4 +321,4 @@ def _run_cells_concurrently(
         if slot is None:  # pragma: no cover - every future completed, or we raised above
             raise RuntimeError("a cell completed without producing a verdict")
         verdicts.append(slot)
-    return verdicts
+    return verdicts, usage_slots
