@@ -303,3 +303,23 @@ def test_submit_after_state_boundary_is_not_suppressed() -> None:
     events.clear()
     _drain(session)
     assert any(e.kind == "submit" for e in events)
+
+
+def test_stale_submit_after_a_quick_next_message_is_still_suppressed() -> None:
+    """A cancelled turn's in-flight submit is suppressed even if the user already sent a new
+    message: only the runner's next state frame (the turn boundary) clears the abort gate."""
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            # The cancelled turn's submit arrives AFTER the user's next message was drained.
+            {"type": "tool_request", "req_id": 1, "name": "submit", "arguments": {"answer": "x"}},
+        ]
+    )
+    events: list[SessionEvent] = []
+    session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
+    session.start()
+    session.interrupt()
+    session.send_user_message("do the next thing")  # queued before the stale submit is read
+    events.clear()
+    _drain(session)
+    assert not any(e.kind == "submit" for e in events)  # stale submit stays suppressed
