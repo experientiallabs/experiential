@@ -934,3 +934,55 @@ def test_create_worker_usage_is_none_when_no_wave_reports_it(
     )
 
     assert result.worker_usage is None
+
+
+def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """A candidate that flips param:runtime-kind is archived invalid, not a run-aborting raise.
+
+    Regression (Greptile P1): `doc.runtime(backend="e2b")` raises for non-pi-node docs; a meta
+    proposal that rewrote the runtime-kind surface escaped the invalid-delta handling and
+    aborted the whole search.
+    """
+    seed = _pi_seed()
+    kind = seed.surface("param:runtime-kind")
+    assert kind is not None
+    escape = json.dumps(
+        {
+            "expected_effect": "run in-process instead",
+            "preconditions": {"param:runtime-kind": kind.content_hash},
+            "ops": [
+                {
+                    "op": "replace",
+                    "surface_id": "param:runtime-kind",
+                    "content": "kit-python",
+                    "rationale": "abandon the pi runtime",
+                }
+            ],
+        }
+    )
+    provider = RoleProvider(meta_reply=escape)
+    monkeypatch.setattr(
+        create_module,
+        "evaluate_closed_loop",
+        lambda *a, **k: _canned_report(0.5, k=k.get("k", 3)),
+    )
+
+    result = create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=1,
+        harness_backend="e2b",
+    )
+
+    assert result.skipped == 1  # the escape delta was rejected, not fatal
+    [delta] = result.archive.deltas
+    assert delta.verdict is not None and not delta.verdict.accepted
+    assert "pi-node only" in delta.verdict.reason
+    assert result.best_score == 0.5  # the seed stayed champion and the search finished

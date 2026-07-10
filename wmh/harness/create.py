@@ -439,6 +439,20 @@ def create_harness(
                 archive.deltas.append(delta)
                 skipped += 1
                 continue
+            if harness_backend == "e2b" and child.runtime_kind() != "pi-node":
+                # A delta that abandons the pi-node runtime cannot execute on this backend:
+                # `doc.runtime(backend="e2b")` would raise mid-score and abort the whole search.
+                # Reject-and-archive it like any other invalid-before-eval proposal.
+                delta.verdict = GateRecord(
+                    accepted=False,
+                    reason=(
+                        f"invalid before eval: runtime kind {child.runtime_kind()!r} cannot "
+                        "run on harness_backend='e2b' (pi-node only)"
+                    ),
+                )
+                archive.deltas.append(delta)
+                skipped += 1
+                continue
 
             # Cheap screen: before a full-split eval, the delta must improve the very cluster it
             # was proposed to fix. A delta that cannot beat its parent on its own target is noise.
