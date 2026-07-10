@@ -51,6 +51,11 @@ DEFAULT_MAX_TOTAL_BYTES = 2_500_000
 BODYMAP_PATH = "BODYMAP.md"
 _BODYMAP_SLUG = "bodymap-md"
 
+# Paths the harness store's render owns (SYSTEM.md, config.toml, ...): a repo
+# file at one of these paths keeps its content but moves aside (hash suffix),
+# so the rendered bundle never carries two files with one path.
+RESERVED_RENDER_PATHS = frozenset({"SYSTEM.md", "config.toml", "runtime.py", "doc.json"})
+
 # Directories that never contain agent body: VCS internals, dependency trees, caches, build
 # output. Pruned by basename at any depth.
 EXCLUDED_DIRS = frozenset(
@@ -280,7 +285,7 @@ def build_ingest_doc(
     shows them.
     """
     taken_slugs = {_BODYMAP_SLUG}
-    taken_paths = {BODYMAP_PATH}
+    taken_paths = {BODYMAP_PATH, *RESERVED_RENDER_PATHS}
     surfaces = [
         Surface(
             id="prompt:core",

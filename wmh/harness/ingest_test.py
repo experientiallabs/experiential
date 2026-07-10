@@ -201,3 +201,17 @@ def test_build_ingest_doc_disambiguates_sanitized_collisions() -> None:
     assert len(set(code_paths)) == 2  # both kept, paths disambiguated
     original_notes = [s.doc for s in doc.code_files() if s.path != BODYMAP_PATH]
     assert any(note is not None and "Original path: a/[x].ts" in note for note in original_notes)
+
+
+def test_build_ingest_doc_moves_reserved_render_paths_aside() -> None:
+    collected = CollectedRepo(
+        files=[RepoFile(path="SYSTEM.md", content="the repo's own system doc")],
+        skipped=[],
+    )
+    mapping = BodyMap(overview="o", file_docs=[FileDoc(path="SYSTEM.md", role="r", doc="d")])
+    doc = build_ingest_doc("demo", collected, mapping, source="local")
+    paths = [s.path for s in doc.code_files()]
+    assert "SYSTEM.md" not in paths  # the store's rendered SYSTEM.md owns that path
+    moved = next(s for s in doc.code_files() if s.path not in {BODYMAP_PATH})
+    assert moved.path.startswith("SYSTEM-") and moved.content == "the repo's own system doc"
+    assert moved.doc is not None and "Original path: SYSTEM.md" in moved.doc
