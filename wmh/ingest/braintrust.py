@@ -49,7 +49,13 @@ from pydantic import JsonValue
 from wmh.core.types import JsonObject
 from wmh.ingest.adapter import VendorPull, register_adapter
 from wmh.ingest.base import BaseTraceAdapter
-from wmh.ingest.normalize import SpanRecord, as_text, iso_to_ordinal
+from wmh.ingest.normalize import (
+    SpanRecord,
+    as_text,
+    iso_to_ordinal,
+    openai_call_name_args,
+    openai_tool_calls,
+)
 
 # Braintrust REST API. The fetch endpoint returns `{"events": [span rows]}`; the project list
 # resolves a human project name to its id. Overridable for self-hosted deployments.
@@ -113,37 +119,6 @@ def _is_error(row: JsonObject) -> bool:
     if isinstance(error, str):
         return bool(error.strip())
     return bool(error)
-
-
-def _tool_calls(output: JsonValue) -> list[JsonObject]:
-    """Extract OpenAI-style tool calls from an `output` (a message object or a message list)."""
-    if isinstance(output, dict):
-        raw = output.get("tool_calls")
-        if isinstance(raw, list):
-            return [tc for tc in raw if isinstance(tc, dict)]
-    if isinstance(output, list):
-        calls: list[JsonObject] = []
-        for message in output:
-            if isinstance(message, dict):
-                raw = message.get("tool_calls")
-                if isinstance(raw, list):
-                    calls.extend(tc for tc in raw if isinstance(tc, dict))
-        return calls
-    return []
-
-
-def _call_name_args(tool_call: JsonObject) -> tuple[str, str]:
-    """(name, raw-arguments-json) from a tool call in OpenAI-nested or flattened shape."""
-    fn = tool_call.get("function")
-    if isinstance(fn, dict):
-        name = fn.get("name")
-        args = fn.get("arguments")
-    else:
-        name = tool_call.get("name")
-        args = tool_call.get("arguments")
-    name_s = name if isinstance(name, str) else ""
-    args_s = args if isinstance(args, str) else as_text(args)
-    return name_s, args_s
 
 
 def _first_user_text(value: JsonValue) -> str | None:
@@ -323,13 +298,13 @@ class BraintrustAdapter(BaseTraceAdapter):
             rtype = _row_type(row)
             error = _is_error(row)
             output = row.get("output")
-            calls = _tool_calls(output) if rtype not in _TOOL_TYPES else []
+            calls = openai_tool_calls(output) if rtype not in _TOOL_TYPES else []
             if calls:
                 # An llm/task/function row that issued tool calls: one `chat` action span per call.
                 # The RESULT comes from the sibling `tool` row below (the normalizer pairs the
                 # nearest following execute_tool span), so we do NOT synthesize a result here.
                 for tool_call in calls:
-                    name, args = _call_name_args(tool_call)
+                    name, args = openai_call_name_args(tool_call)
                     emit(
                         {"gen_ai.tool.name": name, "gen_ai.tool.call.arguments": args},
                         tool=False,

@@ -45,7 +45,7 @@ from pydantic import JsonValue
 from wmh.core.types import JsonObject
 from wmh.ingest.adapter import VendorPull, register_adapter
 from wmh.ingest.base import BaseTraceAdapter
-from wmh.ingest.normalize import SpanRecord, as_text, iso_to_ordinal
+from wmh.ingest.normalize import SpanRecord, as_text, iso_to_ordinal, openai_call_name_args
 
 # PostHog API. `$AI_*` events are queried via HogQL over the `events` table. Host is region-specific
 # (US: us.posthog.com, EU: eu.posthog.com), so it is configurable.
@@ -89,7 +89,7 @@ def _tool_calls(choices: JsonValue) -> list[JsonObject]:
     PostHog's NORMALIZED format puts a tool call as a `content` PART `{"type": "function",
     "function": {"name", "arguments"}}` (arguments is a JSON object, not a string), NOT in a
     `tool_calls` array. We collect both: content-parts with `type == "function"` (the normalized
-    shape) and a `tool_calls` array (raw-OpenAI passthrough). `_call_name_args` handles either.
+    shape) and a `tool_calls` array (raw-OpenAI passthrough); `openai_call_name_args` reads either.
     """
     calls: list[JsonObject] = []
     if not isinstance(choices, list):
@@ -108,20 +108,6 @@ def _tool_calls(choices: JsonValue) -> list[JsonObject]:
                 if isinstance(part, dict) and part.get("type") == "function"
             )
     return calls
-
-
-def _call_name_args(tool_call: JsonObject) -> tuple[str, str]:
-    """(name, raw-arguments-json) from a tool call in OpenAI-nested or flattened shape."""
-    fn = tool_call.get("function")
-    if isinstance(fn, dict):
-        name = fn.get("name")
-        args = fn.get("arguments")
-    else:
-        name = tool_call.get("name")
-        args = tool_call.get("arguments")
-    name_s = name if isinstance(name, str) else ""
-    args_s = args if isinstance(args, str) else as_text(args)
-    return name_s, args_s
 
 
 def _content_text(content: JsonValue) -> str:
@@ -255,7 +241,7 @@ class PostHogAdapter(BaseTraceAdapter):
                 calls = _tool_calls(props.get("$ai_output_choices"))
                 if calls:
                     for tool_call in calls:
-                        tool_name, args = _call_name_args(tool_call)
+                        tool_name, args = openai_call_name_args(tool_call)
                         emit(
                             {"gen_ai.tool.name": tool_name, "gen_ai.tool.call.arguments": args},
                             tool=False,

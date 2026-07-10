@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wmh.ingest.normalize import iso_to_ordinal
+from wmh.ingest.normalize import iso_to_ordinal, openai_call_name_args, openai_tool_calls
 
 
 def test_iso_to_ordinal_naive_timestamp_is_utc_not_local() -> None:
@@ -27,3 +27,22 @@ def test_iso_to_ordinal_orders_and_falls_back() -> None:
     assert iso_to_ordinal(None, fallback=7) == 7
     assert iso_to_ordinal("not-a-date", fallback=9) == 9
     assert iso_to_ordinal("", fallback=3) == 3
+
+
+def test_openai_tool_calls_from_object_and_list() -> None:
+    call = {"function": {"name": "f", "arguments": "{}"}}
+    assert openai_tool_calls({"tool_calls": [call, "junk"]}) == [call]
+    assert openai_tool_calls([{"tool_calls": [call]}, {"role": "user"}]) == [call]
+    assert openai_tool_calls("nope") == []
+    assert openai_tool_calls({"content": "hi"}) == []
+
+
+def test_openai_call_name_args_nested_and_flattened() -> None:
+    assert openai_call_name_args({"function": {"name": "search", "arguments": '{"q": 1}'}}) == (
+        "search",
+        '{"q": 1}',
+    )
+    # Flattened shape, and an object (non-string) arguments value serialized to compact JSON.
+    assert openai_call_name_args({"name": "run", "arguments": {"a": 1}}) == ("run", '{"a": 1}')
+    # Missing/typeless fields degrade to empty strings, never a crash.
+    assert openai_call_name_args({}) == ("", "")

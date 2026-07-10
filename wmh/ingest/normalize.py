@@ -154,6 +154,44 @@ def _as_str(value: JsonValue) -> str:
     return value if isinstance(value, str) else ""
 
 
+# --- OpenAI chat-completion tool-call shape ---------------------------------------------------
+
+
+def openai_tool_calls(output: JsonValue) -> list[JsonObject]:
+    """Extract OpenAI-style tool calls from an `output` (a message object or a message list)."""
+    if isinstance(output, dict):
+        raw = output.get("tool_calls")
+        if isinstance(raw, list):
+            return [tc for tc in raw if isinstance(tc, dict)]
+    if isinstance(output, list):
+        calls: list[JsonObject] = []
+        for message in output:
+            if isinstance(message, dict):
+                raw = message.get("tool_calls")
+                if isinstance(raw, list):
+                    calls.extend(tc for tc in raw if isinstance(tc, dict))
+        return calls
+    return []
+
+
+def openai_call_name_args(tool_call: JsonObject) -> tuple[str, str]:
+    """(name, raw-arguments-json) from a tool call in OpenAI-nested or flattened shape.
+
+    Arguments are usually a JSON *string* (OpenAI) but may be an object; either way the returned
+    value is a string the span carries, which the normalizer's `_tool_args` re-parses.
+    """
+    fn = tool_call.get("function")
+    if isinstance(fn, dict):
+        name = fn.get("name")
+        args = fn.get("arguments")
+    else:
+        name = tool_call.get("name")
+        args = tool_call.get("arguments")
+    name_s = name if isinstance(name, str) else ""
+    args_s = args if isinstance(args, str) else as_text(args)
+    return name_s, args_s
+
+
 # --- OTLP / OpenInference AnyValue decoding ---------------------------------------------------
 
 

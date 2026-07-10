@@ -37,7 +37,12 @@ from pydantic import JsonValue
 
 from wmh.core.types import JsonObject, Trace
 from wmh.ingest.adapter import VendorPull, register_adapter
-from wmh.ingest.normalize import SpanRecord, as_text, spans_to_traces
+from wmh.ingest.normalize import (
+    SpanRecord,
+    as_text,
+    openai_call_name_args,
+    spans_to_traces,
+)
 
 
 def _hash_id(*parts: str) -> str:
@@ -51,22 +56,6 @@ def _tool_calls(message: JsonObject) -> list[JsonObject]:
     if not isinstance(raw, list):
         return []
     return [tc for tc in raw if isinstance(tc, dict)]
-
-
-def _call_name_args(tc: JsonObject) -> tuple[str, str]:
-    """Extract (name, raw-arguments-json) from a tool call in OpenAI or flattened shape."""
-    fn = tc.get("function")
-    if isinstance(fn, dict):
-        name = fn.get("name")
-        args = fn.get("arguments")
-    else:  # flattened {"name":..., "arguments":...}
-        name = tc.get("name")
-        args = tc.get("arguments")
-    name_s = name if isinstance(name, str) else ""
-    # arguments is usually a JSON *string* (OpenAI) but may be an object; normalize to a string the
-    # span carries, and let the normalizer's _tool_args re-parse it.
-    args_s = args if isinstance(args, str) else as_text(args)
-    return name_s, args_s
 
 
 def _spans_for_conversation(
@@ -118,7 +107,7 @@ def _spans_for_conversation(
         calls = _tool_calls(m)
         if calls:
             for tc in calls:
-                name, args = _call_name_args(tc)
+                name, args = openai_call_name_args(tc)
                 _emit({"gen_ai.tool.name": name, "gen_ai.tool.call.arguments": args}, tool=False)
                 tcid = tc.get("id")
                 if isinstance(tcid, str) and tcid in results_by_id:

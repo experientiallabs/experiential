@@ -55,7 +55,13 @@ from pydantic import JsonValue
 from wmh.core.types import JsonObject
 from wmh.ingest.adapter import register_adapter
 from wmh.ingest.base import BaseTraceAdapter
-from wmh.ingest.normalize import SpanRecord, as_text, iso_to_ordinal
+from wmh.ingest.normalize import (
+    SpanRecord,
+    as_text,
+    iso_to_ordinal,
+    openai_call_name_args,
+    openai_tool_calls,
+)
 
 
 def _as_str(value: JsonValue) -> str:
@@ -75,37 +81,6 @@ def _is_error(observation: JsonObject) -> bool:
     presence as an error (that misclassified successful observations).
     """
     return _as_str(observation.get("level")).upper() == "ERROR"
-
-
-def _tool_calls(output: JsonValue) -> list[JsonObject]:
-    """Extract OpenAI-style tool calls from a GENERATION `output` (object or message list)."""
-    if isinstance(output, dict):
-        raw = output.get("tool_calls")
-        if isinstance(raw, list):
-            return [tc for tc in raw if isinstance(tc, dict)]
-    if isinstance(output, list):
-        calls: list[JsonObject] = []
-        for message in output:
-            if isinstance(message, dict):
-                raw = message.get("tool_calls")
-                if isinstance(raw, list):
-                    calls.extend(tc for tc in raw if isinstance(tc, dict))
-        return calls
-    return []
-
-
-def _call_name_args(tool_call: JsonObject) -> tuple[str, str]:
-    """(name, raw-arguments-json) from a tool call in OpenAI-nested or flattened shape."""
-    fn = tool_call.get("function")
-    if isinstance(fn, dict):
-        name = fn.get("name")
-        args = fn.get("arguments")
-    else:
-        name = tool_call.get("name")
-        args = tool_call.get("arguments")
-    name_s = name if isinstance(name, str) else ""
-    args_s = args if isinstance(args, str) else as_text(args)
-    return name_s, args_s
 
 
 def _observation_tool_name(observation: JsonObject) -> str:
@@ -196,13 +171,13 @@ class LangfuseAdapter(BaseTraceAdapter):
         for _, obs in indexed:
             otype = _as_str(obs.get("type")).upper()
             error = _is_error(obs)
-            calls = _tool_calls(obs.get("output")) if otype == "GENERATION" else []
+            calls = openai_tool_calls(obs.get("output")) if otype == "GENERATION" else []
             if calls:
                 # A GENERATION that issued tool calls: emit a `chat` action span per call. The tool
                 # RESULT comes from the sibling TOOL/SPAN observation below (the normalizer pairs
                 # the nearest following execute_tool span), so we do NOT synthesize a result here.
                 for tool_call in calls:
-                    name, args = _call_name_args(tool_call)
+                    name, args = openai_call_name_args(tool_call)
                     emit(
                         {"gen_ai.tool.name": name, "gen_ai.tool.call.arguments": args},
                         tool=False,
