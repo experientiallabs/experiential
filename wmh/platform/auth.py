@@ -19,11 +19,11 @@ from urllib.parse import parse_qs, urlencode, urlparse
 LOGIN_TIMEOUT_SECONDS = 300.0
 
 _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
-<html><head><meta http-equiv="refresh" content="1;url={projects_url}"></head>
+<html><head><meta http-equiv="refresh" content="1;url={platform_url}"></head>
 <body style="font-family: system-ui; padding: 48px; color: #171717;">
 <h1 style="font-size: 18px;">wmh is connected</h1>
 <p>The key was handed to your terminal — taking you back to
-<a href="{projects_url}">your projects</a>.</p>
+<a href="{platform_url}">your organization</a>.</p>
 </body></html>"""
 
 _FAILURE_PAGE = b"""<!doctype html>
@@ -56,10 +56,8 @@ class BrowserLogin:
         tokens = self._tokens
         expected_state = self.state
         # After the hand-off the browser is stranded on the loopback page;
-        # send it back to the platform's projects instead.
-        success_page = _SUCCESS_PAGE_TEMPLATE.format(
-            projects_url=f"{self.web_url}/projects"
-        ).encode("utf-8")
+        # send it back to the platform (which routes to the organization).
+        success_page = _SUCCESS_PAGE_TEMPLATE.format(platform_url=self.web_url).encode("utf-8")
 
         class _CallbackHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - http.server contract

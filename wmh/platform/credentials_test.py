@@ -22,7 +22,7 @@ from wmh.platform.credentials import (
 @pytest.fixture(autouse=True)
 def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ENV_HOME, str(tmp_path))
-    for var in (ENV_API_URL, ENV_TOKEN, "WMH_PLATFORM_URL", "WMH_PLATFORM_PROJECT"):
+    for var in (ENV_API_URL, ENV_TOKEN, "WMH_PLATFORM_URL", "WMH_PLATFORM_ORG"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -32,7 +32,7 @@ def test_save_load_round_trip_with_owner_only_permissions() -> None:
             web_url="https://platform.test",
             api_url="https://api.test",
             token="xpl_secret",
-            default_project="proj-1",
+            default_org="org-1",
         )
     )
 
@@ -43,7 +43,7 @@ def test_save_load_round_trip_with_owner_only_permissions() -> None:
     loaded = load_credentials()
     assert loaded.web_url == "https://platform.test"
     assert loaded.token == "xpl_secret"
-    assert loaded.default_project == "proj-1"
+    assert loaded.default_org == "org-1"
     assert loaded.is_complete()
 
 
@@ -68,6 +68,25 @@ def test_env_alone_is_sufficient(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ENV_TOKEN, "xpl_ci")
 
     assert load_credentials().is_complete()
+
+
+def test_legacy_default_project_key_reads_as_default_org() -> None:
+    """Files written before the platform's org-only change keep their default."""
+    path = credentials_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '[platform]\napi_url = "https://api.test"\ntoken = "xpl_old"\ndefault_project = "org-1"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_credentials()
+    assert loaded.default_org == "org-1"
+
+    # The next save persists the new key only.
+    save_credentials(loaded)
+    rewritten = path.read_text(encoding="utf-8")
+    assert "default_org" in rewritten
+    assert "default_project" not in rewritten
 
 
 def test_save_refuses_symlinked_credentials_file(tmp_path: Path) -> None:

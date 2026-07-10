@@ -19,7 +19,6 @@ _WHOAMI = WhoAmI.model_validate(
     {
         "actor": {"kind": "api_key", "id": "api-key:org-1"},
         "orgs": [{"id": "org-1", "slug": "acme", "name": "Acme"}],
-        "projects": [{"id": "proj-1", "org_id": "org-1", "slug": "alpha", "name": "Alpha"}],
     }
 )
 
@@ -27,7 +26,12 @@ _WHOAMI = WhoAmI.model_validate(
 @pytest.fixture(autouse=True)
 def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ENV_HOME, str(tmp_path))
-    for var in ("WMH_PLATFORM_URL", "WMH_PLATFORM_API_URL", "WMH_PLATFORM_TOKEN"):
+    for var in (
+        "WMH_PLATFORM_URL",
+        "WMH_PLATFORM_API_URL",
+        "WMH_PLATFORM_TOKEN",
+        "WMH_PLATFORM_ORG",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -71,7 +75,7 @@ def test_status_reports_connection(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "Acme" in result.output
-    assert "proj-1" in result.output
+    assert "org-1" in result.output
 
 
 def test_status_surfaces_rejected_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,16 +100,16 @@ def test_pull_rejects_unknown_kind() -> None:
     assert "must be 'model' or 'harness'" in result.output
 
 
-def test_login_with_token_drops_stale_default_project(
+def test_login_with_token_drops_stale_default_org(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A relogin keeps the default project only if the new identity sees it."""
+    """A relogin keeps the default organization only if the new identity sees it."""
     save_credentials(
         PlatformCredentials(
             web_url="https://platform.test",
             api_url="https://api.test",
             token="xpl_old",
-            default_project="proj-gone",
+            default_org="org-gone",
         )
     )
     monkeypatch.setattr("wmh.cli.platform_cmds.fetch_cli_config", lambda _url: "https://api.test")
@@ -118,9 +122,9 @@ def test_login_with_token_drops_stale_default_project(
 
     saved = load_credentials()
     assert saved.token == "xpl_new"
-    # proj-gone is invisible to the new identity; the single visible project
-    # becomes the default instead.
-    assert saved.default_project == "proj-1"
+    # org-gone is invisible to the new identity; the single visible
+    # organization becomes the default instead.
+    assert saved.default_org == "org-1"
 
 
 def test_push_requires_login_first(tmp_path: Path) -> None:

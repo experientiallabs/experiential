@@ -44,21 +44,11 @@ class OrgInfo(BaseModel):
     name: str
 
 
-class ProjectInfo(BaseModel):
-    """One project visible to the credential."""
-
-    id: str
-    org_id: str
-    slug: str
-    name: str
-
-
 class WhoAmI(BaseModel):
     """Response of ``GET /api/whoami``."""
 
     actor: ActorInfo
     orgs: list[OrgInfo]
-    projects: list[ProjectInfo]
 
 
 class RemoteWorldModel(BaseModel):
@@ -171,15 +161,15 @@ class PlatformClient:
 
     # -- world models --------------------------------------------------------------------------
 
-    def list_world_models(self, project_id: str) -> list[RemoteWorldModel]:
-        response = self._client.get(f"/api/projects/{project_id}/world-models")
+    def list_world_models(self, org_id: str) -> list[RemoteWorldModel]:
+        response = self._client.get(f"/api/orgs/{org_id}/world-models")
         self._raise_for_error(response)
         rows = response.json().get("world_models", [])
         return [RemoteWorldModel.model_validate(row) for row in rows]
 
     def push_model_bundle(
         self,
-        project_id: str,
+        org_id: str,
         name: str,
         bundle_path: Path,
         sha256: str,
@@ -193,7 +183,7 @@ class PlatformClient:
         through the API.
         """
         ticket_response = self._client.post(
-            f"/api/projects/{project_id}/world-models/{name}/bundle/uploads"
+            f"/api/orgs/{org_id}/world-models/{name}/bundle/uploads"
         )
         self._raise_for_error(ticket_response)
         ticket = ticket_response.json()
@@ -216,7 +206,7 @@ class PlatformClient:
             raise PlatformError(msg, status_code=upload_response.status_code)
 
         finalize = self._client.post(
-            f"/api/projects/{project_id}/world-models/{name}/bundle",
+            f"/api/orgs/{org_id}/world-models/{name}/bundle",
             json={
                 "staging_path": ticket["staging_path"],
                 "sha256": sha256,
@@ -227,7 +217,7 @@ class PlatformClient:
         self._raise_for_error(finalize)
         return RemoteWorldModel.model_validate(finalize.json())
 
-    def download_model_bundle(self, project_id: str, name: str, dest: Path) -> str:
+    def download_model_bundle(self, org_id: str, name: str, dest: Path) -> str:
         """Stream a model's bundle from storage to ``dest``, verifying its digest.
 
         The API hands back an expiring signed URL plus the recorded sha256;
@@ -237,7 +227,7 @@ class PlatformClient:
         Returns:
             The verified sha256 hex digest.
         """
-        response = self._client.get(f"/api/projects/{project_id}/world-models/{name}/bundle")
+        response = self._client.get(f"/api/orgs/{org_id}/world-models/{name}/bundle")
         self._raise_for_error(response)
         payload = response.json()
         declared = str(payload["sha256"])
@@ -262,38 +252,36 @@ class PlatformClient:
 
     # -- harnesses -----------------------------------------------------------------------------
 
-    def list_harnesses(self, project_id: str) -> list[RemoteHarness]:
-        response = self._client.get(f"/api/projects/{project_id}/harnesses")
+    def list_harnesses(self, org_id: str) -> list[RemoteHarness]:
+        response = self._client.get(f"/api/orgs/{org_id}/harnesses")
         self._raise_for_error(response)
         rows = response.json().get("harnesses", [])
         return [RemoteHarness.model_validate(row) for row in rows]
 
     def get_harness(
-        self, project_id: str, name: str
+        self, org_id: str, name: str
     ) -> tuple[RemoteHarness, list[RemoteHarnessVersion]]:
-        response = self._client.get(f"/api/projects/{project_id}/harnesses/{name}")
+        response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}")
         self._raise_for_error(response)
         payload = response.json()
         harness = RemoteHarness.model_validate(payload["harness"])
         versions = [RemoteHarnessVersion.model_validate(row) for row in payload["versions"]]
         return harness, versions
 
-    def get_harness_version(self, project_id: str, name: str, version: int) -> HarnessVersionDoc:
-        response = self._client.get(
-            f"/api/projects/{project_id}/harnesses/{name}/versions/{version}"
-        )
+    def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
+        response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}/versions/{version}")
         self._raise_for_error(response)
         return HarnessVersionDoc.model_validate(response.json())
 
     def push_harness_version(
         self,
-        project_id: str,
+        org_id: str,
         name: str,
         doc: dict[str, JsonValue],
         doc_hash: str,
     ) -> PushedHarnessVersion:
         response = self._client.post(
-            f"/api/projects/{project_id}/harnesses/{name}/versions",
+            f"/api/orgs/{org_id}/harnesses/{name}/versions",
             json={"doc": doc, "doc_hash": doc_hash},
         )
         self._raise_for_error(response)

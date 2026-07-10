@@ -68,11 +68,11 @@ def test_wait_times_out_to_none(login_attempt: BrowserLogin) -> None:
 
 
 def test_success_page_redirects_back_to_the_platform(login_attempt: BrowserLogin) -> None:
-    """After the hand-off the browser is sent back to the platform's projects."""
+    """After the hand-off the browser is sent back to the platform."""
     url = f"http://127.0.0.1:{login_attempt.port}/callback?" + urlencode(
         {"token": "xpl_abc", "state": login_attempt.state}
     )
     with urllib.request.urlopen(url) as response:
         body = response.read().decode("utf-8")
-    assert "url=https://platform.test/projects" in body
+    assert "url=https://platform.test" in body
     assert login_attempt.wait(timeout=2) == "xpl_abc"
