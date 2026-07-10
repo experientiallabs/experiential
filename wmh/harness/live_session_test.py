@@ -263,3 +263,43 @@ def test_unknown_tool_is_rejected() -> None:
 
 def _no_tool(name: str, args: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
     return ToolOutcome(content="", is_error=True)
+
+
+def test_interrupt_suppresses_a_racing_submit_event() -> None:
+    """A submit that arrives after an interrupt for the same turn emits no submit event."""
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            # The interrupt is queued (below) before this in-flight submit is processed.
+            {"type": "tool_request", "req_id": 1, "name": "submit", "arguments": {"answer": "x"}},
+        ]
+    )
+    events: list[SessionEvent] = []
+    session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
+    session.start()
+    events.clear()
+    session.interrupt()  # user hits Stop while the submit is racing
+    _drain(session)
+    # The abort was sent; the racing submit is answered but NOT surfaced as a submit event.
+    assert not any(e.kind == "submit" for e in events)
+    assert any(f["type"] == "abort" for f in channel.sent)
+    resp = next(f for f in channel.sent if f["type"] == "tool_response")
+    assert resp["content"] == "submitted"  # runner still gets a response (no hang)
+
+
+def test_submit_after_state_boundary_is_not_suppressed() -> None:
+    """A fresh turn's submit is emitted normally after the aborted turn ended (state boundary)."""
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "state", "status": "idle", "reason": "aborted"},  # aborted turn ended
+            {"type": "tool_request", "req_id": 1, "name": "submit", "arguments": {"answer": "y"}},
+        ]
+    )
+    events: list[SessionEvent] = []
+    session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
+    session.start()
+    session.interrupt()
+    events.clear()
+    _drain(session)
+    assert any(e.kind == "submit" for e in events)
