@@ -212,3 +212,26 @@ def test_malformed_tool_arguments_are_normalized_on_replay() -> None:
         m for m in calls[1]["messages"] if m["role"] == "assistant" and m.get("tool_calls")
     )
     json_mod.loads(replayed["tool_calls"][0]["function"]["arguments"])  # must not raise
+
+
+def test_terminal_scenarios_v2_attach_seed_state_only() -> None:
+    """Terminal v2 adds seed_state; rubric stays as pinned (null — no gold criteria)."""
+    from terminal_scenarios_v2 import upgrade
+
+    from wmh.core.types import Action, ActionKind, Observation, Step, Trace
+
+    trace = Trace(
+        trace_id="t1",
+        steps=[
+            Step(
+                task="x",
+                action=Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "ls"}),
+                observation=Observation(content="a.txt"),
+            )
+        ],
+        metadata={},
+    )
+    rows = [{"task": "x", "provenance": ["t1"], "category": "Misc", "rubric": None}]
+    (v2,) = upgrade(rows, {"t1": trace})
+    assert "bash -> a.txt" in v2["seed_state"]["scratchpad"]
+    assert v2["rubric"] is None
