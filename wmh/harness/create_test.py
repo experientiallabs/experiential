@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import ClassVar
 
 import pytest
 
-from wmh.core.types import Action, Observation
+from wmh.core.types import JsonObject
 from wmh.engine.world_model import WorldModel
-from wmh.evals.closed_loop import ClosedLoopReport, EnvFactory, TaskOutcome
+from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
 from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness import create as create_module
@@ -564,20 +565,21 @@ def test_confirmed_suite_overturn_still_faces_the_holdout_tier() -> None:
     assert result.best_score == pytest.approx(0.5)  # champion stayed the seed
 
 
-# -- env backends: sim (world model) vs e2b (real sandboxes) -------------------------------------
+# -- harness backends: local (in-process) vs e2b (the pi process in pooled sandboxes) ------------
 
 
-class _EchoEnv:
-    """A fake real environment: any tool call succeeds; lifecycle is recorded."""
+def _pi_seed() -> HarnessDoc:
+    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, Surface, SurfaceKind
 
-    def __init__(self) -> None:
-        self.closed = 0
-
-    def execute(self, action: Action) -> Observation:
-        return Observation(content="ok")
-
-    def close(self) -> None:
-        self.closed += 1
+    return HarnessDoc(
+        name="seed",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+        ],
+    )
 
 
 def _canned_report(rate: float, *, k: int = 3) -> ClosedLoopReport:
@@ -587,42 +589,119 @@ def _canned_report(rate: float, *, k: int = 3) -> ClosedLoopReport:
     )
 
 
-def test_sim_backend_requires_a_world_model() -> None:
+class _ScriptedPoolChannel:
+    """Plays the runner peer for one pooled episode: a tool_request, then done.
+
+    The same frame script `runner_link_test._FakeChannel` speaks; recv() hands frames to the
+    real `RunnerLink`, send() records what the host answered — the tool_response content is how
+    a test observes WHO answered the tool call.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[JsonObject] = []
+        self._script: list[JsonObject] = [
+            {
+                "type": "tool_request",
+                "req_id": 1,
+                "name": "bash",
+                "arguments": {"command": "verify the work"},
+            },
+            {"type": "done", "answer": "done-verified"},
+        ]
+
+    def send(self, frame: JsonObject) -> None:
+        self.sent.append(frame)
+
+    def recv(self) -> JsonObject | None:
+        return self._script.pop(0) if self._script else None
+
+
+class _FakePool:
+    """Stands in for `E2BSandboxPool`: no sandboxes, one scripted runner channel per acquire."""
+
+    instances: ClassVar[list[_FakePool]] = []
+
+    def __init__(
+        self,
+        *,
+        template: str | None = None,
+        api_key: str | None = None,
+        sandbox_factory: object = None,
+        hello_timeout: float = 0.0,
+    ) -> None:
+        self.template = template
+        self.channels: list[_ScriptedPoolChannel] = []
+        self.releases: list[bool] = []
+        self.closes = 0
+        _FakePool.instances.append(self)
+
+    def acquire(self) -> tuple[object, _ScriptedPoolChannel]:
+        channel = _ScriptedPoolChannel()
+        self.channels.append(channel)
+        return object(), channel
+
+    def release(self, sandbox: object, channel: object, *, healthy: bool) -> None:
+        self.releases.append(healthy)
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+@pytest.fixture
+def fake_pool_cls(monkeypatch: pytest.MonkeyPatch) -> type[_FakePool]:
+    """Patch the pool at its source module (create_harness imports it lazily from there)."""
+    _FakePool.instances = []
+    monkeypatch.setattr("wmh.harness.pi_e2b.E2BSandboxPool", _FakePool)
+    return _FakePool
+
+
+def test_unknown_harness_backend_is_rejected() -> None:
+    from typing import Literal, cast
+
     provider = RoleProvider()
-    with pytest.raises(ValueError, match="world_model=None is only valid"):
+    # Dynamic callers (the platform's optimizer passes a plain str) can hand in anything;
+    # the runtime guard, not the type annotation, is what this test pins.
+    bogus = cast("Literal['local', 'e2b']", "banana")
+    with pytest.raises(ValueError, match="choose local or e2b"):
         create_harness(
             "winner",
             HarnessDoc.baseline("seed"),
             _tasks(),
-            None,
+            _wm(provider),
             provider,
             provider,
             GoldJudge(provider),
+            harness_backend=bogus,
         )
 
 
-def test_sim_backend_rejects_parallel_pi_node_scoring() -> None:
-    """Local pi runtimes are single-episode (one port/workdir/channel): sim must stay sequential.
+def test_e2b_backend_rejects_non_pi_node_seeds() -> None:
+    """e2b moves the pi-node harness PROCESS into sandboxes; in-process seeds must fail early."""
+    provider = RoleProvider()
+    with pytest.raises(ValueError, match="use harness_backend='local'"):
+        create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            harness_backend="e2b",
+        )
+
+
+def test_local_backend_rejects_parallel_pi_node_scoring() -> None:
+    """Local pi runtimes are single-episode (one port/workdir/channel): local stays sequential.
 
     The guard fires per-doc at scoring time, before any rollout, so a parallel request fails
     loudly instead of colliding episodes.
     """
-    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, Surface, SurfaceKind
-
     provider = RoleProvider()
-    pi_seed = HarnessDoc(
-        name="seed",
-        surfaces=[
-            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
-            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
-            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
-            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
-        ],
-    )
     with pytest.raises(ValueError, match="one episode at a time"):
         create_harness(
             "winner",
-            pi_seed,
+            _pi_seed(),
             _tasks(),
             _wm(provider),
             provider,
@@ -632,107 +711,21 @@ def test_sim_backend_rejects_parallel_pi_node_scoring() -> None:
         )
 
 
-def test_unknown_env_backend_is_rejected() -> None:
-    from typing import Literal, cast
-
-    provider = RoleProvider()
-    # Dynamic callers (the platform's optimizer passes a plain str) can hand in anything;
-    # the runtime guard, not the type annotation, is what this test pins.
-    bogus = cast("Literal['sim', 'e2b']", "banana")
-    with pytest.raises(ValueError, match="choose sim or e2b"):
-        create_harness(
-            "winner",
-            HarnessDoc.baseline("seed"),
-            _tasks(),
-            _wm(provider),
-            provider,
-            provider,
-            GoldJudge(provider),
-            env_backend=bogus,
-        )
-
-
-def test_e2b_backend_never_touches_the_world_model_and_defaults_to_full_parallelism(
-    monkeypatch: pytest.MonkeyPatch,
+def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
 ) -> None:
-    """env_backend='e2b' scores through the env factory: no world model, concurrency 0.
+    """harness_backend='e2b': the pi process lives in pooled sandboxes, the env stays the WM.
 
-    The env factory is faked (no sandboxes in unit tests); `evaluate_with_env` is the real one,
-    wrapped only to record the concurrency each eval was asked for. `world_model=None` proves the
-    e2b path never needs (or touches) a world model — any access would raise.
+    The pool is faked (its channels play the runner peer), `evaluate_closed_loop` is the real
+    one wrapped only to record the concurrency each eval was asked for — so every scripted
+    tool_request is really brokered by `RunnerLink` into `WorldModelEnvironment`, and the
+    tool_response carries the world model's marker reply ("ok" from the RoleProvider env role).
     """
-    seed = HarnessDoc.baseline("seed")
-    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    provider = RoleProvider()  # default judge passes on the runner's "done-verified" answer
     concurrencies: list[int] = []
-    real_evaluate = create_module.evaluate_with_env
+    real_evaluate = create_module.evaluate_closed_loop
 
     def spying_evaluate(
-        tasks: list[TaskSpec],
-        make_env: EnvFactory,
-        runtime: Runtime,
-        judge: GoldJudge,
-        *,
-        label: str,
-        k: int,
-        concurrency: int,
-    ) -> ClosedLoopReport:
-        concurrencies.append(concurrency)
-        return real_evaluate(
-            tasks, make_env, runtime, judge, label=label, k=k, concurrency=concurrency
-        )
-
-    envs: list[_EchoEnv] = []
-    templates: list[str | None] = []
-
-    def fake_factory(*, template: str | None = None) -> EnvFactory:
-        templates.append(template)
-
-        def make(task: TaskSpec) -> _EchoEnv:
-            env = _EchoEnv()
-            envs.append(env)
-            return env
-
-        return make
-
-    monkeypatch.setattr(create_module, "evaluate_with_env", spying_evaluate)
-    monkeypatch.setattr(create_module, "e2b_env_factory", fake_factory)
-
-    result = create_harness(
-        "winner",
-        seed,
-        _tasks(),
-        None,  # the e2b path must work with no world model at all
-        provider,
-        provider,
-        GoldJudge(provider),
-        iterations=1,
-        k=3,
-        env_backend="e2b",
-        e2b_template="tmpl-1",
-    )
-
-    # The search genuinely ran end to end on the real-env path (seed 0.0 -> careful child 1.0).
-    assert result.best_score == 1.0
-    assert result.best.system_prompt() == _CAREFUL_PROMPT
-    # Every eval (seed, screen, child full split) ran all cells at once (the e2b default) and
-    # carried the template through to the env factory.
-    assert concurrencies == [0, 0, 0]
-    assert templates == ["tmpl-1", "tmpl-1", "tmpl-1"]
-    # One fresh env per (task, attempt) cell, each closed exactly once.
-    assert len(envs) == 9  # 3 evals x 1 task x k=3
-    assert all(env.closed == 1 for env in envs)
-
-
-def test_eval_concurrency_overrides_both_backend_defaults(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An explicit eval_concurrency reaches the scorer; unset sim keeps the sequential default."""
-    provider = RoleProvider()
-    seed = HarnessDoc.baseline("seed")
-    sim_concurrencies: list[int] = []
-    e2b_concurrencies: list[int] = []
-
-    def fake_sim_evaluate(
         tasks: list[TaskSpec],
         world_model: WorldModel,
         agent_provider: Provider,
@@ -743,41 +736,112 @@ def test_eval_concurrency_overrides_both_backend_defaults(
         concurrency: int,
         runtime: Runtime | None = None,
     ) -> ClosedLoopReport:
-        sim_concurrencies.append(concurrency)
-        return _canned_report(1.0, k=k)
+        concurrencies.append(concurrency)
+        return real_evaluate(
+            tasks,
+            world_model,
+            agent_provider,
+            judge,
+            label=label,
+            k=k,
+            concurrency=concurrency,
+            runtime=runtime,
+        )
 
-    def fake_e2b_evaluate(
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", spying_evaluate)
+
+    result = create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=0,  # the seed eval alone exercises the whole scoring path
+        k=3,
+        harness_backend="e2b",
+        e2b_template="tmpl-1",
+    )
+
+    # The judge passed the runner's submitted answer: the eval genuinely ran end to end.
+    assert result.best_score == 1.0
+    assert concurrencies == [0]  # e2b default: every (task, attempt) cell at once
+    [pool] = fake_pool_cls.instances  # ONE shared pool for the whole search
+    assert pool.template == "tmpl-1"
+    assert pool.closes == 1  # closed exactly once, when create_harness returned
+    assert len(pool.channels) == 3  # one pooled runner episode per (task, attempt) cell
+    assert pool.releases == [True, True, True]  # healthy episodes return their sandboxes
+    for channel in pool.channels:
+        kinds = [f.get("type") for f in channel.sent]
+        assert kinds == ["episode_start", "tool_response"]
+        response = channel.sent[1]
+        # The WORLD MODEL answered the tool: "ok" is the RoleProvider env-role marker reply.
+        assert response.get("content") == "ok" and response.get("is_error") is False
+
+
+def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    provider = RoleProvider()
+
+    def exploding_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
+        raise RuntimeError("boom mid-eval")
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", exploding_evaluate)
+    with pytest.raises(RuntimeError, match="boom mid-eval"):
+        create_harness(
+            "winner",
+            _pi_seed(),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            harness_backend="e2b",
+        )
+    [pool] = fake_pool_cls.instances
+    assert pool.closes == 1  # the try/finally tears the pool down even on failure
+
+
+def test_eval_concurrency_overrides_both_backend_defaults(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """An explicit eval_concurrency reaches the scorer; unset local keeps the sequential default."""
+    provider = RoleProvider()
+    concurrencies: list[int] = []
+
+    def fake_evaluate(
         tasks: list[TaskSpec],
-        make_env: EnvFactory,
-        runtime: Runtime,
+        world_model: WorldModel,
+        agent_provider: Provider,
         judge: GoldJudge,
         *,
         label: str,
         k: int,
         concurrency: int,
+        runtime: Runtime | None = None,
     ) -> ClosedLoopReport:
-        e2b_concurrencies.append(concurrency)
+        concurrencies.append(concurrency)
         return _canned_report(1.0, k=k)
 
-    monkeypatch.setattr(create_module, "evaluate_closed_loop", fake_sim_evaluate)
-    monkeypatch.setattr(create_module, "evaluate_with_env", fake_e2b_evaluate)
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", fake_evaluate)
 
-    def run(*, env_backend: str, eval_concurrency: int | None) -> None:
+    def run(seed: HarnessDoc, *, harness_backend: str, eval_concurrency: int | None) -> None:
         create_harness(
             "winner",
             seed,
             _tasks(),
-            _wm(provider) if env_backend == "sim" else None,
+            _wm(provider),
             provider,
             provider,
             GoldJudge(provider),
             iterations=0,  # score the seed only: one eval call per run
-            env_backend="sim" if env_backend == "sim" else "e2b",
+            harness_backend="local" if harness_backend == "local" else "e2b",
             eval_concurrency=eval_concurrency,
         )
 
-    run(env_backend="sim", eval_concurrency=None)
-    run(env_backend="sim", eval_concurrency=4)
-    run(env_backend="e2b", eval_concurrency=2)
-    assert sim_concurrencies == [1, 4]  # sim default stays the sequential world-model loop
-    assert e2b_concurrencies == [2]  # an explicit cap replaces the all-at-once default
+    run(HarnessDoc.baseline("seed"), harness_backend="local", eval_concurrency=None)
+    run(HarnessDoc.baseline("seed"), harness_backend="local", eval_concurrency=4)
+    run(_pi_seed(), harness_backend="e2b", eval_concurrency=2)
+    assert concurrencies == [1, 4, 2]  # local defaults sequential; explicit caps pass through

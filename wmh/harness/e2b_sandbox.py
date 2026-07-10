@@ -1,0 +1,148 @@
+"""E2B sandbox plumbing for the e2b harness backend: protocol slice, creation, retries.
+
+An E2B microVM is where a `pi-node` harness *process* executes under `backend="e2b"` — the
+environment its tool calls hit stays whatever `AgentEnvironment` the eval binds (normally the
+world-model simulation). This module owns only the sandbox mechanics: the exact protocol slice of
+`e2b.Sandbox` the harness uses (so tests substitute fakes), the lazy-SDK default factory, and
+capacity-shaped creation retries with fixed (1, 3, 9) s delays — the
+`wmh.providers.retry.RetryingProvider` precedent, no RNG in scoring paths. The e2b SDK stays an
+optional extra (`uv sync --extra e2b`).
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from collections.abc import Callable, Iterator
+from typing import Protocol, cast, runtime_checkable
+
+E2B_API_KEY_ENV = "E2B_API_KEY"
+E2B_TEMPLATE_ENV = "WMH_E2B_TEMPLATE"
+
+# Sandbox lifetime. The sandbox only hosts the harness process (tool calls are answered by the
+# environment host-side), so the bound is episode wall-time, not command time.
+DEFAULT_SANDBOX_TIMEOUT_S = 900.0
+
+# Fixed delays before each retry of sandbox creation (RetryingProvider precedent: 1s, 3s, 9s).
+_CREATE_DELAYS = (1.0, 3.0, 9.0)
+
+
+@runtime_checkable
+class CommandOutput(Protocol):
+    """The result slice of a finished sandbox command (e2b's `CommandResult` shape).
+
+    `runtime_checkable` because e2b's `CommandExitException` *is* a `CommandResult` (non-zero
+    exits raise instead of returning) — an isinstance check against this protocol recognizes it
+    without importing the SDK.
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+class CommandHandle(Protocol):
+    """A background sandbox command (e2b's handle): stdin by pid, iteration yields stream events.
+
+    Iteration events are `(stdout, stderr, pty)` chunks; `E2BPiRuntime` drives the RunnerLink
+    frame stream over one.
+    """
+
+    @property
+    def pid(self) -> int: ...
+
+    def __iter__(self) -> Iterator[tuple[str | None, str | None, str | None]]: ...
+
+
+class SandboxCommands(Protocol):
+    """The `sandbox.commands` slice: run (foreground or background) and stdin injection."""
+
+    def run(
+        self,
+        cmd: str,
+        background: bool | None = None,
+        *,
+        stdin: bool | None = None,
+        timeout: float | None = None,
+    ) -> CommandOutput | CommandHandle: ...
+
+    def send_stdin(self, pid: int, data: str) -> object: ...
+
+
+class SandboxFiles(Protocol):
+    """The `sandbox.files` slice: whole-file read and write."""
+
+    def write(self, path: str, data: str) -> object: ...
+
+    def read(self, path: str) -> str: ...
+
+
+@runtime_checkable
+class SandboxHandle(Protocol):
+    """The exact slice of `e2b.Sandbox` the harness uses, so tests substitute fakes."""
+
+    @property
+    def commands(self) -> SandboxCommands: ...
+
+    @property
+    def files(self) -> SandboxFiles: ...
+
+    def kill(self) -> object: ...
+
+
+# Opens one sandbox. The default factory calls the real SDK; tests inject fakes.
+SandboxFactory = Callable[[], SandboxHandle]
+
+
+def default_sandbox_factory(
+    *,
+    api_key: str | None = None,
+    template: str | None = None,
+    timeout: float = DEFAULT_SANDBOX_TIMEOUT_S,
+) -> SandboxFactory:
+    """A factory creating real E2B sandboxes (lazy SDK import; key from arg or $E2B_API_KEY)."""
+
+    def make() -> SandboxHandle:
+        try:
+            from e2b import Sandbox
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise ImportError(
+                "the e2b SDK is not installed; run `uv sync --extra e2b` to use the "
+                "e2b harness backend"
+            ) from exc
+        key = api_key or os.environ.get(E2B_API_KEY_ENV)
+        if not key:
+            raise RuntimeError(f"set ${E2B_API_KEY_ENV} to run the harness in E2B sandboxes")
+        chosen = template or os.environ.get(E2B_TEMPLATE_ENV) or None
+        sandbox = Sandbox.create(template=chosen, timeout=int(timeout), api_key=key)
+        # The SDK object satisfies the protocol slice structurally; cast rather than pin the
+        # SDK's full (much wider) signatures into the protocol.
+        return cast("SandboxHandle", sandbox)
+
+    return make
+
+
+def create_sandbox(factory: SandboxFactory) -> SandboxHandle:
+    """Open one sandbox via `factory`, retrying capacity errors with fixed (1, 3, 9) s delays."""
+    for delay in _CREATE_DELAYS:
+        try:
+            return factory()
+        except Exception as exc:  # noqa: BLE001 - classified below; non-capacity re-raises
+            if not _is_retryable_create_error(exc):
+                raise
+            time.sleep(delay)
+    return factory()  # final attempt: let any error propagate
+
+
+def _is_retryable_create_error(exc: Exception) -> bool:
+    """True for capacity-shaped creation failures (rate limit / no capacity / 5xx).
+
+    Matched by exception name and message so fakes need no SDK import; anything else (auth,
+    bad template, missing key) fails immediately — retrying those only hides real bugs.
+    """
+    if type(exc).__name__ == "RateLimitException":  # e2b's 429
+        return True
+    text = str(exc).lower()
+    if "rate limit" in text or "capacity" in text or "too many requests" in text:
+        return True
+    return any(code in text for code in ("429", "500", "502", "503", "504"))

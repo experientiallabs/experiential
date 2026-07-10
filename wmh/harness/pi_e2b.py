@@ -1,19 +1,24 @@
-"""The pi agent inside the E2B sandbox: a stdio frame channel + the runtime that drives it.
+"""The pi agent inside E2B sandboxes: a stdio frame channel + the runtime that drives it.
 
-For pi-node harnesses the agent process itself must run in the rollout's sandbox (its multi-file
-TypeScript source is the thing under search), while the worker LLM and the tool routing stay
-host-side. `E2BStdioChannel` carries the existing RunnerLink frame protocol over an E2B background
-command's stdin/stdout — one base64(JSON) frame per line, because the sandbox command channel is a
-text stream — and `E2BPiRuntime` composes it: bootstrap the sandbox once (upload
-`pi_entry/runner_stdio.ts`, install node 22 + the vendored pi's npm deps unless a prebaked
-template supplies them), start the runner, await its `hello`, then delegate the whole episode to
-`wmh.harness.runner_link.RunnerLink` — zero duplication of episode logic, and the
-creds-stay-host-side invariant RunnerLink was built for holds (only frames enter the sandbox).
+For pi-node harnesses the agent *process* itself must run for real (its multi-file TypeScript
+source — context forking, dropping, summarizing — is the thing under search), while the worker LLM
+and the tool routing stay host-side. The ENVIRONMENT is whatever `AgentEnvironment` the eval
+binds; in `wmh harness create` / `wmh eval` that is the world-model simulation — the sandbox is
+purely the compute substrate for the harness process, and its filesystem is never an environment.
 
-One channel per sandbox, one sandbox per rollout (`E2BEnvironment`): no process-wide
-`_ACTIVE_CHANNEL` singleton, no max_concurrent:1 limit — rollouts parallelize naturally. The
-runner's stderr never carries frames; it is collected in a bounded deque and surfaced in every
-transport error so a crashed node process diagnoses itself.
+`E2BStdioChannel` carries the existing RunnerLink frame protocol over an E2B background command's
+stdin/stdout — one base64(JSON) frame per line, because the sandbox command channel is a text
+stream — and `E2BPiRuntime` composes it: acquire a sandbox from the runtime's own pool (create +
+bootstrap on demand: upload `pi_entry/runner_stdio.ts`, install node 22 + the vendored pi's npm
+deps unless a prebaked template supplies them), start the runner, await its `hello`, then delegate
+the whole episode to `wmh.harness.runner_link.RunnerLink` — zero duplication of episode logic, and
+the creds-stay-host-side invariant RunnerLink was built for holds (only frames enter the sandbox).
+
+Sandboxes are pooled per runtime instance and reused across sequential episodes (bootstrap is
+paid once per sandbox, not per rollout); concurrent episodes each acquire their own sandbox, so
+rollouts parallelize naturally — no process-wide `_ACTIVE_CHANNEL` singleton, no max_concurrent:1
+limit. The runner's stderr never carries frames; it is collected in a bounded deque and surfaced
+in every transport error so a crashed node process diagnoses itself.
 """
 
 from __future__ import annotations
@@ -24,20 +29,23 @@ import os
 import queue
 import threading
 import time
-import weakref
 from collections import deque
 from typing import cast
 
 from wmh.core.types import JsonObject
-from wmh.harness.e2b_env import E2B_TEMPLATE_ENV, CommandHandle, E2BEnvironment, SandboxHandle
+from wmh.harness.e2b_sandbox import (
+    E2B_TEMPLATE_ENV,
+    CommandHandle,
+    SandboxFactory,
+    SandboxHandle,
+    create_sandbox,
+    default_sandbox_factory,
+)
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.runner_link import RunnerLink, WorkerConfig, WorkerFn
 from wmh.harness.runtime import RunResult
 from wmh.harness.tools import ToolSpec
 
-# Where the runner lives inside every sandbox. A prebaked template (WMH_E2B_TEMPLATE) must provide
-# node >= 22.6 plus this directory containing node_modules and a package.json with type:"module";
-# without a template, `_bootstrap` builds the same layout on the base image.
 RUNNER_WORKDIR = "/home/user/pi-run"
 
 # The npm packages the vendored pi source imports (verified against
@@ -175,78 +183,84 @@ class E2BStdioChannel:
             self._stderr.append(f"[stdout] {text}")
 
 
-class E2BPiRuntime:
-    """The `Runtime` for pi-node harnesses on the e2b backend: pi runs inside the rollout sandbox.
+class E2BSandboxPool:
+    """Bootstrapped sandboxes with a running pi runner, reused across episodes and docs.
 
-    `run` requires an `E2BEnvironment` (the runner shares its sandbox, so env tool calls and the
-    agent process see the same filesystem), bootstraps that sandbox exactly once (idempotent per
-    sandbox: runner files uploaded; node 22 + pi's npm deps installed unless a template prebakes
-    them), starts `runner_stdio.ts` as a background command, awaits its `hello`, then delegates
-    the episode to `RunnerLink` — the frame broker, worker-LLM answering, tool budget, and
-    transcript recording all stay in that one implementation.
+    The bootstrap (runner files + node 22 + pi's npm deps unless a template prebakes them) is
+    doc-independent — a mutated harness's code surfaces travel per-episode in
+    `episode_start.files` — so one pool serves a whole search: `create_harness` opens it once and
+    every `_score` wave reuses warm sandboxes instead of re-paying installs. Concurrent episodes
+    acquire distinct sandboxes; a sandbox whose episode raised is discarded (the runner process
+    is in an unknown state — reuse could cross frames between episodes). `close()` kills
+    everything; the pool lock guards only the free lists, so parallel bootstraps never serialize
+    behind one sandbox's multi-minute npm install.
     """
 
     def __init__(
         self,
         *,
-        worker: WorkerConfig,
-        files: dict[str, str],
-        tools: list[ToolSpec],
-        system_prompt: str,
-        template: str | None,
+        template: str | None = None,
         api_key: str | None = None,
-        worker_fn: WorkerFn | None = None,
+        sandbox_factory: SandboxFactory | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
     ) -> None:
-        self._worker = worker
-        self._files = dict(files)
-        self._tools = list(tools)
-        self._system_prompt = system_prompt
         self._template = template
-        # The sandbox is created (and paid for) by E2BEnvironment; the key is accepted to mirror
-        # the doc-runtime wiring surface but nothing here opens sandboxes today.
-        self._api_key = api_key
-        self._worker_fn = worker_fn  # test seam, exactly like RunnerLink's
+        self._factory = sandbox_factory or default_sandbox_factory(
+            api_key=api_key, template=template
+        )
         self._hello_timeout = hello_timeout
         self._lock = threading.Lock()
-        # One live channel per sandbox: episodes on the same sandbox reuse the runner process, and
-        # entries vanish with their sandbox objects (a rollout's env owns the sandbox lifetime).
-        self._channels: weakref.WeakKeyDictionary[SandboxHandle, E2BStdioChannel] = (
-            weakref.WeakKeyDictionary()
-        )
+        self._idle: list[tuple[SandboxHandle, E2BStdioChannel]] = []
+        self._all: list[SandboxHandle] = []
+        self._closed = False
 
-    def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
-        if not isinstance(environment, E2BEnvironment):
-            raise TypeError(
-                "E2BPiRuntime needs an E2BEnvironment (the pi agent runs inside its sandbox); "
-                f"got {type(environment).__name__}"
-            )
-        channel = self._channel_for(environment.sandbox)
-        link = RunnerLink(
-            channel,
-            tools=self._tools,
-            worker=self._worker,
-            worker_fn=self._worker_fn,
-            files=self._files,
-            system_prompt=self._system_prompt,
-        )
-        return link.run(task_id, instruction, environment)
-
-    def _channel_for(self, sandbox: SandboxHandle) -> E2BStdioChannel:
-        """The (bootstrapped, hello-verified) channel for this sandbox, created on first use.
-
-        The lock guards only the map: parallel rollouts each own a distinct sandbox, so bootstraps
-        run concurrently instead of serializing multi-minute npm installs behind one lock.
-        """
+    def acquire(self) -> tuple[SandboxHandle, E2BStdioChannel]:
+        """An idle (bootstrapped, hello-verified) sandbox+channel; creates one when none is free."""
         with self._lock:
-            existing = self._channels.get(sandbox)
-        if existing is not None:
-            return existing
-        self._bootstrap(sandbox)
-        channel = self._start_runner(sandbox)
+            if self._closed:
+                raise RuntimeError("E2BSandboxPool is closed")
+            if self._idle:
+                return self._idle.pop()
+        sandbox = create_sandbox(self._factory)
+        try:
+            self._bootstrap(sandbox)
+            channel = self._start_runner(sandbox)
+        except BaseException:
+            _kill_quietly(sandbox)
+            raise
         with self._lock:
-            self._channels[sandbox] = channel
-        return channel
+            if not self._closed:
+                self._all.append(sandbox)
+                return sandbox, channel
+        _kill_quietly(sandbox)  # closed while we were bootstrapping: don't leak the sandbox
+        raise RuntimeError("E2BSandboxPool is closed")
+
+    def release(self, sandbox: SandboxHandle, channel: E2BStdioChannel, *, healthy: bool) -> None:
+        """Return a sandbox for reuse, or discard it after a failed episode."""
+        if healthy:
+            with self._lock:
+                if not self._closed:
+                    self._idle.append((sandbox, channel))
+                    return
+        with self._lock:
+            if sandbox in self._all:
+                self._all.remove(sandbox)
+        _kill_quietly(sandbox)
+
+    def close(self) -> None:
+        """Kill every pooled sandbox; safe to call more than once."""
+        with self._lock:
+            self._closed = True
+            sandboxes, self._all = self._all, []
+            self._idle = []
+        for sandbox in sandboxes:
+            _kill_quietly(sandbox)
+
+    def __enter__(self) -> E2BSandboxPool:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def _bootstrap(self, sandbox: SandboxHandle) -> None:
         """Upload the runner files; on template-less sandboxes also install node 22 + pi's deps."""
@@ -285,6 +299,79 @@ class E2BPiRuntime:
                 raise RuntimeError(_no_hello(self._hello_timeout, channel))
             if frame.get("type") == "hello":
                 return
+
+
+class E2BPiRuntime:
+    """The `Runtime` for pi-node harnesses on the e2b backend: pi runs inside a pooled sandbox.
+
+    `run` accepts ANY `AgentEnvironment` — tool calls are answered host-side (the world-model
+    simulation in closed-loop eval), while the harness process executes in an E2B sandbox drawn
+    from the pool. Each episode acquires a sandbox, delegates wholly to `RunnerLink` (frame
+    broker, worker-LLM answering, tool budget, transcript recording), and returns the sandbox for
+    reuse. Pass a shared `pool` to amortize bootstrap across many runtimes (a whole harness
+    search); without one, the runtime creates a private pool from `template` and owns its
+    lifetime — call `close()` (or use as a context manager) when the eval finishes.
+    """
+
+    def __init__(
+        self,
+        *,
+        worker: WorkerConfig,
+        files: dict[str, str],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        template: str | None = None,
+        api_key: str | None = None,
+        pool: E2BSandboxPool | None = None,
+        worker_fn: WorkerFn | None = None,
+        hello_timeout: float = HELLO_TIMEOUT_S,
+    ) -> None:
+        self._worker = worker
+        self._files = dict(files)
+        self._tools = list(tools)
+        self._system_prompt = system_prompt
+        self._worker_fn = worker_fn  # test seam, exactly like RunnerLink's
+        self._owns_pool = pool is None
+        self._pool = pool or E2BSandboxPool(
+            template=template, api_key=api_key, hello_timeout=hello_timeout
+        )
+
+    def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+        sandbox, channel = self._pool.acquire()
+        healthy = False
+        try:
+            link = RunnerLink(
+                channel,
+                tools=self._tools,
+                worker=self._worker,
+                worker_fn=self._worker_fn,
+                files=self._files,
+                system_prompt=self._system_prompt,
+            )
+            result = link.run(task_id, instruction, environment)
+            healthy = True
+            return result
+        finally:
+            self._pool.release(sandbox, channel, healthy=healthy)
+
+    def close(self) -> None:
+        """Close the private pool; a no-op when the pool is shared (its owner closes it)."""
+        if self._owns_pool:
+            self._pool.close()
+
+    def __enter__(self) -> E2BPiRuntime:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+def _kill_quietly(sandbox: SandboxHandle) -> None:
+    """Best-effort sandbox teardown; a dead sandbox is already gone."""
+    try:
+        sandbox.kill()
+    except Exception:  # noqa: BLE001 - teardown must never mask the original error
+        pass
 
 
 def _no_hello(timeout: float, channel: E2BStdioChannel) -> str:

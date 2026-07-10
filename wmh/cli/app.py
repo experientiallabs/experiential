@@ -674,25 +674,27 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     harness: str | None = typer.Option(
         None, "--harness", help="Stored harness to run for `closed-loop` (default: baseline)."
     ),
-    env: str = typer.Option(
-        "sim",
-        "--env",
-        help="Closed-loop environment: sim (the world model) or e2b (one real E2B sandbox "
-        "per rollout; the world model becomes optional).",
+    harness_backend: str = typer.Option(
+        "local",
+        "--harness-backend",
+        help="Where the closed-loop harness PROCESS runs: local (in/from this process) or e2b "
+        "(the pi-node harness inside pooled E2B sandboxes). The environment is always the "
+        "world model.",
     ),
     eval_concurrency: int | None = typer.Option(
         None,
         "--eval-concurrency",
         min=0,
-        help="Closed-loop (task, attempt) cells run at once. Default: 1 for sim; "
+        help="Closed-loop (task, attempt) cells run at once. Default: 1 for local; "
         "0 (= all cells at once) for e2b.",
     ),
     e2b_template: str | None = typer.Option(
         None,
         "--e2b-template",
         envvar="WMH_E2B_TEMPLATE",
-        help="Prebaked E2B sandbox template for --env e2b (default: $WMH_E2B_TEMPLATE; "
-        "without one, sandboxes bootstrap node + the pi runner deps on first use).",
+        help="Prebaked E2B sandbox template for --harness-backend e2b (default: "
+        "$WMH_E2B_TEMPLATE; without one, sandboxes bootstrap node + the pi runner deps on "
+        "first use).",
     ),
 ) -> None:
     """Score reconstruction fidelity, or run named example-local eval suites.
@@ -701,8 +703,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmh eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
       default mode).
     - `wmh eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
-      as its environment — or in real E2B sandboxes with `--env e2b` (one per rollout, all in
-      parallel); score task success against gold assertions (see docs/reference/closed_loop.md).
+      as its environment; `--harness-backend e2b` moves the pi-node harness process into pooled
+      E2B sandboxes (the env stays the world model, all cells in parallel); score task success
+      against gold assertions (see docs/reference/closed_loop.md).
     - `wmh eval list`: list named suites under `examples/<task>/evals/`.
     - `wmh eval run <suite>`: run a suite and save a local JSON result.
     - `wmh eval results optional-suite`: summarize local suite results.
@@ -727,7 +730,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             max_turns=max_turns,
             out=out,
             harness=harness,
-            env=env,
+            harness_backend=harness_backend,
             eval_concurrency=eval_concurrency,
             e2b_template=e2b_template,
         )

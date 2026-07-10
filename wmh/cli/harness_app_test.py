@@ -1,9 +1,9 @@
-"""CLI tests for `wmh harness create`: the env-backend wiring, driven via CliRunner.
+"""CLI tests for `wmh harness create`: the harness-backend wiring, driven via CliRunner.
 
 The search itself is faked (`create_harness` is monkeypatched to a recorder) — these tests pin
-the WIRING the flags control: which env backend reaches the search, when the world model is
-(not) loaded, which provider anchors an e2b run, and what the cost-confirmation line advertises.
-Flag validation, task loading, and the harness store are real.
+the WIRING the flags control: which harness backend reaches the search, that the world model is
+ALWAYS loaded (it is the environment on every backend), and what the cost-confirmation line
+advertises. Flag validation, task loading, and the harness store are real.
 """
 
 from __future__ import annotations
@@ -92,78 +92,63 @@ def _invoke(tmp_path: Path, *extra: str) -> Result:
     )
 
 
-def test_create_env_e2b_without_model_skips_world_model_loading(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    recorder = _CreateRecorder()
-    fallback = _Provider()
-    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
-    monkeypatch.setattr(
-        harness_app_module,
-        "_load_world_model",
-        lambda model, root: pytest.fail("--env e2b without --model must not load a world model"),
-    )
-    monkeypatch.setattr(
-        harness_app_module, "default_worker_provider", lambda root: (fallback, "fallback-model")
-    )
-
-    result = _invoke(
-        tmp_path, "--env", "e2b", "--eval-concurrency", "4", "--e2b-template", "tmpl-x"
-    )
-
-    assert result.exit_code == 0, result.output
-    [call] = recorder.calls
-    assert call["world_model"] is None  # nothing simulated: no world model was ever loaded
-    assert call["provider"] is fallback  # the settings/default provider anchors the run
-    assert call["env_backend"] == "e2b"
-    assert call["eval_concurrency"] == 4
-    assert call["e2b_template"] == "tmpl-x"
-    # The cost line advertises the sandbox bill: (iterations+1) * k * tasks = 3 * 3 * 1 = 9.
-    flat = result.output.replace("\n", " ")  # rich wraps lines
-    assert "real E2B sandboxes" in flat
-    assert "9 sandboxes" in flat
-
-
-def test_create_env_e2b_with_model_still_anchors_its_provider(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`--env e2b --model X` loads X so its provider runs agent/meta/judge (the model idles)."""
-    recorder = _CreateRecorder()
-    wm = object()
-    anchored = _Provider()
+def _patch_load(
+    monkeypatch: pytest.MonkeyPatch, wm: object, provider: _Provider
+) -> list[str | None]:
     loads: list[str | None] = []
 
     def fake_load(model: str | None, root: str) -> tuple[object, _Provider, str]:
         loads.append(model)
-        return wm, anchored, "wm-alpha"
+        return wm, provider, "wm-alpha"
 
-    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
     monkeypatch.setattr(harness_app_module, "_load_world_model", fake_load)
+    return loads
 
-    result = _invoke(tmp_path, "--env", "e2b", "--model", "wm-alpha")
+
+def test_create_e2b_wires_backend_flags_and_still_loads_the_world_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _CreateRecorder()
+    wm = object()
+    anchored = _Provider()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    loads = _patch_load(monkeypatch, wm, anchored)
+
+    result = _invoke(
+        tmp_path,
+        "--harness-backend",
+        "e2b",
+        "--eval-concurrency",
+        "4",
+        "--e2b-template",
+        "tmpl-x",
+    )
 
     assert result.exit_code == 0, result.output
-    assert loads == ["wm-alpha"]
+    assert loads == [None]  # the world model is the environment: ALWAYS loaded, even for e2b
     [call] = recorder.calls
-    assert call["env_backend"] == "e2b"
+    assert call["world_model"] is wm
     assert call["provider"] is anchored
-    assert call["world_model"] is wm  # passed through; the e2b backend simply never touches it
+    assert call["harness_backend"] == "e2b"
+    assert call["eval_concurrency"] == 4
+    assert call["e2b_template"] == "tmpl-x"
+    flat = " ".join(result.output.split())  # rich wraps (and pads) lines
+    # The cost line keeps the rollout estimate ((iterations+1) * k * tasks = 3 * 3 * 1 = 9)
+    # and says where the harness process runs — while the env stays the world model.
+    assert "9 rollouts" in flat
+    assert "pooled E2B sandboxes" in flat
+    assert "world model" in flat and "wm-alpha" in flat
+    assert "--harness-backend e2b" in flat  # the run-it hint carries the backend through
 
 
-def test_create_default_sim_loads_the_world_model(
+def test_create_default_local_loads_the_world_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("WMH_E2B_TEMPLATE", raising=False)  # --e2b-template defaults from it
     recorder = _CreateRecorder()
     wm = object()
-    loads: list[str | None] = []
-
-    def fake_load(model: str | None, root: str) -> tuple[object, _Provider, str]:
-        loads.append(model)
-        return wm, _Provider(), "wm-alpha"
-
     monkeypatch.setattr(harness_app_module, "create_harness", recorder)
-    monkeypatch.setattr(harness_app_module, "_load_world_model", fake_load)
+    loads = _patch_load(monkeypatch, wm, _Provider())
 
     result = _invoke(tmp_path)
 
@@ -171,15 +156,16 @@ def test_create_default_sim_loads_the_world_model(
     assert loads == [None]  # default: resolve the only built model
     [call] = recorder.calls
     assert call["world_model"] is wm
-    assert call["env_backend"] == "sim"
-    assert call["eval_concurrency"] is None  # backend default decided downstream (sim -> 1)
+    assert call["harness_backend"] == "local"
+    assert call["eval_concurrency"] is None  # backend default decided downstream (local -> 1)
     assert call["e2b_template"] is None
-    flat = result.output.replace("\n", " ")
+    flat = " ".join(result.output.split())
     assert "world model" in flat and "wm-alpha" in flat
-    assert "sandbox" not in flat  # no sandbox bill on the sim path
+    assert "sandbox" not in flat  # no sandbox note on the local path
+    assert "--harness-backend" not in flat  # and the run-it hint stays plain
 
 
-def test_create_rejects_unknown_env(tmp_path: Path) -> None:
-    result = _invoke(tmp_path, "--env", "banana")
+def test_create_rejects_unknown_harness_backend(tmp_path: Path) -> None:
+    result = _invoke(tmp_path, "--harness-backend", "banana")
     assert result.exit_code == 2  # usage error, not a traceback
-    assert "choose sim or e2b" in result.output
+    assert "choose local or e2b" in result.output

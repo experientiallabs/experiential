@@ -24,24 +24,23 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
 from wmh.engine.world_model import WorldModel
-from wmh.evals.closed_loop import (
-    DEFAULT_K,
-    ClosedLoopReport,
-    evaluate_closed_loop,
-    evaluate_with_env,
-)
+from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_loop
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.e2b_env import e2b_env_factory
 from wmh.harness.mutate import propose_delta, render_evidence
 from wmh.providers.base import Provider
+
+if TYPE_CHECKING:
+    # Only the annotation: pi_e2b (the optional e2b extra's consumer) is imported lazily where
+    # the pool is actually constructed.
+    from wmh.harness.pi_e2b import E2BSandboxPool
 
 # Selection floor: a zero-scoring variant keeps a small chance of being expanded, so early
 # pools with no successes still make progress instead of dividing by zero interest.
@@ -278,7 +277,7 @@ def create_harness(
     name: str,
     seed_doc: HarnessDoc,
     tasks: list[TaskSpec],
-    world_model: WorldModel | None,
+    world_model: WorldModel,
     agent_provider: Provider,
     meta_provider: Provider,
     judge: GoldJudge,
@@ -287,7 +286,7 @@ def create_harness(
     k: int = DEFAULT_K,
     holdout: list[TaskSpec] | None = None,
     confirm_narrow_vetoes: bool = True,
-    env_backend: Literal["sim", "e2b"] = "sim",
+    harness_backend: Literal["local", "e2b"] = "local",
     eval_concurrency: int | None = None,
     e2b_template: str | None = None,
     on_progress: CreateProgress | None = None,
@@ -298,13 +297,16 @@ def create_harness(
     iteration whose proposal is unusable or fails atomic application is skipped (counted in
     `skipped`; an invalid delta is still archived with its rejection verdict), never fatal.
 
-    `env_backend` picks where rollouts execute: `sim` (the default) scores against the world
-    model exactly as before — `world_model` must be provided; `e2b` runs every rollout in a
-    fresh real E2B sandbox (`e2b_env_factory` + `doc.runtime(backend="e2b")`) and never touches
-    the world model, so `world_model=None` is allowed. `eval_concurrency` is how many
-    (task, attempt) cells run at once; `None` means the backend default — 1 (sequential) for
-    sim, 0 (every cell at once, one sandbox each) for e2b. `e2b_template` names a prebaked
-    sandbox template (node 22 + the pi runner deps) so e2b rollouts skip bootstrap installs.
+    Every rollout scores against the world-model simulation — the environment is always sim.
+    `harness_backend` picks where the harness PROCESS executes: `local` (the default) runs it
+    in/from this process exactly as before; `e2b` runs the real pi agent inside E2B sandboxes
+    (pi-node seeds only — that harness's context management is the thing under search), with its
+    tool calls still answered by the world model host-side. One `E2BSandboxPool` is shared across
+    every `_score` wave so sandbox bootstraps amortize over the whole search. `eval_concurrency`
+    is how many (task, attempt) cells run at once; `None` means the backend default — 1
+    (sequential) for local, 0 (every cell at once, one pooled sandbox each) for e2b.
+    `e2b_template` names a prebaked sandbox template (node 22 + the pi runner deps) so e2b
+    rollouts skip bootstrap installs.
 
     Verification is staged by cost: a child is first SCREENED on its own trigger cluster (the
     2-3 failing tasks its delta claims to fix, k passes) — if the cluster did not improve over
@@ -320,221 +322,230 @@ def create_harness(
     re-measured — child AND champion, at 2k — and the re-measurement decides. The verdict records
     the retrial either way, so the archive shows which accepts needed confirmation.
     """
-    if env_backend not in ("sim", "e2b"):
-        raise ValueError(f"unknown env_backend {env_backend!r}; choose sim or e2b")
-    if env_backend == "sim" and world_model is None:
+    if harness_backend not in ("local", "e2b"):
+        raise ValueError(f"unknown harness_backend {harness_backend!r}; choose local or e2b")
+    if harness_backend == "e2b" and seed_doc.runtime_kind() != "pi-node":
         raise ValueError(
-            "env_backend='sim' scores rollouts against the world model; pass one "
-            "(world_model=None is only valid with env_backend='e2b')"
+            "harness_backend='e2b' runs the pi-node harness process in sandboxes; seed "
+            f"runtime kind is {seed_doc.runtime_kind()!r}, which already runs in-process — "
+            "use harness_backend='local'"
         )
+    sandbox_pool: E2BSandboxPool | None = None
+    if harness_backend == "e2b":
+        # Lazy: the e2b backend is an optional extra; local searches must import none of it.
+        from wmh.harness.pi_e2b import E2BSandboxPool as _Pool
 
-    docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
-    reports: dict[str, ClosedLoopReport] = {}
-    holdout_reports: dict[str, ClosedLoopReport] = {}
-    archive = DeltaArchive(seed=seed_doc)
-    children_counts: dict[str, int] = {}
-    skipped = 0
-    screened = 0
-    confirmations = 0
+        sandbox_pool = _Pool(template=e2b_template)
 
-    def _score(
-        doc: HarnessDoc, split: list[TaskSpec], *, k_override: int | None = None
-    ) -> ClosedLoopReport:
-        k_eff = k if k_override is None else k_override
-        if env_backend == "sim" and doc.runtime_kind() == "pi-node":
-            # Local pi runtimes are single-episode resources (one runner port/workdir, or one
-            # RunnerLink channel): parallel cells would collide. Checked per-doc because a delta
-            # can flip param:runtime-kind mid-search.
-            sim_concurrency = eval_concurrency if eval_concurrency is not None else 1
-            if sim_concurrency != 1:
-                raise ValueError(
-                    "pi-node harnesses run one episode at a time under env_backend='sim' "
-                    "(single runner port/channel); use eval_concurrency=1 or env_backend='e2b'"
-                )
-        if env_backend == "e2b":
-            # One fresh sandbox per (task, attempt) cell; default = every cell at once.
-            return evaluate_with_env(
+    try:
+        docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
+        reports: dict[str, ClosedLoopReport] = {}
+        holdout_reports: dict[str, ClosedLoopReport] = {}
+        archive = DeltaArchive(seed=seed_doc)
+        children_counts: dict[str, int] = {}
+        skipped = 0
+        screened = 0
+        confirmations = 0
+
+        def _score(
+            doc: HarnessDoc, split: list[TaskSpec], *, k_override: int | None = None
+        ) -> ClosedLoopReport:
+            k_eff = k if k_override is None else k_override
+            if harness_backend == "local":
+                concurrency = eval_concurrency if eval_concurrency is not None else 1
+                if concurrency != 1 and doc.runtime_kind() == "pi-node":
+                    # Local pi runtimes are single-episode resources (one runner port/workdir, or
+                    # one RunnerLink channel): parallel cells would collide. Checked per-doc because
+                    # a delta can flip param:runtime-kind mid-search.
+                    raise ValueError(
+                        "pi-node harnesses run one episode at a time under harness_backend='local' "
+                        "(single runner port/channel); use eval_concurrency=1 or "
+                        "harness_backend='e2b'"
+                    )
+                runtime = doc.runtime(agent_provider)
+            else:
+                # The pi process runs in pooled sandboxes; every cell at once by default. Tool calls
+                # still route to the world model — the environment is sim regardless of backend.
+                concurrency = eval_concurrency if eval_concurrency is not None else 0
+                runtime = doc.runtime(agent_provider, backend="e2b", e2b_pool=sandbox_pool)
+            return evaluate_closed_loop(
                 split,
-                e2b_env_factory(template=e2b_template),
-                doc.runtime(agent_provider, backend="e2b", e2b_template=e2b_template),
+                world_model,
+                agent_provider,
                 judge,
                 label=doc.name,
                 k=k_eff,
-                concurrency=eval_concurrency if eval_concurrency is not None else 0,
+                concurrency=concurrency,
+                runtime=runtime,
             )
-        if world_model is None:  # unreachable: validated at entry; narrows the type for the call
-            raise ValueError("env_backend='sim' requires a world model")
-        return evaluate_closed_loop(
-            split,
-            world_model,
-            agent_provider,
-            judge,
-            label=doc.name,
-            k=k_eff,
-            concurrency=eval_concurrency if eval_concurrency is not None else 1,
-            runtime=doc.runtime(agent_provider),
+
+        seed_report = _score(seed_doc, tasks)
+        reports[seed_doc.doc_hash] = seed_report
+        if holdout:
+            holdout_reports[seed_doc.doc_hash] = _score(seed_doc, holdout)
+        if on_progress is not None:
+            on_progress(0, seed_doc.name, seed_report.success_rate, True)
+
+        pool = [
+            PoolEntry(
+                doc_hash=seed_doc.doc_hash,
+                name=seed_doc.name,
+                success_rate=seed_report.success_rate,
+            )
+        ]
+        champion_hash = seed_doc.doc_hash
+        best_full = seed_report.success_rate
+        # The regression suite: tasks the champion lineage has fully passed. Wins promote in
+        # on accept.
+        suite = sorted(
+            task.task_id
+            for task in tasks
+            if seed_report.per_task[task.task_id].success_rate >= 1.0 - _TIE_EPS
         )
 
-    seed_report = _score(seed_doc, tasks)
-    reports[seed_doc.doc_hash] = seed_report
-    if holdout:
-        holdout_reports[seed_doc.doc_hash] = _score(seed_doc, holdout)
-    if on_progress is not None:
-        on_progress(0, seed_doc.name, seed_report.success_rate, True)
+        for i in range(1, iterations + 1):
+            parent_entry = select_parent(pool, children_counts, seed=i)
+            parent = docs[parent_entry.doc_hash]
+            parent_report = reports[parent_entry.doc_hash]
+            # Count the expansion attempt up front so a parent whose proposals keep failing is
+            # progressively discounted instead of re-selected every iteration.
+            children_counts[parent.doc_hash] = children_counts.get(parent.doc_hash, 0) + 1
 
-    pool = [
-        PoolEntry(
-            doc_hash=seed_doc.doc_hash, name=seed_doc.name, success_rate=seed_report.success_rate
-        )
-    ]
-    champion_hash = seed_doc.doc_hash
-    best_full = seed_report.success_rate
-    # The regression suite: tasks the champion lineage has fully passed. Wins promote in on accept.
-    suite = sorted(
-        task.task_id
-        for task in tasks
-        if seed_report.per_task[task.task_id].success_rate >= 1.0 - _TIE_EPS
-    )
-
-    for i in range(1, iterations + 1):
-        parent_entry = select_parent(pool, children_counts, seed=i)
-        parent = docs[parent_entry.doc_hash]
-        parent_report = reports[parent_entry.doc_hash]
-        # Count the expansion attempt up front so a parent whose proposals keep failing is
-        # progressively discounted instead of re-selected every iteration.
-        children_counts[parent.doc_hash] = children_counts.get(parent.doc_hash, 0) + 1
-
-        clusters = cluster_failures(parent_report, tasks)
-        trigger = clusters[0] if clusters else FailureSignature(mechanism=ALL_PASS_MECHANISM)
-        evidence = render_evidence(trigger, parent_report, tasks)
-        delta = propose_delta(parent, trigger, evidence, meta_provider, history=archive.deltas)
-        if delta is None:
-            skipped += 1
-            continue
-        try:
-            child = apply_delta(parent, delta, f"{name}-g{i}")
-        except ValueError as exc:
-            delta.verdict = GateRecord(accepted=False, reason=f"invalid before eval: {exc}")
-            archive.deltas.append(delta)
-            skipped += 1
-            continue
-
-        # Cheap screen: before a full-split eval, the delta must improve the very cluster it
-        # was proposed to fix. A delta that cannot beat its parent on its own target is noise.
-        screen_tasks = [t for t in tasks if t.task_id in set(trigger.task_ids)]
-        if screen_tasks:
-            screen_report = _score(child, screen_tasks)
-            parent_mean = _suite_rate(parent_report, sorted(trigger.task_ids))
-            child_mean = _suite_rate(screen_report, sorted(trigger.task_ids))
-            if child_mean <= parent_mean + _TIE_EPS:
-                delta.verdict = GateRecord(
-                    accepted=False,
-                    reason=(
-                        f"screened out: trigger cluster {child_mean:.2f} vs parent "
-                        f"{parent_mean:.2f} over {len(screen_tasks)} task(s), k={k} — "
-                        "the delta did not improve its own target"
-                    ),
-                )
+            clusters = cluster_failures(parent_report, tasks)
+            trigger = clusters[0] if clusters else FailureSignature(mechanism=ALL_PASS_MECHANISM)
+            evidence = render_evidence(trigger, parent_report, tasks)
+            delta = propose_delta(parent, trigger, evidence, meta_provider, history=archive.deltas)
+            if delta is None:
+                skipped += 1
+                continue
+            try:
+                child = apply_delta(parent, delta, f"{name}-g{i}")
+            except ValueError as exc:
+                delta.verdict = GateRecord(accepted=False, reason=f"invalid before eval: {exc}")
                 archive.deltas.append(delta)
-                screened += 1
+                skipped += 1
                 continue
 
-        child_report = _score(child, tasks)
-        pre_verdict = gate_delta(
-            delta,
-            child=child_report,
-            champion=reports[champion_hash],
-            best_full=best_full,
-            suite=suite,
-        )
-        # The held-out tier is measured for every candidate that could still be accepted —
-        # including candidates whose suite/full veto is narrow enough for a confirmation
-        # re-run. A confirmation may overturn a veto; it must never bypass the held-out tier.
-        could_accept = pre_verdict.accepted or (
-            confirm_narrow_vetoes
-            and narrow_failing_tiers(pre_verdict, k=k, n_suite=len(suite), n_holdout=0) is not None
-        )
-        if holdout and could_accept:
-            child_holdout = _score(child, holdout)
-            holdout_reports[child.doc_hash] = child_holdout
-            if champion_hash not in holdout_reports:
-                holdout_reports[champion_hash] = _score(docs[champion_hash], holdout)
-            verdict = gate_delta(
+            # Cheap screen: before a full-split eval, the delta must improve the very cluster it
+            # was proposed to fix. A delta that cannot beat its parent on its own target is noise.
+            screen_tasks = [t for t in tasks if t.task_id in set(trigger.task_ids)]
+            if screen_tasks:
+                screen_report = _score(child, screen_tasks)
+                parent_mean = _suite_rate(parent_report, sorted(trigger.task_ids))
+                child_mean = _suite_rate(screen_report, sorted(trigger.task_ids))
+                if child_mean <= parent_mean + _TIE_EPS:
+                    delta.verdict = GateRecord(
+                        accepted=False,
+                        reason=(
+                            f"screened out: trigger cluster {child_mean:.2f} vs parent "
+                            f"{parent_mean:.2f} over {len(screen_tasks)} task(s), k={k} — "
+                            "the delta did not improve its own target"
+                        ),
+                    )
+                    archive.deltas.append(delta)
+                    screened += 1
+                    continue
+
+            child_report = _score(child, tasks)
+            pre_verdict = gate_delta(
                 delta,
                 child=child_report,
                 champion=reports[champion_hash],
                 best_full=best_full,
                 suite=suite,
-                child_holdout=child_holdout,
-                champion_holdout=holdout_reports[champion_hash],
             )
-        else:
-            verdict = pre_verdict
-        tiers = (
-            narrow_failing_tiers(verdict, k=k, n_suite=len(suite), n_holdout=len(holdout or []))
-            if confirm_narrow_vetoes
-            else None
-        )
-        if tiers:
-            confirmations += 1
-            confirmed_ok = True
-            notes: list[str] = []
-            for tier in tiers:
-                tier_tasks = (
-                    [t for t in tasks if t.task_id in set(suite)]
-                    if tier == "suite"
-                    else list(holdout or [])
+            # The held-out tier is measured for every candidate that could still be accepted —
+            # including candidates whose suite/full veto is narrow enough for a confirmation
+            # re-run. A confirmation may overturn a veto; it must never bypass the held-out tier.
+            could_accept = pre_verdict.accepted or (
+                confirm_narrow_vetoes
+                and narrow_failing_tiers(pre_verdict, k=k, n_suite=len(suite), n_holdout=0)
+                is not None
+            )
+            if holdout and could_accept:
+                child_holdout = _score(child, holdout)
+                holdout_reports[child.doc_hash] = child_holdout
+                if champion_hash not in holdout_reports:
+                    holdout_reports[champion_hash] = _score(docs[champion_hash], holdout)
+                verdict = gate_delta(
+                    delta,
+                    child=child_report,
+                    champion=reports[champion_hash],
+                    best_full=best_full,
+                    suite=suite,
+                    child_holdout=child_holdout,
+                    champion_holdout=holdout_reports[champion_hash],
                 )
-                child_re = _score(child, tier_tasks, k_override=2 * k)
-                champ_re = _score(docs[champion_hash], tier_tasks, k_override=2 * k)
-                re_delta = child_re.success_rate - champ_re.success_rate
-                notes.append(f"{tier} re-measured at k={2 * k}: {re_delta:+.3f}")
-                if re_delta < -_TIE_EPS:
-                    confirmed_ok = False
-            outcome = "veto overturned" if confirmed_ok else "regression confirmed"
-            verdict = GateRecord(
-                suite_delta=verdict.suite_delta,
-                full_delta=verdict.full_delta,
-                holdout_delta=verdict.holdout_delta,
-                accepted=confirmed_ok,
-                reason=f"confirmation re-run ({outcome}): {'; '.join(notes)} | initially: "
-                + verdict.reason,
+            else:
+                verdict = pre_verdict
+            tiers = (
+                narrow_failing_tiers(verdict, k=k, n_suite=len(suite), n_holdout=len(holdout or []))
+                if confirm_narrow_vetoes
+                else None
             )
-        delta.verdict = verdict
-        archive.deltas.append(delta)
-        docs[child.doc_hash] = child
-        reports[child.doc_hash] = child_report
-        if verdict.accepted:
-            pool.append(
-                PoolEntry(
-                    doc_hash=child.doc_hash,
-                    name=child.name,
-                    success_rate=child_report.success_rate,
+            if tiers:
+                confirmations += 1
+                confirmed_ok = True
+                notes: list[str] = []
+                for tier in tiers:
+                    tier_tasks = (
+                        [t for t in tasks if t.task_id in set(suite)]
+                        if tier == "suite"
+                        else list(holdout or [])
+                    )
+                    child_re = _score(child, tier_tasks, k_override=2 * k)
+                    champ_re = _score(docs[champion_hash], tier_tasks, k_override=2 * k)
+                    re_delta = child_re.success_rate - champ_re.success_rate
+                    notes.append(f"{tier} re-measured at k={2 * k}: {re_delta:+.3f}")
+                    if re_delta < -_TIE_EPS:
+                        confirmed_ok = False
+                outcome = "veto overturned" if confirmed_ok else "regression confirmed"
+                verdict = GateRecord(
+                    suite_delta=verdict.suite_delta,
+                    full_delta=verdict.full_delta,
+                    holdout_delta=verdict.holdout_delta,
+                    accepted=confirmed_ok,
+                    reason=f"confirmation re-run ({outcome}): {'; '.join(notes)} | initially: "
+                    + verdict.reason,
                 )
-            )
-            champion_hash = child.doc_hash
-            best_full = max(best_full, child_report.success_rate)
-            promoted = {
-                task_id
-                for task_id, outcome in child_report.per_task.items()
-                if outcome.success_rate >= 1.0 - _TIE_EPS
-            }
-            suite = sorted(set(suite) | promoted)
-        if on_progress is not None:
-            on_progress(i, child.name, child_report.success_rate, verdict.accepted)
+            delta.verdict = verdict
+            archive.deltas.append(delta)
+            docs[child.doc_hash] = child
+            reports[child.doc_hash] = child_report
+            if verdict.accepted:
+                pool.append(
+                    PoolEntry(
+                        doc_hash=child.doc_hash,
+                        name=child.name,
+                        success_rate=child_report.success_rate,
+                    )
+                )
+                champion_hash = child.doc_hash
+                best_full = max(best_full, child_report.success_rate)
+                promoted = {
+                    task_id
+                    for task_id, outcome in child_report.per_task.items()
+                    if outcome.success_rate >= 1.0 - _TIE_EPS
+                }
+                suite = sorted(set(suite) | promoted)
+            if on_progress is not None:
+                on_progress(i, child.name, child_report.success_rate, verdict.accepted)
 
-    best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
-    return CreateResult(
-        best=best,
-        best_score=reports[champion_hash].success_rate,
-        archive=archive,
-        reports=reports,
-        holdout_reports=holdout_reports,
-        suite=suite,
-        skipped=skipped,
-        screened=screened,
-        confirmations=confirmations,
-    )
+        best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
+        return CreateResult(
+            best=best,
+            best_score=reports[champion_hash].success_rate,
+            archive=archive,
+            reports=reports,
+            holdout_reports=holdout_reports,
+            suite=suite,
+            skipped=skipped,
+            screened=screened,
+            confirmations=confirmations,
+        )
+    finally:
+        if sandbox_pool is not None:
+            sandbox_pool.close()
 
 
 def _suite_rate(report: ClosedLoopReport, suite: list[str]) -> float:

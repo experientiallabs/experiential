@@ -186,17 +186,30 @@ def evaluate_closed_loop(
     runtime: Runtime | None = None,
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
 ) -> ClosedLoopReport:
-    """Score the fixed agent on `tasks` against `world_model` (`wmh eval --mode closed-loop`)."""
-    return evaluate_with_env(
-        tasks,
-        lambda task: WorldModelEnvironment(world_model, task=task.instruction),
-        runtime if runtime is not None else AgentRuntime(agent_provider),
-        judge,
-        label=label,
-        k=k,
-        concurrency=concurrency,
-        on_progress=on_progress,
-    )
+    """Score the fixed agent on `tasks` against `world_model` (`wmh eval --mode closed-loop`).
+
+    With `concurrency != 1` the world model steps for many rollouts at once, so the whole eval
+    runs under `world_model.frozen()` (the `scenario_fidelity.score_matrix` precedent): sessions
+    are already independent (`enrich=False`), and freezing keeps parallel stepping from mutating
+    the shared retrieval index mid-eval. Sequential behavior is unchanged.
+    """
+
+    def _evaluate() -> ClosedLoopReport:
+        return evaluate_with_env(
+            tasks,
+            lambda task: WorldModelEnvironment(world_model, task=task.instruction),
+            runtime if runtime is not None else AgentRuntime(agent_provider),
+            judge,
+            label=label,
+            k=k,
+            concurrency=concurrency,
+            on_progress=on_progress,
+        )
+
+    if concurrency == 1:
+        return _evaluate()
+    with world_model.frozen():
+        return _evaluate()
 
 
 class ClosedLoopEval:

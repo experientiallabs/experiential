@@ -2,10 +2,11 @@
 
 A `_ScriptedHandle` plays the runner process (its stream events are scripted, stdin is recorded)
 and a `FakeSandbox` implements the `SandboxHandle` slice, so `E2BStdioChannel` is exercised over
-the real reader-thread/framing code path and `E2BPiRuntime.run` end-to-end — the runner script
-speaks the same frames `runner_link_test.py`'s `_FakeChannel` does (hello → llm_request →
-tool_request → done), and the environment answering tool calls is a real `E2BEnvironment` over the
-same fake sandbox, proving env actions execute in the rollout's own VM.
+the real reader-thread/framing code path, `E2BSandboxPool` over the real bootstrap/reuse/discard
+lifecycle, and `E2BPiRuntime.run` end-to-end — the runner script speaks the same frames
+`runner_link_test.py`'s `_FakeChannel` does (hello → llm_request → tool_request → done), and the
+environment answering tool calls is a plain host-side `AgentEnvironment` fake: the sandbox is only
+where the harness process lives, never where tool calls land.
 
 No TS-side test: the repo has no TypeScript test precedent (no *_test.ts outside the untouchable
 vendor tree, no root package.json), so runner_stdio.ts is covered by the frame-contract tests here.
@@ -16,19 +17,21 @@ from __future__ import annotations
 import base64
 import json
 import threading
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Callable, Iterator
+from typing import cast
 
 import pytest
 
 from wmh.core.types import Action, JsonObject, Observation
-from wmh.harness.e2b_env import E2B_TEMPLATE_ENV, E2BEnvironment
+from wmh.harness import pi_e2b as pi_e2b_module
+from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
 from wmh.harness.pi_e2b import (
     NODE_INSTALL_CMD,
     PI_NPM_PACKAGES,
     RUNNER_WORKDIR,
     START_CMD,
     E2BPiRuntime,
+    E2BSandboxPool,
     E2BStdioChannel,
 )
 from wmh.harness.runner_link import WorkerConfig
@@ -81,7 +84,7 @@ class _FakeCommands:
 
     def __init__(self, handle: _ScriptedHandle) -> None:
         self._handle = handle
-        self.calls: list[str] = []  # foreground commands, in order (installs, env bash, ...)
+        self.calls: list[str] = []  # foreground commands, in order (installs, ...)
         self.background_cmds: list[str] = []
         self.stdin: list[tuple[int, str]] = []
 
@@ -132,11 +135,15 @@ class FakeSandbox:
         return True
 
 
-class _PlainEnv:
-    """An AgentEnvironment that is not an E2BEnvironment (for the rejection test)."""
+class _RecordingEnv:
+    """ANY host-side `AgentEnvironment` (the world-model shape in real evals): records executes."""
+
+    def __init__(self) -> None:
+        self.actions: list[Action] = []
 
     def execute(self, action: Action) -> Observation:
-        return Observation(content="nope")
+        self.actions.append(action)
+        return Observation(content="wm says ok")
 
     def close(self) -> None:
         pass
@@ -150,26 +157,46 @@ def _tools() -> list[ToolSpec]:
     return [TOOL_REGISTRY["bash"], SUBMIT]
 
 
-def _runtime(**kw: Any) -> E2BPiRuntime:  # noqa: ANN401 - test helper forwards ctor overrides
-    defaults: dict[str, Any] = {
-        "worker": WorkerConfig(),
-        "files": {"src/agent.ts": "// a"},
-        "tools": _tools(),
-        "system_prompt": "sys",
-        "template": None,
-        "worker_fn": lambda body: {"choices": [{"message": {"content": "ok"}}]},
-    }
-    defaults.update(kw)
-    return E2BPiRuntime(**defaults)
+def _factory_for(
+    scripts: list[list[JsonObject]],
+) -> tuple[Callable[[], FakeSandbox], list[FakeSandbox]]:
+    """A sandbox factory: each call makes a FakeSandbox whose runner plays the next script."""
+    made: list[FakeSandbox] = []
+    remaining = [list(script) for script in scripts]
+
+    def factory() -> FakeSandbox:
+        frames = remaining.pop(0) if remaining else [{"type": "hello"}]
+        fake = FakeSandbox(_ScriptedHandle(_stdout_events(frames), hold_open=True))
+        made.append(fake)
+        return fake
+
+    return factory, made
 
 
-def _sent_frames(fake: FakeSandbox) -> list[Any]:
-    """Decode every frame the host pushed into the runner's stdin (Any keeps deep asserts terse)."""
+def _runtime(
+    *,
+    pool: E2BSandboxPool | None = None,
+    template: str | None = None,
+    worker_fn: Callable[[JsonObject], JsonObject] | None = None,
+) -> E2BPiRuntime:
+    return E2BPiRuntime(
+        worker=WorkerConfig(),
+        files={"src/agent.ts": "// a"},
+        tools=_tools(),
+        system_prompt="sys",
+        template=template,
+        pool=pool,
+        worker_fn=worker_fn or (lambda body: {"choices": [{"message": {"content": "ok"}}]}),
+    )
+
+
+def _sent_frames(fake: FakeSandbox) -> list[JsonObject]:
+    """Decode every frame the host pushed into the runner's stdin."""
     lines = [data for _pid, data in fake.commands.stdin]
-    return [json.loads(base64.b64decode(data.strip())) for data in lines]
+    return [cast("JsonObject", json.loads(base64.b64decode(data.strip()))) for data in lines]
 
 
-def _of_kind(fake: FakeSandbox, kind: str) -> list[Any]:
+def _of_kind(fake: FakeSandbox, kind: str) -> list[JsonObject]:
     return [f for f in _sent_frames(fake) if f.get("type") == kind]
 
 
@@ -246,27 +273,106 @@ def test_close_sends_shutdown_and_makes_the_stream_end_clean() -> None:
     assert len(shutdowns) == 1
 
 
+# --- E2BSandboxPool ---
+def test_pool_acquire_creates_bootstraps_starts_runner_and_awaits_hello(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello", "node_version": "v22.0.0"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    sandbox, channel = pool.acquire()
+    assert sandbox is made[0]
+    fake = made[0]
+    # Bootstrap: runner files up, node 22 + pinned pi deps installed, the runner started.
+    assert fake.files.store[f"{RUNNER_WORKDIR}/runner_stdio.ts"].startswith("/**")
+    assert f"{RUNNER_WORKDIR}/runner_frames.ts" in fake.files.store
+    assert fake.commands.calls[0] == NODE_INSTALL_CMD
+    assert all(pkg in fake.commands.calls[1] for pkg in PI_NPM_PACKAGES)
+    assert fake.commands.background_cmds == [START_CMD]
+    # The hello was consumed by acquire: the channel is idle, ready for episode frames.
+    with pytest.raises(TimeoutError):
+        channel.recv(timeout=0.05)
+    pool.close()
+
+
+def test_pool_reuses_a_healthy_sandbox_without_rebootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    sandbox, channel = pool.acquire()
+    pool.release(sandbox, channel, healthy=True)
+    again, channel_again = pool.acquire()
+    assert again is sandbox and channel_again is channel  # the SAME warm sandbox came back
+    assert len(made) == 1  # no second sandbox was ever created
+    assert made[0].commands.calls.count(NODE_INSTALL_CMD) == 1  # bootstrap paid once
+    assert made[0].commands.background_cmds == [START_CMD]  # one runner process
+    pool.close()
+
+
+def test_pool_discards_an_unhealthy_sandbox_and_creates_a_fresh_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}], [{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    sandbox, channel = pool.acquire()
+    pool.release(sandbox, channel, healthy=False)
+    assert made[0].kills == 1  # a failed episode's runner state is unknown: never reused
+    fresh, _fresh_channel = pool.acquire()
+    assert fresh is made[1] and fresh is not sandbox
+    assert made[1].commands.calls.count(NODE_INSTALL_CMD) == 1  # the fresh one bootstrapped
+    pool.close()
+
+
+def test_pool_close_kills_everything_and_acquire_after_close_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}], [{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    first, first_channel = pool.acquire()
+    pool.acquire()  # a second, still-in-flight sandbox
+    pool.release(first, first_channel, healthy=True)  # one idle, one in flight
+    pool.close()
+    assert [fake.kills for fake in made] == [1, 1]
+    with pytest.raises(RuntimeError, match="closed"):
+        pool.acquire()
+    pool.close()  # idempotent
+
+
+def test_pool_acquire_without_hello_raises_with_stderr_and_kills_the_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    handle = _ScriptedHandle([(None, "SyntaxError: unexpected token\n", None)], hold_open=True)
+    fake = FakeSandbox(handle)
+    pool = E2BSandboxPool(sandbox_factory=lambda: fake, hello_timeout=0.1)
+    with pytest.raises(RuntimeError, match="no hello") as excinfo:
+        pool.acquire()
+    assert "SyntaxError: unexpected token" in str(excinfo.value)
+    assert fake.kills == 1  # a sandbox that failed bootstrap never leaks
+
+
+def test_pool_with_template_skips_installs_but_still_writes_runner_files() -> None:
+    factory, made = _factory_for([[{"type": "hello"}]])
+    pool = E2BSandboxPool(template="wmh-pi-node", sandbox_factory=factory)
+    pool.acquire()
+    fake = made[0]
+    assert fake.commands.calls == []  # no node upgrade, no npm install
+    assert fake.commands.background_cmds == [START_CMD]  # the runner still starts
+    assert f"{RUNNER_WORKDIR}/runner_stdio.ts" in fake.files.store  # repo files still refresh
+    assert f"{RUNNER_WORKDIR}/package.json" not in fake.files.store  # template owns the layout
+    pool.close()
+
+
 # --- E2BPiRuntime ---
-def test_run_rejects_non_e2b_environment() -> None:
-    with pytest.raises(TypeError, match="E2BEnvironment"):
-        _runtime().run("t1", "do it", _PlainEnv())
-
-
 def test_satisfies_runtime_protocol() -> None:
     assert isinstance(_runtime(), Runtime)
 
 
-def test_hello_timeout_error_includes_runner_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
-    handle = _ScriptedHandle([(None, "SyntaxError: unexpected token\n", None)], hold_open=True)
-    fake = FakeSandbox(handle)
-    env = E2BEnvironment(sandbox_factory=lambda: fake)
-    with pytest.raises(RuntimeError, match="no hello") as excinfo:
-        _runtime(hello_timeout=0.1).run("t1", "do it", env)
-    assert "SyntaxError: unexpected token" in str(excinfo.value)
-
-
-def test_end_to_end_fake_episode_delegates_to_runner_link(
+def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
@@ -277,9 +383,8 @@ def test_end_to_end_fake_episode_delegates_to_runner_link(
         {"type": "tool_request", "req_id": 2, "name": "bash", "arguments": {"command": "echo hi"}},
         {"type": "done", "answer": "finished"},
     ]
-    handle = _ScriptedHandle(_stdout_events(script), hold_open=True)
-    fake = FakeSandbox(handle)
-    env = E2BEnvironment(sandbox_factory=lambda: fake)
+    factory, made = _factory_for([script])
+    env = _RecordingEnv()  # a plain AgentEnvironment: the world-model shape in real evals
 
     worker_calls: list[JsonObject] = []
     completion: JsonObject = {"choices": [{"message": {"content": "use bash"}}]}
@@ -288,7 +393,8 @@ def test_end_to_end_fake_episode_delegates_to_runner_link(
         worker_calls.append(b)
         return completion
 
-    result = _runtime(worker_fn=worker).run("t1", "do it", env)
+    with E2BSandboxPool(sandbox_factory=factory) as pool:
+        result = _runtime(pool=pool, worker_fn=worker).run("t1", "do it", env)
 
     assert result.stop_reason is StopReason.SUBMITTED
     assert result.answer == "finished"
@@ -297,69 +403,72 @@ def test_end_to_end_fake_episode_delegates_to_runner_link(
     assert step.action == Action(
         kind=step.action.kind, name="bash", arguments={"command": "echo hi"}
     )
-    assert step.observation.content == "ran: echo hi"  # produced by the sandbox, not a stub
-
-    # Bootstrap ran against THIS sandbox: runner files up, node 22 + pinned pi deps installed.
-    assert fake.files.store[f"{RUNNER_WORKDIR}/runner_stdio.ts"].startswith("/**")
-    assert f"{RUNNER_WORKDIR}/runner_frames.ts" in fake.files.store
-    assert fake.commands.calls[0] == NODE_INSTALL_CMD
-    assert all(pkg in fake.commands.calls[1] for pkg in PI_NPM_PACKAGES)
-    assert fake.commands.background_cmds == [START_CMD]
-
-    # The tool_request went through environment.execute -> the same sandbox ran the command.
-    assert fake.commands.calls[-1] == "echo hi"
+    # The tool_request went through environment.execute — answered HOST-side, not in the sandbox.
+    assert [a.name for a in env.actions] == ["bash"]
+    assert step.observation.content == "wm says ok"
 
     # Host -> runner frames: episode_start first, then the two answers, correlated by req_id.
+    fake = made[0]
     kinds = [f["type"] for f in _sent_frames(fake)]
     assert kinds == ["episode_start", "llm_response", "tool_response"]
     start = _of_kind(fake, "episode_start")[0]
     assert start["instruction"] == "do it" and start["system"] == "sys"
     assert start["files"] == {"src/agent.ts": "// a"}
-    assert {t["name"] for t in start["tools"]} >= {"bash", "submit"}
+    tool_names = {t["name"] for t in cast("list[JsonObject]", start["tools"])}
+    assert tool_names >= {"bash", "submit"}
     llm = _of_kind(fake, "llm_response")[0]
     assert llm["req_id"] == 1 and llm["completion"] == completion
     assert worker_calls == [body]  # answered host-side, by the injected worker
     tool = _of_kind(fake, "tool_response")[0]
-    assert tool["req_id"] == 2 and tool["content"] == "ran: echo hi" and tool["is_error"] is False
+    assert tool["req_id"] == 2 and tool["content"] == "wm says ok" and tool["is_error"] is False
 
 
-def test_bootstrap_runs_once_for_two_episodes_on_the_same_sandbox(
+def test_two_runtimes_sharing_a_pool_reuse_warm_sandboxes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
     script: list[JsonObject] = [
-        {"type": "hello"},  # one hello: the runner process persists across episodes
+        {"type": "hello"},  # one hello: the runner process persists across episodes and docs
         {"type": "done", "answer": "a1"},
         {"type": "done", "answer": "a2"},
     ]
-    handle = _ScriptedHandle(_stdout_events(script), hold_open=True)
-    fake = FakeSandbox(handle)
-    env = E2BEnvironment(sandbox_factory=lambda: fake)
-    runtime = _runtime()
+    factory, made = _factory_for([script])
+    with E2BSandboxPool(sandbox_factory=factory) as pool:
+        first = _runtime(pool=pool)
+        second = _runtime(pool=pool)
+        r1 = first.run("t1", "first", _RecordingEnv())
+        r2 = second.run("t2", "second", _RecordingEnv())
 
-    r1 = runtime.run("t1", "first", env)
-    r2 = runtime.run("t2", "second", env)
+        assert (r1.answer, r2.answer) == ("a1", "a2")
+        assert len(made) == 1  # both runtimes drew the SAME warm sandbox
+        fake = made[0]
+        assert fake.commands.calls.count(NODE_INSTALL_CMD) == 1  # bootstrap once, not per doc
+        assert fake.commands.background_cmds == [START_CMD]  # one runner process
+        assert fake.files.writes.count(f"{RUNNER_WORKDIR}/runner_stdio.ts") == 1  # files once
+        starts = _of_kind(fake, "episode_start")
+        assert len(starts) == 2
+        assert starts[0]["episode_id"] != starts[1]["episode_id"]
+        assert (starts[0]["instruction"], starts[1]["instruction"]) == ("first", "second")
 
-    assert (r1.answer, r2.answer) == ("a1", "a2")
-    assert fake.commands.calls.count(NODE_INSTALL_CMD) == 1  # installs once
-    assert fake.commands.background_cmds == [START_CMD]  # one runner process
-    assert fake.files.writes.count(f"{RUNNER_WORKDIR}/runner_stdio.ts") == 1  # files once
-    starts = _of_kind(fake, "episode_start")
-    assert len(starts) == 2
-    assert starts[0]["episode_id"] != starts[1]["episode_id"]
-    assert (starts[0]["instruction"], starts[1]["instruction"]) == ("first", "second")
 
+def test_close_kills_a_private_pool_but_never_a_shared_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    # Private pool: pool=None makes the runtime build its own from the (patched) default factory.
+    factory, made = _factory_for([[{"type": "hello"}, {"type": "done", "answer": "a"}]])
+    monkeypatch.setattr(pi_e2b_module, "default_sandbox_factory", lambda **_kw: factory)
+    private = _runtime()
+    assert private.run("t1", "go", _RecordingEnv()).answer == "a"
+    private.close()
+    assert made[0].kills == 1  # the runtime owned its pool, so close tore the sandbox down
 
-def test_template_skips_node_and_npm_installs() -> None:
-    script: list[JsonObject] = [{"type": "hello"}, {"type": "done", "answer": "ok"}]
-    handle = _ScriptedHandle(_stdout_events(script), hold_open=True)
-    fake = FakeSandbox(handle)
-    env = E2BEnvironment(sandbox_factory=lambda: fake)
-
-    result = _runtime(template="wmh-pi-node").run("t1", "do it", env)
-
-    assert result.answer == "ok"
-    assert fake.commands.calls == []  # no node upgrade, no npm install
-    assert fake.commands.background_cmds == [START_CMD]  # the runner still starts
-    assert f"{RUNNER_WORKDIR}/runner_stdio.ts" in fake.files.store  # repo files still refresh
-    assert f"{RUNNER_WORKDIR}/package.json" not in fake.files.store  # template owns the layout
+    # Shared pool: the pool's owner (a whole search) outlives any one runtime.
+    factory2, made2 = _factory_for([[{"type": "hello"}, {"type": "done", "answer": "b"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory2)
+    shared = _runtime(pool=pool)
+    assert shared.run("t1", "go", _RecordingEnv()).answer == "b"
+    shared.close()
+    assert made2[0].kills == 0  # closing the runtime must not kill the shared pool's sandboxes
+    pool.close()
+    assert made2[0].kills == 1
