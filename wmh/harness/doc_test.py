@@ -149,3 +149,42 @@ def test_runtime_backend_selector() -> None:
     # Unknown backends are rejected.
     with pytest.raises(ValueError, match="unknown backend"):
         coded.runtime(provider, backend="bogus")
+
+
+def test_surface_doc_annotation_roundtrips_and_is_not_hashed() -> None:
+    plain = Surface(id="code:x-py", kind=SurfaceKind.CODE, content="X = 1\n", path="x.py")
+    annotated = plain.model_copy(update={"doc": "Defines X."})
+    doc_a = HarnessDoc(
+        name="a",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            plain,
+        ],
+    )
+    doc_b = HarnessDoc(
+        name="a",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            annotated,
+        ],
+    )
+    # The annotation is envelope metadata: identical content -> identical identity.
+    assert doc_a.doc_hash == doc_b.doc_hash
+    reloaded = HarnessDoc.model_validate_json(doc_b.model_dump_json())
+    surface = reloaded.surface("code:x-py")
+    assert surface is not None and surface.doc == "Defines X."
+
+
+def test_unknown_fields_are_rejected_not_dropped() -> None:
+    with pytest.raises(ValueError, match="future_field"):
+        Surface.model_validate(
+            {"id": "prompt:core", "kind": "prompt", "content": "p", "future_field": 1}
+        )
+    with pytest.raises(ValueError, match="future_field"):
+        HarnessDoc.model_validate(
+            {
+                "name": "a",
+                "surfaces": [{"id": "prompt:core", "kind": "prompt", "content": "p"}],
+                "future_field": 1,
+            }
+        )

@@ -23,6 +23,16 @@ from wmh.harness.delta import (
 )
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.environment import AgentEnvironment, is_env_action
+from wmh.harness.ingest import (
+    BodyMap,
+    CollectedRepo,
+    FileDoc,
+    RepoFile,
+    SkippedFile,
+    body_map,
+    build_ingest_doc,
+    collect_repo_files,
+)
 from wmh.harness.runtime import AgentRuntime, RunResult, StopReason
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.store import HarnessStore
@@ -32,20 +42,28 @@ __all__ = [
     "TOOL_REGISTRY",
     "AgentEnvironment",
     "AgentRuntime",
+    "BodyMap",
+    "CollectedRepo",
     "FailureSignature",
+    "FileDoc",
     "GateRecord",
     "HarnessDelta",
     "HarnessDoc",
     "HarnessStore",
+    "RepoFile",
     "RunResult",
     "Skill",
     "SkillLibrary",
+    "SkippedFile",
     "StopReason",
     "Surface",
     "SurfaceKind",
     "SurfaceOp",
     "ToolCall",
     "apply_delta",
+    "body_map",
+    "build_ingest_doc",
+    "collect_repo_files",
     "is_env_action",
     "parse_tool_call",
 ]

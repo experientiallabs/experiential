@@ -7,7 +7,7 @@ import json
 from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature
-from wmh.harness.doc import HarnessDoc
+from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.mutate import propose_delta, render_evidence
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
@@ -139,3 +139,32 @@ def test_all_pass_evidence_asks_for_generalization() -> None:
     evidence = render_evidence(trigger, report, [TaskSpec(task_id="t", instruction="do it")])
     assert "passed every task" in evidence
     assert "GENERALIZE" in evidence
+
+
+def test_prompt_elides_pathful_code_surfaces() -> None:
+    body = "\n".join(f"line {i}" for i in range(200))
+    parent = HarnessDoc(
+        name="parent",
+        surfaces=[
+            *HarnessDoc.baseline("parent").surfaces,
+            Surface(
+                id="code:src-agent-ts",
+                kind=SurfaceKind.CODE,
+                content=body,
+                path="src/agent.ts",
+                doc="The agent loop entry.",
+            ),
+        ],
+    )
+    provider = ScriptedProvider(_reply(parent))
+    propose_delta(parent, _trigger(), "evidence", provider)
+    user = provider.users[0]
+    # Header keeps identity + path + harnessdoc; the tail of the content never ships.
+    assert "path=src/agent.ts" in user
+    assert "content elided" in user
+    assert "The agent loop entry." in user
+    assert "line 5" in user  # head preview
+    assert "line 199" not in user
+    # Non-pathful surfaces (the baseline prompt) still ship in full.
+    core = parent.surface("prompt:core")
+    assert core is not None and core.content in user

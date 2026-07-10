@@ -28,7 +28,7 @@ import os
 import re
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wmh.harness.code_runtime import (
     DEFAULT_RUNTIME_CODE,
@@ -66,6 +66,11 @@ class SurfaceKind(StrEnum):
 class Surface(BaseModel):
     """One named, independently addressable unit of harness behavior."""
 
+    # Unknown fields are rejected, not ignored: a consumer pinned to an older schema must fail
+    # loudly on a newer document instead of silently dropping fields it does not know (which
+    # would corrupt the doc on the next round-trip).
+    model_config = ConfigDict(extra="forbid")
+
     id: str  # "<kind>:<slug>"
     kind: SurfaceKind
     content: str
@@ -76,6 +81,10 @@ class Surface(BaseModel):
     # Optional size budget (characters). Enforced at construction: a surface that exceeds its
     # budget is invalid, so context cost is a schema property rather than a runtime surprise.
     budget: int | None = Field(default=None, ge=1)
+    # Optional harnessdoc: a short annotation describing what this surface is and how it serves
+    # the agent (ingest writes one per mapped repo file). Like `path` and `budget` it is envelope
+    # metadata, not content: it does not participate in hashing.
+    doc: str | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> Surface:
@@ -107,6 +116,8 @@ class Surface(BaseModel):
 
 class HarnessDoc(BaseModel):
     """A complete, validated harness: the value the runtime runs and updates are applied to."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     version: int = Field(default=0, ge=0)  # assigned by the store on save; 0 = unsaved

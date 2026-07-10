@@ -11,14 +11,18 @@ the agent's scaffold should be. Run one closed-loop with
 
 from __future__ import annotations
 
+import subprocess
+import tempfile
+import uuid
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.progress import Progress
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
-from wmh.config import ARTIFACT_DIR, WorldModelStore
+from wmh.config import ARTIFACT_DIR, WorldModelStore, load_settings
 from wmh.config.store import validate_name
 from wmh.engine import load_world_model
 from wmh.engine.world_model import WorldModel
@@ -26,8 +30,18 @@ from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec, load_tasks
 from wmh.harness.create import create_harness
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.ingest import (
+    DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_MAX_TOTAL_BYTES,
+    body_map,
+    build_ingest_doc,
+    collect_repo_files,
+)
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
-from wmh.providers.base import Provider
+from wmh.providers import get_provider
+from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+from wmh.providers.retry import RetryingProvider
+from wmh.tracking import MeteredProvider, RunTracker
 
 harness_app = typer.Typer(
     help="Named, versioned agent harnesses (.wmh/harnesses): create, init, list, show.",
@@ -239,3 +253,157 @@ def init_harness(
         f"[green]wrote[/green] {name} v{doc.version} (champion) -> {store.dir_for(name)}"
     )
     _console.print(f"run it: [bold]wmh eval closed-loop <tasks.jsonl> --harness {name}[/bold]")
+
+
+@harness_app.command("ingest")
+def ingest(
+    source: str = typer.Argument(..., help="Local repo directory, or a git URL to clone."),
+    name: str = typer.Option(None, "--name", help="Harness name (default: the repo name)."),
+    ref: str = typer.Option(None, "--ref", help="Branch or tag to clone (URL sources only)."),
+    exclude: list[str] = typer.Option(  # noqa: B008
+        [], "--exclude", help="Extra glob(s) to skip (repeatable)."
+    ),
+    max_file_bytes: int = typer.Option(
+        DEFAULT_MAX_FILE_BYTES, min=1, help="Per-file content cap (bytes)."
+    ),
+    max_total_bytes: int = typer.Option(
+        DEFAULT_MAX_TOTAL_BYTES, min=1, help="Total content cap (bytes)."
+    ),
+    provider_name: str = typer.Option(
+        None, "--provider", help="Mapping LLM provider (default: [models.worker] from settings)."
+    ),
+    model: str = typer.Option(None, "--model", help="Mapping LLM model id."),
+    region: str = typer.Option(None, "--region", help="AWS region (bedrock providers)."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+) -> None:
+    """Body-map an existing agent repo into a new harness.
+
+    Every relevant textual file becomes a pathful code surface (directory hierarchy preserved)
+    with an LLM-written harnessdoc; the built document also carries an overview prompt and a
+    BODYMAP.md index. Inclusion is zealous: when in doubt a file is mapped, never dropped
+    silently — skips are listed in BODYMAP.md with reasons. The result is saved as a new harness
+    with the `champion` alias; push it with `wmh push <name> --kind harness`.
+    """
+    store = HarnessStore(root)
+    resolved_name = name or _default_ingest_name(source)
+    try:
+        validate_name(resolved_name)
+    except ValueError as exc:
+        raise typer.BadParameter(f"{exc}; pass --name") from exc
+    if store.exists(resolved_name):
+        raise typer.BadParameter(f"harness {resolved_name!r} already exists; pick another --name")
+    provider = _ingest_provider(provider_name, model, region, root)
+
+    with tempfile.TemporaryDirectory(prefix="wmh-ingest-") as scratch:
+        if _looks_like_git_url(source):
+            checkout = Path(scratch) / "repo"
+            _clone(source, ref, checkout)
+            source_label = source if ref is None else f"{source}@{ref}"
+        else:
+            if ref is not None:
+                raise typer.BadParameter("--ref applies only to git URL sources")
+            checkout = Path(source)
+            source_label = f"local checkout {checkout.resolve().name}"
+        try:
+            collected = collect_repo_files(
+                checkout,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+                extra_excludes=tuple(exclude),
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if not collected.files:
+            raise typer.BadParameter(f"nothing to ingest under {checkout} (all files excluded?)")
+
+        _console.print(
+            f"body-mapping [bold]{resolved_name}[/bold]: {len(collected.files)} file(s) to map "
+            f"({len(collected.skipped)} skipped) -> ~{len(collected.files) + 1} LLM calls "
+            f"on {provider.config.model}"
+        )
+        if _console.is_terminal and not yes and not Confirm.ask("Proceed?", default=True):
+            raise typer.Exit(0)
+
+        tracker = RunTracker(run_id=uuid.uuid4().hex, kind="ingest")
+        metered = MeteredProvider(RetryingProvider(provider), tracker)
+        with tracker.timed(), Progress(console=_console, transient=True) as progress:
+            task = progress.add_task("mapping", total=len(collected.files))
+
+            def _tick(index: int, total: int, path: str) -> None:
+                progress.update(task, completed=index, description=f"mapping {path}")
+
+            mapping = body_map(collected, metered, name=resolved_name, on_progress=_tick)
+        doc = build_ingest_doc(resolved_name, collected, mapping, source=source_label)
+
+    saved = store.save_version(doc, alias=CHAMPION_ALIAS)
+    totals = tracker.totals()
+    unmapped = f", {len(mapping.unmapped)} unmapped" if mapping.unmapped else ""
+    _console.print(
+        f"[green]ingested[/green] [bold]{resolved_name}[/bold] v{saved.version} (champion): "
+        f"{len(collected.files)} file(s) mapped{unmapped}, {len(collected.skipped)} skipped "
+        f"-> {store.dir_for(resolved_name)}"
+    )
+    _console.print(
+        f"  mapping cost: {totals.total_tokens} tokens, ${totals.cost_usd:.4f} "
+        f"({totals.calls} calls, {tracker.duration_seconds():.0f}s)"
+    )
+    _console.print(
+        f"  inspect: [bold]wmh harness show {resolved_name}[/bold]   "
+        f"push: [bold]wmh push {resolved_name} --kind harness[/bold]"
+    )
+
+
+def _default_ingest_name(source: str) -> str:
+    tail = source.rstrip("/").rpartition("/")[2]
+    return tail.removesuffix(".git") or "ingested"
+
+
+def _looks_like_git_url(source: str) -> bool:
+    return source.startswith(("http://", "https://", "git@", "ssh://")) or source.endswith(".git")
+
+
+def _clone(url: str, ref: str | None, target: Path) -> None:
+    """Shallow-clone `url` (optionally a branch/tag) for a one-shot read; fail as a usage error."""
+    command = ["git", "clone", "--depth", "1", "--quiet"]
+    if ref is not None:
+        command += ["--branch", ref]
+    command += [url, str(target)]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise typer.BadParameter(
+            f"git clone failed for {url!r}: {detail[-1] if detail else 'unknown error'}"
+        )
+
+
+def _ingest_provider(
+    provider_name: str | None, model: str | None, region: str | None, root: str
+) -> Provider:
+    """The mapping LLM: explicit --provider/--model, else the settings worker role."""
+    if provider_name is not None or model is not None:
+        if provider_name is None or model is None:
+            raise typer.BadParameter("--provider and --model must be given together")
+        try:
+            kind = ProviderKind(provider_name)
+        except ValueError:
+            kinds = ", ".join(k.value for k in ProviderKind)
+            raise typer.BadParameter(
+                f"unknown provider {provider_name!r}; choose one of: {kinds}"
+            ) from None
+        return get_provider(ProviderConfig(kind=kind, model=model, region=region))
+    configured = load_settings(root).models.resolve("worker")
+    if configured is None:
+        raise typer.BadParameter(
+            "no mapping model configured: set [models.worker] in .wmh/settings.toml "
+            "(wmh config models) or pass --provider/--model"
+        )
+    return get_provider(
+        ProviderConfig(
+            kind=ProviderKind(configured.provider),
+            model=configured.model,
+            region=configured.region or region,
+            endpoint=configured.endpoint,
+            deployment=configured.deployment,
+        )
+    )

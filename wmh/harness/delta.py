@@ -137,10 +137,13 @@ def apply_delta(parent: HarnessDoc, delta: HarnessDelta, child_name: str) -> Har
         # Carry the file path: a replace inherits the existing surface's path unless overridden,
         # so mutating a vendored pi `code:src-...` surface stays a valid pathful CODE surface.
         path = op.path if op.path is not None else existing.path if existing else None
+        # The harnessdoc annotation always survives a replace: it describes the surface's role,
+        # which an in-place content edit does not change.
+        doc = existing.doc if existing else None
         if kind is None or op.content is None:
             raise ValueError(f"malformed {op.op} of {op.surface_id!r}")
         surfaces[op.surface_id] = Surface(
-            id=op.surface_id, kind=kind, content=op.content, budget=budget, path=path
+            id=op.surface_id, kind=kind, content=op.content, budget=budget, path=path, doc=doc
         )
 
     child = HarnessDoc(name=child_name, surfaces=list(surfaces.values()))

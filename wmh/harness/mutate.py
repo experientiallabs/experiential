@@ -62,7 +62,9 @@ Surface kinds:
 cannot end).
 - param — a scalar loop knob: `param:max-turns` (int >= 1), `param:temperature` (float in [0, 2]).
 - code — the agent loop program, singleton `code:runtime` (contract above). Must compile and
-  define `run`.
+  define `run`. Code surfaces carrying a `path` are vendored/ingested repo files; they are shown
+  ELIDED (header, harnessdoc, and first lines only) and are inert to the running loop — prefer
+  other levers unless the evidence names one specifically.
 - skill — one reusable technique, shaped as:
   ---
   name: <kebab-slug matching the surface id>
@@ -171,6 +173,12 @@ def render_history(history: list[HarnessDelta], limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+# Pathful CODE surfaces (vendored or ingested repo files) are shown elided: a whole-repo harness
+# would otherwise put megabytes into every proposal prompt. The header keeps id/hash/path (enough
+# to target an op), the harnessdoc says what the file is for, and the head keeps orientation.
+_CODE_FILE_PREVIEW_LINES = 20
+
+
 def _build_prompt(
     parent: HarnessDoc, trigger: FailureSignature, evidence: str, history: list[HarnessDelta]
 ) -> str:
@@ -178,6 +186,15 @@ def _build_prompt(
     blocks: list[str] = []
     for surface in parent.surfaces:
         budget = f", budget={surface.budget}" if surface.budget is not None else ""
+        if surface.path is not None:
+            head = "\n".join(surface.content.splitlines()[:_CODE_FILE_PREVIEW_LINES])
+            note = f"\ndoc: {surface.doc}" if surface.doc else ""
+            blocks.append(
+                f"### {surface.id} (kind={surface.kind.value}, hash={surface.content_hash}"
+                f"{budget}, path={surface.path}, {len(surface.content)} chars, content elided)"
+                f"{note}\n```\n{head}\n... [elided]\n```"
+            )
+            continue
         blocks.append(
             f"### {surface.id} (kind={surface.kind.value}, "
             f"hash={surface.content_hash}{budget})\n```\n{surface.content}\n```"
