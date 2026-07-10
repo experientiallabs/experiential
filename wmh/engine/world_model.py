@@ -141,7 +141,7 @@ class WorldModel:
         return tracker.record_summary()
 
     def sample_steps(self, n: int) -> list[Step]:
-        """Return up to `n` steps from the replay buffer (used to seed the demo agent)."""
+        """Return up to `n` steps from the replay buffer (used to seed `wmh play` suggestions)."""
         return self._retriever.sample(n)
 
     def score_session(self, session_id: str) -> EpisodeScore:

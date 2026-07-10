@@ -1,6 +1,6 @@
 """`wmh play`: a human drives the agent inside the reconstructed environment.
 
-This is the interactive sibling of `wmh demo`. Instead of an LLM-as-agent proposing one tool call,
+This is the interactive sibling of `wmh demo`. Instead of replaying a recorded trajectory,
 a *person* types actions — `tool_name {json args}` or a free-text message — and the world model
 returns the observation, advancing the session (history + scratchpad "database") exactly as a real
 agent would experience it.

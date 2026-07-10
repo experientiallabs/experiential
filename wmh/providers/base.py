@@ -112,7 +112,7 @@ class Provider(Protocol):
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
-        """Generate a completion. Used by the world model, GEPA, the judge, and the demo agent."""
+        """Generate a completion. Used by the world model, GEPA, and the judge."""
         ...
 
     def embed(self, texts: list[str]) -> list[list[float]]:

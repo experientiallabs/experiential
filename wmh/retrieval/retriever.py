@@ -40,7 +40,7 @@ class Retriever(Protocol):
         ...
 
     def sample(self, n: int) -> list[Step]:
-        """Return up to `n` steps from the buffer (e.g. to seed the demo agent)."""
+        """Return up to `n` steps from the buffer (e.g. to seed `wmh play` action suggestions)."""
         ...
 
 
