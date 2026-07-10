@@ -165,6 +165,13 @@ def test_prompt_elides_pathful_code_surfaces() -> None:
     assert "The agent loop entry." in user
     assert "line 5" in user  # head preview
     assert "line 199" not in user
-    # Non-pathful surfaces (the baseline prompt) still ship in full.
+    # The real content hash is WITHHELD for the elided (pathful) surface: the proposer never saw
+    # its content, so it must not be able to copy a hash and replace/remove it. Sentinel says so.
+    elided = parent.surface("code:src-agent-ts")
+    assert elided is not None and elided.content_hash not in user
+    assert "hash=(withheld: content elided; replace/remove not available from this view)" in user
+    # Non-pathful surfaces (the baseline prompt) still ship in full, with their real hash intact
+    # so the precondition (copy-not-guess) path stays usable for them.
     core = parent.surface("prompt:core")
     assert core is not None and core.content in user
+    assert core.content_hash in user

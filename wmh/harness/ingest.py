@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
@@ -137,6 +138,24 @@ prompts / loop / tools live>"}
 Ground everything in what is shown; never invent files or behavior."""
 
 
+class _GitignoreMatcher(BaseModel):
+    """One compiled .gitignore rule: a regex over the relative posix path, plus its kind.
+
+    We deliberately implement only the conservative subset git uses that cannot silently drop
+    body files: no negations (a whitelist .gitignore disables gitignore handling entirely, see
+    `_gitignore_patterns`), no per-parent-directory .gitignore files, no character classes. A
+    root-anchored pattern (one containing a non-trailing '/') matches the full relative path; a
+    bare pattern matches any path segment at any depth; a trailing '/' marks a directory prefix.
+    """
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    regex: re.Pattern[str]
+
+    def matches(self, rel: str) -> bool:
+        return self.regex.match(rel) is not None
+
+
 class RepoFile(BaseModel):
     """One textual file of the agent's body, ready to map."""
 
@@ -190,20 +209,20 @@ def collect_repo_files(
     """Walk a checkout and collect every textual file worth mapping, in deterministic path order.
 
     Exclusions: the fixed dir/file lists, secret-shaped files, extra caller globs, patterns from
-    the repo's root `.gitignore` (approximate fnmatch translation; negations ignored), binaries
-    (NUL sniff or undecodable UTF-8), files over `max_file_bytes`, and everything past
+    the repo's root `.gitignore` (conservative gitignore subset, negations disable it entirely),
+    binaries (NUL sniff or undecodable UTF-8), files over `max_file_bytes`, and everything past
     `max_total_bytes` cumulative content (paths sort first, so the cut is deterministic). Every
-    exclusion is recorded with its reason.
+    exclusion is recorded with its reason, including symlinks and pruned directories from the walk.
     """
     if not root.is_dir():
         raise ValueError(f"not a directory: {root}")
-    ignore_patterns = _gitignore_patterns(root)
+    ignore_matchers = _gitignore_patterns(root)
     files: list[RepoFile] = []
-    skipped: list[SkippedFile] = []
+    walked, skipped = _walk_sorted(root)
     total = 0
-    for path in _walk_sorted(root):
+    for path in walked:
         rel = path.relative_to(root).as_posix()
-        reason = _exclusion_reason(rel, path.name, ignore_patterns, extra_excludes)
+        reason = _exclusion_reason(rel, path.name, ignore_matchers, extra_excludes)
         if reason is not None:
             skipped.append(SkippedFile(path=rel, reason=reason))
             continue
@@ -229,6 +248,7 @@ def collect_repo_files(
             continue
         total += len(raw)
         files.append(RepoFile(path=rel, content=content))
+    skipped.sort(key=lambda s: s.path)
     return CollectedRepo(files=files, skipped=skipped)
 
 
@@ -262,12 +282,21 @@ def body_map(
                 )
             )
             continue
-        file_docs.append(FileDoc(path=repo_file.path, role=parsed.role, doc=parsed.doc))
+        # The mapping model's output travels into prompt:core, BODYMAP.md, and (transitively) the
+        # mutate proposal prompt, so a hostile repo could poison those with fence injection or
+        # unbounded length. Sanitize at this boundary before the text is ever embedded.
+        file_docs.append(
+            FileDoc(
+                path=repo_file.path,
+                role=_clean_role(parsed.role),
+                doc=_clean_doc(parsed.doc),
+            )
+        )
     overview = _complete_json(
         provider, OVERVIEW_SYSTEM, _overview_prompt(name, collected, file_docs), _RawOverview
     )
     overview_text = (
-        overview.overview
+        _clean_overview(overview.overview)
         if overview is not None
         else f"{name}: an agent ingested from an existing repo ({total} files mapped)."
     )
@@ -364,11 +393,16 @@ def sanitize_path(path: str) -> tuple[str, bool]:
 def _disambiguate_path(safe_path: str, original: str, taken: set[str]) -> str:
     if safe_path not in taken:
         return safe_path
-    head, dot, ext = safe_path.rpartition(".")
+    directory, sep, basename = safe_path.rpartition("/")
+    stem, dot, ext = basename.rpartition(".")
     digest = _path_digest(original)
-    if dot:
-        return f"{head}-{digest}.{ext}"
-    return f"{safe_path}-{digest}"
+    # `stem` guards dotfiles: '.gitignore'.rpartition('.') == ('', '.', 'gitignore'), so an empty
+    # stem means there is no real extension to preserve and we suffix the whole basename instead.
+    if dot and stem:
+        moved = f"{stem}-{digest}.{ext}"
+    else:
+        moved = f"{basename}-{digest}"
+    return f"{directory}{sep}{moved}"
 
 
 def _kebab(text: str) -> str:
@@ -386,26 +420,65 @@ def _path_digest(path: str) -> str:
     return hashlib.blake2b(path.encode("utf-8"), digest_size=3).hexdigest()
 
 
-def _walk_sorted(root: Path) -> list[Path]:
-    """Every regular file under `root`, sorted by relative posix path; excluded dirs pruned."""
+_ROLE_MAX_CHARS = 120
+_DOC_MAX_CHARS = 600
+_OVERVIEW_MAX_CHARS = 4_000
+
+
+def _clean_role(text: str) -> str:
+    """One-line role: drop backticks, collapse all whitespace, cap at `_ROLE_MAX_CHARS`."""
+    collapsed = " ".join(text.replace("`", "").split())
+    return collapsed[:_ROLE_MAX_CHARS]
+
+
+def _clean_doc(text: str) -> str:
+    """Harnessdoc body: strip backticks (defence against fence injection), strip, cap length."""
+    return text.replace("`", "").strip()[:_DOC_MAX_CHARS]
+
+
+def _clean_overview(text: str) -> str:
+    """Agent overview: strip backticks, cap length; newlines are kept (paragraph structure)."""
+    return text.replace("`", "").strip()[:_OVERVIEW_MAX_CHARS]
+
+
+def _walk_sorted(root: Path) -> tuple[list[Path], list[SkippedFile]]:
+    """Every regular file under `root`, sorted by relative posix path, plus the walk's own skips.
+
+    Symlinks are not followed (they can escape the checkout) and pruned excluded dirs are not
+    descended, but neither is silently dropped: each symlink and each pruned dir gets a
+    `SkippedFile` so the reported skips match the 'skips are reported, never silent' contract. A
+    pruned directory yields exactly one skip for the dir, not one per file it would have contained.
+    """
     results: list[Path] = []
+    skips: list[SkippedFile] = []
 
     def _walk(directory: Path) -> None:
         for entry in sorted(directory.iterdir(), key=lambda p: p.name):
+            rel = entry.relative_to(root).as_posix()
             if entry.is_symlink():
-                continue  # a symlink can escape the checkout; the body is what is physically here
+                skips.append(SkippedFile(path=rel, reason="symlink (not followed)"))
+                continue
             if entry.is_dir():
-                if entry.name not in EXCLUDED_DIRS:
+                if entry.name in EXCLUDED_DIRS:
+                    skips.append(
+                        SkippedFile(
+                            path=f"{rel}/", reason="excluded directory (contents not walked)"
+                        )
+                    )
+                else:
                     _walk(entry)
             elif entry.is_file():
                 results.append(entry)
 
     _walk(root)
-    return sorted(results, key=lambda p: p.relative_to(root).as_posix())
+    return sorted(results, key=lambda p: p.relative_to(root).as_posix()), skips
 
 
 def _exclusion_reason(
-    rel: str, basename: str, ignore_patterns: list[str], extra_excludes: tuple[str, ...]
+    rel: str,
+    basename: str,
+    ignore_matchers: list[_GitignoreMatcher],
+    extra_excludes: tuple[str, ...],
 ) -> str | None:
     if basename in EXCLUDED_FILES:
         return "generated file (lockfile or OS litter)"
@@ -415,29 +488,65 @@ def _exclusion_reason(
     for pattern in extra_excludes:
         if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(basename, pattern):
             return f"excluded by --exclude {pattern!r}"
-    for pattern in ignore_patterns:
-        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(basename, pattern):
+    for matcher in ignore_matchers:
+        if matcher.matches(rel):
             return "matched .gitignore"
     return None
 
 
-def _gitignore_patterns(root: Path) -> list[str]:
-    """Root `.gitignore` lines as fnmatch patterns (approximate: no negations, no anchoring)."""
+def _gitignore_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile one conservative gitignore pattern into an anchored full-relative-path regex.
+
+    A pattern with a non-trailing '/' is root-anchored: it matches the whole relative path from the
+    repo root. A bare pattern (no '/') matches that segment as a basename at any depth. A trailing
+    '/' marks a directory: it and everything under it match. '**' becomes '.*', a single '*'
+    becomes '[^/]*' (no directory crossing), and all other characters are escaped literally.
+    """
+    is_dir = pattern.endswith("/")
+    body = pattern.rstrip("/")
+    anchored = "/" in body
+    # Translate glob tokens to regex on the literal-escaped text so '.' and friends stay literal.
+    escaped = re.escape(body).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+    if anchored:
+        prefix = ""
+        core = escaped
+    else:
+        # Match the pattern as a full path segment at any depth: at the start or after a '/'.
+        prefix = r"(?:.*/)?"
+        core = escaped
+    if is_dir:
+        # A directory pattern matches the directory itself and everything beneath it.
+        suffix = r"/.*"
+    else:
+        # A file/either pattern matches the path itself or, if it names a dir, its contents.
+        suffix = r"(?:/.*)?"
+    return re.compile(f"^{prefix}{core}{suffix}$")
+
+
+def _gitignore_patterns(root: Path) -> list[_GitignoreMatcher]:
+    """Root `.gitignore` as conservative compiled matchers, or [] if it uses negation/whitelist.
+
+    Whitelist-style .gitignore files (any '!' line, e.g. '*' then '!src/') re-include paths a
+    plain pattern list would exclude; approximating them by dropping the '!' lines would collapse
+    ingest to zero. Since body files must never be silently dropped, the presence of ANY negation
+    disables gitignore handling entirely rather than over-excluding.
+    """
     gitignore = root / ".gitignore"
     if not gitignore.is_file():
         return []
-    patterns: list[str] = []
-    for line in gitignore.read_text(encoding="utf-8", errors="replace").splitlines():
+    lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
+    matchers: list[_GitignoreMatcher] = []
+    for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped.startswith("!"):
+        if not stripped or stripped.startswith("#"):
             continue
+        if stripped.startswith("!"):
+            return []  # negation/whitelist: do not apply gitignore at all
         stripped = stripped.lstrip("/")
-        if stripped.endswith("/"):
-            base = stripped.rstrip("/")
-            patterns += [f"{base}/*", f"*/{base}/*"]
-        else:
-            patterns += [stripped, f"*/{stripped}"]
-    return patterns
+        if not stripped:
+            continue
+        matchers.append(_GitignoreMatcher(regex=_gitignore_to_regex(stripped)))
+    return matchers
 
 
 class _RawFileDoc(BaseModel):

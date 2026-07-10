@@ -189,8 +189,14 @@ def _build_prompt(
         if surface.path is not None:
             head = "\n".join(surface.content.splitlines()[:_CODE_FILE_PREVIEW_LINES])
             note = f"\ndoc: {surface.doc}" if surface.doc else ""
+            # The real content_hash is WITHHELD for elided surfaces: the proposer never saw the
+            # full content, so it must not be able to copy a hash into preconditions and replace or
+            # remove the surface (a truncating replace of an inert body file could otherwise pass
+            # `delta.py` preconditions and become champion). Without the hash, replace/remove is
+            # impossible; `add` still works with a fresh id.
             blocks.append(
-                f"### {surface.id} (kind={surface.kind.value}, hash={surface.content_hash}"
+                f"### {surface.id} (kind={surface.kind.value}, "
+                f"hash=(withheld: content elided; replace/remove not available from this view)"
                 f"{budget}, path={surface.path}, {len(surface.content)} chars, content elided)"
                 f"{note}\n```\n{head}\n... [elided]\n```"
             )

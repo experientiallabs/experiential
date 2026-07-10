@@ -213,5 +213,154 @@ def test_build_ingest_doc_moves_reserved_render_paths_aside() -> None:
     paths = [s.path for s in doc.code_files()]
     assert "SYSTEM.md" not in paths  # the store's rendered SYSTEM.md owns that path
     moved = next(s for s in doc.code_files() if s.path not in {BODYMAP_PATH})
+    assert moved.path is not None
     assert moved.path.startswith("SYSTEM-") and moved.content == "the repo's own system doc"
     assert moved.doc is not None and "Original path: SYSTEM.md" in moved.doc
+
+
+# ---- FINDING 4: gitignore is conservative and correct ---------------------------------------
+
+
+def test_gitignore_whitelist_disables_gitignore_entirely(tmp_path: Path) -> None:
+    # A negation (whitelist-style) .gitignore must NOT collapse ingest: body files stay in.
+    root = tmp_path / "repo"
+    _write(root, ".gitignore", "*\n!src/\n")
+    _write(root, "src/agent.py", "print(1)\n")
+    _write(root, "README.md", "# hi\n")
+    collected = collect_repo_files(root)
+    included = {f.path for f in collected.files}
+    assert "src/agent.py" in included
+    assert "README.md" in included  # not dropped despite the leading '*'
+    assert not any(s.reason == "matched .gitignore" for s in collected.skipped)
+
+
+def test_gitignore_dir_pattern_excludes_contents_but_not_similarly_named_file(
+    tmp_path: Path,
+) -> None:
+    # 'coverage/' is not in EXCLUDED_DIRS, so the walk descends it and gitignore does the excluding.
+    root = tmp_path / "repo"
+    _write(root, ".gitignore", "coverage/\n")
+    _write(root, "coverage/out.js", "x\n")
+    _write(root, "recoverage.py", "y\n")  # 'coverage/' must NOT catch this substring match
+    collected = collect_repo_files(root)
+    included = {f.path for f in collected.files}
+    reasons = {s.path: s.reason for s in collected.skipped}
+    assert "recoverage.py" in included
+    assert reasons.get("coverage/out.js") == "matched .gitignore"
+
+
+def test_gitignore_anchored_pattern_does_not_match_deeper_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _write(root, ".gitignore", "src/generated.py\n")
+    _write(root, "src/generated.py", "a\n")
+    _write(root, "lib/src/generated.py", "b\n")  # anchored: NOT excluded
+    collected = collect_repo_files(root)
+    included = {f.path for f in collected.files}
+    reasons = {s.path: s.reason for s in collected.skipped}
+    assert "lib/src/generated.py" in included
+    assert reasons.get("src/generated.py") == "matched .gitignore"
+
+
+def test_gitignore_bare_pattern_excludes_at_any_depth(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _write(root, ".gitignore", "*.log\n")
+    _write(root, "app.log", "a\n")
+    _write(root, "deep/nested/trace.log", "b\n")
+    _write(root, "keep.txt", "c\n")
+    collected = collect_repo_files(root)
+    included = {f.path for f in collected.files}
+    reasons = {s.path: s.reason for s in collected.skipped}
+    assert "keep.txt" in included
+    assert reasons.get("app.log") == "matched .gitignore"
+    assert reasons.get("deep/nested/trace.log") == "matched .gitignore"
+
+
+# ---- FINDING 5: mapping-LLM output is sanitized at the boundary -------------------------------
+
+
+class _PoisonProvider:
+    """Replies with fence-laden, oversized role/doc/overview to test boundary sanitization."""
+
+    def __init__(self) -> None:
+        self.config = ProviderConfig(kind=ProviderKind.OPENAI, model="fake")
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        user = messages[0].content
+        if "## File tree" in user:
+            payload = {"overview": "```injected fence``` " + ("o" * 5000)}
+        else:
+            payload = {
+                "role": "```role fence``` " + ("r" * 500),
+                "doc": "```doc fence``` " + ("d" * 5000),
+            }
+        return Completion(text=json.dumps(payload), usage=TokenUsage(), model="fake")
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
+
+    def verify(self) -> VerifyResult:  # pragma: no cover - protocol filler
+        raise NotImplementedError
+
+
+def test_body_map_defences_fence_injection_and_length(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _write(root, "README.md", "# tree seed\n")
+    _write(root, "src/agent.py", "print(1)\n")
+    collected = collect_repo_files(root)
+    mapping = body_map(collected, _PoisonProvider(), name="demo")
+    doc = mapping.doc_for("src/agent.py")
+    assert doc is not None
+    assert "`" not in doc.role and "`" not in doc.doc  # fences stripped
+    assert len(doc.role) <= 120
+    assert len(doc.doc) <= 600
+    assert "`" not in mapping.overview  # overview fences stripped
+    assert len(mapping.overview) <= 4000  # overview clamped
+
+
+# ---- FINDING 7: disambiguation operates on the final path segment only ------------------------
+
+
+def test_disambiguate_preserves_dotted_directory_on_collision() -> None:
+    # 'a.b/c' collides: the digest must land on the basename, never mangle the 'a.b' directory.
+    collected = CollectedRepo(
+        files=[
+            RepoFile(path="a.b/c", content="one"),
+            RepoFile(path="a.b/c", content="two"),  # forces a path collision after sanitize
+        ],
+        skipped=[],
+    )
+    mapping = BodyMap(
+        overview="o",
+        file_docs=[FileDoc(path="a.b/c", role="r", doc="d")],
+    )
+    doc = build_ingest_doc("demo", collected, mapping, source="local")
+    code_paths = [s.path for s in doc.code_files() if s.path not in {BODYMAP_PATH}]
+    assert len(set(code_paths)) == 2
+    for path in code_paths:
+        assert path is not None and path.startswith("a.b/")  # dotted directory kept intact
+
+
+# ---- FINDING 8: symlinks and pruned dirs are reported as skips --------------------------------
+
+
+def test_symlink_and_pruned_dir_are_reported_skips(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _write(root, "real.txt", "content\n")
+    _write(root, "node_modules/a/index.js", "1\n")
+    _write(root, "node_modules/b/index.js", "2\n")
+    (root / "link.txt").symlink_to(root / "real.txt")
+    collected = collect_repo_files(root)
+    reasons = {s.path: s.reason for s in collected.skipped}
+    assert reasons.get("link.txt") == "symlink (not followed)"
+    assert reasons.get("node_modules/") == "excluded directory (contents not walked)"
+    # Exactly one skip entry for the pruned dir, not one per contained file.
+    node_skips = [s for s in collected.skipped if s.path.startswith("node_modules")]
+    assert len(node_skips) == 1
+    assert "real.txt" in {f.path for f in collected.files}
