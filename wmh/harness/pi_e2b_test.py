@@ -489,11 +489,12 @@ def test_acquire_extends_the_lifetime_of_a_reused_sandbox(
     factory, made = _factory_for([[{"type": "hello"}]])
     pool = E2BSandboxPool(sandbox_factory=factory)
     sandbox, channel = pool.acquire()
-    assert sandbox.timeouts == []  # fresh sandboxes carry their creation-time lifetime
+    [fake] = made
+    assert fake.timeouts == []  # fresh sandboxes carry their creation-time lifetime
     pool.release(sandbox, channel, healthy=True)
     again, _ = pool.acquire()
     assert again is sandbox
-    assert sandbox.timeouts == [900]  # the reuse extended the countdown
+    assert fake.timeouts == [900]  # the reuse extended the countdown
     pool.close()
 
 
@@ -504,12 +505,12 @@ def test_acquire_replaces_a_dead_idle_sandbox(monkeypatch: pytest.MonkeyPatch) -
     pool = E2BSandboxPool(sandbox_factory=factory)
     sandbox, channel = pool.acquire()
     pool.release(sandbox, channel, healthy=True)
-    sandbox.dead = True  # E2B killed it while idle
+    made[0].dead = True  # E2B killed it while idle
 
     fresh, _ = pool.acquire()
 
     assert fresh is not sandbox
-    assert sandbox.kills == 1  # the dead one was retired
+    assert made[0].kills == 1  # the dead one was retired
     assert len(made) == 2
     assert pool.usage().count == 2
     pool.close()
@@ -539,7 +540,8 @@ def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(
     def dying_first_factory() -> FakeSandbox:
         fake = original_factory()
         if len(made) == 1:
-            fake.commands._handle.hold_open = False  # noqa: SLF001 - first stream ends after hello
+            # First stream ends right after hello (no hold): the channel reads EOF mid-episode.
+            fake.commands._handle._hold_open = False  # noqa: SLF001
         return fake
 
     pool = E2BSandboxPool(sandbox_factory=dying_first_factory)
