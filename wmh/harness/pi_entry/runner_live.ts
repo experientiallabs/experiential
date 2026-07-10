@@ -327,6 +327,11 @@ class Session {
 				// The host emits the submit event; the run then ends (but the SESSION stays alive
 				// awaiting the next user message).
 				await this.conn.request("tool_request", { name: "submit", arguments: { answer: params.answer ?? "" } });
+				// Re-check after the round-trip: if the interrupt landed while the request was in
+				// flight, end via the abort path rather than terminating the run as a clean submit.
+				if (signal?.aborted) {
+					return { content: [{ type: "text", text: "interrupted" }], details: {}, terminate: false };
+				}
 				return { content: [{ type: "text", text: "submitted" }], details: {}, terminate: true };
 			},
 		};
