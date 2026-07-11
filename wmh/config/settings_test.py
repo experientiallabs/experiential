@@ -92,6 +92,38 @@ def test_resolve_prefers_the_configured_role_over_worker() -> None:
     assert resolved.model == "gpt-5.4-mini"
 
 
+def test_meta_role_resolves_when_configured_and_never_falls_back_to_worker() -> None:
+    """The proposer role is opt-in: unset meta means the caller's default, not the worker.
+
+    The worker is picked for scenario-generation quality, not the proposer's
+    long-context/long-output needs, so it must not leak into delta proposal silently.
+    """
+    worker = ModelRole(provider="azure", model="gpt-5.4")
+    meta = ModelRole(provider="azure", model="gpt-5.5", deployment="gpt-5-5")
+    assert ModelsSettings(worker=worker).resolve("meta") is None
+    assert ModelsSettings(worker=worker, meta=meta).resolve("meta") is meta
+
+
+def test_meta_role_round_trips_through_toml(tmp_path: Path) -> None:
+    root = tmp_path / ".wmh"
+    settings = ProjectSettings(
+        models=ModelsSettings(
+            meta=ModelRole(
+                provider="azure",
+                model="gpt-5.5",
+                endpoint="https://x.example",
+                deployment="gpt-5-5",
+            )
+        )
+    )
+    save_settings(settings, root)
+    loaded = load_settings(root)
+    assert loaded.models.meta is not None
+    assert loaded.models.meta.model == "gpt-5.5"
+    assert loaded.models.meta.deployment == "gpt-5-5"
+    assert "[models.meta]" in settings_path(root).read_text(encoding="utf-8")
+
+
 def test_resolve_rejects_unknown_role() -> None:
     with pytest.raises(ValueError, match="unknown model role"):
         ModelsSettings().resolve("teacher")
