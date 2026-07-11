@@ -121,18 +121,19 @@ class AzureOpenAIProvider:
 
 
 def _same_endpoint(a: str, b: str | None) -> bool:
-    """True when two endpoint strings name the same host + path.
+    """True when two endpoint strings name the same host, path, and query.
 
-    Scheme and host are compared case-insensitively (per URL semantics), the path is compared
-    case-sensitively (paths are case-sensitive), and a trailing slash is ignored. This tolerates a
-    trailing slash or host-casing difference for the *same* Azure resource without ever treating a
-    URL that differs in a case-sensitive path component as equal.
+    Scheme and host are compared case-insensitively (per URL semantics); path and query are
+    compared case-sensitively (both are case-sensitive), with only a trailing slash ignored. This
+    tolerates a trailing slash or host-casing difference for the *same* Azure resource without
+    treating a URL that differs in a case-sensitive path or query component as equal.
     """
     if b is None:
         return False
     pa, pb = urlsplit(a), urlsplit(b)
-    return (pa.scheme.lower(), pa.netloc.lower(), pa.path.rstrip("/")) == (
+    return (pa.scheme.lower(), pa.netloc.lower(), pa.path.rstrip("/"), pa.query) == (
         pb.scheme.lower(),
         pb.netloc.lower(),
         pb.path.rstrip("/"),
+        pb.query,
     )

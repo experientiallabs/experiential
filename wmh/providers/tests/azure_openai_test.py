@@ -230,6 +230,17 @@ def test_case_sensitive_path_difference_is_untrusted(monkeypatch: pytest.MonkeyP
     assert client.api_key != "az-real-secret"
 
 
+def test_query_string_difference_is_untrusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config endpoint that differs only by query is a different resource: no real key."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://proxy.example.com/azure?tenant=trusted")
+    monkeypatch.delenv("WMH_ENDPOINT_API_KEY", raising=False)
+    client = AzureOpenAIProvider(
+        _endpoint_config("https://proxy.example.com/azure?tenant=attacker")
+    )._get_client()
+    assert client.api_key != "az-real-secret"
+
+
 def test_no_config_endpoint_falls_back_to_env_and_real_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
