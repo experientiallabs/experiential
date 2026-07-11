@@ -130,6 +130,7 @@ def _run(
     k: int = 3,
     holdout: list[TaskSpec] | None = None,
     on_progress: Callable[[int, str, float, bool], None] | None = None,
+    on_note: Callable[[str], None] | None = None,
 ) -> CreateResult:
     return create_harness(
         "winner",
@@ -143,6 +144,7 @@ def _run(
         k=k,
         holdout=holdout,
         on_progress=on_progress,
+        on_note=on_note,
     )
 
 
@@ -986,3 +988,23 @@ def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
     assert delta.verdict is not None and not delta.verdict.accepted
     assert "pi-node only" in delta.verdict.reason
     assert result.best_score == 0.5  # the seed stayed champion and the search finished
+
+
+def test_skipped_iterations_narrate_through_on_note() -> None:
+    """Every iteration whose proposal dies before scoring reports itself.
+
+    Regression: a run whose proposals were all unusable (e.g. truncated meta replies on huge
+    pi code surfaces) emitted NO progress events at all — five iterations looked like one.
+    """
+    provider = RoleProvider(meta_reply="truncated garbage that is not json")
+    notes: list[str] = []
+    result = _run(provider, iterations=3, on_note=notes.append)
+
+    assert result.skipped == 3
+    assert len(notes) == 3
+    assert all("proposal unusable" in note for note in notes)
+    assert [note.split(":")[0] for note in notes] == [
+        "iteration 1/3",
+        "iteration 2/3",
+        "iteration 3/3",
+    ]

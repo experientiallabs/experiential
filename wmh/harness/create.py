@@ -298,6 +298,7 @@ def create_harness(
     eval_concurrency: int | None = None,
     e2b_template: str | None = None,
     on_progress: CreateProgress | None = None,
+    on_note: Callable[[str], None] | None = None,
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
 
@@ -346,6 +347,13 @@ def create_harness(
         sandbox_pool = _Pool(template=e2b_template)
 
     try:
+
+        def _note(message: str) -> None:
+            # Narration for iterations that produce NO on_progress event (unusable/invalid/screened
+            # proposals): without it a run whose proposals all fail looks like it never iterated.
+            if on_note is not None:
+                on_note(message)
+
         docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
         worker_usages: list[TokenUsage | None] = []
         reports: dict[str, ClosedLoopReport] = {}
@@ -431,6 +439,10 @@ def create_harness(
             delta = propose_delta(parent, trigger, evidence, meta_provider, history=archive.deltas)
             if delta is None:
                 skipped += 1
+                _note(
+                    f"iteration {i}/{iterations}: proposal unusable (unparseable or truncated "
+                    "meta reply); skipped"
+                )
                 continue
             try:
                 child = apply_delta(parent, delta, f"{name}-g{i}")
@@ -438,6 +450,7 @@ def create_harness(
                 delta.verdict = GateRecord(accepted=False, reason=f"invalid before eval: {exc}")
                 archive.deltas.append(delta)
                 skipped += 1
+                _note(f"iteration {i}/{iterations}: delta invalid before eval ({exc}); skipped")
                 continue
             if harness_backend == "e2b" and child.runtime_kind() != "pi-node":
                 # A delta that abandons the pi-node runtime cannot execute on this backend:
@@ -452,6 +465,10 @@ def create_harness(
                 )
                 archive.deltas.append(delta)
                 skipped += 1
+                _note(
+                    f"iteration {i}/{iterations}: delta abandoned the pi-node runtime "
+                    "(e2b runs pi-node only); skipped"
+                )
                 continue
 
             # Cheap screen: before a full-split eval, the delta must improve the very cluster it
@@ -472,6 +489,10 @@ def create_harness(
                     )
                     archive.deltas.append(delta)
                     screened += 1
+                    _note(
+                        f"iteration {i}/{iterations}: screened out — trigger cluster "
+                        f"{child_mean:.2f} vs parent {parent_mean:.2f}"
+                    )
                     continue
 
             child_report = _score(child, tasks)
