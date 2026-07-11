@@ -92,6 +92,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
   const onUpload = useCallback(async (file: File) => {
     setUploading(true);
     setError(null);
+    setTracesPath("");
     try {
       setTracesPath(await uploadTraces(file));
     } catch (e) {
@@ -222,7 +223,11 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
                 accept=".jsonl,.json"
                 className="hidden"
                 disabled={running}
-                onChange={(e) => e.target.files?.[0] && onUpload(e.target.files[0])}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (file) void onUpload(file);
+                }}
               />
             </label>
           </div>

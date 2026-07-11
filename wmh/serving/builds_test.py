@@ -87,7 +87,7 @@ def test_successful_build_reports_events_and_writes_card(tmp_path: Path) -> None
     assert card.built_at is not None
 
 
-def test_build_receives_resolved_upload_path(tmp_path: Path) -> None:
+def test_build_receives_private_upload_snapshot(tmp_path: Path) -> None:
     received: list[str] = []
 
     def _capture(config, *, file: str, root: str, reporter) -> None:  # noqa: ANN001
@@ -98,7 +98,36 @@ def test_build_receives_resolved_upload_path(tmp_path: Path) -> None:
     request = _request(tmp_path)
     manager.wait(manager.start(request))
 
-    assert received == [str((manager.uploads_dir / request.file).resolve())]
+    assert len(received) == 1
+    snapshot = Path(received[0])
+    assert snapshot.parent != manager.uploads_dir
+    assert snapshot.name != request.file
+    assert not snapshot.exists()
+
+
+def test_build_uses_snapshot_if_upload_is_replaced_after_start(tmp_path: Path) -> None:
+    gate = threading.Event()
+    received: list[str] = []
+
+    def _read_after_release(config, *, file: str, root: str, reporter) -> None:  # noqa: ANN001
+        gate.wait(5)
+        received.append(Path(file).read_text(encoding="utf-8"))
+        _ok_build_fn(config, file=file, root=root, reporter=reporter)
+
+    manager, _ = _manager(tmp_path, build_fn=_read_after_release)
+    request = _request(tmp_path)
+    uploaded = manager.uploads_dir / request.file
+    uploaded.write_text("uploaded\n", encoding="utf-8")
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("server secret\n", encoding="utf-8")
+
+    build_id = manager.start(request)
+    uploaded.unlink()
+    uploaded.symlink_to(secret)
+    gate.set()
+    manager.wait(build_id)
+
+    assert received == ["uploaded\n"]
 
 
 def test_failed_build_surfaces_error(tmp_path: Path) -> None:
