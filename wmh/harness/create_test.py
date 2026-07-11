@@ -23,7 +23,6 @@ from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness import create as create_module
 from wmh.harness.create import (
-    ATTEMPTS_PER_ITERATION,
     CreateResult,
     PoolEntry,
     cluster_failures,
@@ -213,12 +212,14 @@ def test_create_rejects_regressing_delta_and_keeps_champion() -> None:
 def test_create_skips_unusable_proposals() -> None:
     provider = RoleProvider(meta_reply="not json at all")
     result = _run(provider, iterations=2)
-    # Dead attempts retry the slot: 2 slots x ATTEMPTS_PER_ITERATION attempts, all unusable.
-    assert result.skipped == 2 * ATTEMPTS_PER_ITERATION
+    assert result.skipped == 2
     assert result.archive.deltas == []  # nothing to audit: no delta object ever existed
     assert result.best.name == "winner"  # even a search with no children yields the renamed seed
-    assert [a.outcome for a in result.attempts] == ["unusable"] * (2 * ATTEMPTS_PER_ITERATION)
-    assert all(a.iteration == 1 for a in result.attempts)  # slot 1 never filled
+    # Every iteration is recorded even when its proposal dies before producing anything.
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "unusable"),
+        (2, "unusable"),
+    ]
 
 
 def test_create_audits_invalid_delta_without_spending_eval() -> None:
@@ -238,9 +239,7 @@ def test_create_audits_invalid_delta_without_spending_eval() -> None:
     )
     provider = RoleProvider(meta_reply=stale)
     result = _run(provider)
-    # Attempt 1 is judged invalid; the retries re-propose the same delta and are skipped as
-    # duplicates without re-archiving or re-evaluating it.
-    assert result.skipped == ATTEMPTS_PER_ITERATION
+    assert result.skipped == 1
     [delta] = result.archive.deltas
     assert delta.verdict is not None and not delta.verdict.accepted
     assert delta.verdict.reason.startswith("invalid before eval")
@@ -347,16 +346,14 @@ def test_screen_rejects_delta_that_does_not_improve_its_trigger() -> None:
     progress: list[tuple[int, str, float, bool]] = []
     result = _run(provider, on_progress=lambda i, n, r, a: progress.append((i, n, r, a)))
 
-    # The screened attempt retries the slot; the retries duplicate the judged delta and
-    # are skipped without spend.
-    assert result.screened == 1 and result.skipped == ATTEMPTS_PER_ITERATION - 1
+    assert result.screened == 1 and result.skipped == 0
     [delta] = result.archive.deltas
     assert delta.verdict is not None and not delta.verdict.accepted
     assert delta.verdict.reason.startswith("screened out")
-    first = result.attempts[0]
-    assert first.outcome == "screened"
-    assert first.screen_child is not None and first.screen_parent is not None
-    assert all(a.outcome == "invalid" for a in result.attempts[1:])  # duplicates
+    # The dead iteration is still a first-class record, with its screen means attached.
+    [record] = result.iteration_records
+    assert record.iteration == 1 and record.outcome == "screened"
+    assert record.screen_child is not None and record.screen_parent is not None
     # The cheap screen replaced the full eval: only the seed has a full-split report,
     # and no child progress event ever fired.
     assert len(result.reports) == 1
@@ -367,7 +364,7 @@ def test_rejected_history_reaches_the_next_proposal() -> None:
     seed = HarnessDoc.baseline("seed")
     provider = RoleProvider(meta_reply=_useless_meta_reply(seed))
     _run(provider, iterations=2)
-    assert len(provider.meta_users) == 2 * ATTEMPTS_PER_ITERATION
+    assert len(provider.meta_users) == 2
     assert "Previous attempts" not in provider.meta_users[0]
     assert "Previous attempts" in provider.meta_users[1]
     assert "screened out" in provider.meta_users[1]  # the verdict itself is the lesson
@@ -459,7 +456,7 @@ def test_broken_code_delta_is_rejected_before_any_eval() -> None:
         iterations=1,
         k=2,
     )
-    assert result.skipped == ATTEMPTS_PER_ITERATION  # judged once, then duplicate retries
+    assert result.skipped == 1
     [delta] = result.archive.deltas
     assert delta.verdict is not None and "does not compile" in delta.verdict.reason
     assert len(result.reports) == 1  # only the seed was ever scored
@@ -995,7 +992,7 @@ def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
         harness_backend="e2b",
     )
 
-    assert result.skipped == ATTEMPTS_PER_ITERATION  # rejected once, duplicates skipped
+    assert result.skipped == 1  # the escape delta was rejected, not fatal
     [delta] = result.archive.deltas
     assert delta.verdict is not None and not delta.verdict.accepted
     assert "pi-node only" in delta.verdict.reason
@@ -1029,13 +1026,15 @@ def test_proposer_call_failure_skips_the_iteration_not_the_run() -> None:
     notes: list[str] = []
     result = _run(provider, iterations=2, on_note=notes.append)
 
-    budget = 2 * ATTEMPTS_PER_ITERATION
-    assert result.skipped == budget  # every attempt failed; the budget bounds the retries
+    assert result.skipped == 2
     assert result.best.name == "winner"  # the seed still wins; the run completed
-    assert len(notes) == budget + 1  # one per attempt + the exhaustion note
-    assert all("proposer call failed" in note for note in notes[:-1])
-    assert all("max_tokens above model output limit" in note for note in notes[:-1])
-    assert "attempt budget exhausted" in notes[-1]
+    assert len(notes) == 2
+    assert all("proposer call failed" in note for note in notes)
+    assert all("max_tokens above model output limit" in note for note in notes)
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "proposer_error"),
+        (2, "proposer_error"),
+    ]
 
 
 class _SequencedMetaProvider(RoleProvider):
@@ -1060,32 +1059,30 @@ class _SequencedMetaProvider(RoleProvider):
         return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
 
 
-def test_dead_attempt_retries_the_slot_instead_of_consuming_it() -> None:
-    """The ruling behind attempt semantics: a dead proposal must not eat an iteration.
+def test_dead_iteration_ends_early_and_the_search_moves_on() -> None:
+    """A dead proposal costs its iteration cheaply; the next iteration proceeds normally.
 
-    Attempt 1 is unusable; attempt 2 proposes the genuine fix. A 1-iteration search still
-    ends with the fix scored and accepted, and both attempts appear in the records.
+    Iteration 1's proposal is unusable; iteration 2 proposes the genuine fix. Both appear
+    in the records, and the scored one keeps its own iteration number.
     """
     seed = HarnessDoc.baseline("seed")
     provider = _SequencedMetaProvider(["garbage, not json", _meta_reply(seed, _CAREFUL_PROMPT)])
     progress: list[tuple[int, str, float, bool]] = []
     result = _run(
-        provider, iterations=1, on_progress=lambda i, n, r, a: progress.append((i, n, r, a))
+        provider, iterations=2, on_progress=lambda i, n, r, a: progress.append((i, n, r, a))
     )
 
     assert result.skipped == 1
     assert result.best_score == 1.0
     assert result.best.system_prompt() == _CAREFUL_PROMPT
-    # The scored candidate landed in slot 1 on attempt 2, so the progress event numbering
-    # (what the platform plots as the main line) stays 1..iterations.
-    assert [e[0] for e in progress] == [0, 1]
-    assert [(a.attempt, a.iteration, a.outcome) for a in result.attempts] == [
-        (1, 1, "unusable"),
-        (2, 1, "scored"),
+    assert [e[0] for e in progress] == [0, 2]  # the dead iteration fires no progress event
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "unusable"),
+        (2, "scored"),
     ]
-    scored = result.attempts[-1]
+    scored = result.iteration_records[-1]
     assert scored.accepted is True and scored.score == 1.0
-    assert scored.candidate == "winner-g2"  # named by attempt, so retries never collide
+    assert scored.candidate == "winner-g2"
 
 
 def test_skipped_iterations_narrate_through_on_note() -> None:
@@ -1098,12 +1095,11 @@ def test_skipped_iterations_narrate_through_on_note() -> None:
     notes: list[str] = []
     result = _run(provider, iterations=3, on_note=notes.append)
 
-    budget = 3 * ATTEMPTS_PER_ITERATION
-    assert result.skipped == budget
-    assert len(notes) == budget + 1  # one per attempt + the exhaustion note
-    assert all("proposal unusable" in note for note in notes[:-1])
-    # Slot 1 is never filled, so every attempt narrates against it, numbered globally.
-    assert [note.split(":")[0] for note in notes[:-1]] == [
-        f"iteration 1/3 attempt {n}" for n in range(1, budget + 1)
+    assert result.skipped == 3
+    assert len(notes) == 3
+    assert all("proposal unusable" in note for note in notes)
+    assert [note.split(":")[0] for note in notes] == [
+        "iteration 1/3",
+        "iteration 2/3",
+        "iteration 3/3",
     ]
-    assert "attempt budget exhausted" in notes[-1]
