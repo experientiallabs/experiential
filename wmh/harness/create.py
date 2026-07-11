@@ -94,6 +94,38 @@ class DeltaArchive(BaseModel):
         return docs[doc_hash]
 
 
+# Attempt ceiling per iteration slot: a dead proposal (unusable, invalid, screened) retries
+# the slot with a fresh attempt instead of consuming it, and this factor bounds the total
+# spend when every proposal dies (each dead attempt still costs a proposal call and possibly
+# a trigger-cluster screen eval).
+ATTEMPTS_PER_ITERATION = 3
+
+
+class AttemptRecord(BaseModel):
+    """One proposal attempt, scored or dead, in search order: the complete search history.
+
+    `iteration` is the 1-based slot the attempt tried to fill; dead attempts (every outcome
+    but "scored") do not consume the slot, so several records can share an iteration. Callers
+    render these as records and plot points, so a run full of dead proposals shows its work
+    instead of looking like it never iterated. `champion_score` is the champion's full-suite
+    rate when the attempt resolved: the honest y-level for plotting a dead attempt (the line
+    the attempt failed to move).
+    """
+
+    attempt: int
+    iteration: int
+    outcome: Literal["scored", "screened", "invalid", "unusable", "proposer_error"]
+    candidate: str | None = None
+    delta_id: str | None = None
+    ops: list[str] = Field(default_factory=list)  # "replace prompt:main" style summaries
+    reason: str | None = None
+    score: float | None = None  # full-suite success rate; scored attempts only
+    accepted: bool | None = None  # gate verdict; scored attempts only
+    screen_child: float | None = None  # trigger-cluster means; screened attempts only
+    screen_parent: float | None = None
+    champion_score: float | None = None
+
+
 class CreateResult(BaseModel):
     """What a create run produced: the champion, its score, and the full search record."""
 
@@ -103,7 +135,8 @@ class CreateResult(BaseModel):
     reports: dict[str, ClosedLoopReport] = Field(default_factory=dict)  # by doc_hash
     holdout_reports: dict[str, ClosedLoopReport] = Field(default_factory=dict)  # by doc_hash
     suite: list[str] = Field(default_factory=list)  # final regression suite (task ids)
-    skipped: int = 0  # iterations lost to unusable or invalid proposals
+    skipped: int = 0  # attempts lost to unusable or invalid proposals (they retry the slot)
+    attempts: list[AttemptRecord] = Field(default_factory=list)  # every attempt, in order
     screened: int = 0  # deltas rejected at the cheap trigger-cluster screen (no full eval spent)
     confirmations: int = 0  # narrow vetoes retried at higher k (see `narrow_failing_tiers`)
     # Spend meters over the WHOLE search (seed, screens, full splits, holdout, confirmations).
@@ -299,12 +332,16 @@ def create_harness(
     e2b_template: str | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
+    on_attempt: Callable[[AttemptRecord], None] | None = None,
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
 
-    Scores the seed first, then runs `iterations` propose-apply-SCREEN-score-gate steps. An
-    iteration whose proposal is unusable or fails atomic application is skipped (counted in
-    `skipped`; an invalid delta is still archived with its rejection verdict), never fatal.
+    Scores the seed first, then fills `iterations` scored propose-apply-SCREEN-score-gate
+    slots. A dead attempt (unusable/invalid proposal, or one screened out on its own trigger
+    cluster) does NOT consume its slot: it is counted (`skipped`/`screened`), recorded in
+    `attempts`, narrated via `on_note`, and the slot retries with a fresh proposal, bounded
+    at `iterations * ATTEMPTS_PER_ITERATION` total attempts so an unproductive proposer
+    cannot spend without limit. Never fatal.
 
     Every rollout scores against the world-model simulation — the environment is always sim.
     `harness_backend` picks where the harness PROCESS executes: `local` (the default) runs it
@@ -425,43 +462,108 @@ def create_harness(
             if seed_report.per_task[task.task_id].success_rate >= 1.0 - _TIE_EPS
         )
 
-        for i in range(1, iterations + 1):
-            parent_entry = select_parent(pool, children_counts, seed=i)
+        attempts: list[AttemptRecord] = []
+
+        def _dead(record: AttemptRecord, note: str) -> None:
+            # A dead attempt is a first-class search event: recorded, streamed, narrated,
+            # then the slot retries with a fresh proposal instead of being consumed.
+            attempts.append(record)
+            if on_attempt is not None:
+                on_attempt(record)
+            _note(note)
+
+        attempt = 0
+        scored = 0
+        max_attempts = iterations * ATTEMPTS_PER_ITERATION
+        while scored < iterations and attempt < max_attempts:
+            attempt += 1
+            slot = scored + 1
+            champion_score = reports[champion_hash].success_rate
+            parent_entry = select_parent(pool, children_counts, seed=attempt)
             parent = docs[parent_entry.doc_hash]
             parent_report = reports[parent_entry.doc_hash]
             # Count the expansion attempt up front so a parent whose proposals keep failing is
-            # progressively discounted instead of re-selected every iteration.
+            # progressively discounted instead of re-selected every attempt.
             children_counts[parent.doc_hash] = children_counts.get(parent.doc_hash, 0) + 1
 
             clusters = cluster_failures(parent_report, tasks)
             trigger = clusters[0] if clusters else FailureSignature(mechanism=ALL_PASS_MECHANISM)
             evidence = render_evidence(trigger, parent_report, tasks)
             # A meta-provider failure (an API rejecting the 16k reply budget, a rate limit, a
-            # network fault) costs this iteration, not the run: same contract as an unusable
+            # network fault) costs this attempt, not the run: same contract as an unusable
             # reply, but narrated with the error so a systematically failing provider is
-            # visible on every iteration instead of aborting the search on the first one.
+            # visible on every attempt instead of aborting the search on the first one.
             try:
                 delta = propose_delta(
                     parent, trigger, evidence, meta_provider, history=archive.deltas
                 )
             except Exception as exc:  # noqa: BLE001 - any provider/transport error, by design
                 skipped += 1
-                _note(f"iteration {i}/{iterations}: proposer call failed ({exc}); skipped")
+                _dead(
+                    AttemptRecord(
+                        attempt=attempt,
+                        iteration=slot,
+                        outcome="proposer_error",
+                        reason=str(exc),
+                        champion_score=champion_score,
+                    ),
+                    f"iteration {slot}/{iterations} attempt {attempt}: proposer call failed "
+                    f"({exc}); retrying the slot",
+                )
                 continue
             if delta is None:
                 skipped += 1
-                _note(
-                    f"iteration {i}/{iterations}: proposal unusable (unparseable or truncated "
-                    "meta reply); skipped"
+                _dead(
+                    AttemptRecord(
+                        attempt=attempt,
+                        iteration=slot,
+                        outcome="unusable",
+                        reason="unparseable or truncated meta reply",
+                        champion_score=champion_score,
+                    ),
+                    f"iteration {slot}/{iterations} attempt {attempt}: proposal unusable "
+                    "(unparseable or truncated meta reply); retrying the slot",
+                )
+                continue
+            ops_summary = [f"{op.op} {op.surface_id}" for op in delta.ops]
+            if any(d.delta_id == delta.delta_id for d in archive.deltas):
+                # The proposer re-proposed a delta this run already judged. Re-evaluating it
+                # would spend a screen (or worse) to learn a known verdict; skip without spend.
+                # The duplicate is NOT re-archived; the original carries the verdict.
+                skipped += 1
+                _dead(
+                    AttemptRecord(
+                        attempt=attempt,
+                        iteration=slot,
+                        outcome="invalid",
+                        delta_id=delta.delta_id,
+                        ops=ops_summary,
+                        reason="duplicate of an already-judged delta",
+                        champion_score=champion_score,
+                    ),
+                    f"iteration {slot}/{iterations} attempt {attempt}: proposal duplicates an "
+                    "already-judged delta; retrying the slot",
                 )
                 continue
             try:
-                child = apply_delta(parent, delta, f"{name}-g{i}")
+                child = apply_delta(parent, delta, f"{name}-g{attempt}")
             except ValueError as exc:
                 delta.verdict = GateRecord(accepted=False, reason=f"invalid before eval: {exc}")
                 archive.deltas.append(delta)
                 skipped += 1
-                _note(f"iteration {i}/{iterations}: delta invalid before eval ({exc}); skipped")
+                _dead(
+                    AttemptRecord(
+                        attempt=attempt,
+                        iteration=slot,
+                        outcome="invalid",
+                        delta_id=delta.delta_id,
+                        ops=ops_summary,
+                        reason=f"invalid before eval: {exc}",
+                        champion_score=champion_score,
+                    ),
+                    f"iteration {slot}/{iterations} attempt {attempt}: delta invalid before "
+                    f"eval ({exc}); retrying the slot",
+                )
                 continue
             if harness_backend == "e2b" and child.runtime_kind() != "pi-node":
                 # A delta that abandons the pi-node runtime cannot execute on this backend:
@@ -476,9 +578,19 @@ def create_harness(
                 )
                 archive.deltas.append(delta)
                 skipped += 1
-                _note(
-                    f"iteration {i}/{iterations}: delta abandoned the pi-node runtime "
-                    "(e2b runs pi-node only); skipped"
+                _dead(
+                    AttemptRecord(
+                        attempt=attempt,
+                        iteration=slot,
+                        outcome="invalid",
+                        candidate=child.name,
+                        delta_id=delta.delta_id,
+                        ops=ops_summary,
+                        reason=str(delta.verdict.reason),
+                        champion_score=champion_score,
+                    ),
+                    f"iteration {slot}/{iterations} attempt {attempt}: delta abandoned the "
+                    "pi-node runtime (e2b runs pi-node only); retrying the slot",
                 )
                 continue
 
@@ -494,15 +606,28 @@ def create_harness(
                         accepted=False,
                         reason=(
                             f"screened out: trigger cluster {child_mean:.2f} vs parent "
-                            f"{parent_mean:.2f} over {len(screen_tasks)} task(s), k={k} — "
+                            f"{parent_mean:.2f} over {len(screen_tasks)} task(s), k={k}; "
                             "the delta did not improve its own target"
                         ),
                     )
                     archive.deltas.append(delta)
                     screened += 1
-                    _note(
-                        f"iteration {i}/{iterations}: screened out: trigger cluster "
-                        f"{child_mean:.2f} vs parent {parent_mean:.2f}"
+                    _dead(
+                        AttemptRecord(
+                            attempt=attempt,
+                            iteration=slot,
+                            outcome="screened",
+                            candidate=child.name,
+                            delta_id=delta.delta_id,
+                            ops=ops_summary,
+                            reason=str(delta.verdict.reason),
+                            screen_child=child_mean,
+                            screen_parent=parent_mean,
+                            champion_score=champion_score,
+                        ),
+                        f"iteration {slot}/{iterations} attempt {attempt}: screened out: "
+                        f"trigger cluster {child_mean:.2f} vs parent {parent_mean:.2f}; "
+                        "retrying the slot",
                     )
                     continue
 
@@ -588,8 +713,30 @@ def create_harness(
                     if outcome.success_rate >= 1.0 - _TIE_EPS
                 }
                 suite = sorted(set(suite) | promoted)
+            scored += 1
+            record = AttemptRecord(
+                attempt=attempt,
+                iteration=scored,
+                outcome="scored",
+                candidate=child.name,
+                delta_id=delta.delta_id,
+                ops=ops_summary,
+                reason=str(verdict.reason),
+                score=child_report.success_rate,
+                accepted=verdict.accepted,
+                champion_score=reports[champion_hash].success_rate,
+            )
+            attempts.append(record)
+            if on_attempt is not None:
+                on_attempt(record)
             if on_progress is not None:
-                on_progress(i, child.name, child_report.success_rate, verdict.accepted)
+                on_progress(scored, child.name, child_report.success_rate, verdict.accepted)
+
+        if scored < iterations:
+            _note(
+                f"attempt budget exhausted ({max_attempts} attempts = {iterations} iterations x "
+                f"{ATTEMPTS_PER_ITERATION}): {scored}/{iterations} iterations scored"
+            )
 
         best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
         sandbox_usage = None
@@ -604,6 +751,7 @@ def create_harness(
             holdout_reports=holdout_reports,
             suite=suite,
             skipped=skipped,
+            attempts=attempts,
             screened=screened,
             confirmations=confirmations,
             worker_usage=combine_usage(worker_usages),
