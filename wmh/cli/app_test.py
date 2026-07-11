@@ -366,8 +366,18 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
 
     chain = FakeProvider()
     pinned = FakeProvider()
-    monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: chain)
-    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: pinned)
+    configs: list[ProviderConfig] = []
+
+    def provider_or_chain(config: ProviderConfig, **kw) -> FakeProvider:  # noqa: ANN003
+        configs.append(config)
+        return chain
+
+    def get_provider(config: ProviderConfig) -> FakeProvider:
+        configs.append(config)
+        return pinned
+
+    monkeypatch.setattr(providers_pkg, "provider_or_chain", provider_or_chain)
+    monkeypatch.setattr(providers_pkg, "get_provider", get_provider)
 
     result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--no-rag"])
 
@@ -378,6 +388,11 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
     assert judge_systems_pinned  # every judge call went to the pinned backend
     prediction_systems = [s for s in chain.systems if "grade a world model" not in s]
     assert prediction_systems  # predictions went through the chain
+    assert [config.model for config in configs] == [
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-8",
+    ]
+    assert all(config.model_type == "claude-opus-4-8" for config in configs)
 
 
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001

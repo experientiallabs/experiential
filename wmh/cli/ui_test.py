@@ -247,7 +247,7 @@ def test_build_wizard_collects_all_inputs() -> None:
             "",  # trace source: accept the default (otel-genai)
             "/tmp/traces.jsonl",
             "bedrock",
-            "us.anthropic.claude-opus-4-8",
+            "claude-opus-4-8",
             "us-east-1",
             "",  # judge model: accept the bedrock default (dated haiku)
             "8",
@@ -266,7 +266,7 @@ def test_build_wizard_collects_all_inputs() -> None:
     assert params.file == "/tmp/traces.jsonl"
     assert params.provider == "bedrock"
     assert params.region == "us-east-1"
-    assert params.judge_model == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    assert params.judge_model == "claude-haiku-4-5"
     assert params.gepa_budget == 8
     assert params.embed_provider == "hashing"
     assert params.train_split == 0.5

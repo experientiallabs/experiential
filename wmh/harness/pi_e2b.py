@@ -24,9 +24,11 @@ in every transport error so a crashed node process diagnoses itself.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import queue
+import shlex
 import threading
 import time
 from collections import deque
@@ -65,6 +67,11 @@ PI_NPM_PACKAGES = (
 NODE_INSTALL_CMD = "npm install -g n && n 22"
 INSTALL_TIMEOUT_S = 600.0
 START_CMD = f"cd {RUNNER_WORKDIR} && node --experimental-strip-types runner_stdio.ts"
+# The live-session runner (interactive multi-turn) vs. the episode runner (one-shot eval).
+LIVE_START_CMD = f"cd {RUNNER_WORKDIR} && node --experimental-strip-types runner_live.ts"
+_LIVE_RUNNER_FILES = ("runner_live.ts",)
+# Default working directory a live session's real tools operate in (the agent's "cwd").
+LIVE_WORKSPACE = "/home/user/workspace"
 HELLO_TIMEOUT_S = 60.0
 
 # ESM so node treats the runner's .ts files as modules regardless of syntax detection.
@@ -419,6 +426,74 @@ class E2BPiRuntime:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def session_entry_files() -> dict[str, str]:
+    """The in-sandbox runner file(s) a live session uploads, as {filename: content}.
+
+    Public accessor for consumers outside wmh (the platform's live-session driver reads these
+    from the installed wmh package and writes them into the sandbox at start).
+    """
+    return {name: _read_entry(name) for name in _LIVE_RUNNER_FILES}
+
+
+def start_live_runner(
+    sandbox: SandboxHandle,
+    *,
+    template: str | None = None,
+    workspace: str = LIVE_WORKSPACE,
+    hello_timeout: float = HELLO_TIMEOUT_S,
+) -> E2BStdioChannel:
+    """Bootstrap and start `runner_live.ts` on an already-created sandbox; return its channel.
+
+    A live session (unlike a pooled eval episode) is one dedicated sandbox whose lifecycle the
+    caller owns — the caller creates it (setting its own timeout / metadata for reaping) and holds
+    the handle for keepalive, PTY, and reconciliation. This function does only the runner
+    bootstrap: upload the live runner file(s), install node 22 + pi's npm deps unless a template
+    prebakes them, ensure the workspace dir, start the long-lived runner over a stdin-writable
+    background command, and block until its `hello`. The returned `E2BStdioChannel` is what a
+    `wmh.harness.live_session.LiveSession` drives.
+    """
+    for name in _LIVE_RUNNER_FILES:
+        sandbox.files.write(f"{RUNNER_WORKDIR}/{name}", _read_entry(name))
+    if not (template or os.environ.get(E2B_TEMPLATE_ENV)):
+        sandbox.files.write(f"{RUNNER_WORKDIR}/package.json", _PACKAGE_JSON)
+        sandbox.commands.run(NODE_INSTALL_CMD, timeout=INSTALL_TIMEOUT_S)
+        sandbox.commands.run(
+            f"cd {RUNNER_WORKDIR} && npm install {' '.join(PI_NPM_PACKAGES)}",
+            timeout=INSTALL_TIMEOUT_S,
+        )
+    # `workspace` is a public parameter; quote it so a caller-supplied path can't
+    # inject extra shell commands into the live sandbox.
+    sandbox.commands.run(f"mkdir -p {shlex.quote(workspace)}", timeout=30)
+    handle = sandbox.commands.run(LIVE_START_CMD, background=True, stdin=True, timeout=0)
+    channel = E2BStdioChannel(sandbox, cast("CommandHandle", handle))
+    try:
+        deadline = time.monotonic() + hello_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(_no_hello_live(hello_timeout, channel))
+            try:
+                frame = channel.recv(timeout=remaining)
+            except TimeoutError as exc:
+                raise RuntimeError(_no_hello_live(hello_timeout, channel)) from exc
+            if frame is None:
+                raise RuntimeError(_no_hello_live(hello_timeout, channel))
+            if frame.get("type") == "hello":
+                return channel
+    except Exception:
+        # A failed handshake must not orphan the background node runner + its reader
+        # thread in the caller-owned sandbox; close the channel before propagating.
+        with contextlib.suppress(Exception):
+            channel.close()
+        raise
+
+
+def _no_hello_live(timeout: float, channel: E2BStdioChannel) -> str:
+    tail = channel.stderr_tail()
+    suffix = f"; recent runner stderr:\n{tail}" if tail else ""
+    return f"live runner sent no hello within {timeout:g}s ({LIVE_START_CMD!r}){suffix}"
 
 
 def _kill_quietly(sandbox: SandboxHandle) -> None:

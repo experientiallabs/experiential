@@ -116,8 +116,14 @@ def default_sandbox_factory(
     api_key: str | None = None,
     template: str | None = None,
     timeout: float = DEFAULT_SANDBOX_TIMEOUT_S,
+    metadata: dict[str, str] | None = None,
 ) -> SandboxFactory:
-    """A factory creating real E2B sandboxes (lazy SDK import; key from arg or $E2B_API_KEY)."""
+    """A factory creating real E2B sandboxes (lazy SDK import; key from arg or $E2B_API_KEY).
+
+    `metadata` tags the sandbox at create time (e.g. `{"session_id": …}`) so an out-of-band sweep
+    (`Sandbox.list`) can find and reap an orphaned sandbox whose owning process died — the live
+    session driver relies on this for cost-leak reconciliation.
+    """
 
     def make() -> SandboxHandle:
         try:
@@ -131,7 +137,12 @@ def default_sandbox_factory(
         if not key:
             raise RuntimeError(f"set ${E2B_API_KEY_ENV} to run the harness in E2B sandboxes")
         chosen = template or os.environ.get(E2B_TEMPLATE_ENV) or None
-        sandbox = Sandbox.create(template=chosen, timeout=int(timeout), api_key=key)
+        if metadata:
+            sandbox = Sandbox.create(
+                template=chosen, timeout=int(timeout), api_key=key, metadata=metadata
+            )
+        else:
+            sandbox = Sandbox.create(template=chosen, timeout=int(timeout), api_key=key)
         # The SDK object satisfies the protocol slice structurally; cast rather than pin the
         # SDK's full (much wider) signatures into the protocol.
         return cast("SandboxHandle", sandbox)

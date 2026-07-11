@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 import threading
 from collections.abc import Callable, Iterator
 from typing import cast
@@ -26,6 +27,7 @@ from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness import pi_e2b as pi_e2b_module
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
 from wmh.harness.pi_e2b import (
+    LIVE_START_CMD,
     NODE_INSTALL_CMD,
     PI_NPM_PACKAGES,
     RUNNER_WORKDIR,
@@ -33,6 +35,8 @@ from wmh.harness.pi_e2b import (
     E2BPiRuntime,
     E2BSandboxPool,
     E2BStdioChannel,
+    session_entry_files,
+    start_live_runner,
 )
 from wmh.harness.runner_link import WorkerConfig
 from wmh.harness.runtime import Runtime, StopReason
@@ -555,3 +559,60 @@ def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(
     assert len(made) == 2
     assert made[0].kills == 1  # the dead attempt's sandbox was discarded, not reused
     pool.close()
+
+
+# --- live-session bootstrap (start_live_runner / session_entry_files) ---
+def test_session_entry_files_returns_the_live_runner_source() -> None:
+    files = session_entry_files()
+    assert "runner_live.ts" in files
+    assert files["runner_live.ts"].startswith("/**")
+
+
+def test_start_live_runner_bootstraps_starts_and_consumes_hello() -> None:
+    fake = FakeSandbox(_ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True))
+    channel = start_live_runner(fake, template=None)
+    # runner_live.ts uploaded; node 22 + pi deps installed; workspace ensured; runner started.
+    assert f"{RUNNER_WORKDIR}/runner_live.ts" in fake.files.store
+    assert fake.commands.calls[0] == NODE_INSTALL_CMD
+    assert any("mkdir -p" in c for c in fake.commands.calls)
+    assert fake.commands.background_cmds == [LIVE_START_CMD]
+    # The hello was consumed; the channel is idle and ready for session frames.
+    with pytest.raises(TimeoutError):
+        channel.recv(timeout=0.05)
+
+
+def test_start_live_runner_with_template_skips_installs() -> None:
+    fake = FakeSandbox(_ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True))
+    start_live_runner(fake, template="wmh-pi-node")
+    assert all(c == c for c in fake.commands.calls)  # only the workspace mkdir, no installs
+    assert NODE_INSTALL_CMD not in fake.commands.calls
+    assert f"{RUNNER_WORKDIR}/package.json" not in fake.files.store
+    assert fake.commands.background_cmds == [LIVE_START_CMD]
+
+
+def test_start_live_runner_without_hello_raises_with_stderr() -> None:
+    # Runner starts but never emits hello (stream held open): recv times out -> no-hello error.
+    handle = _ScriptedHandle([(None, "boom: cannot start\n", None)], hold_open=True)
+    fake = FakeSandbox(handle)
+    with pytest.raises(RuntimeError, match="live runner sent no hello"):
+        start_live_runner(fake, template="wmh-pi-node", hello_timeout=0.3)
+
+
+def test_start_live_runner_quotes_the_workspace_path() -> None:
+    """A caller-supplied workspace can't inject extra shell commands into the sandbox."""
+    fake = FakeSandbox(_ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True))
+    evil = "/tmp/x; touch /pwned"  # noqa: S108 - deliberately hostile input for the quoting test
+    start_live_runner(fake, template="wmh-pi-node", workspace=evil)
+    assert f"mkdir -p {shlex.quote(evil)}" in fake.commands.calls
+    # Neutralized: no bare injected command runs.
+    assert not any(c.startswith("mkdir -p /tmp/x;") for c in fake.commands.calls)
+
+
+def test_start_live_runner_without_hello_closes_the_channel() -> None:
+    """A failed handshake tears the runner channel down so no node process is orphaned."""
+    handle = _ScriptedHandle([(None, "boom\n", None)], hold_open=True)
+    fake = FakeSandbox(handle)
+    with pytest.raises(RuntimeError, match="live runner sent no hello"):
+        start_live_runner(fake, template="wmh-pi-node", hello_timeout=0.3)
+    # close() asked the runner to exit (a shutdown frame reached its stdin).
+    assert any(f.get("type") == "shutdown" for f in _sent_frames(fake))

@@ -55,7 +55,7 @@ class BuildRouteRequest(BaseModel):
     description: str = ""
     tags: list[str] = Field(default_factory=list)
     provider: str = "bedrock"
-    model: str = "us.anthropic.claude-opus-4-8"
+    model: str = "claude-opus-4-8"
     region: str | None = None
     gepa_budget: int = 50
     train_split: float = 0.8

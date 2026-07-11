@@ -85,6 +85,7 @@ from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
+from wmh.providers.models import resolve_provider_model
 from wmh.providers.retry import RetryingProvider
 from wmh.retrieval import HashingEmbedder, get_embedder
 from wmh.scenarios import (
@@ -273,9 +274,9 @@ def build(
     provider: str = typer.Option(
         None, "--provider", help="Provider that serves the model (default: bedrock)."
     ),
-    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Serve provider model id."),
+    model: str = typer.Option("claude-opus-4-8", help="Canonical serve model type."),
     judge_model: str = typer.Option(
-        None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
+        None, "--judge-model", help="Canonical GEPA judge model type (default: cheap per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     chain: str = typer.Option(
@@ -650,7 +651,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         None, "--prompt", help="Prompt file; default=BASE_ENV_PROMPT."
     ),
     provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
-    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
+    model: str = typer.Option("claude-opus-4-8", help="Canonical model type."),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     chain: str | None = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
@@ -1011,12 +1012,7 @@ def _run_eval_files(
     for path in files:
         if not path.exists():
             raise typer.BadParameter(f"trace file not found: {path}")
-    try:
-        serve_provider = ProviderKind(provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in ProviderKind)
-        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
+    provider_config = _provider_config(provider, model, region)
     llm = providers.provider_or_chain(provider_config, chain=chain)
     if isinstance(llm, providers.WaterfallProvider):
         _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
@@ -1145,7 +1141,7 @@ def scenarios_verify(
     name: str = typer.Option(None, "--name", help="World model to roll against."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models."),
     provider: str = typer.Option(None, "--provider", help="Override serve provider kind."),
-    model: str = typer.Option(None, help="Override serve model id (e.g. a small/cheap model)."),
+    model: str = typer.Option(None, help="Override canonical serve model type."),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     max_steps: int = typer.Option(12, help="Rollout step budget per scenario."),
     drop: bool = typer.Option(False, "--drop", help="Write back only verified scenarios."),
@@ -1161,9 +1157,7 @@ def scenarios_verify(
     if provider is not None or model is not None:
         store = WorldModelStore(root)
         model_dir = store.resolve(_resolve_name(store, name))
-        override = _provider_config(
-            provider or "bedrock", model or "us.anthropic.claude-opus-4-8", region
-        )
+        override = _provider_config(provider or "bedrock", model or "claude-opus-4-8", region)
         llm = RetryingProvider(providers.get_provider(override))
         world_model = WorldModel.load(str(model_dir), llm)
     else:
@@ -1221,11 +1215,17 @@ def _provider_config(provider: str, model: str, region: str | None) -> ProviderC
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    return ProviderConfig(kind=kind, model=model, region=region)
+    spec = resolve_provider_model(kind, model)
+    return ProviderConfig(
+        kind=kind,
+        model_type=spec.model_type,
+        model=spec.model_id,
+        region=region,
+    )
 
 
 _SCENARIO_DEFAULT_PROVIDER = "bedrock"
-_SCENARIO_DEFAULT_MODEL = "us.anthropic.claude-opus-4-8"
+_SCENARIO_DEFAULT_MODEL = "claude-opus-4-8"
 
 
 def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
@@ -1397,7 +1397,7 @@ def demo(
             # failed step — completed steps stay done.
             _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
             _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
-            provider_name, model_id, region = select_provider_and_model(
+            provider_name, model_type, region = select_provider_and_model(
                 _console,
                 lambda text: _console.input(text),
                 lambda text: _console.input(text, password=True),
@@ -1407,15 +1407,14 @@ def demo(
                 interactive=True,
                 check=lambda cfg: verify_all([cfg])[0],
             )
-            switched = ProviderConfig(
-                kind=ProviderKind(provider_name), model=model_id, region=region
-            )
+            switched = _provider_config(provider_name, model_type, region)
             provider = RetryingProvider(
                 providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
             )
             wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
             _console.print(
-                f"[dim]resuming from step {len(done) + 1} with {provider_name} ({model_id})…[/dim]"
+                f"[dim]resuming from step {len(done) + 1} with "
+                f"{provider_name} ({model_type})…[/dim]"
             )
     matches = sum(1 for d in done if d.exact_match)
     _console.print(f"\n{matches}/{len(done)} exact matches (run `wmh eval` for judged fidelity)")
