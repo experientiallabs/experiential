@@ -1,6 +1,9 @@
 """Azure OpenAI provider (GPT 5.5).
 
-Reads AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT from the environment; deployment name and
+The real AZURE_OPENAI_API_KEY is only ever sent to the trusted, operator-supplied
+AZURE_OPENAI_ENDPOINT. A config-controlled endpoint (ProviderConfig.endpoint, which can arrive
+in an untrusted model bundle's config.toml) is treated as an untrusted host: auth for it comes
+from WMH_ENDPOINT_API_KEY, never the real key, mirroring OpenAIProvider. Deployment name and
 api_version come from ProviderConfig.deployment / ProviderConfig.api_version.
 """
 
@@ -33,21 +36,41 @@ class AzureOpenAIProvider:
         self._client: AzureOpenAI | None = None
 
     def _get_client(self) -> AzureOpenAI:
-        # Lazy: construct on first use. api_key + endpoint default to AZURE_OPENAI_API_KEY /
-        # AZURE_OPENAI_ENDPOINT from the environment; api_version must be supplied by config.
+        # Lazy: construct on first use. api_version must be supplied by config; the endpoint and
+        # api_key are resolved with a trust check (see below), never blindly from the environment.
         if self._client is None:
             # Validate config before reaching for the SDK, so a config error doesn't depend on the
             # optional `openai` extra being installed.
             if self.config.api_version is None:
                 raise ValueError("AzureOpenAIProvider requires config.api_version to be set.")
-            endpoint = self.config.endpoint or _require_endpoint()
+
+            env_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+            endpoint = self.config.endpoint or env_endpoint
+            if not endpoint:
+                raise ValueError(
+                    "AzureOpenAIProvider needs an endpoint: set config.endpoint or "
+                    "AZURE_OPENAI_ENDPOINT."
+                )
 
             from openai import AzureOpenAI
 
-            self._client = AzureOpenAI(
-                api_version=self.config.api_version,
-                azure_endpoint=endpoint,
-            )
+            if self.config.endpoint and self.config.endpoint != env_endpoint:
+                # A config-controlled endpoint (config.toml can come from an untrusted model
+                # bundle) is an untrusted host. NEVER let the SDK fall back to the real
+                # AZURE_OPENAI_API_KEY for it: auth comes from WMH_ENDPOINT_API_KEY, mirroring
+                # OpenAIProvider. The SDK insists on *a* key, hence the placeholder.
+                self._client = AzureOpenAI(
+                    api_version=self.config.api_version,
+                    azure_endpoint=endpoint,
+                    api_key=os.environ.get("WMH_ENDPOINT_API_KEY") or "not-needed",
+                )
+            else:
+                # Trusted endpoint (operator-supplied AZURE_OPENAI_ENDPOINT): the SDK reads the
+                # real AZURE_OPENAI_API_KEY from the environment.
+                self._client = AzureOpenAI(
+                    api_version=self.config.api_version,
+                    azure_endpoint=endpoint,
+                )
         return self._client
 
     def _deployment(self) -> str:
@@ -88,13 +111,3 @@ class AzureOpenAIProvider:
 
     def verify(self) -> VerifyResult:
         return verify_via_ping(self)
-
-
-def _require_endpoint() -> str:
-
-    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-    if not endpoint:
-        raise ValueError(
-            "AzureOpenAIProvider needs an endpoint: set config.endpoint or AZURE_OPENAI_ENDPOINT."
-        )
-    return endpoint
