@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from wmh.providers import _openai_common
 from wmh.providers.base import (
@@ -120,7 +121,18 @@ class AzureOpenAIProvider:
 
 
 def _same_endpoint(a: str, b: str | None) -> bool:
-    """True when two Azure endpoint strings name the same host (ignoring trailing slash + case)."""
+    """True when two endpoint strings name the same host + path.
+
+    Scheme and host are compared case-insensitively (per URL semantics), the path is compared
+    case-sensitively (paths are case-sensitive), and a trailing slash is ignored. This tolerates a
+    trailing slash or host-casing difference for the *same* Azure resource without ever treating a
+    URL that differs in a case-sensitive path component as equal.
+    """
     if b is None:
         return False
-    return a.rstrip("/").lower() == b.rstrip("/").lower()
+    pa, pb = urlsplit(a), urlsplit(b)
+    return (pa.scheme.lower(), pa.netloc.lower(), pa.path.rstrip("/")) == (
+        pb.scheme.lower(),
+        pb.netloc.lower(),
+        pb.path.rstrip("/"),
+    )
