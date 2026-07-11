@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from llm_waterfall import ChatRequest, ChatResponse
+
 from wmh.core.types import JsonObject
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.tools import BASH, READ_SKILL, SUBMIT
@@ -27,7 +29,7 @@ class ScriptedChannel:
 
 def _completion(
     text: str = "", tool_calls: list | None = None, usage: dict | None = None
-) -> JsonObject:
+) -> ChatResponse:
     msg: JsonObject = {"role": "assistant", "content": text}
     if tool_calls is not None:
         msg["tool_calls"] = tool_calls
@@ -35,7 +37,7 @@ def _completion(
     completion: JsonObject = {"choices": [choice]}
     if usage is not None:
         completion["usage"] = usage
-    return completion
+    return ChatResponse.model_validate(completion)
 
 
 def _drain(session: LiveSession) -> None:
@@ -223,8 +225,10 @@ def test_worker_error_is_reported_not_raised() -> None:
         ]
     )
 
-    def boom(body: JsonObject) -> JsonObject:
-        raise RuntimeError("provider down")
+    def boom(request: ChatRequest) -> ChatResponse:
+        _ = request
+        msg = "provider down"
+        raise RuntimeError(msg)
 
     session = LiveSession(
         channel, tools=[], execute_tool=_no_tool, on_event=events.append, worker_fn=boom

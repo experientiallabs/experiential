@@ -10,9 +10,9 @@ output, state changes) that a UI renders live. Everything else is the RunnerLink
 the worker LLM is answered host-side so credentials never reach the runner, and the wire is the
 same length-prefixed / base64-line frame `Channel`.
 
-The engine is transport- and platform-agnostic. It answers `llm_request` frames with an injected
-`worker_fn` (the platform passes a metered, streaming completion; the default calls the same
-`worker_completion` the SSH shim uses), and answers `tool_request` frames with an injected
+The engine is transport- and platform-agnostic. It answers `llm_request` frames host-side via a
+fully-configured `ToolCallingProvider`'s `complete_chat` (Bedrock or Azure — provider-agnostic per
+wmh #142) or an injected `worker_fn` (tests), and answers `tool_request` frames with an injected
 `ToolExecutor` (the platform runs bash/read_file/write_file against the session's E2B sandbox
 filesystem; a CLI would run them against a local directory). Because the host answers every
 `llm_request` and every `tool_request`, it *is* the trusted observer of what the agent did — the
@@ -45,18 +45,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
+from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import JsonValue
 
 from wmh.core.types import JsonObject
-from wmh.harness.runner_link import (
-    Channel,
-    TokenUsage,
-    WorkerConfig,
-    WorkerFn,
-    params_schema,
-    worker_completion,
-)
+from wmh.harness.runner_link import Channel, TokenUsage, WorkerFn, params_schema
 from wmh.harness.tools import SUBMIT, ToolSpec
+from wmh.providers.base import ToolCallingProvider
 
 # The action budget a single user turn may spend before the runner is told to stop — the live
 # analogue of `HostEpisode.max_env_actions`, so a champion optimized under that pressure behaves
@@ -151,7 +146,7 @@ class LiveSession:
         files: dict[str, str] | None = None,
         system_prompt: str = "",
         skill_bodies: dict[str, str] | None = None,
-        worker: WorkerConfig | None = None,
+        provider: ToolCallingProvider | None = None,
         worker_fn: WorkerFn | None = None,
         actions_per_turn: int = DEFAULT_ACTIONS_PER_TURN,
         turn_cap: int = DEFAULT_TURN_CAP,
@@ -163,8 +158,16 @@ class LiveSession:
         self._files = dict(files or {})
         self._system_prompt = system_prompt
         self._skill_bodies = dict(skill_bodies or {})
-        cfg = worker or WorkerConfig()
-        self._worker_fn: WorkerFn = worker_fn or (lambda body: worker_completion(body, cfg))
+        # The worker LLM is answered host-side by a fully-configured provider's
+        # `complete_chat` (Bedrock or Azure — provider-agnostic per #142), or an
+        # injected `worker_fn` (tests). Left unset, an `llm_request` is answered
+        # with an error instead of crashing the host.
+        if worker_fn is not None:
+            self._worker_fn: WorkerFn | None = worker_fn
+        elif provider is not None:
+            self._worker_fn = provider.complete_chat
+        else:
+            self._worker_fn = None
         self._actions_per_turn = actions_per_turn
         self._turn_cap = turn_cap
 
@@ -302,11 +305,20 @@ class LiveSession:
     def _answer_llm(self, frame: JsonObject) -> None:
         req_id = frame.get("req_id")
         body = frame.get("openai_body")
+        if self._worker_fn is None:
+            self._emit("error", {"message": "live session has no worker configured"})
+            self._safe_send(
+                {"type": "llm_response", "req_id": req_id, "error": "no worker configured"}
+            )
+            return
         try:
-            completion = self._worker_fn(body if isinstance(body, dict) else {})
+            request = ChatRequest.model_validate(body if isinstance(body, dict) else {})
+            completion = self._worker_fn(request)
             self._meter(completion)
             self._emit_assistant(completion)
-            self._safe_send({"type": "llm_response", "req_id": req_id, "completion": completion})
+            self._safe_send(
+                {"type": "llm_response", "req_id": req_id, "completion": completion.wire_payload()}
+            )
         except Exception as exc:  # noqa: BLE001 - report to the runner, never crash the host
             self._emit("error", {"message": f"worker LLM error: {exc}"})
             self._safe_send({"type": "llm_response", "req_id": req_id, "error": str(exc)})
@@ -399,21 +411,18 @@ class LiveSession:
             payload["cleared_steers"] = cleared
         self._emit("state", payload)
 
-    def _emit_assistant(self, completion: JsonObject) -> None:
-        choice = _first_choice(completion)
-        message = choice.get("message") if isinstance(choice, dict) else None
-        text = message.get("content") if isinstance(message, dict) else None
+    def _emit_assistant(self, completion: ChatResponse) -> None:
+        if not completion.choices:
+            return
+        text = completion.choices[0].message.content
         if isinstance(text, str) and text.strip():
             self._emit("assistant_message", {"text": text})
 
-    def _meter(self, completion: JsonObject) -> None:
+    def _meter(self, completion: ChatResponse) -> None:
         self.worker_usage.calls += 1
-        reported = completion.get("usage")
-        if isinstance(reported, dict):
-            prompt = reported.get("prompt_tokens")
-            out = reported.get("completion_tokens")
-            self.worker_usage.input_tokens += prompt if isinstance(prompt, int) else 0
-            self.worker_usage.output_tokens += out if isinstance(out, int) else 0
+        reported = completion.token_usage()
+        self.worker_usage.input_tokens += reported.input_tokens
+        self.worker_usage.output_tokens += reported.output_tokens
 
     def _tool_specs(self) -> list[JsonObject]:
         return [
@@ -453,13 +462,6 @@ class LiveSession:
     def _mark_closed(self, status: str) -> None:
         self._closed = True
         self._status = status
-
-
-def _first_choice(completion: JsonObject) -> JsonObject:
-    choices = completion.get("choices")
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        return cast("JsonObject", choices[0])
-    return {}
 
 
 def _recv_with_timeout(channel: Channel, timeout: float | None) -> JsonObject | None:
