@@ -141,9 +141,13 @@ def _build_client(tmp_path: Path) -> TestClient:
 
 def test_build_routes_run_a_build_and_stream_events(tmp_path: Path) -> None:
     client = _build_client(tmp_path)
-    traces = tmp_path / "t.jsonl"
-    traces.write_text("{}\n", encoding="utf-8")
-    started = client.post("/world_models/builds", json={"name": "fresh", "file": str(traces)})
+    upload = client.post(
+        "/world_models/builds/uploads",
+        files={"file": ("t.jsonl", b"{}\n", "application/jsonl")},
+    )
+    started = client.post(
+        "/world_models/builds", json={"name": "fresh", "file": upload.json()["file"]}
+    )
     assert started.status_code == 202
     build_id = started.json()["build_id"]
     # Poll until the background build reaches a terminal state.
@@ -166,6 +170,17 @@ def test_build_routes_unavailable_without_manager() -> None:
     assert resp.status_code == 503
 
 
+def test_build_route_rejects_server_local_path(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("{}\n", encoding="utf-8")
+
+    response = client.post("/world_models/builds", json={"name": "fresh", "file": str(secret)})
+
+    assert response.status_code == 422
+    assert "upload" in response.json()["detail"]
+
+
 def test_upload_rejects_foreign_origin(tmp_path: Path) -> None:
     client = _build_client(tmp_path)
     resp = client.post(
@@ -180,6 +195,18 @@ def test_upload_rejects_foreign_origin(tmp_path: Path) -> None:
         headers={"Origin": "http://localhost:6001"},
     )
     assert ok.status_code == 200
+
+
+def test_upload_returns_opaque_filename(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+    response = client.post(
+        "/world_models/builds/uploads",
+        files={"file": ("traces.jsonl", b"{}\n", "application/jsonl")},
+    )
+
+    assert response.status_code == 200
+    upload = response.json()["file"]
+    assert Path(upload).name == upload
 
 
 def test_session_lifecycle_and_step_are_namespaced() -> None:

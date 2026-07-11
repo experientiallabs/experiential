@@ -91,7 +91,7 @@ class NewBuildResponse(BaseModel):
 
 
 class UploadResponse(BaseModel):
-    path: str
+    file: str
 
 
 def resolve_model_dirs(artifact_dirs: Sequence[str], names: list[str] | None) -> dict[str, Path]:
@@ -285,7 +285,9 @@ def create_app(
         if origin is not None and not re.match(ALLOWED_ORIGIN_REGEX, origin):
             raise HTTPException(status_code=403, detail=f"origin {origin!r} not allowed")
         manager.uploads_dir.mkdir(parents=True, exist_ok=True)
-        suffix = Path(file.filename or "traces.jsonl").suffix or ".jsonl"
+        suffix = Path(file.filename or "traces.jsonl").suffix.lower()
+        if suffix not in {".json", ".jsonl"}:
+            suffix = ".jsonl"
         target = manager.uploads_dir / f"{uuid.uuid4().hex}{suffix}"
         # Stream to disk in chunks (Starlette already spooled it to a temp file) with a size cap,
         # so a huge/malicious upload can't be slurped whole into memory or fill the disk.
@@ -301,7 +303,7 @@ def create_app(
                         detail=f"upload exceeds {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit",
                     )
                 fh.write(chunk)
-        return UploadResponse(path=str(target))
+        return UploadResponse(file=target.name)
 
     def _snapshot_or_404(manager: BuildManager, build_id: str) -> BuildSnapshot:
         try:

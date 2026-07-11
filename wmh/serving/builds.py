@@ -50,7 +50,7 @@ class BuildRouteRequest(BaseModel):
     """Inputs for one serve-side build - the `wmh build` wizard's fields over HTTP."""
 
     name: str
-    file: str  # server-local path to exported traces (use the uploads route from a browser)
+    file: str  # opaque filename returned by POST /world_models/builds/uploads
     title: str = ""
     description: str = ""
     tags: list[str] = Field(default_factory=list)
@@ -225,13 +225,36 @@ class BuildManager:
     def uploads_dir(self) -> Path:
         return self._store.root / "uploads"
 
+    def _resolve_upload(self, filename: str) -> Path:
+        """Resolve one opaque upload filename without permitting filesystem traversal."""
+        if (
+            not filename
+            or filename in {".", ".."}
+            or Path(filename).name != filename
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise ValueError(
+                "invalid traces file reference; upload traces via "
+                "POST /world_models/builds/uploads and pass its returned filename"
+            )
+        uploads_dir = self.uploads_dir.resolve()
+        traces_file = (uploads_dir / filename).resolve()
+        if not traces_file.is_relative_to(uploads_dir):
+            raise ValueError(
+                "invalid traces file reference; uploaded files must stay inside "
+                "the uploads directory"
+            )
+        if not traces_file.is_file():
+            raise FileNotFoundError(
+                f"no uploaded traces file named {filename!r}; upload one via "
+                "POST /world_models/builds/uploads"
+            )
+        return traces_file
+
     def start(self, request: BuildRouteRequest) -> str:
         """Validate and launch a build, returning its id. Raises before spending anything."""
-        if not Path(request.file).is_file():
-            raise FileNotFoundError(
-                f"no traces file at {request.file!r}; upload one via "
-                "POST /world_models/builds/uploads or pass a server-local path"
-            )
+        traces_file = self._resolve_upload(request.file)
         config = HarnessConfig.for_build(
             serve_provider=ProviderKind(request.provider),
             serve_model=request.model,
@@ -268,14 +291,20 @@ class BuildManager:
             self._builds[state.build_id] = state
         thread = threading.Thread(
             target=self._run,
-            args=(state, request, config),
+            args=(state, request, config, traces_file),
             name=f"wmh-build-{request.name}",
             daemon=True,  # never block `wmh serve` shutdown on an in-flight build
         )
         thread.start()
         return state.build_id
 
-    def _run(self, state: _BuildState, request: BuildRouteRequest, config: HarnessConfig) -> None:
+    def _run(
+        self,
+        state: _BuildState,
+        request: BuildRouteRequest,
+        config: HarnessConfig,
+        traces_file: Path,
+    ) -> None:
         reporter = _RecordingReporter(state)
         model_dir = self._store.model_dir(request.name)
         # If the dir already exists, this build did not create it - never delete it on failure
@@ -283,7 +312,7 @@ class BuildManager:
         preexisting = model_dir.exists()
         try:
             # Only the pipeline itself can leave a partial/broken artifact worth cleaning up.
-            self._build_fn(config, file=request.file, root=str(model_dir), reporter=reporter)
+            self._build_fn(config, file=str(traces_file), root=str(model_dir), reporter=reporter)
         except Exception as exc:  # noqa: BLE001 - report any failure to the client, never a dead silent thread
             # Remove the partial artifact so a failed build doesn't leave a model that `exists()`
             # then treats as real (bricking retries with 409 and serving a broken model) - but
