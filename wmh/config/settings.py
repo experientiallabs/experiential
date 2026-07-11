@@ -29,6 +29,7 @@ class ModelRole(BaseModel):
     region: str | None = None  # AWS Bedrock region
     endpoint: str | None = None  # Azure OpenAI / custom base URL
     deployment: str | None = None  # Azure OpenAI deployment name
+    api_version: str | None = None  # Azure OpenAI API version (azure roles get a default)
 
 
 class ModelsSettings(BaseModel):

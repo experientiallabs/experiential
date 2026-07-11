@@ -269,6 +269,12 @@ def _resolve_seed(store: HarnessStore, seed: str | None) -> HarnessDoc:
         raise typer.BadParameter(str(exc)) from exc
 
 
+# Azure OpenAI chat completions need an API version on every call; when the meta role
+# does not pin one in settings, this current stable version applies (override with
+# `api_version` under [models.meta]).
+_DEFAULT_AZURE_API_VERSION = "2024-05-01-preview"
+
+
 def _meta_provider_from_settings(root: str, fallback: Provider) -> tuple[Provider, str | None]:
     """The delta proposer's provider: `[models.meta]` from settings, else the fallback.
 
@@ -288,12 +294,18 @@ def _meta_provider_from_settings(root: str, fallback: Provider) -> tuple[Provide
             f"settings [models.meta] has unknown provider {configured.provider!r}; "
             f"choose one of: {kinds}"
         ) from None
+    api_version = configured.api_version
+    if api_version is None and kind is ProviderKind.AZURE_OPENAI:
+        # The Azure provider refuses to run without one; a bare [models.meta] azure entry
+        # must still produce usable proposals, not a proposer error every iteration.
+        api_version = _DEFAULT_AZURE_API_VERSION
     config = ProviderConfig(
         kind=kind,
         model=configured.model,
         region=configured.region,
         endpoint=configured.endpoint,
         deployment=configured.deployment,
+        api_version=api_version,
     )
     return get_provider(config), configured.model
 

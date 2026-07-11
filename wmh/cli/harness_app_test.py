@@ -213,8 +213,44 @@ def test_create_meta_role_from_settings_drives_the_proposer(
     assert config.kind is ProviderKind.AZURE_OPENAI
     assert config.model == "gpt-5.5"
     assert config.deployment == "gpt-5-5"
+    # A bare azure meta role still runs: the Azure provider refuses a None api_version,
+    # so the default applies when settings do not pin one.
+    assert config.api_version == "2024-05-01-preview"
     flat = " ".join(result.output.split())
     assert "proposer: gpt-5.5 from settings models.meta" in flat  # the banner names it
+
+
+def test_create_meta_role_api_version_override_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit api_version in [models.meta] overrides the azure default."""
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                meta=ModelRole(
+                    provider="azure",
+                    model="gpt-5.5",
+                    endpoint="https://x.example",
+                    deployment="gpt-5-5",
+                    api_version="2025-01-01",
+                )
+            )
+        ),
+        tmp_path / ".wmh",
+    )
+    configs: list[ProviderConfig] = []
+    monkeypatch.setattr(
+        harness_app_module, "get_provider", lambda config: configs.append(config) or _Provider()
+    )
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    [config] = configs
+    assert config.api_version == "2025-01-01"
 
 
 def test_create_meta_defaults_to_the_world_model_provider(
