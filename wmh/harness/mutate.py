@@ -114,11 +114,16 @@ def propose_delta(
     verdicts are shown to the proposer so it iterates instead of re-proposing rejected ideas.
     """
     user = _build_prompt(parent, trigger, evidence, history or [])
+    # The reply must hold a COMPLETE replacement surface (ops carry full content, not diffs).
+    # The largest vendored pi source file is ~36 KB (~10k tokens before JSON escaping), so 4k
+    # silently truncated every real code-surface proposal into an unusable reply; the search
+    # "ran" its iterations but skipped them all. 16k fits any single-surface rewrite with room
+    # for preconditions/rationale, and stays under common provider output caps.
     completion = provider.complete(
         MUTATE_SYSTEM,
         [Message(role="user", content=user)],
         temperature=0.9,
-        max_tokens=4096,
+        max_tokens=16384,
     )
     raw = extract_json_object(completion.text)
     if raw is None:

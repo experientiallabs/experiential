@@ -19,6 +19,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 from wmh.config import ARTIFACT_DIR, WorldModelStore
+from wmh.config.settings import load_settings
 from wmh.config.store import validate_name
 from wmh.engine import load_world_model
 from wmh.engine.world_model import WorldModel
@@ -28,7 +29,8 @@ from wmh.harness.create import create_harness
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
-from wmh.providers.base import Provider
+from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+from wmh.providers.registry import get_provider
 
 harness_app = typer.Typer(
     help="Named, versioned agent harnesses (.wmh/harnesses): create, init, list, show.",
@@ -143,6 +145,9 @@ def create(
     An LLM meta-agent proposes typed deltas against the harness document (surface-keyed ops with
     preconditions), each applied child is scored closed-loop (k passes per task) and gated on
     non-regression (regression suite, then full split, then the optional held-out split). The
+    The proposer's model resolves from `.wmh/settings.toml` `[models.meta]` when set (pick a
+    long-context, long-output model; a proposal carries whole replacement surfaces), and falls
+    back to the world model's provider otherwise. The
     environment is ALWAYS the world-model simulation; `--harness-backend` only picks where the
     harness PROCESS runs: `local` (the default) keeps it in/from this process, `e2b` runs the
     real pi agent inside pooled E2B sandboxes (pi-node seeds only), its tool calls still answered
@@ -182,6 +187,7 @@ def create(
     seed_doc = _resolve_seed(store, seed)
     # The world model IS the environment on every backend, so it is always required.
     world_model, provider, model_name = _load_world_model(model, root)
+    meta_provider, meta_model = _meta_provider_from_settings(root, provider)
 
     rollouts = (iterations + 1) * k * len(tasks)
     holdout_note = f" (+ up to {(iterations + 1) * k * len(holdout)} held-out)" if holdout else ""
@@ -190,11 +196,14 @@ def create(
         if harness_backend == "e2b"
         else ""
     )
+    meta_note = (
+        f" (proposer: {meta_model} from settings models.meta)" if meta_model is not None else ""
+    )
     _console.print(
         f"searching from [bold]{seed_doc.name}[/bold] against world model "
         f"[bold]{model_name}[/bold]: {iterations} iteration(s), k={k}, {len(tasks)} task(s) "
         f"-> up to ~{rollouts} rollouts{holdout_note} + {iterations} proposal calls"
-        f"{backend_note}"
+        f"{meta_note}{backend_note}"
     )
     if interactive and not yes and not Confirm.ask("Proceed?", default=True):
         raise typer.Exit(0)
@@ -204,13 +213,19 @@ def create(
         gate = "[green]accepted[/green]" if accepted else "[yellow]rejected[/yellow]"
         _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {gate}")
 
+    def _note(message: str) -> None:
+        # Iterations that die before scoring (unusable/invalid/screened proposals) emit no
+        # _progress event; without this a run whose proposals all fail looks frozen after
+        # the seed line.
+        _console.print(f"  [dim]{message}[/dim]")
+
     result = create_harness(
         name,
         seed_doc,
         tasks,
         world_model,
         provider,
-        provider,
+        meta_provider,
         GoldJudge(provider),
         iterations=iterations,
         k=k,
@@ -219,6 +234,7 @@ def create(
         eval_concurrency=eval_concurrency,
         e2b_template=e2b_template,
         on_progress=_progress,
+        on_note=_note,
     )
     saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
     accepted = len(result.archive.accepted())
@@ -251,6 +267,47 @@ def _resolve_seed(store: HarnessStore, seed: str | None) -> HarnessDoc:
         return store.load(base, ref or None)
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+# Azure OpenAI chat completions need an API version on every call; when the meta role
+# does not pin one in settings, this current stable version applies (override with
+# `api_version` under [models.meta]).
+_DEFAULT_AZURE_API_VERSION = "2024-05-01-preview"
+
+
+def _meta_provider_from_settings(root: str, fallback: Provider) -> tuple[Provider, str | None]:
+    """The delta proposer's provider: `[models.meta]` from settings, else the fallback.
+
+    The meta role is opt-in (see `ModelsSettings.resolve`): users who want a specific
+    long-context proposer set it in `.wmh/settings.toml`; everyone else keeps the world
+    model's provider, the pre-roles behavior. Returns the provider plus the configured model
+    name (None when falling back) for the run banner.
+    """
+    configured = load_settings(root).models.resolve("meta")
+    if configured is None:
+        return fallback, None
+    try:
+        kind = ProviderKind(configured.provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in ProviderKind)
+        raise typer.BadParameter(
+            f"settings [models.meta] has unknown provider {configured.provider!r}; "
+            f"choose one of: {kinds}"
+        ) from None
+    api_version = configured.api_version
+    if api_version is None and kind is ProviderKind.AZURE_OPENAI:
+        # The Azure provider refuses to run without one; a bare [models.meta] azure entry
+        # must still produce usable proposals, not a proposer error every iteration.
+        api_version = _DEFAULT_AZURE_API_VERSION
+    config = ProviderConfig(
+        kind=kind,
+        model=configured.model,
+        region=configured.region,
+        endpoint=configured.endpoint,
+        deployment=configured.deployment,
+        api_version=api_version,
+    )
+    return get_provider(config), configured.model
 
 
 def _load_world_model(name: str | None, root: str) -> tuple[WorldModel, Provider, str]:

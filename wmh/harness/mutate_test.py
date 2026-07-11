@@ -21,6 +21,7 @@ class ScriptedProvider:
         self.systems: list[str] = []
         self.users: list[str] = []
         self.temperatures: list[float] = []
+        self.max_tokens_seen: list[int] = []
 
     def complete(
         self,
@@ -33,6 +34,7 @@ class ScriptedProvider:
         self.systems.append(system)
         self.users.append(messages[-1].content)
         self.temperatures.append(temperature)
+        self.max_tokens_seen.append(max_tokens)
         return Completion(text=self._text)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -172,3 +174,20 @@ def test_prompt_exposes_pi_code_files_as_editable_levers() -> None:
         assert surface.content in user
     # The system instructions frame pathful code surfaces as an editable lever, not just runtime.
     assert "pathful" in system and "code:" in system
+
+
+def test_proposer_reply_budget_fits_a_full_pi_file_rewrite() -> None:
+    """Ops carry complete replacement content: the reply cap must fit the largest pi source.
+
+    Regression: max_tokens=4096 truncated every real code-surface proposal (largest vendored
+    file ~36 KB ≈ ~10k tokens), so multi-iteration searches silently skipped every iteration.
+    """
+    from wmh.harness.pi_vendor import pi_agent_code_surfaces
+
+    parent = HarnessDoc.baseline("parent")
+    provider = ScriptedProvider(_reply(parent))
+    propose_delta(parent, _trigger(), "evidence", provider)
+    [max_tokens] = provider.max_tokens_seen
+    largest = max(len(s.content) for s in pi_agent_code_surfaces())
+    # ~4 bytes/token; JSON escaping and rationale need headroom beyond the raw file.
+    assert max_tokens * 4 > largest * 1.3

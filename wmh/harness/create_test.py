@@ -30,6 +30,7 @@ from wmh.harness.create import (
     create_harness,
     select_parent,
 )
+from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.runtime import Runtime
@@ -144,6 +145,8 @@ def _run(
     k: int = 3,
     holdout: list[TaskSpec] | None = None,
     on_progress: Callable[[int, str, float, bool], None] | None = None,
+    on_note: Callable[[str], None] | None = None,
+    on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
 ) -> CreateResult:
     return create_harness(
         "winner",
@@ -157,6 +160,8 @@ def _run(
         k=k,
         holdout=holdout,
         on_progress=on_progress,
+        on_note=on_note,
+        on_accept=on_accept,
     )
 
 
@@ -227,6 +232,11 @@ def test_create_skips_unusable_proposals() -> None:
     assert result.skipped == 2
     assert result.archive.deltas == []  # nothing to audit: no delta object ever existed
     assert result.best.name == "winner"  # even a search with no children yields the renamed seed
+    # Every iteration is recorded even when its proposal dies before producing anything.
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "unusable"),
+        (2, "unusable"),
+    ]
 
 
 def test_create_audits_invalid_delta_without_spending_eval() -> None:
@@ -357,6 +367,10 @@ def test_screen_rejects_delta_that_does_not_improve_its_trigger() -> None:
     [delta] = result.archive.deltas
     assert delta.verdict is not None and not delta.verdict.accepted
     assert delta.verdict.reason.startswith("screened out")
+    # The dead iteration is still a first-class record, with its screen means attached.
+    [record] = result.iteration_records
+    assert record.iteration == 1 and record.outcome == "screened"
+    assert record.screen_child is not None and record.screen_parent is not None
     # The cheap screen replaced the full eval: only the seed has a full-split report,
     # and no child progress event ever fired.
     assert len(result.reports) == 1
@@ -1000,3 +1014,128 @@ def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
     assert delta.verdict is not None and not delta.verdict.accepted
     assert "pi-node only" in delta.verdict.reason
     assert result.best_score == 0.5  # the seed stayed champion and the search finished
+
+
+class _MetaExplodingProvider(RoleProvider):
+    """RoleProvider whose meta-agent calls raise (an API rejecting the request outright)."""
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Completion:
+        if "meta-agent improving an agent harness" in system:
+            msg = "max_tokens above model output limit"
+            raise RuntimeError(msg)
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_proposer_call_failure_skips_the_iteration_not_the_run() -> None:
+    """A meta-provider exception (output-cap rejection, rate limit) costs one iteration.
+
+    Same contract as an unusable reply, but narrated with the error; the search must not
+    abort on the first provider fault.
+    """
+    provider = _MetaExplodingProvider()
+    notes: list[str] = []
+    result = _run(provider, iterations=2, on_note=notes.append)
+
+    assert result.skipped == 2
+    assert result.best.name == "winner"  # the seed still wins; the run completed
+    assert len(notes) == 2
+    assert all("proposer call failed" in note for note in notes)
+    assert all("max_tokens above model output limit" in note for note in notes)
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "proposer_error"),
+        (2, "proposer_error"),
+    ]
+
+
+class _SequencedMetaProvider(RoleProvider):
+    """RoleProvider whose meta-agent replies follow a script, one per proposal call."""
+
+    def __init__(self, replies: list[str]) -> None:
+        super().__init__()
+        self._replies = replies
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Completion:
+        if "meta-agent improving an agent harness" in system:
+            self.meta_users.append(messages[-1].content)
+            reply = self._replies[min(len(self.meta_users) - 1, len(self._replies) - 1)]
+            return Completion(text=reply)
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_on_accept_delivers_the_new_champion_the_moment_it_is_crowned() -> None:
+    """Accepted champions stream out live, so callers can persist them in real time."""
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    crowned: list[tuple[str, bool, float]] = []
+    result = _run(
+        provider,
+        on_accept=lambda doc, delta, score: crowned.append(
+            (doc.system_prompt(), delta.verdict is not None and delta.verdict.accepted, score)
+        ),
+    )
+
+    assert result.best_score == 1.0
+    [(prompt, verdict_accepted, score)] = crowned
+    assert prompt == _CAREFUL_PROMPT  # the actual champion doc, not a name or hash
+    assert verdict_accepted is True  # the delta arrives with its verdict already attached
+    assert score == 1.0
+
+
+def test_dead_iteration_ends_early_and_the_search_moves_on() -> None:
+    """A dead proposal costs its iteration cheaply; the next iteration proceeds normally.
+
+    Iteration 1's proposal is unusable; iteration 2 proposes the genuine fix. Both appear
+    in the records, and the scored one keeps its own iteration number.
+    """
+    seed = HarnessDoc.baseline("seed")
+    provider = _SequencedMetaProvider(["garbage, not json", _meta_reply(seed, _CAREFUL_PROMPT)])
+    progress: list[tuple[int, str, float, bool]] = []
+    result = _run(
+        provider, iterations=2, on_progress=lambda i, n, r, a: progress.append((i, n, r, a))
+    )
+
+    assert result.skipped == 1
+    assert result.best_score == 1.0
+    assert result.best.system_prompt() == _CAREFUL_PROMPT
+    assert [e[0] for e in progress] == [0, 2]  # the dead iteration fires no progress event
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "unusable"),
+        (2, "scored"),
+    ]
+    scored = result.iteration_records[-1]
+    assert scored.accepted is True and scored.score == 1.0
+    assert scored.candidate == "winner-g2"
+
+
+def test_skipped_iterations_narrate_through_on_note() -> None:
+    """Every iteration whose proposal dies before scoring reports itself.
+
+    Regression: a run whose proposals were all unusable (e.g. truncated meta replies on huge
+    pi code surfaces) emitted NO progress events at all; five iterations looked like one.
+    """
+    provider = RoleProvider(meta_reply="truncated garbage that is not json")
+    notes: list[str] = []
+    result = _run(provider, iterations=3, on_note=notes.append)
+
+    assert result.skipped == 3
+    assert len(notes) == 3
+    assert all("proposal unusable" in note for note in notes)
+    assert [note.split(":")[0] for note in notes] == [
+        "iteration 1/3",
+        "iteration 2/3",
+        "iteration 3/3",
+    ]
