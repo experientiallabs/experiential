@@ -33,7 +33,7 @@ from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_l
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
-from wmh.harness.doc import HarnessDoc
+from wmh.harness.doc import CODE_RUNTIME_ID, HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.mutate import propose_delta, render_evidence
 from wmh.harness.runtime import TokenUsage, combine_usage
@@ -321,6 +321,7 @@ def create_harness(
     holdout: list[TaskSpec] | None = None,
     confirm_narrow_vetoes: bool = True,
     harness_backend: Literal["local", "e2b"] = "local",
+    trust_code: bool = False,
     eval_concurrency: int | None = None,
     e2b_template: str | None = None,
     on_progress: CreateProgress | None = None,
@@ -350,6 +351,12 @@ def create_harness(
     `e2b_template` names a prebaked sandbox template (node 22 + the pi runner deps) so e2b
     rollouts skip bootstrap installs.
 
+    `trust_code` must be set to score `code:runtime` children whose loop the meta-agent edited:
+    those surfaces exec in the host process with no sandbox, and their content is LLM-proposed
+    (prompt-injectable via the task/trace corpus), so scoring them auto-runs untrusted code. It is
+    refused by default; pass `trust_code=True` (the `--trust-code` CLI flag) only when you accept
+    running the searched code in-process. The unedited seed loop always runs.
+
     Verification is staged by cost: a child is first SCREENED on its own trigger cluster (the
     2-3 failing tasks its delta claims to fix, k passes) — if the cluster did not improve over
     the parent, the delta is rejected and archived for a fraction of a full eval's cost, and no
@@ -371,6 +378,15 @@ def create_harness(
             "harness_backend='e2b' runs the pi-node harness process in sandboxes; seed "
             f"runtime kind is {seed_doc.runtime_kind()!r}, which already runs in-process — "
             "use harness_backend='local'"
+        )
+    if not trust_code and seed_doc.surface(CODE_RUNTIME_ID) is not None:
+        # A code:runtime seed means the search proposes and auto-scores Python loops that exec in
+        # this process with no sandbox, and their content is LLM-generated (prompt-injectable via
+        # the task/trace corpus). Refuse up front rather than raise mid-score on the first child.
+        raise ValueError(
+            "seed has a code:runtime surface, so the search proposes and auto-scores Python loops "
+            "that exec in-process with no sandbox (LLM-generated, prompt-injectable via the "
+            "corpus). Pass trust_code=True only if you accept running the searched code in-process."
         )
     sandbox_pool: E2BSandboxPool | None = None
     if harness_backend == "e2b":
@@ -412,7 +428,7 @@ def create_harness(
                         "(single runner port/channel); use eval_concurrency=1 or "
                         "harness_backend='e2b'"
                     )
-                runtime = doc.runtime(agent_provider)
+                runtime = doc.runtime(agent_provider, trust_code=trust_code)
             else:
                 # The pi process runs in pooled sandboxes; every cell at once by default. Tool calls
                 # still route to the world model — the environment is sim regardless of backend.

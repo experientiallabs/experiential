@@ -234,6 +234,7 @@ class HarnessDoc(BaseModel):
         backend: str = "local",
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
+        trust_code: bool = False,
     ) -> Runtime:
         """The configured agent runtime this document describes.
 
@@ -249,6 +250,11 @@ class HarnessDoc(BaseModel):
         `code:runtime` surface drives episodes with the harness's own in-process program; with
         neither, the fixed baseline loop runs. All expose the same
         `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
+
+        `trust_code` gates the in-process `code:runtime` path: exec'ing a non-seed code surface
+        runs arbitrary Python in the host process, and the surface may be a meta-agent delta or a
+        registry-pulled harness, so `CodeRuntime` refuses unless `trust_code=True` (the caller
+        opts in, e.g. the `--trust-code` CLI flag). The built-in seed loop always runs.
         """
         if backend not in ("local", "e2b"):
             raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
@@ -325,6 +331,7 @@ class HarnessDoc(BaseModel):
                 temperature=self.temperature(),
                 skills=skills,
                 system_prompt=self._assembled_prompt(skills),
+                trust_code=trust_code,
             )
         return AgentRuntime(
             provider,

@@ -431,6 +431,7 @@ def test_code_delta_passes_screen_and_gate_end_to_end() -> None:
         GoldJudge(provider),
         iterations=1,
         k=3,
+        trust_code=True,
     )
     assert result.screened == 0 and result.skipped == 0
     [delta] = result.archive.deltas
@@ -439,6 +440,26 @@ def test_code_delta_passes_screen_and_gate_end_to_end() -> None:
     assert result.best_score == 1.0
     winner_code = result.best.surface(CODE_RUNTIME_ID)
     assert winner_code is not None and "done-verified" in winner_code.content
+
+
+def test_code_seed_search_is_refused_without_trust_optin() -> None:
+    # A code:runtime seed auto-scores meta-agent-proposed loops that exec in-process; the search
+    # must refuse up front (before any eval) unless trust_code is set.
+    from wmh.harness.doc import code_baseline
+
+    provider = RoleProvider()
+    with pytest.raises(ValueError, match="trust_code=True"):
+        create_harness(
+            "winner",
+            code_baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            iterations=1,
+            k=2,
+        )
 
 
 def test_broken_code_delta_is_rejected_before_any_eval() -> None:
@@ -472,6 +493,7 @@ def test_broken_code_delta_is_rejected_before_any_eval() -> None:
         GoldJudge(provider),
         iterations=1,
         k=2,
+        trust_code=True,
     )
     assert result.skipped == 1
     [delta] = result.archive.deltas

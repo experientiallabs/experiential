@@ -19,7 +19,8 @@ from rich.console import Console
 from rich.table import Table
 
 from wmh.config.store import WorldModelStore
-from wmh.harness.doc import HarnessDoc
+from wmh.harness.code_runtime import is_seed_runtime_code
+from wmh.harness.doc import CODE_RUNTIME_ID, HarnessDoc
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.platform.auth import BrowserLogin
 from wmh.platform.client import PlatformClient, PlatformError, WhoAmI, fetch_cli_config
@@ -337,6 +338,15 @@ def _pull_harness(
         f"{_CHECK} Pulled harness [bold]{name}[/bold] remote v{version} → local v{saved.version} "
         f"(champion)"
     )
+    code = doc.surface(CODE_RUNTIME_ID)
+    if code is not None and not is_seed_runtime_code(code.content):
+        # A pulled harness's code:runtime is arbitrary Python published by another org member; it
+        # execs in the host process when run. Warn so the reader knows running it takes the
+        # explicit --trust-code opt-in and that it should be reviewed first.
+        _console.print(
+            f"[yellow]![/yellow] {name} carries a custom code:runtime loop that execs in-process "
+            "with no sandbox. Review it before running; `wmh eval` needs --trust-code to run it."
+        )
 
 
 def _print_orgs(identity: WhoAmI, default_org: str | None) -> None:

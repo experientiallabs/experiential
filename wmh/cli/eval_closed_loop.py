@@ -39,6 +39,7 @@ def run_closed_loop(
     harness_backend: str = "local",
     eval_concurrency: int | None = None,
     e2b_template: str | None = None,
+    trust_code: bool = False,
 ) -> None:
     """Run an agent harness on each task against the world model; print and optionally save.
 
@@ -48,7 +49,9 @@ def run_closed_loop(
     never silently ignored. The environment is ALWAYS the world-model simulation;
     `--harness-backend e2b` only moves the pi-node harness PROCESS into pooled E2B sandboxes
     (tool calls stay answered by the world model host-side), running all (task, attempt) cells
-    at once unless `--eval-concurrency` caps them.
+    at once unless `--eval-concurrency` caps them. A harness whose `code:runtime` loop differs
+    from the built-in seed (e.g. one pulled from the registry) execs arbitrary Python in this
+    process; that is refused unless `trust_code` is set (the `--trust-code` flag).
     """
     if harness_backend not in ("local", "e2b"):
         raise typer.BadParameter(
@@ -115,8 +118,9 @@ def run_closed_loop(
                 provider,
                 backend=harness_backend,
                 e2b_template=e2b_template,
+                trust_code=trust_code,
             )
-        except ValueError as exc:  # e.g. e2b on a non-pi-node harness -> usage error
+        except ValueError as exc:  # e2b on a non-pi-node harness, or untrusted code -> usage error
             raise typer.BadParameter(str(exc)) from exc
     else:
         runtime = AgentRuntime(provider, max_turns=max_turns or DEFAULT_MAX_TURNS)

@@ -720,6 +720,13 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         "$WMH_E2B_TEMPLATE; without one, sandboxes bootstrap node + the pi runner deps on "
         "first use).",
     ),
+    trust_code: bool = typer.Option(
+        False,
+        "--trust-code",
+        help="Allow a closed-loop harness whose code:runtime loop differs from the built-in seed "
+        "(e.g. a registry-pulled harness) to exec in this process. Off by default: such code is "
+        "arbitrary Python with no sandbox; only opt in for code you authored or reviewed.",
+    ),
 ) -> None:
     """Score reconstruction fidelity, or run named example-local eval suites.
 
@@ -757,6 +764,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             harness_backend=harness_backend,
             eval_concurrency=eval_concurrency,
             e2b_template=e2b_template,
+            trust_code=trust_code,
         )
         return
     if args and args[0] == "agreement":

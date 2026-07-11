@@ -9,7 +9,9 @@ from wmh.harness.code_runtime import (
     DEFAULT_RUNTIME_CODE,
     CodeRuntime,
     RunBudget,
+    UntrustedCodeError,
     compile_harness_code,
+    is_seed_runtime_code,
 )
 from wmh.harness.doc import CODE_RUNTIME_ID, HarnessDoc, Surface, SurfaceKind, code_baseline
 from wmh.harness.runtime import Runtime, StopReason
@@ -62,6 +64,9 @@ class FakeEnv:
 def _runtime(code: str, replies: list[str] | None = None, **kwargs) -> CodeRuntime:  # noqa: ANN003
     provider = ScriptedProvider(replies or ['{"tool": "submit", "arguments": {"answer": "ok"}}'])
     tools = [TOOL_REGISTRY["bash"], SUBMIT]
+    # These tests author the code themselves, so it is trusted; the trust gate is exercised
+    # explicitly in the trust-gate tests below.
+    kwargs.setdefault("trust_code", True)
     return CodeRuntime(provider, code=code, tools=tools, **kwargs)
 
 
@@ -79,6 +84,67 @@ def test_compile_rejects_syntax_errors_and_missing_run() -> None:
 def test_run_must_be_callable() -> None:
     with pytest.raises(ValueError, match="not callable"):
         _runtime("run = 42\n")
+
+
+# -- trust gate (in-process exec of untrusted code:runtime) -------------------------------------
+
+
+_UNTRUSTED = "def run(kit):\n    return ''\n"
+
+
+def test_nonseed_code_is_refused_in_process_without_optin() -> None:
+    # The core RCE gate: a code:runtime surface that is not the built-in seed must not exec in the
+    # host process unless the caller explicitly trusts it (its source may be a meta-agent delta or
+    # a registry-pulled harness).
+    provider = ScriptedProvider(["x"])
+    tools = [TOOL_REGISTRY["bash"], SUBMIT]
+    with pytest.raises(UntrustedCodeError, match="trust-code"):
+        CodeRuntime(provider, code=_UNTRUSTED, tools=tools)
+
+
+def test_refusal_precedes_module_side_effects() -> None:
+    # The refusal must happen BEFORE exec, so module-level statements in untrusted code never run.
+    import wmh.harness.code_runtime as cr
+
+    provider = ScriptedProvider(["x"])
+    tools = [TOOL_REGISTRY["bash"], SUBMIT]
+    payload = (
+        "import wmh.harness.code_runtime as _cr\n_cr._pwned = True\ndef run(kit):\n    return ''\n"
+    )
+    with pytest.raises(UntrustedCodeError):
+        CodeRuntime(provider, code=payload, tools=tools)
+    assert not hasattr(cr, "_pwned")
+
+
+def test_seed_code_runs_without_trust_optin() -> None:
+    # The built-in seed loop is trusted unconditionally: trust_code defaults to False and it runs.
+    provider = ScriptedProvider(['{"tool": "submit", "arguments": {"answer": "ok"}}'])
+    tools = [TOOL_REGISTRY["bash"], SUBMIT]
+    runtime = CodeRuntime(provider, code=DEFAULT_RUNTIME_CODE, tools=tools)
+    assert isinstance(runtime, Runtime)
+    assert is_seed_runtime_code(DEFAULT_RUNTIME_CODE)
+    assert not is_seed_runtime_code(DEFAULT_RUNTIME_CODE + "\n# edit\n")
+
+
+def test_trust_optin_allows_nonseed_code() -> None:
+    result = _runtime(_UNTRUSTED, trust_code=True).run("t1", "x", FakeEnv())
+    assert result.stop_reason is StopReason.SUBMITTED
+
+
+def test_doc_runtime_gates_mutated_code_surface() -> None:
+    # doc.runtime() propagates the trust decision to the exec sink: a mutated (non-seed)
+    # code:runtime surface is refused by default and allowed only with trust_code=True.
+    base = code_baseline("seed")
+    mutated = DEFAULT_RUNTIME_CODE + "\n# meta-agent edit\n"
+    surfaces = [s for s in base.surfaces if s.id != CODE_RUNTIME_ID]
+    surfaces.append(Surface(id=CODE_RUNTIME_ID, kind=SurfaceKind.CODE, content=mutated))
+    doc = HarnessDoc(name="mutant", surfaces=surfaces)
+    provider = ScriptedProvider(['{"tool": "submit", "arguments": {"answer": "x"}}'])
+    with pytest.raises(UntrustedCodeError):
+        doc.runtime(provider)
+    assert isinstance(doc.runtime(provider, trust_code=True), CodeRuntime)
+    # The unmodified seed still runs with no opt-in.
+    assert isinstance(code_baseline("seed").runtime(provider), CodeRuntime)
 
 
 # -- the default loop, end to end ---------------------------------------------------------------

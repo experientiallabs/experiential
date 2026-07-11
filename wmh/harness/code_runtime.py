@@ -16,10 +16,14 @@ The contract is the `RuntimeKit`, and it carries three guarantees the search rel
 - **Crash-isolated.** An exception inside `run` fails that episode (scored as a failure with the
   partial transcript), never the evaluation loop around it.
 
-The kit is an interface contract, not a security boundary: harness code runs in-process and is
-trusted to the same degree as the rest of the search (it is reviewed via the delta archive, and
-only ever exercised against the world model during search). Running searched code against real
-environments is a deployment decision that belongs behind a sandbox.
+The kit is an interface contract, not a security boundary: in-process harness code runs with the
+host's full privileges. Only the built-in seed loop (`DEFAULT_RUNTIME_CODE`, shipped in this repo)
+is trusted to exec unconditionally. Any other `code:runtime` surface has untrusted provenance - a
+meta-agent delta (whose prompt embeds attacker-influenced trace/task text) or a harness pulled from
+the shared org registry - so `CodeRuntime` refuses to exec it in-process unless the caller opts in
+with `trust_code=True` (the `--trust-code` CLI flag). Running searched or pulled code against real
+environments is a deployment decision that belongs behind a sandbox; this gate keeps the host from
+silently executing code it never reviewed.
 """
 
 from __future__ import annotations
@@ -156,6 +160,28 @@ def _to_message(m: Message | tuple[str, str]) -> Message:
     raise ValueError(f"message role must be 'user' or 'assistant', got {role!r}")
 
 
+class UntrustedCodeError(ValueError):
+    """Raised when in-process exec of a non-seed `code:runtime` surface is attempted without opt-in.
+
+    A `code:runtime` string's provenance is not always trusted: it can be a delta proposed by the
+    meta-agent (whose prompt embeds attacker-influenced trace/task text) or a harness version pulled
+    from the shared org registry that another user published. Either way `exec`ing it in the host
+    process is arbitrary code execution with no sandbox. Only the built-in seed loop (shipped in
+    this repo) is trusted unconditionally; running any other code in-process requires an explicit
+    opt-in (`trust_code=True`, surfaced as the `--trust-code` CLI flag) so the host never silently
+    executes searched or pulled code.
+    """
+
+
+def is_seed_runtime_code(code: str) -> bool:
+    """True if `code` is byte-for-byte the built-in baseline loop shipped in this repo.
+
+    The seed is the only `code:runtime` content trusted to exec in-process without an explicit
+    opt-in: it is version-controlled here, not sourced from a meta-agent delta or the registry.
+    """
+    return code == DEFAULT_RUNTIME_CODE
+
+
 def compile_harness_code(code: str) -> None:
     """Front-loaded validation: the code must compile and define `run` at module scope.
 
@@ -190,8 +216,21 @@ class CodeRuntime:
         skills: SkillLibrary | None = None,
         budget: RunBudget | None = None,
         system_prompt: str = "",
+        trust_code: bool = False,
     ) -> None:
         compile_harness_code(code)
+        # Trust gate: exec runs `code` in the host process with no sandbox, so anything other than
+        # the built-in seed must be explicitly trusted. A meta-agent delta or a registry-pulled
+        # harness can carry arbitrary Python, and this check refuses to run it before exec (so no
+        # module-level statement executes) unless the caller opted in via `trust_code`.
+        if not trust_code and not is_seed_runtime_code(code):
+            raise UntrustedCodeError(
+                "refusing to exec a non-seed `code:runtime` surface in the host process: its "
+                "source is untrusted (a meta-agent delta or a registry-pulled harness can carry "
+                "arbitrary Python, which would run here with no sandbox). Re-run with --trust-code "
+                "(or pass trust_code=True) only if you authored or reviewed this code and accept "
+                "running it in-process."
+            )
         namespace: dict[str, object] = {"__name__": "wmh_harness_code"}
         exec(code, namespace)  # noqa: S102 - the code surface IS the artifact under search
         entry = namespace.get(CODE_ENTRYPOINT)

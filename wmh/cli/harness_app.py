@@ -26,7 +26,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec, load_tasks
 from wmh.harness.create import create_harness
-from wmh.harness.doc import HarnessDoc
+from wmh.harness.doc import CODE_RUNTIME_ID, HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
@@ -138,6 +138,14 @@ def create(
     archive_out: str = typer.Option(
         None, "--archive", help="Also write the full delta archive JSON here."
     ),
+    trust_code: bool = typer.Option(
+        False,
+        "--trust-code",
+        help="Required to search a code:runtime seed: the meta-agent's proposed loops exec in "
+        "this process with no sandbox, and their content is LLM-generated (prompt-injectable via "
+        "the task/trace corpus). Off by default; only opt in if you accept auto-running the "
+        "searched code in-process.",
+    ),
     yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
 ) -> None:
     """Create a harness by inverting the world model: search harness-space against it.
@@ -185,6 +193,16 @@ def create(
     holdout = _load_task_file(holdout_file) if holdout_file else None
     store = HarnessStore(root)
     seed_doc = _resolve_seed(store, seed)
+    # A code:runtime seed means the meta-agent will propose (and this run auto-scores) mutated
+    # loops that exec in-process with no sandbox. Refuse up front unless the user opted in, rather
+    # than let every proposed child fail its scoring exec deep in the search.
+    if seed_doc.surface(CODE_RUNTIME_ID) is not None and not trust_code:
+        raise typer.BadParameter(
+            "this seed has a code:runtime surface, so the search proposes Python loops that exec "
+            "in this process with no sandbox (their content is LLM-generated and "
+            "prompt-injectable via the task/trace corpus). Re-run with --trust-code only if you "
+            "accept auto-running the searched code in-process."
+        )
     # The world model IS the environment on every backend, so it is always required.
     world_model, provider, model_name = _load_world_model(model, root)
     meta_provider, meta_model = _meta_provider_from_settings(root, provider)
@@ -231,6 +249,7 @@ def create(
         k=k,
         holdout=holdout,
         harness_backend="e2b" if harness_backend == "e2b" else "local",
+        trust_code=trust_code,
         eval_concurrency=eval_concurrency,
         e2b_template=e2b_template,
         on_progress=_progress,

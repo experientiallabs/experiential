@@ -229,8 +229,11 @@ def test_eval_e2b_runs_the_pi_harness_in_parallel_and_closes_its_runtime(
             *,
             backend: str = "local",
             e2b_template: str | None = None,
+            trust_code: bool = False,
         ) -> _FakePiRuntime:
-            seen.update({"backend": backend, "e2b_template": e2b_template})
+            seen.update(
+                {"backend": backend, "e2b_template": e2b_template, "trust_code": trust_code}
+            )
             return fake_runtime
 
     monkeypatch.setattr(eval_cl_module, "_load_harness", lambda name, root: _FakePiDoc())
