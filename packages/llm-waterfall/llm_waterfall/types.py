@@ -13,6 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 Role = Literal["user", "assistant"]
+ChatMaxTokensField = Literal["max_completion_tokens", "max_tokens"]
 
 PROVIDERS = ("openai", "anthropic", "azure_openai", "bedrock", "aws_mantle")
 
@@ -46,6 +47,7 @@ class Backend:
     # mid-generation cutoff wastes the whole call — but a stalled connection must still raise
     # (and thus fail over) instead of hanging forever.
     read_timeout_s: float = 600.0
+    chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
 
     def __post_init__(self) -> None:
         if self.provider not in PROVIDERS:
@@ -176,15 +178,25 @@ class ChatRequest(BaseModel):
     stream: bool = False
     stream_options: JsonObject | None = None
 
-    def provider_payload(self, model: str) -> JsonObject:
+    def provider_payload(
+        self,
+        model: str,
+        *,
+        max_tokens_field: ChatMaxTokensField = "max_completion_tokens",
+    ) -> JsonObject:
         """Return the non-streaming wire payload for a provider-routed model."""
         payload = self.model_dump(mode="json", exclude_none=True)
         payload["model"] = model
         payload["stream"] = False
         payload.pop("stream_options", None)
-        max_completion = payload.pop("max_completion_tokens", None)
-        if max_completion is not None and "max_tokens" not in payload:
-            payload["max_tokens"] = max_completion
+        if max_tokens_field == "max_tokens":
+            alternate = payload.pop("max_completion_tokens", None)
+            if alternate is not None and "max_tokens" not in payload:
+                payload["max_tokens"] = alternate
+        else:
+            alternate = payload.pop("max_tokens", None)
+            if alternate is not None and "max_completion_tokens" not in payload:
+                payload["max_completion_tokens"] = alternate
         return payload
 
 

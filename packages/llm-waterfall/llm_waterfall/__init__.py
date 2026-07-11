@@ -10,6 +10,7 @@ from llm_waterfall.pricing import ModelPrice, cost_usd, price_for
 from llm_waterfall.types import (
     Attempt,
     Backend,
+    ChatMaxTokensField,
     ChatRequest,
     ChatResponse,
     ChatResult,
@@ -30,6 +31,7 @@ __version__ = "0.1.3"
 __all__ = [
     "Attempt",
     "Backend",
+    "ChatMaxTokensField",
     "ChatRequest",
     "ChatResponse",
     "ChatResult",

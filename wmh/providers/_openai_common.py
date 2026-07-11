@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from openai import BadRequestError
 
 from wmh.providers.base import Completion, Message, TokenUsage
@@ -97,13 +97,19 @@ def complete(
     return Completion(text=text, usage=token_usage)
 
 
-def complete_chat(chat_completions: object, model: str, request: ChatRequest) -> ChatResponse:
+def complete_chat(
+    chat_completions: object,
+    model: str,
+    request: ChatRequest,
+    *,
+    max_tokens_field: ChatMaxTokensField,
+) -> ChatResponse:
     """Run a validated structured request against an OpenAI-compatible SDK resource."""
     # ChatRequest validates the stable tool-calling core before this SDK boundary. The OpenAI
     # package models its evolving request surface as a large TypedDict union, so the narrow cast
     # preserves forward-compatible extra fields without leaking Any into the public contract.
     resource = cast("Any", chat_completions)
-    response = resource.create(**request.provider_payload(model))
+    response = resource.create(**request.provider_payload(model, max_tokens_field=max_tokens_field))
     return ChatResponse.model_validate(response.model_dump(mode="json"))
 
 

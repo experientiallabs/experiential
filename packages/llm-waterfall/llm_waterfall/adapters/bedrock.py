@@ -167,11 +167,12 @@ class BedrockAdapter:
                 }
             )
         stop_reason = response["stopReason"]
-        finish_reason = (
-            "tool_calls"
-            if stop_reason == "tool_use"
-            else ("length" if stop_reason == "max_tokens" else "stop")
-        )
+        finish_reason = {
+            "tool_use": "tool_calls",
+            "max_tokens": "length",
+            "content_filtered": "content_filter",
+            "guardrail_intervened": "content_filter",
+        }.get(stop_reason, "stop")
         message: dict[str, object] = {"role": "assistant", "content": text}
         if tool_calls:
             message["tool_calls"] = tool_calls

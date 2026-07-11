@@ -74,11 +74,25 @@ def test_structured_chat_normalizes_provider_payload_without_losing_tools() -> N
 
     assert payload["model"] == "routed-model"
     assert payload["stream"] is False
-    assert payload["max_tokens"] == 2048
-    assert "max_completion_tokens" not in payload
+    assert payload["max_completion_tokens"] == 2048
+    assert "max_tokens" not in payload
     assert "stream_options" not in payload
     assert payload["tools"]
     assert payload["store"] is False
+
+
+def test_structured_chat_can_target_legacy_max_tokens_backends() -> None:
+    request = ChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 2048,
+        }
+    )
+
+    payload = request.provider_payload("compatible-model", max_tokens_field="max_tokens")
+
+    assert payload["max_tokens"] == 2048
+    assert "max_completion_tokens" not in payload
 
 
 def test_structured_response_preserves_tool_calls_and_usage() -> None:

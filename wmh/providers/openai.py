@@ -73,7 +73,10 @@ class OpenAIProvider:
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request on the configured OpenAI-compatible backend."""
         return _openai_common.complete_chat(
-            self._get_client().chat.completions, self.config.model, request
+            self._get_client().chat.completions,
+            self.config.model,
+            request,
+            max_tokens_field=self.config.chat_max_tokens_field,
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:

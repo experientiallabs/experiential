@@ -7,12 +7,12 @@ import json
 import sys
 import threading
 import types
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from llm_waterfall.adapters.bedrock import BedrockAdapter
-from llm_waterfall.types import Backend, Message
+from llm_waterfall.types import Backend, ChatRequest, Message
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -23,6 +23,7 @@ class _FakeClient:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.converse_stop_reason = "end_turn"
 
     def invoke_model(self, *, modelId: str, body: str) -> dict[str, Any]:  # noqa: N803
         parsed = json.loads(body)
@@ -35,6 +36,14 @@ class _FakeClient:
                 "usage": {"input_tokens": 10, "output_tokens": 5},
             }
         return {"body": io.BytesIO(json.dumps(payload).encode())}
+
+    def converse(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(kwargs)
+        return {
+            "output": {"message": {"role": "assistant", "content": []}},
+            "stopReason": self.converse_stop_reason,
+            "usage": {"inputTokens": 5, "outputTokens": 0},
+        }
 
 
 class _FakeSession:
@@ -138,3 +147,19 @@ def test_client_built_once_under_concurrency(fake_boto3: list[_FakeSession]) -> 
     for t in threads:
         t.join()
     assert len(fake_boto3) == 1  # exactly one Session/client constructed
+
+
+@pytest.mark.parametrize("stop_reason", ["content_filtered", "guardrail_intervened"])
+def test_structured_chat_preserves_filtered_stops(
+    fake_boto3: list[_FakeSession], stop_reason: str
+) -> None:
+    """Blocked Bedrock waterfall turns retain the OpenAI safety signal."""
+    adapter = BedrockAdapter(Backend("bedrock", "model-x"))
+    client = cast("_FakeClient", adapter._get_client())  # noqa: SLF001 - configure SDK fake
+    client.converse_stop_reason = stop_reason
+
+    response = adapter.complete_chat(
+        ChatRequest.model_validate({"messages": [{"role": "user", "content": "hi"}]})
+    )
+
+    assert response.choices[0].finish_reason == "content_filter"

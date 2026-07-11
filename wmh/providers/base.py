@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from pydantic import BaseModel, Field
 
 
@@ -86,6 +86,7 @@ class ProviderConfig(BaseModel):
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
     reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
+    chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
 
 
 @runtime_checkable

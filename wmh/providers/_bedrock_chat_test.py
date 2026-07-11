@@ -2,6 +2,7 @@
 
 from typing import cast
 
+import pytest
 from llm_waterfall import ChatRequest
 
 from wmh.providers._bedrock_chat import converse_request, converse_response
@@ -77,3 +78,18 @@ def test_converse_round_trip_preserves_tools_results_and_usage() -> None:
     assert response.choices[0].message.tool_calls is not None
     assert response.choices[0].message.tool_calls[0].function.name == "bash"
     assert response.token_usage().input_tokens == 42
+
+
+@pytest.mark.parametrize("stop_reason", ["content_filtered", "guardrail_intervened"])
+def test_converse_response_preserves_filtered_stops(stop_reason: str) -> None:
+    """Blocked Bedrock turns cannot look like successful assistant stops."""
+    response = converse_response(
+        {
+            "output": {"message": {"role": "assistant", "content": []}},
+            "stopReason": stop_reason,
+            "usage": {"inputTokens": 5, "outputTokens": 0},
+        },
+        "model-id",
+    )
+
+    assert response.choices[0].finish_reason == "content_filter"

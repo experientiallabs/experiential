@@ -102,7 +102,9 @@ class OpenAIAdapter:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full OpenAI-compatible tool-calling request through this backend."""
-        payload = request.provider_payload(self._request_model())
+        payload = request.provider_payload(
+            self._request_model(), max_tokens_field=self.backend.chat_max_tokens_field
+        )
         # The OpenAI SDK's input TypedDict is intentionally not our public contract. This one
         # narrow cast sits at the SDK boundary after ChatRequest validated the structured core;
         # provider_payload preserves forward-compatible extra fields emitted by agent SDKs.
