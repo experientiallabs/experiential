@@ -323,3 +323,71 @@ def test_stale_submit_after_a_quick_next_message_is_still_suppressed() -> None:
     events.clear()
     _drain(session)
     assert not any(e.kind == "submit" for e in events)  # stale submit stays suppressed
+
+
+def test_running_state_does_not_clear_the_abort_gate() -> None:
+    """A `running` frame is a prompt start, not the cancelled turn's boundary: only `idle`
+    clears the gate, so a stale submit read after a `running` frame stays suppressed."""
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "state", "status": "running"},  # prompt-start frame, NOT the boundary
+            {"type": "tool_request", "req_id": 1, "name": "submit", "arguments": {"answer": "x"}},
+        ]
+    )
+    events: list[SessionEvent] = []
+    session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
+    session.start()
+    session.interrupt()
+    events.clear()
+    _drain(session)
+    assert not any(e.kind == "submit" for e in events)  # `running` did not re-enable submit
+
+
+def test_aborting_skips_real_tool_execution() -> None:
+    """While a turn is aborting, a side-effecting tool request is answered interrupted, not run."""
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {"command": "rm x"}},
+        ]
+    )
+    ran: list[str] = []
+
+    def execute(name: str, args: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
+        ran.append(name)
+        return ToolOutcome(content="ran")
+
+    session = LiveSession(channel, tools=[BASH], execute_tool=execute, on_event=lambda e: None)
+    session.start()
+    session.interrupt()  # user hits Stop while a bash request is already queued
+    _drain(session)
+    assert ran == []  # the tool never executed against the live sandbox
+    resp = next(f for f in channel.sent if f["type"] == "tool_response")
+    assert resp["is_error"] is True
+    assert resp["content"] == "interrupted"
+
+
+def test_tool_executor_exception_becomes_error_result() -> None:
+    """A raising executor yields an error tool_result + response instead of crashing pump()."""
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {"command": "ls"}},
+        ]
+    )
+
+    def boom(name: str, args: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
+        raise RuntimeError("sandbox gone")
+
+    events: list[SessionEvent] = []
+    session = LiveSession(channel, tools=[BASH], execute_tool=boom, on_event=events.append)
+    session.start()
+    session.send_user_message("go")
+    events.clear()
+    _drain(session)  # must not raise
+    result = next(e for e in events if e.kind == "tool_result")
+    assert result.payload["is_error"] is True
+    assert "failed" in str(result.payload["content"])
+    resp = next(f for f in channel.sent if f["type"] == "tool_response")
+    assert resp["is_error"] is True

@@ -172,8 +172,15 @@ async function loadAgent(start: Frame): Promise<any> {
 		throw new Error("session_start carried no src/agent.ts (the live runner has no static fallback)");
 	}
 	const base = path.join(process.cwd(), "live");
+	const basePrefix = base.endsWith(path.sep) ? base : base + path.sep;
 	for (const [rel, content] of Object.entries(files)) {
-		const dst = path.join(base, rel);
+		// Keep every materialized file under ./live: `path.join`/`resolve` let a
+		// `../` or absolute manifest key escape and overwrite arbitrary sandbox
+		// files, so reject anything that resolves outside the base.
+		const dst = path.resolve(base, rel);
+		if (dst !== base && !dst.startsWith(basePrefix)) {
+			throw new Error(`session_start file path escapes the live directory: ${rel}`);
+		}
 		fs.mkdirSync(path.dirname(dst), { recursive: true });
 		fs.writeFileSync(dst, content);
 	}

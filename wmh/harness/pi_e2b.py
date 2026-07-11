@@ -24,9 +24,11 @@ in every transport error so a crashed node process diagnoses itself.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import queue
+import shlex
 import threading
 import time
 from collections import deque
@@ -461,22 +463,31 @@ def start_live_runner(
             f"cd {RUNNER_WORKDIR} && npm install {' '.join(PI_NPM_PACKAGES)}",
             timeout=INSTALL_TIMEOUT_S,
         )
-    sandbox.commands.run(f"mkdir -p {workspace}", timeout=30)
+    # `workspace` is a public parameter; quote it so a caller-supplied path can't
+    # inject extra shell commands into the live sandbox.
+    sandbox.commands.run(f"mkdir -p {shlex.quote(workspace)}", timeout=30)
     handle = sandbox.commands.run(LIVE_START_CMD, background=True, stdin=True, timeout=0)
     channel = E2BStdioChannel(sandbox, cast("CommandHandle", handle))
-    deadline = time.monotonic() + hello_timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError(_no_hello_live(hello_timeout, channel))
-        try:
-            frame = channel.recv(timeout=remaining)
-        except TimeoutError as exc:
-            raise RuntimeError(_no_hello_live(hello_timeout, channel)) from exc
-        if frame is None:
-            raise RuntimeError(_no_hello_live(hello_timeout, channel))
-        if frame.get("type") == "hello":
-            return channel
+    try:
+        deadline = time.monotonic() + hello_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(_no_hello_live(hello_timeout, channel))
+            try:
+                frame = channel.recv(timeout=remaining)
+            except TimeoutError as exc:
+                raise RuntimeError(_no_hello_live(hello_timeout, channel)) from exc
+            if frame is None:
+                raise RuntimeError(_no_hello_live(hello_timeout, channel))
+            if frame.get("type") == "hello":
+                return channel
+    except Exception:
+        # A failed handshake must not orphan the background node runner + its reader
+        # thread in the caller-owned sandbox; close the channel before propagating.
+        with contextlib.suppress(Exception):
+            channel.close()
+        raise
 
 
 def _no_hello_live(timeout: float, channel: E2BStdioChannel) -> str:

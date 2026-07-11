@@ -329,6 +329,13 @@ class LiveSession:
             self._respond_tool(req_id, "submitted", is_error=False)
             return
 
+        if self._aborting:
+            # The turn is being interrupted; do NOT run a real side-effecting tool
+            # (bash / write_file) for a cancelled run. Respond so the runner's tool
+            # call does not hang; the aborted run ends via `state:idle`.
+            self._respond_tool(req_id, "interrupted", is_error=True)
+            return
+
         self._emit("tool_call", {"call_id": call_id, "name": name, "arguments": args})
         known = {t.name for t in self._tools}
         if name == "read_skill":
@@ -344,7 +351,12 @@ class LiveSession:
                 if chunk:
                     self._emit("tool_output", {"call_id": call_id, "stream": stream, "text": chunk})
 
-            outcome = self._execute_tool(name, args, emit_output)
+            try:
+                outcome = self._execute_tool(name, args, emit_output)
+            except Exception as exc:  # noqa: BLE001 - a tool failure must not crash the host loop
+                # A transient sandbox/FS error becomes an error result, so the runner
+                # always gets a tool_response and pump() keeps running.
+                outcome = ToolOutcome(content=f"tool {name!r} failed: {exc}", is_error=True)
         self._emit(
             "tool_result",
             {
@@ -372,9 +384,12 @@ class LiveSession:
         status = frame.get("status")
         if isinstance(status, str):
             self._status = status
-        # A state transition is a turn boundary: the aborting turn has ended, so
-        # the next turn's submit is not suppressed.
-        self._aborting = False
+        # Only the terminal `idle` frame is the cancelled turn's true boundary. The
+        # runner emits `state:running` at each prompt start; clearing on that (or any
+        # non-idle frame) could re-enable submit emission while the turn is still
+        # aborting, letting a stale in-flight `submit` surface as a final answer.
+        if self._status == "idle":
+            self._aborting = False
         payload: JsonObject = {"status": self._status}
         for key in ("turns", "reason", "msg_id"):
             if key in frame:

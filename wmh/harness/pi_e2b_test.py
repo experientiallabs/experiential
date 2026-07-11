@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 import threading
 from collections.abc import Callable, Iterator
 from typing import cast
@@ -595,3 +596,23 @@ def test_start_live_runner_without_hello_raises_with_stderr() -> None:
     fake = FakeSandbox(handle)
     with pytest.raises(RuntimeError, match="live runner sent no hello"):
         start_live_runner(fake, template="wmh-pi-node", hello_timeout=0.3)
+
+
+def test_start_live_runner_quotes_the_workspace_path() -> None:
+    """A caller-supplied workspace can't inject extra shell commands into the sandbox."""
+    fake = FakeSandbox(_ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True))
+    evil = "/tmp/x; touch /pwned"  # noqa: S108 - deliberately hostile input for the quoting test
+    start_live_runner(fake, template="wmh-pi-node", workspace=evil)
+    assert f"mkdir -p {shlex.quote(evil)}" in fake.commands.calls
+    # Neutralized: no bare injected command runs.
+    assert not any(c.startswith("mkdir -p /tmp/x;") for c in fake.commands.calls)
+
+
+def test_start_live_runner_without_hello_closes_the_channel() -> None:
+    """A failed handshake tears the runner channel down so no node process is orphaned."""
+    handle = _ScriptedHandle([(None, "boom\n", None)], hold_open=True)
+    fake = FakeSandbox(handle)
+    with pytest.raises(RuntimeError, match="live runner sent no hello"):
+        start_live_runner(fake, template="wmh-pi-node", hello_timeout=0.3)
+    # close() asked the runner to exit (a shutdown frame reached its stdin).
+    assert any(f.get("type") == "shutdown" for f in _sent_frames(fake))
