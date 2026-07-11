@@ -141,9 +141,11 @@ def test_runtime_backend_selector() -> None:
 
     provider = cast("Provider", _P())
 
-    # Default backend is local; a code:runtime doc runs in-process.
+    # In-process harness code requires an explicit trust decision.
     coded = code_baseline("seed")
-    assert isinstance(coded.runtime(provider), CodeRuntime)
+    with pytest.raises(ValueError, match="allow_unsafe_code=True"):
+        coded.runtime(provider)
+    assert isinstance(coded.runtime(provider, allow_unsafe_code=True), CodeRuntime)
     assert coded.surface(CODE_RUNTIME_ID) is not None
 
     # Unknown backends are rejected.

@@ -431,6 +431,7 @@ def test_code_delta_passes_screen_and_gate_end_to_end() -> None:
         GoldJudge(provider),
         iterations=1,
         k=3,
+        allow_unsafe_code=True,
     )
     assert result.screened == 0 and result.skipped == 0
     [delta] = result.archive.deltas
@@ -439,6 +440,25 @@ def test_code_delta_passes_screen_and_gate_end_to_end() -> None:
     assert result.best_score == 1.0
     winner_code = result.best.surface(CODE_RUNTIME_ID)
     assert winner_code is not None and "done-verified" in winner_code.content
+
+
+def test_code_seed_requires_explicit_unsafe_code_opt_in() -> None:
+    """A stored code seed cannot execute as an implicit side effect of starting search."""
+    from wmh.harness.doc import code_baseline
+
+    provider = RoleProvider(meta_reply="")
+    with pytest.raises(ValueError, match="allow_unsafe_code=True"):
+        create_harness(
+            "winner",
+            code_baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            iterations=1,
+            k=2,
+        )
 
 
 def test_broken_code_delta_is_rejected_before_any_eval() -> None:
@@ -472,6 +492,7 @@ def test_broken_code_delta_is_rejected_before_any_eval() -> None:
         GoldJudge(provider),
         iterations=1,
         k=2,
+        allow_unsafe_code=True,
     )
     assert result.skipped == 1
     [delta] = result.archive.deltas

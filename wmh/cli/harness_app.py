@@ -132,6 +132,12 @@ def create(
         "--seed",
         help="Harness to start from, as name[@ref] (default: the built-in baseline).",
     ),
+    allow_unsafe_code: bool = typer.Option(
+        False,
+        "--allow-unsafe-code",
+        help="Allow reviewed code:runtime Python to execute in this process. Never use for "
+        "untrusted or registry-sourced harnesses.",
+    ),
     iterations: int = typer.Option(None, min=1, help="Propose-and-gate steps (the search budget)."),
     k: int = typer.Option(3, min=1, help="Closed-loop passes per task per variant."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
@@ -231,6 +237,7 @@ def create(
         k=k,
         holdout=holdout,
         harness_backend="e2b" if harness_backend == "e2b" else "local",
+        allow_unsafe_code=allow_unsafe_code,
         eval_concurrency=eval_concurrency,
         e2b_template=e2b_template,
         on_progress=_progress,
@@ -244,8 +251,10 @@ def create(
         f"{accepted} accepted, {result.skipped} skipped -> {store.dir_for(name)}"
     )
     backend_hint = " --harness-backend e2b" if harness_backend == "e2b" else ""
+    unsafe_hint = " --allow-unsafe-code" if allow_unsafe_code else ""
     _console.print(
-        f"  run it: [bold]wmh eval closed-loop {tasks_file} --harness {name}{backend_hint}[/bold]"
+        f"  run it: [bold]wmh eval closed-loop {tasks_file} --harness {name}"
+        f"{backend_hint}{unsafe_hint}[/bold]"
     )
     if archive_out:
         Path(archive_out).write_text(result.archive.model_dump_json(indent=2), encoding="utf-8")

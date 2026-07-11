@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from wmh.core.types import Action, Observation
@@ -184,11 +186,36 @@ def test_code_baseline_validates_and_dispatches_code_runtime() -> None:
     doc = code_baseline("seed")
     assert doc.surface(CODE_RUNTIME_ID) is not None
     provider = ScriptedProvider(['{"tool": "submit", "arguments": {"answer": "done"}}'])
-    runtime = doc.runtime(provider)
+    runtime = doc.runtime(provider, allow_unsafe_code=True)
     assert isinstance(runtime, CodeRuntime)
     result = runtime.run("t1", "do it", FakeEnv())
     assert result.stop_reason is StopReason.SUBMITTED
     assert result.answer == "done"
+
+
+def test_doc_runtime_keeps_module_scope_inert_without_opt_in(tmp_path: Path) -> None:
+    marker = tmp_path / "executed"
+    code = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "def run(kit):\n"
+        "    return ''\n"
+    )
+    doc = HarnessDoc(
+        name="untrusted",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=CODE_RUNTIME_ID, kind=SurfaceKind.CODE, content=code),
+        ],
+    )
+    provider = ScriptedProvider([""])
+
+    with pytest.raises(ValueError, match="allow_unsafe_code=True"):
+        doc.runtime(provider)
+    assert not marker.exists()
+
+    doc.runtime(provider, allow_unsafe_code=True)
+    assert marker.read_text(encoding="utf-8") == "executed"
 
 
 def test_doc_rejects_bad_code_surface_at_construction() -> None:

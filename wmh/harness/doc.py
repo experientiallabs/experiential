@@ -234,6 +234,7 @@ class HarnessDoc(BaseModel):
         backend: str = "local",
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
+        allow_unsafe_code: bool = False,
     ) -> Runtime:
         """The configured agent runtime this document describes.
 
@@ -246,8 +247,8 @@ class HarnessDoc(BaseModel):
         nothing. `e2b_template` names a prebaked sandbox template whose bootstrap (node 22 + pi's
         npm deps) is already done; default is $WMH_E2B_TEMPLATE. Under `local`, "pi-node" uses
         the SSH shim (or the RunnerLink frame transport when PI_TRANSPORT=link); otherwise a
-        `code:runtime` surface drives episodes with the harness's own in-process program; with
-        neither, the fixed baseline loop runs. All expose the same
+        `code:runtime` surface drives episodes with the harness's own in-process program only when
+        `allow_unsafe_code=True`; with neither, the fixed baseline loop runs. All expose the same
         `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
         if backend not in ("local", "e2b"):
@@ -318,6 +319,12 @@ class HarnessDoc(BaseModel):
         code = self.surface(CODE_RUNTIME_ID)
         skills = SkillLibrary(self.skills())
         if code is not None:
+            if not allow_unsafe_code:
+                raise ValueError(
+                    "code:runtime executes arbitrary Python in this process; pass "
+                    "--allow-unsafe-code (or allow_unsafe_code=True in Python) only for code "
+                    "you have reviewed and trust"
+                )
             return CodeRuntime(
                 provider,
                 code=code.content,

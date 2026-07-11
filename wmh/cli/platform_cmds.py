@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 
 from wmh.config.store import WorldModelStore
-from wmh.harness.doc import HarnessDoc
+from wmh.harness.doc import CODE_RUNTIME_ID, HarnessDoc
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.platform.auth import BrowserLogin
 from wmh.platform.client import PlatformClient, PlatformError, WhoAmI, fetch_cli_config
@@ -329,6 +329,12 @@ def _pull_harness(
     doc = HarnessDoc.model_validate(payload.doc)
     if doc.doc_hash != payload.doc_hash:
         _console.print("[red]Pulled doc failed its integrity check; not saving.[/red]")
+        raise typer.Exit(code=1)
+    if doc.surface(CODE_RUNTIME_ID) is not None:
+        _console.print(
+            "[red]Pulled harness contains code:runtime, which can execute arbitrary Python. "
+            "Registry code is not trusted and will not be saved.[/red]"
+        )
         raise typer.Exit(code=1)
     saved = HarnessStore(root).save_version(
         doc.model_copy(update={"name": name}), alias=CHAMPION_ALIAS

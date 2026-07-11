@@ -705,6 +705,12 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         "(the pi-node harness inside pooled E2B sandboxes). The environment is always the "
         "world model.",
     ),
+    allow_unsafe_code: bool = typer.Option(
+        False,
+        "--allow-unsafe-code",
+        help="Allow reviewed code:runtime Python to execute in this process. Never use for "
+        "untrusted or registry-sourced harnesses.",
+    ),
     eval_concurrency: int | None = typer.Option(
         None,
         "--eval-concurrency",
@@ -755,6 +761,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             out=out,
             harness=harness,
             harness_backend=harness_backend,
+            allow_unsafe_code=allow_unsafe_code,
             eval_concurrency=eval_concurrency,
             e2b_template=e2b_template,
         )

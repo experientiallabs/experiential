@@ -37,6 +37,7 @@ def run_closed_loop(
     out: str | None,
     harness: str | None = None,
     harness_backend: str = "local",
+    allow_unsafe_code: bool = False,
     eval_concurrency: int | None = None,
     e2b_template: str | None = None,
 ) -> None:
@@ -115,6 +116,7 @@ def run_closed_loop(
                 provider,
                 backend=harness_backend,
                 e2b_template=e2b_template,
+                allow_unsafe_code=allow_unsafe_code,
             )
         except ValueError as exc:  # e.g. e2b on a non-pi-node harness -> usage error
             raise typer.BadParameter(str(exc)) from exc

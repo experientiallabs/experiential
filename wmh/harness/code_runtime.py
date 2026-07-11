@@ -16,10 +16,11 @@ The contract is the `RuntimeKit`, and it carries three guarantees the search rel
 - **Crash-isolated.** An exception inside `run` fails that episode (scored as a failure with the
   partial transcript), never the evaluation loop around it.
 
-The kit is an interface contract, not a security boundary: harness code runs in-process and is
-trusted to the same degree as the rest of the search (it is reviewed via the delta archive, and
-only ever exercised against the world model during search). Running searched code against real
-environments is a deployment decision that belongs behind a sandbox.
+The kit is an interface contract, not a security boundary: harness code runs in-process with the
+host's privileges. `HarnessDoc.runtime()` therefore requires an explicit trust opt-in before it
+constructs this runtime, and registry pulls refuse `code:runtime` surfaces entirely. The opt-in is
+for reviewed local search code only. Running searched code against real environments belongs
+behind a sandbox.
 """
 
 from __future__ import annotations

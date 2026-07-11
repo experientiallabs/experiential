@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
 from wmh.cli.app import app
-from wmh.cli.platform_cmds import _resolve_kind
-from wmh.platform.client import PlatformError, WhoAmI
+from wmh.cli.platform_cmds import _pull_harness, _resolve_kind
+from wmh.harness.doc import code_baseline
+from wmh.harness.store import HarnessStore
+from wmh.platform.client import HarnessVersionDoc, PlatformClient, PlatformError, WhoAmI
 from wmh.platform.credentials import ENV_HOME, PlatformCredentials, save_credentials
 
 runner = CliRunner()
@@ -98,6 +101,30 @@ def test_pull_rejects_unknown_kind() -> None:
     result = runner.invoke(app, ["pull", "anything", "--kind", "typo"])
     assert result.exit_code != 0
     assert "must be 'model' or 'harness'" in result.output
+
+
+def test_pull_refuses_in_process_code_harness(tmp_path: Path) -> None:
+    """Registry content cannot plant Python that a later command executes in-process."""
+    doc = code_baseline("remote")
+
+    class _CodeHarnessClient:
+        def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
+            return HarnessVersionDoc(
+                version=version,
+                doc=doc.model_dump(mode="json"),
+                doc_hash=doc.doc_hash,
+            )
+
+    with pytest.raises(typer.Exit):
+        _pull_harness(
+            cast("PlatformClient", _CodeHarnessClient()),
+            "org-1",
+            "remote",
+            str(tmp_path),
+            version=1,
+        )
+
+    assert not HarnessStore(tmp_path).exists("remote")
 
 
 def test_login_with_token_drops_stale_default_org(

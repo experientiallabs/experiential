@@ -137,6 +137,7 @@ def test_create_e2b_wires_backend_flags_and_still_loads_the_world_model(
     assert call["world_model"] is wm
     assert call["provider"] is anchored
     assert call["harness_backend"] == "e2b"
+    assert call["allow_unsafe_code"] is False
     assert call["eval_concurrency"] == 4
     assert call["e2b_template"] == "tmpl-x"
     flat = " ".join(result.output.split())  # rich wraps (and pads) lines
@@ -164,12 +165,28 @@ def test_create_default_local_loads_the_world_model(
     [call] = recorder.calls
     assert call["world_model"] is wm
     assert call["harness_backend"] == "local"
+    assert call["allow_unsafe_code"] is False
     assert call["eval_concurrency"] is None  # backend default decided downstream (local -> 1)
     assert call["e2b_template"] is None
     flat = " ".join(result.output.split())
     assert "world model" in flat and "wm-alpha" in flat
     assert "sandbox" not in flat  # no sandbox note on the local path
     assert "--harness-backend" not in flat  # and the run-it hint stays plain
+
+
+def test_create_forwards_explicit_unsafe_code_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = _invoke(tmp_path, "--allow-unsafe-code")
+
+    assert result.exit_code == 0, result.output
+    [call] = recorder.calls
+    assert call["allow_unsafe_code"] is True
+    assert "--allow-unsafe-code" in result.output
 
 
 def test_create_meta_role_from_settings_drives_the_proposer(

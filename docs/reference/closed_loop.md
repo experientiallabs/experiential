@@ -22,6 +22,21 @@ wmh eval tasks.jsonl --mode closed-loop --name <world-model> --k 3 --out sim_rep
   passes whose transcript satisfies every gold assertion, judged by an LLM judge that never trusts
   the agent's own claim of success.
 
+### In-process Python harnesses
+
+A path-less `code:runtime` surface is Python executed with the host process's privileges. Closed-loop
+eval and harness search refuse it by default. After reviewing locally authored code, acknowledge
+that trust decision explicitly:
+
+```bash
+wmh eval tasks.jsonl --mode closed-loop --harness reviewed-code --allow-unsafe-code
+wmh harness create evolved --tasks tasks.jsonl --seed reviewed-code --allow-unsafe-code
+```
+
+`wmh pull` never saves registry harnesses containing `code:runtime`. The registry's document hash
+checks transport integrity, not publisher authenticity, so the unsafe-code flag is intentionally
+not a way to opt pulled code back in.
+
 ## Comparing two reports (`wmh eval agreement`)
 
 ```bash
@@ -45,5 +60,6 @@ those.
 scoring + `WorldModelEnvironment`), `gold.py` (gold-assertion judge), `agreement.py`
 (report-vs-report comparison), `tasks.py` (task specs).
 
-`wmh/harness/`: `runtime.py` (the fixed agent loop), `environment.py` (the `AgentEnvironment`
-seam the loop drives), `tools.py` (the tool registry).
+`wmh/harness/`: `runtime.py` (the fixed agent loop), `code_runtime.py` (explicitly trusted local
+Python loops), `environment.py` (the `AgentEnvironment` seam the loop drives), `tools.py` (the tool
+registry).

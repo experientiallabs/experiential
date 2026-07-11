@@ -321,6 +321,7 @@ def create_harness(
     holdout: list[TaskSpec] | None = None,
     confirm_narrow_vetoes: bool = True,
     harness_backend: Literal["local", "e2b"] = "local",
+    allow_unsafe_code: bool = False,
     eval_concurrency: int | None = None,
     e2b_template: str | None = None,
     on_progress: CreateProgress | None = None,
@@ -349,6 +350,8 @@ def create_harness(
     (sequential) for local, 0 (every cell at once, one pooled sandbox each) for e2b.
     `e2b_template` names a prebaked sandbox template (node 22 + the pi runner deps) so e2b
     rollouts skip bootstrap installs.
+    `allow_unsafe_code=True` explicitly permits a path-less `code:runtime` surface to execute
+    Python in this process. Leave it false for unreviewed or registry-sourced harnesses.
 
     Verification is staged by cost: a child is first SCREENED on its own trigger cluster (the
     2-3 failing tasks its delta claims to fix, k passes) — if the cluster did not improve over
@@ -412,7 +415,7 @@ def create_harness(
                         "(single runner port/channel); use eval_concurrency=1 or "
                         "harness_backend='e2b'"
                     )
-                runtime = doc.runtime(agent_provider)
+                runtime = doc.runtime(agent_provider, allow_unsafe_code=allow_unsafe_code)
             else:
                 # The pi process runs in pooled sandboxes; every cell at once by default. Tool calls
                 # still route to the world model — the environment is sim regardless of backend.

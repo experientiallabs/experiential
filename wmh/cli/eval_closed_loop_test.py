@@ -18,7 +18,14 @@ from wmh.cli import app
 from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
-from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
+from wmh.harness.doc import (
+    RUNTIME_KIND_ID,
+    TOOL_POLICY_ID,
+    HarnessDoc,
+    Surface,
+    SurfaceKind,
+    code_baseline,
+)
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.pi_e2b import E2BPiRuntime
 from wmh.harness.runtime import RunResult, Runtime
@@ -191,6 +198,25 @@ def test_eval_e2b_with_a_non_pi_harness_is_a_usage_error(
     assert "label" not in seen
 
 
+def test_eval_code_runtime_requires_explicit_unsafe_code_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stored Python stays inert unless the operator explicitly accepts host execution."""
+    seen: dict[str, object] = {}
+    _patch_seams(monkeypatch, seen)
+    doc = code_baseline("code").model_copy(update={"version": 1})
+    monkeypatch.setattr(eval_cl_module, "_load_harness", lambda name, root: doc)
+
+    blocked = _invoke(tmp_path, "--harness", "code")
+    assert blocked.exit_code == 2
+    assert "allow_unsafe_code=True" in blocked.output
+    assert "runtime" not in seen
+
+    allowed = _invoke(tmp_path, "--harness", "code", "--allow-unsafe-code")
+    assert allowed.exit_code == 0, allowed.output
+    assert seen["runtime"] is not None
+
+
 def test_eval_e2b_runs_the_pi_harness_in_parallel_and_closes_its_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -229,8 +255,15 @@ def test_eval_e2b_runs_the_pi_harness_in_parallel_and_closes_its_runtime(
             *,
             backend: str = "local",
             e2b_template: str | None = None,
+            allow_unsafe_code: bool = False,
         ) -> _FakePiRuntime:
-            seen.update({"backend": backend, "e2b_template": e2b_template})
+            seen.update(
+                {
+                    "backend": backend,
+                    "e2b_template": e2b_template,
+                    "allow_unsafe_code": allow_unsafe_code,
+                }
+            )
             return fake_runtime
 
     monkeypatch.setattr(eval_cl_module, "_load_harness", lambda name, root: _FakePiDoc())
@@ -245,6 +278,7 @@ def test_eval_e2b_runs_the_pi_harness_in_parallel_and_closes_its_runtime(
     assert seen["concurrency"] == 0  # e2b default: every (task, attempt) cell at once
     assert seen["backend"] == "e2b"
     assert seen["e2b_template"] == "tmpl-x"
+    assert seen["allow_unsafe_code"] is False
     assert seen["runtime"] is fake_runtime
     assert fake_runtime.closes == 1  # the eval tears down the runtime's private sandbox pool
     flat = " ".join(result.output.split())
