@@ -1012,12 +1012,7 @@ def _run_eval_files(
     for path in files:
         if not path.exists():
             raise typer.BadParameter(f"trace file not found: {path}")
-    try:
-        serve_provider = ProviderKind(provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in ProviderKind)
-        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
+    provider_config = _provider_config(provider, model, region)
     llm = providers.provider_or_chain(provider_config, chain=chain)
     if isinstance(llm, providers.WaterfallProvider):
         _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
@@ -1402,7 +1397,7 @@ def demo(
             # failed step — completed steps stay done.
             _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
             _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
-            provider_name, model_id, region = select_provider_and_model(
+            provider_name, model_type, region = select_provider_and_model(
                 _console,
                 lambda text: _console.input(text),
                 lambda text: _console.input(text, password=True),
@@ -1412,15 +1407,14 @@ def demo(
                 interactive=True,
                 check=lambda cfg: verify_all([cfg])[0],
             )
-            switched = ProviderConfig(
-                kind=ProviderKind(provider_name), model=model_id, region=region
-            )
+            switched = _provider_config(provider_name, model_type, region)
             provider = RetryingProvider(
                 providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
             )
             wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
             _console.print(
-                f"[dim]resuming from step {len(done) + 1} with {provider_name} ({model_id})…[/dim]"
+                f"[dim]resuming from step {len(done) + 1} with "
+                f"{provider_name} ({model_type})…[/dim]"
             )
     matches = sum(1 for d in done if d.exact_match)
     _console.print(f"\n{matches}/{len(done)} exact matches (run `wmh eval` for judged fidelity)")

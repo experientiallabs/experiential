@@ -54,7 +54,7 @@ from wmh.engine.play import PlayTurn, parse_action, play_turn
 from wmh.engine.world_model import WorldModel
 from wmh.providers import verify_all, verify_embedder
 from wmh.providers.base import ProviderConfig, ProviderKind, VerifyResult
-from wmh.providers.models import model_types_for_provider, resolve_provider_model
+from wmh.providers.models import resolve_provider_model
 
 # A reader takes a fully-rendered prompt string and returns the user's typed line.
 PromptReader = Callable[[str], str]
@@ -68,12 +68,19 @@ _ACTIVITY_WINDOW_LINES = 8
 # Serve providers offered in the wizard picker, with the model ids each supports. The first model
 # in each list is the suggested default. Keep these in sync with the provider backends.
 _PROVIDER_MODELS: dict[str, list[str]] = {
-    "openai": list(model_types_for_provider(ProviderKind.OPENAI)),
-    "anthropic": list(model_types_for_provider(ProviderKind.ANTHROPIC)),
-    "bedrock": list(model_types_for_provider(ProviderKind.BEDROCK)),
+    "openai": ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini"],
+    "anthropic": [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ],
+    # Keep this picker curated to inference profiles verified by the normal interactive flow.
+    # The full canonical registry remains available to flags and programmatic callers.
+    "bedrock": ["claude-opus-4-8", "claude-opus-4-7", "claude-haiku-4-5"],
     # openai_responses (the Responses API) stays flag-only (`wmh build --provider
     # openai_responses`); the wizard list keeps to the four everyday backends.
-    "azure": list(model_types_for_provider(ProviderKind.AZURE_OPENAI)),
+    "azure": ["gpt-5.5", "gpt-5.4"],
 }
 _DEFAULT_REGIONS: dict[str, str] = {"bedrock": "us-east-1"}
 
