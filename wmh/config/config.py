@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, JsonValue, ValidationError
 
 from wmh.core.types import JsonObject
 from wmh.providers.base import EmbedderKind, ProviderConfig, ProviderKind
+from wmh.providers.models import resolve_provider_model
 
 ARTIFACT_DIR = ".wmh"
 
@@ -90,7 +91,13 @@ class HarnessConfig(BaseModel):
         entry point one place to construct a build config. Callers must already have validated that
         a non-hashing embedder has an `embed_model`.
         """
-        serve = ProviderConfig(kind=serve_provider, model=serve_model, region=region)
+        serve_spec = resolve_provider_model(serve_provider, serve_model)
+        serve = ProviderConfig(
+            kind=serve_provider,
+            model_type=serve_spec.model_type,
+            model=serve_spec.model_id,
+            region=region,
+        )
         providers = [serve]
         if embed_provider is not EmbedderKind.HASHING:
             embed_kind = embed_provider.provider_kind()
@@ -112,7 +119,11 @@ class HarnessConfig(BaseModel):
             embed_dim=embed_dim,
             gepa_budget=gepa_budget,
             train_split=train_split,
-            judge_model=judge_model,
+            judge_model=(
+                resolve_provider_model(serve_provider, judge_model).model_id
+                if judge_model is not None
+                else None
+            ),
             trace_adapter=trace_adapter,
         )
 

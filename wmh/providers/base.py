@@ -76,6 +76,9 @@ class ProviderConfig(BaseModel):
     """
 
     kind: ProviderKind
+    # Canonical, provider-independent identity. ``model`` remains the exact
+    # provider runtime id for SDK calls and old persisted configs.
+    model_type: str | None = None
     model: str
     embed_model: str | None = None  # embeddings model id / Azure embedding deployment
     embed_dim: int | None = None  # requested embedding dimension (Titan v2, text-embedding-3-*)
