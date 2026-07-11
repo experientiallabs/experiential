@@ -29,6 +29,7 @@ from wmh.harness.create import (
     create_harness,
     select_parent,
 )
+from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.runtime import Runtime
@@ -131,6 +132,7 @@ def _run(
     holdout: list[TaskSpec] | None = None,
     on_progress: Callable[[int, str, float, bool], None] | None = None,
     on_note: Callable[[str], None] | None = None,
+    on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
 ) -> CreateResult:
     return create_harness(
         "winner",
@@ -145,6 +147,7 @@ def _run(
         holdout=holdout,
         on_progress=on_progress,
         on_note=on_note,
+        on_accept=on_accept,
     )
 
 
@@ -1057,6 +1060,25 @@ class _SequencedMetaProvider(RoleProvider):
             reply = self._replies[min(len(self.meta_users) - 1, len(self._replies) - 1)]
             return Completion(text=reply)
         return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_on_accept_delivers_the_new_champion_the_moment_it_is_crowned() -> None:
+    """Accepted champions stream out live, so callers can persist them in real time."""
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    crowned: list[tuple[str, bool, float]] = []
+    result = _run(
+        provider,
+        on_accept=lambda doc, delta, score: crowned.append(
+            (doc.system_prompt(), delta.verdict is not None and delta.verdict.accepted, score)
+        ),
+    )
+
+    assert result.best_score == 1.0
+    [(prompt, verdict_accepted, score)] = crowned
+    assert prompt == _CAREFUL_PROMPT  # the actual champion doc, not a name or hash
+    assert verdict_accepted is True  # the delta arrives with its verdict already attached
+    assert score == 1.0
 
 
 def test_dead_iteration_ends_early_and_the_search_moves_on() -> None:

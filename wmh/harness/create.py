@@ -326,6 +326,7 @@ def create_harness(
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
     on_iteration: Callable[[IterationRecord], None] | None = None,
+    on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
 
@@ -333,7 +334,10 @@ def create_harness(
     iterations, one proposal each. A dead iteration (unusable/invalid proposal, or one
     screened out on its own trigger cluster) ends early and cheaply: it is counted
     (`skipped`/`screened`), recorded in `iteration_records`, narrated via `on_note`, and
-    the search moves straight to the next iteration. Never fatal.
+    the search moves straight to the next iteration. Never fatal. `on_accept` fires the
+    moment a delta is accepted, with the new champion doc, its delta (verdict attached),
+    and its full-suite score, so callers can persist champions in real time instead of
+    waiting for the search to finish.
 
     Every rollout scores against the world-model simulation — the environment is always sim.
     `harness_backend` picks where the harness PROCESS executes: `local` (the default) runs it
@@ -691,6 +695,8 @@ def create_harness(
                     if outcome.success_rate >= 1.0 - _TIE_EPS
                 }
                 suite = sorted(set(suite) | promoted)
+                if on_accept is not None:
+                    on_accept(child, delta, child_report.success_rate)
             record = IterationRecord(
                 iteration=i,
                 outcome="scored",
