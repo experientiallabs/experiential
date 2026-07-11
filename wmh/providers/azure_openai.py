@@ -54,7 +54,13 @@ class AzureOpenAIProvider:
 
             from openai import AzureOpenAI
 
-            if self.config.endpoint and self.config.endpoint != env_endpoint:
+            # Compare canonically so a trailing slash or host-casing difference between the config
+            # value and the trusted env endpoint doesn't misclassify the same Azure resource as an
+            # untrusted host (which would strip the real key and break the call).
+            is_config_endpoint = self.config.endpoint is not None and not _same_endpoint(
+                self.config.endpoint, env_endpoint
+            )
+            if is_config_endpoint:
                 # A config-controlled endpoint (config.toml can come from an untrusted model
                 # bundle) is an untrusted host. NEVER let the SDK fall back to the real
                 # AZURE_OPENAI_API_KEY for it: auth comes from WMH_ENDPOINT_API_KEY, mirroring
@@ -111,3 +117,10 @@ class AzureOpenAIProvider:
 
     def verify(self) -> VerifyResult:
         return verify_via_ping(self)
+
+
+def _same_endpoint(a: str, b: str | None) -> bool:
+    """True when two Azure endpoint strings name the same host (ignoring trailing slash + case)."""
+    if b is None:
+        return False
+    return a.rstrip("/").lower() == b.rstrip("/").lower()

@@ -208,6 +208,19 @@ def test_trusted_env_endpoint_uses_the_real_azure_key(monkeypatch: pytest.Monkey
     assert client.api_key == "az-real-secret"
 
 
+def test_trusted_endpoint_matches_despite_trailing_slash_and_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trailing slash or casing difference must not strip the real key from a trusted host."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://Trusted.openai.azure.com")
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "endpoint-token")
+    client = AzureOpenAIProvider(
+        _endpoint_config("https://trusted.openai.azure.com/")
+    )._get_client()
+    assert client.api_key == "az-real-secret"
+
+
 def test_no_config_endpoint_falls_back_to_env_and_real_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
