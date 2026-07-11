@@ -152,29 +152,6 @@ def test_get_client_requires_api_version(monkeypatch: pytest.MonkeyPatch) -> Non
         provider._get_client()
 
 
-def test_get_client_reads_configured_api_key_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A provider can select a non-default API-key env without copying the secret into config."""
-    calls: list[dict[str, str]] = []
-
-    class _AzureOpenAI:
-        def __init__(self, **kwargs: str) -> None:
-            calls.append(kwargs)
-
-    monkeypatch.setenv("CUSTOM_AZURE_KEY", "custom-key")
-    monkeypatch.setattr("openai.AzureOpenAI", _AzureOpenAI)
-    provider = AzureOpenAIProvider(_config().model_copy(update={"api_key_env": "CUSTOM_AZURE_KEY"}))
-
-    provider._get_client()
-
-    assert calls == [
-        {
-            "api_version": "2024-10-21",
-            "azure_endpoint": "https://example.openai.azure.com",
-            "api_key": "custom-key",
-        }
-    ]
-
-
 def test_verify_reports_failure_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Boom:
         class completions:  # noqa: N801 - mimic the SDK attribute path

@@ -39,7 +39,7 @@ from wmh.harness.code_runtime import (
 from wmh.harness.runtime import DEFAULT_MAX_TURNS, DEFAULT_SYSTEM_PROMPT, AgentRuntime, Runtime
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import DEFAULT_TOOLS, render_tools, resolve_tools
-from wmh.providers.base import Provider
+from wmh.providers.base import Provider, ToolCallingProvider
 
 if TYPE_CHECKING:
     # Import-time neutral: pi_e2b (the optional e2b extra's consumer) is imported lazily inside
@@ -255,15 +255,21 @@ class HarnessDoc(BaseModel):
         if self.runtime_kind() == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
+            structured_provider = provider if isinstance(provider, ToolCallingProvider) else None
+            if (
+                backend == "e2b" or os.environ.get("PI_TRANSPORT") == "link"
+            ) and structured_provider is None:
+                raise TypeError(
+                    "pi-node link/e2b execution needs a ToolCallingProvider; "
+                    "use a structured provider or WaterfallProvider"
+                )
             if backend == "e2b":
                 # Lazy: the e2b backend is an optional extra; `local` must import none of it.
                 from wmh.harness.pi_e2b import E2BPiRuntime
-                from wmh.harness.runner_link import worker_config_for
 
+                assert structured_provider is not None
                 return E2BPiRuntime(
-                    # Explicit PI_AGENT_* env wins; else a Bedrock `provider` is derived so the
-                    # worker LLM is the agent model the caller already chose (hosted platform).
-                    worker=worker_config_for(provider.config),
+                    provider=structured_provider,
                     files=code_files,
                     tools=resolve_tools(self.tools()),
                     system_prompt=self._assembled_prompt(skills),
@@ -277,7 +283,6 @@ class HarnessDoc(BaseModel):
                 from wmh.harness.runner_link import (
                     RunnerLink,
                     active_channel,
-                    worker_config_from_env,
                 )
 
                 channel = active_channel()
@@ -286,10 +291,11 @@ class HarnessDoc(BaseModel):
                         "PI_TRANSPORT=link but no active runner channel; call "
                         "runner_link.set_active_channel(channel) before running episodes"
                     )
+                assert structured_provider is not None
                 return RunnerLink(
                     channel,
                     tools=resolve_tools(self.tools()),
-                    worker=worker_config_from_env(),
+                    provider=structured_provider,
                     system_prompt=self._assembled_prompt(skills),
                     files=code_files,
                 )

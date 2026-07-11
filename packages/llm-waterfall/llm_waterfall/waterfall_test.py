@@ -9,6 +9,8 @@ import pytest
 from llm_waterfall.pricing import ModelPrice
 from llm_waterfall.types import (
     Backend,
+    ChatRequest,
+    ChatResponse,
     EmbeddingsUnsupported,
     Message,
     RetryPolicy,
@@ -49,6 +51,21 @@ class FakeAdapter:
     ) -> tuple[str, TokenUsage]:
         self._next()
         return f"text-from-{self.backend.model}", TokenUsage(input_tokens=100, output_tokens=10)
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        self._next()
+        return ChatResponse.model_validate(
+            {
+                "model": self.backend.model,
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "structured"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+            }
+        )
 
     def embed(self, texts: list[str]) -> tuple[list[list[float]], TokenUsage]:
         self._next()
@@ -96,6 +113,18 @@ def test_failover_attributes_cost_to_serving_backend() -> None:
     assert r.attempts[0].error_type == "_Throttle"
     # 100 in @ $3/M + 10 out @ $15/M — sonnet's rate, not opus's.
     assert r.cost_usd == pytest.approx((100 * 3.0 + 10 * 15.0) / 1_000_000)
+
+
+def test_structured_chat_uses_the_same_failover_and_attribution() -> None:
+    wf, _ = _waterfall({"primary": [_Throttle()], "fallback": []})
+
+    result = wf.complete_chat(
+        ChatRequest.model_validate({"messages": [{"role": "user", "content": "use a tool"}]})
+    )
+
+    assert result.model_used == "fallback"
+    assert result.response.choices[0].message.content == "structured"
+    assert [attempt.outcome for attempt in result.attempts] == ["capacity_error", "ok"]
 
 
 def test_client_error_propagates_immediately() -> None:

@@ -44,9 +44,10 @@ from wmh.harness.e2b_sandbox import (
     default_sandbox_factory,
 )
 from wmh.harness.environment import AgentEnvironment
-from wmh.harness.runner_link import RunnerLink, WorkerConfig, WorkerFn
+from wmh.harness.runner_link import RunnerLink, WorkerFn
 from wmh.harness.runtime import RunResult
 from wmh.harness.tools import ToolSpec
+from wmh.providers.base import ToolCallingProvider
 
 RUNNER_WORKDIR = "/home/user/pi-run"
 
@@ -357,7 +358,7 @@ class E2BPiRuntime:
     def __init__(
         self,
         *,
-        worker: WorkerConfig,
+        provider: ToolCallingProvider,
         files: dict[str, str],
         tools: list[ToolSpec],
         system_prompt: str,
@@ -367,7 +368,7 @@ class E2BPiRuntime:
         worker_fn: WorkerFn | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
     ) -> None:
-        self._worker = worker
+        self._provider = provider
         self._files = dict(files)
         self._tools = list(tools)
         self._system_prompt = system_prompt
@@ -398,7 +399,7 @@ class E2BPiRuntime:
             link = RunnerLink(
                 channel,
                 tools=self._tools,
-                worker=self._worker,
+                provider=self._provider,
                 worker_fn=self._worker_fn,
                 files=self._files,
                 system_prompt=self._system_prompt,

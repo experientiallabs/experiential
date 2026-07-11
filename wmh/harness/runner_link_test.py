@@ -2,28 +2,17 @@
 
 No socket, no node, no Bedrock. A `FakeChannel` plays the runner side (emits tool_request /
 llm_request / done frames and records what the host sent back); a fake `AgentEnvironment` stands in
-for the world model; `worker_fn` is injected so the worker-LLM callback needs no provider. The
-frame codec and the Bedrock translation (shared with the SSH shim) are unit-tested directly.
+for the world model; `worker_fn` is injected so the worker-LLM callback needs no provider.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any, cast
 
-import pytest
+from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
-from wmh.harness.runner_link import (
-    RunnerLink,
-    WorkerConfig,
-    _azure_completion,
-    _normalized_openai_body,
-    bedrock_to_completion,
-    openai_to_bedrock,
-    read_frame,
-    write_frame,
-)
+from wmh.harness.runner_link import RunnerLink, read_frame, write_frame
 from wmh.harness.runtime import StopReason
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
@@ -58,13 +47,28 @@ def _tools() -> list:
     return [TOOL_REGISTRY["bash"], SUBMIT]
 
 
+def _completion(
+    content: str = "ok", *, input_tokens: int = 0, output_tokens: int = 0
+) -> ChatResponse:
+    return ChatResponse.model_validate(
+        {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+            },
+        }
+    )
+
+
 def _link(channel: _FakeChannel, **kw) -> RunnerLink:  # noqa: ANN003
     # worker_fn returns a fixed completion so the llm_request path needs no provider.
-    return RunnerLink(
-        channel,
-        worker_fn=lambda body: {"choices": [{"message": {"content": "ok"}}]},
-        **kw,
-    )
+    return RunnerLink(channel, worker_fn=lambda request: _completion(), **kw)
 
 
 def _sent(channel: _FakeChannel, kind: str) -> list:
@@ -145,11 +149,11 @@ def test_env_action_budget_enforced() -> None:
 
 
 def test_llm_request_answered_via_worker_fn() -> None:
-    calls: list[JsonObject] = []
+    calls: list[ChatRequest] = []
 
-    def worker(body: JsonObject) -> JsonObject:
-        calls.append(body)
-        return {"choices": [{"message": {"content": "hi", "role": "assistant"}}]}
+    def worker(request: ChatRequest) -> ChatResponse:
+        calls.append(request)
+        return _completion("hi")
 
     script = [
         {"type": "llm_request", "req_id": 7, "openai_body": {"messages": [{"role": "user"}]}},
@@ -164,7 +168,8 @@ def test_llm_request_answered_via_worker_fn() -> None:
 
 
 def test_worker_fn_error_is_reported_not_crashed() -> None:
-    def boom(body: JsonObject) -> JsonObject:
+    def boom(request: ChatRequest) -> ChatResponse:
+        del request
         raise RuntimeError("provider down")
 
     script = [
@@ -202,7 +207,7 @@ def test_tools_bound_at_construction_satisfy_runtime_contract() -> None:
         {"type": "done", "answer": "done"},
     ]
     ch = _FakeChannel(script)
-    link = RunnerLink(ch, tools=_tools(), worker_fn=lambda body: {"choices": [{"message": {}}]})
+    link = RunnerLink(ch, tools=_tools(), worker_fn=lambda request: _completion())
     result = link.run("t1", "do it", env)  # no tools= : uses the constructor's
     assert result.stop_reason is StopReason.SUBMITTED
     assert [a.name for a in env.actions] == ["bash"]
@@ -226,34 +231,6 @@ def test_multiple_episodes_over_one_channel() -> None:
     assert (starts[0]["instruction"], starts[1]["instruction"]) == ("first", "second")
 
 
-# --- shared Bedrock translation (offline) ---
-def test_openai_to_bedrock_maps_tools_and_tool_results() -> None:
-    body: JsonObject = {
-        "messages": [
-            {"role": "system", "content": "be nice"},
-            {"role": "user", "content": "look up u1"},
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {"id": "c1", "function": {"name": "get_user", "arguments": '{"id":"u1"}'}}
-                ],
-            },
-            {"role": "tool", "tool_call_id": "c1", "content": "found u1"},
-        ],
-        "tools": [
-            {"function": {"name": "get_user", "description": "d", "parameters": {"type": "object"}}}
-        ],
-    }
-    system, msgs, tool_config = openai_to_bedrock(body)
-    assert system == [{"text": "be nice"}]
-    assert tool_config is not None
-    assert cast(Any, tool_config)["tools"][0]["toolSpec"]["name"] == "get_user"
-    # assistant toolUse + tool result present
-    blocks = [b for m in cast(Any, msgs) for b in m["content"]]
-    assert any("toolUse" in b for b in blocks)
-    assert any("toolResult" in b for b in blocks)
-
-
 def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
     import os as _os
 
@@ -266,6 +243,9 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
 
         def complete(self, *a, **k) -> object:  # noqa: ANN002, ANN003
             raise NotImplementedError
+
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            return _completion()
 
         def embed(self, texts) -> list:  # noqa: ANN001
             return [[0.0] for _ in texts]
@@ -302,189 +282,16 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
             _os.environ["PI_TRANSPORT"] = prev
 
 
-def test_bedrock_to_completion_shape() -> None:
-    resp: JsonObject = {
-        "output": {
-            "message": {
-                "content": [
-                    {"text": "sure"},
-                    {"toolUse": {"toolUseId": "t1", "name": "get_user", "input": {"id": "u1"}}},
-                ]
-            }
-        },
-        "stopReason": "tool_use",
-    }
-    completion = cast(Any, bedrock_to_completion(resp))
-    choice = completion["choices"][0]
-    assert choice["finish_reason"] == "tool_calls"
-    assert choice["message"]["content"] == "sure"
-    tc = choice["message"]["tool_calls"][0]
-    assert tc["function"]["name"] == "get_user"
-    assert tc["function"]["arguments"] == '{"id": "u1"}'
-
-
-def test_normalized_openai_body_strips_stream_options_and_maps_max_tokens() -> None:
-    """pi asks for a stream; the framed transport sends ONE non-streaming request.
-
-    DeepSeek 400s on `stream_options` without `stream=true` (live-observed), and
-    `max_completion_tokens` is translated to the widely supported `max_tokens`.
-    """
-    cfg = WorkerConfig(
-        backend="openai",
-        model="deepseek-chat",
-        region="us-east-1",
-        base_url="https://api.deepseek.com/v1",
-        key_env="DEEPSEEK_API_KEY",
-    )
-    body: JsonObject = {
-        "model": "worker",
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "store": False,
-        "max_completion_tokens": 4096,
-        "messages": [{"role": "user", "content": "hi"}],
-    }
-    b = _normalized_openai_body(body, cfg)
-    assert b["model"] == "deepseek-chat"
-    assert b["stream"] is False
-    assert "stream_options" not in b
-    assert b["max_tokens"] == 4096
-    assert "max_completion_tokens" not in b
-    # an explicit max_tokens wins, and the unsupported field is dropped even then
-    b2 = _normalized_openai_body({"max_completion_tokens": 10, "max_tokens": 7}, cfg)
-    assert b2["max_tokens"] == 7
-    assert "max_completion_tokens" not in b2
-    # the original body is never mutated
-    assert body["stream"] is True and "stream_options" in body
-
-
-def test_worker_config_for_prefers_env_then_derives_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Explicit PI_AGENT_* env wins; Bedrock and fully configured Azure derive."""
-    from wmh.harness.runner_link import worker_config_for
-    from wmh.providers.base import ProviderConfig, ProviderKind
-
-    monkeypatch.delenv("PI_AGENT_BACKEND", raising=False)
-    monkeypatch.delenv("PI_AGENT_MODEL", raising=False)
-    monkeypatch.delenv("PI_AGENT_REGION", raising=False)
-    monkeypatch.delenv("PI_AGENT_BASE_URL", raising=False)
-    monkeypatch.delenv("PI_AGENT_KEY_ENV", raising=False)
-    monkeypatch.delenv("PI_AGENT_API_VERSION", raising=False)
-    monkeypatch.setenv("AWS_REGION", "eu-west-1")
-
-    bedrock = ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-haiku-4-5")
-    derived = worker_config_for(bedrock)
-    assert derived.backend == "bedrock"
-    assert derived.model == "us.anthropic.claude-haiku-4-5"
-    assert derived.region == "eu-west-1"
-
-    # An explicit region on the provider beats the env region.
-    pinned = worker_config_for(bedrock.model_copy(update={"region": "us-west-2"}))
-    assert pinned.region == "us-west-2"
-
-    # Any PI_AGENT_* env var set -> the operator's env config wins wholesale.
-    monkeypatch.setenv("PI_AGENT_MODEL", "deepseek-chat")
-    env_won = worker_config_for(bedrock)
-    assert env_won.backend == "openai"
-    assert env_won.model == "deepseek-chat"
-    monkeypatch.delenv("PI_AGENT_MODEL")
-
-    azure = ProviderConfig(
-        kind=ProviderKind.AZURE_OPENAI,
-        model="kimi-k2-6",
-        deployment="kimi deployment",
-        endpoint="https://foundry.example.com",
-        api_version="2024-05-01-preview",
-        api_key_env="AZURE_FOUNDRY_API_KEY",
-    )
-    azure_worker = worker_config_for(azure)
-    assert azure_worker == WorkerConfig(
-        backend="azure",
-        model="kimi deployment",
-        base_url="https://foundry.example.com",
-        key_env="AZURE_FOUNDRY_API_KEY",
-        api_version="2024-05-01-preview",
-    )
-
-    incomplete = azure.model_copy(update={"api_key_env": None})
-    with pytest.raises(ValueError, match="api_key_env"):
-        worker_config_for(incomplete)
-
-
-def test_azure_completion_uses_deployment_route_api_version_and_api_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The raw pi tool-calling request reaches Azure's deployment API without leaking its key."""
-    import urllib.request
-
-    requests: list[urllib.request.Request] = []
-
-    class _Response:
-        def __enter__(self) -> _Response:
-            return self
-
-        def __exit__(self, *exc: object) -> None:
-            return None
-
-        def read(self) -> bytes:
-            return b'{"choices":[{"message":{"content":"ok"}}]}'
-
-    def fake_urlopen(request: urllib.request.Request, *, timeout: int) -> _Response:
-        assert timeout == 180
-        requests.append(request)
-        return _Response()
-
-    monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "secret-test-key")
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    cfg = WorkerConfig(
-        backend="azure",
-        model="kimi deployment",
-        base_url="https://foundry.example.com/",
-        key_env="AZURE_FOUNDRY_API_KEY",
-        api_version="2024-05-01-preview",
-    )
-    body: JsonObject = {
-        "model": "placeholder",
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "bash"}}],
-    }
-
-    response = _azure_completion(body, cfg)
-
-    assert response["choices"]
-    (request,) = requests
-    assert request.full_url == (
-        "https://foundry.example.com/openai/deployments/kimi%20deployment/chat/completions"
-        "?api-version=2024-05-01-preview"
-    )
-    assert request.get_header("Api-key") == "secret-test-key"
-    sent = cast("dict[str, Any]", json.loads(cast("bytes", request.data)))
-    assert sent["model"] == "kimi deployment"
-    assert sent["stream"] is False
-    assert sent["tools"] == body["tools"]
-
-
 def test_worker_usage_accumulates_across_llm_requests() -> None:
     """Each answered llm_request adds its completion usage to RunResult.worker_usage."""
-    replies = iter(
-        [
-            {
-                "choices": [{"message": {"content": "a"}}],
-                "usage": {"prompt_tokens": 100, "completion_tokens": 7},
-            },
-            {"choices": [{"message": {"content": "b"}}]},  # no usage block: call counted, 0 tokens
-        ]
-    )
+    replies = iter([_completion("a", input_tokens=100, output_tokens=7), _completion("b")])
     script = [
         {"type": "llm_request", "req_id": 1, "openai_body": {}},
         {"type": "llm_request", "req_id": 2, "openai_body": {}},
         {"type": "done", "answer": "fin"},
     ]
     ch = _FakeChannel(script)
-    result = RunnerLink(ch, worker_fn=lambda body: next(replies)).run(
+    result = RunnerLink(ch, worker_fn=lambda request: next(replies)).run(
         "t1", "x", _Env(), tools=_tools()
     )
     assert result.worker_usage is not None
@@ -493,16 +300,7 @@ def test_worker_usage_accumulates_across_llm_requests() -> None:
     assert result.worker_usage.output_tokens == 7
     # No llm_request at all -> usage stays None (not zero: the runtime reported nothing).
     quiet = RunnerLink(
-        _FakeChannel([{"type": "done", "answer": "ok"}]), worker_fn=lambda body: {}
+        _FakeChannel([{"type": "done", "answer": "ok"}]),
+        worker_fn=lambda request: _completion(),
     ).run("t2", "x", _Env(), tools=_tools())
     assert quiet.worker_usage is None
-
-
-def test_bedrock_to_completion_carries_usage() -> None:
-    resp: JsonObject = {
-        "output": {"message": {"content": [{"text": "hi"}]}},
-        "stopReason": "end_turn",
-        "usage": {"inputTokens": 42, "outputTokens": 5},
-    }
-    completion = cast(Any, bedrock_to_completion(resp))
-    assert completion["usage"] == {"prompt_tokens": 42, "completion_tokens": 5}

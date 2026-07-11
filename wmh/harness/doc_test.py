@@ -168,6 +168,8 @@ def _pi_doc() -> HarnessDoc:
 def _stub_provider():  # noqa: ANN202 - returns the casted Provider protocol below
     from typing import cast
 
+    from llm_waterfall import ChatRequest, ChatResponse
+
     from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 
     class _P:
@@ -175,6 +177,19 @@ def _stub_provider():  # noqa: ANN202 - returns the casted Provider protocol bel
 
         def complete(self, system: str, messages: list[Message], **k) -> Completion:  # noqa: ANN003
             raise NotImplementedError
+
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            del request
+            return ChatResponse.model_validate(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
 
         def embed(self, texts: list[str]) -> list[list[float]]:
             return [[0.0] for _ in texts]

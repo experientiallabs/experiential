@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterator
 from typing import cast
 
 import pytest
+from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness import pi_e2b as pi_e2b_module
@@ -34,7 +35,6 @@ from wmh.harness.pi_e2b import (
     E2BSandboxPool,
     E2BStdioChannel,
 )
-from wmh.harness.runner_link import WorkerConfig
 from wmh.harness.runtime import Runtime, StopReason
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY, ToolSpec
 
@@ -164,6 +164,25 @@ def _tools() -> list[ToolSpec]:
     return [TOOL_REGISTRY["bash"], SUBMIT]
 
 
+def _completion(content: str = "ok") -> ChatResponse:
+    return ChatResponse.model_validate(
+        {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+    )
+
+
+class _Provider:
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        del request
+        return _completion()
+
+
 def _factory_for(
     scripts: list[list[JsonObject]],
 ) -> tuple[Callable[[], FakeSandbox], list[FakeSandbox]]:
@@ -184,16 +203,16 @@ def _runtime(
     *,
     pool: E2BSandboxPool | None = None,
     template: str | None = None,
-    worker_fn: Callable[[JsonObject], JsonObject] | None = None,
+    worker_fn: Callable[[ChatRequest], ChatResponse] | None = None,
 ) -> E2BPiRuntime:
     return E2BPiRuntime(
-        worker=WorkerConfig(),
+        provider=_Provider(),
         files={"src/agent.ts": "// a"},
         tools=_tools(),
         system_prompt="sys",
         template=template,
         pool=pool,
-        worker_fn=worker_fn or (lambda body: {"choices": [{"message": {"content": "ok"}}]}),
+        worker_fn=worker_fn,
     )
 
 
@@ -393,11 +412,11 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
     factory, made = _factory_for([script])
     env = _RecordingEnv()  # a plain AgentEnvironment: the world-model shape in real evals
 
-    worker_calls: list[JsonObject] = []
-    completion: JsonObject = {"choices": [{"message": {"content": "use bash"}}]}
+    worker_calls: list[ChatRequest] = []
+    completion = _completion("use bash")
 
-    def worker(b: JsonObject) -> JsonObject:
-        worker_calls.append(b)
+    def worker(request: ChatRequest) -> ChatResponse:
+        worker_calls.append(request)
         return completion
 
     with E2BSandboxPool(sandbox_factory=factory) as pool:
@@ -424,8 +443,8 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
     tool_names = {t["name"] for t in cast("list[JsonObject]", start["tools"])}
     assert tool_names >= {"bash", "submit"}
     llm = _of_kind(fake, "llm_response")[0]
-    assert llm["req_id"] == 1 and llm["completion"] == completion
-    assert worker_calls == [body]  # answered host-side, by the injected worker
+    assert llm["req_id"] == 1 and llm["completion"] == completion.wire_payload()
+    assert [request.messages[0].content for request in worker_calls] == ["hi"]
     tool = _of_kind(fake, "tool_response")[0]
     assert tool["req_id"] == 2 and tool["content"] == "wm says ok" and tool["is_error"] is False
 

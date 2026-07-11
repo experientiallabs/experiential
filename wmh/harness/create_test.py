@@ -15,6 +15,7 @@ from collections.abc import Callable
 from typing import ClassVar
 
 import pytest
+from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import JsonObject
 from wmh.engine.world_model import WorldModel
@@ -101,6 +102,19 @@ class RoleProvider:
         else:
             answer = "done"
         return Completion(text=json.dumps({"tool": "submit", "arguments": {"answer": answer}}))
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        del request
+        return ChatResponse.model_validate(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [[0.0] for _ in texts]

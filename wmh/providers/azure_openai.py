@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 from wmh.providers import _openai_common
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -42,21 +44,10 @@ class AzureOpenAIProvider:
 
             from openai import AzureOpenAI
 
-            if self.config.api_key_env is None:
-                self._client = AzureOpenAI(
-                    api_version=self.config.api_version,
-                    azure_endpoint=endpoint,
-                )
-            else:
-                api_key = os.environ.get(self.config.api_key_env)
-                if not api_key:
-                    msg = f"AzureOpenAIProvider needs {self.config.api_key_env} to be set."
-                    raise ValueError(msg)
-                self._client = AzureOpenAI(
-                    api_version=self.config.api_version,
-                    azure_endpoint=endpoint,
-                    api_key=api_key,
-                )
+            self._client = AzureOpenAI(
+                api_version=self.config.api_version,
+                azure_endpoint=endpoint,
+            )
         return self._client
 
     def _deployment(self) -> str:
@@ -77,6 +68,12 @@ class AzureOpenAIProvider:
             self._get_client().chat.completions, self._deployment(), system, messages, max_tokens
         )
 
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a full structured request on the configured Azure deployment."""
+        return _openai_common.complete_chat(
+            self._get_client().chat.completions, self._deployment(), request
+        )
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         # As with `model` in complete(), `embed_model` must be the Azure *deployment* name of an
         # embedding model, not a base OpenAI model id, or the call 404s.
@@ -91,7 +88,6 @@ class AzureOpenAIProvider:
 
 
 def _require_endpoint() -> str:
-    import os
 
     endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     if not endpoint:

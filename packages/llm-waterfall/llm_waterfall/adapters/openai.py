@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from llm_waterfall.adapters.base import missing_sdk_error
-from llm_waterfall.types import Backend, EmbeddingsUnsupported, Message, TokenUsage
+from llm_waterfall.types import (
+    Backend,
+    ChatRequest,
+    ChatResponse,
+    EmbeddingsUnsupported,
+    Message,
+    TokenUsage,
+)
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -92,6 +99,15 @@ class OpenAIAdapter:
             else TokenUsage()
         )
         return text, token_usage
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a full OpenAI-compatible tool-calling request through this backend."""
+        payload = request.provider_payload(self._request_model())
+        # The OpenAI SDK's input TypedDict is intentionally not our public contract. This one
+        # narrow cast sits at the SDK boundary after ChatRequest validated the structured core;
+        # provider_payload preserves forward-compatible extra fields emitted by agent SDKs.
+        response = self._get_client().chat.completions.create(**cast("Any", payload))
+        return ChatResponse.model_validate(response.model_dump(mode="json"))
 
     def _request_model(self) -> str:
         """The id sent as `model` on the wire (Azure overrides this with the deployment)."""

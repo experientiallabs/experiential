@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
+from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import BaseModel, Field
 
 
@@ -84,7 +85,6 @@ class ProviderConfig(BaseModel):
     region: str | None = None  # AWS Bedrock region
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
-    api_key_env: str | None = None  # non-default env var holding the provider API key
     reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
 
 
@@ -122,6 +122,20 @@ class Provider(Protocol):
 
     def verify(self) -> VerifyResult:
         """Cheap creds/model check run on startup (`wmh providers verify`)."""
+        ...
+
+
+@runtime_checkable
+class ToolCallingProvider(Protocol):
+    """Provider capability for full structured agent requests.
+
+    This stays separate from :class:`Provider`: world-model, judge, and prompt-optimization
+    callers need only text, while agent runtimes must preserve tool schemas, tool calls, tool
+    results, finish reasons, and usage end to end.
+    """
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Return one non-streaming structured chat completion."""
         ...
 
 

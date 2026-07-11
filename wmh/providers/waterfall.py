@@ -23,7 +23,16 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
-from llm_waterfall import Backend, CompletionResult, EmbeddingResult, RetryPolicy, Waterfall
+from llm_waterfall import (
+    Backend,
+    ChatRequest,
+    ChatResponse,
+    ChatResult,
+    CompletionResult,
+    EmbeddingResult,
+    RetryPolicy,
+    Waterfall,
+)
 from llm_waterfall import Message as WfMessage
 from llm_waterfall import VerifyResult as WfVerifyResult
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -89,6 +98,8 @@ class WaterfallLike(Protocol):
         max_tokens: int = 4096,
     ) -> CompletionResult: ...
 
+    def complete_chat(self, request: ChatRequest) -> ChatResult: ...
+
     def embed(self, texts: Sequence[str]) -> EmbeddingResult: ...
 
     def verify(self) -> list[WfVerifyResult]: ...
@@ -146,6 +157,10 @@ class WaterfallProvider:
             ),
             model=result.model_used,  # true attribution even when a fallback served
         )
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a structured agent request through the configured failover chain."""
+        return self._waterfall.complete_chat(request).response
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._waterfall.embed(texts).vectors

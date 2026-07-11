@@ -6,7 +6,15 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from llm_waterfall import Backend, CompletionResult, EmbeddingResult, Waterfall
+from llm_waterfall import (
+    Backend,
+    ChatRequest,
+    ChatResponse,
+    ChatResult,
+    CompletionResult,
+    EmbeddingResult,
+    Waterfall,
+)
 from llm_waterfall import Message as WfMessage
 from llm_waterfall import TokenUsage as WfTokenUsage
 from llm_waterfall import VerifyResult as WfVerifyResult
@@ -49,6 +57,22 @@ class _FakeWaterfall:
         return EmbeddingResult(
             vectors=[[0.1] for _ in texts],
             model_used="amazon.titan-embed-text-v2:0",
+            provider_used="bedrock",
+        )
+
+    def complete_chat(self, request: ChatRequest) -> ChatResult:
+        return ChatResult(
+            response=ChatResponse.model_validate(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "structured"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ),
+            model_used="sonnet",
             provider_used="bedrock",
         )
 
@@ -112,6 +136,14 @@ def test_config_reports_primary_for_metering() -> None:
     provider = WaterfallProvider(_configs(), waterfall=_FakeWaterfall())
     assert provider.config.model == "us.anthropic.claude-opus-4-8"
     assert provider.config.kind is ProviderKind.BEDROCK
+
+
+def test_complete_chat_delegates_without_collapsing_tool_shape() -> None:
+    provider = WaterfallProvider(_configs(), waterfall=_FakeWaterfall())
+    response = provider.complete_chat(
+        ChatRequest.model_validate({"messages": [{"role": "user", "content": "hi"}]})
+    )
+    assert response.choices[0].message.content == "structured"
 
 
 def test_embed_delegates_to_waterfall() -> None:
