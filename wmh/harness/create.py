@@ -436,7 +436,18 @@ def create_harness(
             clusters = cluster_failures(parent_report, tasks)
             trigger = clusters[0] if clusters else FailureSignature(mechanism=ALL_PASS_MECHANISM)
             evidence = render_evidence(trigger, parent_report, tasks)
-            delta = propose_delta(parent, trigger, evidence, meta_provider, history=archive.deltas)
+            # A meta-provider failure (an API rejecting the 16k reply budget, a rate limit, a
+            # network fault) costs this iteration, not the run: same contract as an unusable
+            # reply, but narrated with the error so a systematically failing provider is
+            # visible on every iteration instead of aborting the search on the first one.
+            try:
+                delta = propose_delta(
+                    parent, trigger, evidence, meta_provider, history=archive.deltas
+                )
+            except Exception as exc:  # noqa: BLE001 - any provider/transport error, by design
+                skipped += 1
+                _note(f"iteration {i}/{iterations}: proposer call failed ({exc}); skipped")
+                continue
             if delta is None:
                 skipped += 1
                 _note(
@@ -490,7 +501,7 @@ def create_harness(
                     archive.deltas.append(delta)
                     screened += 1
                     _note(
-                        f"iteration {i}/{iterations}: screened out — trigger cluster "
+                        f"iteration {i}/{iterations}: screened out: trigger cluster "
                         f"{child_mean:.2f} vs parent {parent_mean:.2f}"
                     )
                     continue

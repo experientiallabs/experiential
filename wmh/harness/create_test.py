@@ -990,11 +990,45 @@ def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
     assert result.best_score == 0.5  # the seed stayed champion and the search finished
 
 
+class _MetaExplodingProvider(RoleProvider):
+    """RoleProvider whose meta-agent calls raise (an API rejecting the request outright)."""
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Completion:
+        if "meta-agent improving an agent harness" in system:
+            msg = "max_tokens above model output limit"
+            raise RuntimeError(msg)
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_proposer_call_failure_skips_the_iteration_not_the_run() -> None:
+    """A meta-provider exception (output-cap rejection, rate limit) costs one iteration.
+
+    Same contract as an unusable reply, but narrated with the error; the search must not
+    abort on the first provider fault.
+    """
+    provider = _MetaExplodingProvider()
+    notes: list[str] = []
+    result = _run(provider, iterations=2, on_note=notes.append)
+
+    assert result.skipped == 2
+    assert result.best.name == "winner"  # the seed still wins; the run completed
+    assert len(notes) == 2
+    assert all("proposer call failed" in note for note in notes)
+    assert all("max_tokens above model output limit" in note for note in notes)
+
+
 def test_skipped_iterations_narrate_through_on_note() -> None:
     """Every iteration whose proposal dies before scoring reports itself.
 
     Regression: a run whose proposals were all unusable (e.g. truncated meta replies on huge
-    pi code surfaces) emitted NO progress events at all — five iterations looked like one.
+    pi code surfaces) emitted NO progress events at all; five iterations looked like one.
     """
     provider = RoleProvider(meta_reply="truncated garbage that is not json")
     notes: list[str] = []

@@ -204,6 +204,12 @@ def create(
         gate = "[green]accepted[/green]" if accepted else "[yellow]rejected[/yellow]"
         _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {gate}")
 
+    def _note(message: str) -> None:
+        # Iterations that die before scoring (unusable/invalid/screened proposals) emit no
+        # _progress event; without this a run whose proposals all fail looks frozen after
+        # the seed line.
+        _console.print(f"  [dim]{message}[/dim]")
+
     result = create_harness(
         name,
         seed_doc,
@@ -219,6 +225,7 @@ def create(
         eval_concurrency=eval_concurrency,
         e2b_template=e2b_template,
         on_progress=_progress,
+        on_note=_note,
     )
     saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
     accepted = len(result.archive.accepted())
