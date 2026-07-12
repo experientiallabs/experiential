@@ -209,6 +209,15 @@ def test_bedrock_judge_and_target_get_same_model_chains() -> None:
     single = _make_target(ModelSpec("GPT", "openai", "gpt-5.5"), tracking_factory)
     assert not isinstance(single, SameModelFailover)
 
+    # Bedrock target with NO explicit region: skip the region-spread rung (it could just re-hit the
+    # ambient region as a no-op duplicate); chain is [ambient primary, same-model direct-Anthropic].
+    built.clear()
+    none_region = _make_target(
+        ModelSpec("Opus", "bedrock", "us.anthropic.claude-opus-4-8"), tracking_factory
+    )
+    assert isinstance(none_region, SameModelFailover)
+    assert built == ["us.anthropic.claude-opus-4-8@None", "claude-opus-4-8@None"]
+
 
 def _cell(model: str, condition: str, fidelity: float) -> GridCell:
     return GridCell(
