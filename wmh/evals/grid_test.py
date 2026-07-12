@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wmh.evals.failover import SameModelFailover
 from wmh.evals.grid import (
     CONDITIONS,
@@ -118,7 +120,9 @@ def test_base_identical_gepa_prompt_skips_gepa_cells(tmp_path) -> None:  # noqa:
     # so the grid never reports same-prompt-rerun noise as a GEPA delta.
     traces = _tiny_trace_file(tmp_path)
     noop = tmp_path / "noop.txt"
-    noop.write_text("BASE PROMPT", encoding="utf-8")  # identical to base_prompt below
+    # Trailing whitespace (a common editor/export artifact) must NOT defeat the guard: compared
+    # stripped, this is still the base prompt.
+    noop.write_text("BASE PROMPT\n", encoding="utf-8")
     result = run_grid(
         suite_name="tiny",
         files=[traces],
@@ -136,7 +140,7 @@ def test_base_identical_gepa_prompt_skips_gepa_cells(tmp_path) -> None:  # noqa:
         provider_factory=_factory,
     )
     conds = {c.condition for c in result.cells}
-    assert conds == {"base", "base_rag"}  # no gepa/gepa_rag — the no-op prompt was treated as none
+    assert conds == {"base", "base_rag"}  # no gepa/gepa_rag - the no-op prompt was treated as none
 
 
 def test_grid_cost_is_none_for_unpriced_model(tmp_path) -> None:  # noqa: ANN001 - fixture
@@ -178,7 +182,7 @@ def test_bedrock_judge_and_target_get_same_model_chains() -> None:
         return _FakeProvider(config)
 
     # Bedrock judge -> SameModelFailover of EXACTLY [primary opus-4.8, direct-Anthropic opus-4.8].
-    # The judge NEVER switches to a different model (no resilience models) — only the same model on
+    # The judge NEVER switches to a different model (no resilience models) - only the same model on
     # the unlimited direct API, so cells stay comparable.
     judge = _make_judge("bedrock", "us.anthropic.claude-opus-4-8", "us-west-1", tracking_factory)
     assert isinstance(judge, RubricJudge)  # the only judge kind; narrows for the attr check below
@@ -276,6 +280,54 @@ def test_merge_results_concatenates_cells_and_keeps_first_metadata() -> None:
     assert merged.suite == "terminal-tasks"  # metadata from the first result
     assert merged.total_test_steps == 100
     assert merged.total_test_traces == 12
+
+
+def test_merge_results_rejects_mismatched_suite_or_judge_version() -> None:
+    def _r(suite: str, version: str) -> GridResult:
+        return GridResult(
+            suite=suite,
+            judge_model="us.anthropic.claude-opus-4-8",
+            judge_provider="bedrock",
+            judge_version=version,
+            train_split=0.7,
+            top_k=5,
+            seed=0,
+            sample_turns="all",
+            cells=[_cell("GPT-5.5", "base", 0.6)],
+        )
+
+    # Different suites must not be merged into one chart.
+    with pytest.raises(ValueError, match="one suite"):
+        merge_results([_r("tau-bench", "rubric-v2"), _r("swe-bench", "rubric-v2")])
+    # Different judge versions score on different scales and must not be merged (the whole point
+    # of stamping judge_version).
+    with pytest.raises(ValueError, match="judge_version"):
+        merge_results([_r("tau-bench", "rubric-v2"), _r("tau-bench", "rubric-v1")])
+
+
+def test_run_grid_falls_back_to_2way_when_no_room_for_val_band(tmp_path) -> None:  # noqa: ANN001
+    # train_split=1.0 makes the default val_frac=(1-1.0)/2=0, which has no room for a 3-way split;
+    # run_grid must fall back to the plain 2-way split rather than crashing in split_traces_3way.
+    traces = _tiny_trace_file(tmp_path)
+    result = run_grid(
+        suite_name="tiny",
+        files=[traces],
+        models=[ModelSpec("Opus 4.8", "bedrock", "us.anthropic.claude-opus-4-8")],
+        gepa_prompts=None,
+        base_prompt="BASE PROMPT",
+        judge_provider="bedrock",
+        judge_model="us.anthropic.claude-opus-4-8",
+        judge_region=None,
+        train_split=1.0,
+        top_k=5,
+        seed=0,
+        sample_turns="all",
+        embed_dim=2,
+        provider_factory=_factory,
+    )
+    assert result.val_frac == 0.0  # clamped: recorded honestly as "no reserved val band"
+    assert result.total_test_traces == 1  # 2-way fallback still scores the tiny corpus
+    assert {c.condition for c in result.cells} == {"base", "base_rag"}
 
 
 def test_grid_bar_label_uses_lowercase_wmh(tmp_path) -> None:  # noqa: ANN001 - fixture

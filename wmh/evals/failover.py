@@ -4,7 +4,7 @@ Main's failover architecture (`wmh.providers.provider_or_chain` + `.wmh/fallback
 config-driven chain for *world-model* calls and keeps the *judge* pinned. The grid needs one thing
 that config can't express: a **programmatic, per-cell, same-model** chain. Its judge is a single
 pinned model and each cell's target is a distinct model, so there is no static named chain to point
-at — yet Bedrock Anthropic models throttle hard, and the direct Anthropic API is the *identical*
+at - yet Bedrock Anthropic models throttle hard, and the direct Anthropic API is the *identical*
 model on an un-throttled endpoint. Failing over Bedrock -> direct-Anthropic (same model), or across
 Bedrock regions (same model), keeps what's measured unchanged, so it honours main's
 never-silently-switch-models invariant while surviving capacity pressure over an 80-cell grid.
@@ -47,8 +47,8 @@ class SameModelFailover:
     """Try a chain of pre-built providers in order; fail over only on capacity errors.
 
     Every rung MUST serve the same underlying model (a Bedrock model, its direct-Anthropic twin, or
-    the same model in another region) — the chain spreads throttling load without changing what is
-    measured. Capacity errors (throttling, transient 5xx, timeouts — see llm-waterfall's
+    the same model in another region) - the chain spreads throttling load without changing what is
+    measured. Capacity errors (throttling, transient 5xx, timeouts - see llm-waterfall's
     `is_capacity_error`) spill to the next rung; a real error (bad request, auth) propagates
     immediately, and the last rung's error surfaces when the whole chain is capacity-constrained.
     """

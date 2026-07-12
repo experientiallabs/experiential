@@ -1,7 +1,7 @@
 # Eval grid (`wmh eval grid`)
 
 A **grid** scores one eval suite across many **(model × condition)** cells on the *same* held-out
-split, by the *same* judge — answering the project's core question: does `base → +RAG → +GEPA →
+split, by the *same* judge - answering the project's core question: does `base → +RAG → +GEPA →
 +GEPA+RAG` actually lift world-model reconstruction fidelity, for which serving models, at what
 cost? It's the multi-model sibling of `wmh eval` (one trace) and `wmh eval run` (one suite), built
 on the same open-loop scorer (`wmh.evals.open_loop.evaluate_files`).
@@ -21,14 +21,14 @@ A model with no evolved prompt in the `--gepa-prompts` dir is scored on `base`/`
 
 ## Invariants (what makes cells comparable)
 
-- **Pinned judge.** One Bedrock Opus-4.8 `RubricJudge` grades every cell, regardless of target — a
-  Qwen target is never judged by Qwen — and it **never switches models**. Its `JUDGE_VERSION`
+- **Pinned judge.** One Bedrock Opus-4.8 `RubricJudge` grades every cell, regardless of target - a
+  Qwen target is never judged by Qwen - and it **never switches models**. Its `JUDGE_VERSION`
   (currently `rubric-v2`) is stamped on the result JSON; numbers from different judge versions are
   not comparable, so never mix them in one chart.
 - **Same-model capacity fallover.** A Bedrock target fails over on capacity errors across regions
   and then to the *same model on the direct Anthropic API* (Bedrock Opus is heavily throttled; the
-  direct API is the identical model, so what's measured is unchanged — see `wmh.evals.failover`).
-  The pinned judge fails over *only* to that same-model direct API, never to a different model — a
+  direct API is the identical model, so what's measured is unchanged - see `wmh.evals.failover`).
+  The pinned judge fails over *only* to that same-model direct API, never to a different model - a
   judge that swapped models mid-grid would score cells on different scales (cf.
   `docs/reference/failover.md`).
 - **Leak-free splits.** Cells score the reserved `test` band of the same 3-way `train/val/test`
@@ -68,7 +68,7 @@ are never committed.
 ## Reproducing a full grid
 
 The trace corpora are the ones under `packages/environment-capture/<suite>/` (e.g.
-`kimi-gui-control`, `tau-bench`, `terminal-tasks`, `swe-bench`) — fetch a corpus with
+`kimi-gui-control`, `tau-bench`, `terminal-tasks`, `swe-bench`) - fetch a corpus with
 `wmh download <suite>`, evolve one prompt per (suite × model) with `wmh build`, collect them into a
 `--gepa-prompts` directory as `<label>.txt`, then run `wmh eval grid <suite>/default` per benchmark
 and `grid-heatmap` across the saved JSONs. All cells in a comparison must share one `JUDGE_VERSION`.

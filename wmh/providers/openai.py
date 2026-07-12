@@ -40,12 +40,14 @@ class OpenAIProvider:
             # Bound each request: a reasoning model (GPT-5.5) can leave a connection open with no
             # output, hanging an eval/build indefinitely (Bedrock already caps this via botocore
             # timeouts). `timeout=240` turns a stall into a bounded failure instead of a silent
-            # multi-hour hang. `max_retries=0` disables the SDK's OWN retries on purpose: throttling
-            # /5xx/timeouts should surface immediately to the caller, where the ONE retry owner —
-            # the llm-waterfall failover chain (or, in the grid, per-step 0.0 resilience) — decides.
-            # Stacking SDK retries under the chain's would multiply back-off per throttled request
-            # (the same reason Bedrock pins botocore to a single attempt). Key + OPENAI_BASE_URL
-            # still come from env.
+            # multi-hour hang. Retry ownership is split by CONCERN, not stacked: the SDK's
+            # `max_retries=1` owns a single same-endpoint transient retry (one blip on THIS server),
+            # while the llm-waterfall chain owns cross-endpoint failover on capacity errors (move to
+            # the NEXT backend). They don't compound the way Bedrock's botocore retries did (3 same
+            # -model attempts before failover) because one is bounded at 1; and unlike a Bedrock
+            # target, a grid's OpenAI/self-hosted target is a SINGLE provider with no chain behind
+            # it, so removing this retry would turn any transient 429/5xx into a permanent 0.0 step
+            # and bias the comparison against exactly those models. Key + OPENAI_BASE_URL from env.
             if self.config.endpoint:
                 # OpenAI-compatible server. Auth comes from WMH_ENDPOINT_API_KEY; NEVER send
                 # the real OPENAI_API_KEY to an arbitrary base_url. Most self-hosted servers
@@ -54,10 +56,10 @@ class OpenAIProvider:
                     base_url=self.config.endpoint,
                     api_key=os.environ.get("WMH_ENDPOINT_API_KEY") or "not-needed",
                     timeout=240.0,
-                    max_retries=0,
+                    max_retries=1,
                 )
             else:
-                self._client = OpenAI(timeout=240.0, max_retries=0)
+                self._client = OpenAI(timeout=240.0, max_retries=1)
         return self._client
 
     def complete(

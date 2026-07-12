@@ -74,13 +74,14 @@ def evaluate_files(
     Each file is split deterministically; tiny corpora with no held-out trace fall back to scoring
     every trace. RAG, when enabled, retrieves from that file's own train split only (leak-free).
     `sample_turns`/`seed` are forwarded to `replay` (see its docstring). `max_holdout_traces` caps
-    how many held-out traces are scored per file (a deterministic prefix by trace_id) — for cheap
+    how many held-out traces are scored per file (a deterministic prefix by trace_id) - for cheap
     dry-runs; the train side stays full so retrieval is unaffected.
 
-    `val_frac` makes the split leak-free against a GEPA-evolved prompt: when set, the traces are cut
-    3-way (`train`/`val`/`test`) on the same hash line GEPA used, and only the reserved `test` band
-    is scored — so a prompt selected on `val` is never graded on those same traces. Retrieval still
-    draws from `train` only. `val_frac=None` keeps the plain 2-way `train`/held-out split.
+    `val_frac` makes the split leak-free against a GEPA-evolved prompt: when it is a positive
+    fraction, the traces are cut 3-way (`train`/`val`/`test`) on the same hash line GEPA used, and
+    only the reserved `test` band is scored, so a prompt selected on `val` is never graded on those
+    same traces. Retrieval still draws from `train` only. `val_frac` of `None` or `0` keeps the
+    plain 2-way `train`/held-out split (`split_traces_3way` requires a strictly positive band).
     """
     adapter = get_adapter(adapter_name)
     per_file: dict[str, ReplayReport] = {}
@@ -88,7 +89,7 @@ def evaluate_files(
         traces = adapter.from_file(str(path))
         if not traces:
             continue
-        if val_frac is not None:
+        if val_frac:  # truthy (a positive val band); None or 0.0 keeps the plain 2-way split
             train, _val, holdout = split_traces_3way(traces, train_split, val_frac)
         else:
             train, holdout = split_traces(traces, train_split)

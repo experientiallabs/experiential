@@ -81,7 +81,7 @@ def test_verify_treats_max_tokens_limit_as_reachable() -> None:
 
 
 def test_verify_reports_real_failures() -> None:
-    # Auth / missing-model / network errors are genuine failures — not reachability confirmations.
+    # Auth / missing-model / network errors are genuine failures - not reachability confirmations.
     exc = Exception("Error code: 401 - invalid api key")
     result = verify_via_ping(_RaisingProvider(exc))
     assert not result.ok

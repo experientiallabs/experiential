@@ -68,7 +68,7 @@ def _trace(tid: str, n: int = 2) -> Trace:
 
 
 class _BoomProvider:
-    """A provider that raises on complete() — simulates a timeout/capacity error mid-eval."""
+    """A provider that raises on complete() - simulates a timeout/capacity error mid-eval."""
 
     def __init__(self) -> None:
         self.config = ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5")

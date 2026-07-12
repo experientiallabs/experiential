@@ -42,5 +42,11 @@ prompt"), so fresh runs cannot reintroduce these no-op cells — the disclosure 
   self-hosted Qwen grid, which runs in its own process). Re-render figures from these with
   `wmh eval grid-plot` / `grid-heatmap` (charts are regenerable, so no PNGs are committed).
 
+One more reference-run caveat: for `swe-bench` the api and qwen JSONs were scored on slightly
+different held-out sets (api = 8 traces / 12 steps, qwen = 5 traces / 17 steps) despite the same
+split config, because they were captured in separate passes. `grid-plot` merges them with a `max`
+over the counts, so a combined swe-bench chart's "held-out traces / judged steps" subtitle is an
+upper bound, not a per-bar count. This is another reason these archives are reference-only.
+
 The `kimi-gui-control` trace corpus that this run scored now lives at
 `packages/environment-capture/kimi-gui-control/` (Hub-hosted, not committed) — see its README.

@@ -6,7 +6,7 @@ azure-foundry driving macOS GUI apps through the Accessibility API + shell). It 
 (one 9GB file holds 1000 trajectories), so this reads it STREAMING, one line at a time, and never
 loads the whole file into memory.
 
-Like the other environment-capture converters, this does NOT import `wmh` — it only emits the
+Like the other environment-capture converters, this does NOT import `wmh` - it only emits the
 OTel-GenAI span JSONL shape that `wmh.ingest.otel_genai` reads, so the world-model-harness package
 stays free of any capture-side dependency. The produced `traces.otel.jsonl` is Hub-hosted, not
 committed (see this corpus's README § Data & license).
@@ -22,7 +22,7 @@ windows, filesystem) is not captured as a compact snapshot, so open-loop replay 
 environment from the action + retrieved similar past steps + the teacher-forced session history,
 which is the point.
 
-Pure-conversational turns (no tool call) are not Steps — open-loop replay scores predicted
+Pure-conversational turns (no tool call) are not Steps - open-loop replay scores predicted
 observations for `(state, action)`, and a chat turn has no environment observation to score. A
 trajectory with zero tool calls is skipped entirely.
 

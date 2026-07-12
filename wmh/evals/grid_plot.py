@@ -2,7 +2,7 @@
 
 One vertical bar per (model x condition) cell, sorted ASCENDING by fidelity left->right, each
 labeled with its fidelity and (when priced) its target-side cost. Matplotlib/seaborn live behind
-the `viz` extra, so this module imports them lazily inside the function — the only sanctioned lazy
+the `viz` extra, so this module imports them lazily inside the function - the only sanctioned lazy
 import here (the engine must import without the plotting deps installed).
 """
 
@@ -14,7 +14,7 @@ from wmh.evals.grid import CONDITIONS, GridResult
 
 _TITLE = "World-Model Harness Fidelity"
 
-# Brand palette (AGENTS.md rule 15) — no ad-hoc colors. Ink for text/lines, a light gridline, and
+# Brand palette (AGENTS.md rule 15) - no ad-hoc colors. Ink for text/lines, a light gridline, and
 # one brand hue per condition so a bar's color reads its condition regardless of sorted position.
 _INK = "#0a0a0a"
 _GRIDLINE = "#ececec"
@@ -99,7 +99,7 @@ def plot_grid(
     ax.set_title(_TITLE, fontsize=17, fontweight="bold", pad=28)
     subtitle = (
         f"{dataset_label} | {n_test_traces} held-out test traces | "
-        f"{result.total_test_steps} judged steps"
+        f"{result.total_test_steps} judged steps | judge {result.judge_version}"
     )
     ax.text(
         0.5,
@@ -192,7 +192,9 @@ def plot_grid_heatmap(
     # Separator lines between models (every 4 conditions) so the model blocks read as groups.
     for i in range(len(CONDITIONS), len(rows), len(CONDITIONS)):
         ax.axhline(i, color=_INK, linewidth=1.4)
-    ax.set_title(f"{_TITLE} — full grid", fontsize=17, fontweight="bold", pad=16)
+    judge_versions = sorted({r.judge_version for r in results.values()})
+    judge_tag = judge_versions[0] if len(judge_versions) == 1 else "/".join(judge_versions)
+    ax.set_title(f"{_TITLE}: full grid (judge {judge_tag})", fontsize=17, fontweight="bold", pad=16)
     ax.tick_params(axis="y", labelsize=9, rotation=0)
     ax.tick_params(axis="x", labelsize=11)
     fig.tight_layout()

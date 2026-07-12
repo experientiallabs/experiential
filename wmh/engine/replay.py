@@ -147,11 +147,11 @@ def _score_step(
 
     - A *prediction* failure (the target times out / throttles / errors and never produces an
       observation) is a genuine fidelity failure: it scores 0.0 with `valid=True` (counted in the
-      mean) rather than aborting the whole run — one stalled target request must not throw away
+      mean) rather than aborting the whole run - one stalled target request must not throw away
       every other step. Only `predict_observation` is guarded, so this covers the target model.
     - A *judge* failure is NOT caught here. A malformed reply already comes back as `valid=False`
       (excluded from aggregates); a judge call that RAISES (throttle/5xx after its own fallover)
-      propagates and aborts the eval on purpose — a partially judged run would silently change what
+      propagates and aborts the eval on purpose - a partially judged run would silently change what
       the fidelity mean is over. The grid guards against this with the judge's same-model fallover.
     """
     try:

@@ -6,7 +6,7 @@ the open-loop eval (`wmh.evals.open_loop.evaluate_files`) once per cell and roll
 report into a `GridCell`. Two invariants make cells comparable:
 
 - The **judge is pinned** (a single Bedrock Opus 4.8 `RubricJudge`) across every cell, independent
-  of the target model — a Qwen target must not be judged by Qwen — and it never switches models
+  of the target model - a Qwen target must not be judged by Qwen - and it never switches models
   (only to the SAME model on the direct Anthropic API under Bedrock throttling; see
   `wmh.evals.failover`). Its `JUDGE_VERSION` is stamped on the result so numbers from different
   judge generations are never silently compared.
@@ -35,7 +35,7 @@ from wmh.retrieval import HashingEmbedder
 from wmh.tracking import MeteredProvider, RunTracker
 from wmh.tracking.pricing import price_for
 
-# Regions a Bedrock TARGET fails over across (same model, so what's measured is unchanged — this
+# Regions a Bedrock TARGET fails over across (same model, so what's measured is unchanged - this
 # only spreads throttling load, it does not switch models).
 _TARGET_FALLBACK_REGIONS = ("us-east-1",)
 
@@ -142,13 +142,25 @@ def merge_results(results: list[GridResult]) -> GridResult:
 
     A self-hosted model runs in its own process (its OpenAI-compatible base URL is process-global
     via `OPENAI_BASE_URL`), so its cells arrive in a separate result JSON. All results must be the
-    same suite/split — they score the same held-out set — so metadata is taken from the first and
+    same suite/split - they score the same held-out set - so metadata is taken from the first and
     cells are concatenated. `total_test_steps`/`total_test_traces` take the max across results
     (equal in practice; max guards against a capped dry-run being merged with a full run).
     """
     if not results:
         raise ValueError("merge_results requires at least one GridResult")
     head = results[0]
+    # Guard the two invariants that make merged cells comparable in one chart: every result must
+    # score the SAME suite and be graded by the SAME judge version. Merging across either would
+    # present incomparable fidelities side by side (rubric-v1 scores run ~0.12 above rubric-v2),
+    # which is exactly what `judge_version` exists to prevent, so fail loudly instead.
+    suites = {r.suite for r in results}
+    if len(suites) > 1:
+        raise ValueError(f"merge_results needs one suite; got {sorted(suites)}")
+    versions = {r.judge_version for r in results}
+    if len(versions) > 1:
+        raise ValueError(
+            f"merge_results needs one judge_version (not comparable); got {sorted(versions)}"
+        )
     merged = GridResult(
         suite=head.suite,
         judge_model=head.judge_model,
@@ -178,7 +190,7 @@ def _make_judge(
     A judge that silently swapped models mid-grid would score cells on different scales and make
     fidelity numbers incomparable (see `docs/reference/failover.md`). The ONLY failover allowed is
     to the SAME model on the direct Anthropic API (unlimited key) when the primary is a throttled
-    Bedrock Anthropic model — identical model, different endpoint — so what's measured is unchanged.
+    Bedrock Anthropic model - identical model, different endpoint - so what's measured is unchanged.
     The judge is never metered as target cost.
     """
     kind_enum = ProviderKind(judge_provider)
@@ -192,14 +204,20 @@ def _make_judge(
 
 def _make_target(spec: ModelSpec, factory) -> Provider:  # noqa: ANN001 - factory injectable for tests
     """Build a target provider. A Bedrock target fails over across `_TARGET_FALLBACK_REGIONS` (SAME
-    model — spreads throttle without changing what's measured); other providers are single."""
+    model - spreads throttle without changing what's measured); other providers are single."""
     kind = ProviderKind(spec.provider)
     if kind is ProviderKind.BEDROCK:
-        regions = [spec.region] + [r for r in _TARGET_FALLBACK_REGIONS if r != spec.region]
+        # Spread across regions only when the primary region is EXPLICIT: with region=None the
+        # primary already resolves via AWS_REGION/the boto3 chain, and appending a literal
+        # us-east-1 rung could just re-hit the same endpoint (a no-op duplicate) if that is what
+        # the ambient region resolves to. The direct-Anthropic rung below is the real resilience.
+        regions: list[str | None] = [spec.region]
+        if spec.region is not None:
+            regions += [r for r in _TARGET_FALLBACK_REGIONS if r != spec.region]
         configs = [ProviderConfig(kind=kind, model=spec.model, region=r) for r in regions]
         # Then fail over to the SAME model on the direct Anthropic API (unlimited key), so a target
         # throttled across all Bedrock regions still produces real predictions on the identical
-        # model instead of scoring the step 0 — critical for Opus 4.8 under Bedrock load.
+        # model instead of scoring the step 0 - critical for Opus 4.8 under Bedrock load.
         direct = anthropic_direct_id(spec.model)
         if direct is not None:
             configs.append(ProviderConfig(kind=ProviderKind.ANTHROPIC, model=direct))
@@ -255,11 +273,17 @@ def run_grid(
     """
     from pathlib import Path
 
-    from wmh.engine.build import split_traces_3way
+    from wmh.engine.build import split_traces, split_traces_3way
     from wmh.ingest import get_adapter
 
     if val_frac is None:
         val_frac = (1.0 - train_split) / 2
+    # A 3-way split needs a strictly positive val band that still leaves a non-empty test band. When
+    # `train_split` leaves no room (e.g. train_split >= 1.0, or a --val-frac that overflows the
+    # [0,1) line) fall back to the plain 2-way split instead of crashing in `split_traces_3way`.
+    use_3way = val_frac > 0 and train_split + val_frac < 1
+    if not use_3way:
+        val_frac = 0.0
     judge = _make_judge(judge_provider, judge_model, judge_region, provider_factory)
     result = GridResult(
         suite=suite_name,
@@ -273,12 +297,15 @@ def run_grid(
     )
     paths = [Path(f) for f in files]
 
-    # Held-out trace count (for reporting) — the reserved TEST band each cell scores, after any cap.
+    # Held-out trace count (for reporting) - the reserved TEST band each cell scores, after any cap.
     # Uses the same 3-way split as the scorer so the count matches what is actually evaluated.
     adapter = get_adapter("otel-genai")
     for path in paths:
         traces = adapter.from_file(str(path))
-        _, _, holdout = split_traces_3way(traces, train_split, val_frac)
+        if use_3way:
+            _, _, holdout = split_traces_3way(traces, train_split, val_frac)
+        else:
+            _, holdout = split_traces(traces, train_split)
         holdout = holdout or traces
         if max_holdout_traces is not None:
             holdout = holdout[:max_holdout_traces]
@@ -292,7 +319,9 @@ def run_grid(
             # `gepa`/`gepa_rag` cells would just re-run `base`/`base_rag` and report the judge/
             # sampling noise between the two runs as a spurious "GEPA lift". Treat a base-identical
             # evolved prompt as NO evolved prompt so the grid never presents that noise as a delta.
-            gepa_prompt = text if text != base_prompt else None
+            # Compare stripped so a prompt that differs only by trailing whitespace (a common
+            # artifact of hand-edited/exported prompt files) is still caught as a no-op.
+            gepa_prompt = text if text.strip() != base_prompt.strip() else None
         for condition in CONDITIONS:
             uses_gepa = condition in ("gepa", "gepa_rag")
             if uses_gepa and gepa_prompt is None:
@@ -321,7 +350,10 @@ def run_grid(
                     max_holdout_traces=max_holdout_traces,
                 )
             fidelity, err, steps = _aggregate(report)
-            result.total_test_steps = steps
+            # Every cell scores the same held-out band with the same sampling, so `steps` is
+            # invariant across cells; take the max defensively so the reported count can never
+            # under-report if a future per-model option makes one cell score fewer steps.
+            result.total_test_steps = max(result.total_test_steps, steps)
             result.cells.append(
                 GridCell(
                     model_label=spec.label,

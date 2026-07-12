@@ -1024,7 +1024,7 @@ def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | N
     """Merge one or more grid result JSONs and render a single combined fidelity chart.
 
     Lets a self-hosted model's grid (run in its own process, since its OpenAI base URL is
-    process-global) be combined with the API-model grid into one chart — and re-plots any saved
+    process-global) be combined with the API-model grid into one chart - and re-plots any saved
     result without re-running the eval.
     """
     results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]

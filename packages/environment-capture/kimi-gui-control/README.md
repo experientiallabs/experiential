@@ -7,12 +7,12 @@ agent reads the accessibility tree, takes a single targeted action, and re-reads
 
 ## Contents
 
-- `traces.otel.jsonl` — the trace corpus (**Hub-hosted, not committed**; see § Data & license):
+- `traces.otel.jsonl` - the trace corpus (**Hub-hosted, not committed**; see § Data & license):
   ~60 trajectories, one Step per agent tool call, enough for the 30 train / 8 val / 8 test benchmark
   split. Materialize it with `uv run wmh download kimi-gui-control` (or
   `uv run python -m environment_capture.hub fetch kimi-gui-control`).
-- `convert_to_wmh.py` — the converter that produced the corpus (see § Regenerate).
-- `evals/default.toml` — fidelity suite; run with
+- `convert_to_wmh.py` - the converter that produced the corpus (see § Regenerate).
+- `evals/default.toml` - fidelity suite; run with
   `uv run wmh eval run kimi-gui-control/default --examples-root packages/environment-capture`.
 
 ## What the converter produces
@@ -21,10 +21,10 @@ agent reads the accessibility tree, takes a single targeted action, and re-reads
 so it never loads the file into memory) and emits one trace per trajectory, one Step per agent
 **tool call**:
 
-- `action` — the real tool call (`name` + `arguments`, e.g. `read`, `bash`, GUI actions).
-- `observation` — the **real recorded tool output** the agent saw (`gen_ai.tool.message`), error
+- `action` - the real tool call (`name` + `arguments`, e.g. `read`, `bash`, GUI actions).
+- `observation` - the **real recorded tool output** the agent saw (`gen_ai.tool.message`), error
   flag from the recorded `isError`.
-- `Trace.metadata` — `benchmark`, `task_category`, `task_url`, `model`, `provider`, `returncode`.
+- `Trace.metadata` - `benchmark`, `task_category`, `task_url`, `model`, `provider`, `returncode`.
 
 `state_before` is intentionally **empty**: the real GUI/OS state (full accessibility tree, open
 windows, filesystem) isn't captured as a compact snapshot. Open-loop replay reconstructs the
@@ -48,7 +48,7 @@ OTel-GenAI span JSONL that `wmh.ingest.otel_genai` reads directly.
 
 ## Regenerate
 
-From the raw screenpipe dump (path is machine-local — the ~9 GB source is not redistributed):
+From the raw screenpipe dump (path is machine-local - the ~9 GB source is not redistributed):
 
 ```bash
 cd packages/environment-capture/kimi-gui-control

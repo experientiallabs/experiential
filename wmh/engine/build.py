@@ -175,7 +175,7 @@ def build(
     # held-out split still backs `wmh eval`.
     gepa_val = _cap_gepa_valset(val or train)
     result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
-    # A GEPA candidate can be empty — a weak reflection LM (e.g. a self-reflecting open model)
+    # A GEPA candidate can be empty - a weak reflection LM (e.g. a self-reflecting open model)
     # sometimes proposes a blank env prompt that still scores acceptably on easy steps and gets
     # selected. An empty env prompt is never a valid artifact, so fall back to base.
     if not result.prompt.strip():
