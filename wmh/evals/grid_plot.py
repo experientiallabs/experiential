@@ -15,7 +15,7 @@ from wmh.evals.grid import CONDITIONS, GridResult
 _TITLE = "World-Model Harness Fidelity"
 
 # Brand palette (AGENTS.md rule 15) — no ad-hoc colors. Ink for text/lines, a light gridline, and
-# one brand hue per condition so a bar's color reads its condition regardless of its sorted position.
+# one brand hue per condition so a bar's color reads its condition regardless of sorted position.
 _INK = "#0a0a0a"
 _GRIDLINE = "#ececec"
 _BRAND_BY_CONDITION = {

@@ -6,10 +6,10 @@ azure-foundry driving macOS GUI apps through the Accessibility API + shell). It 
 (one 9GB file holds 1000 trajectories), so this reads it STREAMING, one line at a time, and never
 loads the whole file into memory.
 
-Like the tau-bench converter, this does NOT import `wmh` — it only emits the OTel-GenAI span JSONL
-shape that `wmh.ingest.otel_genai` reads, so the world-model-harness package stays free of any
-capture-side dependency. Only the produced `traces.otel.jsonl` is carried back into the example
-folder.
+Like the other environment-capture converters, this does NOT import `wmh` — it only emits the
+OTel-GenAI span JSONL shape that `wmh.ingest.otel_genai` reads, so the world-model-harness package
+stays free of any capture-side dependency. The produced `traces.otel.jsonl` is Hub-hosted, not
+committed (see this corpus's README § Data & license).
 
 What it produces, per trajectory (one trace), faithful to the contract open-loop replay needs:
   - one Step per AGENT TOOL CALL: action = the real tool call (name + arguments), observation = the
@@ -90,30 +90,34 @@ def _spans_for_trajectory(record: dict[str, Any], *, trace_id: str) -> list[dict
         if ordinal == 0:
             action_attrs.append(_attr("wmh.trace.metadata", json.dumps(metadata)))
 
-        spans.append({
-            "traceId": trace_id,
-            "spanId": f"{trace_id[:12]}{ordinal:04x}a",
-            "parentSpanId": "",
-            "name": "chat kimi-gui-control",
-            "startTimeUnixNano": ordinal * 10,
-            "endTimeUnixNano": ordinal * 10 + 1,
-            "status": {"code": "STATUS_CODE_OK"},
-            "attributes": action_attrs,
-        })
-        spans.append({
-            "traceId": trace_id,
-            "spanId": f"{trace_id[:12]}{ordinal:04x}b",
-            "parentSpanId": "",
-            "name": "execute_tool kimi-gui-control",
-            "startTimeUnixNano": ordinal * 10 + 2,
-            "endTimeUnixNano": ordinal * 10 + 3,
-            "status": {"code": "STATUS_CODE_ERROR" if obs_error else "STATUS_CODE_OK"},
-            "attributes": [
-                _attr("gen_ai.operation.name", "execute_tool"),
-                _attr("gen_ai.tool.name", str(name)),
-                _attr("gen_ai.tool.message", obs_content),
-            ],
-        })
+        spans.append(
+            {
+                "traceId": trace_id,
+                "spanId": f"{trace_id[:12]}{ordinal:04x}a",
+                "parentSpanId": "",
+                "name": "chat kimi-gui-control",
+                "startTimeUnixNano": ordinal * 10,
+                "endTimeUnixNano": ordinal * 10 + 1,
+                "status": {"code": "STATUS_CODE_OK"},
+                "attributes": action_attrs,
+            }
+        )
+        spans.append(
+            {
+                "traceId": trace_id,
+                "spanId": f"{trace_id[:12]}{ordinal:04x}b",
+                "parentSpanId": "",
+                "name": "execute_tool kimi-gui-control",
+                "startTimeUnixNano": ordinal * 10 + 2,
+                "endTimeUnixNano": ordinal * 10 + 3,
+                "status": {"code": "STATUS_CODE_ERROR" if obs_error else "STATUS_CODE_OK"},
+                "attributes": [
+                    _attr("gen_ai.operation.name", "execute_tool"),
+                    _attr("gen_ai.tool.name", str(name)),
+                    _attr("gen_ai.tool.message", obs_content),
+                ],
+            }
+        )
     return spans
 
 

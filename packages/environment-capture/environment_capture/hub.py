@@ -159,6 +159,16 @@ CORPORA: dict[str, CorpusSpec] = {
                 "exploration and repo edits inside per-instance Docker images."
             ),
         ),
+        CorpusSpec(
+            benchmark="kimi-gui-control",
+            license_id="mit",
+            upstream="mediar-ai/screenpipe gui-control (MIT); trajectories captured with "
+            "Kimi-K2.6 via Azure AI Foundry",
+            description=(
+                "Computer-use agent runs driving macOS GUI apps through the Accessibility API "
+                "plus a shell: real tool calls and the accessibility-tree/command outputs they saw."
+            ),
+        ),
     )
 }
 

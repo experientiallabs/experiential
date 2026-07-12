@@ -22,23 +22,30 @@ A model with no evolved prompt in the `--gepa-prompts` dir is scored on `base`/`
 ## Invariants (what makes cells comparable)
 
 - **Pinned judge.** One Bedrock Opus-4.8 `RubricJudge` grades every cell, regardless of target — a
-  Qwen target is never judged by Qwen.
-- **Capacity fallover.** The judge and any Bedrock target fail over on capacity errors to the *same
-  model on the direct Anthropic API* (`wmh.providers.with_anthropic_fallover` /
-  `anthropic_direct_id`) — Bedrock Opus is heavily throttled; the direct API is the identical model,
-  so what's measured is unchanged. The judge then falls further to Bedrock resilience models.
-- **Leak-free splits.** Prompts are built with the 3-way `train/val/test` split (GEPA selects on
-  `val`); the grid reports on the reserved `test` band, so a `+GEPA` cell is never scored on traces
-  it was tuned on.
+  Qwen target is never judged by Qwen — and it **never switches models**. Its `JUDGE_VERSION`
+  (currently `rubric-v2`) is stamped on the result JSON; numbers from different judge versions are
+  not comparable, so never mix them in one chart.
+- **Same-model capacity fallover.** A Bedrock target fails over on capacity errors across regions
+  and then to the *same model on the direct Anthropic API* (Bedrock Opus is heavily throttled; the
+  direct API is the identical model, so what's measured is unchanged — see `wmh.evals.failover`).
+  The pinned judge fails over *only* to that same-model direct API, never to a different model — a
+  judge that swapped models mid-grid would score cells on different scales (cf.
+  `docs/reference/failover.md`).
+- **Leak-free splits.** Cells score the reserved `test` band of the same 3-way `train/val/test`
+  split GEPA used (`--val-frac`, default `(1 - train_split)/2`, matching `wmh build`); GEPA selects
+  on `val`, so a `+GEPA` cell is never scored on the traces its prompt was tuned on. A GEPA prompt
+  byte-identical to base is treated as "no evolved prompt" (its GEPA cells are skipped) so
+  same-prompt noise is never reported as a `+GEPA` delta.
 - **Cost is target-side.** A `MeteredProvider` wraps only the target, so each cell's `$` is target
-  inference cost (never judge cost); self-hosted models report no cost.
+  inference cost (never judge cost); a self-hosted model has no pricing row and reports no cost
+  (blank, not a misleading `$0.00`).
 - **Bounded target output.** `CappedProvider` clamps the target's `max_tokens` so a reasoning target
   can't make a grid take hours; the judge is uncapped.
 
 ## Commands
 
 ```bash
-# One benchmark, 4 API models × 4 conditions -> result JSON + fidelity bar chart PNG
+# One benchmark, N API models × 4 conditions -> result JSON + fidelity bar chart PNG
 wmh eval grid <suite> \
   --models "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,GPT-5.5:openai:gpt-5.5" \
   --gepa-prompts <dir-of-<label>.txt-prompts> --limit-traces 8 --out grid.png
@@ -52,11 +59,16 @@ wmh eval grid-heatmap <result.json>... --out heatmap.png
 ```
 
 `--models` entries are `Label:provider:model` (a self-hosted vLLM model is just `provider=openai`
-with `OPENAI_BASE_URL` set). Results write to `.wmh/evals/grid/` (or `--out`).
+with `OPENAI_BASE_URL` set). `--gepa-prompts` points at a directory of `<label>.txt` evolved prompts
+(a model with no matching file, or one whose file equals the base prompt, is scored on
+`base`/`base_rag` only). Results write to `.wmh/evals/grid/<suite>-<runid>.json` unless `--out` is
+given; every figure is re-renderable from that JSON with `grid-plot` / `grid-heatmap`, so charts
+are never committed.
 
-## This repo's reference run
+## Reproducing a full grid
 
-The 4-benchmark × 5-model grid (terminal-tasks, tau-bench, kimi-gui-control, swe-bench) and its
-inputs live under `.agents/docs/research/benchmark-grid/`: the rendered charts + heatmap, the result
-JSONs, the 20 GEPA-evolved prompts (`gepa-prompts/<suite>/`), and the Kimi-K2.6 corpus
-(`corpus/kimi-gui-control/`). Re-render any figure from the JSONs with `grid-plot` / `grid-heatmap`.
+The trace corpora are the ones under `packages/environment-capture/<suite>/` (e.g.
+`kimi-gui-control`, `tau-bench`, `terminal-tasks`, `swe-bench`) — fetch a corpus with
+`wmh download <suite>`, evolve one prompt per (suite × model) with `wmh build`, collect them into a
+`--gepa-prompts` directory as `<label>.txt`, then run `wmh eval grid <suite>/default` per benchmark
+and `grid-heatmap` across the saved JSONs. All cells in a comparison must share one `JUDGE_VERSION`.

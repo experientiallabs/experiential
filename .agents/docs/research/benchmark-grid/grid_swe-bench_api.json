@@ -2,6 +2,7 @@
   "suite": "swe-bench/default",
   "judge_model": "us.anthropic.claude-opus-4-8",
   "judge_provider": "bedrock",
+  "judge_version": "rubric-v1",
   "train_split": 0.85,
   "top_k": 5,
   "seed": 0,

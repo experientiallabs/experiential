@@ -112,6 +112,32 @@ def test_run_grid_produces_a_cell_per_model_and_condition(tmp_path) -> None:  # 
     assert result.judge_model == "us.anthropic.claude-opus-4-8"
 
 
+def test_base_identical_gepa_prompt_skips_gepa_cells(tmp_path) -> None:  # noqa: ANN001 - fixture
+    # A GEPA prompt byte-identical to base carries no lift; its gepa/gepa_rag cells must be skipped
+    # so the grid never reports same-prompt-rerun noise as a GEPA delta.
+    traces = _tiny_trace_file(tmp_path)
+    noop = tmp_path / "noop.txt"
+    noop.write_text("BASE PROMPT", encoding="utf-8")  # identical to base_prompt below
+    result = run_grid(
+        suite_name="tiny",
+        files=[traces],
+        models=[ModelSpec("Opus 4.8", "bedrock", "us.anthropic.claude-opus-4-8")],
+        gepa_prompts={"Opus 4.8": str(noop)},
+        base_prompt="BASE PROMPT",
+        judge_provider="bedrock",
+        judge_model="us.anthropic.claude-opus-4-8",
+        judge_region=None,
+        train_split=0.7,
+        top_k=5,
+        seed=0,
+        sample_turns="all",
+        embed_dim=2,
+        provider_factory=_factory,
+    )
+    conds = {c.condition for c in result.cells}
+    assert conds == {"base", "base_rag"}  # no gepa/gepa_rag — the no-op prompt was treated as none
+
+
 def test_grid_cost_is_none_for_unpriced_model(tmp_path) -> None:  # noqa: ANN001 - fixture
     traces = _tiny_trace_file(tmp_path)
     result = run_grid(

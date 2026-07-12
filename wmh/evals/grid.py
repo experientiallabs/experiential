@@ -285,15 +285,20 @@ def run_grid(
         result.total_test_traces += len(holdout)
     for spec in models:
         gepa_prompt_file = (gepa_prompts or {}).get(spec.label)
+        gepa_prompt: str | None = None
+        if gepa_prompt_file is not None:
+            text = Path(gepa_prompt_file).read_text(encoding="utf-8")
+            # A GEPA run that finds no improvement returns the base prompt verbatim. Scoring its
+            # `gepa`/`gepa_rag` cells would just re-run `base`/`base_rag` and report the judge/
+            # sampling noise between the two runs as a spurious "GEPA lift". Treat a base-identical
+            # evolved prompt as NO evolved prompt so the grid never presents that noise as a delta.
+            gepa_prompt = text if text != base_prompt else None
         for condition in CONDITIONS:
             uses_gepa = condition in ("gepa", "gepa_rag")
-            if uses_gepa and gepa_prompt_file is None:
-                continue  # no evolved prompt for this model -> skip its GEPA cells
-            if uses_gepa:
-                assert gepa_prompt_file is not None  # noqa: S101 - narrowed by the guard above
-                prompt = Path(gepa_prompt_file).read_text(encoding="utf-8")
-            else:
-                prompt = base_prompt
+            if uses_gepa and gepa_prompt is None:
+                continue  # no (real) evolved prompt for this model -> skip its GEPA cells
+            prompt = gepa_prompt if uses_gepa else base_prompt
+            assert prompt is not None  # noqa: S101 - narrowed by the guard above
             use_rag = condition in ("base_rag", "gepa_rag")
             # Meter ONLY the target so cost is target-side, never judge cost. The target itself may
             # be a region-fallback chain (Bedrock); MeteredProvider records whichever entry served.
