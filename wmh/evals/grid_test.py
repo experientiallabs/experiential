@@ -16,6 +16,7 @@ from wmh.evals.grid import (
     merge_results,
     run_grid,
 )
+from wmh.optimize.judge import RubricJudge
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 
@@ -180,6 +181,7 @@ def test_bedrock_judge_and_target_get_same_model_chains() -> None:
     # The judge NEVER switches to a different model (no resilience models) — only the same model on
     # the unlimited direct API, so cells stay comparable.
     judge = _make_judge("bedrock", "us.anthropic.claude-opus-4-8", "us-west-1", tracking_factory)
+    assert isinstance(judge, RubricJudge)  # the only judge kind; narrows for the attr check below
     assert isinstance(judge._provider, SameModelFailover)  # noqa: SLF001 - inspect wrapped provider
     assert built == [
         "us.anthropic.claude-opus-4-8@us-west-1",  # pinned Bedrock primary
@@ -233,7 +235,7 @@ def test_capped_provider_clamps_target_max_tokens() -> None:
         def embed(self, texts) -> list:  # noqa: ANN001
             return [[0.0] for _ in texts]
 
-        def verify(self) -> None:
+        def verify(self):  # noqa: ANN202 - unused on the eval path
             raise NotImplementedError
 
     capped = CappedProvider(_Recorder(), 4096)
