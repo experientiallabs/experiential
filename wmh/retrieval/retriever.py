@@ -11,6 +11,7 @@ steps (`add`).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
@@ -132,6 +133,10 @@ class EmbeddingRetriever:
         with (path / _STEPS_FILE).open("w", encoding="utf-8") as fh:
             for step in self._steps:
                 fh.write(step.model_dump_json() + "\n")
+        # Persist key_mode: the matrix was embedded from this mode's key text, so a reload MUST
+        # query in the same mode or it cosine-compares mismatched embedding spaces (no dim error,
+        # just near-random neighbours). Without this, a reloaded index reverts to state_action.
+        (path / _META_FILE).write_text(json.dumps({"key_mode": self._key_mode}), encoding="utf-8")
 
     def load(self, index_dir: str | Path) -> None:
         """Reload a buffer previously written by `save`, replacing any current contents."""
@@ -144,10 +149,18 @@ class EmbeddingRetriever:
         ]
         self._steps = steps
         self._matrix = matrix if matrix.size and steps else None
+        # Restore the mode the matrix was built with (older indexes predate meta.json -> default).
+        meta_path = path / _META_FILE
+        if meta_path.exists():
+            mode = json.loads(meta_path.read_text(encoding="utf-8")).get("key_mode", "state_action")
+            if mode not in ("state_action", "action"):
+                raise ValueError(f"index meta has invalid key_mode {mode!r}")
+            self._key_mode = mode
 
 
 _MATRIX_FILE = "embeddings.npy"
 _STEPS_FILE = "steps.jsonl"
+_META_FILE = "meta.json"
 
 
 def _cosine(query: NDArray[np.float64], matrix: NDArray[np.float64]) -> NDArray[np.float64]:

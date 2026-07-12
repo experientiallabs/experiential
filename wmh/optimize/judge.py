@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -36,6 +36,10 @@ JUDGE_VERSION = "rubric-v2"
 # The five fidelity dimensions, scored independently in 0..1. Modeled on Qwen-AgentWorld
 # (arXiv 2606.24597) "AgentWorldBench" rubric.
 RUBRIC_DIMENSIONS = ("format", "factuality", "consistency", "realism", "quality")
+
+# The same five names as a type, for callers that select one dimension (e.g. score_prompt's
+# `score_dimension`). Keep in sync with RUBRIC_DIMENSIONS above.
+RubricDimension = Literal["format", "factuality", "consistency", "realism", "quality"]
 
 # Headline weights. Factuality dominates because it *is* the definition of functional
 # equivalence (same outcome, errors, and salient data the agent would act on); quality is the

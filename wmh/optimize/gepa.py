@@ -85,6 +85,7 @@ def predict_observation(
     action: Action,
     demos: list[Step],
     history: list[Step] | None = None,
+    *,
     max_retrieved_observation_chars: int | None = None,
 ) -> Observation:
     """Predict the observation for (state, action) under `prompt`, using only a Provider.

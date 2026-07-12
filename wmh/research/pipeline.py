@@ -24,7 +24,7 @@ import logging
 from wmh.core.types import Trace
 from wmh.engine.replay import replay
 from wmh.optimize.gepa import GEPAOptimizer, OptimizeResult
-from wmh.optimize.judge import RUBRIC_DIMENSIONS, Judge
+from wmh.optimize.judge import RUBRIC_DIMENSIONS, Judge, RubricDimension
 from wmh.providers.base import Embedder, Provider
 from wmh.retrieval import EmbeddingRetriever, RetrievalKey
 
@@ -66,7 +66,7 @@ def score_prompt(
     concurrency: int = 1,
     max_retrieved_observation_chars: int | None = None,
     retrieval_key: RetrievalKey = "state_action",
-    score_dimension: str | None = None,
+    score_dimension: RubricDimension | None = None,
 ) -> float:
     """Replay-score `prompt`'s held-out fidelity, leak-free. Returns the mean judge score (0..1).
 
@@ -123,10 +123,11 @@ def score_prompt(
             report.n_invalid,
             report.n_steps,
         )
-    if score_dimension is not None:
+    if score_dimension is not None and report.n_steps:
         # Mirror the mean's rule: aggregate the chosen dimension over VALID steps only, and raise
-        # (never silently return 0.0) if none carried it — an empty result is a judge outage or a
-        # judge without that dimension, not genuine zero fidelity.
+        # (never silently return 0.0) if none carried it — an empty result over scored steps is a
+        # judge outage or a judge without that dimension, not genuine zero fidelity. An empty
+        # held-out set (n_steps == 0) falls through to `mean_score` (0.0), matching the headline.
         vals = [
             r.dimensions[score_dimension]
             for r in report.results

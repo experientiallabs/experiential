@@ -130,7 +130,7 @@ def test_score_prompt_rejects_unknown_score_dimension() -> None:
             judge=FakeJudge(score=0.6),
             embedder=None,
             train=None,
-            score_dimension="nonexistent_dim",
+            score_dimension="nonexistent_dim",  # ty: ignore[invalid-argument-type]
         )
 
 

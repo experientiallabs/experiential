@@ -6,6 +6,8 @@ so we can assert exact top-k ordering by cosine similarity without any network.
 
 from __future__ import annotations
 
+import pytest
+
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval.retriever import EmbeddingRetriever, Retriever
@@ -170,8 +172,6 @@ def test_key_mode_action_embeds_command_only_not_state_scaffolding() -> None:
 
 
 def test_key_mode_rejects_unknown() -> None:
-    import pytest
-
     emb = _RecordingEmbedder()
     # The Literal type rules this out statically; the runtime guard still defends untyped callers
     # (e.g. a raw CLI string), which is what this asserts.

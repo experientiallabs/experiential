@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from wmh.core.render import (
     build_env_prompt,
+    encode_action,
     encode_state_action,
     render_action,
     render_demo,
@@ -88,8 +89,6 @@ def test_build_env_prompt_handles_empty_optional_blocks() -> None:
 
 
 def test_encode_action_is_command_only() -> None:
-    from wmh.core.render import encode_action
-
     action = Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "pytest -q"})
     key = encode_action(action)
     assert "bash" in key and "pytest -q" in key

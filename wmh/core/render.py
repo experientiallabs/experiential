@@ -43,12 +43,15 @@ def encode_action(action: Action) -> str:
     dominates the embedding and dilutes the part that actually varies — the command. Embedding just
     the action concentrates the signal, which helps a semantic embedder find same-intent neighbours.
     """
+    # Truthy checks (not `is not None`): a blank name/content contributes no retrieval signal, and
+    # an all-blank action would otherwise embed as an empty string — indistinguishable from every
+    # other blank step. Fall back to `render_action` (labelled, never empty) in that case.
     parts: list[str] = []
     if action.name:
         parts.append(action.name)
     if action.arguments:
         parts.append(render_json(action.arguments))
-    if action.content is not None:
+    if action.content:
         parts.append(action.content)
     return " ".join(parts) if parts else render_action(action)
 

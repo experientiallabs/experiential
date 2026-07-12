@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from wmh.core.types import JsonValue, Trace
+from wmh.optimize.judge import RubricDimension
 from wmh.research.ablation import Condition
 from wmh.research.pipeline import optimize_prompt, score_prompt
 from wmh.research.scaling_split import CorpusSplit, partition_corpus, subsample_train
@@ -84,7 +85,7 @@ class TraceScalingAblation:
         concurrency: int = 1,
         max_retrieved_observation_chars: int | None = None,
         retrieval_key: RetrievalKey = "state_action",
-        score_dimension: str | None = None,
+        score_dimension: RubricDimension | None = None,
     ) -> None:
         self._base_prompt = base_prompt
         self._make_backends = make_backends
@@ -96,6 +97,18 @@ class TraceScalingAblation:
         self._retrieval_key = retrieval_key
         self._score_dimension = score_dimension
         self._modes = list(modes)
+        # GEPA optimizes under DEFAULT retrieval (optimize_prompt does not yet thread these knobs),
+        # so scoring the evolved prompt under a non-default key/cap would measure it on a retrieval
+        # distribution it never optimized for — a confounded gepa-vs-base comparison. Fail fast
+        # rather than silently bias the curve; the base arm honours these knobs.
+        if GEPA in self._modes and (
+            retrieval_key != "state_action" or max_retrieved_observation_chars is not None
+        ):
+            raise ValueError(
+                "gepa mode does not honour retrieval_key / max_retrieved_observation_chars yet; "
+                "combining them would score the evolved prompt under retrieval it never optimized "
+                "for. Use gepa with default retrieval, or restrict these knobs to base mode."
+            )
         self._split: CorpusSplit = partition_corpus(
             corpus, test_frac=test_frac, valid_frac=valid_frac
         )

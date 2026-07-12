@@ -150,6 +150,7 @@ def _score_step(
     judge: Judge,
     demos: DemoRetriever,
     history: list[Step],
+    *,
     max_retrieved_observation_chars: int | None = None,
 ) -> StepResult:
     """Predict the observation for one step and score it against the recorded observation."""
