@@ -7,11 +7,13 @@ modes (`base` = shipped prompt + RAG, `gepa` = GEPA-optimized per count), report
 mean ± std across seeds at each point. The curve says whether more traces keep buying fidelity or
 saturate.
 
-    # cheap base curve first, then the GEPA curve (optimize on Opus 4.7 to dodge 4.8 throttling):
-    AWS_REGION=us-east-1 uv run python scripts/run_trace_scaling.py tau-bench \
-        --counts 10,20,50,100,200,400 --modes base --seeds 0,1 --out scaling_base.json
-    AWS_REGION=us-east-1 uv run python scripts/run_trace_scaling.py tau-bench \
-        --counts 10,20,50,100,200,400 --modes gepa --budget 12 --seeds 0,1 \
+    # RAG-only base curve (the published run: log ladder, capped at the corpus, seeds 0/1):
+    AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_trace_scaling.py \
+        tau-bench --counts 1,4,16,64,256,648 --modes base --seeds 0,1 --sample-turns sampled \
+        --test-cap 40 --concurrency 8 --opt-model us.anthropic.claude-opus-4-8 --out base.json
+    # optional GEPA curve (optimize on Opus 4.7 to dodge 4.8 throttling):
+    AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_trace_scaling.py \
+        tau-bench --counts 1,4,16,64,256,648 --modes gepa --budget 12 --seeds 0,1 \
         --opt-model us.anthropic.claude-opus-4-7 --out scaling_gepa.json
 
 Resolves the corpus from an **eval suite** name (`tau-bench`) or a raw `--file`. The judge defaults
@@ -30,13 +32,15 @@ from wmh.ingest import get_adapter
 from wmh.optimize.judge import Judge, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, get_provider
 from wmh.providers.base import Embedder, Provider
+from wmh.providers.retry import RetryingProvider
 from wmh.research import TraceScalingAblation, run_ablation
 from wmh.research.ablation import AblationReport, Condition
 from wmh.retrieval import HashingEmbedder
 
-# Default scaling ladder: dense at the low end (where the curve bends), capped at the corpus by the
-# ablation. Override with --counts.
-DEFAULT_COUNTS = "10,20,50,100,200,400,800"
+
+# Default scaling ladder: log-spaced from a single trace up, capped at the corpus by the ablation
+# (tau-bench tops out at its 648 pool; terminal-tasks/swe-bench at theirs). Override with --counts.
+DEFAULT_COUNTS = "1,4,16,64,256,648"
 
 
 def _parse_ints(text: str) -> list[int]:
@@ -47,28 +51,53 @@ def _parse_strs(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
 
+def _build_embedder(args: argparse.Namespace) -> Embedder | None:
+    """The phi embedder: None (--no-rag), offline hashing, or Azure ada-002 (--embedder azure).
+
+    Azure reads AZURE_OPENAI_API_KEY from the env; ada-002 has a fixed 1536-dim output (no
+    `dimensions` param), so embed_dim is left None.
+    """
+    if args.no_rag:
+        return None
+    if args.embedder == "azure":
+        return RetryingProvider(
+            get_provider(
+                ProviderConfig(
+                    kind=ProviderKind.AZURE_OPENAI,
+                    model=args.opt_model,
+                    endpoint=args.embed_endpoint,
+                    api_version=args.embed_api_version,
+                    embed_model=args.embed_deployment,
+                    embed_dim=None,
+                )
+            )
+        )
+    return HashingEmbedder(dim=args.embed_dim)
+
+
 def _make_backends(
-    judge_model: str,
-    opt_model: str,
-    region: str | None,
-    embed_dim: int,
-    no_rag: bool,
+    args: argparse.Namespace,
 ) -> Callable[[], tuple[Provider, Judge, Embedder | None]]:
     """Factory the ablation calls per run for (provider, judge, embedder).
 
-    `provider` is the model GEPA optimizes/serves with — defaulting to `opt_model` (use 4.6/4.7 to
-    avoid 4.8's Bedrock throttling). The judge is scored with `judge_model` so fidelity stays
-    comparable to the rest of the harness. Both run on Bedrock; the embedder is the offline
-    HashingEmbedder (no creds) unless --no-rag.
+    `provider` is the model that serves the world model (defaulting to `--opt-model`); the judge runs
+    on `--judge-model` so fidelity stays comparable to the rest of the harness. Both are wrapped in
+    the shared `RetryingProvider` (llm-waterfall backoff) so a long fallback-less sweep rides through
+    transient Bedrock capacity errors. The embedder is offline hashing (default), Azure ada-002
+    (`--embedder azure`, semantic), or None (`--no-rag`).
     """
-    serve: Provider = get_provider(
-        ProviderConfig(kind=ProviderKind.BEDROCK, model=opt_model, region=region)
+    serve: Provider = RetryingProvider(
+        get_provider(
+            ProviderConfig(kind=ProviderKind.BEDROCK, model=args.opt_model, region=args.region)
+        )
     )
-    judge_provider: Provider = get_provider(
-        ProviderConfig(kind=ProviderKind.BEDROCK, model=judge_model, region=region)
+    judge_provider: Provider = RetryingProvider(
+        get_provider(
+            ProviderConfig(kind=ProviderKind.BEDROCK, model=args.judge_model, region=args.region)
+        )
     )
     scorer: Judge = RubricJudge(judge_provider)
-    embedder: Embedder | None = None if no_rag else HashingEmbedder(dim=embed_dim)
+    embedder = _build_embedder(args)
 
     def factory() -> tuple[Provider, Judge, Embedder | None]:
         return serve, scorer, embedder
@@ -98,9 +127,7 @@ def _run(args: argparse.Namespace) -> AblationReport:
     ablation = TraceScalingAblation(
         traces,
         BASE_ENV_PROMPT,
-        make_backends=_make_backends(
-            args.judge_model, args.opt_model, args.region, args.embed_dim, args.no_rag
-        ),
+        make_backends=_make_backends(args),
         counts=_parse_ints(args.counts),
         modes=_parse_strs(args.modes),
         budget=args.budget,
@@ -110,6 +137,9 @@ def _run(args: argparse.Namespace) -> AblationReport:
         sample_turns=args.sample_turns,
         test_cap=args.test_cap,
         concurrency=args.concurrency,
+        max_retrieved_observation_chars=args.max_retrieved_observation_chars,
+        retrieval_key=args.retrieval_key,
+        score_dimension=args.score_dimension,
     )
     split = ablation.split
     scored = len(ablation.scored_test)
@@ -173,7 +203,34 @@ def main() -> None:
         "--judge-model", default="us.anthropic.claude-opus-4-8", help="Bedrock model for the judge."
     )
     parser.add_argument("--region", default="us-east-1", help="AWS region (Bedrock).")
-    parser.add_argument("--embed-dim", type=int, default=512, help="phi dim (offline embedder).")
+    parser.add_argument("--embed-dim", type=int, default=512, help="phi dim (hashing embedder).")
+    parser.add_argument(
+        "--embedder", default="hashing", choices=["hashing", "azure"],
+        help="Retrieval phi: hashing (lexical, offline) | azure (semantic ada-002).",
+    )
+    parser.add_argument(
+        "--embed-endpoint", default="https://endflow-southcentralus.openai.azure.com",
+        help="Azure OpenAI base endpoint (--embedder azure).",
+    )
+    parser.add_argument(
+        "--embed-deployment", default="text-embedding-ada-002",
+        help="Azure embedding deployment name (--embedder azure).",
+    )
+    parser.add_argument(
+        "--embed-api-version", default="2024-12-01-preview", help="Azure API version.",
+    )
+    parser.add_argument(
+        "--max-retrieved-observation-chars", type=int, default=None,
+        help="Keep only the first N chars of each retrieved observation (bounds prompt growth).",
+    )
+    parser.add_argument(
+        "--retrieval-key", default="state_action", choices=["state_action", "action"],
+        help="What phi embeds: state_action (full summary) | action (command-only).",
+    )
+    parser.add_argument(
+        "--score-dimension", default=None,
+        help="Report one RubricJudge dimension (e.g. factuality) not the mean-of-5 headline.",
+    )
     parser.add_argument("--no-rag", action="store_true", help="Disable retrieval (zero-shot).")
     parser.add_argument("--out", default=None, help="Path to write the AblationReport JSON.")
     args = parser.parse_args()
