@@ -35,6 +35,24 @@ def render_action(action: Action) -> str:
     return f"message: {action.content or ''}"
 
 
+def encode_action(action: Action) -> str:
+    """Command-only retrieval key: the action itself (tool + arguments, or message) with none of the
+    `STATE:` / `ACTION kind=` scaffolding `encode_state_action` adds.
+
+    For stateless traces (empty env state) that scaffolding is constant across every step, so it
+    dominates the embedding and dilutes the part that actually varies — the command. Embedding just
+    the action concentrates the signal, which helps a semantic embedder find same-intent neighbours.
+    """
+    parts: list[str] = []
+    if action.name:
+        parts.append(action.name)
+    if action.arguments:
+        parts.append(render_json(action.arguments))
+    if action.content is not None:
+        parts.append(action.content)
+    return " ".join(parts) if parts else render_action(action)
+
+
 def encode_state_action(state: EnvState, action: Action) -> str:
     """Render (state, action) into the text embedded for phi(s, a) and reused in prompts.
 
@@ -55,12 +73,22 @@ def encode_state_action(state: EnvState, action: Action) -> str:
     return "\n".join(lines)
 
 
-def render_demo(step: Step) -> str:
-    """Render a retrieved past step as a (state, action) -> observation few-shot example."""
+def render_demo(step: Step, *, max_observation_chars: int | None = None) -> str:
+    """Render a retrieved past step as a (state, action) -> observation few-shot example.
+
+    `max_observation_chars`, when set, keeps only the first N characters of the observation and
+    appends a "… [+N chars]" marker. Retrieval keys on (state, action), so the *format* and salient
+    head of a past observation carry the signal; capping the tail bounds prompt growth when many or
+    large past examples are retrieved (a big `top_k` over verbose shell/log output crowds context).
+    """
     obs = step.observation
+    content = obs.content
+    if max_observation_chars is not None and len(content) > max_observation_chars:
+        dropped = len(content) - max_observation_chars
+        content = f"{content[:max_observation_chars]}… [+{dropped} chars]"
     return (
         f"{encode_state_action(step.state_before, step.action)}\n"
-        f"OBSERVATION (is_error={obs.is_error}): {obs.content}"
+        f"OBSERVATION (is_error={obs.is_error}): {content}"
     )
 
 
@@ -72,6 +100,7 @@ def build_env_prompt(
     *,
     history: list[Step] | None = None,
     demos: list[Step] | None = None,
+    max_retrieved_observation_chars: int | None = None,
 ) -> tuple[str, str]:
     """Assemble the (system, user) world-model completion that predicts the next observation.
 
@@ -83,7 +112,11 @@ def build_env_prompt(
     """
     system = base_prompt
     demo_block = (
-        "\n\n".join(render_demo(d) for d in demos) if demos else "(no similar past examples)"
+        "\n\n".join(
+            render_demo(d, max_observation_chars=max_retrieved_observation_chars) for d in demos
+        )
+        if demos
+        else "(no similar past examples)"
     )
     history_block = (
         "\n".join(

@@ -44,7 +44,19 @@ class FakeJudge:
 
     def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
         self.calls += 1
-        return JudgeResult(score=self._score, critique="tweak it")
+        # A high mean-of-5 driven by format/plausibility, but low factuality — the exact split the
+        # score_dimension lever exists to separate.
+        return JudgeResult(
+            score=self._score,
+            critique="tweak it",
+            dimensions={
+                "format": 0.9,
+                "factuality": 0.2,
+                "consistency": 0.8,
+                "realism": 0.9,
+                "quality": 0.7,
+            },
+        )
 
 
 def _trace(tid: str, n: int = 2) -> Trace:
@@ -93,6 +105,33 @@ def test_score_prompt_delegates_to_replay_and_returns_mean() -> None:
     assert judge.calls == 3
     # replay scores each held-out step once, deterministically.
     assert provider.rollout_temps == [0.0, 0.0, 0.0]
+
+
+def test_score_prompt_score_dimension_isolates_factuality() -> None:
+    factuality = score_prompt(
+        "PROMPT",
+        [_trace("te1", n=3)],
+        provider=FakeProvider(),
+        judge=FakeJudge(score=0.72),  # headline mean; dimension is what we ask for
+        embedder=None,
+        train=None,
+        score_dimension="factuality",
+    )
+    assert abs(factuality - 0.2) < 1e-9  # returns the factuality dimension, not the 0.72 mean
+
+
+def test_score_prompt_rejects_unknown_score_dimension() -> None:
+    # An unknown dimension is a caller error, caught up front — not a silent 0.0 or a run.
+    with pytest.raises(ValueError, match="score_dimension must be one of"):
+        score_prompt(
+            "P",
+            [_trace("te1", n=2)],
+            provider=FakeProvider(),
+            judge=FakeJudge(score=0.6),
+            embedder=None,
+            train=None,
+            score_dimension="nonexistent_dim",
+        )
 
 
 def test_score_prompt_raises_on_total_judge_outage() -> None:

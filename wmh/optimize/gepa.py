@@ -85,6 +85,7 @@ def predict_observation(
     action: Action,
     demos: list[Step],
     history: list[Step] | None = None,
+    max_retrieved_observation_chars: int | None = None,
 ) -> Observation:
     """Predict the observation for (state, action) under `prompt`, using only a Provider.
 
@@ -96,7 +97,15 @@ def predict_observation(
     Rollouts run deterministically: the providers (Opus 4.8 / GPT 5.5) reject sampling params, so no
     temperature is forwarded.
     """
-    system, user = build_env_prompt(prompt, task, state, action, history=history, demos=demos)
+    system, user = build_env_prompt(
+        prompt,
+        task,
+        state,
+        action,
+        history=history,
+        demos=demos,
+        max_retrieved_observation_chars=max_retrieved_observation_chars,
+    )
     completion = provider.complete(
         system, [Message(role="user", content=user)], temperature=0.0, max_tokens=DEFAULT_MAX_TOKENS
     )

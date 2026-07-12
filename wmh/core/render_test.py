@@ -47,6 +47,21 @@ def test_render_demo_includes_observation() -> None:
     assert "OBSERVATION (is_error=True): not found" in demo
 
 
+def test_render_demo_caps_observation() -> None:
+    step = Step(
+        action=Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"cmd": "cat big.log"}),
+        observation=Observation(content="X" * 5000),
+    )
+    uncapped = render_demo(step)
+    assert "X" * 5000 in uncapped  # no cap by default
+
+    capped = render_demo(step, max_observation_chars=2000)
+    assert "X" * 2000 in capped
+    assert "X" * 2001 not in capped  # truncated at the cap
+    assert "[+3000 chars]" in capped  # marker reports how much was dropped
+    assert "bash" in capped  # the (state, action) head is preserved
+
+
 def test_build_env_prompt_composes_all_parts() -> None:
     state = EnvState(structured={"cart": []})
     action = Action(kind=ActionKind.TOOL_CALL, name="add", arguments={"sku": "A1"})
@@ -70,3 +85,12 @@ def test_build_env_prompt_handles_empty_optional_blocks() -> None:
     assert "(no similar past examples)" in user
     assert "(start of session)" in user
     assert "scratchpad: (empty)" in user
+
+
+def test_encode_action_is_command_only() -> None:
+    from wmh.core.render import encode_action
+
+    action = Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "pytest -q"})
+    key = encode_action(action)
+    assert "bash" in key and "pytest -q" in key
+    assert "STATE:" not in key and "ACTION kind=" not in key

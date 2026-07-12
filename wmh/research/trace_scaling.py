@@ -32,6 +32,7 @@ from wmh.research.ablation import Condition
 from wmh.research.pipeline import optimize_prompt, score_prompt
 from wmh.research.scaling_split import CorpusSplit, partition_corpus, subsample_train
 from wmh.research.seed_stability import BackendFactory
+from wmh.retrieval import RetrievalKey
 
 # The two prompt sources the sweep compares. `base` = the shipped prompt + RAG only (cheap);
 # `gepa` = GEPA-optimized on the train sample (expensive). Strings (not an enum) so they read
@@ -81,6 +82,9 @@ class TraceScalingAblation:
         sample_turns: str = "all",
         test_cap: int | None = None,
         concurrency: int = 1,
+        max_retrieved_observation_chars: int | None = None,
+        retrieval_key: RetrievalKey = "state_action",
+        score_dimension: str | None = None,
     ) -> None:
         self._base_prompt = base_prompt
         self._make_backends = make_backends
@@ -88,6 +92,9 @@ class TraceScalingAblation:
         self._top_k = top_k
         self._sample_turns = sample_turns
         self._concurrency = concurrency
+        self._max_retrieved_observation_chars = max_retrieved_observation_chars
+        self._retrieval_key = retrieval_key
+        self._score_dimension = score_dimension
         self._modes = list(modes)
         self._split: CorpusSplit = partition_corpus(
             corpus, test_frac=test_frac, valid_frac=valid_frac
@@ -158,6 +165,9 @@ class TraceScalingAblation:
             sample_turns=self._sample_turns,
             seed=seed,
             concurrency=self._concurrency,
+            max_retrieved_observation_chars=self._max_retrieved_observation_chars,
+            retrieval_key=self._retrieval_key,
+            score_dimension=self._score_dimension,
         )
 
 

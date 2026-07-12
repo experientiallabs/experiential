@@ -84,6 +84,7 @@ def replay(
     sample_turns: str = "all",
     seed: int = 0,
     concurrency: int = 1,
+    max_retrieved_observation_chars: int | None = None,
 ) -> ReplayReport:
     """Replay held-out steps, scoring predicted vs. actual observations.
 
@@ -112,7 +113,16 @@ def replay(
 
     def _score(item: tuple[str, Step, list[Step]]) -> StepResult:
         trace_id, step, history = item
-        return _score_step(prompt, trace_id, step, provider, judge, demos, history)
+        return _score_step(
+            prompt,
+            trace_id,
+            step,
+            provider,
+            judge,
+            demos,
+            history,
+            max_retrieved_observation_chars=max_retrieved_observation_chars,
+        )
 
     if concurrency > 1 and len(work) > 1:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -140,6 +150,7 @@ def _score_step(
     judge: Judge,
     demos: DemoRetriever,
     history: list[Step],
+    max_retrieved_observation_chars: int | None = None,
 ) -> StepResult:
     """Predict the observation for one step and score it against the recorded observation."""
     predicted = predict_observation(
@@ -150,6 +161,7 @@ def _score_step(
         step.action,
         demos=demos.demos_for(trace_id, step),
         history=history,
+        max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
     verdict = judge.score(predicted, step.observation, step)
     return StepResult(
