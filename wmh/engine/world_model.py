@@ -56,6 +56,8 @@ class WorldModel:
         grounder: Grounder | None = None,
         ground_budget: int = DEFAULT_GROUND_BUDGET,
         verify: bool = False,
+        confidence: bool = False,
+        confidence_why: bool = False,
         max_retrieved_observation_chars: int | None = None,
     ) -> None:
         self._provider = provider
@@ -85,6 +87,10 @@ class WorldModel:
         # into retrieval. Evaluation rollouts must NOT (see `frozen`), or one episode's
         # predictions become another's retrieved demos and results turn order-dependent.
         self._enrich_index = True
+        # Verbalized confidence (WS-A6): the contract asks for a 0.0-1.0 self-assessment, carried
+        # to clients in Observation.metadata. Analysis/abstention-side lever; never judged.
+        self._confidence = confidence
+        self._confidence_why = confidence_why
 
     @classmethod
     def load(
@@ -161,6 +167,8 @@ class WorldModel:
             reasoning=reasoning,
             grounder=None if grounder_kind == "none" else get_grounder(grounder_kind),
             verify=verify,
+            confidence=config.confidence,
+            confidence_why=config.confidence_why,
             max_retrieved_observation_chars=demo_obs_cap,
         )
 
@@ -280,6 +288,8 @@ class WorldModel:
             knowledge=self._rendered_knowledge(),
             reasoning=self._reasoning,
             grounding=self._grounder is not None,
+            confidence=self._confidence,
+            confidence_why=self._confidence_why,
             max_retrieved_observation_chars=self._demo_obs_cap,
         )
         return f"{system}\n\n=== USER ===\n{user}"
@@ -434,6 +444,8 @@ class WorldModel:
             knowledge=knowledge,
             reasoning=self._reasoning,
             grounding=False,
+            confidence=self._confidence,
+            confidence_why=self._confidence_why,
             max_retrieved_observation_chars=self._demo_obs_cap,
         )
         verify_user = user + VERIFY_INSTRUCTION.format(draft=dumps_observation_contract(draft))
@@ -467,6 +479,8 @@ class WorldModel:
             knowledge=knowledge,
             reasoning=self._reasoning,
             grounding=grounding,
+            confidence=self._confidence,
+            confidence_why=self._confidence_why,
             max_retrieved_observation_chars=self._demo_obs_cap,
         )
         completion = self._provider.complete(system, [_user_message(user)])

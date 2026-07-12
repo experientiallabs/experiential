@@ -23,7 +23,7 @@ from statistics import fmean, pstdev
 from pydantic import BaseModel, Field
 
 from wmh.core.render import render_action
-from wmh.core.types import Step, Trace
+from wmh.core.types import Observation, Step, Trace
 from wmh.engine.grounding import (
     Grounder,
     SourceResolver,
@@ -67,6 +67,17 @@ class StepResult(BaseModel):
     # observation — carried so humans can read WHY the env decided success vs. error.
     reasoning: str = ""
     valid: bool = True  # False = the judge failed on this step; excluded from fidelity aggregates
+    # The model's stated confidence in confidence mode (None when absent/off) plus its optional
+    # one-line justification. Analysis-only, same rule as `reasoning`: the judge never sees it.
+    confidence: float | None = None
+    confidence_why: str = ""
+    # Whether the verify second pass actually ran on this step — always-verify sets it on every
+    # step; confidence-gated verify (`verify_below`) only where the draft's confidence fell
+    # under the threshold. This is the population count every gated-cost claim divides by.
+    verified: bool = False
+    # Whether the step was re-predicted on the escalation provider (confidence-gated model
+    # escalation, `escalate_below`). Same accounting role as `verified`.
+    escalated: bool = False
 
 
 class ReplayReport(BaseModel):
@@ -108,6 +119,11 @@ def replay(
     tree: RepoTreeResolver | None = None,
     profile: bool = False,
     poll: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
+    verify_below: float | None = None,
+    escalate_provider: Provider | None = None,
+    escalate_below: float | None = None,
     max_retrieved_observation_chars: int | None = None,
 ) -> ReplayReport:
     """Replay held-out steps, scoring predicted vs. actual observations.
@@ -131,6 +147,17 @@ def replay(
       current-state belief profile ("what is running NOW") injected alongside the knowledge —
       the eval face of the serve-side `state_update` revision. Extra completion per step with
       history.
+    - `confidence`/`confidence_why`: the verbalized-confidence contract fields (WS-A6, D75); the
+      stated value lands on `StepResult.confidence`, never in the judged observation.
+    - `verify_below`: confidence-GATED verify — the second self-check completion runs only when
+      the draft states confidence < `verify_below` (a missing confidence counts as low). Raises
+      unless `confidence=True` (a gate with no stated confidence would silently always fire);
+      independent of `verify` (which remains always-verify).
+    - `escalate_provider`/`escalate_below`: confidence-gated MODEL escalation — when the draft
+      (from `provider`, the cheap model) states confidence < `escalate_below`, the step is
+      re-predicted from scratch on `escalate_provider` (the strong model) and that prediction is
+      what gets scored (and verify-gated). Fresh re-prediction, not a revision: anchoring the
+      strong model on a weak draft is the failure mode this avoids.
     - `poll`: two zero-completion grounding channels — live registry polls (PyPI/npm JSON for
       `pip show/install` / `npm view` actions; NON-HERMETIC like `grounder`) and deterministic
       text-op answers (wc/sort/uniq computed in pure Python over content the session itself
@@ -145,6 +172,17 @@ def replay(
     multiple times per step needs temperature support in the provider layer (no backend forwards it
     today; tracked with the GEPA temperature work).
     """
+    if (verify_below is not None or escalate_below is not None) and not confidence:
+        raise ValueError(
+            "verify_below/escalate_below gate on the STATED confidence — pass confidence=True so"
+            " the contract asks for one. Without it every draft parses to no-confidence, the"
+            " gate fires on 100% of steps, and a 'gated' run silently pays the always-on bill."
+        )
+    if (escalate_provider is None) != (escalate_below is None):
+        raise ValueError(
+            "escalate_provider and escalate_below must be set together: the provider without a"
+            " threshold (or vice versa) would be a silent no-op."
+        )
     demos = DemoRetriever(retriever, train or [], top_k=top_k)
     rng = random.Random(seed)
     # Materialize the (step, history) work list first — selection uses `rng` and must stay
@@ -178,6 +216,11 @@ def replay(
             instance_id=instance_id,
             profile=profile,
             poll=poll,
+            confidence=confidence,
+            confidence_why=confidence_why,
+            verify_below=verify_below,
+            escalate_provider=escalate_provider,
+            escalate_below=escalate_below,
             max_retrieved_observation_chars=max_retrieved_observation_chars,
         )
 
@@ -218,6 +261,11 @@ def _score_step(
     instance_id: str | None = None,
     profile: bool = False,
     poll: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
+    verify_below: float | None = None,
+    escalate_provider: Provider | None = None,
+    escalate_below: float | None = None,
     max_retrieved_observation_chars: int | None = None,
 ) -> StepResult:
     """Predict the observation for one step and score it against the recorded observation."""
@@ -243,21 +291,40 @@ def _score_step(
         if profile_text is not None:
             block = f"## environment profile (revised from session history)\n{profile_text}"
             step_knowledge = f"{step_knowledge}\n\n{block}" if step_knowledge else block
-    predicted = predict_observation(
-        provider,
-        prompt,
-        step.task,
-        step.state_before,
-        step.action,
-        demos=step_demos,
-        history=history,
-        knowledge=step_knowledge,
-        reasoning=reasoning,
-        max_retrieved_observation_chars=max_retrieved_observation_chars,
-    )
-    if verify:
+
+    def _predict(with_provider: Provider) -> Observation:
+        return predict_observation(
+            with_provider,
+            prompt,
+            step.task,
+            step.state_before,
+            step.action,
+            demos=step_demos,
+            history=history,
+            knowledge=step_knowledge,
+            reasoning=reasoning,
+            confidence=confidence,
+            confidence_why=confidence_why,
+            max_retrieved_observation_chars=max_retrieved_observation_chars,
+        )
+
+    predicted = _predict(provider)
+    escalated = False
+    if (
+        escalate_provider is not None
+        and escalate_below is not None
+        and _below(predicted, escalate_below)
+    ):
+        predicted = _predict(escalate_provider)
+        escalated = True
+    should_verify = verify or (verify_below is not None and _below(predicted, verify_below))
+    if should_verify:
+        # The reviser must be the model whose draft is being kept: letting the cheap model
+        # revise an escalated (strong-model) prediction would silently undo the escalation on
+        # exactly the hard steps it was bought for.
+        reviser = escalate_provider if escalated and escalate_provider is not None else provider
         predicted = verify_observation(
-            provider,
+            reviser,
             prompt,
             step.task,
             step.state_before,
@@ -267,10 +334,11 @@ def _score_step(
             history=history,
             knowledge=step_knowledge,
             reasoning=reasoning,
+            confidence=confidence,
+            confidence_why=confidence_why,
             max_retrieved_observation_chars=max_retrieved_observation_chars,
         )
     verdict = judge.score(predicted, step.observation, step)
-    predicted_reasoning = predicted.metadata.get("reasoning")
     return StepResult(
         trace_id=trace_id,
         task=step.task,
@@ -282,9 +350,35 @@ def _score_step(
         critique=verdict.critique,
         is_error_actual=step.observation.is_error,
         is_error_predicted=predicted.is_error,
-        reasoning=predicted_reasoning if isinstance(predicted_reasoning, str) else "",
+        reasoning=_stated_str(predicted, "reasoning"),
         valid=verdict.valid,
+        # The SCORED prediction's stated confidence (after escalation/verify, when they ran) —
+        # each gate decided on the confidence stated by the draft it saw.
+        confidence=_stated_confidence(predicted),
+        confidence_why=_stated_str(predicted, "confidence_why"),
+        verified=should_verify,
+        escalated=escalated,
     )
+
+
+def _stated_confidence(observation: Observation) -> float | None:
+    """The observation's stated confidence, or None when the model didn't emit one."""
+    value = observation.metadata.get("confidence")
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _below(observation: Observation, threshold: float) -> bool:
+    """Gate rule shared by verify_below and escalate_below: missing confidence counts as low."""
+    stated = _stated_confidence(observation)
+    return stated is None or stated < threshold
+
+
+def _stated_str(observation: Observation, key: str) -> str:
+    """A carried metadata string, degrading to '' when absent or wrong-typed."""
+    value = observation.metadata.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def valid_scores(results: Iterable[StepResult]) -> list[float]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmh.engine.replay import ReplayReport
 from wmh.optimize.judge import JudgeResult
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.research.pipeline import optimize_prompt, score_prompt
@@ -217,3 +218,118 @@ def test_score_prompt_empty_holdout_is_zero() -> None:
         train=None,
     )
     assert mean == 0.0
+
+
+class _PromptRecordingProvider(FakeProvider):
+    """FakeProvider that also keeps the last user prompt for contract assertions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_user: str | None = None
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        self.last_user = messages[0].content
+        return Completion(text='{"output": "predicted", "is_error": false, "confidence": 0.4}')
+
+
+def test_score_prompt_forwards_confidence_and_hands_the_report_to_on_report() -> None:
+    provider = _PromptRecordingProvider()
+    reports: list[object] = []
+    score = score_prompt(
+        "BASE",
+        [_trace("h", n=1)],
+        provider=provider,
+        judge=FakeJudge(0.6),
+        embedder=None,
+        train=None,
+        confidence=True,
+        on_report=reports.append,
+    )
+    assert score == 0.6
+    assert '"confidence"' in (provider.last_user or "")  # the contract asked for it
+    # The full per-step report reached the sink — calibration analysis needs the joint
+    # (confidence, score) pairs the scalar return cannot carry.
+    (report,) = reports
+    assert isinstance(report, ReplayReport)
+    assert report.results[0].confidence == 0.4
+
+
+def test_score_prompt_forwards_verify_below_to_the_gate() -> None:
+    provider = _PromptRecordingProvider()  # states 0.4 -> under the 0.7 gate -> verify runs
+    report_box: list[object] = []
+    score_prompt(
+        "BASE",
+        [_trace("h", n=1)],
+        provider=provider,
+        judge=FakeJudge(0.6),
+        embedder=None,
+        train=None,
+        confidence=True,
+        verify_below=0.7,
+        on_report=report_box.append,
+    )
+    (report,) = report_box
+    assert isinstance(report, ReplayReport)
+    assert report.results[0].verified is True
+
+
+class _OutageJudge:
+    """Every judgement invalid — the judge-outage shape score_prompt guards against."""
+
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        return JudgeResult(score=0.0, critique="parse failure", valid=False)
+
+
+def test_score_prompt_hands_report_to_sink_even_on_judge_outage() -> None:
+    # Persistence must run BEFORE the all-invalid guard raises: the per-step report is exactly
+    # what diagnoses the outage, and calibration cells must never silently skip the sink.
+    provider = _PromptRecordingProvider()
+    reports: list[ReplayReport] = []
+    with pytest.raises(RuntimeError, match="no valid judgement"):
+        score_prompt(
+            "BASE",
+            [_trace("h", n=1)],
+            provider=provider,
+            judge=_OutageJudge(),
+            embedder=None,
+            train=None,
+            confidence=True,
+            on_report=reports.append,
+        )
+    (report,) = reports
+    assert report.n_steps == 1
+
+
+class _DimensionJudge:
+    """Valid judgements with a rubric dimension, for the score_dimension return path."""
+
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        return JudgeResult(score=0.6, critique="ok", dimensions={"factuality": 0.7})
+
+
+def test_score_prompt_persists_report_for_dimension_scored_cells() -> None:
+    # The "Persist FIRST" invariant's other exit: score_dimension returns a different aggregate
+    # below on_report — a dimension-scored calibration cell must still hit the sink.
+    provider = _PromptRecordingProvider()
+    reports: list[ReplayReport] = []
+    score = score_prompt(
+        "BASE",
+        [_trace("h", n=1)],
+        provider=provider,
+        judge=_DimensionJudge(),
+        embedder=None,
+        train=None,
+        confidence=True,
+        score_dimension="factuality",
+        on_report=reports.append,
+    )
+    assert score == 0.7  # the dimension mean, not the headline
+    (report,) = reports
+    assert report.n_steps == 1

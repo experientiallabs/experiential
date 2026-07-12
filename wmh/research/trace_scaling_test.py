@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import wmh.research.trace_scaling as ts
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.research.ablation import run_ablation
@@ -256,6 +258,139 @@ def test_reason_poll_mode_threads_the_poll_channels(monkeypatch) -> None:  # noq
     assert [c.label for c in ab.conditions()] == ["reason+poll@5"]
     assert ab.run(ab.conditions()[0], seed=0) == 0.6
     assert seen == {"reasoning": True, "poll": True}
+
+
+def test_split_mode_composes_confidence_suffixes() -> None:
+    assert ts.split_mode("base") == ("base", False, False, None)
+    assert ts.split_mode("base+conf") == ("base", True, False, None)
+    assert ts.split_mode("reason+confwhy") == ("reason", True, True, None)
+    assert ts.split_mode("reason+workspace+conf") == ("reason+workspace", True, False, None)
+    # gateverify implies +conf (the gate reads the stated confidence).
+    assert ts.split_mode("reason+gateverify@0.7") == ("reason", True, False, 0.7)
+    with pytest.raises(ValueError, match="unknown mode"):
+        ts.split_mode("reasn+conf")  # typos fail loudly, not as a silent base cell
+
+
+def test_split_mode_validates_gateverify_thresholds() -> None:
+    with pytest.raises(ValueError, match="not a number"):
+        ts.split_mode("reason+gateverify@o.7")  # typo'd threshold names the mode, not float()
+    for bad in ("0", "-1", "2.5", "nan"):
+        with pytest.raises(ValueError, match=r"\(0, 1\]"):
+            ts.split_mode(f"reason+gateverify@{bad}")
+
+
+def test_ablation_rejects_bad_modes_at_construction() -> None:
+    # A typo'd mode must fail BEFORE the sweep spends hours on the cells that precede it.
+    with pytest.raises(ValueError, match="unknown mode"):
+        TraceScalingAblation(
+            _corpus(50),
+            "BASE",
+            make_backends=_fake_backends,
+            counts=[5],
+            modes=["base", "reasn+conf"],
+            budget=4,
+        )
+
+
+def test_conf_suffixes_thread_confidence_flags(monkeypatch) -> None:  # noqa: ANN001
+    seen: dict[str, object] = {}
+
+    def fake_score(  # noqa: ANN202
+        prompt,  # noqa: ANN001
+        held_out,  # noqa: ANN001
+        *,
+        reasoning=False,  # noqa: ANN001
+        confidence=False,  # noqa: ANN001
+        confidence_why=False,  # noqa: ANN001
+        verify_below=None,  # noqa: ANN001
+        **_,  # noqa: ANN003
+    ):
+        seen.update(
+            reasoning=reasoning,
+            confidence=confidence,
+            confidence_why=confidence_why,
+            verify_below=verify_below,
+        )
+        return 0.6
+
+    monkeypatch.setattr(ts, "score_prompt", fake_score)
+    ab = TraceScalingAblation(
+        _corpus(200),
+        "BASE",
+        make_backends=_fake_backends,
+        counts=[5],
+        modes=["base+conf", "reason+confwhy", "reason+gateverify@0.7"],
+        budget=4,
+    )
+    conditions = ab.conditions()
+    assert [c.label for c in conditions] == [
+        "base+conf@5",
+        "reason+confwhy@5",
+        "reason+gateverify@0.7@5",
+    ]
+    ab.run(conditions[0], seed=0)
+    assert seen == {
+        "reasoning": False,
+        "confidence": True,
+        "confidence_why": False,
+        "verify_below": None,
+    }
+    ab.run(conditions[1], seed=0)
+    assert seen == {
+        "reasoning": True,
+        "confidence": True,
+        "confidence_why": True,
+        "verify_below": None,
+    }
+    ab.run(conditions[2], seed=0)
+    assert seen == {
+        "reasoning": True,
+        "confidence": True,
+        "confidence_why": False,
+        "verify_below": 0.7,
+    }
+
+
+def test_results_dir_persists_per_cell_replay_reports(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    from wmh.engine.replay import ReplayReport, StepResult
+
+    def fake_score(prompt, held_out, *, on_report=None, **_):  # noqa: ANN001, ANN003, ANN202
+        assert on_report is not None
+        on_report(
+            ReplayReport(
+                mean_score=0.6,
+                n_steps=1,
+                results=[
+                    StepResult(
+                        trace_id="t",
+                        action="a",
+                        actual="x",
+                        predicted="y",
+                        score=0.6,
+                        confidence=0.7,
+                    )
+                ],
+            )
+        )
+        return 0.6
+
+    monkeypatch.setattr(ts, "score_prompt", fake_score)
+    ab = TraceScalingAblation(
+        _corpus(200),
+        "BASE",
+        make_backends=_fake_backends,
+        counts=[5],
+        modes=["base+conf"],
+        budget=4,
+        results_dir=str(tmp_path / "cells"),
+    )
+    ab.run(ab.conditions()[0], seed=1)
+    out = tmp_path / "cells" / "base+conf@5_seed1.json"
+    assert out.exists()
+    report = ReplayReport.model_validate_json(out.read_text(encoding="utf-8"))
+    # The per-step (confidence, score) join — the calibration dataset — survives the round trip.
+    assert report.results[0].confidence == 0.7
+    assert report.results[0].score == 0.6
 
 
 def test_run_ablation_end_to_end_with_fakes(monkeypatch) -> None:  # noqa: ANN001

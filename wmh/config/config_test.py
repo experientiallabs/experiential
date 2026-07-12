@@ -76,13 +76,15 @@ def test_agentic_fields_default_off_so_old_configs_load(tmp_path: Path) -> None:
     assert config.knowledge is False
     assert config.reasoning is False
     assert config.grounder == "none"
+    assert config.confidence is False
+    assert config.confidence_why is False
     root = tmp_path / ".wmh"
     save_config(config, root=root)
     raw = (root / "config.toml").read_text(encoding="utf-8")
     stripped = "\n".join(
         line
         for line in raw.splitlines()
-        if not line.startswith(("knowledge", "reasoning", "grounder"))
+        if not line.startswith(("knowledge", "reasoning", "grounder", "confidence"))
     )
     (root / "config.toml").write_text(stripped, encoding="utf-8")
     assert load_config(root=root) == config

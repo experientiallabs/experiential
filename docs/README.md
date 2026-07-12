@@ -27,5 +27,7 @@ file here must justify its existence in the table below; a doc that can't gets d
 | `research/gepa_scaling_law.png` | The figure the writeup renders. |
 | `research/fidelity_tiers.md` | The design + evidence record for `wmh build --fidelity` and `--max-fidelity`: the tier ladder measured on all three benchmarks, the evidence audit that removed unproven ingredients (semantic phi, extra GEPA iterations), and the traps (runaway valset cost, judge pinning). The fidelity-tier UX is a product surface; this is its justification. |
 | `research/fidelity_tiers.png` | The figure `research/fidelity_tiers.md` renders (tier ladder, three benchmarks). |
+| `research/confidence_calibration.md` | The WS-A6 result the confidence lever ships on: stated confidence is calibrated (AUROC .84–.98, underconfident), abstention buys 5–10 fidelity points, and confidence-gated verify Pareto-dominates always-verify. The product claim behind per-step confidence in serving. |
+| `research/confidence_gated_frontier.png` | The one figure the writeup renders: the gated-verify cost frontier (fidelity vs $/cell, never/gated/always) — the headline Pareto claim. |
 | `reference/eval_suites.md` | The reproducibility contract every benchmark number in this repo rests on (`examples/<task>/evals/*.toml` + `wmh eval`); commands verified against `main` at promotion. |
 | `reference/failover.md` | The `.wmh/fallback.toml` failover contract: which calls ride the chain (world-model) and which never do (the judge), plus the cross-account ladder format; verified live against both AWS accounts. |

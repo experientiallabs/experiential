@@ -17,9 +17,30 @@ from __future__ import annotations
 import json
 import re
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
-from wmh.core.types import JsonObject, Observation
+from wmh.core.types import JsonObject, JsonValue, Observation
+
+
+def accepted_confidence(value: float | int | str | bool) -> float | None:
+    """The one definition of a usable stated confidence: a finite number in [0, 1], else None.
+
+    Gates and calibration both consume this, so the acceptance rule must not fork: booleans are
+    not confidences (JSON `true` is not 1.0), NaN/inf are garbage, and OUT-OF-RANGE numerics
+    degrade to "not stated" rather than clamping — a model answering 85 (percent) or 7 (out of
+    10) has violated the 0.0-1.0 contract, and clamping such a reply to 1.0 would record maximal
+    certainty on exactly the steps where the model is off the rails. Missing conservatively
+    gates as LOW; malformed must never gate as certain.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if not (0.0 <= parsed <= 1.0):  # also rejects NaN (all comparisons false) and +/-inf
+        return None
+    return parsed
 
 
 def extract_json_object(text: str) -> str | None:
@@ -70,6 +91,18 @@ class _RawObservation(BaseModel):
     kb_note: str = ""
     ground_query: str = ""
     state_update: str = ""
+    # Verbalized confidence (WS-A6): None when the model didn't state one. Lenient like the rest
+    # of the contract — an off-contract value degrades to "no stated confidence", never a crash.
+    confidence: float | None = None
+    confidence_why: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _lenient_confidence(cls, value: JsonValue) -> float | None:
+        """Coerce the raw JSON field through `accepted_confidence` (off-contract -> None)."""
+        if isinstance(value, int | float | str):
+            return accepted_confidence(value)
+        return None
 
 
 # The keys that mark a reply as following the observation contract (any one present is enough).
@@ -78,6 +111,8 @@ class _RawObservation(BaseModel):
 # every complete contract reply (base or reasoning mode) carries `output`/`is_error`, while a
 # reasoning-mode superset key alone (e.g. off-contract JSON with a "reasoning" field but no
 # "output") must fall through to the plain-text fallback, not become an empty observation.
+# Confidence-mode keys are deliberately excluded too: an arbitrary API payload with its own
+# "confidence" field must not be mistaken for a contract reply.
 _CONTRACT_KEYS = frozenset({"output", "is_error", "state_note"})
 
 
@@ -117,9 +152,13 @@ def parse_observation(text: str) -> Observation:
                     ("kb_note", parsed.kb_note),
                     ("ground_query", parsed.ground_query),
                     ("state_update", parsed.state_update),
+                    ("confidence_why", parsed.confidence_why),
                 ):
                     if value:
                         metadata[key] = value
+                # Separate from the truthiness loop: a stated confidence of 0.0 must survive.
+                if parsed.confidence is not None:
+                    metadata["confidence"] = parsed.confidence
                 return Observation(
                     content=parsed.output, is_error=parsed.is_error, metadata=metadata
                 )
@@ -151,10 +190,26 @@ def _salvage_truncated_contract(text: str) -> Observation | None:
     # Recover every metadata-carried contract field the truncated text still contains —
     # dropping state_note/state_update here would silently stall the scratchpad and belief
     # profile for the rest of the session.
-    for key in ("reasoning", "state_note", "kb_note", "ground_query", "state_update"):
+    salvage_keys = (
+        "reasoning",
+        "state_note",
+        "kb_note",
+        "ground_query",
+        "state_update",
+        "confidence_why",
+    )
+    for key in salvage_keys:
         value = _string_field_value(stripped, key)
         if value:
             metadata[key] = value
+    # Salvage a stated confidence too: truncation correlates with HARD steps, so silently
+    # dropping their confidences would bias any calibration analysis toward the easy ones.
+    # Same acceptance rule as the validator — the two paths must not fork.
+    match = _CONFIDENCE_VALUE.search(stripped)
+    if match is not None:
+        confidence = accepted_confidence(match.group(1))
+        if confidence is not None:
+            metadata["confidence"] = confidence
     is_error = re.search(r'"is_error"\s*:\s*true', stripped) is not None
     return Observation(content=output, is_error=is_error, metadata=metadata)
 
@@ -200,10 +255,26 @@ def _string_field_value(text: str, key: str) -> str | None:
 
 _UNESCAPE = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
 
+# The numeric confidence value in possibly-truncated contract text (salvage path only; complete
+# JSON goes through `_RawObservation`).
+_CONFIDENCE_VALUE = re.compile(r'"confidence"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
+
 
 def dumps_observation_contract(observation: Observation) -> str:
-    """Render an Observation back into the JSON output contract (used to seed/demo the format)."""
+    """Render an Observation back into the JSON output contract (used to seed/demo the format).
+
+    Carries the confidence fields when present (key order mirroring the contract:
+    justification before the number, both after `is_error`) — the verify pass embeds this as
+    the draft, and a draft missing the field the contract demands invites the reviser to drop
+    it too, thinning stated confidence exactly on the verified (low-confidence) population.
+    """
     payload: JsonObject = {"output": observation.content, "is_error": observation.is_error}
+    why = observation.metadata.get("confidence_why")
+    if isinstance(why, str) and why:
+        payload["confidence_why"] = why
+    confidence = observation.metadata.get("confidence")
+    if isinstance(confidence, int | float) and not isinstance(confidence, bool):
+        payload["confidence"] = float(confidence)
     note = observation.metadata.get("state_note")
     if isinstance(note, str) and note:
         payload["state_note"] = note

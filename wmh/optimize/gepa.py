@@ -97,6 +97,8 @@ def predict_observation(
     *,
     knowledge: str | None = None,
     reasoning: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
     max_retrieved_observation_chars: int | None = None,
 ) -> Observation:
     """Predict the observation for (state, action) under `prompt`, using only a Provider.
@@ -107,6 +109,9 @@ def predict_observation(
     predicted observation (content + is_error + state_note) matches what the world model produces.
     `knowledge`/`reasoning` mirror the serving engine's agentic mode (grounding stays serve-only:
     optimization and eval rollouts never touch the network beyond the provider).
+    `confidence`/`confidence_why` add the verbalized-confidence contract fields (WS-A6). GEPA's
+    own optimize path never sets them — a prompt must not be evolved against a model that is
+    also emitting a gameable confidence field (D75).
 
     Rollouts run deterministically: the providers (Opus 4.8 / GPT 5.5) reject sampling params, so no
     temperature is forwarded.
@@ -120,6 +125,8 @@ def predict_observation(
         demos=demos,
         knowledge=knowledge,
         reasoning=reasoning,
+        confidence=confidence,
+        confidence_why=confidence_why,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
     completion = provider.complete(
@@ -150,6 +157,8 @@ def verify_observation(
     *,
     knowledge: str | None = None,
     reasoning: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
     max_retrieved_observation_chars: int | None = None,
 ) -> Observation:
     """Second-pass self-check: re-present the full evidence plus the draft, return the revision.
@@ -167,6 +176,8 @@ def verify_observation(
         demos=demos,
         knowledge=knowledge,
         reasoning=reasoning,
+        confidence=confidence,
+        confidence_why=confidence_why,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
     verify_user = user + VERIFY_INSTRUCTION.format(draft=dumps_observation_contract(draft))

@@ -150,6 +150,38 @@ def test_output_contract_grounding_adds_ground_query() -> None:
     assert output_contract() == OUTPUT_CONTRACT  # base contract is untouched
 
 
+def test_build_env_prompt_confidence_off_is_byte_identical() -> None:
+    # The lever must be invisible when off: explicit False renders exactly the default prompt.
+    args = ("BASE", "t", EnvState(), Action(kind=ActionKind.MESSAGE, content="hi"))
+    assert build_env_prompt(*args, confidence=False, confidence_why=False) == build_env_prompt(
+        *args
+    )
+    assert '"confidence"' not in build_env_prompt(*args)[1]
+
+
+def test_output_contract_confidence_sits_after_is_error() -> None:
+    # Ordered decoding: the self-assessment must be conditioned on the emitted answer (D75).
+    for contract in (
+        output_contract(confidence=True),
+        output_contract(reasoning=True, confidence=True),
+        output_contract(reasoning=True, grounding=True, confidence=True),
+    ):
+        assert (
+            contract.find('"is_error"')
+            < contract.find('"confidence"')
+            < contract.find('"state_note"')
+        )
+    assert '"confidence"' not in output_contract(reasoning=True)
+
+
+def test_output_contract_confidence_why_justifies_before_the_number() -> None:
+    contract = output_contract(confidence=True, confidence_why=True)
+    assert contract.find('"confidence_why"') < contract.find('"confidence":')
+    assert '"confidence_why"' not in output_contract(confidence=True)
+    # The justification is meaningless without the number: why alone is a no-op.
+    assert output_contract(confidence_why=True) == OUTPUT_CONTRACT
+
+
 def test_render_demo_caps_observation_with_honest_marker() -> None:
     step = Step(
         task="t",

@@ -106,6 +106,8 @@ def build_env_prompt(
     knowledge: str | None = None,
     reasoning: bool = False,
     grounding: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
     max_retrieved_observation_chars: int | None = None,
 ) -> tuple[str, str]:
     """Assemble the (system, user) world-model completion that predicts the next observation.
@@ -116,11 +118,11 @@ def build_env_prompt(
     (`wmh.engine.prompts`) and the GEPA optimizer, so prompts are evolved against exactly what the
     world model serves.
 
-    `knowledge`/`reasoning`/`grounding` are the opt-in agentic-mode extensions; at their defaults
-    the rendering is byte-identical to the pre-knowledge shape (pinned in render_test), so
-    prebuilt models keep serving unchanged. `knowledge` (the model's cross-session knowledge
-    base, rendered by `wmh.engine.knowledge`) becomes an authoritative facts section; `reasoning`
-    switches the output contract to deliberate-then-answer; `grounding` additionally offers the
+    `knowledge`/`reasoning`/`grounding`/`confidence` are the opt-in agentic-mode extensions; at
+    their defaults the rendering is byte-identical to the pre-knowledge shape (pinned in
+    render_test), so prebuilt models keep serving unchanged. `knowledge` (the cross-session
+    knowledge base, rendered by `wmh.engine.knowledge`) becomes an authoritative facts section;
+    `reasoning` switches the output contract to deliberate-then-answer; `grounding` offers the
     `ground_query` escape hatch (pass it only when a live grounder will actually serve it).
     """
     system = base_prompt
@@ -154,7 +156,12 @@ def build_env_prompt(
         f"CURRENT ENV STATE:\n  structured: {render_json(state.structured)}\n"
         f"  scratchpad: {state.scratchpad or '(empty)'}\n\n"
         f"AGENT ACTION:\n{render_action(action)}\n\n"
-        f"{output_contract(reasoning=reasoning, grounding=grounding)}"
+        + output_contract(
+            reasoning=reasoning,
+            grounding=grounding,
+            confidence=confidence,
+            confidence_why=confidence_why,
+        )
     )
     return system, user
 
@@ -194,10 +201,27 @@ _REASONING_FIELD = (
     " behaved in the examples, not from what the task narrative hopes is there. Work exact"
     ' computations carefully (counts, off-by-one, trailing newlines)>", '
 )
-_BASE_FIELDS = (
+_OUTPUT_IS_ERROR_FIELDS = (
     '"output": "<exactly what the environment returns to the agent>", '
-    '"is_error": <true if the action failed/was invalid>, '
-    '"state_note": "<one short fact to remember about the new env state, or empty>"'
+    '"is_error": <true if the action failed/was invalid>'
+)
+_STATE_NOTE_FIELD = (
+    ', "state_note": "<one short fact to remember about the new env state, or empty>"'
+)
+# Verbalized-confidence fields (WS-A6, D75). `confidence` sits AFTER output/is_error so ordered
+# decoding conditions it on the answer actually emitted (the post-hoc p(true) framing, better
+# calibrated than prospective confidence). One decimal = 11 levels: enough resolution for a
+# risk-coverage sweep, coarse enough not to invite false precision. The optional `confidence_why`
+# one-liner comes BEFORE the number (justify-then-rate) so the rating conditions on the
+# articulated reason. Stated confidence is analysis-only: the judge and GEPA never see it
+# (guarded by tests in judge_test/gepa_test).
+_CONFIDENCE_WHY_FIELD = (
+    ', "confidence_why": "<one short sentence: the strongest reason to trust or doubt the'
+    ' "output" above>"'
+)
+_CONFIDENCE_FIELD = (
+    ', "confidence": <your probability, 0.0-1.0 with ONE decimal, that the "output" above'
+    " matches what the real environment would return for this action>"
 )
 _KB_NOTE_FIELD = (
     ', "kb_note": "<one canonical fact about this environment worth remembering across ALL'
@@ -213,23 +237,35 @@ _GROUND_QUERY_FIELD = (
 )
 
 
-def output_contract(*, reasoning: bool = False, grounding: bool = False) -> str:
+def output_contract(
+    *,
+    reasoning: bool = False,
+    grounding: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
+) -> str:
     """Return the output-contract instruction for the requested mode.
 
-    The base contract (both flags off) is exactly `OUTPUT_CONTRACT` — the shape every existing
+    The base contract (all flags off) is exactly `OUTPUT_CONTRACT` — the shape every existing
     model was built against. All variants are parsed by the one lenient
-    `wmh.core.parsing.parse_observation`.
+    `wmh.core.parsing.parse_observation`. `confidence` inserts the verbalized-confidence field
+    after `is_error`; `confidence_why` (a no-op without `confidence`) prepends its one-line
+    justification.
     """
-    if not reasoning and not grounding:
+    if not reasoning and not grounding and not confidence:
         return OUTPUT_CONTRACT
+    conf_fields = ""
+    if confidence:
+        conf_fields = (_CONFIDENCE_WHY_FIELD if confidence_why else "") + _CONFIDENCE_FIELD
+    fields = f"{_OUTPUT_IS_ERROR_FIELDS}{conf_fields}{_STATE_NOTE_FIELD}"
     ground_field = _GROUND_QUERY_FIELD if grounding else ""
     if reasoning:
         return (
             "First deliberate, then answer. Respond with ONLY a JSON object whose FIRST key is"
-            f" your deliberation:\n{_REASONING_FIELD}{_BASE_FIELDS}{_KB_NOTE_FIELD}{ground_field}}}"
+            f" your deliberation:\n{_REASONING_FIELD}{fields}{_KB_NOTE_FIELD}{ground_field}}}"
         )
-    # Grounding without the deliberation pass: the base contract + the ground_query escape hatch.
+    # No deliberation pass: the base fields + whichever optional fields are on.
     return (
         "Respond with ONLY a JSON object describing the environment's response to this action:\n"
-        f"{{{_BASE_FIELDS}{ground_field}}}"
+        f"{{{fields}{ground_field}}}"
     )

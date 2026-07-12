@@ -74,13 +74,15 @@ def build_env_prompt(
     knowledge: str | None = None,
     reasoning: bool = False,
     grounding: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
     max_retrieved_observation_chars: int | None = None,
 ) -> tuple[str, str]:
     """Return (system, user) text for a world-model completion.
 
     Mirrors M_exp(R_t | {(s_i,a_i)}, {d_j}, tau): base+task -> system, history+demos+action -> user.
     Delegates to the shared renderer, supplying the session's task, state, and history; the
-    agentic-mode flags (`knowledge`/`reasoning`/`grounding`) pass straight through.
+    agentic-mode flags (`knowledge`/`reasoning`/`grounding`/`confidence`) pass straight through.
     """
     return _build_env_prompt(
         base_prompt,
@@ -92,6 +94,8 @@ def build_env_prompt(
         knowledge=knowledge,
         reasoning=reasoning,
         grounding=grounding,
+        confidence=confidence,
+        confidence_why=confidence_why,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
 

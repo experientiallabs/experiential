@@ -25,11 +25,13 @@ and terminal-tasks / swe-bench tomorrow are just a different trace file in — n
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from wmh.core.types import JsonValue, Trace
 from wmh.engine.grounding import FetchGrounder, SourceResolver
 from wmh.engine.knowledge import seeded_knowledge_text
+from wmh.engine.replay import ReplayReport
 from wmh.engine.workspace import RepoTreeResolver
 from wmh.optimize.judge import RubricDimension
 from wmh.research.ablation import Condition, as_int
@@ -69,6 +71,11 @@ REASON_WORKSPACE: Mode = "reason+workspace"
 # (NON-HERMETIC) + deterministic wc/sort/uniq answers over session-written content (hermetic).
 REASON_POLL: Mode = "reason+poll"
 MODES: tuple[Mode, ...] = (BASE, GEPA)
+# Composable confidence suffixes (WS-A6, D75): any mode above also accepts `+conf` (the
+# verbalized-confidence contract field), `+confwhy` (confidence with its one-line justification),
+# and `+gateverify@<t>` (confidence-gated verify: the second self-check completion runs only when
+# the draft states confidence < t; implies +conf). E.g. `base+conf`, `reason+confwhy`,
+# `reason+workspace+conf`, `reason+gateverify@0.7`. Split off by `split_mode` before dispatch.
 ALL_MODES: tuple[Mode, ...] = (
     BASE,
     GEPA,
@@ -83,6 +90,45 @@ ALL_MODES: tuple[Mode, ...] = (
     REASON_PROFILE,
     REASON_POLL,
 )
+
+
+def split_mode(mode: Mode) -> tuple[Mode, bool, bool, float | None]:
+    """Split the composable confidence suffixes off `mode`.
+
+    Returns `(base_mode, confidence, confidence_why, verify_below)`. The base mode must be one of
+    `ALL_MODES` — raising here (not deep in dispatch) keeps a typo like `reasn+conf` loud.
+    """
+    confidence = False
+    confidence_why = False
+    verify_below: float | None = None
+    kept: list[str] = []
+    for part in mode.split("+"):
+        if part == "conf":
+            confidence = True
+        elif part == "confwhy":
+            confidence = True
+            confidence_why = True
+        elif part.startswith("gateverify@"):
+            confidence = True
+            raw = part.removeprefix("gateverify@")
+            try:
+                verify_below = float(raw)
+            except ValueError:
+                raise ValueError(
+                    f"unknown mode {mode!r}: gateverify threshold {raw!r} is not a number"
+                ) from None
+            if not 0.0 < verify_below <= 1.0:  # also rejects NaN
+                raise ValueError(
+                    f"unknown mode {mode!r}: gateverify threshold must be in (0, 1] —"
+                    f" {verify_below} would mean {'never' if verify_below <= 0 else 'always'}"
+                    " verifying (use the plain mode or +verify instead)"
+                )
+        else:
+            kept.append(part)
+    base = "+".join(kept)
+    if base not in ALL_MODES:
+        raise ValueError(f"unknown mode {mode!r}: base {base!r} is not one of {ALL_MODES}")
+    return base, confidence, confidence_why, verify_below
 
 
 def _as_mode(value: JsonValue) -> Mode:
@@ -121,6 +167,7 @@ class TraceScalingAblation:
         retrieval_key: RetrievalKey = "state_action",
         score_dimension: RubricDimension | None = None,
         source_pins: str | None = None,
+        results_dir: str | None = None,
     ) -> None:
         self._base_prompt = base_prompt
         self._make_backends = make_backends
@@ -134,6 +181,15 @@ class TraceScalingAblation:
         self._source_pins = source_pins
         self._source = SourceResolver.from_file(source_pins) if source_pins else None
         self._tree = RepoTreeResolver(self._source.pins) if self._source is not None else None
+        # Per-cell ReplayReports (per-step scores + stated confidences) land here as
+        # `<label>_seed<seed>.json` when set. Calibration analysis (WS-A6) joins per-step
+        # (confidence, judge score) pairs — the scalar fidelity the ablation returns can't carry
+        # that, and rerunning cells to get it would double the serve bill.
+        self._results_dir = results_dir
+        # Validate every mode string NOW: a typo'd mode must fail before the sweep spends hours
+        # of provider budget on the cells that precede it, not when run() finally reaches it.
+        for mode in modes:
+            split_mode(mode)
         self._modes = list(modes)
         # GEPA optimizes under DEFAULT retrieval (optimize_prompt does not yet thread these knobs),
         # so scoring the evolved prompt under a non-default key/cap would measure it on a retrieval
@@ -185,7 +241,9 @@ class TraceScalingAblation:
 
     def run(self, condition: Condition, seed: int) -> float:
         """Score one (mode, n_train) point at `seed` on the fixed test set; fidelity 0..1."""
-        mode = _as_mode(condition.params["mode"])
+        mode, confidence, confidence_why, verify_below = split_mode(
+            _as_mode(condition.params["mode"])
+        )
         n_train = as_int(condition.params["n_train"])
         train = subsample_train(self._split.train_pool, n_train, seed=seed)
         provider, judge, embedder = self._make_backends()
@@ -259,4 +317,32 @@ class TraceScalingAblation:
             tree=tree,
             profile=profile,
             poll=poll,
+            confidence=confidence,
+            confidence_why=confidence_why,
+            verify_below=verify_below,
+            on_report=self._report_sink(condition.label, seed),
         )
+
+    def _report_sink(self, label: str, seed: int) -> Callable[[ReplayReport], None] | None:
+        """A writer persisting the cell's full ReplayReport under `results_dir`, or None."""
+        if self._results_dir is None:
+            return None
+        out_dir = Path(self._results_dir)
+
+        def write(report: ReplayReport) -> None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"{label.replace('/', '_')}_seed{seed}.json"
+            path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+        return write
+
+
+def _dedupe(values: list[int]) -> list[int]:
+    """Drop duplicates while preserving first-seen order."""
+    seen: set[int] = set()
+    out: list[int] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out

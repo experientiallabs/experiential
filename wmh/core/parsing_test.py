@@ -114,6 +114,78 @@ def test_parse_observation_ignores_non_contract_json() -> None:
     assert obs.content == '{"foo": 1}'
 
 
+def test_parse_observation_confidence_in_metadata() -> None:
+    obs = parse_observation('{"output": "ok", "is_error": false, "confidence": 0.7}')
+    assert obs.metadata["confidence"] == 0.7
+    # A stated 0.0 is a real (minimum) confidence, not an absent one.
+    zero = parse_observation('{"output": "ok", "is_error": false, "confidence": 0.0}')
+    assert zero.metadata["confidence"] == 0.0
+    # Absent field -> absent key, so analysis can distinguish "off" from "stated 0".
+    assert "confidence" not in parse_observation('{"output": "ok", "is_error": false}').metadata
+
+
+def test_parse_observation_confidence_accepts_only_finite_in_range_numbers() -> None:
+    # Numeric strings on-scale are accepted; anything off the 0.0-1.0 contract degrades to "not
+    # stated" — clamping a scale misread like 85 (percent) to 1.0 would record MAXIMUM certainty
+    # on exactly the replies whose contract violation signals the model is off the rails.
+    assert parse_observation('{"output": "ok", "confidence": "0.4"}').metadata["confidence"] == 0.4
+    assert parse_observation('{"output": "ok", "confidence": 1.0}').metadata["confidence"] == 1.0
+    for bad in ("1.7", "-3", "85", '"high"', "true", '"nan"', '"inf"', "1e999"):
+        obs = parse_observation(f'{{"output": "ok", "confidence": {bad}}}')
+        assert "confidence" not in obs.metadata, bad
+
+
+def test_parse_observation_confidence_why_in_metadata() -> None:
+    obs = parse_observation(
+        '{"output": "ok", "is_error": false, '
+        '"confidence_why": "the demo shows this exact lookup", "confidence": 0.9}'
+    )
+    assert obs.metadata["confidence_why"] == "the demo shows this exact lookup"
+    assert obs.content == "ok"  # the justification never leaks into what the agent observes
+
+
+def test_parse_observation_empty_output_with_confidence_is_still_contract() -> None:
+    # A silent command (empty output) in confidence mode must not fall back to the salvage
+    # path, which would drop the justification. The explicit `output` key marks it a contract
+    # reply; a foreign payload that merely contains a confidence field must NOT be mistaken
+    # for one.
+    obs = parse_observation(
+        '{"output": "", "is_error": false, "confidence_why": "mkdir prints nothing", '
+        '"confidence": 0.9}'
+    )
+    assert obs.content == ""
+    assert obs.metadata["confidence"] == 0.9
+    assert obs.metadata["confidence_why"] == "mkdir prints nothing"
+    foreign = parse_observation('{"confidence": 0.31, "label": "spam"}')  # no "output" key
+    assert foreign.content == '{"confidence": 0.31, "label": "spam"}'  # plaintext fallback
+
+
+def test_dumps_observation_contract_carries_confidence_into_the_draft() -> None:
+    # The verify pass embeds this rendering as the draft; a draft missing the confidence field
+    # the contract demands invites the reviser to drop it too.
+    obs = Observation(
+        content="ok",
+        is_error=False,
+        metadata={"confidence": 0.7, "confidence_why": "seen in demo"},
+    )
+    back = parse_observation(dumps_observation_contract(obs))
+    assert back.metadata["confidence"] == 0.7
+    assert back.metadata["confidence_why"] == "seen in demo"
+
+
+def test_parse_observation_salvages_confidence_from_truncated_completion() -> None:
+    # Truncation correlates with hard steps; dropping their stated confidences would bias any
+    # calibration join toward the easy ones. The salvage path must keep the number when it made
+    # it into the text before the cutoff.
+    truncated = (
+        '{"output": "done", "is_error": false, "confidence": 0.6, '
+        '"state_note": "a note that never terminat'
+    )
+    obs = parse_observation(truncated)
+    assert obs.content == "done"
+    assert obs.metadata["confidence"] == 0.6
+
+
 def test_dumps_observation_contract_roundtrips() -> None:
     obs = Observation(content="ok", is_error=False, metadata={"state_note": "did x"})
     text = dumps_observation_contract(obs)

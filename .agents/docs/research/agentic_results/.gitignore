@@ -1,2 +1,11 @@
 *.log
 *.inspection.json
+
+# Per-seed ReplayReport dumps and usage records are regenerable heavyweight scratch:
+# TraceScalingAblation._report_sink writes exactly the *_seed<N>.json pattern, and every
+# runner writes .usage.json next to its --out. Summaries/calibration JSONs stay tracked.
+# Scoped to confidence/ — older studies' tracked .usage.json artifacts must stay re-addable
+# (wmh/repo_layout_test.py forbids ignore rules matching tracked files).
+confidence/**/*_seed*.json
+confidence/**/*.usage.json
+confidence/figs/*.png

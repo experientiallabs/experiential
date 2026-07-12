@@ -128,6 +128,32 @@ def test_optimizer_satisfies_protocol() -> None:
     assert isinstance(GEPAOptimizer(FakeProvider(), FakeJudge()), Optimizer)
 
 
+def test_predict_observation_confidence_flag_renders_the_field() -> None:
+    provider = FakeProvider(prediction='{"output": "ok", "is_error": false, "confidence": 0.8}')
+    obs = predict_observation(
+        provider,
+        "PROMPT",
+        task="t",
+        state=EnvState(),
+        action=Action(kind=ActionKind.MESSAGE, content="hi"),
+        demos=[],
+        confidence=True,
+    )
+    assert '"confidence"' in (provider.last_rollout_user or "")
+    assert obs.metadata["confidence"] == 0.8
+
+
+def test_gepa_rollouts_never_request_confidence() -> None:
+    # WS-A6 guard (D75): a prompt must never be EVOLVED against a model that is also emitting
+    # the confidence field — GEPA could learn wording that games the stated confidence.
+    # `optimize` has no confidence knob by design; this pins that its rollouts stay clean.
+    provider = FakeProvider()
+    optimizer = GEPAOptimizer(provider, FakeJudge())
+    optimizer.optimize([_trace("tr1"), _trace("tr2")], [_trace("te1")], "BASE", 1)
+    assert provider.rollout_calls > 0
+    assert '"confidence"' not in (provider.last_rollout_user or "")
+
+
 def test_optimize_runs_bounded_loop_and_returns_valid_frontier() -> None:
     provider = FakeProvider()
     judge = FakeJudge(score=0.5)

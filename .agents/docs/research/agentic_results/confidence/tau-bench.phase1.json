@@ -1,0 +1,135 @@
+{
+  "name": "trace-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "base@200",
+        "params": {
+          "mode": "base",
+          "n_train": 200
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8977073170731706
+        },
+        {
+          "seed": 1,
+          "score": 0.9048414634146342
+        }
+      ],
+      "mean": 0.9012743902439024,
+      "std": 0.0035670731707317938
+    },
+    {
+      "condition": {
+        "label": "base+conf@200",
+        "params": {
+          "mode": "base+conf",
+          "n_train": 200
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9145121951219511
+        },
+        {
+          "seed": 1,
+          "score": 0.9140731707317072
+        }
+      ],
+      "mean": 0.9142926829268292,
+      "std": 0.00021951219512195141
+    },
+    {
+      "condition": {
+        "label": "base+confwhy@200",
+        "params": {
+          "mode": "base+confwhy",
+          "n_train": 200
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9163902439024391
+        },
+        {
+          "seed": 1,
+          "score": 0.9179146341463416
+        }
+      ],
+      "mean": 0.9171524390243904,
+      "std": 0.0007621951219512479
+    },
+    {
+      "condition": {
+        "label": "reason@200",
+        "params": {
+          "mode": "reason",
+          "n_train": 200
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9111585365853659
+        },
+        {
+          "seed": 1,
+          "score": 0.9128536585365854
+        }
+      ],
+      "mean": 0.9120060975609756,
+      "std": 0.0008475609756097291
+    },
+    {
+      "condition": {
+        "label": "reason+conf@200",
+        "params": {
+          "mode": "reason+conf",
+          "n_train": 200
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9150975609756097
+        },
+        {
+          "seed": 1,
+          "score": 0.9161951219512195
+        }
+      ],
+      "mean": 0.9156463414634146,
+      "std": 0.000548780487804934
+    },
+    {
+      "condition": {
+        "label": "reason+confwhy@200",
+        "params": {
+          "mode": "reason+confwhy",
+          "n_train": 200
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8986707317073171
+        },
+        {
+          "seed": 1,
+          "score": 0.9132926829268293
+        }
+      ],
+      "mean": 0.9059817073170733,
+      "std": 0.007310975609756076
+    }
+  ]
+}

@@ -147,6 +147,11 @@ class HarnessConfig(BaseModel):
     # Second self-check completion per step (draft re-examined against the evidence). ~2x serve
     # cost; earns it only where content prediction is hardest (empirically: swe-style suites).
     verify: bool = False
+    # Verbalized confidence (WS-A6, D75): the contract asks for a 0.0-1.0 self-assessment of the
+    # emitted output (carried in Observation.metadata, never shown to the judge).
+    # `confidence_why` adds its one-line justification. Analysis/abstention lever, off by default.
+    confidence: bool = False
+    confidence_why: bool = False
 
     def provider_config(self, kind: ProviderKind) -> ProviderConfig:
         """Return the configured ProviderConfig for `kind` (model + backend knobs)."""

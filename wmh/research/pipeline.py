@@ -24,7 +24,7 @@ from collections.abc import Callable
 
 from wmh.core.types import Step, Trace
 from wmh.engine.grounding import Grounder, SourceResolver
-from wmh.engine.replay import replay
+from wmh.engine.replay import ReplayReport, replay
 from wmh.engine.workspace import RepoTreeResolver
 from wmh.optimize.gepa import GEPAOptimizer, OptimizeResult
 from wmh.optimize.judge import RUBRIC_DIMENSIONS, Judge, RubricDimension
@@ -95,6 +95,10 @@ def score_prompt(
     tree: RepoTreeResolver | None = None,
     profile: bool = False,
     poll: bool = False,
+    confidence: bool = False,
+    confidence_why: bool = False,
+    verify_below: float | None = None,
+    on_report: Callable[[ReplayReport], None] | None = None,
 ) -> float:
     """Replay-score `prompt`'s held-out fidelity, leak-free. Returns the mean judge score (0..1).
 
@@ -105,7 +109,11 @@ def score_prompt(
     `seed` makes that turn selection reproducible. `retrieval_key` selects what phi embeds:
     "state_action" (full summary) or "action" (command-only). `knowledge`/`reasoning` are the
     serving engine's agentic mode (knowledge must be train-derived — callers own that
-    discipline).
+    discipline). `confidence`/`confidence_why`/`verify_below` are the WS-A6
+    verbalized-confidence lever and its gated verify. `on_report` receives the full per-step
+    `ReplayReport` as soon as replay returns — BEFORE the invalid-judgement exits and the
+    `score_dimension` return below — because calibration persistence must capture the per-step
+    joint distribution even for cells the mean cannot represent.
 
     `score_dimension` (a `RubricJudge` dimension, e.g. "factuality") returns that dimension's mean
     over validly-judged steps instead of the mean-of-dimensions headline. The headline is largely
@@ -147,8 +155,15 @@ def score_prompt(
         tree=tree,
         profile=profile,
         poll=poll,
+        confidence=confidence,
+        confidence_why=confidence_why,
+        verify_below=verify_below,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
     )
+    # Persist FIRST: the sink must see the per-step report even when the judge-outage guard
+    # below aborts the cell (the raw results are exactly what diagnoses the outage).
+    if on_report is not None:
+        on_report(report)
     if report.n_steps and report.n_invalid == report.n_steps:
         raise RuntimeError(
             f"judge produced no valid judgement over {report.n_steps} steps — a judge outage, "

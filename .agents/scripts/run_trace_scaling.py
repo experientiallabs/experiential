@@ -205,6 +205,7 @@ def _run(args: argparse.Namespace) -> tuple[AblationReport, _MeterBank]:
         retrieval_key=args.retrieval_key,
         score_dimension=args.score_dimension,
         source_pins=args.source_pins,
+        results_dir=args.results_dir,
     )
     split = ablation.split
     scored = len(ablation.scored_test)
@@ -244,7 +245,16 @@ def main() -> None:
         help="Benchmark-suite root (all benchmark suites moved to packages/environment-capture/).",
     )
     parser.add_argument("--counts", default=DEFAULT_COUNTS, help="Comma-separated train counts.")
-    parser.add_argument("--modes", default="base,gepa", help="Comma-separated: base, gepa.")
+    parser.add_argument(
+        "--modes",
+        default="base,gepa",
+        help="Comma-separated modes; any mode composes with +conf/+confwhy/+gateverify@<t>.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        default=None,
+        help="Persist each cell's full ReplayReport (per-step scores + stated confidences) here.",
+    )
     parser.add_argument("--seeds", default="0,1,2", help="Comma-separated seeds (error bars).")
     parser.add_argument("--budget", type=int, default=12, help="GEPA rollout budget (gepa mode).")
     parser.add_argument("--top-k", type=int, default=5, help="Retrieval depth.")
