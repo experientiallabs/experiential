@@ -127,6 +127,39 @@ def test_login_with_token_drops_stale_default_org(
     assert saved.default_org == "org-1"
 
 
+def test_login_with_explicit_api_url_skips_web_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protected previews can pair browser auth with their direct backend URL."""
+
+    def unexpected_discovery(_url: str) -> str:
+        pytest.fail("explicit --api-url must skip web discovery")
+
+    monkeypatch.setattr("wmh.cli.platform_cmds.fetch_cli_config", unexpected_discovery)
+    monkeypatch.setattr("wmh.cli.platform_cmds.PlatformClient", _StubClient)
+
+    result = runner.invoke(
+        app,
+        [
+            "login",
+            "--url",
+            "https://preview.test/",
+            "--api-url",
+            "https://api-preview.test/",
+            "--token",
+            "xpl_new",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    from wmh.platform.credentials import load_credentials
+
+    saved = load_credentials()
+    assert saved.web_url == "https://preview.test"
+    assert saved.api_url == "https://api-preview.test"
+    assert saved.token == "xpl_new"
+
+
 def test_push_requires_login_first(tmp_path: Path) -> None:
     result = runner.invoke(app, ["push", "anything", "--root", str(tmp_path)])
     assert result.exit_code != 0

@@ -41,6 +41,10 @@ _CHECK = "[green]✓[/green]"
 _LOGIN_URL = typer.Option(
     "--url", help="Platform URL (defaults to the saved one, then the hosted platform)."
 )
+_LOGIN_API_URL = typer.Option(
+    "--api-url",
+    help="Platform API URL (skips web discovery; useful for protected previews).",
+)
 _LOGIN_TOKEN = typer.Option(
     "--token", help="Paste an existing API key instead of using the browser."
 )
@@ -64,6 +68,7 @@ _ROOT = typer.Option("--root", help="Artifact root directory.")
 
 def login(
     url: Annotated[str | None, _LOGIN_URL] = None,
+    api_url: Annotated[str | None, _LOGIN_API_URL] = None,
     token: Annotated[str | None, _LOGIN_TOKEN] = None,
     no_browser: Annotated[bool, _LOGIN_NO_BROWSER] = False,
 ) -> None:
@@ -71,12 +76,15 @@ def login(
     credentials = load_credentials()
     web_url = (url or credentials.web_url or DEFAULT_WEB_URL).rstrip("/")
 
-    try:
-        api_url = fetch_cli_config(web_url)
-    except PlatformError as error:
-        raise typer.BadParameter(f"{web_url} does not look like a platform: {error}") from error
     if api_url is None:
-        raise typer.BadParameter(f"{web_url} did not advertise a backend URL; is it deployed?")
+        try:
+            api_url = fetch_cli_config(web_url)
+        except PlatformError as error:
+            raise typer.BadParameter(f"{web_url} does not look like a platform: {error}") from error
+        if api_url is None:
+            raise typer.BadParameter(f"{web_url} did not advertise a backend URL; is it deployed?")
+    else:
+        api_url = api_url.rstrip("/")
 
     if token is None:
         token = _browser_login(web_url, open_browser=not no_browser)

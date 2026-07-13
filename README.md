@@ -73,6 +73,13 @@ wmh run <world-model-or-agent-id> --task "inspect this repository"
 wmh run --task "fix the failing tests"   # built-in pi harness, also platform-backed when logged in
 ```
 
+For a deployment-protected preview whose public discovery route is not available to a
+non-browser client, pair its browser and backend URLs explicitly:
+
+```bash
+wmh login --url https://preview.example --api-url https://preview-api.example
+```
+
 Local pi execution requires Node.js 22.19 or newer plus npm on `PATH`. WMH installs the pinned pi
 npm dependencies into its user cache on the first run. It does not require E2B. Harness code and
 shell commands run with your normal user permissions: file tools are restricted to `--dir`, but
