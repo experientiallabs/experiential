@@ -282,23 +282,22 @@ class RunnerLink:
             reported = completion.token_usage()
             usage.input_tokens += reported.input_tokens
             usage.output_tokens += reported.output_tokens
-            self._channel.send(
-                {
-                    "type": "llm_response",
-                    "episode_id": episode_id,
-                    "req_id": req_id,
-                    "completion": completion.wire_payload(),
-                }
-            )
+            response: JsonObject = {
+                "type": "llm_response",
+                "episode_id": episode_id,
+                "req_id": req_id,
+                "completion": completion.wire_payload(),
+            }
         except Exception as exc:  # noqa: BLE001 - report to the runner, never crash the host
-            self._channel.send(
-                {
-                    "type": "llm_response",
-                    "episode_id": episode_id,
-                    "req_id": req_id,
-                    "error": str(exc),
-                }
-            )
+            response = {
+                "type": "llm_response",
+                "episode_id": episode_id,
+                "req_id": req_id,
+                "error": str(exc),
+            }
+        # A send timeout is transport failure with an uncertain delivery state. Let it propagate
+        # so the owning runtime retires the channel instead of sending a second response frame.
+        self._channel.send(response)
 
     @staticmethod
     def _error_result(

@@ -388,7 +388,9 @@ class E2BPiRuntime:
     def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
         try:
             return self._run_episode(task_id, instruction, environment)
-        except (RuntimeError, TimeoutError):
+        except Exception as exc:
+            if not _is_retryable_transport_error(exc):
+                raise
             # Transport death (stream drop, sandbox lifetime, dead runner) — the failed
             # attempt's sandbox was already discarded on release. Retry ONCE on a fresh
             # sandbox: the environment session may replay the dead attempt's opening steps,
@@ -427,6 +429,16 @@ class E2BPiRuntime:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def _is_retryable_transport_error(exc: Exception) -> bool:
+    """Whether an episode exception means its E2B transport is no longer trustworthy."""
+    if isinstance(exc, (RuntimeError, TimeoutError)):
+        return True
+    # Keep the E2B SDK optional at import time. Its TimeoutException is not a built-in
+    # TimeoutError, but any instance means the sandbox/channel state is uncertain.
+    exc_type = type(exc)
+    return exc_type.__module__ == "e2b.exceptions" and exc_type.__name__ == "TimeoutException"
 
 
 def session_entry_files() -> dict[str, str]:
