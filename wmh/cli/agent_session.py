@@ -597,8 +597,8 @@ class RemoteAgentDriver:
         """Download and apply one announced E2B patch, then advance the local base."""
         payload = getattr(event, "payload", {})
         revision_value = payload.get("revision") if isinstance(payload, dict) else None
-        if not isinstance(revision_value, int):
-            raise WorkspaceSyncError("workspace patch event has no integer revision")
+        if not isinstance(revision_value, str) or not revision_value:
+            raise WorkspaceSyncError("workspace patch event has no revision")
         content = self._client.download_agent_workspace_patch(
             self._target_id, session_id, revision_value
         )

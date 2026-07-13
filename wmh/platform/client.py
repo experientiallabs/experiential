@@ -339,7 +339,7 @@ class PlatformClient:
         return WorkspacePatchResult.model_validate(response.json())
 
     def download_agent_workspace_patch(
-        self, agent_id: str, session_id: str, revision: int
+        self, agent_id: str, session_id: str, revision: str
     ) -> bytes:
         """Download one remote-to-local live workspace patch."""
         response = self._client.get(
@@ -350,7 +350,7 @@ class PlatformClient:
         return response.content
 
     def acknowledge_agent_workspace_patch(
-        self, agent_id: str, session_id: str, revision: int
+        self, agent_id: str, session_id: str, revision: str
     ) -> None:
         """Remove a remote patch after it is safely reflected or reported locally."""
         response = self._client.post(

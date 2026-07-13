@@ -494,7 +494,7 @@ def test_remote_agent_driver_applies_live_workspace_patch(
 
     class _HostedClient:
         def __init__(self) -> None:
-            self.patch_acks: list[int] = []
+            self.patch_acks: list[str] = []
             self.closed = False
 
         def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
@@ -504,18 +504,18 @@ def test_remote_agent_driver_applies_live_workspace_patch(
             event = type(
                 "Event",
                 (),
-                {"kind": "workspace_patch", "payload": {"revision": 1}},
+                {"kind": "workspace_patch", "payload": {"revision": "patch-1"}},
             )()
             return type("Page", (), {"events": [event], "last_seq": 1, "status": "ended"})()
 
         def download_agent_workspace_patch(
-            self, _agent_id: str, _session_id: str, revision: int
+            self, _agent_id: str, _session_id: str, revision: str
         ) -> bytes:
-            assert revision == 1
+            assert revision == "patch-1"
             return patch
 
         def acknowledge_agent_workspace_patch(
-            self, _agent_id: str, _session_id: str, revision: int
+            self, _agent_id: str, _session_id: str, revision: str
         ) -> None:
             self.patch_acks.append(revision)
 
@@ -546,5 +546,5 @@ def test_remote_agent_driver_applies_live_workspace_patch(
     ).run()
 
     assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "during"
-    assert client.patch_acks == [1]
+    assert client.patch_acks == ["patch-1"]
     assert client.closed

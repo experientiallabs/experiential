@@ -149,9 +149,9 @@ def test_hosted_agent_session_uses_regular_create_and_workspace_patch_routes() -
         if path.endswith("/commands"):
             assert json.loads(request.read()) == {"kind": "user_message", "text": "continue"}
             return httpx.Response(202, json={"command_id": 1})
-        if path.endswith("/workspace/patches/7/ack"):
+        if path.endswith("/workspace/patches/patch-7/ack"):
             return httpx.Response(204)
-        if path.endswith("/workspace/patches/7"):
+        if path.endswith("/workspace/patches/patch-7"):
             return httpx.Response(200, content=b"remote-patch")
         if path.endswith("/workspace/patches"):
             body = request.read()
@@ -171,8 +171,8 @@ def test_hosted_agent_session_uses_regular_create_and_workspace_patch_routes() -
         client.post_agent_session_command("agent-1", created.id, "user_message", text="continue")
         current = client.get_agent_session("agent-1", created.id)
         patch_result = client.upload_agent_workspace_patch("agent-1", created.id, b"local-patch")
-        patch = client.download_agent_workspace_patch("agent-1", created.id, 7)
-        client.acknowledge_agent_workspace_patch("agent-1", created.id, 7)
+        patch = client.download_agent_workspace_patch("agent-1", created.id, "patch-7")
+        client.acknowledge_agent_workspace_patch("agent-1", created.id, "patch-7")
         final = client.download_agent_workspace("agent-1", created.id)
         client.acknowledge_agent_workspace("agent-1", created.id)
 
@@ -189,8 +189,8 @@ def test_hosted_agent_session_uses_regular_create_and_workspace_patch_routes() -
         "POST /api/agents/agent-1/sessions/sess-1/commands",
         "GET /api/agents/agent-1/sessions/sess-1",
         "POST /api/agents/agent-1/sessions/sess-1/workspace/patches",
-        "GET /api/agents/agent-1/sessions/sess-1/workspace/patches/7",
-        "POST /api/agents/agent-1/sessions/sess-1/workspace/patches/7/ack",
+        "GET /api/agents/agent-1/sessions/sess-1/workspace/patches/patch-7",
+        "POST /api/agents/agent-1/sessions/sess-1/workspace/patches/patch-7/ack",
         "GET /api/agents/agent-1/sessions/sess-1/workspace",
         "POST /api/agents/agent-1/sessions/sess-1/workspace/ack",
     ]
