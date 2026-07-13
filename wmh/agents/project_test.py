@@ -130,3 +130,13 @@ def test_project_rejects_paths_that_escape_its_workspace() -> None:
         assert "relative project path" in str(error)
     else:
         raise AssertionError("path traversal should fail")
+
+
+def test_agent_file_tools_reject_paths_outside_the_project() -> None:
+    """Absolute and traversing agent paths cannot reach runner or sibling files."""
+    project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
+
+    for path in ("/home/user/runner.js", "../runner.js"):
+        outcome = project._execute_tool("read_file", {"path": path}, lambda stream, data: None)
+        assert outcome.is_error is True
+        assert "escapes project workspace" in outcome.content

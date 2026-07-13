@@ -8,9 +8,9 @@ from llm_waterfall import ChatResponse
 
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProjectRun
-from wmh.harness.delta import FailureSignature
+from wmh.harness.delta import FailureSignature, HarnessDelta
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.proposer import ProjectDeltaProposer, ProviderDeltaProposer
+from wmh.harness.proposer import ProjectDeltaProposer, ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runner_link import TokenUsage
 from wmh.providers.base import (
     Completion,
@@ -68,6 +68,20 @@ class _Provider:
         raise AssertionError("fake project never calls the provider")
 
 
+class _FlakyProvider(_Provider):
+    def __init__(self, replies: list[str | Exception]) -> None:
+        super().__init__("")
+        self.replies = replies
+
+    def complete(self, system: str, messages: list[Message], **kwargs: object) -> Completion:
+        del system, messages, kwargs
+        reply = self.replies[self.calls]
+        self.calls += 1
+        if isinstance(reply, Exception):
+            raise reply
+        return Completion(text=reply)
+
+
 class _Project:
     workspace = "/home/user/project"
 
@@ -110,6 +124,22 @@ def test_provider_proposer_produces_requested_sibling_count() -> None:
     assert all(proposal is not None for proposal in proposals)
 
 
+def test_provider_proposer_isolates_one_failed_sibling_call() -> None:
+    parent = HarnessDoc.baseline("parent")
+    provider = _FlakyProvider(
+        [_payload(parent, "first"), RuntimeError("rate limited"), _payload(parent, "third")]
+    )
+
+    proposals = ProviderDeltaProposer(provider).propose_batch(
+        parent, _trigger(), "evidence", history=[], count=3
+    )
+
+    assert provider.calls == 3
+    assert proposals[0] is not None and not isinstance(proposals[0], ProposalFailure)
+    assert proposals[1] == ProposalFailure(reason="rate limited")
+    assert proposals[2] is not None and not isinstance(proposals[2], ProposalFailure)
+
+
 def test_project_proposer_uses_one_agent_turn_and_keeps_round_files() -> None:
     parent = HarnessDoc.baseline("parent")
     project = _Project([_payload(parent, "careful"), _payload(parent, "verify")])
@@ -122,7 +152,7 @@ def test_project_proposer_uses_one_agent_turn_and_keeps_round_files() -> None:
         parent,
         _trigger(),
         "inspect the next failures",
-        history=[proposal for proposal in proposals if proposal is not None],
+        history=[proposal for proposal in proposals if isinstance(proposal, HarnessDelta)],
         count=2,
     )
 

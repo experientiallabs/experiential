@@ -1148,6 +1148,26 @@ def test_dead_iteration_ends_early_and_the_search_moves_on() -> None:
     assert scored.candidate == "winner-g2"
 
 
+def test_dead_proposals_do_not_discount_the_selected_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selection freshness changes only after a valid child is constructed."""
+    observed_counts: list[dict[str, int]] = []
+
+    def capture_selection(
+        entries: list[PoolEntry], children_counts: dict[str, int], seed: int
+    ) -> PoolEntry:
+        del seed
+        observed_counts.append(dict(children_counts))
+        return entries[0]
+
+    monkeypatch.setattr(create_module, "select_parent", capture_selection)
+    result = _run(RoleProvider(meta_reply="not json"), iterations=2)
+
+    assert result.skipped == 2
+    assert observed_counts == [{}, {}]
+
+
 def test_skipped_iterations_narrate_through_on_note() -> None:
     """Every iteration whose proposal dies before scoring reports itself.
 

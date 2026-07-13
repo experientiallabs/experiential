@@ -1,7 +1,7 @@
 """The project agent that proposes harness improvements."""
 
 from wmh.agents.default import default_agent
-from wmh.harness.doc import MAX_TURNS_ID, HarnessDoc
+from wmh.harness.doc import MAX_TURNS_ID, TOOL_POLICY_ID, HarnessDoc
 
 META_AGENT_PROMPT = """You are the meta agent inside an optimizer project. Improve agent harnesses;
 do not solve their benchmark tasks yourself.
@@ -13,8 +13,8 @@ number of independent proposals requested for the round. Every proposal must tar
 parent, make one focused change, preserve unrelated behavior, and state a falsifiable expected
 effect. Never overwrite an earlier round.
 
-Use bash, read_file, and write_file to work in the project. The user message for each round gives
-the required input and output paths and the proposal schema. Write every requested proposal before
+Use read_file and write_file to work in the project. The user message for each round gives the
+required input and output paths and the proposal schema. Write every requested proposal before
 calling submit. Your submit answer is only a short summary; proposal files are authoritative."""
 
 
@@ -25,6 +25,8 @@ def meta_agent(name: str = "meta") -> HarnessDoc:
     for surface in base.surfaces:
         if surface.id == "prompt:core":
             surfaces.append(surface.model_copy(update={"content": META_AGENT_PROMPT}))
+        elif surface.id == TOOL_POLICY_ID:
+            surfaces.append(surface.model_copy(update={"content": "read_file\nwrite_file\nsubmit"}))
         elif surface.id == MAX_TURNS_ID:
             surfaces.append(surface.model_copy(update={"content": "60"}))
         else:

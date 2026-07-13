@@ -36,7 +36,7 @@ from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.mutate import render_evidence
-from wmh.harness.proposer import DeltaProposer
+from wmh.harness.proposer import DeltaProposer, ProposalFailure
 from wmh.harness.runtime import TokenUsage, combine_usage
 from wmh.providers.base import Provider
 
@@ -482,8 +482,7 @@ def create_harness(
                 HarnessDoc,
                 ClosedLoopReport,
                 FailureSignature,
-                HarnessDelta | None,
-                str | None,
+                HarnessDelta | ProposalFailure | None,
             ]
         ] = []
         total_attempts = iterations * proposal_batch_size
@@ -495,10 +494,6 @@ def create_harness(
                 parent_entry = select_parent(pool, children_counts, seed=round_index)
                 parent = docs[parent_entry.doc_hash]
                 parent_report = reports[parent_entry.doc_hash]
-                # Every sibling is an expansion of the selected parent, including dead proposals.
-                children_counts[parent.doc_hash] = (
-                    children_counts.get(parent.doc_hash, 0) + proposal_batch_size
-                )
                 clusters = cluster_failures(parent_report, tasks)
                 trigger = (
                     clusters[0] if clusters else FailureSignature(mechanism=ALL_PASS_MECHANISM)
@@ -517,23 +512,18 @@ def create_harness(
                             f"proposer returned {len(batch)} proposals; "
                             f"expected {proposal_batch_size}"
                         )
-                    errors: list[str | None] = [None] * proposal_batch_size
                 except Exception as exc:  # noqa: BLE001 - provider/agent/transport failure
-                    batch = [None] * proposal_batch_size
-                    errors = [str(exc)] * proposal_batch_size
-                proposal_queue.extend(
-                    (parent, parent_report, trigger, delta, error)
-                    for delta, error in zip(batch, errors, strict=True)
-                )
+                    batch = [ProposalFailure(reason=str(exc))] * proposal_batch_size
+                proposal_queue.extend((parent, parent_report, trigger, delta) for delta in batch)
 
-            parent, parent_report, trigger, delta, proposer_error = proposal_queue.pop(0)
+            parent, parent_report, trigger, delta = proposal_queue.pop(0)
             label = _proposal_label(
                 round_index,
                 proposal_index,
                 rounds=iterations,
                 batch_size=proposal_batch_size,
             )
-            if proposer_error is not None:
+            if isinstance(delta, ProposalFailure):
                 skipped += 1
                 _dead(
                     IterationRecord(
@@ -541,10 +531,10 @@ def create_harness(
                         round=round_index,
                         proposal_index=proposal_index,
                         outcome="proposer_error",
-                        reason=proposer_error,
+                        reason=delta.reason,
                         champion_score=champion_score,
                     ),
-                    f"{label}: proposer call failed ({proposer_error}); skipped",
+                    f"{label}: proposer call failed ({delta.reason}); skipped",
                 )
                 continue
             if delta is None:
@@ -635,6 +625,10 @@ def create_harness(
                     "(e2b runs pi-node only); skipped",
                 )
                 continue
+
+            # Only an evaluable child counts as a real expansion. Provider faults,
+            # unusable replies, duplicates, and invalid deltas leave the parent fresh.
+            children_counts[parent.doc_hash] = children_counts.get(parent.doc_hash, 0) + 1
 
             # Cheap screen: before a full-split eval, the delta must improve the very cluster it
             # was proposed to fix. A delta that cannot beat its parent on its own target is noise.

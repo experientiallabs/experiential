@@ -203,9 +203,10 @@ class AgentProject:
                 command = str(arguments.get("command", ""))
                 return self._run_bash(command, emit)
             if name == "read_file":
-                return _capped(self._sandbox.files.read(str(arguments.get("path", ""))))
+                path = self._tool_path(str(arguments.get("path", "")))
+                return _capped(self._sandbox.files.read(path))
             if name == "write_file":
-                path = str(arguments.get("path", ""))
+                path = self._tool_path(str(arguments.get("path", "")))
                 self._sandbox.files.write(path, str(arguments.get("content", "")))
                 return ToolOutcome(content=f"wrote {path}")
         except Exception as error:  # noqa: BLE001 - tool errors are agent observations
@@ -232,6 +233,19 @@ class AgentProject:
         if exit_code:
             content = f"{content}\n[exit {exit_code}]"
         return _capped(content, is_error=exit_code != 0)
+
+    def _tool_path(self, path: str) -> str:
+        """Resolve an agent-supplied path while containing it to the project."""
+        candidate = PurePosixPath(path)
+        workspace = PurePosixPath(self.workspace)
+        if candidate.is_absolute():
+            try:
+                candidate = candidate.relative_to(workspace)
+            except ValueError as error:
+                raise ValueError(f"path escapes project workspace: {path!r}") from error
+        if not candidate.parts or ".." in candidate.parts:
+            raise ValueError(f"path escapes project workspace: {path!r}")
+        return str(workspace / candidate)
 
 
 def _start_channel(sandbox: SandboxHandle, workspace: str) -> Channel:
