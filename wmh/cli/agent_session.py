@@ -62,7 +62,7 @@ if TYPE_CHECKING:
 
     from llm_waterfall import ChatRequest, ChatResponse
 
-    from wmh.core.types import JsonObject, JsonValue
+    from wmh.core.types import JsonObject
 
 _console = Console()
 
@@ -195,45 +195,6 @@ def _as_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value if isinstance(value, str) else ""
-
-
-class SessionRecorder:
-    """Best-effort mirror of the local transcript to the platform (create done already)."""
-
-    def __init__(self, client: PlatformClient, agent_id: str, session_id: str) -> None:
-        """Buffer events for the given already-created platform session."""
-        self._client = client
-        self._agent_id = agent_id
-        self._session_id = session_id
-        self._buffer: list[dict[str, JsonValue]] = []
-
-    def record(self, event: SessionEvent) -> None:
-        """Queue one event for the next flush."""
-        self._buffer.append({"kind": event.kind, "payload": event.payload})
-
-    def flush(self) -> None:
-        """Report queued events; drop the batch on a transport error (best-effort)."""
-        if not self._buffer:
-            return
-        batch, self._buffer = self._buffer, []
-        try:
-            self._client.append_local_events(self._agent_id, self._session_id, batch)
-        except PlatformError as error:
-            _console.print(f"[yellow]could not report {len(batch)} events: {error}[/yellow]")
-
-    def finish(self, *, ended_reason: str, error: str | None) -> None:
-        """Flush the tail and post the terminal transition."""
-        self.flush()
-        status = "failed" if error is not None else "ended"
-        with contextlib.suppress(PlatformError):
-            self._client.finish_local_session(
-                self._agent_id,
-                self._session_id,
-                status=status,
-                ended_reason=ended_reason,
-                error=error,
-            )
-        self._client.close()
 
 
 class RunRecorder(Protocol):
@@ -590,10 +551,7 @@ class RemoteAgentDriver:
                         synchronized,
                     )
                 now = time.monotonic()
-                if (
-                    synchronized is not None
-                    and now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S
-                ):
+                if synchronized is not None and now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S:
                     synchronized = self._push_local_patch(session_id, synchronized)
                     last_workspace_push = now
                 time.sleep(0.5)
@@ -746,9 +704,7 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
 _TARGET_ARG = typer.Argument(
     help="Platform world-model or agent id (omit to run the built-in pi harness locally)."
 )
-_DIR_OPT = typer.Option(
-    "--dir", help="Working directory for the built-in local pi harness."
-)
+_DIR_OPT = typer.Option("--dir", help="Working directory for the built-in local pi harness.")
 _UPLOAD_DIR_OPT = typer.Option(
     "-u", "--upload-dir", help="Directory to upload and live-sync for a hosted agent."
 )

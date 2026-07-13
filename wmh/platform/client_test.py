@@ -116,7 +116,6 @@ def test_hosted_agent_session_uses_regular_create_and_workspace_patch_routes() -
         "id": "sess-1",
         "agent_id": "agent-1",
         "status": "starting",
-        "source": "hosted",
         "workspace_sync": True,
         "launched_from": "cli",
     }
@@ -210,16 +209,13 @@ def test_hosted_agent_session_without_workspace_posts_create_directly() -> None:
                 "id": "sess-1",
                 "agent_id": "agent-1",
                 "status": "starting",
-                "source": "hosted",
                 "workspace_sync": False,
-                "launched_from": "web",
+                "launched_from": "cli",
             },
         )
 
     with _client(handler) as client:
-        created = client.create_agent_session(
-            "agent-1", workspace=None, instruction="remote task"
-        )
+        created = client.create_agent_session("agent-1", workspace=None, instruction="remote task")
 
     assert not created.workspace_sync
     assert seen == ["POST /api/agents/agent-1/sessions"]

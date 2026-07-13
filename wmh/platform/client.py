@@ -98,18 +98,6 @@ class PushedHarnessVersion(BaseModel):
     created: bool  # False when the push was an idempotent repeat of the tip
 
 
-class LocalSessionInfo(BaseModel):
-    """The platform's record of a CLI-driven local session (a session_view slice)."""
-
-    id: str
-    agent_id: str
-    status: str
-    source: str
-    agent_provider: str
-    agent_model: str
-    title: str | None = None
-
-
 class RunTarget(BaseModel):
     """A platform id resolved to one executable resource kind."""
 
@@ -135,7 +123,6 @@ class RemoteAgentSession(BaseModel):
     id: str
     agent_id: str
     status: str
-    source: str
     workspace_sync: bool
     launched_from: Literal["web", "cli"]
     starting_detail: str | None = None
@@ -501,63 +488,6 @@ class PlatformClient:
         )
         self._raise_for_error(response)
         return PushedHarnessVersion.model_validate(response.json())
-
-    # -- local (CLI-driven) agent sessions -----------------------------------------------------
-
-    def fetch_champion_harness(self, agent_id: str) -> HarnessVersionDoc:
-        """Fetch an agent's champion harness WITH its raw doc (to run locally)."""
-        response = self._client.get(f"/api/agents/{agent_id}/champion")
-        self._raise_for_error(response)
-        return HarnessVersionDoc.model_validate(response.json())
-
-    def create_local_session(self, agent_id: str, *, title: str | None = None) -> LocalSessionInfo:
-        """Open a platform-recorded local session for this agent (no dispatch)."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/local-sessions", json={"title": title}
-        )
-        self._raise_for_error(response)
-        return LocalSessionInfo.model_validate(response.json())
-
-    def append_local_events(
-        self, agent_id: str, session_id: str, events: list[dict[str, JsonValue]]
-    ) -> int:
-        """Report a batch of transcript events; return the session's new last_seq."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/local-sessions/{session_id}/events",
-            json={"events": events},
-        )
-        self._raise_for_error(response)
-        seq = response.json().get("last_seq", 0)
-        return int(seq) if isinstance(seq, int | float | str) else 0
-
-    def complete_worker(self, agent_id: str, session_id: str, request: ChatRequest) -> ChatResponse:
-        """Answer one worker turn through the platform proxy (platform keys, org-billed)."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/local-sessions/{session_id}/worker-completion",
-            json=request.model_dump(mode="json", exclude_none=True),
-        )
-        self._raise_for_error(response)
-        return ChatResponse.model_validate(response.json())
-
-    def finish_local_session(
-        self,
-        agent_id: str,
-        session_id: str,
-        *,
-        status: str,
-        ended_reason: str,
-        error: str | None = None,
-    ) -> None:
-        """Report the terminal transition of a local session."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/local-sessions/{session_id}/finish",
-            json={
-                "status": status,
-                "ended_reason": ended_reason,
-                "error": error,
-            },
-        )
-        self._raise_for_error(response)
 
     # -- built-in local pi runs ---------------------------------------------------------------
 

@@ -98,11 +98,10 @@ class _FakeProvider:
 
 
 class _FakeClient:
-    """Records proxy calls; serves a baseline champion + a created session."""
+    """Records hosted target resolution and built-in Pi proxy calls."""
 
     def __init__(self) -> None:
         self.worker_calls: list[ChatRequest] = []
-        self.created: list[str] = []
         self.target_kind = "agent"
         self.closed = False
         self.local_pi_created: list[str] = []
@@ -114,24 +113,6 @@ class _FakeClient:
             (),
             {"id": target_id, "kind": self.target_kind, "name": "remote-target"},
         )()
-
-    def fetch_champion_harness(self, agent_id: str) -> object:
-        _ = agent_id
-        doc = mod.HarnessDoc.baseline("champ").model_dump(mode="json")
-        return type("Champ", (), {"doc": doc})()
-
-    def create_local_session(self, agent_id: str, *, title: str | None = None) -> object:
-        _ = title
-        self.created.append(agent_id)
-        return type("Sess", (), {"id": "sess-1"})()
-
-    def complete_worker(self, agent_id: str, session_id: str, request: ChatRequest) -> ChatResponse:
-        _ = agent_id, session_id
-        self.worker_calls.append(request)
-        return ChatResponse(
-            choices=[ChatChoice(message=ChatMessage(role="assistant", content="ok"))],
-            usage=ChatUsage(prompt_tokens=1, completion_tokens=1),
-        )
 
     def create_local_pi_run(self, org_id: str) -> object:
         self.local_pi_created.append(org_id)
@@ -205,12 +186,9 @@ def test_build_driver_logged_in_agent_uses_hosted_e2b_without_local_workspace(
     assert isinstance(driver, mod.RemoteAgentDriver)
     assert driver._target_id == "a1"
     assert driver._jail is None
-    assert client.created == []
 
 
-def test_run_upload_dir_is_explicit_opt_in(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_run_upload_dir_is_explicit_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A hosted run receives no local path unless -u/--upload-dir is present."""
     roots: list[Path | None] = []
 
@@ -274,7 +252,6 @@ def test_platform_target_rejects_local_provider_before_creating_session(
             model=None,
             task=None,
         )
-    assert client.created == []
 
 
 def test_hosted_agent_does_not_prompt_for_local_execution(
@@ -297,7 +274,6 @@ def test_hosted_agent_does_not_prompt_for_local_execution(
     )
     assert isinstance(driver, mod.RemoteAgentDriver)
     assert prompted == []
-    assert client.created == []
     assert not client.closed
 
 
