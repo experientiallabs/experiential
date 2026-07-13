@@ -9,7 +9,9 @@ from pathlib import Path
 
 import httpx
 import pytest
+from llm_waterfall.types import ChatMessage, ChatRequest
 
+from wmh.core.types import Action, ActionKind
 from wmh.platform.client import PlatformClient, PlatformError, fetch_cli_config
 
 API_URL = "https://api.test"
@@ -55,6 +57,106 @@ def test_401_error_suggests_logging_in() -> None:
 
     with _client(handler) as client, pytest.raises(PlatformError, match="wmh login"):
         client.whoami()
+
+
+def test_unified_run_target_and_world_model_session_payloads() -> None:
+    """The run client resolves once, then uses the hosted world-model session API."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/run-targets/wm-1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "wm-1",
+                    "kind": "world_model",
+                    "org_id": "org-1",
+                    "name": "tau",
+                    "status": "ready",
+                },
+            )
+        if request.url.path == "/api/world-models/wm-1/sessions":
+            assert json.loads(request.read()) == {"task": "book a flight"}
+            return httpx.Response(
+                201,
+                json={"id": "sess-1", "world_model_id": "wm-1", "status": "active"},
+            )
+        assert request.url.path == "/api/sessions/sess-1/step"
+        body = json.loads(request.read())
+        assert body["action"] == {
+            "kind": "tool_call",
+            "name": "search",
+            "arguments": {"q": "SFO"},
+            "content": None,
+        }
+        return httpx.Response(200, json={"observation": {"content": "three flights"}})
+
+    with _client(handler) as client:
+        target = client.resolve_run_target("wm-1")
+        session = client.create_world_model_session(target.id, task="book a flight")
+        observation = client.step_world_model_session(
+            session.id,
+            Action(kind=ActionKind.TOOL_CALL, name="search", arguments={"q": "SFO"}),
+        )
+
+    assert target.kind == "world_model"
+    assert observation.content == "three flights"
+    assert seen == [
+        "/api/run-targets/wm-1",
+        "/api/world-models/wm-1/sessions",
+        "/api/sessions/sess-1/step",
+    ]
+
+
+def test_builtin_local_pi_run_payloads() -> None:
+    """The built-in harness has an org-scoped, metered platform worker path."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/orgs/org-1/local-pi-runs":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "run-1",
+                    "org_id": "org-1",
+                    "status": "running",
+                    "worker_provider": "bedrock",
+                    "worker_model": "claude-haiku-4-5",
+                },
+            )
+        if request.url.path.endswith("/worker-completion"):
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                },
+            )
+        assert request.url.path.endswith("/finish")
+        assert json.loads(request.read()) == {
+            "status": "ended",
+            "ended_reason": "user_ended",
+            "error": None,
+        }
+        return httpx.Response(202, json={})
+
+    with _client(handler) as client:
+        run = client.create_local_pi_run("org-1")
+        response = client.complete_local_pi_worker(
+            "org-1",
+            run.id,
+            ChatRequest(messages=[ChatMessage(role="user", content="hi")]),
+        )
+        client.finish_local_pi_run("org-1", run.id, status="ended", ended_reason="user_ended")
+
+    assert response.choices[0].message.content == "ok"
+    assert seen == [
+        "/api/orgs/org-1/local-pi-runs",
+        "/api/orgs/org-1/local-pi-runs/run-1/worker-completion",
+        "/api/orgs/org-1/local-pi-runs/run-1/finish",
+    ]
 
 
 def test_push_model_bundle_runs_ticket_put_finalize(tmp_path: Path) -> None:

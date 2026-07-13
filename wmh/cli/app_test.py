@@ -165,7 +165,7 @@ def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_pa
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
     core = {"build", "list", "serve", "demo", "eval", "play", "download"}
-    platform = {"login", "logout", "status", "push", "pull"}
+    platform = {"login", "logout", "status", "push", "pull", "run"}
     assert names == core | platform
 
 

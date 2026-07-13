@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Experiential Labs. All rights reserved.
 
-"""Tests for `wmh session start`: the jailed local executor, the credential state
-machine (proxy / local-provider / baseline), and the driver's teardown wiring."""
+"""Tests for ``wmh run`` target dispatch and local execution boundaries."""
 
 from __future__ import annotations
 
@@ -99,6 +98,17 @@ class _FakeClient:
     def __init__(self) -> None:
         self.worker_calls: list[ChatRequest] = []
         self.created: list[str] = []
+        self.target_kind = "agent"
+        self.closed = False
+        self.local_pi_created: list[str] = []
+        self.local_pi_finished: list[str] = []
+
+    def resolve_run_target(self, target_id: str) -> object:
+        return type(
+            "Target",
+            (),
+            {"id": target_id, "kind": self.target_kind, "name": "remote-target"},
+        )()
 
     def fetch_champion_harness(self, agent_id: str) -> object:
         _ = agent_id
@@ -110,15 +120,42 @@ class _FakeClient:
         self.created.append(agent_id)
         return type("Sess", (), {"id": "sess-1"})()
 
-    def complete_worker(
-        self, agent_id: str, session_id: str, request: ChatRequest
-    ) -> ChatResponse:
+    def complete_worker(self, agent_id: str, session_id: str, request: ChatRequest) -> ChatResponse:
         _ = agent_id, session_id
         self.worker_calls.append(request)
         return ChatResponse(
             choices=[ChatChoice(message=ChatMessage(role="assistant", content="ok"))],
             usage=ChatUsage(prompt_tokens=1, completion_tokens=1),
         )
+
+    def create_local_pi_run(self, org_id: str) -> object:
+        self.local_pi_created.append(org_id)
+        return type("Run", (), {"id": "run-1"})()
+
+    def complete_local_pi_worker(
+        self, org_id: str, run_id: str, request: ChatRequest
+    ) -> ChatResponse:
+        _ = org_id, run_id
+        self.worker_calls.append(request)
+        return ChatResponse(
+            choices=[ChatChoice(message=ChatMessage(role="assistant", content="ok"))],
+            usage=ChatUsage(prompt_tokens=1, completion_tokens=1),
+        )
+
+    def finish_local_pi_run(
+        self,
+        org_id: str,
+        run_id: str,
+        *,
+        status: str,
+        ended_reason: str,
+        error: str | None = None,
+    ) -> None:
+        _ = org_id, status, ended_reason, error
+        self.local_pi_finished.append(run_id)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _patch_local_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,20 +168,20 @@ def test_build_driver_not_logged_in_runs_baseline_local(monkeypatch: pytest.Monk
     _patch_local_provider(monkeypatch)
 
     driver = mod._build_driver(
-        agent=None,
+        target=None,
         jail_root=Path.cwd(),
-        local_provider=False,
         provider=None,
         model=None,
-        instruction=None,
+        task=None,
     )
+    assert isinstance(driver, mod.LocalLiveDriver)
     assert driver._recorder is None
     assert driver._worker_fn is None
     assert isinstance(driver._provider, _FakeProvider)
     assert driver._doc.runtime_kind() == "pi-node"
 
 
-def test_build_driver_logged_in_default_uses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_driver_logged_in_agent_uses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Logged in + agent: the worker is the platform proxy and the session is recorded."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
     monkeypatch.setattr(mod, "load_credentials", lambda: creds)
@@ -152,13 +189,13 @@ def test_build_driver_logged_in_default_uses_proxy(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
 
     driver = mod._build_driver(
-        agent="a1",
+        target="a1",
         jail_root=Path.cwd(),
-        local_provider=False,
         provider=None,
         model=None,
-        instruction=None,
+        task=None,
     )
+    assert isinstance(driver, mod.LocalLiveDriver)
     assert driver._provider is None
     assert driver._worker_fn is not None
     assert driver._recorder is not None
@@ -168,56 +205,117 @@ def test_build_driver_logged_in_default_uses_proxy(monkeypatch: pytest.MonkeyPat
     assert len(client.worker_calls) == 1
 
 
-def test_build_driver_local_provider_still_records(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Logged in + --local-provider: worker runs locally but the session is still recorded."""
-    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+def test_build_driver_logged_in_builtin_pi_uses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Logged-in bare run needs no local provider credentials."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test", default_org="org-1")
     monkeypatch.setattr(mod, "load_credentials", lambda: creds)
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: _FakeClient())
-    _patch_local_provider(monkeypatch)
+    client = _FakeClient()
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
 
     driver = mod._build_driver(
-        agent="a1",
+        target=None,
         jail_root=Path.cwd(),
-        local_provider=True,
         provider=None,
         model=None,
-        instruction=None,
+        task=None,
     )
-    assert isinstance(driver._provider, _FakeProvider)
-    assert driver._worker_fn is None
-    assert driver._recorder is not None
+    assert isinstance(driver, mod.LocalLiveDriver)
+    assert driver._provider is None
+    assert driver._worker_fn is not None
+    assert isinstance(driver._recorder, mod.LocalPiRunRecorder)
+    assert client.local_pi_created == ["org-1"]
+
+    driver._worker_fn(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))
+    assert len(client.worker_calls) == 1
 
 
-def test_build_driver_agent_without_login_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Naming an agent while logged out is a clear parameter error."""
+def test_platform_target_rejects_local_provider_before_creating_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider overrides never create an orphan platform run."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    client = _FakeClient()
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+
+    with pytest.raises(typer.BadParameter, match="platform credentials"):
+        mod._build_driver(
+            target="a1",
+            jail_root=Path.cwd(),
+            provider="bedrock",
+            model=None,
+            task=None,
+        )
+    assert client.created == []
+
+
+def test_declining_local_execution_creates_no_platform_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consent happens after kind resolution but before champion or session creation."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    client = _FakeClient()
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+
+    def decline() -> None:
+        raise typer.Exit(code=1)
+
+    with pytest.raises(typer.Exit):
+        mod._build_driver(
+            target="a1",
+            jail_root=Path.cwd(),
+            provider=None,
+            model=None,
+            task=None,
+            confirm_local=decline,
+        )
+    assert client.created == []
+    assert client.closed
+
+
+def test_build_driver_world_model_uses_hosted_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A resolved world-model id never boots a local agent process."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    client = _FakeClient()
+    client.target_kind = "world_model"
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+
+    driver = mod._build_driver(
+        target="wm-1",
+        jail_root=Path.cwd(),
+        provider=None,
+        model=None,
+        task="help the customer",
+    )
+    assert isinstance(driver, mod.RemoteWorldModelDriver)
+
+
+def test_build_driver_target_without_login_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Naming any platform target while logged out is a clear parameter error."""
     monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
     with pytest.raises(typer.BadParameter):
         mod._build_driver(
-            agent="a1",
+            target="a1",
             jail_root=Path.cwd(),
-            local_provider=False,
             provider=None,
             model=None,
-            instruction=None,
+            task=None,
         )
 
 
 # -- driver orchestration --------------------------------------------------------------------------
 
 
-class _FakeSandbox:
-    """Records timeout extensions + kills."""
+class _FakeChannel:
+    """Records local runner teardown."""
 
     def __init__(self) -> None:
-        self.sandbox_id = "sbx-local"
-        self.timeouts: list[int] = []
-        self.kills = 0
+        self.closed = False
 
-    def set_timeout(self, timeout: int) -> None:
-        self.timeouts.append(timeout)
-
-    def kill(self) -> None:
-        self.kills += 1
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeLiveSession:
@@ -263,17 +361,16 @@ class _FakeReader:
         pass
 
 
-def _patch_driver_boundaries(monkeypatch: pytest.MonkeyPatch, sandbox: _FakeSandbox) -> None:
-    monkeypatch.setattr(mod, "default_sandbox_factory", lambda **_: lambda: sandbox)
-    monkeypatch.setattr(mod, "start_live_runner", lambda *_a, **_k: object())
+def _patch_driver_boundaries(monkeypatch: pytest.MonkeyPatch, channel: _FakeChannel) -> None:
+    monkeypatch.setattr(mod, "start_local_live_runner", lambda: channel)
     monkeypatch.setattr(mod, "LiveSession", _FakeLiveSession)
     monkeypatch.setattr(mod, "StdinCommandReader", _FakeReader)
 
 
-def test_driver_boots_loops_and_kills_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The driver boots, runs the pump loop to close, and always kills the sandbox."""
-    sandbox = _FakeSandbox()
-    _patch_driver_boundaries(monkeypatch, sandbox)
+def test_driver_boots_loops_and_closes_local_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The driver boots, runs the pump loop, and always closes its local process."""
+    channel = _FakeChannel()
+    _patch_driver_boundaries(monkeypatch, channel)
 
     mod.LocalLiveDriver(
         jail_root=Path.cwd(),
@@ -284,13 +381,13 @@ def test_driver_boots_loops_and_kills_sandbox(monkeypatch: pytest.MonkeyPatch) -
         instruction=None,
     ).run()
 
-    assert sandbox.kills == 1
+    assert channel.closed
 
 
 def test_driver_reports_finish_to_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
     """When recording, the driver posts a terminal finish on teardown."""
-    sandbox = _FakeSandbox()
-    _patch_driver_boundaries(monkeypatch, sandbox)
+    channel = _FakeChannel()
+    _patch_driver_boundaries(monkeypatch, channel)
     finished: list[str] = []
 
     class _Recorder:
@@ -298,8 +395,8 @@ def test_driver_reports_finish_to_recorder(monkeypatch: pytest.MonkeyPatch) -> N
         def record(self, event: SessionEvent) -> None:
             _ = event
 
-        def finish(self, *, ended_reason: str, sandbox_seconds: int, error: str | None) -> None:
-            _ = sandbox_seconds, error
+        def finish(self, *, ended_reason: str, error: str | None) -> None:
+            _ = error
             finished.append(ended_reason)
 
     mod.LocalLiveDriver(
@@ -307,9 +404,9 @@ def test_driver_reports_finish_to_recorder(monkeypatch: pytest.MonkeyPatch) -> N
         doc=mod.HarnessDoc.baseline("t"),
         provider=_FakeProvider(),
         worker_fn=None,
-        recorder=cast("mod.SessionRecorder", _Recorder()),
+        recorder=cast("mod.RunRecorder", _Recorder()),
         instruction=None,
     ).run()
 
     assert finished == ["user_ended"]
-    assert sandbox.kills == 1
+    assert channel.closed

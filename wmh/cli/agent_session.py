@@ -1,25 +1,22 @@
 # Copyright (c) 2026 Experiential Labs. All rights reserved.
 
-"""`wmh session start`: run an agent live against the LOCAL working directory.
+"""Run an agent live against the local working directory.
 
-The agent process (the real vendored pi harness) runs in a cloud E2B sandbox,
-but every tool it calls is answered HERE by the CLI against a jailed local
-directory: read_file / write_file / bash all hit the user's real disk, so the
-agent's view IS the local tree (a bind-mount feel with no file sync). The
-sandbox only hosts the pi runner process.
+The agent process is the real vendored pi harness running as a local Node.js
+child. Every tool it calls is answered by the CLI against a jailed local
+directory: read_file and write_file stay under that directory, while bash
+starts there with the user's normal machine permissions.
 
-Three credential modes, chosen automatically (see :func:`register`):
+The execution mode is chosen automatically (see :func:`register`):
 
-* logged in, default: the worker LLM turn is answered by the platform through a
-  metered proxy (platform keys, billed to the org), and the session is recorded
-  on the platform (create -> append events -> finish) so it shows up in the UI.
-* logged in, ``--local-provider``: the worker runs on the user's own local keys,
-  but the session is still recorded.
-* not logged in (or no agent given): a built-in baseline pi agent runs fully
-  locally on the user's own keys and nothing is recorded.
+* logged in: worker LLM turns use platform credentials and org metering. An
+  agent id also records its transcript; the built-in harness uses an org-level
+  run record.
+* logged out with no target: the built-in baseline pi agent can use the user's
+  local provider credentials.
 
-The agent's bash runs on the user's real machine, so a consent prompt and a hard
-path jail (every read/write resolves under the chosen directory) are mandatory.
+The harness code and bash tool run on the user's real machine, so an explicit
+consent prompt is mandatory. This is local execution, not an OS sandbox.
 """
 
 from __future__ import annotations
@@ -30,15 +27,17 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Protocol
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
+from rich.panel import Panel
 
+from wmh.engine.play import parse_action
 from wmh.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
-from wmh.harness.e2b_sandbox import default_sandbox_factory
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
-from wmh.harness.pi_e2b import start_live_runner
+from wmh.harness.pi_local import LocalStdioChannel, start_local_live_runner
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import render_tools, resolve_tools
@@ -54,18 +53,13 @@ if TYPE_CHECKING:
     from llm_waterfall import ChatRequest, ChatResponse
 
     from wmh.core.types import JsonObject, JsonValue
-    from wmh.harness.e2b_sandbox import SandboxHandle
 
 _console = Console()
 
 # Per-tool-call output cap (head+tail) reported to the transcript.
 _TOOL_OUTPUT_CAP = 16_000
 _BASH_TIMEOUT_S = 300.0
-# How far ahead each keepalive pushes the sandbox timeout while the agent runs.
-_KEEPALIVE_S = 900
-# Short initial ceiling: if the driver dies during boot the sandbox self-expires.
-_STARTUP_TIMEOUT_S = 900
-# Driver housekeeping cadence (event flush + keepalive).
+# Driver housekeeping cadence (event flush).
 _TICK_S = 5.0
 # Default local worker when the user pins none.
 _DEFAULT_PROVIDER = "bedrock"
@@ -91,7 +85,7 @@ def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str
 
     Returns the assembled system prompt (prompt + rendered tools + skills index),
     the resolved tool specs, the code surfaces as {path: content} (the agent's own
-    code, materialized into the sandbox), and skill bodies answered host-side.
+    code, materialized into the local runner), and skill bodies answered host-side.
     """
     tool_specs = resolve_tools(doc.tools())
     system = f"{doc.system_prompt()}\n\n## Tools\n{render_tools(tool_specs)}"
@@ -107,7 +101,7 @@ def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str
 def _pi_node_baseline() -> HarnessDoc:
     """A pi-node baseline: the default prompt/tools plus the vendored pi agent code.
 
-    ``HarnessDoc.baseline`` is the in-process loop, which the live E2B runner
+    ``HarnessDoc.baseline`` is the in-process loop, which the live pi runner
     cannot host (it needs the pi agent's src/agent.ts). This grafts the vendored
     pi code surfaces on and pins ``param:runtime-kind = pi-node`` so a not-logged-in
     session has a runnable agent without fetching a champion.
@@ -122,7 +116,7 @@ def _pi_node_baseline() -> HarnessDoc:
 
 
 class LocalToolExecutor:
-    """Answer read_file / write_file / bash against a jailed local directory."""
+    """Jail file tools to one directory and start bash there without OS isolation."""
 
     def __init__(self, jail_root: Path) -> None:
         """Confine every tool path under ``jail_root`` (its resolved real path)."""
@@ -154,9 +148,7 @@ class LocalToolExecutor:
                 target.write_text(str(args.get("content", "")), encoding="utf-8")
                 return ToolOutcome(content=f"wrote {path}")
         except _JailEscape as error:
-            return ToolOutcome(
-                content=f"path {error} escapes the session directory", is_error=True
-            )
+            return ToolOutcome(content=f"path {error} escapes the session directory", is_error=True)
         except OSError as error:
             return ToolOutcome(content=f"{name} failed: {error}", is_error=True)
         return ToolOutcome(content=f"tool {name!r} not available", is_error=True)
@@ -218,7 +210,7 @@ class SessionRecorder:
         except PlatformError as error:
             _console.print(f"[yellow]could not report {len(batch)} events: {error}[/yellow]")
 
-    def finish(self, *, ended_reason: str, sandbox_seconds: int, error: str | None) -> None:
+    def finish(self, *, ended_reason: str, error: str | None) -> None:
         """Flush the tail and post the terminal transition."""
         self.flush()
         status = "failed" if error is not None else "ended"
@@ -228,9 +220,48 @@ class SessionRecorder:
                 self._session_id,
                 status=status,
                 ended_reason=ended_reason,
-                sandbox_seconds=sandbox_seconds,
                 error=error,
             )
+        self._client.close()
+
+
+class RunRecorder(Protocol):
+    """Recording slice consumed by the local driver and terminal event sink."""
+
+    def record(self, event: SessionEvent) -> None: ...
+
+    def flush(self) -> None: ...
+
+    def finish(self, *, ended_reason: str, error: str | None) -> None: ...
+
+
+class LocalPiRunRecorder:
+    """Finish and close an org-scoped built-in pi run; it has no transcript."""
+
+    def __init__(self, client: PlatformClient, org_id: str, run_id: str) -> None:
+        self._client = client
+        self._org_id = org_id
+        self._run_id = run_id
+
+    def record(self, event: SessionEvent) -> None:
+        """Ignore transcript events; this row exists only for usage accounting."""
+        _ = event
+
+    def flush(self) -> None:
+        """There is no transcript buffer for a built-in run."""
+
+    def finish(self, *, ended_reason: str, error: str | None) -> None:
+        """Report the terminal state and release the HTTP client."""
+        status = "failed" if error is not None else "ended"
+        with contextlib.suppress(PlatformError):
+            self._client.finish_local_pi_run(
+                self._org_id,
+                self._run_id,
+                status=status,
+                ended_reason=ended_reason,
+                error=error,
+            )
+        self._client.close()
 
 
 class TerminalEventSink:
@@ -239,7 +270,7 @@ class TerminalEventSink:
     def __init__(
         self,
         *,
-        recorder: SessionRecorder | None,
+        recorder: RunRecorder | None,
         on_running: Callable[[bool], None],
     ) -> None:
         """Render to the console; ``on_running`` tracks turn state for keepalive."""
@@ -303,7 +334,7 @@ class StdinCommandReader(threading.Thread):
 
 
 class LocalLiveDriver:
-    """Own one E2B sandbox + LiveSession and drive it against the local directory."""
+    """Own one local pi process + LiveSession and drive it against the local directory."""
 
     def __init__(
         self,
@@ -312,7 +343,7 @@ class LocalLiveDriver:
         doc: HarnessDoc,
         provider: ToolCallingProvider | None,
         worker_fn: Callable[[ChatRequest], ChatResponse] | None,
-        recorder: SessionRecorder | None,
+        recorder: RunRecorder | None,
         instruction: str | None,
     ) -> None:
         """Configure the driver; ``run`` performs boot, loop, and teardown."""
@@ -323,32 +354,25 @@ class LocalLiveDriver:
         self._recorder = recorder
         self._instruction = instruction
         self._executor = LocalToolExecutor(jail_root)
-        self._sandbox: SandboxHandle | None = None
-        self._sandbox_started = 0.0
-        self._agent_running = False
+        self._channel: LocalStdioChannel | None = None
         self._interrupts = 0
 
     def run(self) -> None:
-        """Boot the sandbox + runner, drive the session, and always tear down."""
+        """Boot the local runner, drive the session, and always tear down."""
         system, tool_specs, files, skill_bodies = _assemble(self._doc)
-        factory = default_sandbox_factory(
-            timeout=_STARTUP_TIMEOUT_S, metadata={"kind": "wmh-local-session"}
-        )
-        _console.print("[dim]creating sandbox and starting the agent...[/dim]")
-        sandbox = factory()
-        self._sandbox = sandbox
-        self._sandbox_started = time.time()
+        _console.print("[dim]starting the built-in pi harness locally...[/dim]")
         session: LiveSession | None = None
         reason = "user_ended"
         error: str | None = None
         try:
-            channel = start_live_runner(sandbox)
+            channel = start_local_live_runner()
+            self._channel = channel
             session = LiveSession(
                 channel,
                 tools=tool_specs,
                 execute_tool=self._execute,
                 on_event=TerminalEventSink(
-                    recorder=self._recorder, on_running=self._set_running
+                    recorder=self._recorder, on_running=lambda _running: None
                 ),
                 files=files,
                 system_prompt=system,
@@ -375,8 +399,7 @@ class LocalLiveDriver:
     def _execute(
         self, name: str, args: JsonObject, emit: Callable[[str, str], None]
     ) -> ToolOutcome:
-        """Extend the sandbox, then run the tool locally (each tool blocks the pump)."""
-        self._extend_sandbox()
+        """Run one tool locally (each tool blocks the session pump)."""
         return self._executor(name, args, emit)
 
     def _loop(self, session: LiveSession) -> None:
@@ -391,8 +414,6 @@ class LocalLiveDriver:
                 last_tick = now
                 if self._recorder is not None:
                     self._recorder.flush()
-                if self._agent_running:
-                    self._extend_sandbox()
 
     def _handle_sigint(self, session: LiveSession) -> None:
         """First Ctrl-C interrupts the current turn; a second ends the session."""
@@ -404,29 +425,90 @@ class LocalLiveDriver:
             _console.print("\n[yellow]ending session[/yellow]")
             session.end()
 
-    def _set_running(self, running: bool) -> None:
-        self._agent_running = running
-
-    def _extend_sandbox(self) -> None:
-        if self._sandbox is not None:
-            with contextlib.suppress(Exception):
-                self._sandbox.set_timeout(_KEEPALIVE_S)
-
     def _teardown(self, session: LiveSession | None, *, reason: str, error: str | None) -> None:
         if session is not None and not session.closed:
             with contextlib.suppress(Exception):
                 session.end()
-        seconds = int(time.time() - self._sandbox_started) if self._sandbox_started else 0
         if self._recorder is not None:
-            self._recorder.finish(ended_reason=reason, sandbox_seconds=seconds, error=error)
-        if self._sandbox is not None:
+            self._recorder.finish(ended_reason=reason, error=error)
+        if self._channel is not None:
             with contextlib.suppress(Exception):
-                self._sandbox.kill()
-        _console.print(f"[dim]session ended ({reason}), sandbox ran {seconds}s[/dim]")
+                self._channel.close()
+        _console.print(f"[dim]session ended ({reason})[/dim]")
+
+
+class RemoteWorldModelDriver:
+    """Interactive terminal loop over the platform's world-model session API."""
+
+    def __init__(self, client: PlatformClient, target_id: str, name: str, task: str | None) -> None:
+        """Store the resolved target and opening task."""
+        self._client = client
+        self._target_id = target_id
+        self._name = name
+        self._task = task
+
+    def run(self) -> None:
+        """Create one hosted session and step it until the user exits."""
+        try:
+            session = self._client.create_world_model_session(self._target_id, task=self._task)
+            _console.print(
+                Panel(
+                    'Type an action such as [cyan]search {"q": "SFO"}[/cyan], '
+                    "or a free-text message. Commands: [cyan]:help[/cyan], [cyan]:quit[/cyan].",
+                    title=f"[bold]running world model[/bold] {self._name}",
+                    subtitle=f"task: {self._task}" if self._task else "no task set",
+                    border_style="cyan",
+                )
+            )
+            self._loop(session.id)
+        except PlatformError as error:
+            raise typer.BadParameter(str(error)) from error
+        finally:
+            self._client.close()
+
+    def _loop(self, session_id: str) -> None:
+        """Read actions and render hosted observations."""
+        while True:
+            try:
+                line = _console.input("[bold]agent>[/bold] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                _console.print("\n[dim]bye[/dim]")
+                return
+            if not line:
+                continue
+            if line in {":quit", ":q", ":exit"}:
+                _console.print("[dim]bye[/dim]")
+                return
+            if line in {":help", ":h"}:
+                _console.print(
+                    'Tool call: [cyan]name {"arg": "value"}[/cyan]. '
+                    "Any other text is sent as a message."
+                )
+                continue
+            try:
+                action = parse_action(line)
+            except ValueError as error:
+                _console.print(f"[red]parse error[/red]: {error}")
+                continue
+            try:
+                with _console.status("[dim]world model thinking...[/dim]", spinner="dots"):
+                    observation = self._client.step_world_model_session(session_id, action)
+            except PlatformError as error:
+                _console.print(f"[red]step failed[/red]: {error}")
+                continue
+            style = "red" if observation.is_error else "green"
+            title = "error" if observation.is_error else "observation"
+            _console.print(
+                Panel(
+                    observation.content or "[dim](empty)[/dim]",
+                    title=title,
+                    border_style=style,
+                )
+            )
 
 
 def _local_worker_provider(provider: str | None, model: str | None) -> ToolCallingProvider:
-    """Build a local worker provider from env creds (the --local-provider path)."""
+    """Build the logged-out worker provider from local environment credentials."""
     try:
         kind = ProviderKind(provider or _DEFAULT_PROVIDER)
     except ValueError:
@@ -441,62 +523,54 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
     return built
 
 
-_AGENT_ARG = typer.Argument(
-    help="Platform agent id to run (omit to run the built-in baseline agent locally)."
+_TARGET_ARG = typer.Argument(
+    help="Platform world-model or agent id (omit to run the built-in pi harness locally)."
 )
 _DIR_OPT = typer.Option("--dir", help="Local working directory the agent's tools act on.")
-_LOCAL_PROVIDER_OPT = typer.Option(
-    "--local-provider", help="Answer the worker LLM with your own local keys, not the platform."
-)
 _PROVIDER_OPT = typer.Option(
-    "--provider", help="Local worker provider kind (with --local-provider)."
+    "--provider", help="Worker provider for the built-in local pi harness."
 )
-_MODEL_OPT = typer.Option("--model", help="Local worker model type (with --local-provider).")
-_INSTRUCTION_OPT = typer.Option("--instruction", help="Opening instruction to send on start.")
+_MODEL_OPT = typer.Option("--model", help="Worker model for the built-in local pi harness.")
+_TASK_OPT = typer.Option("--task", "--instruction", help="Opening task for either execution kind.")
 _YES_OPT = typer.Option("--yes", help="Skip the local-execution consent prompt.")
 
 
 def register(app: typer.Typer) -> None:
-    """Register the ``wmh session`` command group on the root app."""
-    session_app = typer.Typer(
-        help="Run an agent live against your local working directory.", no_args_is_help=True
-    )
+    """Register the unified ``wmh run`` command on the root app."""
 
-    @session_app.command("start")
-    def start(  # noqa: PLR0913 - a CLI entrypoint's options are its surface
-        agent: Annotated[str | None, _AGENT_ARG] = None,
+    @app.command("run")
+    def run(
+        target: Annotated[str | None, _TARGET_ARG] = None,
         directory: Annotated[str, _DIR_OPT] = ".",
-        local_provider: Annotated[bool, _LOCAL_PROVIDER_OPT] = False,
         provider: Annotated[str | None, _PROVIDER_OPT] = None,
         model: Annotated[str | None, _MODEL_OPT] = None,
-        instruction: Annotated[str | None, _INSTRUCTION_OPT] = None,
+        task: Annotated[str | None, _TASK_OPT] = None,
         yes: Annotated[bool, _YES_OPT] = False,
     ) -> None:
-        """Start an interactive local session (agent in E2B, tools on your disk)."""
+        """Run a platform world model/agent by id, or the built-in pi harness."""
         jail_root = Path(directory).resolve()
         if not jail_root.is_dir():
             msg = f"working directory does not exist: {jail_root}"
             raise typer.BadParameter(msg)
-        _confirm_local_execution(jail_root, agent=agent, yes=yes)
         driver = _build_driver(
-            agent=agent,
+            target=target,
             jail_root=jail_root,
-            local_provider=local_provider,
             provider=provider,
             model=model,
-            instruction=instruction,
+            task=task,
+            confirm_local=lambda: _confirm_local_execution(jail_root, target=target, yes=yes),
         )
         driver.run()
 
-    app.add_typer(session_app, name="session")
 
-
-def _confirm_local_execution(jail_root: Path, *, agent: str | None, yes: bool) -> None:
-    """Warn that the agent's bash runs on the real machine; require consent."""
-    target = f"agent {agent}" if agent else "the built-in baseline agent"
+def _confirm_local_execution(jail_root: Path, *, target: str | None, yes: bool) -> None:
+    """Warn that harness code and bash run with local user permissions."""
+    label = f"agent {target}" if target else "the built-in pi harness"
     _console.print(
-        f"[bold yellow]{target} will run shell commands on THIS machine[/bold yellow], "
-        f"confined to:\n  {jail_root}"
+        f"[bold yellow]{label}, its harness code, and shell commands run on THIS machine"
+        "[/bold yellow].\n"
+        f"File tools stay under {jail_root}, and bash starts there, but bash is not "
+        "OS-sandboxed and can access anything your user can."
     )
     if not yes and not typer.confirm("continue?"):
         raise typer.Exit(code=1)
@@ -504,60 +578,93 @@ def _confirm_local_execution(jail_root: Path, *, agent: str | None, yes: bool) -
 
 def _build_driver(
     *,
-    agent: str | None,
+    target: str | None,
     jail_root: Path,
-    local_provider: bool,
     provider: str | None,
     model: str | None,
-    instruction: str | None,
-) -> LocalLiveDriver:
-    """Resolve the credential mode (A/B/C) and assemble the driver."""
+    task: str | None,
+    confirm_local: Callable[[], None] | None = None,
+) -> LocalLiveDriver | RemoteWorldModelDriver:
+    """Resolve the target kind once and assemble its execution driver."""
     credentials = load_credentials()
     logged_in = credentials.is_complete()
 
-    if agent is None:
-        # Built-in baseline, fully local + ephemeral (no recording).
-        if not logged_in:
-            _console.print(
-                "[dim]not logged in: running the built-in baseline agent, no recording[/dim]"
-            )
+    if target is None and not logged_in:
+        if confirm_local is not None:
+            confirm_local()
+        _console.print(
+            "[dim]not logged in: running the built-in baseline agent with local credentials[/dim]"
+        )
         return LocalLiveDriver(
             jail_root=jail_root,
             doc=_pi_node_baseline(),
             provider=_local_worker_provider(provider, model),
             worker_fn=None,
             recorder=None,
-            instruction=instruction,
+            instruction=task,
+        )
+
+    if target is None:
+        if provider is not None or model is not None:
+            raise typer.BadParameter(
+                "logged-in runs use platform credentials; omit --provider/--model, "
+                "or run `wmh logout` to use local credentials"
+            )
+        if confirm_local is not None:
+            confirm_local()
+        client = PlatformClient(str(credentials.api_url), str(credentials.token))
+        try:
+            org_id = _default_org(client, credentials.default_org)
+            run = client.create_local_pi_run(org_id)
+        except typer.BadParameter:
+            client.close()
+            raise
+        except PlatformError as error:
+            client.close()
+            raise typer.BadParameter(str(error)) from error
+        recorder = LocalPiRunRecorder(client, org_id, run.id)
+
+        def built_in_worker(request: ChatRequest) -> ChatResponse:
+            return client.complete_local_pi_worker(org_id, run.id, request)
+
+        return LocalLiveDriver(
+            jail_root=jail_root,
+            doc=_pi_node_baseline(),
+            provider=None,
+            worker_fn=built_in_worker,
+            recorder=recorder,
+            instruction=task,
         )
 
     if not logged_in:
-        msg = (
-            "run `wmh login` to run a platform agent, or omit the agent id "
-            "to run the built-in baseline agent locally"
-        )
+        msg = "run `wmh login` to run a platform id, or omit the id to run the built-in pi harness"
         raise typer.BadParameter(msg)
 
+    if provider is not None or model is not None:
+        raise typer.BadParameter(
+            "platform target runs use platform credentials; --provider/--model are not accepted"
+        )
     client = PlatformClient(str(credentials.api_url), str(credentials.token))
     try:
-        champion = client.fetch_champion_harness(agent)
+        resolved = client.resolve_run_target(target)
+        if resolved.kind == "world_model":
+            return RemoteWorldModelDriver(client, resolved.id, resolved.name, task)
+        if confirm_local is not None:
+            try:
+                confirm_local()
+            except BaseException:
+                client.close()
+                raise
+        champion = client.fetch_champion_harness(resolved.id)
         doc = HarnessDoc.model_validate(champion.doc)
-        session = client.create_local_session(agent, title=instruction)
-    except PlatformError as error:
+        session = client.create_local_session(resolved.id, title=task)
+    except (PlatformError, ValidationError) as error:
+        client.close()
         raise typer.BadParameter(str(error)) from error
-
-    recorder = SessionRecorder(client, agent, session.id)
-    if local_provider:
-        return LocalLiveDriver(
-            jail_root=jail_root,
-            doc=doc,
-            provider=_local_worker_provider(provider, model),
-            worker_fn=None,
-            recorder=recorder,
-            instruction=instruction,
-        )
+    recorder = SessionRecorder(client, resolved.id, session.id)
 
     def worker_fn(request: ChatRequest) -> ChatResponse:
-        return client.complete_worker(agent, session.id, request)
+        return client.complete_worker(resolved.id, session.id, request)
 
     return LocalLiveDriver(
         jail_root=jail_root,
@@ -565,5 +672,17 @@ def _build_driver(
         provider=None,
         worker_fn=worker_fn,
         recorder=recorder,
-        instruction=instruction,
+        instruction=task,
+    )
+
+
+def _default_org(client: PlatformClient, configured: str | None) -> str:
+    """Resolve the login's organization, auto-picking only an unambiguous sole org."""
+    if configured is not None:
+        return configured
+    identity = client.whoami()
+    if len(identity.orgs) == 1:
+        return identity.orgs[0].id
+    raise typer.BadParameter(
+        "no default organization selected; run `wmh login` again and choose an organization"
     )

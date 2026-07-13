@@ -59,6 +59,26 @@ print(obs.content)
 
 Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
+## Run locally after platform login
+
+`wmh run` is the single interactive execution command. After `wmh login`, an opaque platform id
+is resolved automatically: a world-model id opens a hosted model session, while an agent id runs
+that agent's champion pi harness as a local Node.js child process. Agent tools act on `--dir` on
+your machine, but worker completions use platform credentials and organization metering, so no
+provider API keys are needed locally.
+
+```bash
+wmh login
+wmh run <world-model-or-agent-id> --task "inspect this repository"
+wmh run --task "fix the failing tests"   # built-in pi harness, also platform-backed when logged in
+```
+
+Local pi execution requires Node.js 22.19 or newer plus npm on `PATH`. WMH installs the pinned pi
+npm dependencies into its user cache on the first run. It does not require E2B. Harness code and
+shell commands run with your normal user permissions: file tools are restricted to `--dir`, but
+bash is not OS-sandboxed. The CLI states this boundary before the pi process starts. A logged-out
+bare `wmh run` remains available with local provider environment credentials.
+
 ## Real agents in E2B sandboxes
 
 Harness evals normally drive a plain in-process agent loop. With `--harness-backend e2b`, a

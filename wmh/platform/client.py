@@ -12,12 +12,13 @@ import hashlib
 import json
 from importlib import metadata
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import BaseModel
 
-from wmh.core.types import JsonValue
+from wmh.core.types import Action, JsonValue, Observation
 
 _TIMEOUT_SECONDS = 120.0
 
@@ -108,6 +109,35 @@ class LocalSessionInfo(BaseModel):
     title: str | None = None
 
 
+class RunTarget(BaseModel):
+    """A platform id resolved to one executable resource kind."""
+
+    id: str
+    kind: Literal["world_model", "agent"]
+    org_id: str
+    name: str
+    display_name: str | None = None
+    status: str
+
+
+class RemoteWorldModelSession(BaseModel):
+    """The slice of a hosted world-model session needed by ``wmh run``."""
+
+    id: str
+    world_model_id: str
+    status: str
+
+
+class LocalPiRunInfo(BaseModel):
+    """An org-scoped platform usage record for the built-in local pi harness."""
+
+    id: str
+    org_id: str
+    status: str
+    worker_provider: str
+    worker_model: str
+
+
 def fetch_cli_config(web_url: str, *, transport: httpx.BaseTransport | None = None) -> str | None:
     """Ask the web app which backend host the CLI should call.
 
@@ -171,6 +201,33 @@ class PlatformClient:
         response = self._client.get("/api/whoami")
         self._raise_for_error(response)
         return WhoAmI.model_validate(response.json())
+
+    # -- unified runs --------------------------------------------------------------------------
+
+    def resolve_run_target(self, target_id: str) -> RunTarget:
+        """Resolve an opaque platform id without guessing from failed requests."""
+        response = self._client.get(f"/api/run-targets/{target_id}")
+        self._raise_for_error(response)
+        return RunTarget.model_validate(response.json())
+
+    def create_world_model_session(
+        self, world_model_id: str, *, task: str | None = None
+    ) -> RemoteWorldModelSession:
+        """Open a hosted session for a platform world model."""
+        response = self._client.post(
+            f"/api/world-models/{world_model_id}/sessions", json={"task": task}
+        )
+        self._raise_for_error(response)
+        return RemoteWorldModelSession.model_validate(response.json())
+
+    def step_world_model_session(self, session_id: str, action: Action) -> Observation:
+        """Advance a hosted world-model session by one action."""
+        response = self._client.post(
+            f"/api/sessions/{session_id}/step",
+            json={"action": action.model_dump(mode="json")},
+        )
+        self._raise_for_error(response)
+        return Observation.model_validate(response.json()["observation"])
 
     # -- world models --------------------------------------------------------------------------
 
@@ -328,9 +385,7 @@ class PlatformClient:
         seq = response.json().get("last_seq", 0)
         return int(seq) if isinstance(seq, int | float | str) else 0
 
-    def complete_worker(
-        self, agent_id: str, session_id: str, request: ChatRequest
-    ) -> ChatResponse:
+    def complete_worker(self, agent_id: str, session_id: str, request: ChatRequest) -> ChatResponse:
         """Answer one worker turn through the platform proxy (platform keys, org-billed)."""
         response = self._client.post(
             f"/api/agents/{agent_id}/local-sessions/{session_id}/worker-completion",
@@ -346,7 +401,6 @@ class PlatformClient:
         *,
         status: str,
         ended_reason: str,
-        sandbox_seconds: int | None = None,
         error: str | None = None,
     ) -> None:
         """Report the terminal transition of a local session."""
@@ -355,9 +409,43 @@ class PlatformClient:
             json={
                 "status": status,
                 "ended_reason": ended_reason,
-                "sandbox_seconds": sandbox_seconds,
                 "error": error,
             },
+        )
+        self._raise_for_error(response)
+
+    # -- built-in local pi runs ---------------------------------------------------------------
+
+    def create_local_pi_run(self, org_id: str) -> LocalPiRunInfo:
+        """Open a metered platform run for WMH's built-in local pi harness."""
+        response = self._client.post(f"/api/orgs/{org_id}/local-pi-runs")
+        self._raise_for_error(response)
+        return LocalPiRunInfo.model_validate(response.json())
+
+    def complete_local_pi_worker(
+        self, org_id: str, run_id: str, request: ChatRequest
+    ) -> ChatResponse:
+        """Answer one built-in pi worker turn through the platform."""
+        response = self._client.post(
+            f"/api/orgs/{org_id}/local-pi-runs/{run_id}/worker-completion",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+        self._raise_for_error(response)
+        return ChatResponse.model_validate(response.json())
+
+    def finish_local_pi_run(
+        self,
+        org_id: str,
+        run_id: str,
+        *,
+        status: str,
+        ended_reason: str,
+        error: str | None = None,
+    ) -> None:
+        """Report the terminal transition of a built-in local pi run."""
+        response = self._client.post(
+            f"/api/orgs/{org_id}/local-pi-runs/{run_id}/finish",
+            json={"status": status, "ended_reason": ended_reason, "error": error},
         )
         self._raise_for_error(response)
 
