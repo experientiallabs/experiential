@@ -286,6 +286,7 @@ class StdinCommandReader(threading.Thread):
         """Read stdin on a daemon thread; the session's intents are thread-safe."""
         super().__init__(daemon=True)
         self._session = session
+        self.eof = threading.Event()
 
     def run(self) -> None:
         """Map each line to an intent until end-of-input or the session closes."""
@@ -300,9 +301,9 @@ class StdinCommandReader(threading.Thread):
                 self._session.interrupt()
             elif line:
                 self._session.send_user_message(line)
-        # EOF (Ctrl-D): end the session gracefully.
-        with contextlib.suppress(Exception):
-            self._session.end()
+        # The driver owns EOF handling. For a one-shot ``--task`` it must wait
+        # until the opening turn returns to idle before ending the session.
+        self.eof.set()
 
 
 class LocalLiveDriver:
@@ -359,14 +360,22 @@ class LocalLiveDriver:
             )
             if self._instruction:
                 session.send_user_message(self._instruction)
-            StdinCommandReader(session).start()
-            self._loop(session)
+            reader = StdinCommandReader(session)
+            reader.start()
+            stdin_eof = getattr(reader, "eof", threading.Event())
+            self._loop(session, stdin_eof)
+            if session.status == "failed":
+                error = "local live session runner failed"
+                reason = "error"
+                _console.print(f"[red]session failed: {error}[/red]")
         except Exception as exc:  # noqa: BLE001 - report any driver failure, then tear down
             error = str(exc)
             reason = "error"
             _console.print(f"[red]session failed: {exc}[/red]")
         finally:
             self._teardown(session, reason=reason, error=error)
+        if error is not None:
+            raise typer.Exit(code=1)
 
     def _execute(
         self, name: str, args: JsonObject, emit: Callable[[str, str], None]
@@ -374,13 +383,24 @@ class LocalLiveDriver:
         """Run one tool locally (each tool blocks the session pump)."""
         return self._executor(name, args, emit)
 
-    def _loop(self, session: LiveSession) -> None:
+    def _loop(self, session: LiveSession, stdin_eof: threading.Event) -> None:
+        """Pump until closed, treating closed stdin as one-shot after ``--task``."""
         last_tick = 0.0
+        saw_running = False
+        end_sent = False
         while not session.closed:
             try:
                 session.pump(timeout=0.5)
             except KeyboardInterrupt:
                 self._handle_sigint(session)
+            saw_running = saw_running or session.status == "running"
+            if (
+                stdin_eof.is_set()
+                and not end_sent
+                and (self._instruction is None or (saw_running and session.status == "idle"))
+            ):
+                session.end()
+                end_sent = True
             now = time.monotonic()
             if now - last_tick >= _TICK_S:
                 last_tick = now
@@ -418,6 +438,7 @@ class RemoteAgentCommandReader(threading.Thread):
         self._client = client
         self._agent_id = agent_id
         self._session_id = session_id
+        self.eof = threading.Event()
 
     def run(self) -> None:
         """Map stdin lines to hosted steer, interrupt, and end commands."""
@@ -431,9 +452,10 @@ class RemoteAgentCommandReader(threading.Thread):
                     self._post("interrupt")
                 elif line:
                     self._post("user_message", text=line)
-            self._post("end")
         except (OSError, PlatformError):
-            return
+            pass
+        finally:
+            self.eof.set()
 
     def _post(self, kind: str, *, text: str | None = None) -> None:
         """Post one command through the authenticated platform client."""
@@ -482,9 +504,12 @@ class RemoteAgentDriver:
                 "Type to steer, [bold]:stop[/bold] to interrupt, "
                 f"[bold]:quit[/bold] to {quit_detail}."
             )
-            RemoteAgentCommandReader(self._client, self._target_id, session.id).start()
-            terminal, synchronized = self._poll(session.id, initial)
+            reader = RemoteAgentCommandReader(self._client, self._target_id, session.id)
+            reader.start()
+            stdin_eof = getattr(reader, "eof", threading.Event())
+            terminal, synchronized = self._poll(session.id, initial, stdin_eof)
             jail_root = self._jail
+            workspace_conflicts = False
             if jail_root is not None and synchronized is not None:
                 with _console.status("[dim]syncing E2B workspace back...[/dim]", spinner="dots"):
                     final_archive = self._client.download_agent_workspace(
@@ -497,6 +522,7 @@ class RemoteAgentDriver:
                         protected_paths=frozenset(self._live_conflicts),
                     )
                 if result.conflicts:
+                    workspace_conflicts = True
                     recovery = write_conflict_archive(jail_root, session.id, final_archive)
                     self._client.acknowledge_agent_workspace(self._target_id, session.id)
                     paths = ", ".join(result.conflicts)
@@ -504,14 +530,16 @@ class RemoteAgentDriver:
                         f"[red]workspace conflicts preserved locally[/red]: {paths}\n"
                         f"The full E2B result is saved at [bold]{recovery}[/bold]."
                     )
-                    raise typer.Exit(code=2)
-                self._client.acknowledge_agent_workspace(self._target_id, session.id)
-                _console.print(
-                    f"[green]workspace synced[/green] ({len(result.applied)} changed paths)"
-                )
+                else:
+                    self._client.acknowledge_agent_workspace(self._target_id, session.id)
+                    _console.print(
+                        f"[green]workspace synced[/green] ({len(result.applied)} changed paths)"
+                    )
             if terminal.status == "failed":
                 _console.print(f"[red]session failed: {terminal.error or 'unknown error'}[/red]")
                 raise typer.Exit(code=1)
+            if workspace_conflicts:
+                raise typer.Exit(code=2)
         except (WorkspacePatchError, WorkspaceSyncError) as error:
             raise typer.BadParameter(str(error)) from error
         except PlatformError as error:
@@ -520,12 +548,17 @@ class RemoteAgentDriver:
             self._client.close()
 
     def _poll(
-        self, session_id: str, synchronized: WorkspaceSnapshot | None
+        self,
+        session_id: str,
+        synchronized: WorkspaceSnapshot | None,
+        stdin_eof: threading.Event,
     ) -> tuple[RemoteAgentSession, WorkspaceSnapshot | None]:
         """Render new transcript events until output export makes the row terminal."""
         cursor = 0
         last_workspace_push = time.monotonic()
         sink = TerminalEventSink(recorder=None, on_running=lambda _running: None)
+        saw_running = False
+        end_sent = False
         while True:
             try:
                 page = self._client.list_agent_session_events(
@@ -544,6 +577,19 @@ class RemoteAgentDriver:
                             _console.print(f"[dim]({detail})[/dim]")
                     else:
                         sink(SessionEvent(kind=event.kind, payload=event.payload))
+                        if event.kind == "state":
+                            state = event.payload.get("status")
+                            saw_running = saw_running or state == "running"
+                            if (
+                                stdin_eof.is_set()
+                                and not end_sent
+                                and saw_running
+                                and state == "idle"
+                            ):
+                                self._client.post_agent_session_command(
+                                    self._target_id, session_id, "end"
+                                )
+                                end_sent = True
                 cursor = page.last_seq
                 if page.status in {"ended", "failed"}:
                     return (
@@ -551,6 +597,9 @@ class RemoteAgentDriver:
                         synchronized,
                     )
                 now = time.monotonic()
+                if stdin_eof.is_set() and self._task is None and not end_sent:
+                    self._client.post_agent_session_command(self._target_id, session_id, "end")
+                    end_sent = True
                 if synchronized is not None and now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S:
                     synchronized = self._push_local_patch(session_id, synchronized)
                     last_workspace_push = now
@@ -612,7 +661,10 @@ class RemoteAgentDriver:
         if result.conflicts:
             paths = ", ".join(result.conflicts)
             _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
-        return current
+        # A conflicted path was rejected by E2B, so ``current`` cannot become
+        # the synchronized base. Keep the prior base and conservatively retry
+        # accepted sibling paths until the conflict is reconciled at teardown.
+        return synchronized if result.conflicts else current
 
 
 class RemoteWorldModelDriver:

@@ -124,7 +124,7 @@ class RemoteAgentSession(BaseModel):
     agent_id: str
     status: str
     workspace_sync: bool
-    launched_from: Literal["web", "cli"]
+    launched_from: str
     starting_detail: str | None = None
     error: str | None = None
 

@@ -12,7 +12,12 @@ import pytest
 from llm_waterfall.types import ChatMessage, ChatRequest
 
 from wmh.core.types import Action, ActionKind
-from wmh.platform.client import PlatformClient, PlatformError, fetch_cli_config
+from wmh.platform.client import (
+    PlatformClient,
+    PlatformError,
+    RemoteAgentSession,
+    fetch_cli_config,
+)
 
 API_URL = "https://api.test"
 
@@ -219,6 +224,21 @@ def test_hosted_agent_session_without_workspace_posts_create_directly() -> None:
 
     assert not created.workspace_sync
     assert seen == ["POST /api/agents/agent-1/sessions"]
+
+
+def test_hosted_agent_session_accepts_future_launch_origins() -> None:
+    """A compatible platform origin extension does not break session decoding."""
+    session = RemoteAgentSession.model_validate(
+        {
+            "id": "sess-1",
+            "agent_id": "agent-1",
+            "status": "running",
+            "workspace_sync": False,
+            "launched_from": "automation",
+        }
+    )
+
+    assert session.launched_from == "automation"
 
 
 def test_builtin_local_pi_run_payloads() -> None:

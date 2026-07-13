@@ -334,6 +334,10 @@ class _FakeLiveSession:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def status(self) -> str:
+        return "ended" if self._closed else "idle"
+
     def start(self, hello_timeout: float = 60.0) -> None:
         _ = hello_timeout
 
@@ -415,6 +419,98 @@ def test_driver_reports_finish_to_recorder(monkeypatch: pytest.MonkeyPatch) -> N
     assert channel.closed
 
 
+def test_stdin_eof_is_reported_without_aborting_the_opening_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closed stdin is a driver signal, not an immediate local or hosted end command."""
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(""))
+
+    class _Session:
+        closed = False
+        ended = 0
+
+        def end(self) -> None:
+            self.ended += 1
+
+    local_session = _Session()
+    local_reader = mod.StdinCommandReader(cast("mod.LiveSession", local_session))
+    local_reader.run()
+    assert local_reader.eof.is_set()
+    assert local_session.ended == 0
+
+    class _Client:
+        posted: list[str] = []
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            _ = text
+            self.posted.append(kind)
+
+    client = _Client()
+    remote_reader = mod.RemoteAgentCommandReader(
+        cast("mod.PlatformClient", client), "agent-1", "session-1"
+    )
+    remote_reader.run()
+    assert remote_reader.eof.is_set()
+    assert client.posted == []
+
+
+def test_local_driver_returns_nonzero_when_the_runner_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner-side failure cannot look like a successful local CLI run."""
+    channel = _FakeChannel()
+
+    class _FailedSession(_FakeLiveSession):
+        @property
+        def status(self) -> str:
+            return "failed"
+
+        def pump(self, timeout: float = 0.2) -> bool:
+            _ = timeout
+            self._closed = True
+            return False
+
+    monkeypatch.setattr(mod, "start_local_live_runner", lambda: channel)
+    monkeypatch.setattr(mod, "LiveSession", _FailedSession)
+    monkeypatch.setattr(mod, "StdinCommandReader", _FakeReader)
+
+    with pytest.raises(typer.Exit) as raised:
+        mod.LocalLiveDriver(
+            jail_root=Path.cwd(),
+            doc=mod.HarnessDoc.baseline("t"),
+            provider=_FakeProvider(),
+            worker_fn=None,
+            recorder=None,
+            instruction="do work",
+        ).run()
+
+    assert raised.value.exit_code == 1
+    assert channel.closed
+
+
+def test_conflicted_local_patch_does_not_advance_the_synchronized_base(tmp_path: Path) -> None:
+    """A rejected same-file edit remains outside the platform-accepted snapshot."""
+    path = tmp_path / "answer.txt"
+    path.write_text("before", encoding="utf-8")
+    initial = mod.snapshot_workspace(tmp_path)
+    path.write_text("local", encoding="utf-8")
+
+    class _Client:
+        def upload_agent_workspace_patch(self, *_args: object, **_kwargs: object) -> object:
+            return type("Result", (), {"conflicts": ("answer.txt",)})()
+
+    driver = mod.RemoteAgentDriver(
+        cast("mod.PlatformClient", _Client()), "agent-1", "Agent", tmp_path, "work"
+    )
+
+    synchronized = driver._push_local_patch("session-1", initial)
+
+    assert synchronized is initial
+    assert driver._live_conflicts == {"answer.txt"}
+
+
 def test_remote_agent_driver_syncs_final_e2b_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -479,6 +575,64 @@ def test_remote_agent_driver_syncs_final_e2b_workspace(
     assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "after"
     assert client.acked == ["session-1"]
     assert client.closed
+
+
+def test_failed_hosted_session_is_not_hidden_by_workspace_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Session failure remains the primary exit even when final sync needs recovery."""
+    (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
+    final = mod.snapshot_workspace(tmp_path).archive
+
+    class _HostedClient:
+        def __init__(self) -> None:
+            self.acked = False
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "session-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            return type("Page", (), {"events": [], "last_seq": 0, "status": "failed"})()
+
+        def get_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"status": "failed", "error": "runner crashed"})()
+
+        def download_agent_workspace(self, *_args: object, **_kwargs: object) -> bytes:
+            return final
+
+        def acknowledge_agent_workspace(self, *_args: object, **_kwargs: object) -> None:
+            self.acked = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _NoReader:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    client = _HostedClient()
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
+    monkeypatch.setattr(
+        mod,
+        "sync_workspace",
+        lambda *_args, **_kwargs: type(
+            "Result", (), {"applied": (), "conflicts": ("answer.txt",)}
+        )(),
+    )
+
+    with pytest.raises(typer.Exit) as raised:
+        mod.RemoteAgentDriver(
+            cast("mod.PlatformClient", client), "agent-1", "Agent", tmp_path, "fix it"
+        ).run()
+
+    assert raised.value.exit_code == 1
+    assert client.acked
+    assert client.closed
+    assert (tmp_path / ".wmh-conflicts" / "session-1.tar.gz").is_file()
 
 
 def test_remote_agent_driver_without_upload_never_reads_local_workspace(
