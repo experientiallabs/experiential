@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from wmh.core.types import Action, JsonValue, Observation
 
 _TIMEOUT_SECONDS = 120.0
+_WORKSPACE_TIMEOUT_SECONDS = 300.0
 
 
 class PlatformError(RuntimeError):
@@ -128,6 +129,44 @@ class RemoteWorldModelSession(BaseModel):
     status: str
 
 
+class RemoteAgentSession(BaseModel):
+    """Hosted E2B agent session state needed by the CLI driver."""
+
+    id: str
+    agent_id: str
+    status: str
+    source: str
+    workspace_sync: bool
+    starting_detail: str | None = None
+    error: str | None = None
+
+
+class RemoteAgentSessionEvent(BaseModel):
+    """One durable event from a hosted agent session transcript."""
+
+    seq: int
+    kind: Literal[
+        "user_message",
+        "assistant_message",
+        "tool_call",
+        "tool_output",
+        "tool_result",
+        "submit",
+        "state",
+        "status",
+        "error",
+    ]
+    payload: dict[str, JsonValue]
+
+
+class RemoteAgentEventPage(BaseModel):
+    """One poll page of hosted transcript events and current session status."""
+
+    events: list[RemoteAgentSessionEvent]
+    last_seq: int
+    status: str
+
+
 class LocalPiRunInfo(BaseModel):
     """An org-scoped platform usage record for the built-in local pi harness."""
 
@@ -228,6 +267,62 @@ class PlatformClient:
         )
         self._raise_for_error(response)
         return Observation.model_validate(response.json()["observation"])
+
+    def create_agent_workspace_session(
+        self, agent_id: str, workspace: bytes, *, instruction: str | None = None
+    ) -> RemoteAgentSession:
+        """Upload a local snapshot and dispatch the agent in platform-owned E2B."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/workspace-sessions",
+            data={"instruction": instruction or ""},
+            files={"workspace": ("workspace.tar.gz", workspace, "application/gzip")},
+            timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(response)
+        return RemoteAgentSession.model_validate(response.json())
+
+    def get_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
+        """Read current hosted agent session state."""
+        response = self._client.get(f"/api/agents/{agent_id}/sessions/{session_id}")
+        self._raise_for_error(response)
+        return RemoteAgentSession.model_validate(response.json())
+
+    def list_agent_session_events(
+        self, agent_id: str, session_id: str, *, after: int
+    ) -> RemoteAgentEventPage:
+        """Poll hosted transcript events after one durable sequence cursor."""
+        response = self._client.get(
+            f"/api/agents/{agent_id}/sessions/{session_id}/events",
+            params={"after": after},
+        )
+        self._raise_for_error(response)
+        return RemoteAgentEventPage.model_validate(response.json())
+
+    def post_agent_session_command(
+        self, agent_id: str, session_id: str, kind: str, *, text: str | None = None
+    ) -> None:
+        """Steer, interrupt, or end one hosted agent session."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions/{session_id}/commands",
+            json={"kind": kind, "text": text},
+        )
+        self._raise_for_error(response)
+
+    def download_agent_workspace(self, agent_id: str, session_id: str) -> bytes:
+        """Download a terminal hosted session's final E2B workspace snapshot."""
+        response = self._client.get(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace",
+            timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(response)
+        return response.content
+
+    def acknowledge_agent_workspace(self, agent_id: str, session_id: str) -> None:
+        """Confirm the final archive is safe locally so platform objects can be removed."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/ack"
+        )
+        self._raise_for_error(response)
 
     # -- world models --------------------------------------------------------------------------
 

@@ -59,13 +59,15 @@ print(obs.content)
 
 Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
-## Run locally after platform login
+## Run after platform login
 
 `wmh run` is the single interactive execution command. After `wmh login`, an opaque platform id
 is resolved automatically: a world-model id opens a hosted model session, while an agent id runs
-that agent's champion pi harness as a local Node.js child process. Agent tools act on `--dir` on
-your machine, but worker completions use platform credentials and organization metering, so no
-provider API keys are needed locally.
+that agent's champion pi harness in the platform's E2B sandbox. The CLI snapshots `--dir` (the
+current directory by default), uploads it as the E2B workspace, streams the session, and
+automatically syncs the final regular-file changes back. Concurrent local edits are preserved and
+the full E2B result is saved under `.wmh-conflicts/` for manual recovery. Provider and E2B
+credentials remain platform-side, so no API keys are needed locally.
 
 ```bash
 wmh login
@@ -80,11 +82,14 @@ non-browser client, pair its browser and backend URLs explicitly:
 wmh login --url https://preview.example --api-url https://preview-api.example
 ```
 
-Local pi execution requires Node.js 22.19 or newer plus npm on `PATH`. WMH installs the pinned pi
-npm dependencies into its user cache on the first run. It does not require E2B. Harness code and
+Workspace transport skips symlinks, VCS internals, virtual environments, dependency trees, and
+common caches. Uploads are capped at 50 MiB compressed and 512 MiB unpacked.
+
+The bare built-in pi path runs locally and requires Node.js 22.19 or newer plus npm on `PATH`. WMH
+installs the pinned pi npm dependencies into its user cache on the first run. Harness code and
 shell commands run with your normal user permissions: file tools are restricted to `--dir`, but
-bash is not OS-sandboxed. The CLI states this boundary before the pi process starts. A logged-out
-bare `wmh run` remains available with local provider environment credentials.
+bash is not OS-sandboxed. The CLI states this boundary before the local pi process starts. A
+logged-out bare `wmh run` remains available with local provider environment credentials.
 
 ## Real agents in E2B sandboxes
 

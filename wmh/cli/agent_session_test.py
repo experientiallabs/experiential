@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -181,8 +183,8 @@ def test_build_driver_not_logged_in_runs_baseline_local(monkeypatch: pytest.Monk
     assert driver._doc.runtime_kind() == "pi-node"
 
 
-def test_build_driver_logged_in_agent_uses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Logged in + agent: the worker is the platform proxy and the session is recorded."""
+def test_build_driver_logged_in_agent_uses_hosted_e2b(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Logged in + agent: execution is platform-owned E2B with local workspace transport."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
     monkeypatch.setattr(mod, "load_credentials", lambda: creds)
     client = _FakeClient()
@@ -195,14 +197,10 @@ def test_build_driver_logged_in_agent_uses_proxy(monkeypatch: pytest.MonkeyPatch
         model=None,
         task=None,
     )
-    assert isinstance(driver, mod.LocalLiveDriver)
-    assert driver._provider is None
-    assert driver._worker_fn is not None
-    assert driver._recorder is not None
-    assert client.created == ["a1"]
-
-    driver._worker_fn(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))
-    assert len(client.worker_calls) == 1
+    assert isinstance(driver, mod.RemoteAgentDriver)
+    assert driver._target_id == "a1"
+    assert driver._jail == Path.cwd()
+    assert client.created == []
 
 
 def test_build_driver_logged_in_builtin_pi_uses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,29 +247,28 @@ def test_platform_target_rejects_local_provider_before_creating_session(
     assert client.created == []
 
 
-def test_declining_local_execution_creates_no_platform_session(
+def test_hosted_agent_does_not_prompt_for_local_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Consent happens after kind resolution but before champion or session creation."""
+    """The E2B agent path never presents the bare harness's local-shell warning."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
     monkeypatch.setattr(mod, "load_credentials", lambda: creds)
     client = _FakeClient()
     monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
 
-    def decline() -> None:
-        raise typer.Exit(code=1)
-
-    with pytest.raises(typer.Exit):
-        mod._build_driver(
-            target="a1",
-            jail_root=Path.cwd(),
-            provider=None,
-            model=None,
-            task=None,
-            confirm_local=decline,
-        )
+    prompted: list[bool] = []
+    driver = mod._build_driver(
+        target="a1",
+        jail_root=Path.cwd(),
+        provider=None,
+        model=None,
+        task=None,
+        confirm_local=lambda: prompted.append(True),
+    )
+    assert isinstance(driver, mod.RemoteAgentDriver)
+    assert prompted == []
     assert client.created == []
-    assert client.closed
+    assert not client.closed
 
 
 def test_build_driver_world_model_uses_hosted_session(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -410,3 +407,69 @@ def test_driver_reports_finish_to_recorder(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert finished == ["user_ended"]
     assert channel.closed
+
+
+def test_remote_agent_driver_syncs_final_e2b_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hosted driver downloads, applies, acknowledges, and closes after terminal state."""
+    (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
+    buffer = io.BytesIO()
+    content = b"after"
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("answer.txt")
+        info.size = len(content)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(content))
+
+    class _HostedClient:
+        def __init__(self) -> None:
+            self.acked: list[str] = []
+            self.closed = False
+
+        def create_agent_workspace_session(
+            self, agent_id: str, workspace: bytes, *, instruction: str | None = None
+        ) -> object:
+            assert agent_id == "agent-1"
+            assert workspace
+            assert instruction == "fix it"
+            return type("Session", (), {"id": "session-1"})()
+
+        def list_agent_session_events(
+            self, agent_id: str, session_id: str, *, after: int
+        ) -> object:
+            _ = agent_id, session_id, after
+            return type("Page", (), {"events": [], "last_seq": 0, "status": "ended"})()
+
+        def get_agent_session(self, agent_id: str, session_id: str) -> object:
+            _ = agent_id, session_id
+            return type("Session", (), {"status": "ended", "error": None})()
+
+        def download_agent_workspace(self, agent_id: str, session_id: str) -> bytes:
+            _ = agent_id, session_id
+            return buffer.getvalue()
+
+        def acknowledge_agent_workspace(self, agent_id: str, session_id: str) -> None:
+            _ = agent_id
+            self.acked.append(session_id)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _NoReader:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    client = _HostedClient()
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
+
+    mod.RemoteAgentDriver(
+        cast("mod.PlatformClient", client), "agent-1", "Agent", tmp_path, "fix it"
+    ).run()
+
+    assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "after"
+    assert client.acked == ["session-1"]
+    assert client.closed

@@ -109,6 +109,72 @@ def test_unified_run_target_and_world_model_session_payloads() -> None:
     ]
 
 
+def test_hosted_agent_workspace_session_transport() -> None:
+    """Agent runs upload a snapshot, poll/steer hosted E2B, then download and ack it."""
+    seen: list[str] = []
+    session = {
+        "id": "sess-1",
+        "agent_id": "agent-1",
+        "status": "starting",
+        "source": "hosted",
+        "workspace_sync": True,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        path = request.url.path
+        if path.endswith("/workspace-sessions"):
+            body = request.read()
+            assert b"archive-bytes" in body
+            assert b"fix the tests" in body
+            return httpx.Response(202, json=session)
+        if path.endswith("/events"):
+            assert request.url.params["after"] == "0"
+            return httpx.Response(
+                200,
+                json={
+                    "events": [
+                        {"seq": 1, "kind": "assistant_message", "payload": {"text": "done"}}
+                    ],
+                    "last_seq": 1,
+                    "status": "running",
+                },
+            )
+        if path.endswith("/commands"):
+            assert json.loads(request.read()) == {"kind": "user_message", "text": "continue"}
+            return httpx.Response(202, json={"command_id": 1})
+        if path.endswith("/workspace/ack"):
+            return httpx.Response(204)
+        if path.endswith("/workspace"):
+            return httpx.Response(200, content=b"final-archive")
+        return httpx.Response(200, json={**session, "status": "ended"})
+
+    with _client(handler) as client:
+        created = client.create_agent_workspace_session(
+            "agent-1", b"archive-bytes", instruction="fix the tests"
+        )
+        page = client.list_agent_session_events("agent-1", created.id, after=0)
+        client.post_agent_session_command(
+            "agent-1", created.id, "user_message", text="continue"
+        )
+        current = client.get_agent_session("agent-1", created.id)
+        final = client.download_agent_workspace("agent-1", created.id)
+        client.acknowledge_agent_workspace("agent-1", created.id)
+
+    assert created.workspace_sync
+    assert page.events[0].payload["text"] == "done"
+    assert current.status == "ended"
+    assert final == b"final-archive"
+    assert seen == [
+        "POST /api/agents/agent-1/workspace-sessions",
+        "GET /api/agents/agent-1/sessions/sess-1/events",
+        "POST /api/agents/agent-1/sessions/sess-1/commands",
+        "GET /api/agents/agent-1/sessions/sess-1",
+        "GET /api/agents/agent-1/sessions/sess-1/workspace",
+        "POST /api/agents/agent-1/sessions/sess-1/workspace/ack",
+    ]
+
+
 def test_builtin_local_pi_run_payloads() -> None:
     """The built-in harness has an org-scoped, metered platform worker path."""
     seen: list[str] = []

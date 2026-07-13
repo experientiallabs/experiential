@@ -1,22 +1,23 @@
 # Copyright (c) 2026 Experiential Labs. All rights reserved.
 
-"""Run an agent live against the local working directory.
+"""Run a platform target or the built-in pi harness from one CLI command.
 
-The agent process is the real vendored pi harness running as a local Node.js
-child. Every tool it calls is answered by the CLI against a jailed local
-directory: read_file and write_file stay under that directory, while bash
-starts there with the user's normal machine permissions.
+Agent IDs run the champion pi harness in the platform's E2B sandbox. The CLI
+uploads a bounded snapshot of ``--dir``, streams the hosted transcript, then
+automatically reconciles the final sandbox workspace into that directory.
+Bare runs still launch the built-in vendored pi harness as a local Node child.
 
 The execution mode is chosen automatically (see :func:`register`):
 
-* logged in: worker LLM turns use platform credentials and org metering. An
-  agent id also records its transcript; the built-in harness uses an org-level
-  run record.
+* logged in + agent id: the platform owns E2B, provider credentials, metering,
+  and the transcript; the CLI owns only workspace transport and terminal I/O.
+* logged in + no id: the built-in harness runs locally with a platform-proxied
+  worker and org-level usage record.
 * logged out with no target: the built-in baseline pi agent can use the user's
   local provider credentials.
 
-The harness code and bash tool run on the user's real machine, so an explicit
-consent prompt is mandatory. This is local execution, not an OS sandbox.
+Only the bare built-in path executes harness code and bash on the user's real
+machine, so that path retains the explicit local-execution consent prompt.
 """
 
 from __future__ import annotations
@@ -30,10 +31,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Protocol
 
 import typer
-from pydantic import ValidationError
 from rich.console import Console
 from rich.panel import Panel
 
+from wmh.cli.workspace_sync import (
+    WorkspaceSyncError,
+    snapshot_workspace,
+    sync_workspace,
+    write_conflict_archive,
+)
 from wmh.engine.play import parse_action
 from wmh.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
@@ -41,7 +47,7 @@ from wmh.harness.pi_local import LocalStdioChannel, start_local_live_runner
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import render_tools, resolve_tools
-from wmh.platform.client import PlatformClient, PlatformError
+from wmh.platform.client import PlatformClient, PlatformError, RemoteAgentSession
 from wmh.platform.credentials import load_credentials
 from wmh.providers.base import ProviderConfig, ProviderKind, ToolCallingProvider
 from wmh.providers.models import resolve_provider_model
@@ -437,6 +443,136 @@ class LocalLiveDriver:
         _console.print(f"[dim]session ended ({reason})[/dim]")
 
 
+class RemoteAgentCommandReader(threading.Thread):
+    """Forward terminal lines to a platform-owned E2B agent session."""
+
+    def __init__(self, client: PlatformClient, agent_id: str, session_id: str) -> None:
+        """Store the hosted command-channel identity."""
+        super().__init__(daemon=True)
+        self._client = client
+        self._agent_id = agent_id
+        self._session_id = session_id
+
+    def run(self) -> None:
+        """Map stdin lines to hosted steer, interrupt, and end commands."""
+        try:
+            for raw in sys.stdin:
+                line = raw.strip()
+                if line in {":quit", ":q", ":exit"}:
+                    self._post("end")
+                    return
+                if line == ":stop":
+                    self._post("interrupt")
+                elif line:
+                    self._post("user_message", text=line)
+            self._post("end")
+        except (OSError, PlatformError):
+            return
+
+    def _post(self, kind: str, *, text: str | None = None) -> None:
+        """Post one command through the authenticated platform client."""
+        self._client.post_agent_session_command(
+            self._agent_id, self._session_id, kind, text=text
+        )
+
+
+class RemoteAgentDriver:
+    """Stream a hosted E2B agent and reconcile its final workspace locally."""
+
+    def __init__(
+        self,
+        client: PlatformClient,
+        target_id: str,
+        name: str,
+        jail_root: Path,
+        task: str | None,
+    ) -> None:
+        """Store the resolved agent and local workspace transport root."""
+        self._client = client
+        self._target_id = target_id
+        self._name = name
+        self._jail = jail_root
+        self._task = task
+        self._interrupts = 0
+
+    def run(self) -> None:
+        """Upload, run, stream, download, and conflict-safely sync one E2B session."""
+        try:
+            with _console.status("[dim]snapshotting local workspace...[/dim]", spinner="dots"):
+                initial = snapshot_workspace(self._jail)
+            _console.print(
+                f"[dim]uploading {len(initial.files)} files to the platform E2B workspace...[/dim]"
+            )
+            session = self._client.create_agent_workspace_session(
+                self._target_id, initial.archive, instruction=self._task
+            )
+            _console.print(
+                f"[green]E2B session started[/green] for [bold]{self._name}[/bold]. "
+                "Type to steer, [bold]:stop[/bold] to interrupt, "
+                "[bold]:quit[/bold] to end and sync back."
+            )
+            RemoteAgentCommandReader(self._client, self._target_id, session.id).start()
+            terminal = self._poll(session.id)
+            with _console.status("[dim]syncing E2B workspace back...[/dim]", spinner="dots"):
+                final_archive = self._client.download_agent_workspace(
+                    self._target_id, session.id
+                )
+                result = sync_workspace(self._jail, initial, final_archive)
+            if result.conflicts:
+                recovery = write_conflict_archive(self._jail, session.id, final_archive)
+                self._client.acknowledge_agent_workspace(self._target_id, session.id)
+                paths = ", ".join(result.conflicts)
+                _console.print(
+                    f"[red]workspace conflicts preserved locally[/red]: {paths}\n"
+                    f"The full E2B result is saved at [bold]{recovery}[/bold]."
+                )
+                raise typer.Exit(code=2)
+            self._client.acknowledge_agent_workspace(self._target_id, session.id)
+            _console.print(
+                f"[green]workspace synced[/green] ({len(result.applied)} changed paths)"
+            )
+            if terminal.status == "failed":
+                _console.print(f"[red]session failed: {terminal.error or 'unknown error'}[/red]")
+                raise typer.Exit(code=1)
+        except WorkspaceSyncError as error:
+            raise typer.BadParameter(str(error)) from error
+        except PlatformError as error:
+            raise typer.BadParameter(str(error)) from error
+        finally:
+            self._client.close()
+
+    def _poll(self, session_id: str) -> RemoteAgentSession:
+        """Render new transcript events until output export makes the row terminal."""
+        cursor = 0
+        sink = TerminalEventSink(recorder=None, on_running=lambda _running: None)
+        while True:
+            try:
+                page = self._client.list_agent_session_events(
+                    self._target_id, session_id, after=cursor
+                )
+                for event in page.events:
+                    if event.kind == "status":
+                        detail = event.payload.get("message") or event.payload.get("status")
+                        if detail:
+                            _console.print(f"[dim]({detail})[/dim]")
+                    else:
+                        sink(SessionEvent(kind=event.kind, payload=event.payload))
+                cursor = page.last_seq
+                if page.status in {"ended", "failed"}:
+                    return self._client.get_agent_session(self._target_id, session_id)
+                time.sleep(0.5)
+            except KeyboardInterrupt:
+                self._interrupts += 1
+                kind = "interrupt" if self._interrupts == 1 else "end"
+                _console.print(
+                    "\n[yellow]interrupting (press Ctrl-C again to end)[/yellow]"
+                    if kind == "interrupt"
+                    else "\n[yellow]ending session[/yellow]"
+                )
+                self._client.post_agent_session_command(self._target_id, session_id, kind)
+                continue
+
+
 class RemoteWorldModelDriver:
     """Interactive terminal loop over the platform's world-model session API."""
 
@@ -526,7 +662,9 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
 _TARGET_ARG = typer.Argument(
     help="Platform world-model or agent id (omit to run the built-in pi harness locally)."
 )
-_DIR_OPT = typer.Option("--dir", help="Local working directory the agent's tools act on.")
+_DIR_OPT = typer.Option(
+    "--dir", help="Working directory to upload/sync for an agent, or use for a bare local run."
+)
 _PROVIDER_OPT = typer.Option(
     "--provider", help="Worker provider for the built-in local pi harness."
 )
@@ -584,7 +722,7 @@ def _build_driver(
     model: str | None,
     task: str | None,
     confirm_local: Callable[[], None] | None = None,
-) -> LocalLiveDriver | RemoteWorldModelDriver:
+) -> LocalLiveDriver | RemoteAgentDriver | RemoteWorldModelDriver:
     """Resolve the target kind once and assemble its execution driver."""
     credentials = load_credentials()
     logged_in = credentials.is_complete()
@@ -649,31 +787,10 @@ def _build_driver(
         resolved = client.resolve_run_target(target)
         if resolved.kind == "world_model":
             return RemoteWorldModelDriver(client, resolved.id, resolved.name, task)
-        if confirm_local is not None:
-            try:
-                confirm_local()
-            except BaseException:
-                client.close()
-                raise
-        champion = client.fetch_champion_harness(resolved.id)
-        doc = HarnessDoc.model_validate(champion.doc)
-        session = client.create_local_session(resolved.id, title=task)
-    except (PlatformError, ValidationError) as error:
+        return RemoteAgentDriver(client, resolved.id, resolved.name, jail_root, task)
+    except PlatformError as error:
         client.close()
         raise typer.BadParameter(str(error)) from error
-    recorder = SessionRecorder(client, resolved.id, session.id)
-
-    def worker_fn(request: ChatRequest) -> ChatResponse:
-        return client.complete_worker(resolved.id, session.id, request)
-
-    return LocalLiveDriver(
-        jail_root=jail_root,
-        doc=doc,
-        provider=None,
-        worker_fn=worker_fn,
-        recorder=recorder,
-        instruction=task,
-    )
 
 
 def _default_org(client: PlatformClient, configured: str | None) -> str:
