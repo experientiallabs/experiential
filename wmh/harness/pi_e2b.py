@@ -93,6 +93,10 @@ class _Eof:
 _EOF = _Eof()
 
 
+class _E2BChannelSendError(RuntimeError):
+    """A raw socket failure while sending a frame to the E2B runner."""
+
+
 class E2BStdioChannel:
     """A `runner_link.Channel` over an E2B background command's stdin/stdout.
 
@@ -119,7 +123,10 @@ class E2BStdioChannel:
 
     def send(self, frame: JsonObject) -> None:
         line = base64.b64encode(json.dumps(frame).encode("utf-8")).decode("ascii") + "\n"
-        self._sandbox.commands.send_stdin(self._handle.pid, line)
+        try:
+            self._sandbox.commands.send_stdin(self._handle.pid, line)
+        except OSError as exc:
+            raise _E2BChannelSendError("failed to send a frame to the E2B runner") from exc
 
     def recv(self, timeout: float | None = None) -> JsonObject | None:
         """The next frame from the runner; blocks (up to `timeout` seconds when given).
@@ -433,7 +440,7 @@ class E2BPiRuntime:
 
 def _is_retryable_transport_error(exc: Exception) -> bool:
     """Whether an episode exception means its E2B transport is no longer trustworthy."""
-    if isinstance(exc, (RuntimeError, TimeoutError, OSError)):
+    if isinstance(exc, (RuntimeError, TimeoutError)):
         return True
     # Keep the E2B SDK optional at import time. Its TimeoutException is not a built-in
     # TimeoutError, but any instance means the sandbox/channel state is uncertain.

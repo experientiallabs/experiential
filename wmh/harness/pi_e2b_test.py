@@ -674,6 +674,33 @@ def test_run_retries_broken_pipe_once_on_a_fresh_sandbox(
     pool.close()
 
 
+def test_environment_os_error_propagates_without_episode_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool-side OS failure is not mistaken for an E2B transport failure."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+    ]
+    factory, made = _factory_for([script, script])
+
+    class FailingEnv(_RecordingEnv):
+        def execute(self, action: Action) -> Observation:
+            self.actions.append(action)
+            raise OSError("tool filesystem failed")
+
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    env = FailingEnv()
+    with pytest.raises(OSError, match="tool filesystem failed"):
+        _runtime(pool=pool).run("t1", "do it", env)
+
+    assert len(env.actions) == 1
+    assert len(made) == 1
+    assert made[0].kills == 1
+    pool.close()
+
+
 def test_run_propagates_a_second_e2b_send_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
