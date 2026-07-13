@@ -2,10 +2,11 @@
 
 """Run a platform target or the built-in pi harness from one CLI command.
 
-Agent IDs run the champion pi harness in the platform's E2B sandbox. The CLI
-uploads a bounded snapshot of ``--dir``, streams the hosted transcript, then
-automatically reconciles the final sandbox workspace into that directory.
-Bare runs still launch the built-in vendored pi harness as a local Node child.
+Agent IDs run the champion pi harness in the platform's E2B sandbox. By
+default no local files are sent. ``-u PATH`` opts into uploading a bounded
+snapshot, live-syncing changes, and reconciling the final sandbox workspace
+into that directory. Bare runs still launch the built-in vendored pi harness
+as a local Node child.
 
 The execution mode is chosen automatically (see :func:`register`):
 
@@ -479,17 +480,17 @@ class RemoteAgentCommandReader(threading.Thread):
 
 
 class RemoteAgentDriver:
-    """Stream a hosted E2B agent and reconcile its final workspace locally."""
+    """Stream a hosted E2B agent, optionally syncing one local workspace."""
 
     def __init__(
         self,
         client: PlatformClient,
         target_id: str,
         name: str,
-        jail_root: Path,
+        jail_root: Path | None,
         task: str | None,
     ) -> None:
-        """Store the resolved agent and local workspace transport root."""
+        """Store the resolved agent and optional local workspace transport root."""
         self._client = client
         self._target_id = target_id
         self._name = name
@@ -499,42 +500,54 @@ class RemoteAgentDriver:
         self._live_conflicts: set[str] = set()
 
     def run(self) -> None:
-        """Upload, run, stream, download, and conflict-safely sync one E2B session."""
+        """Run and stream one E2B session, syncing local files only when requested."""
         try:
-            with _console.status("[dim]snapshotting local workspace...[/dim]", spinner="dots"):
-                initial = snapshot_workspace(self._jail)
-            _console.print(
-                f"[dim]uploading {len(initial.files)} files to the platform E2B workspace...[/dim]"
-            )
+            initial: WorkspaceSnapshot | None = None
+            if self._jail is not None:
+                with _console.status("[dim]snapshotting local workspace...[/dim]", spinner="dots"):
+                    initial = snapshot_workspace(self._jail)
+                _console.print(
+                    f"[dim]uploading {len(initial.files)} files to the platform "
+                    "E2B workspace...[/dim]"
+                )
             session = self._client.create_agent_session(
-                self._target_id, workspace=initial.archive, instruction=self._task
+                self._target_id,
+                workspace=initial.archive if initial is not None else None,
+                instruction=self._task,
             )
+            quit_detail = "end and sync back" if initial is not None else "end"
             _console.print(
                 f"[green]E2B session started[/green] for [bold]{self._name}[/bold]. "
                 "Type to steer, [bold]:stop[/bold] to interrupt, "
-                "[bold]:quit[/bold] to end and sync back."
+                f"[bold]:quit[/bold] to {quit_detail}."
             )
             RemoteAgentCommandReader(self._client, self._target_id, session.id).start()
             terminal, synchronized = self._poll(session.id, initial)
-            with _console.status("[dim]syncing E2B workspace back...[/dim]", spinner="dots"):
-                final_archive = self._client.download_agent_workspace(self._target_id, session.id)
-                result = sync_workspace(
-                    self._jail,
-                    synchronized,
-                    final_archive,
-                    protected_paths=frozenset(self._live_conflicts),
-                )
-            if result.conflicts:
-                recovery = write_conflict_archive(self._jail, session.id, final_archive)
+            jail_root = self._jail
+            if jail_root is not None and synchronized is not None:
+                with _console.status("[dim]syncing E2B workspace back...[/dim]", spinner="dots"):
+                    final_archive = self._client.download_agent_workspace(
+                        self._target_id, session.id
+                    )
+                    result = sync_workspace(
+                        jail_root,
+                        synchronized,
+                        final_archive,
+                        protected_paths=frozenset(self._live_conflicts),
+                    )
+                if result.conflicts:
+                    recovery = write_conflict_archive(jail_root, session.id, final_archive)
+                    self._client.acknowledge_agent_workspace(self._target_id, session.id)
+                    paths = ", ".join(result.conflicts)
+                    _console.print(
+                        f"[red]workspace conflicts preserved locally[/red]: {paths}\n"
+                        f"The full E2B result is saved at [bold]{recovery}[/bold]."
+                    )
+                    raise typer.Exit(code=2)
                 self._client.acknowledge_agent_workspace(self._target_id, session.id)
-                paths = ", ".join(result.conflicts)
                 _console.print(
-                    f"[red]workspace conflicts preserved locally[/red]: {paths}\n"
-                    f"The full E2B result is saved at [bold]{recovery}[/bold]."
+                    f"[green]workspace synced[/green] ({len(result.applied)} changed paths)"
                 )
-                raise typer.Exit(code=2)
-            self._client.acknowledge_agent_workspace(self._target_id, session.id)
-            _console.print(f"[green]workspace synced[/green] ({len(result.applied)} changed paths)")
             if terminal.status == "failed":
                 _console.print(f"[red]session failed: {terminal.error or 'unknown error'}[/red]")
                 raise typer.Exit(code=1)
@@ -546,8 +559,8 @@ class RemoteAgentDriver:
             self._client.close()
 
     def _poll(
-        self, session_id: str, synchronized: WorkspaceSnapshot
-    ) -> tuple[RemoteAgentSession, WorkspaceSnapshot]:
+        self, session_id: str, synchronized: WorkspaceSnapshot | None
+    ) -> tuple[RemoteAgentSession, WorkspaceSnapshot | None]:
         """Render new transcript events until output export makes the row terminal."""
         cursor = 0
         last_workspace_push = time.monotonic()
@@ -559,6 +572,10 @@ class RemoteAgentDriver:
                 )
                 for event in page.events:
                     if event.kind == "workspace_patch":
+                        if synchronized is None:
+                            raise WorkspaceSyncError(
+                                "received a workspace patch without --upload-dir"
+                            )
                         synchronized = self._apply_remote_patch(session_id, event, synchronized)
                     elif event.kind == "status":
                         detail = event.payload.get("message") or event.payload.get("status")
@@ -573,7 +590,10 @@ class RemoteAgentDriver:
                         synchronized,
                     )
                 now = time.monotonic()
-                if now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S:
+                if (
+                    synchronized is not None
+                    and now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S
+                ):
                     synchronized = self._push_local_patch(session_id, synchronized)
                     last_workspace_push = now
                 time.sleep(0.5)
@@ -595,6 +615,9 @@ class RemoteAgentDriver:
         synchronized: WorkspaceSnapshot,
     ) -> WorkspaceSnapshot:
         """Download and apply one announced E2B patch, then advance the local base."""
+        jail_root = self._jail
+        if jail_root is None:
+            raise WorkspaceSyncError("workspace sync is not enabled")
         payload = getattr(event, "payload", {})
         revision_value = payload.get("revision") if isinstance(payload, dict) else None
         if not isinstance(revision_value, str) or not revision_value:
@@ -602,7 +625,7 @@ class RemoteAgentDriver:
         content = self._client.download_agent_workspace_patch(
             self._target_id, session_id, revision_value
         )
-        result = apply_workspace_patch(self._jail, content)
+        result = apply_workspace_patch(jail_root, content)
         self._live_conflicts.update(result.conflicts)
         self._client.acknowledge_agent_workspace_patch(self._target_id, session_id, revision_value)
         if result.applied:
@@ -610,14 +633,17 @@ class RemoteAgentDriver:
         if result.conflicts:
             paths = ", ".join(result.conflicts)
             _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
-        return snapshot_workspace(self._jail)
+        return snapshot_workspace(jail_root)
 
     def _push_local_patch(
         self, session_id: str, synchronized: WorkspaceSnapshot
     ) -> WorkspaceSnapshot:
         """Send local edits made since the last synchronized snapshot."""
+        jail_root = self._jail
+        if jail_root is None:
+            return synchronized
         try:
-            current = snapshot_workspace(self._jail)
+            current = snapshot_workspace(jail_root)
         except WorkspaceSyncError:
             return synchronized
         content = build_workspace_patch(synchronized.archive, current.archive)
@@ -721,7 +747,10 @@ _TARGET_ARG = typer.Argument(
     help="Platform world-model or agent id (omit to run the built-in pi harness locally)."
 )
 _DIR_OPT = typer.Option(
-    "--dir", help="Working directory to upload/sync for an agent, or use for a bare local run."
+    "--dir", help="Working directory for the built-in local pi harness."
+)
+_UPLOAD_DIR_OPT = typer.Option(
+    "-u", "--upload-dir", help="Directory to upload and live-sync for a hosted agent."
 )
 _PROVIDER_OPT = typer.Option(
     "--provider", help="Worker provider for the built-in local pi harness."
@@ -737,24 +766,44 @@ def register(app: typer.Typer) -> None:
     @app.command("run")
     def run(
         target: Annotated[str | None, _TARGET_ARG] = None,
-        directory: Annotated[str, _DIR_OPT] = ".",
+        directory: Annotated[str | None, _DIR_OPT] = None,
+        upload_directory: Annotated[str | None, _UPLOAD_DIR_OPT] = None,
         provider: Annotated[str | None, _PROVIDER_OPT] = None,
         model: Annotated[str | None, _MODEL_OPT] = None,
         task: Annotated[str | None, _TASK_OPT] = None,
         yes: Annotated[bool, _YES_OPT] = False,
     ) -> None:
         """Run a platform world model/agent by id, or the built-in pi harness."""
-        jail_root = Path(directory).resolve()
-        if not jail_root.is_dir():
+        if target is None and upload_directory is not None:
+            raise typer.BadParameter("--upload-dir is only supported for platform agent ids")
+        if target is not None and directory is not None:
+            raise typer.BadParameter(
+                "--dir is only supported for a bare `wmh run`; use --upload-dir for an agent"
+            )
+        if target is None:
+            path = directory or "."
+        else:
+            path = upload_directory
+        jail_root = Path(path).resolve() if path is not None else None
+        if jail_root is not None and not jail_root.is_dir():
             msg = f"working directory does not exist: {jail_root}"
             raise typer.BadParameter(msg)
+        confirm_local: Callable[[], None] | None = None
+        if target is None and jail_root is not None:
+            local_root = jail_root
+
+            def confirm_execution() -> None:
+                """Confirm the bare harness's local execution boundary."""
+                _confirm_local_execution(local_root, target=target, yes=yes)
+
+            confirm_local = confirm_execution
         driver = _build_driver(
             target=target,
             jail_root=jail_root,
             provider=provider,
             model=model,
             task=task,
-            confirm_local=lambda: _confirm_local_execution(jail_root, target=target, yes=yes),
+            confirm_local=confirm_local,
         )
         driver.run()
 
@@ -775,7 +824,7 @@ def _confirm_local_execution(jail_root: Path, *, target: str | None, yes: bool) 
 def _build_driver(
     *,
     target: str | None,
-    jail_root: Path,
+    jail_root: Path | None,
     provider: str | None,
     model: str | None,
     task: str | None,
@@ -785,22 +834,24 @@ def _build_driver(
     credentials = load_credentials()
     logged_in = credentials.is_complete()
 
-    if target is None and not logged_in:
-        if confirm_local is not None:
-            confirm_local()
-        _console.print(
-            "[dim]not logged in: running the built-in baseline agent with local credentials[/dim]"
-        )
-        return LocalLiveDriver(
-            jail_root=jail_root,
-            doc=_pi_node_baseline(),
-            provider=_local_worker_provider(provider, model),
-            worker_fn=None,
-            recorder=None,
-            instruction=task,
-        )
-
     if target is None:
+        if jail_root is None:
+            raise typer.BadParameter("a working directory is required for the built-in pi harness")
+        if not logged_in:
+            if confirm_local is not None:
+                confirm_local()
+            _console.print(
+                "[dim]not logged in: running the built-in baseline agent with local "
+                "credentials[/dim]"
+            )
+            return LocalLiveDriver(
+                jail_root=jail_root,
+                doc=_pi_node_baseline(),
+                provider=_local_worker_provider(provider, model),
+                worker_fn=None,
+                recorder=None,
+                instruction=task,
+            )
         if provider is not None or model is not None:
             raise typer.BadParameter(
                 "logged-in runs use platform credentials; omit --provider/--model, "
@@ -844,6 +895,9 @@ def _build_driver(
     try:
         resolved = client.resolve_run_target(target)
         if resolved.kind == "world_model":
+            if jail_root is not None:
+                client.close()
+                raise typer.BadParameter("--upload-dir is only supported for agent ids")
             return RemoteWorldModelDriver(client, resolved.id, resolved.name, task)
         return RemoteAgentDriver(client, resolved.id, resolved.name, jail_root, task)
     except PlatformError as error:

@@ -196,6 +196,35 @@ def test_hosted_agent_session_uses_regular_create_and_workspace_patch_routes() -
     ]
 
 
+def test_hosted_agent_session_without_workspace_posts_create_directly() -> None:
+    """The default agent run does not stage any local workspace upload."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        assert request.url.path == "/api/agents/agent-1/sessions"
+        assert json.loads(request.read()) == {"instruction": "remote task"}
+        return httpx.Response(
+            202,
+            json={
+                "id": "sess-1",
+                "agent_id": "agent-1",
+                "status": "starting",
+                "source": "hosted",
+                "workspace_sync": False,
+                "launched_from": "web",
+            },
+        )
+
+    with _client(handler) as client:
+        created = client.create_agent_session(
+            "agent-1", workspace=None, instruction="remote task"
+        )
+
+    assert not created.workspace_sync
+    assert seen == ["POST /api/agents/agent-1/sessions"]
+
+
 def test_builtin_local_pi_run_payloads() -> None:
     """The built-in harness has an org-scoped, metered platform worker path."""
     seen: list[str] = []

@@ -12,8 +12,10 @@ from typing import TYPE_CHECKING, cast
 import pytest
 import typer
 from llm_waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatUsage
+from typer.testing import CliRunner
 
 import wmh.cli.agent_session as mod
+from wmh.cli import app
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.workspace_patch import build_workspace_patch
 from wmh.platform.credentials import PlatformCredentials
@@ -184,8 +186,10 @@ def test_build_driver_not_logged_in_runs_baseline_local(monkeypatch: pytest.Monk
     assert driver._doc.runtime_kind() == "pi-node"
 
 
-def test_build_driver_logged_in_agent_uses_hosted_e2b(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Logged in + agent: execution is platform-owned E2B with local workspace transport."""
+def test_build_driver_logged_in_agent_uses_hosted_e2b_without_local_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Logged in + agent defaults to platform-owned E2B without local files."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
     monkeypatch.setattr(mod, "load_credentials", lambda: creds)
     client = _FakeClient()
@@ -193,15 +197,40 @@ def test_build_driver_logged_in_agent_uses_hosted_e2b(monkeypatch: pytest.Monkey
 
     driver = mod._build_driver(
         target="a1",
-        jail_root=Path.cwd(),
+        jail_root=None,
         provider=None,
         model=None,
         task=None,
     )
     assert isinstance(driver, mod.RemoteAgentDriver)
     assert driver._target_id == "a1"
-    assert driver._jail == Path.cwd()
+    assert driver._jail is None
     assert client.created == []
+
+
+def test_run_upload_dir_is_explicit_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hosted run receives no local path unless -u/--upload-dir is present."""
+    roots: list[Path | None] = []
+
+    class _Driver:
+        def run(self) -> None:
+            pass
+
+    def build_driver(**kwargs: object) -> _Driver:
+        roots.append(cast("Path | None", kwargs["jail_root"]))
+        return _Driver()
+
+    monkeypatch.setattr(mod, "_build_driver", build_driver)
+    runner = CliRunner()
+
+    plain = runner.invoke(app, ["run", "agent-1"])
+    uploaded = runner.invoke(app, ["run", "agent-1", "-u", str(tmp_path)])
+
+    assert plain.exit_code == 0
+    assert uploaded.exit_code == 0
+    assert roots == [None, tmp_path.resolve()]
 
 
 def test_build_driver_logged_in_builtin_pi_uses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -282,7 +311,7 @@ def test_build_driver_world_model_uses_hosted_session(monkeypatch: pytest.Monkey
 
     driver = mod._build_driver(
         target="wm-1",
-        jail_root=Path.cwd(),
+        jail_root=None,
         provider=None,
         model=None,
         task="help the customer",
@@ -473,6 +502,59 @@ def test_remote_agent_driver_syncs_final_e2b_workspace(
 
     assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "after"
     assert client.acked == ["session-1"]
+    assert client.closed
+
+
+def test_remote_agent_driver_without_upload_never_reads_local_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A default hosted run skips snapshot, upload, patches, and final download."""
+    (tmp_path / "private.txt").write_text("do not upload", encoding="utf-8")
+
+    class _HostedClient:
+        def __init__(self) -> None:
+            self.created_workspaces: list[bytes | None] = []
+            self.closed = False
+
+        def create_agent_session(
+            self,
+            agent_id: str,
+            *,
+            workspace: bytes | None,
+            instruction: str | None = None,
+        ) -> object:
+            assert agent_id == "agent-1"
+            assert instruction == "work remotely"
+            self.created_workspaces.append(workspace)
+            return type("Session", (), {"id": "session-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            return type("Page", (), {"events": [], "last_seq": 0, "status": "ended"})()
+
+        def get_agent_session(self, *_args: object) -> object:
+            return type("Session", (), {"status": "ended", "error": None})()
+
+        def download_agent_workspace(self, *_args: object) -> bytes:
+            pytest.fail("a run without --upload-dir must not download a workspace")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _NoReader:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    client = _HostedClient()
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
+
+    mod.RemoteAgentDriver(
+        cast("mod.PlatformClient", client), "agent-1", "Agent", None, "work remotely"
+    ).run()
+
+    assert client.created_workspaces == [None]
     assert client.closed
 
 

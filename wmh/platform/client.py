@@ -281,20 +281,22 @@ class PlatformClient:
         self,
         agent_id: str,
         *,
-        workspace: bytes,
+        workspace: bytes | None,
         instruction: str | None = None,
     ) -> RemoteAgentSession:
-        """Stage a local snapshot, then create an ordinary hosted agent session."""
-        upload = self._client.post(
-            f"/api/agents/{agent_id}/workspace-uploads",
-            files={"workspace": ("workspace.tar.gz", workspace, "application/gzip")},
-            timeout=_WORKSPACE_TIMEOUT_SECONDS,
-        )
-        self._raise_for_error(upload)
-        upload_id = str(upload.json()["id"])
+        """Create a hosted agent session, optionally staging a local snapshot."""
+        payload: dict[str, JsonValue] = {"instruction": instruction}
+        if workspace is not None:
+            upload = self._client.post(
+                f"/api/agents/{agent_id}/workspace-uploads",
+                files={"workspace": ("workspace.tar.gz", workspace, "application/gzip")},
+                timeout=_WORKSPACE_TIMEOUT_SECONDS,
+            )
+            self._raise_for_error(upload)
+            payload["workspace_upload_id"] = str(upload.json()["id"])
         response = self._client.post(
             f"/api/agents/{agent_id}/sessions",
-            json={"instruction": instruction, "workspace_upload_id": upload_id},
+            json=payload,
         )
         self._raise_for_error(response)
         return RemoteAgentSession.model_validate(response.json())
