@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Protocol
 
 from wmh.agents.project import AgentProjectRun
@@ -40,7 +41,14 @@ class DeltaProposer(Protocol):
         *,
         history: list[HarnessDelta],
         count: int,
-    ) -> list[HarnessDelta | None]: ...
+    ) -> list[HarnessDelta | ProposalFailure | None]: ...
+
+
+@dataclass(frozen=True)
+class ProposalFailure:
+    """One proposal slot whose provider or agent call failed."""
+
+    reason: str
 
 
 class ProviderDeltaProposer:
@@ -62,14 +70,24 @@ class ProviderDeltaProposer:
         *,
         history: list[HarnessDelta],
         count: int,
-    ) -> list[HarnessDelta | None]:
+    ) -> list[HarnessDelta | ProposalFailure | None]:
         """Make ``count`` independent proposal calls against the same parent."""
         if count < 1:
             raise ValueError(f"proposal count must be positive, got {count}")
-        return [
-            propose_delta(parent, trigger, evidence, self._provider, history=history)
-            for _ in range(count)
-        ]
+        proposals: list[HarnessDelta | ProposalFailure | None] = []
+        for _ in range(count):
+            try:
+                proposal = propose_delta(
+                    parent,
+                    trigger,
+                    evidence,
+                    self._provider,
+                    history=history,
+                )
+            except Exception as error:  # noqa: BLE001 - isolate one flaky sibling call
+                proposal = ProposalFailure(reason=str(error))
+            proposals.append(proposal)
+        return proposals
 
 
 class ProjectDeltaProposer:
@@ -94,7 +112,7 @@ class ProjectDeltaProposer:
         *,
         history: list[HarnessDelta],
         count: int,
-    ) -> list[HarnessDelta | None]:
+    ) -> list[HarnessDelta | ProposalFailure | None]:
         """Run one meta-agent turn that writes ``count`` proposal files."""
         if count < 1:
             raise ValueError(f"proposal count must be positive, got {count}")
@@ -117,7 +135,7 @@ class ProjectDeltaProposer:
         self._project.write_text(f"{context_dir}/REQUEST.md", request)
         self._project.run(self._agent, self._provider, request)
 
-        proposals: list[HarnessDelta | None] = []
+        proposals: list[HarnessDelta | ProposalFailure | None] = []
         for index in range(1, count + 1):
             try:
                 raw = self._project.read_text(f"{proposal_dir}/proposal-{index:02d}.json")

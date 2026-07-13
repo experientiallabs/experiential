@@ -24,3 +24,8 @@ def test_meta_agent_has_a_larger_turn_budget_without_mutating_default() -> None:
 
     assert default.max_turns() == 20
     assert meta.max_turns() == 60
+
+
+def test_meta_agent_uses_only_project_scoped_file_tools() -> None:
+    """The optimizer agent has no shell escape from its persistent workspace."""
+    assert meta_agent().tools() == ["read_file", "write_file", "submit"]
