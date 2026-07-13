@@ -26,8 +26,8 @@ from wmh.providers.base import ToolCallingProvider
 
 PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
-_COMMAND_TIMEOUT_S = 900.0
 _OUTPUT_CAP = 16_000
+_PROJECT_TOOLS = frozenset({"read_file", "write_file", "submit"})
 
 
 class ChannelFactory(Protocol):
@@ -46,7 +46,7 @@ class AgentProjectRun:
 
 
 class AgentProject:
-    """A persistent filesystem that can run any pi-backed ``HarnessDoc`` agent.
+    """A persistent filesystem that can run project-scoped pi agents.
 
     The project owns environment state, while :class:`LiveSession` owns agent execution. A new
     session is created for each ``run`` call, but every session sees the same sandbox filesystem.
@@ -108,7 +108,11 @@ class AgentProject:
         timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
         on_event: Callable[[SessionEvent], None] | None = None,
     ) -> AgentProjectRun:
-        """Run one ordinary agent session against this project's filesystem."""
+        """Run one project-contained agent session against the persistent filesystem."""
+        unsupported = set(agent.tools()) - _PROJECT_TOOLS
+        if unsupported:
+            names = ", ".join(sorted(unsupported))
+            raise ValueError(f"project agents cannot use uncontained tools: {names}")
         channel = self._channel_factory(self._sandbox, self.workspace)
         events: list[SessionEvent] = []
         answer = ""
@@ -198,10 +202,8 @@ class AgentProject:
         arguments: JsonObject,
         emit: Callable[[str, str], None],
     ) -> ToolOutcome:
+        del emit
         try:
-            if name == "bash":
-                command = str(arguments.get("command", ""))
-                return self._run_bash(command, emit)
             if name == "read_file":
                 path = self._tool_path(str(arguments.get("path", "")))
                 return _capped(self._sandbox.files.read(path))
@@ -212,27 +214,6 @@ class AgentProject:
         except Exception as error:  # noqa: BLE001 - tool errors are agent observations
             return ToolOutcome(content=f"{name} failed: {error}", is_error=True)
         return ToolOutcome(content=f"tool {name!r} not available", is_error=True)
-
-    def _run_bash(self, command: str, emit: Callable[[str, str], None]) -> ToolOutcome:
-        try:
-            result = self._sandbox.commands.run(
-                f"cd {shlex.quote(self.workspace)} && {command}", timeout=_COMMAND_TIMEOUT_S
-            )
-            stdout = str(getattr(result, "stdout", "") or "")
-            stderr = str(getattr(result, "stderr", "") or "")
-            exit_code = int(getattr(result, "exit_code", 0) or 0)
-        except Exception as error:  # noqa: BLE001 - E2B raises command results on nonzero exit
-            stdout = str(getattr(error, "stdout", "") or "")
-            stderr = str(getattr(error, "stderr", "") or str(error))
-            exit_code = int(getattr(error, "exit_code", 1) or 1)
-        if stdout:
-            emit("stdout", stdout)
-        if stderr:
-            emit("stderr", stderr)
-        content = stdout + stderr
-        if exit_code:
-            content = f"{content}\n[exit {exit_code}]"
-        return _capped(content, is_error=exit_code != 0)
 
     def _tool_path(self, path: str) -> str:
         """Resolve an agent-supplied path while containing it to the project."""

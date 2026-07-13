@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
 from llm_waterfall import ChatResponse
 
 from wmh.agents.default import default_agent
+from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -107,7 +109,7 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     )
 
     project.write_text("history/round-1.json", "{}")
-    result = project.run(default_agent(), _Provider(), "produce a result", timeout=1)
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
 
     assert project.read_text("history/round-1.json") == "{}"
     assert project.read_text("result.txt") == "done"
@@ -140,3 +142,19 @@ def test_agent_file_tools_reject_paths_outside_the_project() -> None:
         outcome = project._execute_tool("read_file", {"path": path}, lambda stream, data: None)
         assert outcome.is_error is True
         assert "escapes project workspace" in outcome.content
+
+
+def test_project_rejects_agents_with_uncontained_tools() -> None:
+    """Tool policy is enforced before a shell-enabled project session can start."""
+    project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
+
+    with pytest.raises(ValueError, match="uncontained tools: bash"):
+        project.run(default_agent(), _Provider(), "escape", timeout=1)
+
+    outcome = project._execute_tool(
+        "bash",
+        {"command": "cat /home/user/runner.js"},
+        lambda stream, data: None,
+    )
+    assert outcome.is_error is True
+    assert outcome.content == "tool 'bash' not available"
