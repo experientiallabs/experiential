@@ -2,8 +2,8 @@
 
 The loop: select a parent from the accepted pool (stepping-stone weighting — good scores favored,
 already-expanded parents discounted), cluster the parent's failures into mechanisms, ask the
-proposer for one `HarnessDelta` against the largest cluster, apply it atomically, score the child
-closed-loop against the world model, and gate acceptance:
+proposer for a sibling batch of `HarnessDelta` objects against the largest cluster, apply each
+atomically, score each child closed-loop against the world model, and gate acceptance:
 
 - **Tier 1 — regression suite**: the child's score on the suite (tasks the search has already
   mastered) must not drop below the champion's. Newly-passing tasks promote into the suite on
@@ -35,7 +35,8 @@ from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
-from wmh.harness.mutate import propose_delta, render_evidence
+from wmh.harness.mutate import render_evidence
+from wmh.harness.proposer import DeltaProposer
 from wmh.harness.runtime import TokenUsage, combine_usage
 from wmh.providers.base import Provider
 
@@ -95,18 +96,20 @@ class DeltaArchive(BaseModel):
 
 
 class IterationRecord(BaseModel):
-    """One search iteration, scored or dead, in order: the complete search history.
+    """One proposal attempt, scored or dead, in order: the complete search history.
 
-    Every iteration proposes exactly one delta. A dead iteration (every outcome but
-    "scored") ends early: the proposal died before a full-split eval, the search moves
-    straight to the next iteration, and the record here is what remains of it. Callers
-    render these as records and plot points, so a run full of dead proposals shows its
+    Every search round proposes a sibling batch from one selected parent. A dead attempt
+    (every outcome but "scored") ends early: the proposal died before a full-split eval,
+    the search moves straight to the next sibling, and the record here is what remains of it.
+    Callers render these as records and plot points, so a run full of dead proposals shows its
     work instead of looking like it never iterated. `champion_score` is the champion's
     full-suite rate when the iteration resolved: the honest y-level for plotting a dead
     iteration (the line it failed to move).
     """
 
     iteration: int
+    round: int
+    proposal_index: int
     outcome: Literal["scored", "screened", "invalid", "unusable", "proposer_error"]
     candidate: str | None = None
     delta_id: str | None = None
@@ -132,6 +135,8 @@ class CreateResult(BaseModel):
     iteration_records: list[IterationRecord] = Field(default_factory=list)  # every iteration
     screened: int = 0  # deltas rejected at the cheap trigger-cluster screen (no full eval spent)
     confirmations: int = 0  # narrow vetoes retried at higher k (see `narrow_failing_tiers`)
+    rounds: int = 0
+    proposal_batch_size: int = 1
     # Spend meters over the WHOLE search (seed, screens, full splits, holdout, confirmations).
     # worker_usage: worker-LLM tokens from self-metering runtimes (the pi worker path; None on
     # provider-wrapped runtimes, which are metered upstream). sandbox_usage: E2B sandbox count +
@@ -313,10 +318,11 @@ def create_harness(
     tasks: list[TaskSpec],
     world_model: WorldModel,
     agent_provider: Provider,
-    meta_provider: Provider,
+    proposer: DeltaProposer,
     judge: GoldJudge,
     *,
     iterations: int = 5,
+    proposal_batch_size: int = 1,
     k: int = DEFAULT_K,
     holdout: list[TaskSpec] | None = None,
     confirm_narrow_vetoes: bool = True,
@@ -330,8 +336,9 @@ def create_harness(
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
 
-    Scores the seed first, then runs `iterations` propose-apply-SCREEN-score-gate
-    iterations, one proposal each. A dead iteration (unusable/invalid proposal, or one
+    Scores the seed first, then runs `iterations` proposal rounds. Each round asks the proposer
+    for `proposal_batch_size` sibling deltas against one selected parent before any sibling is
+    evaluated. A dead proposal (unusable/invalid proposal, or one
     screened out on its own trigger cluster) ends early and cheaply: it is counted
     (`skipped`/`screened`), recorded in `iteration_records`, narrated via `on_note`, and
     the search moves straight to the next iteration. Never fatal. `on_accept` fires the
@@ -366,6 +373,8 @@ def create_harness(
     """
     if harness_backend not in ("local", "e2b"):
         raise ValueError(f"unknown harness_backend {harness_backend!r}; choose local or e2b")
+    if proposal_batch_size < 1:
+        raise ValueError(f"proposal_batch_size must be positive, got {proposal_batch_size}")
     if harness_backend == "e2b" and seed_doc.runtime_kind() != "pi-node":
         raise ValueError(
             "harness_backend='e2b' runs the pi-node harness process in sandboxes; seed "
@@ -468,36 +477,74 @@ def create_harness(
                 on_iteration(record)
             _note(note)
 
-        for i in range(1, iterations + 1):
+        proposal_queue: list[
+            tuple[
+                HarnessDoc,
+                ClosedLoopReport,
+                FailureSignature,
+                HarnessDelta | None,
+                str | None,
+            ]
+        ] = []
+        total_attempts = iterations * proposal_batch_size
+        for i in range(1, total_attempts + 1):
+            round_index = ((i - 1) // proposal_batch_size) + 1
+            proposal_index = ((i - 1) % proposal_batch_size) + 1
             champion_score = reports[champion_hash].success_rate
-            parent_entry = select_parent(pool, children_counts, seed=i)
-            parent = docs[parent_entry.doc_hash]
-            parent_report = reports[parent_entry.doc_hash]
-            # Count the expansion attempt up front so a parent whose proposals keep failing is
-            # progressively discounted instead of re-selected every iteration.
-            children_counts[parent.doc_hash] = children_counts.get(parent.doc_hash, 0) + 1
-
-            clusters = cluster_failures(parent_report, tasks)
-            trigger = clusters[0] if clusters else FailureSignature(mechanism=ALL_PASS_MECHANISM)
-            evidence = render_evidence(trigger, parent_report, tasks)
-            # A meta-provider failure (an API rejecting the 16k reply budget, a rate limit, a
-            # network fault) costs this iteration, not the run: same contract as an unusable
-            # reply, but narrated with the error so a systematically failing provider is
-            # visible on every iteration instead of aborting the search on the first one.
-            try:
-                delta = propose_delta(
-                    parent, trigger, evidence, meta_provider, history=archive.deltas
+            if proposal_index == 1:
+                parent_entry = select_parent(pool, children_counts, seed=round_index)
+                parent = docs[parent_entry.doc_hash]
+                parent_report = reports[parent_entry.doc_hash]
+                # Every sibling is an expansion of the selected parent, including dead proposals.
+                children_counts[parent.doc_hash] = (
+                    children_counts.get(parent.doc_hash, 0) + proposal_batch_size
                 )
-            except Exception as exc:  # noqa: BLE001 - any provider/transport error, by design
+                clusters = cluster_failures(parent_report, tasks)
+                trigger = (
+                    clusters[0] if clusters else FailureSignature(mechanism=ALL_PASS_MECHANISM)
+                )
+                evidence = render_evidence(trigger, parent_report, tasks)
+                try:
+                    batch = proposer.propose_batch(
+                        parent,
+                        trigger,
+                        evidence,
+                        history=archive.deltas,
+                        count=proposal_batch_size,
+                    )
+                    if len(batch) != proposal_batch_size:
+                        raise ValueError(
+                            f"proposer returned {len(batch)} proposals; "
+                            f"expected {proposal_batch_size}"
+                        )
+                    errors: list[str | None] = [None] * proposal_batch_size
+                except Exception as exc:  # noqa: BLE001 - provider/agent/transport failure
+                    batch = [None] * proposal_batch_size
+                    errors = [str(exc)] * proposal_batch_size
+                proposal_queue.extend(
+                    (parent, parent_report, trigger, delta, error)
+                    for delta, error in zip(batch, errors, strict=True)
+                )
+
+            parent, parent_report, trigger, delta, proposer_error = proposal_queue.pop(0)
+            label = _proposal_label(
+                round_index,
+                proposal_index,
+                rounds=iterations,
+                batch_size=proposal_batch_size,
+            )
+            if proposer_error is not None:
                 skipped += 1
                 _dead(
                     IterationRecord(
                         iteration=i,
+                        round=round_index,
+                        proposal_index=proposal_index,
                         outcome="proposer_error",
-                        reason=str(exc),
+                        reason=proposer_error,
                         champion_score=champion_score,
                     ),
-                    f"iteration {i}/{iterations}: proposer call failed ({exc}); skipped",
+                    f"{label}: proposer call failed ({proposer_error}); skipped",
                 )
                 continue
             if delta is None:
@@ -505,12 +552,13 @@ def create_harness(
                 _dead(
                     IterationRecord(
                         iteration=i,
+                        round=round_index,
+                        proposal_index=proposal_index,
                         outcome="unusable",
                         reason="unparseable or truncated meta reply",
                         champion_score=champion_score,
                     ),
-                    f"iteration {i}/{iterations}: proposal unusable (unparseable or truncated "
-                    "meta reply); skipped",
+                    f"{label}: proposal unusable (unparseable or truncated meta reply); skipped",
                 )
                 continue
             ops_summary = [f"{op.op} {op.surface_id}" for op in delta.ops]
@@ -522,18 +570,24 @@ def create_harness(
                 _dead(
                     IterationRecord(
                         iteration=i,
+                        round=round_index,
+                        proposal_index=proposal_index,
                         outcome="invalid",
                         delta_id=delta.delta_id,
                         ops=ops_summary,
                         reason="duplicate of an already-judged delta",
                         champion_score=champion_score,
                     ),
-                    f"iteration {i}/{iterations}: proposal duplicates an already-judged delta; "
-                    "skipped",
+                    f"{label}: proposal duplicates an already-judged delta; skipped",
                 )
                 continue
             try:
-                child = apply_delta(parent, delta, f"{name}-g{i}")
+                child_name = (
+                    f"{name}-g{round_index}"
+                    if proposal_batch_size == 1
+                    else f"{name}-g{round_index}-p{proposal_index}"
+                )
+                child = apply_delta(parent, delta, child_name)
             except ValueError as exc:
                 delta.verdict = GateRecord(accepted=False, reason=f"invalid before eval: {exc}")
                 archive.deltas.append(delta)
@@ -541,13 +595,15 @@ def create_harness(
                 _dead(
                     IterationRecord(
                         iteration=i,
+                        round=round_index,
+                        proposal_index=proposal_index,
                         outcome="invalid",
                         delta_id=delta.delta_id,
                         ops=ops_summary,
                         reason=f"invalid before eval: {exc}",
                         champion_score=champion_score,
                     ),
-                    f"iteration {i}/{iterations}: delta invalid before eval ({exc}); skipped",
+                    f"{label}: delta invalid before eval ({exc}); skipped",
                 )
                 continue
             if harness_backend == "e2b" and child.runtime_kind() != "pi-node":
@@ -566,6 +622,8 @@ def create_harness(
                 _dead(
                     IterationRecord(
                         iteration=i,
+                        round=round_index,
+                        proposal_index=proposal_index,
                         outcome="invalid",
                         candidate=child.name,
                         delta_id=delta.delta_id,
@@ -573,7 +631,7 @@ def create_harness(
                         reason=str(delta.verdict.reason),
                         champion_score=champion_score,
                     ),
-                    f"iteration {i}/{iterations}: delta abandoned the pi-node runtime "
+                    f"{label}: delta abandoned the pi-node runtime "
                     "(e2b runs pi-node only); skipped",
                 )
                 continue
@@ -599,6 +657,8 @@ def create_harness(
                     _dead(
                         IterationRecord(
                             iteration=i,
+                            round=round_index,
+                            proposal_index=proposal_index,
                             outcome="screened",
                             candidate=child.name,
                             delta_id=delta.delta_id,
@@ -608,7 +668,7 @@ def create_harness(
                             screen_parent=parent_mean,
                             champion_score=champion_score,
                         ),
-                        f"iteration {i}/{iterations}: screened out: trigger cluster "
+                        f"{label}: screened out: trigger cluster "
                         f"{child_mean:.2f} vs parent {parent_mean:.2f}",
                     )
                     continue
@@ -699,6 +759,8 @@ def create_harness(
                     on_accept(child, delta, child_report.success_rate)
             record = IterationRecord(
                 iteration=i,
+                round=round_index,
+                proposal_index=proposal_index,
                 outcome="scored",
                 candidate=child.name,
                 delta_id=delta.delta_id,
@@ -730,6 +792,8 @@ def create_harness(
             iteration_records=iteration_records,
             screened=screened,
             confirmations=confirmations,
+            rounds=iterations,
+            proposal_batch_size=proposal_batch_size,
             worker_usage=combine_usage(worker_usages),
             sandbox_usage=sandbox_usage,
         )
@@ -750,6 +814,13 @@ def _suite_rate(report: ClosedLoopReport, suite: list[str]) -> float:
     # Dividing by len(suite), not len(rates): a suite task missing from the report counts as 0
     # (fail-closed), though suite tasks are always a subset of the scored split in practice.
     return sum(rates) / len(suite)
+
+
+def _proposal_label(round_index: int, proposal_index: int, *, rounds: int, batch_size: int) -> str:
+    """Human-readable attempt identity that stays concise for singleton batches."""
+    if batch_size == 1:
+        return f"iteration {round_index}/{rounds}"
+    return f"round {round_index}/{rounds} proposal {proposal_index}/{batch_size}"
 
 
 def _fraction(text: str) -> float:

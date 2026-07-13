@@ -7,7 +7,8 @@ representation IS the search space**, and everything the meta-agent can learn ab
 improve harnesses* is bounded by what the update object can express.
 
 Implementation: `wmh/harness/doc.py` (the document), `wmh/harness/delta.py` (the delta),
-`wmh/harness/mutate.py` (the proposer), `wmh/harness/create.py` (clustering, gate, archive).
+`wmh/harness/mutate.py` (delta parsing), `wmh/harness/proposer.py` (proposal runtimes), and
+`wmh/harness/create.py` (clustering, gate, archive).
 
 ---
 
@@ -131,6 +132,11 @@ class HarnessDelta(BaseModel):
   parent on its own target is rejected (and archived) for a fraction of the price. Every judged
   delta is fed back to the proposer as history, so the search iterates instead of re-proposing
   rejected ideas.
+- **Search breadth is independent from evaluation depth**: `proposal_batch_size` asks the
+  proposer for sibling deltas against one selected parent before evaluating any sibling. `k`
+  remains the number of rollout passes used to score each scenario. Project-backed proposers keep
+  all prior proposal files in one persistent agent project while each round runs through a fresh
+  ordinary agent session.
 - **Acceptance is the gate, not "applied cleanly"** (`gate_delta`): regression-suite
   non-regression vs the champion → full-split never-worse-than-best → held-out non-regression vs
   the champion (when a holdout split is given). Ties pass every tier: with k passes per task the

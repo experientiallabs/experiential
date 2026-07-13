@@ -28,6 +28,7 @@ from wmh.evals.tasks import TaskSpec, load_tasks
 from wmh.harness.create import create_harness
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
+from wmh.harness.proposer import ProviderDeltaProposer
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
 from wmh.providers.registry import get_provider
@@ -133,6 +134,12 @@ def create(
         help="Harness to start from, as name[@ref] (default: the built-in baseline).",
     ),
     iterations: int = typer.Option(None, min=1, help="Propose-and-gate steps (the search budget)."),
+    proposal_batch_size: int = typer.Option(
+        1,
+        "--proposal-batch-size",
+        min=1,
+        help="Sibling proposals generated against each selected parent.",
+    ),
     k: int = typer.Option(3, min=1, help="Closed-loop passes per task per variant."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
     archive_out: str = typer.Option(
@@ -189,8 +196,11 @@ def create(
     world_model, provider, model_name = _load_world_model(model, root)
     meta_provider, meta_model = _meta_provider_from_settings(root, provider)
 
-    rollouts = (iterations + 1) * k * len(tasks)
-    holdout_note = f" (+ up to {(iterations + 1) * k * len(holdout)} held-out)" if holdout else ""
+    candidate_count = iterations * proposal_batch_size
+    rollouts = (candidate_count + 1) * k * len(tasks)
+    holdout_note = (
+        f" (+ up to {(candidate_count + 1) * k * len(holdout)} held-out)" if holdout else ""
+    )
     backend_note = (
         " (pi harness in pooled E2B sandboxes; env stays the world model)"
         if harness_backend == "e2b"
@@ -201,8 +211,9 @@ def create(
     )
     _console.print(
         f"searching from [bold]{seed_doc.name}[/bold] against world model "
-        f"[bold]{model_name}[/bold]: {iterations} iteration(s), k={k}, {len(tasks)} task(s) "
-        f"-> up to ~{rollouts} rollouts{holdout_note} + {iterations} proposal calls"
+        f"[bold]{model_name}[/bold]: {iterations} round(s), "
+        f"{proposal_batch_size} proposal(s)/round, k={k}, {len(tasks)} task(s) "
+        f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
         f"{meta_note}{backend_note}"
     )
     if interactive and not yes and not Confirm.ask("Proceed?", default=True):
@@ -225,9 +236,10 @@ def create(
         tasks,
         world_model,
         provider,
-        meta_provider,
+        ProviderDeltaProposer(meta_provider),
         GoldJudge(provider),
         iterations=iterations,
+        proposal_batch_size=proposal_batch_size,
         k=k,
         holdout=holdout,
         harness_backend="e2b" if harness_backend == "e2b" else "local",
