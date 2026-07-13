@@ -33,6 +33,7 @@ from wmh.harness.create import (
 from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.proposer import ProviderDeltaProposer
 from wmh.harness.runtime import Runtime
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
@@ -143,6 +144,7 @@ def _run(
     *,
     iterations: int = 1,
     k: int = 3,
+    proposal_batch_size: int = 1,
     holdout: list[TaskSpec] | None = None,
     on_progress: Callable[[int, str, float, bool], None] | None = None,
     on_note: Callable[[str], None] | None = None,
@@ -154,9 +156,10 @@ def _run(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=iterations,
+        proposal_batch_size=proposal_batch_size,
         k=k,
         holdout=holdout,
         on_progress=on_progress,
@@ -427,7 +430,7 @@ def test_code_delta_passes_screen_and_gate_end_to_end() -> None:
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         k=3,
@@ -468,7 +471,7 @@ def test_broken_code_delta_is_rejected_before_any_eval() -> None:
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         k=2,
@@ -581,7 +584,7 @@ def test_confirmed_suite_overturn_still_faces_the_holdout_tier() -> None:
         tasks,
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         k=5,
@@ -701,7 +704,7 @@ def test_unknown_harness_backend_is_rejected() -> None:
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             harness_backend=bogus,
         )
@@ -717,7 +720,7 @@ def test_e2b_backend_rejects_non_pi_node_seeds() -> None:
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             harness_backend="e2b",
         )
@@ -737,7 +740,7 @@ def test_local_backend_rejects_parallel_pi_node_scoring() -> None:
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             eval_concurrency=2,
         )
@@ -788,7 +791,7 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=0,  # the seed eval alone exercises the whole scoring path
         k=3,
@@ -832,7 +835,7 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             harness_backend="e2b",
         )
@@ -870,7 +873,7 @@ def test_eval_concurrency_overrides_both_backend_defaults(
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             iterations=0,  # score the seed only: one eval call per run
             harness_backend="local" if harness_backend == "local" else "e2b",
@@ -921,7 +924,7 @@ def test_create_sums_worker_usage_across_score_waves(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         harness_backend="e2b",
@@ -955,7 +958,7 @@ def test_create_worker_usage_is_none_when_no_wave_reports_it(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=0,
         harness_backend="local",
@@ -1003,7 +1006,7 @@ def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         harness_backend="e2b",
@@ -1074,6 +1077,30 @@ class _SequencedMetaProvider(RoleProvider):
             reply = self._replies[min(len(self.meta_users) - 1, len(self._replies) - 1)]
             return Completion(text=reply)
         return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_proposal_batch_is_generated_before_siblings_are_evaluated() -> None:
+    """One round expands one parent into independently tracked sibling candidates."""
+    seed = HarnessDoc.baseline("seed")
+    provider = _SequencedMetaProvider(
+        [
+            _meta_reply(seed, _CAREFUL_PROMPT),
+            _meta_reply(seed, f"{_CAREFUL_PROMPT} Double-check the result."),
+        ]
+    )
+
+    result = _run(provider, iterations=1, proposal_batch_size=2)
+
+    assert len(provider.meta_users) == 2
+    assert [(record.round, record.proposal_index) for record in result.iteration_records] == [
+        (1, 1),
+        (1, 2),
+    ]
+    assert [record.candidate for record in result.iteration_records] == [
+        "winner-g1-p1",
+        "winner-g1-p2",
+    ]
+    assert len(result.archive.deltas) == 2
 
 
 def test_on_accept_delivers_the_new_champion_the_moment_it_is_crowned() -> None:

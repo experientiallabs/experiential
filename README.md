@@ -106,7 +106,8 @@ credentials ever enter a sandbox**.
 ```bash
 uv sync --extra e2b                # the e2b SDK is an optional extra
 export E2B_API_KEY=...             # sandboxes; the only credential involved
-uv run wmh harness create my-agent --tasks tasks.jsonl --harness-backend e2b
+uv run wmh harness create my-agent --tasks tasks.jsonl --harness-backend e2b \
+  --iterations 5 --proposal-batch-size 3
 uv run wmh eval tasks.jsonl --mode closed-loop --harness pi-agent --harness-backend e2b
 ```
 
@@ -115,6 +116,13 @@ auto-extended). Set `WMH_E2B_TEMPLATE` to a prebaked template with node ≥ 22.6
 at `/home/user/pi-run` to skip per-sandbox installs (~13 s cold episodes); `--eval-concurrency`
 caps the fan-out (default: every cell at once). Worker-LLM tokens and sandbox-seconds are metered
 on the results (`worker_usage`, `sandbox_usage`).
+
+`wmh.agents` exposes the default agent and a separately customizable meta agent over the same
+vendored pi source and `LiveSession` runtime. `AgentProject` gives an agent a persistent E2B
+filesystem while starting a fresh session for each turn. `ProjectDeltaProposer` uses that ordinary
+agent/project pair to retain every earlier proposal and generate a sibling batch from one selected
+parent per search round. Proposal batch size controls search breadth; `k` independently controls
+the number of evaluation passes per scenario.
 
 ## Providers
 

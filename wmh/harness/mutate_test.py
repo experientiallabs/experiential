@@ -8,7 +8,7 @@ from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.mutate import propose_delta, render_evidence
+from wmh.harness.mutate import parse_delta, propose_delta, render_evidence
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 
@@ -114,6 +114,33 @@ def test_propose_delta_returns_none_on_garbage() -> None:
         }
     )
     assert propose_delta(parent, trigger, "e", ScriptedProvider(no_kind)) is None
+
+
+def test_parse_delta_expands_compact_exact_replacement_edits() -> None:
+    parent = HarnessDoc.baseline("parent")
+    core = parent.surface("prompt:core")
+    assert core is not None
+    old = "You are a capable command-line agent"
+    assert core.content.count(old) == 1
+    raw = json.dumps(
+        {
+            "expected_effect": "verification improves",
+            "preconditions": {"prompt:core": core.content_hash},
+            "ops": [
+                {
+                    "op": "replace",
+                    "surface_id": "prompt:core",
+                    "edits": [{"old": old, "new": "You are a careful agent"}],
+                    "rationale": "add care",
+                }
+            ],
+        }
+    )
+
+    delta = parse_delta(parent, _trigger(), raw)
+
+    assert delta is not None
+    assert delta.ops[0].content == core.content.replace(old, "You are a careful agent")
 
 
 def test_render_evidence_shows_cluster_tasks_and_unmet_assertions() -> None:

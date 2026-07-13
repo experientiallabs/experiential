@@ -19,6 +19,7 @@ from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.create import CreateResult, DeltaArchive
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.proposer import ProviderDeltaProposer
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 # The Typer object `harness_app` shadows the submodule name on plain attribute access; go
@@ -56,7 +57,7 @@ class _CreateRecorder:
         tasks: list[TaskSpec],
         world_model: object,
         agent_provider: object,
-        meta_provider: object,
+        proposer: object,
         judge: object,
         **kwargs: object,
     ) -> CreateResult:
@@ -65,7 +66,7 @@ class _CreateRecorder:
                 "name": name,
                 "world_model": world_model,
                 "provider": agent_provider,
-                "meta_provider": meta_provider,
+                "proposer": proposer,
                 **kwargs,
             }
         )
@@ -208,7 +209,8 @@ def test_create_meta_role_from_settings_drives_the_proposer(
     assert result.exit_code == 0, result.output
     [call] = recorder.calls
     assert call["provider"] is anchored  # agent + judge stay on the world model's provider
-    assert call["meta_provider"] is meta_sentinel
+    assert isinstance(call["proposer"], ProviderDeltaProposer)
+    assert call["proposer"].provider is meta_sentinel
     [config] = configs
     assert config.kind is ProviderKind.AZURE_OPENAI
     assert config.model == "gpt-5.5"
@@ -266,7 +268,8 @@ def test_create_meta_defaults_to_the_world_model_provider(
 
     assert result.exit_code == 0, result.output
     [call] = recorder.calls
-    assert call["meta_provider"] is anchored
+    assert isinstance(call["proposer"], ProviderDeltaProposer)
+    assert call["proposer"].provider is anchored
     assert "models.meta" not in result.output
 
 

@@ -272,7 +272,7 @@ class HarnessDoc(BaseModel):
                     provider=structured_provider,
                     files=code_files,
                     tools=resolve_tools(self.tools()),
-                    system_prompt=self._assembled_prompt(skills),
+                    system_prompt=self.assembled_prompt(skills),
                     template=e2b_template,
                     pool=e2b_pool,
                 )
@@ -296,7 +296,7 @@ class HarnessDoc(BaseModel):
                     channel,
                     tools=resolve_tools(self.tools()),
                     provider=structured_provider,
-                    system_prompt=self._assembled_prompt(skills),
+                    system_prompt=self.assembled_prompt(skills),
                     files=code_files,
                 )
             from wmh.harness.pi_runtime import PiRuntime  # circular: pi_runtime imports doc
@@ -307,7 +307,7 @@ class HarnessDoc(BaseModel):
                 tools=resolve_tools(self.tools()),
                 temperature=self.temperature(),
                 skills=skills,
-                system_prompt=self._assembled_prompt(skills),
+                system_prompt=self.assembled_prompt(skills),
             )
         if backend == "e2b":
             raise ValueError(
@@ -324,7 +324,7 @@ class HarnessDoc(BaseModel):
                 tools=resolve_tools(self.tools()),
                 temperature=self.temperature(),
                 skills=skills,
-                system_prompt=self._assembled_prompt(skills),
+                system_prompt=self.assembled_prompt(skills),
             )
         return AgentRuntime(
             provider,
@@ -335,10 +335,11 @@ class HarnessDoc(BaseModel):
             skills=skills,
         )
 
-    def _assembled_prompt(self, skills: SkillLibrary) -> str:
-        """The full system prompt handed to harness code: sections + tools + skills index."""
+    def assembled_prompt(self, skills: SkillLibrary | None = None) -> str:
+        """Return the system prompt shared by episode and project session runtimes."""
+        resolved_skills = skills if skills is not None else SkillLibrary(self.skills())
         prompt = f"{self.system_prompt()}\n\n## Tools\n{render_tools(resolve_tools(self.tools()))}"
-        index = skills.render_index()
+        index = resolved_skills.render_index()
         if index:
             prompt += f"\n\n## Your skills (read a body with read_skill)\n{index}"
         return prompt

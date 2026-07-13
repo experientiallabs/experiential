@@ -15,6 +15,8 @@ iteration; a flaky meta-model costs budget, not the run.
 
 from __future__ import annotations
 
+import json
+
 from pydantic import BaseModel, Field, ValidationError
 
 from wmh.core.parsing import extract_json_object
@@ -125,12 +127,25 @@ def propose_delta(
         temperature=0.9,
         max_tokens=16384,
     )
-    raw = extract_json_object(completion.text)
+    return parse_delta(parent, trigger, completion.text)
+
+
+def parse_delta(
+    parent: HarnessDoc,
+    trigger: FailureSignature,
+    text: str,
+) -> HarnessDelta | None:
+    """Parse one full-content or compact-edit proposal against ``parent``."""
+    raw = extract_json_object(text)
     if raw is None:
         return None
     try:
-        proposed = _RawDelta.model_validate_json(raw)
-    except ValidationError:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            return None
+        value["ops"] = _expand_compact_ops(parent, value.get("ops"))
+        proposed = _RawDelta.model_validate(value)
+    except (TypeError, ValueError, ValidationError):
         return None
     return HarnessDelta(
         delta_id=compute_delta_id(parent.doc_hash, proposed.ops),
@@ -140,6 +155,44 @@ def propose_delta(
         ops=proposed.ops,
         expected_effect=proposed.expected_effect,
     )
+
+
+def _expand_compact_ops(parent: HarnessDoc, value: object) -> list[dict[str, object]]:
+    """Expand exact replacement hunks into ordinary full-content surface ops."""
+    if not isinstance(value, list):
+        raise ValueError("ops must be an array")
+    expanded: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("each op must be an object")
+        op = dict(item)
+        edits = op.pop("edits", None)
+        if op.get("op") == "replace" and "content" not in op and edits is not None:
+            surface_id = op.get("surface_id")
+            if not isinstance(surface_id, str) or (surface := parent.surface(surface_id)) is None:
+                raise ValueError("compact replace targets an unknown surface")
+            op["content"] = _apply_edits(surface.content, edits)
+        elif edits is not None:
+            raise ValueError("edits are only valid on content-less replace ops")
+        expanded.append(op)
+    return expanded
+
+
+def _apply_edits(content: str, value: object) -> str:
+    """Apply ordered exact edits, rejecting missing or ambiguous anchors."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("edits must be a non-empty array")
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("each edit must be an object")
+        old = item.get("old")
+        new = item.get("new")
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            raise ValueError("edits need non-empty old and string new values")
+        if content.count(old) != 1:
+            raise ValueError("edit old text must occur exactly once")
+        content = content.replace(old, new, 1)
+    return content
 
 
 def render_evidence(
