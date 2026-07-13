@@ -112,6 +112,20 @@ def test_to_backend_maps_config_fields() -> None:
     )
 
 
+def test_to_backend_resolves_model_chat_parameters() -> None:
+    """Waterfall backends inherit token-field compatibility from the WMH catalog."""
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="kimi-k2.6",
+        model="custom-kimi-deployment",
+        deployment="custom-kimi-deployment",
+    )
+
+    backend = to_backend(config)
+
+    assert backend.chat_max_tokens_field == "max_tokens"
+
+
 def test_to_backend_rejects_kinds_without_real_adapters() -> None:
     # openai_responses has no package equivalent (the package speaks chat-completions).
     with pytest.raises(ValueError, match="no llm-waterfall backend"):

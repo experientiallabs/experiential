@@ -89,7 +89,20 @@ class ProviderConfig(BaseModel):
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
     reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
+    # The serialized default stays stable for persisted configs. When callers do not explicitly
+    # set this field, built-in models resolve it from the canonical ProviderModel catalog.
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
+
+    def resolved_chat_max_tokens_field(self) -> ChatMaxTokensField:
+        """Return the output-token field accepted by this configured model."""
+        if "chat_max_tokens_field" in self.model_fields_set:
+            return self.chat_max_tokens_field
+
+        # Local import avoids a module cycle: the model catalog imports ProviderKind above.
+        from wmh.providers.models import resolve_provider_model
+
+        model = self.model_type or self.model
+        return resolve_provider_model(self.kind, model).chat_max_tokens_field
 
 
 @runtime_checkable

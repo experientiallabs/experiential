@@ -83,6 +83,7 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
         api_version=config.api_version,
         embed_model=config.embed_model,
         embed_dim=config.embed_dim,
+        chat_max_tokens_field=config.resolved_chat_max_tokens_field(),
     )
 
 
