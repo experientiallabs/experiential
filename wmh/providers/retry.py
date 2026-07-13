@@ -121,3 +121,19 @@ class RetryingToolCallingProvider(RetryingProvider):
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Retry one structured completion when capacity classification allows it."""
         return self._retry(lambda: self._tool_calling_provider.complete_chat(request))
+
+
+def wrap_provider_with_retries(
+    provider: Provider,
+    on_retry: RetryCallback | None = None,
+    *,
+    delays: tuple[float, ...] = _DELAYS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> RetryingProvider:
+    """Apply retries without changing the provider's runtime capabilities."""
+    wrapper = (
+        RetryingToolCallingProvider
+        if isinstance(provider, ToolCallingProvider)
+        else RetryingProvider
+    )
+    return wrapper(provider, on_retry=on_retry, delays=delays, sleep=sleep)

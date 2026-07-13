@@ -13,7 +13,11 @@ from wmh.providers.base import (
     ProviderKind,
     ToolCallingProvider,
 )
-from wmh.providers.retry import RetryingProvider, RetryingToolCallingProvider
+from wmh.providers.retry import (
+    RetryingProvider,
+    RetryingToolCallingProvider,
+    wrap_provider_with_retries,
+)
 
 
 class _Throttle(Exception):
@@ -129,3 +133,13 @@ def test_tool_calling_retry_preserves_structured_surface() -> None:
     assert provider.calls == 2
     assert events == [(1, 3, 1.0)]
     assert slept == [1.0]
+
+
+def test_retry_factory_preserves_only_the_underlying_provider_capabilities() -> None:
+    structured = wrap_provider_with_retries(FlakyToolCallingProvider(failures=0))
+    text_only = wrap_provider_with_retries(FlakyProvider(failures=0))
+
+    assert isinstance(structured, RetryingToolCallingProvider)
+    assert isinstance(structured, ToolCallingProvider)
+    assert type(text_only) is RetryingProvider
+    assert not isinstance(text_only, ToolCallingProvider)
