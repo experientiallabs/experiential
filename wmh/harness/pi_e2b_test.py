@@ -22,7 +22,6 @@ from collections.abc import Callable, Iterator
 from typing import cast
 
 import pytest
-from e2b.exceptions import TimeoutException
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
@@ -45,6 +44,13 @@ from wmh.harness.tools import SUBMIT, TOOL_REGISTRY, ToolSpec
 
 _Event = tuple[str | None, str | None, str | None]
 _PID = 4242
+
+
+class TimeoutException(Exception):
+    """SDK-shaped timeout exception without importing the optional E2B package."""
+
+
+TimeoutException.__module__ = "e2b.exceptions"
 
 
 def _line(frame: JsonObject) -> str:
@@ -93,6 +99,7 @@ class _FakeCommands:
         self.background_cmds: list[str] = []
         self.stdin: list[tuple[int, str]] = []
         self.fail_sends_from: int | None = None
+        self.send_error: Exception = TimeoutException("request timed out")
 
     def run(
         self,
@@ -112,7 +119,7 @@ class _FakeCommands:
     def send_stdin(self, pid: int, data: str) -> None:
         self.stdin.append((pid, data))
         if self.fail_sends_from is not None and len(self.stdin) >= self.fail_sends_from:
-            raise TimeoutException("request timed out")
+            raise self.send_error
 
 
 class _FakeFiles:
@@ -635,6 +642,34 @@ def test_run_retries_e2b_send_timeout_once_on_a_fresh_sandbox(
     assert result.answer == "recovered"
     assert len(made) == 2
     assert len(_of_kind(made[0], "llm_response")) == 1
+    assert made[0].kills == 1
+    pool.close()
+
+
+def test_run_retries_broken_pipe_once_on_a_fresh_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw socket-style send failure also retires the uncertain sandbox."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "done", "answer": "recovered"},
+    ]
+    factory, made = _factory_for([script, script])
+
+    def broken_first_factory() -> FakeSandbox:
+        fake = factory()
+        if len(made) == 1:
+            fake.commands.fail_sends_from = 2
+            fake.commands.send_error = BrokenPipeError("broken pipe")
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=broken_first_factory)
+    result = _runtime(pool=pool).run("t1", "do it", _RecordingEnv())
+
+    assert result.answer == "recovered"
+    assert len(made) == 2
     assert made[0].kills == 1
     pool.close()
 

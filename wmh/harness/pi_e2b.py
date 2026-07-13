@@ -433,7 +433,7 @@ class E2BPiRuntime:
 
 def _is_retryable_transport_error(exc: Exception) -> bool:
     """Whether an episode exception means its E2B transport is no longer trustworthy."""
-    if isinstance(exc, (RuntimeError, TimeoutError)):
+    if isinstance(exc, (RuntimeError, TimeoutError, OSError)):
         return True
     # Keep the E2B SDK optional at import time. Its TimeoutException is not a built-in
     # TimeoutError, but any instance means the sandbox/channel state is uncertain.
