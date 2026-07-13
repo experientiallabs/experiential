@@ -15,6 +15,7 @@ from llm_waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatRespon
 
 import wmh.cli.agent_session as mod
 from wmh.harness.live_session import SessionEvent
+from wmh.harness.workspace_patch import build_workspace_patch
 from wmh.platform.credentials import PlatformCredentials
 
 if TYPE_CHECKING:
@@ -427,8 +428,8 @@ def test_remote_agent_driver_syncs_final_e2b_workspace(
             self.acked: list[str] = []
             self.closed = False
 
-        def create_agent_workspace_session(
-            self, agent_id: str, workspace: bytes, *, instruction: str | None = None
+        def create_agent_session(
+            self, agent_id: str, *, workspace: bytes, instruction: str | None = None
         ) -> object:
             assert agent_id == "agent-1"
             assert workspace
@@ -472,4 +473,78 @@ def test_remote_agent_driver_syncs_final_e2b_workspace(
 
     assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "after"
     assert client.acked == ["session-1"]
+    assert client.closed
+
+
+def test_remote_agent_driver_applies_live_workspace_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace_patch event updates the local directory before session end."""
+    (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
+    initial = mod.snapshot_workspace(tmp_path)
+    final_buffer = io.BytesIO()
+    with tarfile.open(fileobj=final_buffer, mode="w:gz") as archive:
+        body = b"during"
+        info = tarfile.TarInfo("answer.txt")
+        info.size = len(body)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(body))
+    patch = build_workspace_patch(initial.archive, final_buffer.getvalue())
+    assert patch is not None
+
+    class _HostedClient:
+        def __init__(self) -> None:
+            self.patch_acks: list[int] = []
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "session-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            event = type(
+                "Event",
+                (),
+                {"kind": "workspace_patch", "payload": {"revision": 1}},
+            )()
+            return type("Page", (), {"events": [event], "last_seq": 1, "status": "ended"})()
+
+        def download_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: int
+        ) -> bytes:
+            assert revision == 1
+            return patch
+
+        def acknowledge_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: int
+        ) -> None:
+            self.patch_acks.append(revision)
+
+        def get_agent_session(self, *_args: object) -> object:
+            return type("Session", (), {"status": "ended", "error": None})()
+
+        def download_agent_workspace(self, *_args: object) -> bytes:
+            return final_buffer.getvalue()
+
+        def acknowledge_agent_workspace(self, *_args: object) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _NoReader:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    client = _HostedClient()
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
+
+    mod.RemoteAgentDriver(
+        cast("mod.PlatformClient", client), "agent-1", "Agent", tmp_path, None
+    ).run()
+
+    assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "during"
+    assert client.patch_acks == [1]
     assert client.closed

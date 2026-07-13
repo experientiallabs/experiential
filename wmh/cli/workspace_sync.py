@@ -15,6 +15,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from wmh.harness.workspace_patch import PatchFileState, parse_workspace_patch
+
 MAX_WORKSPACE_ARCHIVE_BYTES = 50 * 1024 * 1024
 MAX_WORKSPACE_UNPACKED_BYTES = 512 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 100_000
@@ -103,7 +105,13 @@ def snapshot_workspace(root: Path) -> WorkspaceSnapshot:
     return WorkspaceSnapshot(archive=content, files=files)
 
 
-def sync_workspace(root: Path, initial: WorkspaceSnapshot, final_archive: bytes) -> SyncResult:
+def sync_workspace(
+    root: Path,
+    initial: WorkspaceSnapshot,
+    final_archive: bytes,
+    *,
+    protected_paths: frozenset[str] = frozenset(),
+) -> SyncResult:
     """Apply remote changes unless the same path changed locally since upload."""
     resolved = root.resolve()
     if len(final_archive) > MAX_WORKSPACE_ARCHIVE_BYTES:
@@ -123,7 +131,11 @@ def sync_workspace(root: Path, initial: WorkspaceSnapshot, final_archive: bytes)
                 continue
             target = resolved / relative
             now = current.get(relative)
-            if _has_non_file_collision(target, now) or (now != before and now != after):
+            if (
+                relative in protected_paths
+                or _has_non_file_collision(target, now)
+                or (now != before and now != after)
+            ):
                 conflicts.append(relative)
                 continue
             if now == after:
@@ -138,6 +150,36 @@ def sync_workspace(root: Path, initial: WorkspaceSnapshot, final_archive: bytes)
                 conflicts.append(relative)
                 continue
             applied.append(relative)
+    return SyncResult(applied=tuple(applied), conflicts=tuple(conflicts))
+
+
+def apply_workspace_patch(root: Path, content: bytes) -> SyncResult:
+    """Apply an incremental remote patch when each local path still matches its base."""
+    resolved = root.resolve()
+    patch = parse_workspace_patch(content)
+    current = _manifest(resolved)
+    applied: list[str] = []
+    conflicts: list[str] = []
+    for operation in patch.operations:
+        target = resolved / operation.path
+        now = current.get(operation.path)
+        before = _file_state(operation.before)
+        after = _file_state(operation.after)
+        if _has_non_file_collision(target, now) or (now != before and now != after):
+            conflicts.append(operation.path)
+            continue
+        if now == after:
+            continue
+        try:
+            if after is None:
+                target.unlink(missing_ok=True)
+                _remove_empty_parents(target.parent, resolved)
+            else:
+                _atomic_write(patch.files[operation.path], target, root=resolved, mode=after.mode)
+        except OSError:
+            conflicts.append(operation.path)
+            continue
+        applied.append(operation.path)
     return SyncResult(applied=tuple(applied), conflicts=tuple(conflicts))
 
 
@@ -272,6 +314,21 @@ def _atomic_copy(source: Path, target: Path, *, root: Path, mode: int) -> None:
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _atomic_write(content: bytes, target: Path, *, root: Path, mode: int) -> None:
+    """Write patch bytes through the same collision-safe sibling replacement path."""
+    with tempfile.TemporaryDirectory(prefix="wmh-patch-") as staging_name:
+        source = Path(staging_name) / "content"
+        source.write_bytes(content)
+        _atomic_copy(source, target, root=root, mode=mode)
+
+
+def _file_state(state: PatchFileState | None) -> FileState | None:
+    """Translate the shared transport state into the CLI merge state."""
+    if state is None:
+        return None
+    return FileState(sha256=state.sha256, mode=state.mode)
 
 
 def _remove_empty_parents(directory: Path, root: Path) -> None:

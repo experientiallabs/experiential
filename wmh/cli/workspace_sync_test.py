@@ -12,10 +12,12 @@ import pytest
 
 from wmh.cli.workspace_sync import (
     WorkspaceSyncError,
+    apply_workspace_patch,
     snapshot_workspace,
     sync_workspace,
     write_conflict_archive,
 )
+from wmh.harness.workspace_patch import build_workspace_patch
 
 
 def _archive(files: dict[str, tuple[bytes, int]]) -> bytes:
@@ -90,6 +92,54 @@ def test_sync_preserves_concurrent_local_edit_and_applies_other_paths(tmp_path: 
     assert (tmp_path / "other.txt").read_text(encoding="utf-8") == "remote"
     recovery = write_conflict_archive(tmp_path, "session-1", final)
     assert recovery.read_bytes() == final
+
+
+def test_incremental_patch_applies_uncontested_changes(tmp_path: Path) -> None:
+    """A live remote patch lands before the hosted session finishes."""
+    (tmp_path / "changed.txt").write_text("before", encoding="utf-8")
+    (tmp_path / "deleted.txt").write_text("remove", encoding="utf-8")
+    before = snapshot_workspace(tmp_path)
+    after = _archive(
+        {
+            "changed.txt": (b"after", 0o755),
+            "added.txt": (b"new", 0o644),
+        }
+    )
+    patch = build_workspace_patch(before.archive, after)
+    assert patch is not None
+
+    result = apply_workspace_patch(tmp_path, patch)
+
+    assert result.conflicts == ()
+    assert set(result.applied) == {"added.txt", "changed.txt", "deleted.txt"}
+    assert (tmp_path / "changed.txt").read_text(encoding="utf-8") == "after"
+    assert (tmp_path / "changed.txt").stat().st_mode & 0o777 == 0o755
+    assert not (tmp_path / "deleted.txt").exists()
+
+
+def test_incremental_patch_preserves_local_conflict_and_applies_other_path(
+    tmp_path: Path,
+) -> None:
+    """Live sync isolates a same-path conflict instead of stopping the stream."""
+    (tmp_path / "same.txt").write_text("base", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("base", encoding="utf-8")
+    before = snapshot_workspace(tmp_path)
+    after = _archive(
+        {
+            "same.txt": (b"remote", 0o644),
+            "other.txt": (b"remote", 0o644),
+        }
+    )
+    patch = build_workspace_patch(before.archive, after)
+    assert patch is not None
+    (tmp_path / "same.txt").write_text("local", encoding="utf-8")
+
+    result = apply_workspace_patch(tmp_path, patch)
+
+    assert result.conflicts == ("same.txt",)
+    assert result.applied == ("other.txt",)
+    assert (tmp_path / "same.txt").read_text(encoding="utf-8") == "local"
+    assert (tmp_path / "other.txt").read_text(encoding="utf-8") == "remote"
 
 
 def test_sync_rejects_traversal_and_links(tmp_path: Path) -> None:

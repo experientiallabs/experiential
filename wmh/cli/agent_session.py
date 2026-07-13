@@ -35,7 +35,9 @@ from rich.console import Console
 from rich.panel import Panel
 
 from wmh.cli.workspace_sync import (
+    WorkspaceSnapshot,
     WorkspaceSyncError,
+    apply_workspace_patch,
     snapshot_workspace,
     sync_workspace,
     write_conflict_archive,
@@ -47,6 +49,7 @@ from wmh.harness.pi_local import LocalStdioChannel, start_local_live_runner
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import render_tools, resolve_tools
+from wmh.harness.workspace_patch import WorkspacePatchError, build_workspace_patch
 from wmh.platform.client import PlatformClient, PlatformError, RemoteAgentSession
 from wmh.platform.credentials import load_credentials
 from wmh.providers.base import ProviderConfig, ProviderKind, ToolCallingProvider
@@ -67,6 +70,7 @@ _TOOL_OUTPUT_CAP = 16_000
 _BASH_TIMEOUT_S = 300.0
 # Driver housekeeping cadence (event flush).
 _TICK_S = 5.0
+_WORKSPACE_SYNC_TICK_S = 1.0
 # Default local worker when the user pins none.
 _DEFAULT_PROVIDER = "bedrock"
 _DEFAULT_MODEL = "claude-opus-4-8"
@@ -471,9 +475,7 @@ class RemoteAgentCommandReader(threading.Thread):
 
     def _post(self, kind: str, *, text: str | None = None) -> None:
         """Post one command through the authenticated platform client."""
-        self._client.post_agent_session_command(
-            self._agent_id, self._session_id, kind, text=text
-        )
+        self._client.post_agent_session_command(self._agent_id, self._session_id, kind, text=text)
 
 
 class RemoteAgentDriver:
@@ -494,6 +496,7 @@ class RemoteAgentDriver:
         self._jail = jail_root
         self._task = task
         self._interrupts = 0
+        self._live_conflicts: set[str] = set()
 
     def run(self) -> None:
         """Upload, run, stream, download, and conflict-safely sync one E2B session."""
@@ -503,8 +506,8 @@ class RemoteAgentDriver:
             _console.print(
                 f"[dim]uploading {len(initial.files)} files to the platform E2B workspace...[/dim]"
             )
-            session = self._client.create_agent_workspace_session(
-                self._target_id, initial.archive, instruction=self._task
+            session = self._client.create_agent_session(
+                self._target_id, workspace=initial.archive, instruction=self._task
             )
             _console.print(
                 f"[green]E2B session started[/green] for [bold]{self._name}[/bold]. "
@@ -512,12 +515,15 @@ class RemoteAgentDriver:
                 "[bold]:quit[/bold] to end and sync back."
             )
             RemoteAgentCommandReader(self._client, self._target_id, session.id).start()
-            terminal = self._poll(session.id)
+            terminal, synchronized = self._poll(session.id, initial)
             with _console.status("[dim]syncing E2B workspace back...[/dim]", spinner="dots"):
-                final_archive = self._client.download_agent_workspace(
-                    self._target_id, session.id
+                final_archive = self._client.download_agent_workspace(self._target_id, session.id)
+                result = sync_workspace(
+                    self._jail,
+                    synchronized,
+                    final_archive,
+                    protected_paths=frozenset(self._live_conflicts),
                 )
-                result = sync_workspace(self._jail, initial, final_archive)
             if result.conflicts:
                 recovery = write_conflict_archive(self._jail, session.id, final_archive)
                 self._client.acknowledge_agent_workspace(self._target_id, session.id)
@@ -528,22 +534,23 @@ class RemoteAgentDriver:
                 )
                 raise typer.Exit(code=2)
             self._client.acknowledge_agent_workspace(self._target_id, session.id)
-            _console.print(
-                f"[green]workspace synced[/green] ({len(result.applied)} changed paths)"
-            )
+            _console.print(f"[green]workspace synced[/green] ({len(result.applied)} changed paths)")
             if terminal.status == "failed":
                 _console.print(f"[red]session failed: {terminal.error or 'unknown error'}[/red]")
                 raise typer.Exit(code=1)
-        except WorkspaceSyncError as error:
+        except (WorkspacePatchError, WorkspaceSyncError) as error:
             raise typer.BadParameter(str(error)) from error
         except PlatformError as error:
             raise typer.BadParameter(str(error)) from error
         finally:
             self._client.close()
 
-    def _poll(self, session_id: str) -> RemoteAgentSession:
+    def _poll(
+        self, session_id: str, synchronized: WorkspaceSnapshot
+    ) -> tuple[RemoteAgentSession, WorkspaceSnapshot]:
         """Render new transcript events until output export makes the row terminal."""
         cursor = 0
+        last_workspace_push = time.monotonic()
         sink = TerminalEventSink(recorder=None, on_running=lambda _running: None)
         while True:
             try:
@@ -551,7 +558,9 @@ class RemoteAgentDriver:
                     self._target_id, session_id, after=cursor
                 )
                 for event in page.events:
-                    if event.kind == "status":
+                    if event.kind == "workspace_patch":
+                        synchronized = self._apply_remote_patch(session_id, event, synchronized)
+                    elif event.kind == "status":
                         detail = event.payload.get("message") or event.payload.get("status")
                         if detail:
                             _console.print(f"[dim]({detail})[/dim]")
@@ -559,7 +568,14 @@ class RemoteAgentDriver:
                         sink(SessionEvent(kind=event.kind, payload=event.payload))
                 cursor = page.last_seq
                 if page.status in {"ended", "failed"}:
-                    return self._client.get_agent_session(self._target_id, session_id)
+                    return (
+                        self._client.get_agent_session(self._target_id, session_id),
+                        synchronized,
+                    )
+                now = time.monotonic()
+                if now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S:
+                    synchronized = self._push_local_patch(session_id, synchronized)
+                    last_workspace_push = now
                 time.sleep(0.5)
             except KeyboardInterrupt:
                 self._interrupts += 1
@@ -571,6 +587,48 @@ class RemoteAgentDriver:
                 )
                 self._client.post_agent_session_command(self._target_id, session_id, kind)
                 continue
+
+    def _apply_remote_patch(
+        self,
+        session_id: str,
+        event: object,
+        synchronized: WorkspaceSnapshot,
+    ) -> WorkspaceSnapshot:
+        """Download and apply one announced E2B patch, then advance the local base."""
+        payload = getattr(event, "payload", {})
+        revision_value = payload.get("revision") if isinstance(payload, dict) else None
+        if not isinstance(revision_value, int):
+            raise WorkspaceSyncError("workspace patch event has no integer revision")
+        content = self._client.download_agent_workspace_patch(
+            self._target_id, session_id, revision_value
+        )
+        result = apply_workspace_patch(self._jail, content)
+        self._live_conflicts.update(result.conflicts)
+        self._client.acknowledge_agent_workspace_patch(self._target_id, session_id, revision_value)
+        if result.applied:
+            _console.print(f"[dim]workspace updated ({len(result.applied)} changed paths)[/dim]")
+        if result.conflicts:
+            paths = ", ".join(result.conflicts)
+            _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
+        return snapshot_workspace(self._jail)
+
+    def _push_local_patch(
+        self, session_id: str, synchronized: WorkspaceSnapshot
+    ) -> WorkspaceSnapshot:
+        """Send local edits made since the last synchronized snapshot."""
+        try:
+            current = snapshot_workspace(self._jail)
+        except WorkspaceSyncError:
+            return synchronized
+        content = build_workspace_patch(synchronized.archive, current.archive)
+        if content is None:
+            return synchronized
+        result = self._client.upload_agent_workspace_patch(self._target_id, session_id, content)
+        self._live_conflicts.update(result.conflicts)
+        if result.conflicts:
+            paths = ", ".join(result.conflicts)
+            _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
+        return current
 
 
 class RemoteWorldModelDriver:

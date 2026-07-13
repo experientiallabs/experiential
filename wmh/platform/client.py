@@ -137,6 +137,7 @@ class RemoteAgentSession(BaseModel):
     status: str
     source: str
     workspace_sync: bool
+    launched_from: Literal["web", "cli"]
     starting_detail: str | None = None
     error: str | None = None
 
@@ -155,6 +156,7 @@ class RemoteAgentSessionEvent(BaseModel):
         "state",
         "status",
         "error",
+        "workspace_patch",
     ]
     payload: dict[str, JsonValue]
 
@@ -165,6 +167,13 @@ class RemoteAgentEventPage(BaseModel):
     events: list[RemoteAgentSessionEvent]
     last_seq: int
     status: str
+
+
+class WorkspacePatchResult(BaseModel):
+    """Paths accepted or rejected while applying a live workspace patch."""
+
+    applied: list[str]
+    conflicts: list[str]
 
 
 class LocalPiRunInfo(BaseModel):
@@ -268,15 +277,24 @@ class PlatformClient:
         self._raise_for_error(response)
         return Observation.model_validate(response.json()["observation"])
 
-    def create_agent_workspace_session(
-        self, agent_id: str, workspace: bytes, *, instruction: str | None = None
+    def create_agent_session(
+        self,
+        agent_id: str,
+        *,
+        workspace: bytes,
+        instruction: str | None = None,
     ) -> RemoteAgentSession:
-        """Upload a local snapshot and dispatch the agent in platform-owned E2B."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/workspace-sessions",
-            data={"instruction": instruction or ""},
+        """Stage a local snapshot, then create an ordinary hosted agent session."""
+        upload = self._client.post(
+            f"/api/agents/{agent_id}/workspace-uploads",
             files={"workspace": ("workspace.tar.gz", workspace, "application/gzip")},
             timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(upload)
+        upload_id = str(upload.json()["id"])
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions",
+            json={"instruction": instruction, "workspace_upload_id": upload_id},
         )
         self._raise_for_error(response)
         return RemoteAgentSession.model_validate(response.json())
@@ -308,6 +326,38 @@ class PlatformClient:
         )
         self._raise_for_error(response)
 
+    def upload_agent_workspace_patch(
+        self, agent_id: str, session_id: str, content: bytes
+    ) -> WorkspacePatchResult:
+        """Apply local changes conditionally to a running hosted workspace."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches",
+            files={"patch": ("workspace-patch.tar.gz", content, "application/gzip")},
+            timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(response)
+        return WorkspacePatchResult.model_validate(response.json())
+
+    def download_agent_workspace_patch(
+        self, agent_id: str, session_id: str, revision: int
+    ) -> bytes:
+        """Download one remote-to-local live workspace patch."""
+        response = self._client.get(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches/{revision}",
+            timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(response)
+        return response.content
+
+    def acknowledge_agent_workspace_patch(
+        self, agent_id: str, session_id: str, revision: int
+    ) -> None:
+        """Remove a remote patch after it is safely reflected or reported locally."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches/{revision}/ack"
+        )
+        self._raise_for_error(response)
+
     def download_agent_workspace(self, agent_id: str, session_id: str) -> bytes:
         """Download a terminal hosted session's final E2B workspace snapshot."""
         response = self._client.get(
@@ -319,9 +369,7 @@ class PlatformClient:
 
     def acknowledge_agent_workspace(self, agent_id: str, session_id: str) -> None:
         """Confirm the final archive is safe locally so platform objects can be removed."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/ack"
-        )
+        response = self._client.post(f"/api/agents/{agent_id}/sessions/{session_id}/workspace/ack")
         self._raise_for_error(response)
 
     # -- world models --------------------------------------------------------------------------

@@ -109,8 +109,8 @@ def test_unified_run_target_and_world_model_session_payloads() -> None:
     ]
 
 
-def test_hosted_agent_workspace_session_transport() -> None:
-    """Agent runs upload a snapshot, poll/steer hosted E2B, then download and ack it."""
+def test_hosted_agent_session_uses_regular_create_and_workspace_patch_routes() -> None:
+    """Agent runs use regular sessions plus the live workspace patch protocol."""
     seen: list[str] = []
     session = {
         "id": "sess-1",
@@ -118,15 +118,21 @@ def test_hosted_agent_workspace_session_transport() -> None:
         "status": "starting",
         "source": "hosted",
         "workspace_sync": True,
+        "launched_from": "cli",
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(f"{request.method} {request.url.path}")
         path = request.url.path
-        if path.endswith("/workspace-sessions"):
+        if path.endswith("/workspace-uploads"):
             body = request.read()
             assert b"archive-bytes" in body
-            assert b"fix the tests" in body
+            return httpx.Response(201, json={"id": "upload-1"})
+        if path.endswith("/sessions") and request.method == "POST":
+            assert json.loads(request.read()) == {
+                "instruction": "fix the tests",
+                "workspace_upload_id": "upload-1",
+            }
             return httpx.Response(202, json=session)
         if path.endswith("/events"):
             assert request.url.params["after"] == "0"
@@ -143,6 +149,14 @@ def test_hosted_agent_workspace_session_transport() -> None:
         if path.endswith("/commands"):
             assert json.loads(request.read()) == {"kind": "user_message", "text": "continue"}
             return httpx.Response(202, json={"command_id": 1})
+        if path.endswith("/workspace/patches/7/ack"):
+            return httpx.Response(204)
+        if path.endswith("/workspace/patches/7"):
+            return httpx.Response(200, content=b"remote-patch")
+        if path.endswith("/workspace/patches"):
+            body = request.read()
+            assert b"local-patch" in body
+            return httpx.Response(200, json={"applied": ["local.txt"], "conflicts": []})
         if path.endswith("/workspace/ack"):
             return httpx.Response(204)
         if path.endswith("/workspace"):
@@ -150,26 +164,33 @@ def test_hosted_agent_workspace_session_transport() -> None:
         return httpx.Response(200, json={**session, "status": "ended"})
 
     with _client(handler) as client:
-        created = client.create_agent_workspace_session(
-            "agent-1", b"archive-bytes", instruction="fix the tests"
+        created = client.create_agent_session(
+            "agent-1", workspace=b"archive-bytes", instruction="fix the tests"
         )
         page = client.list_agent_session_events("agent-1", created.id, after=0)
-        client.post_agent_session_command(
-            "agent-1", created.id, "user_message", text="continue"
-        )
+        client.post_agent_session_command("agent-1", created.id, "user_message", text="continue")
         current = client.get_agent_session("agent-1", created.id)
+        patch_result = client.upload_agent_workspace_patch("agent-1", created.id, b"local-patch")
+        patch = client.download_agent_workspace_patch("agent-1", created.id, 7)
+        client.acknowledge_agent_workspace_patch("agent-1", created.id, 7)
         final = client.download_agent_workspace("agent-1", created.id)
         client.acknowledge_agent_workspace("agent-1", created.id)
 
     assert created.workspace_sync
     assert page.events[0].payload["text"] == "done"
     assert current.status == "ended"
+    assert patch_result.applied == ["local.txt"]
+    assert patch == b"remote-patch"
     assert final == b"final-archive"
     assert seen == [
-        "POST /api/agents/agent-1/workspace-sessions",
+        "POST /api/agents/agent-1/workspace-uploads",
+        "POST /api/agents/agent-1/sessions",
         "GET /api/agents/agent-1/sessions/sess-1/events",
         "POST /api/agents/agent-1/sessions/sess-1/commands",
         "GET /api/agents/agent-1/sessions/sess-1",
+        "POST /api/agents/agent-1/sessions/sess-1/workspace/patches",
+        "GET /api/agents/agent-1/sessions/sess-1/workspace/patches/7",
+        "POST /api/agents/agent-1/sessions/sess-1/workspace/patches/7/ack",
         "GET /api/agents/agent-1/sessions/sess-1/workspace",
         "POST /api/agents/agent-1/sessions/sess-1/workspace/ack",
     ]
