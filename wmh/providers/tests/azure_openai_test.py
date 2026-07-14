@@ -98,6 +98,26 @@ def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> 
     assert chat.last_kwargs["max_completion_tokens"] == 16
 
 
+def test_complete_uses_model_token_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The text-completion path uses the same canonical contract as structured chat."""
+    chat = _FakeChatCompletions(_FakeChatResponse("yo", _FakeUsage(3, 2)))
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="deepseek-v4-pro",
+        model="customer-deepseek-deployment",
+        endpoint="https://example.openai.azure.com",
+        deployment="customer-deepseek-deployment",
+        api_version="2024-10-21",
+    )
+    provider = AzureOpenAIProvider(config)
+    monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
+
+    provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
+
+    assert chat.last_kwargs["max_tokens"] == 16
+    assert "max_completion_tokens" not in chat.last_kwargs
+
+
 def test_missing_deployment_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = AzureOpenAIProvider(
         ProviderConfig(kind=ProviderKind.AZURE_OPENAI, model="gpt-5.5", api_version="2024-10-21")

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import httpx
 import pytest
 from openai import BadRequestError
@@ -41,7 +39,7 @@ def test_complete_handles_missing_usage() -> None:
         def create(self, **kwargs: object) -> _Resp:
             return _Resp()
 
-    chat = cast("_openai_common._ChatCompletions", _Chat())
+    chat = _Chat()
     completion = _openai_common.complete(chat, "m", "", [Message(role="user", content="x")], 8)
     assert completion.text == "hi"
     assert completion.usage.input_tokens == 0
@@ -57,7 +55,7 @@ def test_complete_raises_clearly_on_empty_choices() -> None:
         def create(self, **kwargs: object) -> _Resp:
             return _Resp()
 
-    chat = cast("_openai_common._ChatCompletions", _Chat())
+    chat = _Chat()
     # Content filtering can return zero choices; we want a clear ValueError, not IndexError.
     with pytest.raises(ValueError, match="no choices"):
         _openai_common.complete(chat, "m", "", [Message(role="user", content="x")], 8)
@@ -91,7 +89,7 @@ def test_complete_retries_without_temperature_when_model_rejects_it() -> None:
             return _Resp()
 
     fake = _Chat()
-    chat = cast("_openai_common._ChatCompletions", fake)
+    chat = fake
     completion = _openai_common.complete(
         chat, "m", "", [Message(role="user", content="x")], 8, temperature=0.0
     )
@@ -105,7 +103,7 @@ def test_complete_reraises_unrelated_bad_requests() -> None:
         def create(self, **kwargs: object) -> object:
             raise _bad_request("context length exceeded")
 
-    chat = cast("_openai_common._ChatCompletions", _Chat())
+    chat = _Chat()
     with pytest.raises(BadRequestError, match="context length"):
         _openai_common.complete(
             chat, "m", "", [Message(role="user", content="x")], 8, temperature=0.7

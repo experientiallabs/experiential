@@ -22,6 +22,7 @@ from wmh.providers.base import (
     VerifyResult,
     verify_via_ping,
 )
+from wmh.providers.models import resolve_chat_max_tokens_field
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -65,6 +66,7 @@ class OpenAIProvider:
             system,
             messages,
             max_tokens,
+            max_tokens_field=resolve_chat_max_tokens_field(self.config),
             # Self-hosted OpenAI-compatible servers honor sampling params (a policy being
             # trained NEEDS temperature diversity); real OpenAI GPT-5.5 rejects them.
             temperature=temperature if self.config.endpoint else None,
@@ -76,7 +78,7 @@ class OpenAIProvider:
             self._get_client().chat.completions,
             self.config.model,
             request,
-            max_tokens_field=self.config.resolved_chat_max_tokens_field(),
+            max_tokens_field=resolve_chat_max_tokens_field(self.config),
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:

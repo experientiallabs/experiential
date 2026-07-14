@@ -1,7 +1,11 @@
 """Tests for canonical model types and provider runtime ids."""
 
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.providers.models import model_types_for_provider, resolve_provider_model
+from wmh.providers.models import (
+    model_types_for_provider,
+    resolve_chat_max_tokens_field,
+    resolve_provider_model,
+)
 
 
 def test_same_model_type_resolves_to_provider_specific_ids() -> None:
@@ -60,7 +64,7 @@ def test_unknown_custom_model_round_trips() -> None:
     assert resolved.chat_max_tokens_field == "max_completion_tokens"
 
 
-def test_provider_config_resolves_model_contract_before_custom_deployment() -> None:
+def test_model_contract_resolves_before_custom_deployment() -> None:
     """Canonical model type, not an opaque Azure deployment name, selects parameters."""
     config = ProviderConfig(
         kind=ProviderKind.AZURE_OPENAI,
@@ -69,18 +73,29 @@ def test_provider_config_resolves_model_contract_before_custom_deployment() -> N
         deployment="customer-gpt-deployment",
     )
 
-    assert config.chat_max_tokens_field == "max_completion_tokens"
-    assert "chat_max_tokens_field" not in config.model_fields_set
-    assert config.resolved_chat_max_tokens_field() == "max_completion_tokens"
+    assert resolve_chat_max_tokens_field(config) == "max_completion_tokens"
 
 
-def test_provider_config_allows_an_explicit_custom_endpoint_override() -> None:
-    """Unknown OpenAI-compatible servers can override the catalog default."""
+def test_known_model_contract_wins_after_config_round_trip() -> None:
+    """Serialized config defaults cannot override canonical model behavior."""
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="kimi-k2.6",
+        model="customer-kimi-deployment",
+        deployment="customer-kimi-deployment",
+    )
+    loaded = ProviderConfig.model_validate(config.model_dump(mode="json"))
+
+    assert loaded.chat_max_tokens_field == "max_completion_tokens"
+    assert resolve_chat_max_tokens_field(loaded) == "max_tokens"
+
+
+def test_unknown_model_uses_configured_custom_endpoint_fallback() -> None:
+    """Unknown OpenAI-compatible servers can select their output-token field."""
     config = ProviderConfig(
         kind=ProviderKind.OPENAI,
         model="legacy-compatible-model",
         chat_max_tokens_field="max_tokens",
     )
 
-    assert "chat_max_tokens_field" in config.model_fields_set
-    assert config.resolved_chat_max_tokens_field() == "max_tokens"
+    assert resolve_chat_max_tokens_field(config) == "max_tokens"
