@@ -11,6 +11,7 @@ fails a run based on the submitted answer, so seed and child scores can genuinel
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from typing import ClassVar
 
@@ -679,6 +680,52 @@ class _FakePool:
         self.closes += 1
 
 
+class _UniqueAddProvider(RoleProvider):
+    """Emit one distinct additive delta per proposer call for generation tests."""
+
+    def __init__(self, proposal_barrier: threading.Barrier | None = None) -> None:
+        super().__init__()
+        self._proposal = 0
+        self._proposal_lock = threading.Lock()
+        self._proposal_barrier = proposal_barrier
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Completion:
+        if "meta-agent improving an agent harness" not in system:
+            return super().complete(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+        with self._proposal_lock:
+            self._proposal += 1
+            suffix = str(self._proposal)
+            self.meta_users.append(messages[-1].content)
+        if self._proposal_barrier is not None:
+            self._proposal_barrier.wait(timeout=2)
+        return Completion(
+            text=json.dumps(
+                {
+                    "expected_effect": f"distinct breadth proposal {suffix}",
+                    "preconditions": {},
+                    "ops": [
+                        {
+                            "op": "add",
+                            "surface_id": f"prompt:breadth-{suffix}",
+                            "kind": "prompt",
+                            "content": f"breadth candidate {suffix}",
+                            "rationale": "exercise a distinct real screen",
+                        }
+                    ],
+                }
+            )
+        )
+
+
 @pytest.fixture
 def fake_pool_cls(monkeypatch: pytest.MonkeyPatch) -> type[_FakePool]:
     """Patch the pool at its source module (create_harness imports it lazily from there)."""
@@ -741,6 +788,78 @@ def test_local_backend_rejects_parallel_pi_node_scoring() -> None:
             GoldJudge(provider),
             eval_concurrency=2,
         )
+
+
+def test_iteration_concurrency_requires_e2b() -> None:
+    provider = RoleProvider()
+    with pytest.raises(ValueError, match="requires harness_backend='e2b'"):
+        create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            iteration_concurrency=2,
+        )
+
+
+def test_e2b_breadth_generation_overlaps_all_real_screens(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """A bounded generation overlaps every full-budget proposal and every real k-pass screen."""
+    proposal_barrier = threading.Barrier(3)
+    provider = _UniqueAddProvider(proposal_barrier)
+    barrier = threading.Barrier(3)
+    screened_labels: list[str] = []
+    labels_lock = threading.Lock()
+
+    def fake_evaluate(
+        tasks: list[TaskSpec],
+        world_model: WorldModel,
+        agent_provider: Provider,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+        runtime: Runtime | None = None,
+    ) -> ClosedLoopReport:
+        del tasks, world_model, agent_provider, judge, concurrency, runtime
+        if label == "seed":
+            return _canned_report(0.0, k=k)
+        with labels_lock:
+            screened_labels.append(label)
+        barrier.wait(timeout=2)
+        return _canned_report(0.0, k=k)
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", fake_evaluate)
+    result = create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=3,
+        k=3,
+        harness_backend="e2b",
+        iteration_concurrency=3,
+    )
+
+    assert sorted(screened_labels) == ["winner-g1", "winner-g2", "winner-g3"]
+    assert result.screened == 3 and result.skipped == 0
+    assert [record.iteration for record in result.iteration_records] == [1, 2, 3]
+    assert all(record.outcome == "screened" for record in result.iteration_records)
+    assert len(result.archive.deltas) == 3
+    assert all(delta.verdict is not None for delta in result.archive.deltas)
+    assert len(provider.meta_users) == 3
+    assert all("Previous attempts" not in user for user in provider.meta_users)
+    assert {user.count("Breadth candidate") for user in provider.meta_users} == {1}
+    [pool] = fake_pool_cls.instances
+    assert pool.closes >= 1
 
 
 def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
