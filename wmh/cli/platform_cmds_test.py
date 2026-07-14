@@ -200,4 +200,4 @@ def test_bare_login_targets_the_hosted_platform(monkeypatch: pytest.MonkeyPatch)
     result = runner.invoke(app, ["login", "--token", "xpl_new"])
 
     assert result.exit_code == 0, result.output
-    assert seen["web_url"] == "https://experiential-platform-web.vercel.app"
+    assert seen["web_url"] == "https://platform.experientiallabs.ai"

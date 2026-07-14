@@ -25,7 +25,7 @@ CREDENTIALS_FILENAME = "credentials.toml"
 
 # The hosted platform a bare `wmh login` connects to; `--url` (previews,
 # self-hosted, the local stack) and saved credentials both take precedence.
-DEFAULT_WEB_URL = "https://experiential-platform-web.vercel.app"
+DEFAULT_WEB_URL = "https://platform.experientiallabs.ai"
 
 
 class PlatformCredentials(BaseModel):
