@@ -24,7 +24,6 @@ from wmh.providers.base import (
     VerifyResult,
     verify_via_ping,
 )
-from wmh.providers.models import resolve_chat_max_tokens_field
 
 if TYPE_CHECKING:
     from openai import AzureOpenAI
@@ -96,12 +95,7 @@ class AzureOpenAIProvider:
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
         return _openai_common.complete(
-            self._get_client().chat.completions,
-            self._deployment(),
-            system,
-            messages,
-            max_tokens,
-            max_tokens_field=resolve_chat_max_tokens_field(self.config),
+            self._get_client().chat.completions, self._deployment(), system, messages, max_tokens
         )
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
@@ -110,7 +104,7 @@ class AzureOpenAIProvider:
             self._get_client().chat.completions,
             self._deployment(),
             request,
-            max_tokens_field=resolve_chat_max_tokens_field(self.config),
+            max_tokens_field=self.config.resolved_chat_max_tokens_field(),
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:

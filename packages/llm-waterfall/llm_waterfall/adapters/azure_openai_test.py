@@ -82,25 +82,6 @@ def test_client_config_and_deployment_as_model(fake_azure: list[_FakeAzureOpenAI
     assert usage.input_tokens == 9 and usage.output_tokens == 4
 
 
-def test_complete_uses_backend_token_parameter(fake_azure: list[_FakeAzureOpenAI]) -> None:
-    """Waterfall text completions honor the model contract passed by WMH."""
-    backend = Backend(
-        "azure_openai",
-        "deepseek-v4-pro",
-        endpoint="https://x.openai.azure.com",
-        deployment="deepseek-deploy",
-        api_version="2024-12-01-preview",
-        chat_max_tokens_field="max_tokens",
-    )
-    adapter = AzureOpenAIAdapter(backend)
-
-    adapter.complete("", [Message(role="user", content="hi")], temperature=None, max_tokens=64)
-
-    call = fake_azure[0].chat_calls[0]
-    assert call["max_tokens"] == 64
-    assert "max_completion_tokens" not in call
-
-
 def test_deployment_defaults_to_model(fake_azure: list[_FakeAzureOpenAI]) -> None:
     backend = Backend(
         "azure_openai", "gpt-5.4", endpoint="https://x.openai.azure.com", api_version="v"

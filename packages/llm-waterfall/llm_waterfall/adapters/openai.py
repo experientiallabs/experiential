@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, cast
 from llm_waterfall.adapters.base import missing_sdk_error
 from llm_waterfall.types import (
     Backend,
-    ChatMessage,
     ChatRequest,
     ChatResponse,
     EmbeddingsUnsupported,
@@ -18,6 +17,7 @@ from llm_waterfall.types import (
 
 if TYPE_CHECKING:
     from openai import OpenAI
+    from openai.types.chat import ChatCompletionMessageParam
 
 _DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 
@@ -63,28 +63,30 @@ class OpenAIAdapter:
     ) -> tuple[str, TokenUsage]:
         """One chat completion.
 
-        The backend's model contract selects the output-token field. No default temperature keeps
-        this compatible with GPT-5.x reasoning models, which reject non-default sampling params.
+        `max_completion_tokens` (not the deprecated `max_tokens`) and no default temperature
+        keeps this compatible with GPT-5.x reasoning models, which reject the legacy field and
+        non-default sampling params.
         """
-        wire: list[ChatMessage] = []
+        wire: list[dict[str, str]] = []
         if system:
-            wire.append(ChatMessage(role="system", content=system))
-        wire.extend(ChatMessage(role=m.role, content=m.content) for m in messages)
-        request = ChatRequest(
-            messages=wire,
-            temperature=temperature,
-            max_completion_tokens=max_tokens,
-        )
+            wire.append({"role": "system", "content": system})
+        wire.extend({"role": m.role, "content": m.content} for m in messages)
+        api_messages = cast("list[ChatCompletionMessageParam]", wire)
         chat = self._get_client().chat.completions
         model = self._request_model()
-        response = chat.create(
-            **cast(
-                "Any",
-                request.provider_payload(
-                    model, max_tokens_field=self.backend.chat_max_tokens_field
-                ),
+        if temperature is None:
+            response = chat.create(
+                model=model,
+                messages=api_messages,
+                max_completion_tokens=max_tokens,
             )
-        )
+        else:
+            response = chat.create(
+                model=model,
+                messages=api_messages,
+                max_completion_tokens=max_tokens,
+                temperature=temperature,
+            )
         if not response.choices:
             # Content filtering (and some error modes) can return zero choices; surface it
             # clearly rather than letting choices[0] raise a bare IndexError.

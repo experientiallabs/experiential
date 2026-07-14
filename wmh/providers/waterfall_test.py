@@ -254,25 +254,6 @@ def test_fallback_config_parses_chain_in_order(
     assert os.environ["OPENAI_API_KEY"] == "sk-test-not-real"
 
 
-def test_custom_rung_propagates_token_parameter(tmp_path: Path) -> None:
-    """Unknown OpenAI-compatible rungs carry their configured model fallback."""
-    path = tmp_path / "fallback.toml"
-    path.write_text(
-        "[[chain.custom]]\n"
-        'kind = "openai"\n'
-        'model = "legacy-compatible-model"\n'
-        'endpoint = "https://custom.example/v1"\n'
-        'chat_max_tokens_field = "max_tokens"\n'
-    )
-    requested = ProviderConfig(kind=ProviderKind.OPENAI, model="legacy-compatible-model")
-
-    provider = provider_or_chain(requested, path=path)
-
-    assert isinstance(provider, WaterfallProvider)
-    assert isinstance(provider._waterfall, Waterfall)
-    assert provider._waterfall.backends[0].chat_max_tokens_field == "max_tokens"
-
-
 def test_requested_model_leads_when_not_heading_chain(tmp_path: Path) -> None:
     path = tmp_path / "fallback.toml"
     path.write_text(_CHAIN_TOML)

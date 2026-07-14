@@ -35,7 +35,7 @@ from llm_waterfall import (
 )
 from llm_waterfall import Message as WfMessage
 from llm_waterfall import VerifyResult as WfVerifyResult
-from pydantic import ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -47,7 +47,6 @@ from wmh.providers.base import (
     TokenUsage,
     VerifyResult,
 )
-from wmh.providers.models import resolve_chat_max_tokens_field
 from wmh.providers.registry import get_provider
 
 # ProviderKinds with a REAL llm-waterfall adapter, mapped to the package's provider names
@@ -84,7 +83,7 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
         api_version=config.api_version,
         embed_model=config.embed_model,
         embed_dim=config.embed_dim,
-        chat_max_tokens_field=resolve_chat_max_tokens_field(config),
+        chat_max_tokens_field=config.resolved_chat_max_tokens_field(),
     )
 
 
@@ -197,7 +196,7 @@ class WaterfallProvider:
 #     profile = "endflow"              # optional: named AWS profile (bedrock)
 #     region = "us-west-2"             # optional
 #     # api_key = "sk-..."             # optional: openai/anthropic key, seeded into the env
-#     # Any ProviderConfig field is accepted; profile and api_key are rung-only additions.
+#     # embed_model / embed_dim        # optional: embeddings attribution
 #
 #     [[chain.opus-48]]
 #     ...
@@ -214,13 +213,21 @@ _API_KEY_ENV = {
 Chain = tuple[list[ProviderConfig], list[str | None]]
 
 
-class _Rung(ProviderConfig):
-    """A ProviderConfig plus the two fields that only apply to fallback rungs."""
+class _Rung(BaseModel):
+    """One `[[chain.<name>]]` entry; `extra="forbid"` turns typos into loud errors."""
 
     model_config = ConfigDict(extra="forbid")
 
+    kind: ProviderKind
+    model: str
     profile: str | None = None
+    region: str | None = None
+    endpoint: str | None = None  # azure resource URL / custom OpenAI base URL
+    deployment: str | None = None  # azure deployment name (defaults to model)
+    api_version: str | None = None  # azure api version
     api_key: str | None = None
+    embed_model: str | None = None
+    embed_dim: int | None = None
 
 
 def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Chain:
@@ -247,7 +254,16 @@ def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Cha
                 )
             os.environ.setdefault(env_var, rung.api_key)
         configs.append(
-            ProviderConfig.model_validate(rung.model_dump(exclude={"profile", "api_key"}))
+            ProviderConfig(
+                kind=rung.kind,
+                model=rung.model,
+                region=rung.region,
+                endpoint=rung.endpoint,
+                deployment=rung.deployment,
+                api_version=rung.api_version,
+                embed_model=rung.embed_model,
+                embed_dim=rung.embed_dim,
+            )
         )
         profiles.append(rung.profile)
     return configs, profiles
@@ -266,7 +282,7 @@ def _parse_fallback_config(path: Path) -> tuple[dict[str, Chain], str | None]:
     if not isinstance(chains_raw, dict) or not chains_raw:
         raise ValueError(
             f"{path}: no chains found; define rungs as [[chain.<name>]] entries "
-            "(ProviderConfig fields plus optional profile/api_key per rung)"
+            "(kind/model/profile/region/api_key/embed_model/embed_dim per rung)"
         )
     chains = {name: _parse_rungs(path, name, entries) for name, entries in chains_raw.items()}
     default = data.get("default")
