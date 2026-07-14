@@ -289,6 +289,22 @@ def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
 
 
+def test_fallback_config_preserves_custom_token_field(tmp_path: Path) -> None:
+    path = tmp_path / "fallback.toml"
+    path.write_text(
+        '[[chain.c]]\nkind = "openai"\nmodel = "custom"\nchat_max_tokens_field = "max_tokens"\n'
+    )
+
+    provider = provider_or_chain(
+        ProviderConfig(kind=ProviderKind.OPENAI, model="custom"),
+        path=path,
+    )
+
+    assert isinstance(provider, WaterfallProvider)
+    assert isinstance(provider._waterfall, Waterfall)
+    assert provider._waterfall.backends[0].chat_max_tokens_field == "max_tokens"
+
+
 def test_azure_rung_maps_endpoint_deployment_and_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -135,3 +135,16 @@ def resolve_provider_model(provider: ProviderKind, model: str) -> ProviderModel:
         if spec.provider is provider and model in (spec.model_type, spec.model_id):
             return spec
     return ProviderModel(provider=provider, model_type=model, model_id=model)
+
+
+def resolve_chat_max_tokens_field(
+    provider: ProviderKind,
+    model: str,
+    *,
+    fallback: ChatMaxTokensField = "max_completion_tokens",
+) -> ChatMaxTokensField:
+    """Resolve a known model contract, or preserve a custom endpoint's fallback."""
+    for spec in _MODELS:
+        if spec.provider is provider and model in (spec.model_type, spec.model_id):
+            return spec.chat_max_tokens_field
+    return fallback

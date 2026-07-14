@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -89,6 +90,17 @@ def test_deployment_defaults_to_model(fake_azure: list[_FakeAzureOpenAI]) -> Non
     adapter = AzureOpenAIAdapter(backend)
     adapter.complete("", [Message(role="user", content="x")], temperature=None, max_tokens=8)
     assert fake_azure[0].chat_calls[0]["model"] == "gpt-5.4"
+
+
+def test_complete_honors_legacy_token_field(fake_azure: list[_FakeAzureOpenAI]) -> None:
+    backend = replace(_backend(), chat_max_tokens_field="max_tokens")
+    adapter = AzureOpenAIAdapter(backend)
+
+    adapter.complete("", [Message(role="user", content="x")], temperature=None, max_tokens=8)
+
+    call = fake_azure[0].chat_calls[0]
+    assert call["max_tokens"] == 8
+    assert "max_completion_tokens" not in call
 
 
 def test_embed_uses_embedding_deployment(fake_azure: list[_FakeAzureOpenAI]) -> None:

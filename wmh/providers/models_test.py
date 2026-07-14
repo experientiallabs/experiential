@@ -84,3 +84,17 @@ def test_provider_config_allows_an_explicit_custom_endpoint_override() -> None:
 
     assert "chat_max_tokens_field" in config.model_fields_set
     assert config.resolved_chat_max_tokens_field() == "max_tokens"
+
+
+def test_persisted_default_does_not_override_a_known_model_contract() -> None:
+    """Serialized defaults remain fallbacks; known catalog metadata still wins."""
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="kimi-k2.6",
+        model="customer-kimi-deployment",
+    )
+
+    loaded = ProviderConfig.model_validate(config.model_dump(mode="json"))
+
+    assert loaded.chat_max_tokens_field == "max_completion_tokens"
+    assert loaded.resolved_chat_max_tokens_field() == "max_tokens"
