@@ -49,24 +49,28 @@ def complete(
     given: GPT 5.5's reasoning models reject non-default sampling params (callers pass None), while
     OpenAI-compatible servers (vLLM policies) need it.
     """
+    request = ChatRequest.model_validate(
+        {
+            "messages": to_messages(system, messages),
+            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
+        }
+    )
     resource = cast("Any", chat_completions)
-    payload = {
-        "model": model,
-        "messages": to_messages(system, messages),
-        max_tokens_field: max_tokens,
-    }
-    if temperature is None:
-        response = resource.create(**payload)
-    else:
-        try:
-            response = resource.create(**payload, temperature=temperature)
-        except BadRequestError as exc:
-            # Reasoning-model deployments (GPT-5.x behind Azure/custom endpoints) reject any
-            # non-default temperature with a 400 unsupported_value. The caller can't know which
-            # models sample; degrade to the model's default rather than failing the request.
-            if "temperature" not in str(exc):
-                raise
-            response = resource.create(**payload)
+    try:
+        response = resource.create(
+            **request.provider_payload(model, max_tokens_field=max_tokens_field)
+        )
+    except BadRequestError as exc:
+        if temperature is None or "temperature" not in str(exc):
+            raise
+        # Reasoning-model deployments (GPT-5.x behind Azure/custom endpoints) reject any
+        # non-default temperature. Retry with the same validated request and no sampling value.
+        response = resource.create(
+            **request.model_copy(update={"temperature": None}).provider_payload(
+                model, max_tokens_field=max_tokens_field
+            )
+        )
     if not response.choices:
         # Content filtering (and some error modes) can return zero choices; surface it clearly
         # rather than letting choices[0] raise a bare IndexError.
