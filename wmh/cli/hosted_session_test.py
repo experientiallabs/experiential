@@ -753,3 +753,69 @@ def test_attach_uploads_local_edits_before_rebasing_on_remote_patches(tmp_path: 
     assert len(client.uploaded_patches) >= 1
     assert client.calls.index("upload_patch") < client.calls.index("patch:patch-1")
     assert (root / "answer.txt").read_text(encoding="utf-8") == "during"
+
+
+def test_attached_reader_reports_a_failed_end_and_keeps_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed :end must be reported, not silently converted into a detach."""
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(":end\n:stop\n"))
+
+    class _FailingEndClient(_FakeClient):
+        def end_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
+            raise PlatformError("backend unavailable", status_code=503)
+
+    client = _FailingEndClient()
+    reader = mod.AttachedCommandReader(cast("mod.PlatformClient", client), "agent-1", "sess-1")
+
+    reader.run()
+
+    # The reader kept consuming input after the failed end (the :stop landed),
+    # and only stdin EOF flipped the detach event.
+    assert client.commands == [("interrupt", None)]
+    assert reader.end_failed
+    assert reader.detach.is_set()
+
+
+def test_detached_start_state_failure_names_the_running_session(
+    tmp_path: Path,
+) -> None:
+    """A state-write failure after creation must hand the user the session id."""
+
+    class _FailingSaveStore(SessionStateStore):
+        def save(
+            self, state: DetachedSessionState, *, base_archive: bytes | None = None
+        ) -> DetachedSessionState:
+            raise mod.SessionStateError("disk full")
+
+    store = _FailingSaveStore(tmp_path / "state")
+    client = _FakeClient()
+    driver = mod.DetachedStartDriver(
+        client=cast("mod.PlatformClient", client),
+        credentials=_credentials(),
+        state_store=store,
+        target_id="agent-1",
+        name="Agent",
+        jail_root=None,
+        task=None,
+    )
+
+    with pytest.raises(typer.BadParameter, match="sess-1"):
+        driver.run()
+
+
+def test_end_reruns_cleanly_while_the_session_is_ending(tmp_path: Path) -> None:
+    """--end on a session already winding down still reaches the final handoff."""
+    store = _store_with_session(tmp_path)
+    client = _FakeClient()
+    client.session_states = [_session("ending"), _session("ended")]
+    client.end_result = _session("ending")
+    client.pages = [
+        _page([], 0, "ending"),
+        _page([], 0, "ended"),
+    ]
+
+    _command_driver(client, store, action="end").run()
+
+    assert client.end_calls == [("agent-1", "sess-1")]
+    assert store.load("sess-1") is None

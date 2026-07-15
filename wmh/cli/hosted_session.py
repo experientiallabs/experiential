@@ -114,7 +114,7 @@ class LiveWorkspace:
             self._agent_id, self._session_id, revision
         )
         result = apply_workspace_patch(self.root, content)
-        self.conflicts.update(result.conflicts)
+        new_conflicts = self._record_conflicts(result.conflicts)
         # Advance the base by base+patch, never by re-reading the directory:
         # a disk snapshot here would absorb not-yet-uploaded local edits into
         # the base, so they would never upload (and the final sync could even
@@ -127,8 +127,8 @@ class LiveWorkspace:
         self._client.acknowledge_agent_workspace_patch(self._agent_id, self._session_id, revision)
         if result.applied:
             _console.print(f"[dim]workspace updated ({len(result.applied)} changed paths)[/dim]")
-        if result.conflicts:
-            paths = ", ".join(result.conflicts)
+        if new_conflicts:
+            paths = ", ".join(new_conflicts)
             _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
 
     def push_local(self) -> bool:
@@ -147,16 +147,23 @@ class LiveWorkspace:
         result = self._client.upload_agent_workspace_patch(
             self._agent_id, self._session_id, content
         )
-        self.conflicts.update(result.conflicts)
-        if result.conflicts:
-            paths = ", ".join(result.conflicts)
+        new_conflicts = self._record_conflicts(result.conflicts)
+        if new_conflicts:
+            paths = ", ".join(new_conflicts)
             _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
+        if result.conflicts:
             # A conflicted path was rejected by E2B, so ``current`` cannot become
             # the synchronized base. Keep the prior base and conservatively retry
             # accepted sibling paths until the conflict is reconciled at teardown.
             return False
         self.synchronized = current
         return True
+
+    def _record_conflicts(self, conflicts: Iterable[str]) -> list[str]:
+        """Track conflicts, returning only ones not already reported."""
+        fresh = [path for path in conflicts if path not in self.conflicts]
+        self.conflicts.update(conflicts)
+        return fresh
 
     def finalize(self) -> SyncResult:
         """Reconcile the terminal session's final E2B workspace into the root.
@@ -239,8 +246,21 @@ class DetachedStartDriver:
                 created_at=datetime.now(tz=UTC).isoformat(),
                 workspace=workspace,
             )
-            self._store.save(state, base_archive=initial.archive if initial is not None else None)
-            self._store.set_current(session.id)
+            try:
+                self._store.save(
+                    state, base_archive=initial.archive if initial is not None else None
+                )
+                self._store.set_current(session.id)
+            except SessionStateError as error:
+                # The hosted session is already running; the user must get an
+                # addressable reference even though the local save failed.
+                msg = (
+                    f"session {session.id} is running on the platform, but its local "
+                    f"reference could not be saved: {error}. Control it with "
+                    f"`wmh run --session {session.id} --attach` or end it with "
+                    f"`wmh run --session {session.id} --end`"
+                )
+                raise typer.BadParameter(msg) from error
             _console.print(
                 f"[green]detached E2B session started[/green] for [bold]{self._name}[/bold]\n"
                 f"  agent    {self._target_id}\n"
@@ -266,6 +286,7 @@ class AttachedCommandReader(threading.Thread):
         self._agent_id = agent_id
         self._session_id = session_id
         self.detach = threading.Event()
+        self.end_failed = False
 
     def run(self) -> None:
         """Map lines to hosted commands; leaving the terminal detaches, never ends."""
@@ -278,7 +299,16 @@ class AttachedCommandReader(threading.Thread):
                     self.detach.set()
                     return
                 if line == ":end":
-                    self._client.end_agent_session(self._agent_id, self._session_id)
+                    # A failed end must be reported, never silently converted
+                    # into a detach that leaves the session running.
+                    try:
+                        self._client.end_agent_session(self._agent_id, self._session_id)
+                    except PlatformError as error:
+                        self.end_failed = True
+                        _console.print(
+                            f"[red]end failed:[/red] {error} "
+                            "(retry [bold]:end[/bold], or run `wmh run --end` later)"
+                        )
                 elif line == ":stop":
                     self._post("interrupt")
                 elif line:
