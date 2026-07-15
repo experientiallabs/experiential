@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "name": "financebench",
+  "title": "FinanceBench document QA",
+  "description": "Financial-document QA over real SEC-filing evidence excerpts: the agent greps a workspace of evidence docs plus distractors and submits a final answer.",
+  "task": "financebench",
+  "corpus": {
+    "traces": 40,
+    "steps": 61,
+    "source": "financebench.capped.jsonl"
+  },
+  "provider": "bedrock",
+  "model_id": "us.anthropic.claude-opus-4-8",
+  "fidelity": null,
+  "cost_per_step_usd": null,
+  "latency_per_step_s": null,
+  "built_at": "2026-07-08T07:51:45.507431+00:00",
+  "license": "CC BY-NC 4.0",
+  "tags": [
+    "qa",
+    "finance",
+    "retrieval"
+  ],
+  "traces_hf": null
+}

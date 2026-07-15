@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
+from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from pydantic import BaseModel, Field
 
 
@@ -76,6 +77,9 @@ class ProviderConfig(BaseModel):
     """
 
     kind: ProviderKind
+    # Canonical, provider-independent identity. ``model`` remains the exact
+    # provider runtime id for SDK calls and old persisted configs.
+    model_type: str | None = None
     model: str
     embed_model: str | None = None  # embeddings model id / Azure embedding deployment
     embed_dim: int | None = None  # requested embedding dimension (Titan v2, text-embedding-3-*)
@@ -85,6 +89,21 @@ class ProviderConfig(BaseModel):
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
     reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
+    # The serialized default stays stable for persisted configs. When callers do not explicitly
+    # set this field, built-in models resolve it from the canonical ProviderModel catalog.
+    chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
+
+    def resolved_chat_max_tokens_field(self) -> ChatMaxTokensField:
+        """Return the output-token field accepted by this configured model."""
+        # Local import avoids a module cycle: the model catalog imports ProviderKind above.
+        from wmh.providers.models import resolve_chat_max_tokens_field
+
+        model = self.model_type or self.model
+        return resolve_chat_max_tokens_field(
+            self.kind,
+            model,
+            fallback=self.chat_max_tokens_field,
+        )
 
 
 @runtime_checkable
@@ -121,6 +140,20 @@ class Provider(Protocol):
 
     def verify(self) -> VerifyResult:
         """Cheap creds/model check run on startup (`wmh providers verify`)."""
+        ...
+
+
+@runtime_checkable
+class ToolCallingProvider(Protocol):
+    """Provider capability for full structured agent requests.
+
+    This stays separate from :class:`Provider`: world-model, judge, and prompt-optimization
+    callers need only text, while agent runtimes must preserve tool schemas, tool calls, tool
+    results, finish reasons, and usage end to end.
+    """
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Return one non-streaming structured chat completion."""
         ...
 
 

@@ -157,9 +157,10 @@ def build(
     def _on_rollout(done: int, score: float | None) -> None:
         report.rollout(done, metric_total["calls"], score)
 
-    # Optimize against the SAME scorer we evaluate with (RubricJudge), so GEPA hill-climbs the
-    # metric we actually report. The coarser LLMJudge here would let GEPA improve a proxy objective
-    # that doesn't move the reported rubric fidelity.
+    # Optimize against the SAME rubric we evaluate with (RubricJudge). NOTE: the judge MODEL may
+    # differ — config.judge_model defaults to a cheap per-provider model for GEPA cost, while
+    # `wmh eval` pins the judge to the requested serve-grade model — so held_out_accuracy is only
+    # directly comparable to eval fidelity when --judge-model matches the eval judge.
     optimizer = GEPAOptimizer(
         provider,
         RubricJudge(judge_provider),

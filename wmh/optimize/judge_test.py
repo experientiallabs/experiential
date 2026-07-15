@@ -1,6 +1,8 @@
-"""Tests for the LLMJudge and its robust parsing of the judge reply."""
+"""Tests for the RubricJudge: prompt contract, weighted scoring, truncation, and validity."""
 
 from __future__ import annotations
+
+import re
 
 import pytest
 
@@ -8,14 +10,13 @@ from wmh.core.types import Action, ActionKind, Observation, Step
 from wmh.optimize.judge import (
     JUDGE_MARKER,
     JUDGE_SYSTEM,
-    RUBRIC_JUDGE_MARKER,
-    RUBRIC_JUDGE_SYSTEM,
+    OBSERVATION_HEAD_CHARS,
+    OBSERVATION_TAIL_CHARS,
+    RUBRIC_DIMENSIONS,
+    RUBRIC_WEIGHTS,
     Judge,
-    JudgeResult,
-    LLMJudge,
     RubricJudge,
     _build_judge_prompt,
-    _parse_judgement,
 )
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
@@ -27,12 +28,30 @@ def test_judge_system_contains_marker() -> None:
     assert JUDGE_MARKER in JUDGE_SYSTEM
 
 
-class FakeProvider:
-    """Returns a canned completion text; records the last prompt for assertions."""
+def test_judge_system_explains_payload_and_edge_rules() -> None:
+    # The prompt must describe the payload fields it sends (sentinels, truncation marker) and the
+    # empty/outcome-flip rules the meta-eval pins; drifting these regresses judge quality.
+    assert "content_length" in JUDGE_SYSTEM
+    assert "<EMPTY_PREDICTION>" in JUDGE_SYSTEM
+    assert "characters omitted" in JUDGE_SYSTEM
+    assert "both contents are empty" in JUDGE_SYSTEM
+    assert "is_error" in JUDGE_SYSTEM
 
-    def __init__(self, reply: str) -> None:
+
+def test_rubric_weights_cover_dimensions_and_sum_to_one() -> None:
+    assert set(RUBRIC_WEIGHTS) == set(RUBRIC_DIMENSIONS)
+    assert sum(RUBRIC_WEIGHTS.values()) == pytest.approx(1.0)
+    # Factuality carries the headline: it is the definition of functional equivalence.
+    assert RUBRIC_WEIGHTS["factuality"] == max(RUBRIC_WEIGHTS.values())
+
+
+class FakeProvider:
+    """Returns canned completion texts in order; records prompts and call count."""
+
+    def __init__(self, *replies: str) -> None:
         self.config = ProviderConfig(kind=ProviderKind.ANTHROPIC, model="m")
-        self._reply = reply
+        self._replies = list(replies)
+        self.calls = 0
         self.last_system: str | None = None
         self.last_user: str | None = None
 
@@ -46,7 +65,9 @@ class FakeProvider:
     ) -> Completion:
         self.last_system = system
         self.last_user = messages[0].content
-        return Completion(text=self._reply)
+        reply = self._replies[min(self.calls, len(self._replies) - 1)]
+        self.calls += 1
+        return Completion(text=reply)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [[0.0] for _ in texts]
@@ -62,17 +83,29 @@ def _ctx() -> Step:
     )
 
 
-def test_llm_judge_satisfies_protocol() -> None:
-    assert isinstance(LLMJudge(FakeProvider("{}")), Judge)
+def _rubric_reply(
+    *,
+    format: float = 1.0,  # noqa: A002 - mirrors the rubric field name
+    factuality: float = 1.0,
+    consistency: float = 1.0,
+    realism: float = 1.0,
+    quality: float = 1.0,
+    critique: str = "ok",
+) -> str:
+    return (
+        f'{{"format": {format}, "factuality": {factuality}, "consistency": {consistency}, '
+        f'"realism": {realism}, "quality": {quality}, "critique": "{critique}"}}'
+    )
 
 
-def test_score_parses_bare_json() -> None:
-    provider = FakeProvider('{"score": 0.8, "critique": "close but missing total"}')
-    judge = LLMJudge(provider)
-    result = judge.score(Observation(content="pred"), Observation(content="actual"), _ctx())
-    assert result.score == 0.8
-    assert "missing total" in result.critique
-    # The judge actually saw both observations in its prompt.
+def test_rubric_judge_satisfies_protocol() -> None:
+    assert isinstance(RubricJudge(FakeProvider("{}")), Judge)
+
+
+def test_score_sees_both_observations_and_uses_judge_system() -> None:
+    provider = FakeProvider(_rubric_reply())
+    RubricJudge(provider).score(Observation(content="pred"), Observation(content="actual"), _ctx())
+    assert provider.last_system == JUDGE_SYSTEM
     assert provider.last_user is not None
     assert "pred" in provider.last_user and "actual" in provider.last_user
 
@@ -88,104 +121,134 @@ def test_judge_prompt_makes_empty_prediction_explicit() -> None:
     assert '"empty_content": true' in prompt
     assert '"empty_sentinel": "<EMPTY_PREDICTION>"' in prompt
     assert "<EMPTY_ACTUAL_OBSERVATION>" not in prompt
-    assert "If the predicted observation is empty and the actual observation is non-empty" in (
-        JUDGE_SYSTEM
-    )
     assert "PREDICTED OBSERVATION JSON" in prompt
 
 
-def test_parse_handles_fenced_json() -> None:
-    text = 'Sure:\n```json\n{"score": 0.4, "critique": "wrong status"}\n```\nDone.'
-    result = _parse_judgement(text)
-    assert result.score == 0.4
-    assert result.critique == "wrong status"
-
-
-def test_parse_handles_json_embedded_in_prose() -> None:
-    text = 'My verdict is {"score": 1.0, "critique": "identical"} overall.'
-    result = _parse_judgement(text)
-    assert result.score == 1.0
-
-
-def test_parse_clamps_out_of_range_scores() -> None:
-    assert _parse_judgement('{"score": 1.7, "critique": "x"}').score == 1.0
-    assert _parse_judgement('{"score": -0.5, "critique": "x"}').score == 0.0
-
-
-def test_parse_takes_first_of_multiple_objects() -> None:
-    # A reply that echoes an example object before the real verdict must not fall back to 0.0.
-    text = '{"score": 0.5, "critique": "good"} also note {"score": 0.9, "critique": "other"}'
-    result = _parse_judgement(text)
-    assert result.score == 0.5
-    assert result.critique == "good"
-
-
-def test_parse_handles_nested_objects() -> None:
-    text = '{"score": 0.6, "critique": "x", "meta": {"a": 1, "b": {"c": 2}}}'
-    result = _parse_judgement(text)
-    assert result.score == 0.6
-
-
-def test_parse_ignores_braces_inside_strings() -> None:
-    text = '{"score": 0.3, "critique": "saw a } brace and a { in the output"}'
-    result = _parse_judgement(text)
-    assert result.score == 0.3
-    assert "} brace" in result.critique
-
-
-def test_parse_unparseable_falls_back_to_zero() -> None:
-    result = _parse_judgement("the model rambled with no json at all")
-    assert result.score == 0.0
-    assert "Unparseable" in result.critique
-
-
-def test_score_uses_zero_temperature() -> None:
-    # Determinism matters for a fitness signal; just assert the call path returns a JudgeResult.
-    result = LLMJudge(FakeProvider('{"score": 0.0, "critique": ""}')).score(
-        Observation(content="a"), Observation(content="b"), _ctx()
-    )
-    assert isinstance(result, JudgeResult)
-
-
-# --- RubricJudge ---------------------------------------------------------------------------------
-
-
-def test_rubric_judge_satisfies_protocol() -> None:
-    assert isinstance(RubricJudge(FakeProvider("{}")), Judge)
-
-
-def test_rubric_judge_marker_in_system() -> None:
-    # Same cost-attribution requirement as LLMJudge: the rubric prompt must carry the judge marker.
-    assert RUBRIC_JUDGE_MARKER in RUBRIC_JUDGE_SYSTEM
-    assert JUDGE_MARKER in RUBRIC_JUDGE_SYSTEM
-
-
-def test_rubric_score_is_mean_of_dimensions() -> None:
-    reply = (
-        '{"format": 1.0, "factuality": 0.0, "consistency": 0.5, '
-        '"realism": 1.0, "quality": 0.5, "critique": "partial"}'
-    )
+def test_headline_score_is_weighted_mean_of_dimensions() -> None:
+    reply = _rubric_reply(format=1.0, factuality=0.0, consistency=0.5, realism=1.0, quality=0.5)
     result = RubricJudge(FakeProvider(reply)).score(
         Observation(content="p"), Observation(content="a"), _ctx()
     )
-    assert set(result.dimensions) == {"format", "factuality", "consistency", "realism", "quality"}
-    assert result.score == pytest.approx((1.0 + 0.0 + 0.5 + 1.0 + 0.5) / 5)
-    assert result.dimensions["factuality"] == 0.0
-    assert result.critique == "partial"
+    expected = (
+        RUBRIC_WEIGHTS["format"] * 1.0
+        + RUBRIC_WEIGHTS["factuality"] * 0.0
+        + RUBRIC_WEIGHTS["consistency"] * 0.5
+        + RUBRIC_WEIGHTS["realism"] * 1.0
+        + RUBRIC_WEIGHTS["quality"] * 0.5
+    )
+    assert result.score == pytest.approx(expected)
+    assert set(result.dimensions) == set(RUBRIC_DIMENSIONS)
+    assert result.valid is True
 
 
-def test_rubric_clamps_and_defaults_missing_dims() -> None:
-    # Out-of-range clamps to [0,1]; a missing dimension defaults to 0.0 (penalized, not crash).
-    result = RubricJudge(FakeProvider('{"format": 1.7, "factuality": 0.8}')).score(
+def test_equal_dimensions_score_the_same_as_the_old_unweighted_mean() -> None:
+    # Comparability guard: any reply with all dimensions equal is unaffected by the reweighting,
+    # so uniformly-judged steps keep their pre-overhaul scores.
+    reply = _rubric_reply(format=0.5, factuality=0.5, consistency=0.5, realism=0.5, quality=0.5)
+    result = RubricJudge(FakeProvider(reply)).score(
         Observation(content="p"), Observation(content="a"), _ctx()
     )
-    assert result.dimensions["format"] == 1.0
-    assert result.dimensions["realism"] == 0.0
+    assert result.score == pytest.approx(0.5)
 
 
-def test_rubric_unparseable_falls_back_to_zero() -> None:
-    result = RubricJudge(FakeProvider("not json at all")).score(
+def test_parse_handles_fenced_json_and_prose() -> None:
+    fenced = f"Sure:\n```json\n{_rubric_reply(critique='fenced')}\n```\nDone."
+    result = RubricJudge(FakeProvider(fenced)).score(
         Observation(content="p"), Observation(content="a"), _ctx()
     )
+    assert result.score == 1.0
+    assert result.critique == "fenced"
+    prose = f"My verdict is {_rubric_reply()} overall."
+    assert (
+        RubricJudge(FakeProvider(prose))
+        .score(Observation(content="p"), Observation(content="a"), _ctx())
+        .score
+        == 1.0
+    )
+
+
+# --- validity: judge failures must be flagged, not scored as world-model failures ---------------
+
+
+def test_missing_dimension_triggers_retry_then_uses_good_reply() -> None:
+    provider = FakeProvider('{"format": 1.0, "factuality": 0.8}', _rubric_reply())
+    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    assert provider.calls == 2  # first reply invalid -> one retry
+    assert result.valid is True
+    assert result.score == 1.0
+    # The retry must tell the judge what was wrong — at temperature 0 an identical re-ask just
+    # reproduces the same malformed reply (observed on Bedrock in the meta-eval).
+    assert provider.last_user is not None
+    assert "invalid" in provider.last_user
+    assert "missing dimension 'consistency'" in provider.last_user
+
+
+def test_persistent_missing_dimensions_flag_invalid_not_zero_fidelity() -> None:
+    provider = FakeProvider('{"format": 1.0, "factuality": 0.8}')
+    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    assert provider.calls == 2
+    assert result.valid is False
+    assert "missing" in result.critique
+
+
+def test_unparseable_reply_retries_then_flags_invalid() -> None:
+    provider = FakeProvider("the model rambled with no json at all")
+    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    assert provider.calls == 2
+    assert result.valid is False
     assert result.score == 0.0
     assert "Unparseable" in result.critique
+
+
+def test_scale_confused_dimension_flags_invalid() -> None:
+    # A judge answering on a 0-100 scale must not be clamped into a perfect 1.0.
+    provider = FakeProvider(_rubric_reply(factuality=85))
+    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    assert result.valid is False
+    assert "out of range" in result.critique
+
+
+def test_minor_float_slop_is_clamped_not_invalidated() -> None:
+    result = RubricJudge(FakeProvider(_rubric_reply(factuality=1.1))).score(
+        Observation(content="p"), Observation(content="a"), _ctx()
+    )
+    assert result.valid is True
+    assert result.dimensions["factuality"] == 1.0
+
+
+# --- truncation: huge observations stay gradeable without hiding the tail -----------------------
+
+
+def test_long_content_is_truncated_with_head_tail_and_full_length() -> None:
+    content = "x" * 8000 + "MIDDLE" + "y" * 8000 + "TAIL-END"
+    prompt = _build_judge_prompt(Observation(content="short"), Observation(content=content), _ctx())
+    assert "characters omitted" in prompt
+    assert prompt.count("x" * 100) > 0  # head survives
+    assert "TAIL-END" in prompt  # tail survives
+    assert "MIDDLE" not in prompt  # middle is dropped
+    assert f'"content_length": {len(content)}' in prompt  # full length still reported
+
+
+def test_short_content_is_never_truncated() -> None:
+    content = "z" * (OBSERVATION_HEAD_CHARS + OBSERVATION_TAIL_CHARS)
+    prompt = _build_judge_prompt(Observation(content="short"), Observation(content=content), _ctx())
+    assert "characters omitted" not in prompt
+    assert content in prompt
+    assert "content_sha256" not in prompt  # hash only accompanies truncated content
+
+
+def test_truncated_payloads_carry_a_hash_so_middle_divergence_is_visible() -> None:
+    # Two equal-length observations diverging ONLY in the omitted middle produce identical
+    # visible text and identical content_length — the hash is the only remaining tell, and the
+    # prompt instructs the judge to use it.
+    head, tail = "x" * 7000, "y" * 7000
+    actual = head + "REAL-MIDDLE-" + "a" * 4000 + tail
+    predicted = head + "FAKE-MIDDLE-" + "b" * 4000 + tail
+    assert len(actual) == len(predicted)
+    prompt = _build_judge_prompt(
+        Observation(content=predicted), Observation(content=actual), _ctx()
+    )
+    hashes = re.findall(r'"content_sha256": "([0-9a-f]{64})"', prompt)
+    assert len(hashes) == 2
+    assert hashes[0] != hashes[1]  # differing hashes expose the hidden divergence
+    assert "content_sha256" in JUDGE_SYSTEM  # the prompt explains the field

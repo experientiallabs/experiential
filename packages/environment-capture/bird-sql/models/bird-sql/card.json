@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "name": "bird-sql",
+  "title": "BIRD text-to-SQL",
+  "description": "Text-to-SQL over real SQLite databases: the agent explores a copy of the task's database and schema, then submits a SQL query.",
+  "task": "bird-sql",
+  "corpus": {
+    "traces": 40,
+    "steps": 87,
+    "source": "bird-sql.capped.jsonl"
+  },
+  "provider": "bedrock",
+  "model_id": "us.anthropic.claude-opus-4-8",
+  "fidelity": null,
+  "cost_per_step_usd": null,
+  "latency_per_step_s": null,
+  "built_at": "2026-07-08T07:51:52.716019+00:00",
+  "license": "CC BY-SA 4.0",
+  "tags": [
+    "sql",
+    "text-to-sql",
+    "database"
+  ],
+  "traces_hf": null
+}

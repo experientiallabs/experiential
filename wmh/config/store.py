@@ -24,7 +24,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, JsonValue
 
+from wmh.config.card import ModelCard, load_card
 from wmh.config.config import ARTIFACT_DIR, ArtifactPaths, HarnessConfig
+from wmh.providers.models import resolve_provider_model
 
 # The implicit model name used when the user does not pass `--name`.
 DEFAULT_MODEL_NAME = "default"
@@ -125,6 +127,13 @@ class WorldModelStore:
         assert resolved is not None  # name came from list_names(), so it resolves
         return resolved
 
+    def card(self, name: str) -> ModelCard | None:
+        """The model's `card.json` metadata, or None when the model carries no card."""
+        model_dir = self.dir_for(name)
+        if model_dir is None:
+            raise FileNotFoundError(f"no world model named {name!r} under {self.models_dir}")
+        return load_card(model_dir)
+
     def info(self, name: str) -> ModelInfo:
         """Read a model's config + metrics into a summary (for `wmh list`)."""
         model_dir = self.dir_for(name)
@@ -145,10 +154,11 @@ class WorldModelStore:
             if isinstance(frontier, list):
                 frontier_size = len(frontier)
         serve = config.serve_provider_config()
+        model_type = serve.model_type or resolve_provider_model(serve.kind, serve.model).model_type
         return ModelInfo(
             name=name,
             serve_provider=serve.kind.value,
-            serve_model=serve.model,
+            serve_model=model_type,
             held_out_accuracy=accuracy,
             rollouts_used=rollouts,
             frontier_size=frontier_size,

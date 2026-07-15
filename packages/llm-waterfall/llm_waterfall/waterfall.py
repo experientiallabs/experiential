@@ -26,12 +26,15 @@ from llm_waterfall.pricing import ModelPrice, cost_usd
 from llm_waterfall.types import (
     Attempt,
     Backend,
+    ChatRequest,
+    ChatResult,
     CompletionResult,
     EmbeddingResult,
     EmbeddingsUnsupported,
     Message,
     RetryPolicy,
     TokenUsage,
+    ToolCallingUnsupported,
     VerifyResult,
     WaterfallExhausted,
     normalize_messages,
@@ -89,9 +92,28 @@ class Waterfall:
         def attempt(adapter: Adapter) -> tuple[str, TokenUsage]:
             return adapter.complete(system, msgs, temperature=temperature, max_tokens=max_tokens)
 
-        text, usage, backend, _, attempts = self._run(attempt, embed_call=False)
+        text, usage, backend, _, attempts = self._run(attempt, unsupported=None)
         return CompletionResult(
             text=text,
+            model_used=backend.model,
+            provider_used=backend.provider,
+            usage=usage,
+            cost_usd=cost_usd(backend.model, usage, self._prices),
+            attempts=attempts,
+        )
+
+    def complete_chat(self, request: ChatRequest) -> ChatResult:
+        """Run one structured tool-calling completion down the chain."""
+
+        def attempt(adapter: Adapter):  # noqa: ANN202 - inferred from Adapter.complete_chat
+            response = adapter.complete_chat(request)
+            return response, response.token_usage()
+
+        response, usage, backend, _, attempts = self._run(
+            attempt, unsupported=ToolCallingUnsupported
+        )
+        return ChatResult(
+            response=response,
             model_used=backend.model,
             provider_used=backend.provider,
             usage=usage,
@@ -112,7 +134,9 @@ class Waterfall:
         def attempt(adapter: Adapter) -> tuple[list[list[float]], TokenUsage]:
             return adapter.embed(text_list)
 
-        vectors, usage, backend, adapter, attempts = self._run(attempt, embed_call=True)
+        vectors, usage, backend, adapter, attempts = self._run(
+            attempt, unsupported=EmbeddingsUnsupported
+        )
         # Attribute to the model that actually embedded — the serving adapter is the single
         # source of truth for how it resolved backend.embed_model.
         embed_model = adapter.embed_model_id() or backend.model
@@ -152,7 +176,7 @@ class Waterfall:
         self,
         attempt: Callable[[Adapter], tuple[T, TokenUsage]],
         *,
-        embed_call: bool,
+        unsupported: type[Exception] | None,
     ) -> tuple[T, TokenUsage, Backend, Adapter, list[Attempt]]:
         """The failover loop shared by complete() and embed(). All state is call-local."""
         attempts: list[Attempt] = []
@@ -173,8 +197,8 @@ class Waterfall:
                 start = time.monotonic()
                 try:
                     payload, usage = attempt(adapter)
-                except EmbeddingsUnsupported as exc:
-                    if not embed_call:
+                except (EmbeddingsUnsupported, ToolCallingUnsupported) as exc:
+                    if unsupported is None or not isinstance(exc, unsupported):
                         raise
                     # Not a failure: this backend just has no embeddings API. Recorded and
                     # skipped without counting toward exhaustion.
@@ -195,12 +219,19 @@ class Waterfall:
                 # unsupported) — further rounds and backoff sleeps can't change the outcome.
                 break
         if last_capacity_exc is None:
-            # Only reachable for embed() when every backend lacks an embeddings API: a static
-            # configuration error, not a capacity condition — don't dress it up as one.
-            raise EmbeddingsUnsupported(
-                "no backend in this chain supports embeddings; add a bedrock or openai backend "
-                "(anthropic has no embeddings API)."
-            )
+            # Only reachable when every backend was statically unsupported; further retries
+            # cannot change that, so preserve the feature-specific configuration error.
+            if unsupported is EmbeddingsUnsupported:
+                raise EmbeddingsUnsupported(
+                    "no backend in this chain supports embeddings; add a bedrock or openai "
+                    "backend (anthropic has no embeddings API)."
+                )
+            if unsupported is ToolCallingUnsupported:
+                raise ToolCallingUnsupported(
+                    "no backend in this chain supports structured tool calling; add an openai, "
+                    "azure_openai, or bedrock backend."
+                )
+            raise AssertionError("waterfall ended without a result or capacity error")
         message = (
             f"every backend was capacity-constrained after {len(attempts)} attempts "
             f"across {self._retry.rounds} round(s)"

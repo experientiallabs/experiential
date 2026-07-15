@@ -6,7 +6,15 @@ import threading
 from typing import TYPE_CHECKING, cast
 
 from llm_waterfall.adapters.base import missing_sdk_error
-from llm_waterfall.types import Backend, EmbeddingsUnsupported, Message, TokenUsage
+from llm_waterfall.types import (
+    Backend,
+    ChatRequest,
+    ChatResponse,
+    EmbeddingsUnsupported,
+    Message,
+    TokenUsage,
+    ToolCallingUnsupported,
+)
 
 if TYPE_CHECKING:
     from anthropic import Anthropic
@@ -77,6 +85,14 @@ class AnthropicAdapter:
             output_tokens=response.usage.output_tokens,
         )
         return text, usage
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Direct Anthropic structured mapping is not implemented yet."""
+        del request
+        raise ToolCallingUnsupported(
+            "the anthropic adapter does not yet map OpenAI-compatible tool calls; "
+            "put an openai, azure_openai, or bedrock backend in the chain"
+        )
 
     def embed_model_id(self) -> str | None:
         """Anthropic has no embeddings API."""

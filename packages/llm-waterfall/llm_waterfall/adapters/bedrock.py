@@ -10,8 +10,16 @@ import json
 import threading
 from typing import TYPE_CHECKING, TypedDict, cast
 
+from pydantic import JsonValue
+
 from llm_waterfall.adapters.base import missing_sdk_error
-from llm_waterfall.types import Backend, Message, TokenUsage
+from llm_waterfall.types import (
+    Backend,
+    ChatRequest,
+    ChatResponse,
+    Message,
+    TokenUsage,
+)
 
 if TYPE_CHECKING:
     from botocore.client import BaseClient
@@ -41,6 +49,31 @@ class _MessagesResponse(TypedDict):
 class _TitanEmbedResponse(TypedDict, total=False):
     embedding: list[float]
     inputTextTokenCount: int
+
+
+class _ConverseContentBlock(TypedDict, total=False):
+    text: str
+    toolUse: dict[str, object]
+
+
+class _ConverseMessage(TypedDict):
+    role: str
+    content: list[_ConverseContentBlock]
+
+
+class _ConverseOutput(TypedDict):
+    message: _ConverseMessage
+
+
+class _ConverseUsage(TypedDict):
+    inputTokens: int
+    outputTokens: int
+
+
+class _ConverseResponse(TypedDict):
+    output: _ConverseOutput
+    stopReason: str
+    usage: _ConverseUsage
 
 
 class BedrockAdapter:
@@ -112,6 +145,48 @@ class BedrockAdapter:
         )
         return text, usage
 
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a structured tool-calling request through Bedrock Converse."""
+        converse_request = _converse_request(request, self.backend.model)
+        response = cast("_ConverseResponse", self._get_client().converse(**converse_request))
+        blocks = response["output"]["message"]["content"]
+        text = "".join(block["text"] for block in blocks if "text" in block)
+        tool_calls: list[dict[str, object]] = []
+        for block in blocks:
+            use = block.get("toolUse")
+            if use is None:
+                continue
+            tool_calls.append(
+                {
+                    "id": str(use.get("toolUseId", "")),
+                    "type": "function",
+                    "function": {
+                        "name": str(use.get("name", "")),
+                        "arguments": json.dumps(use.get("input", {})),
+                    },
+                }
+            )
+        stop_reason = response["stopReason"]
+        finish_reason = {
+            "tool_use": "tool_calls",
+            "max_tokens": "length",
+            "content_filtered": "content_filter",
+            "guardrail_intervened": "content_filter",
+        }.get(stop_reason, "stop")
+        message: dict[str, object] = {"role": "assistant", "content": text}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return ChatResponse.model_validate(
+            {
+                "model": self.backend.model,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                "usage": {
+                    "prompt_tokens": response["usage"]["inputTokens"],
+                    "completion_tokens": response["usage"]["outputTokens"],
+                },
+            }
+        )
+
     def embed_model_id(self) -> str | None:
         """The model embed() resolves to — the single source of truth for embed attribution."""
         return self.backend.embed_model or _DEFAULT_EMBED_MODEL
@@ -132,3 +207,103 @@ class BedrockAdapter:
             vectors.append(data["embedding"])
             input_tokens += data.get("inputTextTokenCount", 0)
         return vectors, TokenUsage(input_tokens=input_tokens)
+
+
+def _converse_request(request: ChatRequest, model: str) -> dict[str, object]:
+    """Translate the structured OpenAI-compatible contract to Bedrock Converse."""
+    system: list[dict[str, str]] = []
+    messages: list[dict[str, object]] = []
+
+    def push(role: str, content: list[dict[str, object]]) -> None:
+        if messages and messages[-1]["role"] == role:
+            existing = cast("list[dict[str, object]]", messages[-1]["content"])
+            existing.extend(content)
+        else:
+            messages.append({"role": role, "content": content})
+
+    for message in request.messages:
+        if message.role in ("system", "developer"):
+            text = _chat_text(message.content)
+            if text:
+                system.append({"text": text})
+            continue
+        if message.role == "tool":
+            push(
+                "user",
+                [
+                    {
+                        "toolResult": {
+                            "toolUseId": message.tool_call_id or "",
+                            "content": [{"text": _chat_text(message.content)}],
+                        }
+                    }
+                ],
+            )
+            continue
+        blocks: list[dict[str, object]] = []
+        text = _chat_text(message.content)
+        if text:
+            blocks.append({"text": text})
+        for tool_call in message.tool_calls or []:
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except ValueError:
+                arguments = {}
+            blocks.append(
+                {
+                    "toolUse": {
+                        "toolUseId": tool_call.id,
+                        "name": tool_call.function.name,
+                        "input": arguments,
+                    }
+                }
+            )
+        if blocks:
+            push("assistant" if message.role == "assistant" else "user", blocks)
+
+    max_tokens = request.max_tokens or request.max_completion_tokens or 4096
+    inference: dict[str, float | int] = {"maxTokens": max_tokens}
+    if request.temperature is not None:
+        inference["temperature"] = request.temperature
+    result: dict[str, object] = {
+        "modelId": model,
+        "messages": messages,
+        "inferenceConfig": inference,
+    }
+    if system:
+        result["system"] = system
+    if request.tools:
+        tools = [
+            {
+                "toolSpec": {
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "inputSchema": {"json": tool.function.parameters},
+                }
+            }
+            for tool in request.tools
+        ]
+        tool_config: dict[str, object] = {"tools": tools}
+        choice = request.tool_choice
+        if choice == "required":
+            tool_config["toolChoice"] = {"any": {}}
+        elif isinstance(choice, dict):
+            function = choice.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                tool_config["toolChoice"] = {"tool": {"name": function["name"]}}
+        if choice != "none":
+            result["toolConfig"] = tool_config
+    return result
+
+
+def _chat_text(content: JsonValue) -> str:
+    """Flatten the text-bearing forms used by OpenAI-compatible chat messages."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts)
+    return "" if content is None else str(content)

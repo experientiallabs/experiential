@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from wmh.providers import _openai_common
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -66,6 +68,15 @@ class OpenAIProvider:
             # Self-hosted OpenAI-compatible servers honor sampling params (a policy being
             # trained NEEDS temperature diversity); real OpenAI GPT-5.5 rejects them.
             temperature=temperature if self.config.endpoint else None,
+        )
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a full structured request on the configured OpenAI-compatible backend."""
+        return _openai_common.complete_chat(
+            self._get_client().chat.completions,
+            self.config.model,
+            request,
+            max_tokens_field=self.config.resolved_chat_max_tokens_field(),
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:

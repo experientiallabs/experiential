@@ -1,0 +1,187 @@
+{
+  "judge_model": "gpt-5.5",
+  "report": {
+    "verdicts": [
+      {
+        "case_id": "exact-json-lookup",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The predicted observation exactly matches the actual JSON content, metadata, and non-error status.",
+        "failures": []
+      },
+      {
+        "case_id": "cosmetic-reordering",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The prediction matches the actual reservation details exactly in outcome and data, with only insignificant JSON key ordering differences.",
+        "failures": []
+      },
+      {
+        "case_id": "volatile-pid-differs",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The prediction matches the successful shell response shape and provides a plausible PID followed by a newline. The PID is volatile for a background process, so differing from the actual value is not a meaningful factual divergence.",
+        "failures": []
+      },
+      {
+        "case_id": "wrong-computed-values",
+        "defect": "control",
+        "passed": true,
+        "score": 0.42,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.2,
+          "consistency": 0.7,
+          "realism": 1.0,
+          "quality": 0.25
+        },
+        "critique": "The prediction has the same newline-separated version-list format and correct non-error status, but most deterministic file contents differ from the actual versions. It is a plausible cat output, but largely unusable as a stand-in because the salient values are wrong.",
+        "failures": []
+      },
+      {
+        "case_id": "fabricated-lookup-data",
+        "defect": "control",
+        "passed": true,
+        "score": 0.31500000000000006,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.1,
+          "consistency": 0.45,
+          "realism": 0.9,
+          "quality": 0.15
+        },
+        "critique": "The prediction has the right response structure and matching success status/reservation_id, and it looks like a plausible reservation record. However, nearly all salient deterministic reservation details are wrong, including user, route, trip type, cabin, flights, dates, and prices.",
+        "failures": []
+      },
+      {
+        "case_id": "right-facts-wrong-shape",
+        "defect": "control",
+        "passed": true,
+        "score": 0.7200000000000001,
+        "dimensions": {
+          "format": 0.25,
+          "factuality": 0.9,
+          "consistency": 0.9,
+          "realism": 0.35,
+          "quality": 0.6
+        },
+        "critique": "The prediction conveys the correct reservation outcome and most salient details, including user, route, cabin, date, flights, and prices. However, the real environment returns a structured JSON object string, while the prediction is an English prose summary, making it a poor format match.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-nonempty-actual",
+        "defect": "empty-prediction",
+        "passed": true,
+        "score": 0.0,
+        "dimensions": {
+          "format": 0.0,
+          "factuality": 0.0,
+          "consistency": 0.0,
+          "realism": 0.0,
+          "quality": 0.0
+        },
+        "critique": "The prediction omitted the non-empty file contents entirely. Although the error flag matched, an empty response is not a usable or realistic stand-in for this cat output.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-empty-actual",
+        "defect": "both-empty",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Both actual and predicted observations are empty with no error, matching the silent successful command behavior exactly.",
+        "failures": []
+      },
+      {
+        "case_id": "error-flipped-to-pretty-success",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.11000000000000001,
+        "dimensions": {
+          "format": 0.4,
+          "factuality": 0.0,
+          "consistency": 0.1,
+          "realism": 0.6,
+          "quality": 0.0
+        },
+        "critique": "The actual observation is an error with plain text 'User not found' and is_error=true, while the prediction reports a successful JSON user_id with is_error=false. This flipped outcome makes it unusable despite being a plausible-looking success response.",
+        "failures": []
+      },
+      {
+        "case_id": "success-flipped-to-error",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.08,
+        "dimensions": {
+          "format": 0.3,
+          "factuality": 0.0,
+          "consistency": 0.0,
+          "realism": 0.5,
+          "quality": 0.0
+        },
+        "critique": "The actual observation successfully returns structured reservation details for EHGLP3, while the prediction reports a not-found error with is_error flipped to true. It omits all salient reservation data and uses a different content format.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-identical",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The prediction matches the actual observation exactly in structure, error flag, content length, and visible inventory output. No divergences are apparent.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-divergent-tail",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 0.415,
+        "dimensions": {
+          "format": 0.95,
+          "factuality": 0.2,
+          "consistency": 0.65,
+          "realism": 0.95,
+          "quality": 0.3
+        },
+        "critique": "The prediction matches the JSON structure, non-error outcome, and much of the line-oriented inventory output format. However it falsely reports items 1900-1999 as FAIL/corrupted while the actual output has all items OK, which is highly salient and would mislead the agent.",
+        "failures": []
+      }
+    ]
+  }
+}

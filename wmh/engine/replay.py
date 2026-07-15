@@ -16,6 +16,7 @@ step's own trace.
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from statistics import fmean, pstdev
 
@@ -50,6 +51,7 @@ class StepResult(BaseModel):
     critique: str = ""
     is_error_actual: bool = False
     is_error_predicted: bool = False
+    valid: bool = True  # False = the judge failed on this step; excluded from fidelity aggregates
 
 
 class ReplayReport(BaseModel):
@@ -59,12 +61,14 @@ class ReplayReport(BaseModel):
     score_std: float = 0.0  # spread of per-step scores across steps (uniform vs uneven fidelity)
     error_flag_accuracy: float = 0.0  # fraction where predicted is_error matched actual
     n_steps: int = 0
+    n_invalid: int = 0  # steps where the judge failed; kept in `results` but not in the mean/std
     results: list[StepResult] = Field(default_factory=list)
 
     def summary(self) -> str:
+        invalid = f" invalid={self.n_invalid}" if self.n_invalid else ""
         return (
             f"fidelity={self.mean_score:.3f}±{self.score_std:.3f} "
-            f"error_flag_acc={self.error_flag_accuracy:.3f} n={self.n_steps}"
+            f"error_flag_acc={self.error_flag_accuracy:.3f} n={self.n_steps}{invalid}"
         )
 
 
@@ -159,18 +163,32 @@ def _score_step(
         critique=verdict.critique,
         is_error_actual=step.observation.is_error,
         is_error_predicted=predicted.is_error,
+        valid=verdict.valid,
     )
+
+
+def valid_scores(results: Iterable[StepResult]) -> list[float]:
+    """Scores of validly-judged steps — the one rule for fidelity aggregation.
+
+    Judge failures (valid=False) say nothing about the prediction, so every fidelity aggregate
+    (here and `wmh.evals.open_loop.evaluate_files`) excludes them rather than counting spurious
+    zeros. Kept as the single shared filter so aggregation sites cannot drift.
+    """
+    return [r.score for r in results if r.valid]
 
 
 def _aggregate(results: list[StepResult]) -> ReplayReport:
     if not results:
         return ReplayReport()
-    step_scores = [r.score for r in results]
+    # Error-flag accuracy compares recorded flags and is judge-independent, so unlike the
+    # fidelity mean/std it stays over every step.
+    step_scores = valid_scores(results)
     error_acc = fmean(1.0 if r.is_error_predicted == r.is_error_actual else 0.0 for r in results)
     return ReplayReport(
-        mean_score=fmean(step_scores),
+        mean_score=fmean(step_scores) if step_scores else 0.0,
         score_std=pstdev(step_scores) if len(step_scores) > 1 else 0.0,
         error_flag_accuracy=error_acc,
         n_steps=len(results),
+        n_invalid=len(results) - len(step_scores),
         results=results,
     )

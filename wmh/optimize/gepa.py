@@ -131,6 +131,7 @@ class _StepTrajectory:
     predicted: Observation
     score: float
     critique: str
+    valid: bool = True  # False = the judge failed on this step (see JudgeResult.valid)
 
 
 class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]):
@@ -175,7 +176,7 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
         if self._on_activity is not None:
             self._on_activity(f"evaluating candidate on {len(batch)} steps…")
 
-        def eval_one(item: _EvalStep) -> tuple[Observation, float, str]:
+        def eval_one(item: _EvalStep) -> tuple[Observation, float, str, bool]:
             step = item.step
             try:
                 predicted = predict_observation(
@@ -187,15 +188,23 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
                     demos=item.demos,
                     history=item.history,
                 )
-                result = self._judge.score(predicted, step.observation, step)
-                return predicted, result.score, result.critique
             except Exception as exc:  # noqa: BLE001 - per-example failure must not abort the run
-                return Observation(content="", is_error=True), 0.0, f"Rollout failed: {exc}"
+                # A rollout failure IS world-model signal, so it keeps its 0.0 and stays
+                # valid / in the reflective dataset.
+                return Observation(content="", is_error=True), 0.0, f"Rollout failed: {exc}", True
+            try:
+                result = self._judge.score(predicted, step.observation, step)
+            except Exception as exc:  # noqa: BLE001 - judge infra failure ≠ world-model failure
+                # A judge call that RAISES (throttle, 5xx) says nothing about the prediction:
+                # route it through the same valid=False machinery as a malformed reply, and keep
+                # the prediction the model actually produced.
+                return predicted, 0.0, f"Judge call failed: {exc}", False
+            return predicted, result.score, result.critique, result.valid
 
         # Rollout+judge calls are I/O bound; evaluate the batch concurrently (order preserved by
         # index) and emit callbacks from THIS thread as results land — the live display and the
         # run tracker see a serial stream.
-        results: list[tuple[Observation, float, str] | None] = [None] * len(batch)
+        results: list[tuple[Observation, float, str, bool] | None] = [None] * len(batch)
         with ThreadPoolExecutor(max_workers=min(_EVAL_CONCURRENCY, len(batch))) as pool:
             futures = {pool.submit(eval_one, item): i for i, item in enumerate(batch)}
             landed = 0
@@ -204,18 +213,39 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
                 outcome = future.result()
                 results[index] = outcome
                 landed += 1
-                _, score, critique = outcome
+                _, score, critique, valid = outcome
                 self._note_rollout(score)
                 if self._on_activity is not None:
-                    note = f" — {critique.strip()[:110]}" if critique.strip() else ""
-                    self._on_activity(f"[{landed}/{len(batch)}] fidelity {score:.2f}{note}")
+                    if valid:
+                        note = f" — {critique.strip()[:110]}" if critique.strip() else ""
+                        self._on_activity(f"[{landed}/{len(batch)}] fidelity {score:.2f}{note}")
+                    else:
+                        self._on_activity(f"[{landed}/{len(batch)}] judge invalid")
 
         outputs = [r[0] for r in results if r is not None]
-        scores = [r[1] for r in results if r is not None]
+        raw_scores = [r[1] for r in results if r is not None]
+        valids = [r[3] for r in results if r is not None]
+        # A judge failure (valid=False) says nothing about the prediction. GEPA needs one score
+        # per example, so exclusion isn't possible here (unlike replay/eval): impute the mean of
+        # the batch's valid scores rather than a phantom 0.0 that would make GEPA hill-climb
+        # judge noise. Known trade-off: the imputed value is aggregate-neutral but not neutral
+        # for per-instance Pareto comparison (the candidate neither earned nor lost that slot);
+        # with the judge's own retry, invalid verdicts are rare enough that this beats both
+        # alternatives (0.0 punishes judge outages; dropping the instance breaks GEPA's
+        # aligned-scores contract). All-invalid batches keep their zeros (no signal to impute).
+        earned = [s for s, ok in zip(raw_scores, valids, strict=True) if ok]
+        scores = raw_scores
+        if earned and len(earned) < len(raw_scores):
+            neutral = sum(earned) / len(earned)
+            scores = [s if ok else neutral for s, ok in zip(raw_scores, valids, strict=True)]
         trajectories: list[_StepTrajectory] | None = None
         if capture_traces:
+            # Trajectories carry the raw pre-imputation score with `valid` marking judge
+            # failures; `EvaluationBatch.scores` is the (possibly imputed) fitness GEPA sees.
             trajectories = [
-                _StepTrajectory(step=item.step, predicted=r[0], score=r[1], critique=r[2])
+                _StepTrajectory(
+                    step=item.step, predicted=r[0], score=r[1], critique=r[2], valid=r[3]
+                )
                 for item, r in zip(batch, results, strict=True)
                 if r is not None
             ]
@@ -231,9 +261,24 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
             count = len(eval_batch.trajectories or [])
             self._on_activity(f"distilling {count} scored steps into reflection examples…")
         records: list[Mapping[str, JsonValue]] = []
-        for traj in eval_batch.trajectories or []:
+        # Judge failures carry parse-error critiques ("Unparseable judge reply ...") that would
+        # steer reflection at a non-existent world-model defect — drop them. If the judge failed
+        # on the whole batch, fall back to everything (an empty reflective dataset would break
+        # GEPA's mutation step outright) but with the judge-noise critiques scrubbed: reflection
+        # can still learn from predicted-vs-expected text without chasing parse errors.
+        trajectories = list(eval_batch.trajectories or [])
+        valid_trajectories = [traj for traj in trajectories if traj.valid]
+        for traj in valid_trajectories or trajectories:
             # The same canonical (state, action) text the model saw at prediction time.
             state_action = encode_state_action(traj.step.state_before, traj.step.action)
+            feedback = (
+                f"score={traj.score:.2f}. {traj.critique} "
+                f"Expected (real) observation: {traj.step.observation.content}"
+                if traj.valid
+                else "(judge unavailable for this step — compare the output to the expected "
+                f"observation directly.) Expected (real) observation: "
+                f"{traj.step.observation.content}"
+            )
             records.append(
                 {
                     "Inputs": {
@@ -241,10 +286,7 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
                         "state_action": state_action,
                     },
                     "Generated Outputs": traj.predicted.content,
-                    "Feedback": (
-                        f"score={traj.score:.2f}. {traj.critique} "
-                        f"Expected (real) observation: {traj.step.observation.content}"
-                    ),
+                    "Feedback": feedback,
                 }
             )
         # GEPA only ever asks us to update the components it selected; we own a single one.

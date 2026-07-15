@@ -129,6 +129,36 @@ def test_evaluate_files_zero_shot_without_embedder(tmp_path) -> None:  # noqa: A
     assert report.overall_fidelity == 0.5
 
 
+def test_evaluate_files_excludes_invalid_judgements_from_overall(tmp_path) -> None:  # noqa: ANN001
+    class InvalidOnceJudge:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+            self.calls += 1
+            if self.calls == 1:
+                return JudgeResult(score=0.0, critique="judge broke", valid=False)
+            return JudgeResult(score=0.6, critique="ok")
+
+    corpus = tmp_path / "bench.otel.jsonl"
+    _write_corpus(corpus, n_traces=4)
+    report = evaluate_files(
+        [corpus],
+        "BASE",
+        FakeProvider('{"output": "x"}'),
+        InvalidOnceJudge(),
+        embedder=None,
+        train_split=0.5,
+    )
+    # The judge failure must not drag the overall mean down as a spurious 0.0.
+    assert report.overall_fidelity == 0.6
+    assert report.total_invalid == 1
+    assert report.total_steps > 0
+    assert report.total_valid == report.total_steps - 1
+    # Every reporting surface must disclose the shrunken denominator.
+    assert "1 judge-invalid excluded" in report.summary()
+
+
 def test_evaluate_files_empty_when_no_traces(tmp_path) -> None:  # noqa: ANN001 - fixture
     empty = tmp_path / "empty.otel.jsonl"
     empty.write_text("", encoding="utf-8")

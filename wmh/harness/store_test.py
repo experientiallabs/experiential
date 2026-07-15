@@ -126,3 +126,62 @@ def test_code_surface_round_trips_through_render_and_parse(tmp_path) -> None:  #
     code = loaded.surface(CODE_RUNTIME_ID)
     assert code is not None
     assert code.content == exported.read_text(encoding="utf-8")
+
+
+def test_pi_node_source_tree_renders_and_round_trips(tmp_path: Path) -> None:
+    """A pi-node harness renders its full source tree; a doc.json-less dir recovers it.
+
+    This is what the agent Harness view browses and what a sandbox downloads: the export must be
+    the harness's real directory structure (`src/...`), not just SYSTEM.md/config.toml.
+    """
+    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID
+    from wmh.harness.pi_vendor import pi_agent_code_surfaces
+
+    code_surfaces = pi_agent_code_surfaces()
+    assert code_surfaces, "vendored pi tree should yield code surfaces"
+    doc = HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            *code_surfaces,
+        ],
+    )
+    store = HarnessStore(tmp_path)
+    saved = store.save_version(doc)
+    version_dir = store.dir_for("pi") / f"v{saved.version}"
+
+    # Every code surface rendered to its own path — a real, nested directory tree.
+    for surface in code_surfaces:
+        assert surface.path is not None
+        rendered = version_dir / surface.path
+        assert rendered.exists(), f"{surface.path} missing from the export"
+        assert rendered.read_text(encoding="utf-8") == surface.content
+    assert any("/" in (s.path or "") for s in code_surfaces)  # genuinely nested, not flat
+
+    # doc.json is authoritative when present.
+    assert store.load("pi").doc_hash == doc.doc_hash
+    # Without it, the rendered tree still reconstructs a pi-node harness with the identical code
+    # files (id + path + content). The full doc hash need not match — config.toml materializes the
+    # effective max-turns/temperature the sparse doc omitted — but the source tree is preserved.
+    (version_dir / "doc.json").unlink()
+    reloaded = store.load("pi")
+    assert reloaded.runtime_kind() == "pi-node"
+    original_code = {(s.id, s.path): s.content for s in doc.code_files()}
+    reloaded_code = {(s.id, s.path): s.content for s in reloaded.code_files()}
+    assert reloaded_code == original_code
+
+
+def test_code_surface_path_colliding_with_a_reserved_file_is_rejected(tmp_path: Path) -> None:
+    """A pathful code surface may not shadow SYSTEM.md/config.toml/etc. in the export."""
+    doc = HarnessDoc(
+        name="x",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id="code:sys", kind=SurfaceKind.CODE, path="SYSTEM.md", content="// nope"),
+        ],
+    )
+    store = HarnessStore(tmp_path)
+    with pytest.raises(ValueError, match="reserved file"):
+        store.save_version(doc)

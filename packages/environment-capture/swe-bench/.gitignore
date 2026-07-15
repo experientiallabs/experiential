@@ -7,3 +7,7 @@ runs/
 *.log
 *.traj.json
 preds.json
+
+# concurrency scaling-law report (regenerable; figure is committed, JSON is not)
+conc.json
+conc.png

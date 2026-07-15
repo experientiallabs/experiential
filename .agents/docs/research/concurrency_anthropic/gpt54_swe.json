@@ -1,0 +1,61 @@
+{
+  "name": "concurrency-scaling",
+  "benchmark": "swe-bench",
+  "side": "both",
+  "scenarios": 16,
+  "levels": [
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "_provenance": "Reconstructed from the published per-benchmark table in docs/research/concurrency_scaling_law.md. The original gpt-5.4-mini run used the OpenAI Responses API; that account was deactivated and its raw report JSON was lost, so these are the exact published means/stds/differentials re-materialized as machine-readable data. Fields not determined by the published table (tokens/cost/fidelity) are omitted.",
+  "points": [
+    {
+      "level": 1,
+      "trials": 1,
+      "world_wall_mean": 440.5,
+      "real_wall_mean": 1498.9,
+      "differential": 3.4,
+      "speedup": 1.0,
+      "efficiency": 1.0
+    },
+    {
+      "level": 2,
+      "trials": 1,
+      "world_wall_mean": 249.7,
+      "real_wall_mean": 849.3,
+      "differential": 3.4,
+      "speedup": 1.7641,
+      "efficiency": 0.8821
+    },
+    {
+      "level": 4,
+      "trials": 1,
+      "world_wall_mean": 156.2,
+      "real_wall_mean": 567.6,
+      "differential": 3.63,
+      "speedup": 2.8201,
+      "efficiency": 0.705
+    },
+    {
+      "level": 8,
+      "trials": 1,
+      "world_wall_mean": 144.9,
+      "real_wall_mean": 499.9,
+      "differential": 3.45,
+      "speedup": 3.04,
+      "efficiency": 0.38
+    },
+    {
+      "level": 16,
+      "trials": 1,
+      "world_wall_mean": 140.7,
+      "real_wall_mean": 517.8,
+      "differential": 3.68,
+      "speedup": 3.1308,
+      "efficiency": 0.1957
+    }
+  ]
+}

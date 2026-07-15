@@ -12,7 +12,7 @@ Failing in `__init__` (not at call time) is deliberate: an unimplemented rung mu
 
 from __future__ import annotations
 
-from llm_waterfall.types import Backend, Message, TokenUsage
+from llm_waterfall.types import Backend, ChatRequest, ChatResponse, Message, TokenUsage
 
 
 class AwsMantleAdapter:
@@ -35,6 +35,9 @@ class AwsMantleAdapter:
         temperature: float | None,
         max_tokens: int,
     ) -> tuple[str, TokenUsage]:
+        raise NotImplementedError  # pragma: no cover - unreachable (init raises)
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
         raise NotImplementedError  # pragma: no cover - unreachable (init raises)
 
     def embed(self, texts: list[str]) -> tuple[list[list[float]], TokenUsage]:

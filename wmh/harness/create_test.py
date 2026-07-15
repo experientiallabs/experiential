@@ -12,13 +12,17 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import ClassVar
 
 import pytest
+from llm_waterfall import ChatRequest, ChatResponse
 
+from wmh.core.types import JsonObject
 from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
 from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
+from wmh.harness import create as create_module
 from wmh.harness.create import (
     CreateResult,
     PoolEntry,
@@ -26,8 +30,11 @@ from wmh.harness.create import (
     create_harness,
     select_parent,
 )
+from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc
-from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.runtime import Runtime
+from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
 _CAREFUL_PROMPT = "You are a careful agent. Verify the state of the system before submitting."
@@ -97,6 +104,19 @@ class RoleProvider:
             answer = "done"
         return Completion(text=json.dumps({"tool": "submit", "arguments": {"answer": answer}}))
 
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        del request
+        return ChatResponse.model_validate(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [[0.0] for _ in texts]
 
@@ -125,6 +145,8 @@ def _run(
     k: int = 3,
     holdout: list[TaskSpec] | None = None,
     on_progress: Callable[[int, str, float, bool], None] | None = None,
+    on_note: Callable[[str], None] | None = None,
+    on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
 ) -> CreateResult:
     return create_harness(
         "winner",
@@ -138,6 +160,8 @@ def _run(
         k=k,
         holdout=holdout,
         on_progress=on_progress,
+        on_note=on_note,
+        on_accept=on_accept,
     )
 
 
@@ -208,6 +232,11 @@ def test_create_skips_unusable_proposals() -> None:
     assert result.skipped == 2
     assert result.archive.deltas == []  # nothing to audit: no delta object ever existed
     assert result.best.name == "winner"  # even a search with no children yields the renamed seed
+    # Every iteration is recorded even when its proposal dies before producing anything.
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "unusable"),
+        (2, "unusable"),
+    ]
 
 
 def test_create_audits_invalid_delta_without_spending_eval() -> None:
@@ -338,6 +367,10 @@ def test_screen_rejects_delta_that_does_not_improve_its_trigger() -> None:
     [delta] = result.archive.deltas
     assert delta.verdict is not None and not delta.verdict.accepted
     assert delta.verdict.reason.startswith("screened out")
+    # The dead iteration is still a first-class record, with its screen means attached.
+    [record] = result.iteration_records
+    assert record.iteration == 1 and record.outcome == "screened"
+    assert record.screen_child is not None and record.screen_parent is not None
     # The cheap screen replaced the full eval: only the seed has a full-split report,
     # and no child progress event ever fired.
     assert len(result.reports) == 1
@@ -559,3 +592,550 @@ def test_confirmed_suite_overturn_still_faces_the_holdout_tier() -> None:
     # The holdout tier was measured (not bypassed) and its regression is the rejection.
     assert delta.verdict.holdout_delta is not None and delta.verdict.holdout_delta < 0
     assert result.best_score == pytest.approx(0.5)  # champion stayed the seed
+
+
+# -- harness backends: local (in-process) vs e2b (the pi process in pooled sandboxes) ------------
+
+
+def _pi_seed() -> HarnessDoc:
+    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, Surface, SurfaceKind
+
+    return HarnessDoc(
+        name="seed",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+        ],
+    )
+
+
+def _canned_report(rate: float, *, k: int = 3) -> ClosedLoopReport:
+    outcome = TaskOutcome(task_id="t1", success_rate=rate, mean_fraction=rate, passes=k)
+    return ClosedLoopReport(
+        label="x", success_rate=rate, mean_fraction=rate, k=k, per_task={"t1": outcome}
+    )
+
+
+class _ScriptedPoolChannel:
+    """Plays the runner peer for one pooled episode: a tool_request, then done.
+
+    The same frame script `runner_link_test._FakeChannel` speaks; recv() hands frames to the
+    real `RunnerLink`, send() records what the host answered — the tool_response content is how
+    a test observes WHO answered the tool call.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[JsonObject] = []
+        self._script: list[JsonObject] = [
+            {
+                "type": "tool_request",
+                "req_id": 1,
+                "name": "bash",
+                "arguments": {"command": "verify the work"},
+            },
+            {"type": "done", "answer": "done-verified"},
+        ]
+
+    def send(self, frame: JsonObject) -> None:
+        self.sent.append(frame)
+
+    def recv(self) -> JsonObject | None:
+        return self._script.pop(0) if self._script else None
+
+
+class _FakePool:
+    """Stands in for `E2BSandboxPool`: no sandboxes, one scripted runner channel per acquire."""
+
+    instances: ClassVar[list[_FakePool]] = []
+
+    def __init__(
+        self,
+        *,
+        template: str | None = None,
+        api_key: str | None = None,
+        sandbox_factory: object = None,
+        hello_timeout: float = 0.0,
+    ) -> None:
+        self.template = template
+        self.channels: list[_ScriptedPoolChannel] = []
+        self.releases: list[bool] = []
+        self.closes = 0
+        _FakePool.instances.append(self)
+
+    def usage(self) -> SandboxUsage:
+        return SandboxUsage(count=len(self.channels), seconds=1.5 * len(self.channels))
+
+    def acquire(self) -> tuple[object, _ScriptedPoolChannel]:
+        channel = _ScriptedPoolChannel()
+        self.channels.append(channel)
+        return object(), channel
+
+    def release(self, sandbox: object, channel: object, *, healthy: bool) -> None:
+        self.releases.append(healthy)
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+@pytest.fixture
+def fake_pool_cls(monkeypatch: pytest.MonkeyPatch) -> type[_FakePool]:
+    """Patch the pool at its source module (create_harness imports it lazily from there)."""
+    _FakePool.instances = []
+    monkeypatch.setattr("wmh.harness.pi_e2b.E2BSandboxPool", _FakePool)
+    return _FakePool
+
+
+def test_unknown_harness_backend_is_rejected() -> None:
+    from typing import Literal, cast
+
+    provider = RoleProvider()
+    # Dynamic callers (the platform's optimizer passes a plain str) can hand in anything;
+    # the runtime guard, not the type annotation, is what this test pins.
+    bogus = cast("Literal['local', 'e2b']", "banana")
+    with pytest.raises(ValueError, match="choose local or e2b"):
+        create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            harness_backend=bogus,
+        )
+
+
+def test_e2b_backend_rejects_non_pi_node_seeds() -> None:
+    """e2b moves the pi-node harness PROCESS into sandboxes; in-process seeds must fail early."""
+    provider = RoleProvider()
+    with pytest.raises(ValueError, match="use harness_backend='local'"):
+        create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            harness_backend="e2b",
+        )
+
+
+def test_local_backend_rejects_parallel_pi_node_scoring() -> None:
+    """Local pi runtimes are single-episode (one port/workdir/channel): local stays sequential.
+
+    The guard fires per-doc at scoring time, before any rollout, so a parallel request fails
+    loudly instead of colliding episodes.
+    """
+    provider = RoleProvider()
+    with pytest.raises(ValueError, match="one episode at a time"):
+        create_harness(
+            "winner",
+            _pi_seed(),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            eval_concurrency=2,
+        )
+
+
+def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """harness_backend='e2b': the pi process lives in pooled sandboxes, the env stays the WM.
+
+    The pool is faked (its channels play the runner peer), `evaluate_closed_loop` is the real
+    one wrapped only to record the concurrency each eval was asked for — so every scripted
+    tool_request is really brokered by `RunnerLink` into `WorldModelEnvironment`, and the
+    tool_response carries the world model's marker reply ("ok" from the RoleProvider env role).
+    """
+    provider = RoleProvider()  # default judge passes on the runner's "done-verified" answer
+    concurrencies: list[int] = []
+    real_evaluate = create_module.evaluate_closed_loop
+
+    def spying_evaluate(
+        tasks: list[TaskSpec],
+        world_model: WorldModel,
+        agent_provider: Provider,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+        runtime: Runtime | None = None,
+    ) -> ClosedLoopReport:
+        concurrencies.append(concurrency)
+        return real_evaluate(
+            tasks,
+            world_model,
+            agent_provider,
+            judge,
+            label=label,
+            k=k,
+            concurrency=concurrency,
+            runtime=runtime,
+        )
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", spying_evaluate)
+
+    result = create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=0,  # the seed eval alone exercises the whole scoring path
+        k=3,
+        harness_backend="e2b",
+        e2b_template="tmpl-1",
+    )
+
+    # The judge passed the runner's submitted answer: the eval genuinely ran end to end.
+    assert result.best_score == 1.0
+    assert concurrencies == [0]  # e2b default: every (task, attempt) cell at once
+    [pool] = fake_pool_cls.instances  # ONE shared pool for the whole search
+    assert pool.template == "tmpl-1"
+    # Closed on return (finalizing the usage meter) and again by the finally — the real pool's
+    # close is idempotent, so "at least once, before usage capture" is the contract.
+    assert pool.closes >= 1
+    assert result.sandbox_usage is not None
+    assert result.sandbox_usage.count == len(pool.channels)  # the fake meters per acquire
+    assert len(pool.channels) == 3  # one pooled runner episode per (task, attempt) cell
+    assert pool.releases == [True, True, True]  # healthy episodes return their sandboxes
+    for channel in pool.channels:
+        kinds = [f.get("type") for f in channel.sent]
+        assert kinds == ["episode_start", "tool_response"]
+        response = channel.sent[1]
+        # The WORLD MODEL answered the tool: "ok" is the RoleProvider env-role marker reply.
+        assert response.get("content") == "ok" and response.get("is_error") is False
+
+
+def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    provider = RoleProvider()
+
+    def exploding_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
+        raise RuntimeError("boom mid-eval")
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", exploding_evaluate)
+    with pytest.raises(RuntimeError, match="boom mid-eval"):
+        create_harness(
+            "winner",
+            _pi_seed(),
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            harness_backend="e2b",
+        )
+    [pool] = fake_pool_cls.instances
+    assert pool.closes == 1  # the try/finally tears the pool down even on failure
+
+
+def test_eval_concurrency_overrides_both_backend_defaults(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """An explicit eval_concurrency reaches the scorer; unset local keeps the sequential default."""
+    provider = RoleProvider()
+    concurrencies: list[int] = []
+
+    def fake_evaluate(
+        tasks: list[TaskSpec],
+        world_model: WorldModel,
+        agent_provider: Provider,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+        runtime: Runtime | None = None,
+    ) -> ClosedLoopReport:
+        concurrencies.append(concurrency)
+        return _canned_report(1.0, k=k)
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", fake_evaluate)
+
+    def run(seed: HarnessDoc, *, harness_backend: str, eval_concurrency: int | None) -> None:
+        create_harness(
+            "winner",
+            seed,
+            _tasks(),
+            _wm(provider),
+            provider,
+            provider,
+            GoldJudge(provider),
+            iterations=0,  # score the seed only: one eval call per run
+            harness_backend="local" if harness_backend == "local" else "e2b",
+            eval_concurrency=eval_concurrency,
+        )
+
+    run(HarnessDoc.baseline("seed"), harness_backend="local", eval_concurrency=None)
+    run(HarnessDoc.baseline("seed"), harness_backend="local", eval_concurrency=4)
+    run(_pi_seed(), harness_backend="e2b", eval_concurrency=2)
+    assert concurrencies == [1, 4, 2]  # local defaults sequential; explicit caps pass through
+
+
+def test_create_sums_worker_usage_across_score_waves(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """CreateResult.worker_usage is the sum of every score wave's report.worker_usage.
+
+    Regression: the pi worker path self-meters tokens on each ClosedLoopReport, but the search
+    dropped them on the floor (the accumulator list was declared and summed, never appended to),
+    so CreateResult.worker_usage came back None and the platform's worker cost booked $0.00
+    despite real agent LLM spend. Seed + one screened child = two waves here.
+    """
+    from wmh.harness.runtime import TokenUsage
+
+    provider = RoleProvider(meta_reply=_meta_reply(HarnessDoc.baseline("seed"), _CAREFUL_PROMPT))
+
+    def fake_evaluate(
+        tasks: list[TaskSpec],
+        world_model: WorldModel,
+        agent_provider: Provider,
+        judge: GoldJudge,
+        *,
+        label: str,
+        k: int,
+        concurrency: int,
+        runtime: Runtime | None = None,
+    ) -> ClosedLoopReport:
+        report = _canned_report(0.5, k=k)
+        return report.model_copy(
+            update={"worker_usage": TokenUsage(input_tokens=100, output_tokens=10, calls=2)}
+        )
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", fake_evaluate)
+
+    result = create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=1,
+        harness_backend="e2b",
+    )
+
+    # Before the fix this was None (each wave's usage was never accumulated); now it sums
+    # every wave. At least the seed wave ran (2 calls / 100in / 10out per wave), and the totals
+    # hold that exact per-call ratio however many waves the search took.
+    assert result.worker_usage is not None
+    assert result.worker_usage.calls >= 2
+    assert result.worker_usage.calls % 2 == 0
+    assert result.worker_usage.input_tokens == 50 * result.worker_usage.calls
+    assert result.worker_usage.output_tokens == 5 * result.worker_usage.calls
+
+
+def test_create_worker_usage_is_none_when_no_wave_reports_it(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """Local runtimes don't self-meter: worker_usage stays None (never a zero-token TokenUsage)."""
+    provider = RoleProvider()
+
+    monkeypatch.setattr(
+        create_module,
+        "evaluate_closed_loop",
+        lambda *a, **k: _canned_report(1.0, k=k.get("k", 3)),
+    )
+
+    result = create_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=0,
+        harness_backend="local",
+    )
+
+    assert result.worker_usage is None
+
+
+def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """A candidate that flips param:runtime-kind is archived invalid, not a run-aborting raise.
+
+    Regression (Greptile P1): `doc.runtime(backend="e2b")` raises for non-pi-node docs; a meta
+    proposal that rewrote the runtime-kind surface escaped the invalid-delta handling and
+    aborted the whole search.
+    """
+    seed = _pi_seed()
+    kind = seed.surface("param:runtime-kind")
+    assert kind is not None
+    escape = json.dumps(
+        {
+            "expected_effect": "run in-process instead",
+            "preconditions": {"param:runtime-kind": kind.content_hash},
+            "ops": [
+                {
+                    "op": "replace",
+                    "surface_id": "param:runtime-kind",
+                    "content": "kit-python",
+                    "rationale": "abandon the pi runtime",
+                }
+            ],
+        }
+    )
+    provider = RoleProvider(meta_reply=escape)
+    monkeypatch.setattr(
+        create_module,
+        "evaluate_closed_loop",
+        lambda *a, **k: _canned_report(0.5, k=k.get("k", 3)),
+    )
+
+    result = create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        provider,
+        GoldJudge(provider),
+        iterations=1,
+        harness_backend="e2b",
+    )
+
+    assert result.skipped == 1  # the escape delta was rejected, not fatal
+    [delta] = result.archive.deltas
+    assert delta.verdict is not None and not delta.verdict.accepted
+    assert "pi-node only" in delta.verdict.reason
+    assert result.best_score == 0.5  # the seed stayed champion and the search finished
+
+
+class _MetaExplodingProvider(RoleProvider):
+    """RoleProvider whose meta-agent calls raise (an API rejecting the request outright)."""
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Completion:
+        if "meta-agent improving an agent harness" in system:
+            msg = "max_tokens above model output limit"
+            raise RuntimeError(msg)
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_proposer_call_failure_skips_the_iteration_not_the_run() -> None:
+    """A meta-provider exception (output-cap rejection, rate limit) costs one iteration.
+
+    Same contract as an unusable reply, but narrated with the error; the search must not
+    abort on the first provider fault.
+    """
+    provider = _MetaExplodingProvider()
+    notes: list[str] = []
+    result = _run(provider, iterations=2, on_note=notes.append)
+
+    assert result.skipped == 2
+    assert result.best.name == "winner"  # the seed still wins; the run completed
+    assert len(notes) == 2
+    assert all("proposer call failed" in note for note in notes)
+    assert all("max_tokens above model output limit" in note for note in notes)
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "proposer_error"),
+        (2, "proposer_error"),
+    ]
+
+
+class _SequencedMetaProvider(RoleProvider):
+    """RoleProvider whose meta-agent replies follow a script, one per proposal call."""
+
+    def __init__(self, replies: list[str]) -> None:
+        super().__init__()
+        self._replies = replies
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Completion:
+        if "meta-agent improving an agent harness" in system:
+            self.meta_users.append(messages[-1].content)
+            reply = self._replies[min(len(self.meta_users) - 1, len(self._replies) - 1)]
+            return Completion(text=reply)
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_on_accept_delivers_the_new_champion_the_moment_it_is_crowned() -> None:
+    """Accepted champions stream out live, so callers can persist them in real time."""
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    crowned: list[tuple[str, bool, float]] = []
+    result = _run(
+        provider,
+        on_accept=lambda doc, delta, score: crowned.append(
+            (doc.system_prompt(), delta.verdict is not None and delta.verdict.accepted, score)
+        ),
+    )
+
+    assert result.best_score == 1.0
+    [(prompt, verdict_accepted, score)] = crowned
+    assert prompt == _CAREFUL_PROMPT  # the actual champion doc, not a name or hash
+    assert verdict_accepted is True  # the delta arrives with its verdict already attached
+    assert score == 1.0
+
+
+def test_dead_iteration_ends_early_and_the_search_moves_on() -> None:
+    """A dead proposal costs its iteration cheaply; the next iteration proceeds normally.
+
+    Iteration 1's proposal is unusable; iteration 2 proposes the genuine fix. Both appear
+    in the records, and the scored one keeps its own iteration number.
+    """
+    seed = HarnessDoc.baseline("seed")
+    provider = _SequencedMetaProvider(["garbage, not json", _meta_reply(seed, _CAREFUL_PROMPT)])
+    progress: list[tuple[int, str, float, bool]] = []
+    result = _run(
+        provider, iterations=2, on_progress=lambda i, n, r, a: progress.append((i, n, r, a))
+    )
+
+    assert result.skipped == 1
+    assert result.best_score == 1.0
+    assert result.best.system_prompt() == _CAREFUL_PROMPT
+    assert [e[0] for e in progress] == [0, 2]  # the dead iteration fires no progress event
+    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+        (1, "unusable"),
+        (2, "scored"),
+    ]
+    scored = result.iteration_records[-1]
+    assert scored.accepted is True and scored.score == 1.0
+    assert scored.candidate == "winner-g2"
+
+
+def test_skipped_iterations_narrate_through_on_note() -> None:
+    """Every iteration whose proposal dies before scoring reports itself.
+
+    Regression: a run whose proposals were all unusable (e.g. truncated meta replies on huge
+    pi code surfaces) emitted NO progress events at all; five iterations looked like one.
+    """
+    provider = RoleProvider(meta_reply="truncated garbage that is not json")
+    notes: list[str] = []
+    result = _run(provider, iterations=3, on_note=notes.append)
+
+    assert result.skipped == 3
+    assert len(notes) == 3
+    assert all("proposal unusable" in note for note in notes)
+    assert [note.split(":")[0] for note in notes] == [
+        "iteration 1/3",
+        "iteration 2/3",
+        "iteration 3/3",
+    ]

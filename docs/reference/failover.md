@@ -32,9 +32,12 @@ Per-call cost is attributed to the model that actually served (`Completion.model
 **The judge never rides the chain.** Fidelity scoring (`RubricJudge` in `wmh eval` and as
 GEPA's fitness signal in `wmh build`) stays pinned to the single requested backend: a judge
 that silently switches models mid-run scores steps on different scales and makes fidelity
-numbers incomparable. If the pinned judge model throttles, judge failures are retried once,
-then excluded from aggregates as `valid=False` (reported as `judge-invalid` counts) — never
-scored by a different model.
+numbers incomparable. Judge failures are handled at two layers, never by switching models:
+a MALFORMED reply (missing dimension, no JSON, scale confusion) is retried once with feedback,
+then excluded from aggregates as `valid=False` (reported as `judge-invalid` counts). A judge
+call that RAISES (throttle/5xx after the provider's own retries) is treated as judge-invalid
+during `wmh build` (GEPA imputes and continues) but aborts `wmh eval` — a partially judged
+eval would silently change what the fidelity mean is over.
 
 Keep the file out of git: profile names identify accounts and it may carry an API key
 (`.wmh/` is gitignored wholesale). Known quirk: `verify()` pings each rung with a tiny

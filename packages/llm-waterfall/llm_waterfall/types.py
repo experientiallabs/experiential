@@ -10,9 +10,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 Role = Literal["user", "assistant"]
+ChatMaxTokensField = Literal["max_completion_tokens", "max_tokens"]
 
 PROVIDERS = ("openai", "anthropic", "azure_openai", "bedrock", "aws_mantle")
 
@@ -46,6 +47,7 @@ class Backend:
     # mid-generation cutoff wastes the whole call — but a stalled connection must still raise
     # (and thus fail over) instead of hanging forever.
     read_timeout_s: float = 600.0
+    chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
 
     def __post_init__(self) -> None:
         if self.provider not in PROVIDERS:
@@ -111,6 +113,146 @@ class CompletionResult(BaseModel):
     attempts: list[Attempt] = Field(default_factory=list)
 
 
+JsonObject = dict[str, JsonValue]
+
+
+class ChatFunctionCall(BaseModel):
+    """Function name plus its JSON-encoded arguments in an assistant tool call."""
+
+    name: str
+    arguments: str
+
+
+class ChatToolCall(BaseModel):
+    """One OpenAI-compatible assistant tool call."""
+
+    id: str
+    type: Literal["function"] = "function"
+    function: ChatFunctionCall
+
+
+class ChatMessage(BaseModel):
+    """One structured chat turn, including tool calls and tool results."""
+
+    model_config = ConfigDict(extra="allow")
+
+    role: Literal["system", "developer", "user", "assistant", "tool"]
+    content: JsonValue = None
+    tool_calls: list[ChatToolCall] | None = None
+    tool_call_id: str | None = None
+
+
+class ChatFunctionDefinition(BaseModel):
+    """Function schema advertised to a tool-calling model."""
+
+    name: str
+    description: str = ""
+    parameters: JsonObject = Field(default_factory=dict)
+
+
+class ChatTool(BaseModel):
+    """One OpenAI-compatible function tool definition."""
+
+    type: Literal["function"] = "function"
+    function: ChatFunctionDefinition
+
+
+class ChatRequest(BaseModel):
+    """Provider-neutral structured chat request used by agent runtimes.
+
+    Known tool-calling fields are validated explicitly. ``extra="allow"`` preserves newer
+    OpenAI-compatible request fields emitted by an agent SDK without weakening the typed core.
+    Providers call :meth:`provider_payload` to force a non-streaming request for the framed pi
+    transport and to stamp their own routed model/deployment.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    messages: list[ChatMessage] = Field(default_factory=list)
+    model: str | None = None
+    tools: list[ChatTool] | None = None
+    tool_choice: JsonValue = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    stream: bool = False
+    stream_options: JsonObject | None = None
+
+    def provider_payload(
+        self,
+        model: str,
+        *,
+        max_tokens_field: ChatMaxTokensField = "max_completion_tokens",
+    ) -> JsonObject:
+        """Return the non-streaming wire payload for a provider-routed model."""
+        payload = self.model_dump(mode="json", exclude_none=True)
+        payload["model"] = model
+        payload["stream"] = False
+        payload.pop("stream_options", None)
+        if max_tokens_field == "max_tokens":
+            alternate = payload.pop("max_completion_tokens", None)
+            if alternate is not None and "max_tokens" not in payload:
+                payload["max_tokens"] = alternate
+        else:
+            alternate = payload.pop("max_tokens", None)
+            if alternate is not None and "max_completion_tokens" not in payload:
+                payload["max_completion_tokens"] = alternate
+        return payload
+
+
+class ChatUsage(BaseModel):
+    """OpenAI-compatible structured completion usage."""
+
+    model_config = ConfigDict(extra="allow")
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class ChatChoice(BaseModel):
+    """One structured completion choice."""
+
+    model_config = ConfigDict(extra="allow")
+
+    index: int = 0
+    message: ChatMessage
+    finish_reason: str | None = None
+
+
+class ChatResponse(BaseModel):
+    """Structured completion returned to the agent runtime."""
+
+    model_config = ConfigDict(extra="allow")
+
+    choices: list[ChatChoice]
+    usage: ChatUsage | None = None
+    model: str | None = None
+
+    def token_usage(self) -> TokenUsage:
+        """Project provider usage onto the waterfall's canonical counters."""
+        if self.usage is None:
+            return TokenUsage()
+        return TokenUsage(
+            input_tokens=self.usage.prompt_tokens,
+            output_tokens=self.usage.completion_tokens,
+        )
+
+    def wire_payload(self) -> JsonObject:
+        """Serialize the response back to the OpenAI-compatible pi bridge."""
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+class ChatResult(BaseModel):
+    """A structured completion plus waterfall attribution and failover history."""
+
+    response: ChatResponse
+    model_used: str
+    provider_used: str
+    usage: TokenUsage = Field(default_factory=TokenUsage)
+    cost_usd: float = 0.0
+    attempts: list[Attempt] = Field(default_factory=list)
+
+
 class EmbeddingResult(BaseModel):
     """Embedding vectors plus the same attribution as `CompletionResult`."""
 
@@ -141,6 +283,10 @@ class WaterfallExhausted(RuntimeError):
 
 class EmbeddingsUnsupported(NotImplementedError):
     """Raised by adapters whose provider has no embeddings API; the waterfall skips them."""
+
+
+class ToolCallingUnsupported(NotImplementedError):
+    """Raised by adapters without structured tool-calling support; the waterfall skips them."""
 
 
 def normalize_messages(messages: Sequence[Message | Mapping[str, str]]) -> list[Message]:

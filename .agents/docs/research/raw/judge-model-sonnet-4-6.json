@@ -1,0 +1,187 @@
+{
+  "judge_model": "us.anthropic.claude-sonnet-4-6",
+  "report": {
+    "verdicts": [
+      {
+        "case_id": "exact-json-lookup",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The predicted observation is an exact match to the actual observation in every field, including all flight details, prices, dates, and metadata.",
+        "failures": []
+      },
+      {
+        "case_id": "cosmetic-reordering",
+        "defect": "control",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The predicted observation contains all the same fields and values as the actual observation; only the key ordering within the JSON object differs, which is semantically equivalent.",
+        "failures": []
+      },
+      {
+        "case_id": "volatile-pid-differs",
+        "defect": "control",
+        "passed": true,
+        "score": 0.94,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.9,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 0.95
+        },
+        "critique": "The format, structure, and content length match exactly. The PID is volatile/incidental, so the different value (48211 vs 12345) is acceptable \u2014 both are plausible PIDs from a background process launch.",
+        "failures": []
+      },
+      {
+        "case_id": "wrong-computed-values",
+        "defect": "control",
+        "passed": true,
+        "score": 0.3600000000000001,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.1,
+          "consistency": 0.8,
+          "realism": 0.9,
+          "quality": 0.2
+        },
+        "critique": "The format and structure match perfectly (same number of lines, same content_length, no error), but the actual version numbers differ substantially from the predicted ones \u2014 only 0.1.0 and 1.0.0 match exactly. Since this is deterministic file content, the wrong version values are a significant factuality failure.",
+        "failures": []
+      },
+      {
+        "case_id": "fabricated-lookup-data",
+        "defect": "control",
+        "passed": true,
+        "score": 0.275,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 0.05,
+          "consistency": 0.5,
+          "realism": 0.8,
+          "quality": 0.1
+        },
+        "critique": "The format and structure match perfectly (same JSON fields, no error), but nearly every factual detail is wrong: user_id, origin, destination, flight_type, cabin, flight numbers, intermediate stops, dates, and prices all differ from the actual observation.",
+        "failures": []
+      },
+      {
+        "case_id": "right-facts-wrong-shape",
+        "defect": "control",
+        "passed": true,
+        "score": 0.54,
+        "dimensions": {
+          "format": 0.2,
+          "factuality": 0.7,
+          "consistency": 0.9,
+          "realism": 0.2,
+          "quality": 0.3
+        },
+        "critique": "The prediction captures the correct factual content (reservation ID, user, route, flights, prices, dates) but presents it as a natural-language summary rather than the structured JSON object the environment actually returns. The format is wrong \u2014 a real API response would be JSON, not prose \u2014 which hurts format and realism scores significantly.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-nonempty-actual",
+        "defect": "empty-prediction",
+        "passed": true,
+        "score": 0.030000000000000006,
+        "dimensions": {
+          "format": 0.1,
+          "factuality": 0.0,
+          "consistency": 0.1,
+          "realism": 0.1,
+          "quality": 0.0
+        },
+        "critique": "The prediction returned empty content while the actual observation contained the full list of chalk version numbers. The prediction completely omitted the file's contents, which is the critical data the agent would act on.",
+        "failures": []
+      },
+      {
+        "case_id": "empty-pred-empty-actual",
+        "defect": "both-empty",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "Both actual and predicted observations are empty with no error, matching exactly \u2014 the command redirected output to a file, producing no stdout.",
+        "failures": []
+      },
+      {
+        "case_id": "error-flipped-to-pretty-success",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.08,
+        "dimensions": {
+          "format": 0.2,
+          "factuality": 0.0,
+          "consistency": 0.3,
+          "realism": 0.3,
+          "quality": 0.0
+        },
+        "critique": "The prediction returned a successful user lookup with a user_id, but the actual observation was an error indicating the user was not found. The is_error flag is flipped and the content is completely wrong \u2014 this is a fundamental factuality failure.",
+        "failures": []
+      },
+      {
+        "case_id": "success-flipped-to-error",
+        "defect": "outcome-flip",
+        "passed": true,
+        "score": 0.05,
+        "dimensions": {
+          "format": 0.1,
+          "factuality": 0.0,
+          "consistency": 0.1,
+          "realism": 0.3,
+          "quality": 0.0
+        },
+        "critique": "The prediction returns an error indicating the reservation was not found, while the actual observation successfully retrieved detailed reservation data for EHGLP3. The predicted outcome is completely opposite to the actual result \u2014 a clear factuality failure.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-identical",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 1.0,
+        "dimensions": {
+          "format": 1.0,
+          "factuality": 1.0,
+          "consistency": 1.0,
+          "realism": 1.0,
+          "quality": 1.0
+        },
+        "critique": "The predicted observation is an exact match to the actual observation in every detail: same content, same content_length (34889), same is_error flag, and identical structure.",
+        "failures": []
+      },
+      {
+        "case_id": "long-output-divergent-tail",
+        "defect": "long-observation",
+        "passed": true,
+        "score": 0.4,
+        "dimensions": {
+          "format": 0.9,
+          "factuality": 0.2,
+          "consistency": 0.7,
+          "realism": 0.8,
+          "quality": 0.3
+        },
+        "critique": "The predicted output correctly matches the actual for items 0\u20131899 in format and structure, but critically diverges at items 1900\u20131999: the prediction shows FAIL/corrupted statuses whereas the actual shows all items as OK. This is a significant factuality failure since an agent would act on the FAIL entries as real problems. The content_length also differs (36089 vs 34889).",
+        "failures": []
+      }
+    ]
+  }
+}

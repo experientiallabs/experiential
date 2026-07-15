@@ -7,6 +7,8 @@ cache or substitute them; `wmh scenarios build` extracts them fresh.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 from pydantic import BaseModel
 
@@ -17,6 +19,7 @@ from wmh.scenarios.mining.facets import TraceFacet
 from wmh.scenarios.mining.selection import (
     DEDUP_THRESHOLD,
     PROPORTIONAL_FRACTION,
+    SelectedTrace,
     hybrid_select,
 )
 from wmh.scenarios.synthesis import EvalScenario, ScenarioSet, ScenarioSynthesizer
@@ -33,6 +36,9 @@ class ScenarioBuildConfig(BaseModel):
     dedup_threshold: float = DEDUP_THRESHOLD
     proportional_fraction: float = PROPORTIONAL_FRACTION
     coverage_tau: float = 0.7  # facet counts as covered when cosine-within-tau of a selection
+    # LLM calls in the build (facet extraction, synthesis + back-agreement) are independent
+    # per trace/selection: run them on a small thread pool, order-preserving. 1 = sequential.
+    concurrency: int = 8
 
 
 def build_scenario_set(
@@ -74,9 +80,8 @@ def build_scenario_set(
     cluster_names = {cluster.cluster_id: cluster.name for cluster in clusters}
     synthesizer = ScenarioSynthesizer(provider)
     judge = ChecklistJudge(judge_provider or provider) if config.validate_checklists else None
-    scenarios: list[EvalScenario] = []
-    dropped = 0
-    for selection in selections:
+
+    def _synthesize_one(selection: SelectedTrace) -> EvalScenario | None:
         source = traces_by_id[selection.trace_id]
         scenario = synthesizer.synthesize(source, facets_by_id[selection.trace_id])
         if judge is not None:
@@ -86,13 +91,23 @@ def build_scenario_set(
             if not _checklist_agrees(judge, scenario, source):
                 scenario = synthesizer.synthesize(source, facets_by_id[selection.trace_id])
                 if not _checklist_agrees(judge, scenario, source):
-                    dropped += 1
-                    continue
+                    return None
         scenario.cluster_name = cluster_names.get(selection.cluster_id, "")
         scenario.weight = selection.weight
         if selection.pinned_failure is not None:
             scenario.failure_category = selection.pinned_failure
-        scenarios.append(scenario)
+        return scenario
+
+    # Selections are independent (synthesis + back-agreement are per-trace LLM round trips), so
+    # they run on a small thread pool; `pool.map` preserves selection order, keeping the built
+    # set (and its weight renormalization) deterministic. concurrency=1 is the sequential loop.
+    if config.concurrency > 1 and len(selections) > 1:
+        with ThreadPoolExecutor(max_workers=min(config.concurrency, len(selections))) as pool:
+            maybe_scenarios = list(pool.map(_synthesize_one, selections))
+    else:
+        maybe_scenarios = [_synthesize_one(selection) for selection in selections]
+    scenarios = [scenario for scenario in maybe_scenarios if scenario is not None]
+    dropped = sum(1 for scenario in maybe_scenarios if scenario is None)
 
     selected_ids = {scenario.provenance[0] for scenario in scenarios}
     coverage = _corpus_coverage(facets, embeddings, selected_ids, tau=config.coverage_tau)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from llm_waterfall.types import Backend, Message, TokenUsage
+from llm_waterfall.types import Backend, ChatRequest, ChatResponse, Message, TokenUsage
 
 
 def missing_sdk_error(package: str, extra: str) -> ModuleNotFoundError:
@@ -36,6 +36,10 @@ class Adapter(Protocol):
         max_tokens: int,
     ) -> tuple[str, TokenUsage]:
         """Run one completion; return (text, usage). Raises the SDK's native errors."""
+        ...
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run one structured tool-calling completion."""
         ...
 
     def embed(self, texts: list[str]) -> tuple[list[list[float]], TokenUsage]:

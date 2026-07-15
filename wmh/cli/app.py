@@ -36,8 +36,10 @@ from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
 from rich.table import Table
 
 import wmh.providers as providers
+from wmh.cli.agent_session import register as register_agent_session_commands
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmh.cli.harness_app import harness_app
+from wmh.cli.platform_cmds import register as register_platform_commands
 from wmh.cli.ui import (
     BuildParams,
     RichBuildReporter,
@@ -65,8 +67,10 @@ from wmh.config import (
     settings_path,
     validate_name,
 )
+from wmh.config.card import make_build_card, save_card
+from wmh.core.types import JsonObject
 from wmh.engine.build import build as run_build
-from wmh.engine.build import ingest
+from wmh.engine.build import ingest, split_traces
 from wmh.engine.demo import run_demo
 from wmh.engine.eval_suites import (
     discover_eval_suites,
@@ -79,11 +83,16 @@ from wmh.engine.world_model import WorldModel
 from wmh.env.llm_agent import LLMAgent
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull, get_adapter, list_adapters
-from wmh.optimize.judge import LLMJudge, RubricJudge
+from wmh.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
-from wmh.providers.retry import RetryingProvider
-from wmh.retrieval import HashingEmbedder, get_embedder
+from wmh.providers.models import resolve_provider_model
+from wmh.providers.retry import wrap_provider_with_retries
+from wmh.research import Side, run_concurrency_scaling
+from wmh.research.concurrency_run import build_real_runner, build_world_runner
+from wmh.research.concurrency_scaling import ConcurrencyPoint
+from wmh.retrieval import EmbeddingRetriever, HashingEmbedder, get_embedder
+from wmh.retrieval.leakfree import DemoRetriever
 from wmh.scenarios import (
     ChecklistJudge,
     FacetExtractor,
@@ -113,6 +122,9 @@ examples_app = typer.Typer(
     help="List and launch self-contained task examples.", no_args_is_help=True
 )
 config_app = typer.Typer(help="Manage local harness config.", no_args_is_help=True)
+research_app = typer.Typer(
+    help="Research experiments over the harness (scaling laws, ablations).", no_args_is_help=True
+)
 scenarios_app = typer.Typer(
     help="Construct and verify representative eval scenario sets from traces.",
     no_args_is_help=True,
@@ -120,8 +132,11 @@ scenarios_app = typer.Typer(
 app.add_typer(providers_app, name="providers")
 app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
+app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
+register_platform_commands(app)
+register_agent_session_commands(app)
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
@@ -130,6 +145,30 @@ _EVAL_TOKENS = typer.Argument(
     None,
     help="Trace files to score, or eval flow: list | run <suite> | results optional-suite.",
 )
+# Repeatable option default hoisted out of the signature (ruff B008 forbids the call inline).
+_RESEARCH_REAL_ARG = typer.Option(
+    None, "--real-arg", help="Extra arg forwarded to the real sandbox run.sh; repeat for several."
+)
+_RESEARCH_PLOT_REPORT = typer.Argument(..., help="ConcurrencyScalingReport JSON file to plot.")
+_RESEARCH_PLOT_COMBINED = typer.Argument(
+    ..., help="ConcurrencyScalingReport JSONs to overlay (one per benchmark)."
+)
+# Flags each real runner needs so concurrent scenarios stay COLD/FRESH (as if on separate machines)
+# and measure the TRUE standup cost. swe-bench: `--mode build` forces the honest from-source standup
+# (base image + conda/pip env install + repo clone/checkout/install, minutes/env) instead of pulling
+# SWE-bench's prebuilt image (~16s, which under-counts the real environment cost ~15-30x); plus
+# `--no-family-purge` keeps each instance's own build cold without deleting sibling runs' images.
+# terminal-tasks needs nothing — it already builds a per-run unique image tag under concurrency.
+# tau-bench's real side is in-process (no docker), so it is always isolated.
+_CONCURRENCY_ISOLATION_FLAGS: dict[str, tuple[str, ...]] = {
+    # --cache-shared: build the shared base+env images once, but cold-build the per-instance image
+    # at every level (the marginal per-scenario standup). Correct for this fixed-N sweep, where the
+    # same scenarios repeat across levels — plain --no-family-purge would rebuild the 660MB base for
+    # every scenario and let concurrent workers clobber each other's base image. (--cache-shared
+    # implies no family purge.)
+    "swe-bench": ("--mode", "build", "--cache-shared"),
+}
+
 _DOWNLOAD_BENCHMARKS = typer.Argument(
     None, help="Benchmark bundles to download, or 'all'. Omit for a picker."
 )
@@ -141,7 +180,6 @@ class _EvalOptions:
     train_split: float
     embed_dim: int
     use_rag: bool
-    judge: str
     sample_turns: str
     seed: int
     top_k: int
@@ -270,12 +308,12 @@ def build(
     provider: str = typer.Option(
         None, "--provider", help="Provider that serves the model (default: bedrock)."
     ),
-    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Serve provider model id."),
+    model: str = typer.Option("claude-opus-4-8", help="Canonical serve model type."),
     judge_model: str = typer.Option(
-        None, "--judge-model", help="GEPA judge model id (default: cheap model per provider)."
+        None, "--judge-model", help="Canonical GEPA judge model type (default: cheap per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
-    chain: str | None = typer.Option(
+    chain: str = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
     ),
     gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
@@ -435,6 +473,23 @@ def build(
         )
     record = tracker.record_summary()
     save_run(record, ArtifactPaths(model_dir).runs)
+    # The card is additive metadata; a write failure (disk full, permissions) must not make an
+    # otherwise-complete build exit non-zero and then block retries with "already exists".
+    try:
+        save_card(
+            make_build_card(
+                name=params.name,
+                provider=params.provider,
+                model_id=params.model,
+                traces=build_stats.input_trace_count,
+                steps=build_stats.input_step_count,
+                built_at=datetime.now(UTC).isoformat(),
+                source=Path(params.file).name if params.file else params.vendor,
+            ),
+            model_dir,
+        )
+    except OSError as err:
+        _console.print(f"[yellow]warning[/yellow]: could not write card.json: {err}")
     capture_build_completed(
         stats=build_stats,
         gepa_budget=params.gepa_budget,
@@ -595,18 +650,23 @@ def serve(
         None, "--name", help="World model(s) to serve. Repeatable; default: all built ones."
     ),
     port: int = typer.Option(8000, help="Port for the local backend."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir to serve from."),
+    root: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
+        [ARTIFACT_DIR],
+        "--root",
+        help="Project dir(s) to serve from. Repeatable; server-side builds land in the first.",
+    ),
 ) -> None:
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
-    Serves every built model by default, or just the `--name` ones. Routes are namespaced:
+    Serves every built model by default, or just the `--name` ones, from one or more roots
+    (e.g. `--root .wmh --root examples/tau-bench`). Routes are namespaced:
     `/world_models/{name}/sessions` and `.../step`.
     """
     names = list(name) if name else None
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
     # not a traceback; load the models before uvicorn takes over the process.
     try:
-        server_app = create_app(root, names=names)
+        server_app = create_app(list(root), names=names)
     except (ValueError, FileNotFoundError) as err:
         raise typer.BadParameter(str(err)) from None
     uvicorn.run(server_app, host="127.0.0.1", port=port)
@@ -625,7 +685,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         None, "--prompt", help="Prompt file; default=BASE_ENV_PROMPT."
     ),
     provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
-    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id."),
+    model: str = typer.Option("claude-opus-4-8", help="Canonical model type."),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     chain: str | None = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
@@ -639,14 +699,15 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     rag: bool | None = typer.Option(
         None, "--rag/--no-rag", help="Enable retrieval, or disable it for zero-shot replay."
     ),
-    judge: str | None = typer.Option(
-        None, help="Scorer: rubric (5-dim) | match (functional). Default: rubric, or suite config."
+    sample_turns: str | None = typer.Option(
+        None, help="Turns scored per trace: all | sampled (5). Default: all, or suite config."
     ),
     judge_model: str | None = typer.Option(
         None,
         "--judge-model",
-        help="Pin the judge to its own model instead of the serve model. Comparing fidelity "
-        "across serve backends REQUIRES a pinned judge, or the grader changes with the cell.",
+        help="Pin the fidelity judge to its own model instead of the serve model. Comparing "
+        "fidelity across serve backends REQUIRES a pinned judge, or the grader changes "
+        "with the cell.",
     ),
     judge_provider: str = typer.Option(
         "bedrock", "--judge-provider", help="Provider for --judge-model."
@@ -654,11 +715,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     judge_region: str | None = typer.Option(
         None,
         "--judge-region",
-        help="AWS region for --judge-model (default: --region). Pin it when serve cells "
-        "vary --region, or the 'pinned' judge still changes region per cell.",
-    ),
-    sample_turns: str | None = typer.Option(
-        None, help="Turns scored per trace: all | sampled (5). Default: all, or suite config."
+        help="AWS region for --judge-model (default: --region). Pin it when serve cells vary "
+        "--region, or the 'pinned' judge still changes region per cell.",
     ),
     seed: int | None = typer.Option(None, help="Seed for reproducible turn sampling."),
     top_k: int | None = typer.Option(
@@ -690,6 +748,28 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     harness: str | None = typer.Option(
         None, "--harness", help="Stored harness to run for `closed-loop` (default: baseline)."
     ),
+    harness_backend: str = typer.Option(
+        "local",
+        "--harness-backend",
+        help="Where the closed-loop harness PROCESS runs: local (in/from this process) or e2b "
+        "(the pi-node harness inside pooled E2B sandboxes). The environment is always the "
+        "world model.",
+    ),
+    eval_concurrency: int | None = typer.Option(
+        None,
+        "--eval-concurrency",
+        min=0,
+        help="Closed-loop (task, attempt) cells run at once. Default: 1 for local; "
+        "0 (= all cells at once) for e2b.",
+    ),
+    e2b_template: str | None = typer.Option(
+        None,
+        "--e2b-template",
+        envvar="WMH_E2B_TEMPLATE",
+        help="Prebaked E2B sandbox template for --harness-backend e2b (default: "
+        "$WMH_E2B_TEMPLATE; without one, sandboxes bootstrap node + the pi runner deps on "
+        "first use).",
+    ),
 ) -> None:
     """Score reconstruction fidelity, or run named example-local eval suites.
 
@@ -697,8 +777,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmh eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
       default mode).
     - `wmh eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
-      as its environment; score task success against gold assertions
-      (see docs/reference/closed_loop.md).
+      as its environment; `--harness-backend e2b` moves the pi-node harness process into pooled
+      E2B sandboxes (the env stays the world model, all cells in parallel); score task success
+      against gold assertions (see docs/reference/closed_loop.md).
     - `wmh eval list`: list named suites under `examples/<task>/evals/`.
     - `wmh eval run <suite>`: run a suite and save a local JSON result.
     - `wmh eval results optional-suite`: summarize local suite results.
@@ -723,6 +804,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             max_turns=max_turns,
             out=out,
             harness=harness,
+            harness_backend=harness_backend,
+            eval_concurrency=eval_concurrency,
+            e2b_template=e2b_template,
         )
         return
     if args and args[0] == "agreement":
@@ -755,12 +839,10 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             train_split=train_split,
             embed_dim=embed_dim,
             rag=rag,
-            chain=chain,
-            judge=judge,
+            sample_turns=sample_turns,
             judge_model=judge_model,
             judge_provider=judge_provider,
             judge_region=judge_region,
-            sample_turns=sample_turns,
             seed=seed,
             top_k=top_k,
             out=out,
@@ -777,7 +859,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         train_split=train_split,
         embed_dim=embed_dim,
         rag=rag,
-        judge=judge,
         sample_turns=sample_turns,
         seed=seed,
         top_k=top_k,
@@ -799,9 +880,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     capture_eval_completed(
         mode="ad_hoc",
         file_count=len(args),
-        scored_step_count=report.total_steps,
+        scored_step_count=report.total_valid,
         rag_enabled=options.use_rag,
-        judge_mode=options.judge,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
         top_k=options.top_k,
@@ -818,14 +898,12 @@ def _eval_list(examples_roots: list[str]) -> None:
     table.add_column("Suite", no_wrap=True)
     table.add_column("Files")
     table.add_column("Split")
-    table.add_column("Scorer")
     table.add_column("Description")
     for suite in suites:
         table.add_row(
             suite.id,
             ", ".join(suite.config.files),
             f"{suite.config.train_split:.2f}",
-            suite.config.judge,
             suite.config.description or "",
         )
     _console.print(table)
@@ -857,13 +935,16 @@ def _eval_results(
     table.add_column("Steps", justify="right")
     table.add_column("Path")
     for summary in summaries:
+        steps = str(summary.total_steps)
+        if summary.total_invalid:
+            steps += f" ({summary.total_invalid} inv)"
         table.add_row(
             summary.suite,
             summary.run_id[:8],
             summary.started_at,
             summary.model,
             f"{summary.overall_fidelity:.3f}±{summary.overall_std:.3f}",
-            str(summary.total_steps),
+            steps,
             str(summary.path),
         )
     _console.print(table)
@@ -881,12 +962,10 @@ def _eval_run_suite(
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
-    chain: str | None,
-    judge: str | None,
+    sample_turns: str | None,
     judge_model: str | None,
     judge_provider: str,
     judge_region: str | None,
-    sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
     out: str | None,
@@ -898,7 +977,6 @@ def _eval_run_suite(
         train_split=train_split if train_split is not None else suite.config.train_split,
         embed_dim=embed_dim if embed_dim is not None else suite.config.embed_dim,
         rag=rag if rag is not None else not suite.config.no_rag,
-        judge=judge or suite.config.judge,
         sample_turns=sample_turns or suite.config.sample_turns,
         seed=seed if seed is not None else suite.config.seed,
         top_k=top_k if top_k is not None else suite.config.top_k,
@@ -910,9 +988,9 @@ def _eval_run_suite(
         provider=provider,
         model=model,
         region=region,
-        chain=chain,
         judge_model=judge_model,
         judge_provider=judge_provider,
+        judge_region=judge_region,
     )
     _print_eval_report(report)
 
@@ -930,9 +1008,6 @@ def _eval_run_suite(
             "provider": provider,
             "model": model,
             "region": region,
-            "judge_model": judge_model,
-            "judge_provider": judge_provider if judge_model else None,
-            "judge_region": (judge_region or region) if judge_model else None,
             "prompt": options.prompt_file,
             "files": [str(path) for path in files],
             "train_split": options.train_split,
@@ -940,7 +1015,6 @@ def _eval_run_suite(
             "sample_turns": options.sample_turns,
             "seed": options.seed,
             "rag": options.use_rag,
-            "judge": options.judge,
             "embed_dim": options.embed_dim,
         },
         "report": _eval_report_payload(report),
@@ -950,9 +1024,8 @@ def _eval_run_suite(
     capture_eval_completed(
         mode="suite",
         file_count=len(files),
-        scored_step_count=report.total_steps,
+        scored_step_count=report.total_valid,
         rag_enabled=options.use_rag,
-        judge_mode=options.judge,
         sample_turns=options.sample_turns,
         train_split=options.train_split,
         top_k=options.top_k,
@@ -966,7 +1039,6 @@ def _eval_options(
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
-    judge: str | None,
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
@@ -974,7 +1046,6 @@ def _eval_options(
     split = 0.7 if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
     retrieval = True if rag is None else rag
-    scorer = "rubric" if judge is None else judge
     turns = "all" if sample_turns is None else sample_turns
     rng_seed = 0 if seed is None else seed
     demos = 5 if top_k is None else top_k
@@ -984,8 +1055,6 @@ def _eval_options(
         raise typer.BadParameter("--embed-dim must be positive")
     if demos < 0:
         raise typer.BadParameter("--top-k must be >= 0")
-    if scorer not in {"rubric", "match"}:
-        raise typer.BadParameter("--judge must be one of: rubric, match")
     if turns not in {"all", "sampled"}:
         raise typer.BadParameter("--sample-turns must be one of: all, sampled")
     return _EvalOptions(
@@ -993,7 +1062,6 @@ def _eval_options(
         train_split=split,
         embed_dim=dim,
         use_rag=retrieval,
-        judge=scorer,
         sample_turns=turns,
         seed=rng_seed,
         top_k=demos,
@@ -1015,12 +1083,7 @@ def _run_eval_files(
     for path in files:
         if not path.exists():
             raise typer.BadParameter(f"trace file not found: {path}")
-    try:
-        serve_provider = ProviderKind(provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in ProviderKind)
-        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    provider_config = ProviderConfig(kind=serve_provider, model=model, region=region)
+    provider_config = _provider_config(provider, model, region)
     llm = providers.provider_or_chain(provider_config, chain=chain)
     if isinstance(llm, providers.WaterfallProvider):
         _console.print("failover chain active (.wmh/fallback.toml) — world-model calls only")
@@ -1033,8 +1096,8 @@ def _run_eval_files(
     # The judge is the metric: it stays PINNED to the single requested backend and never rides
     # the failover chain — a judge that silently switches models mid-run makes fidelity numbers
     # incomparable across steps. World-model prediction calls (above) may fail over freely.
-    # --judge-model additionally pins the judge to its OWN model: comparing fidelity
-    # across serve backends requires a constant grader, or the judge changes with the cell.
+    # --judge-model additionally pins the judge to its OWN model/region: comparing
+    # fidelity across serve backends requires a constant grader.
     if judge_model:
         try:
             judge_kind = ProviderKind(judge_provider)
@@ -1048,8 +1111,7 @@ def _run_eval_files(
         )
     else:
         judge_config = provider_config
-    judge_llm = providers.get_provider(judge_config)
-    scorer = RubricJudge(judge_llm) if options.judge == "rubric" else LLMJudge(judge_llm)
+    scorer = RubricJudge(providers.get_provider(judge_config))
     evaluation = OpenLoopEval(
         files,
         prompt,
@@ -1067,9 +1129,10 @@ def _run_eval_files(
 def _print_eval_report(report: EvalReport) -> None:
     for name, rep in report.per_file.items():
         _console.print(f"  {name:28} {rep.summary()}")
+    invalid = f" ({report.total_invalid} judge-invalid excluded)" if report.total_invalid else ""
     _console.print(
         f"[bold]OVERALL[/bold] fidelity={report.overall_fidelity:.3f}±{report.overall_std:.3f} "
-        f"over {report.total_steps} held-out steps"
+        f"over {report.total_steps} held-out steps{invalid}"
     )
 
 
@@ -1081,11 +1144,13 @@ def _write_ad_hoc_eval_report(path: Path, report: EvalReport) -> None:
     _console.print(f"wrote full report -> {path}")
 
 
-def _eval_report_payload(report: EvalReport) -> dict[str, object]:
+def _eval_report_payload(report: EvalReport) -> JsonObject:
     return {
+        "judge_version": JUDGE_VERSION,
         "overall_fidelity": report.overall_fidelity,
         "overall_std": report.overall_std,
         "total_steps": report.total_steps,
+        "total_invalid": report.total_invalid,
         "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
     }
 
@@ -1162,7 +1227,7 @@ def scenarios_verify(
     name: str = typer.Option(None, "--name", help="World model to roll against."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding world models."),
     provider: str = typer.Option(None, "--provider", help="Override serve provider kind."),
-    model: str = typer.Option(None, help="Override serve model id (e.g. a small/cheap model)."),
+    model: str = typer.Option(None, help="Override canonical serve model type."),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     max_steps: int = typer.Option(12, help="Rollout step budget per scenario."),
     drop: bool = typer.Option(False, "--drop", help="Write back only verified scenarios."),
@@ -1178,10 +1243,8 @@ def scenarios_verify(
     if provider is not None or model is not None:
         store = WorldModelStore(root)
         model_dir = store.resolve(_resolve_name(store, name))
-        override = _provider_config(
-            provider or "bedrock", model or "us.anthropic.claude-opus-4-8", region
-        )
-        llm = RetryingProvider(providers.get_provider(override))
+        override = _provider_config(provider or "bedrock", model or "claude-opus-4-8", region)
+        llm = wrap_provider_with_retries(providers.get_provider(override))
         world_model = WorldModel.load(str(model_dir), llm)
     else:
         world_model, _resolved_name, llm = _load_model(name, root)
@@ -1238,11 +1301,17 @@ def _provider_config(provider: str, model: str, region: str | None) -> ProviderC
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
-    return ProviderConfig(kind=kind, model=model, region=region)
+    spec = resolve_provider_model(kind, model)
+    return ProviderConfig(
+        kind=kind,
+        model_type=spec.model_type,
+        model=spec.model_id,
+        region=region,
+    )
 
 
 _SCENARIO_DEFAULT_PROVIDER = "bedrock"
-_SCENARIO_DEFAULT_MODEL = "us.anthropic.claude-opus-4-8"
+_SCENARIO_DEFAULT_MODEL = "claude-opus-4-8"
 
 
 def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
@@ -1414,7 +1483,7 @@ def demo(
             # failed step — completed steps stay done.
             _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
             _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
-            provider_name, model_id, region = select_provider_and_model(
+            provider_name, model_type, region = select_provider_and_model(
                 _console,
                 lambda text: _console.input(text),
                 lambda text: _console.input(text, password=True),
@@ -1424,15 +1493,14 @@ def demo(
                 interactive=True,
                 check=lambda cfg: verify_all([cfg])[0],
             )
-            switched = ProviderConfig(
-                kind=ProviderKind(provider_name), model=model_id, region=region
-            )
-            provider = RetryingProvider(
+            switched = _provider_config(provider_name, model_type, region)
+            provider = wrap_provider_with_retries(
                 providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
             )
             wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
             _console.print(
-                f"[dim]resuming from step {len(done) + 1} with {provider_name} ({model_id})…[/dim]"
+                f"[dim]resuming from step {len(done) + 1} with "
+                f"{provider_name} ({model_type})…[/dim]"
             )
     matches = sum(1 for d in done if d.exact_match)
     _console.print(f"\n{matches}/{len(done)} exact matches (run `wmh eval` for judged fidelity)")
@@ -1613,6 +1681,251 @@ def _resolve_example(name: str) -> Path:
     raise typer.BadParameter(f"unknown example {name!r}{hint}")
 
 
+@research_app.command("concurrency")
+def research_concurrency(
+    suite: str = typer.Argument(
+        ..., help="Eval suite / example name (e.g. tau-bench) — its corpus + config are reused."
+    ),
+    scenarios: int = typer.Option(16, "--scenarios", help="Batch size N held fixed across levels."),
+    levels: str = typer.Option(
+        "1,2,4,8,16", "--levels", help="Comma-separated concurrency levels (baseline first)."
+    ),
+    trials: int = typer.Option(1, "--trials", help="Timed repeats per level (for error bars)."),
+    select: str = typer.Option(
+        "random",
+        "--select",
+        help="Which held-out scenarios to draw: random (default — a representative sample) | "
+        "simplest (fewest steps) | longest. simplest/longest order by step count to check whether "
+        "a result is robust to the trace sample; the biased draws must not be the default.",
+    ),
+    select_seed: int = typer.Option(0, "--select-seed", help="Seed for --select random."),
+    side: str = typer.Option(
+        "both", "--side", help="both = differential | world = WM-only | real = sandbox-only."
+    ),
+    provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
+    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id (environment LLM)."),
+    region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
+    deployment: str | None = typer.Option(None, help="Azure OpenAI deployment name."),
+    api_version: str | None = typer.Option(None, help="Azure OpenAI API version."),
+    endpoint: str | None = typer.Option(None, help="Azure OpenAI / custom base URL."),
+    real_arg: list[str] | None = _RESEARCH_REAL_ARG,
+    real_timeout: float | None = typer.Option(
+        None, "--real-timeout", help="Abort a real sandbox run after N seconds."
+    ),
+    out: str | None = typer.Option(None, help="Path to write the ConcurrencyScalingReport JSON."),
+    examples_root: str | None = typer.Option(None, help="Examples dir. Default: repo-local."),
+) -> None:
+    """Measure the concurrency scaling law: batch wall-clock vs. how many scenarios run at once.
+
+    Reconstructs a fixed batch of N held-out scenarios from `suite`'s corpus at each concurrency
+    level, timing the world-model batch and (with `--side both`) the matching real-sandbox batch,
+    to give the time differential T_real(W)/T_world(W). Reuses the suite's corpus + config
+    (train_split, top_k, prompt) and the example's `run.sh`. See `wmh.research.concurrency_run`.
+    """
+    if scenarios < 1:
+        raise typer.BadParameter("--scenarios must be at least 1")
+    try:
+        which = Side(side)
+    except ValueError:
+        allowed = ", ".join(s.value for s in Side)
+        raise typer.BadParameter(f"--side must be one of: {allowed}") from None
+    # Validate the provider up front, not lazily inside a worker thread mid-sweep.
+    try:
+        provider_kind = ProviderKind(provider)
+    except ValueError:
+        kinds = ", ".join(k.value for k in ProviderKind)
+        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+    if select not in ("simplest", "longest", "random"):
+        raise typer.BadParameter("--select must be one of: simplest, longest, random")
+    try:
+        level_list = [int(x) for x in levels.split(",") if x.strip()]
+    except ValueError:
+        raise typer.BadParameter(
+            f"--levels must be a comma-separated list of integers, got {levels!r}"
+        ) from None
+    if not level_list:
+        raise typer.BadParameter("--levels must list at least one concurrency level")
+    if any(level < 1 for level in level_list):
+        raise typer.BadParameter("--levels must be positive concurrency counts")
+    # Every level runs the same N scenarios, so a level above N would silently cap its effective
+    # concurrency at N and just duplicate the N-worker point — a misleading flat tail.
+    if max(level_list) > scenarios:
+        raise typer.BadParameter(
+            f"--levels goes up to {max(level_list)} but only --scenarios {scenarios} run at each "
+            f"level, so W>{scenarios} would just duplicate W={scenarios}. Raise --scenarios to "
+            f"{max(level_list)} or drop levels above {scenarios}."
+        )
+
+    suite_roots = (
+        [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
+    )
+    resolved = resolve_eval_suite(suite, suite_roots)
+    files = resolved.resolve_files()
+    missing = [f for f in files if not f.exists()]
+    if not files or missing:
+        raise typer.BadParameter(f"suite {suite!r} has no trace corpus at {missing or files}")
+    adapter = get_adapter("otel-genai")
+    traces = [t for f in files for t in adapter.from_file(str(f))]
+    if not traces:
+        raise typer.BadParameter(f"suite {suite!r} ingested no traces")
+
+    # Draw N held-out scenarios, so both sides replay the SAME held-out traces by index — keep N
+    # within the held-out pool so the split stays aligned. `--select` picks the drawing rule:
+    # `random` (default — a representative sample) or `simplest`/`longest`, which order by step
+    # count to check a result is robust to the trace sample rather than an artifact of it.
+    train, holdout = split_traces(traces, resolved.config.train_split)
+    pool = holdout or traces
+    need = scenarios
+    if need > len(pool):
+        raise typer.BadParameter(
+            f"need {need} scenario(s) but suite {suite!r} has only {len(pool)} held-out trace(s); "
+            "lower --scenarios/--levels or grow the corpus"
+        )
+    indexed = list(enumerate(pool))
+    if select == "random":
+        random.Random(select_seed).shuffle(indexed)
+    else:  # simplest | longest — order by step count, ascending or descending
+        indexed.sort(key=lambda item: len(item[1].steps), reverse=(select == "longest"))
+    selected = indexed[:need]
+
+    # Prompt + retrieval mirror the suite's eval config, so the timed reconstruction is the same
+    # work `wmh eval run <suite>` scores.
+    suite_prompt = resolved.resolve_prompt()
+    prompt = (
+        suite_prompt.read_text(encoding="utf-8") if suite_prompt is not None else BASE_ENV_PROMPT
+    )
+    use_rag = not resolved.config.no_rag
+    embedder = HashingEmbedder(dim=resolved.config.embed_dim) if use_rag else None
+    demos = DemoRetriever(
+        EmbeddingRetriever(embedder) if embedder is not None else None,
+        train if use_rag else [],
+        top_k=resolved.config.top_k,
+    )
+
+    def provider_factory() -> Provider:
+        return providers.get_provider(
+            ProviderConfig(
+                kind=provider_kind,
+                model=model,
+                region=region,
+                deployment=deployment,
+                api_version=api_version,
+                endpoint=endpoint,
+            )
+        )
+
+    world_runner = build_world_runner(provider_factory, prompt, demos, selected)
+    real_runner = None
+    if which in (Side.BOTH, Side.REAL):
+        example_dir = _resolve_example(resolved.example)
+        real_extra = list(real_arg or [])
+        # Force each runner's cold-standup + isolation flags so the real side pays its TRUE from-
+        # source standup and concurrent sandboxes don't clobber each other's docker state (see
+        # _CONCURRENCY_ISOLATION_FLAGS). Skipped if the caller passed their own real-runner args.
+        # Prepend the forced cold-standup/isolation flags; any user `--real-arg` comes AFTER so it
+        # can still override (argparse takes the last value), but the forced flags are never dropped
+        # just because the user passed an unrelated arg.
+        forced = _CONCURRENCY_ISOLATION_FLAGS.get(resolved.example, ())
+        if forced:
+            real_extra = list(forced) + real_extra
+            _console.print(
+                f"[yellow]{resolved.example}: real runner uses {' '.join(forced)} "
+                "(true from-source cold standup, isolated per concurrent scenario)[/yellow]"
+            )
+        real_runner = build_real_runner(
+            example_dir,
+            selected,
+            train_split=resolved.config.train_split,
+            extra_args=real_extra,
+            timeout=real_timeout,
+        )
+
+    batch_desc = f"batch of {len(selected)}"
+    _console.print(
+        f"\n[bold]concurrency scaling[/bold] {suite}: {batch_desc} held-out "
+        f"scenario(s), levels={level_list}, side={which.value}, trials={trials}\n"
+    )
+
+    def _progress(point: ConcurrencyPoint) -> None:
+        _console.print(f"  {point.summary()}")
+
+    report = run_concurrency_scaling(
+        world_runner,
+        real_runner,
+        levels=level_list,
+        scenarios=len(selected),
+        trials=trials,
+        side=which,
+        on_point=_progress,
+    )
+    report.benchmark = resolved.example
+
+    # Speedup vs. W=1 is a like-for-like ratio because every level runs the same fixed-N batch.
+    best = report.best_speedup()
+    if best is not None and best.speedup:
+        _console.print(
+            f"\n[bold]best world-model speedup[/bold]: {best.speedup:.2f}x at concurrency "
+            f"{best.level} (efficiency {best.efficiency:.0%})"
+        )
+    if out:
+        Path(out).write_text(report.model_dump_json(indent=2), encoding="utf-8")
+        _console.print(f"wrote report -> {out}")
+
+
+@research_app.command("plot-concurrency")
+def research_plot_concurrency(
+    report: str = _RESEARCH_PLOT_REPORT,
+    out: str = typer.Option("concurrency_scaling.png", "--out", help="Output image path."),
+    title: str = typer.Option("Concurrency scaling law", "--title", help="Figure title."),
+) -> None:
+    """Render a concurrency scaling-law report JSON to a figure (needs the `viz` extra).
+
+    Draws batch wall-clock vs. concurrency (log-log, mean±std), the world-model speedup vs.
+    ideal-linear, and the T_real/T_world differential when the report has both sides.
+
+    `concurrency_plot` is imported here (not at module scope) because it pulls in matplotlib/pandas
+    from the optional `viz` extra — the harness runtime must not require them. A missing extra
+    raises a plain ImportError naming the module (`uv sync --extra viz`); it is not caught.
+    """
+    from wmh.research.concurrency_plot import render_report
+
+    try:
+        written = render_report(report, out, title=title)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _console.print(f"wrote figure -> {written}")
+
+
+@research_app.command("plot-concurrency-combined")
+def research_plot_concurrency_combined(
+    reports: list[str] = _RESEARCH_PLOT_COMBINED,
+    out_speedup: str = typer.Option(
+        "concurrency_speedup.png", "--out-speedup", help="Output path for the speed-up figure."
+    ),
+    out_cost: str = typer.Option(
+        "concurrency_cost.png", "--out-cost", help="Output path for the cost figure."
+    ),
+) -> None:
+    """Render the cross-benchmark comparison as two standalone figures (needs the `viz` extra).
+
+    Overlays several benchmarks so their RELATIVE differences read at a glance, split into two
+    self-contained images: the speed-up figure (how many times faster the world model is than the
+    real environment, per benchmark) and the cost figure (the reconstruction-vs-real-setup cost that
+    explains it). Pass the per-benchmark report JSONs (`wmh research concurrency <suite> --out ...`)
+    in the order you want them coloured.
+
+    Imported lazily for the same reason as `plot-concurrency` (the optional matplotlib viz extra).
+    """
+    from wmh.research.concurrency_plot import render_cost, render_speedup
+
+    try:
+        speedup_path = render_speedup(reports, out_speedup)
+        cost_path = render_cost(reports, out_cost)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _console.print(f"wrote figures -> {speedup_path}, {cost_path}")
+
+
 def _short_error(exc: Exception) -> str:
     """The error's code + service message, without transport chatter.
 
@@ -1688,7 +2001,7 @@ def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, nam
     resolved_name = _resolve_name(store, name)
     model_dir = store.resolve(resolved_name)
     config = load_config(model_dir)
-    provider = RetryingProvider(
+    provider = wrap_provider_with_retries(
         providers.get_provider(config.serve_provider_config()),
         on_retry=_NARRATOR.on_retry,
         sleep=_NARRATOR.sleep,

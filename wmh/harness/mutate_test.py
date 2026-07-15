@@ -21,6 +21,7 @@ class ScriptedProvider:
         self.systems: list[str] = []
         self.users: list[str] = []
         self.temperatures: list[float] = []
+        self.max_tokens_seen: list[int] = []
 
     def complete(
         self,
@@ -33,6 +34,7 @@ class ScriptedProvider:
         self.systems.append(system)
         self.users.append(messages[-1].content)
         self.temperatures.append(temperature)
+        self.max_tokens_seen.append(max_tokens)
         return Completion(text=self._text)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -139,3 +141,53 @@ def test_all_pass_evidence_asks_for_generalization() -> None:
     evidence = render_evidence(trigger, report, [TaskSpec(task_id="t", instruction="do it")])
     assert "passed every task" in evidence
     assert "GENERALIZE" in evidence
+
+
+def test_prompt_exposes_pi_code_files_as_editable_levers() -> None:
+    """A pi-node harness shows the meta agent its real source files, and the code lever names them.
+
+    "Real harness getting optimized": the vendored pi `code:` surfaces are in the prompt with
+    their content and hashes, and the system instructions call pathful `code:` files an editable
+    lever — so the proposer can diff `src/...`, not just the prompt/skills.
+    """
+    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, Surface, SurfaceKind
+    from wmh.harness.pi_vendor import pi_agent_code_surfaces
+
+    code_surfaces = pi_agent_code_surfaces()
+    parent = HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            *code_surfaces,
+        ],
+    )
+    provider = ScriptedProvider(_reply(parent))
+    propose_delta(parent, _trigger(), "the agent never compacts context", provider)
+    user, system = provider.users[0], provider.systems[0]
+
+    # Every pi source file is in the prompt with its id, hash, and full content.
+    for surface in code_surfaces:
+        assert surface.id in user
+        assert surface.content_hash in user
+        assert surface.content in user
+    # The system instructions frame pathful code surfaces as an editable lever, not just runtime.
+    assert "pathful" in system and "code:" in system
+
+
+def test_proposer_reply_budget_fits_a_full_pi_file_rewrite() -> None:
+    """Ops carry complete replacement content: the reply cap must fit the largest pi source.
+
+    Regression: max_tokens=4096 truncated every real code-surface proposal (largest vendored
+    file ~36 KB ≈ ~10k tokens), so multi-iteration searches silently skipped every iteration.
+    """
+    from wmh.harness.pi_vendor import pi_agent_code_surfaces
+
+    parent = HarnessDoc.baseline("parent")
+    provider = ScriptedProvider(_reply(parent))
+    propose_delta(parent, _trigger(), "evidence", provider)
+    [max_tokens] = provider.max_tokens_seen
+    largest = max(len(s.content) for s in pi_agent_code_surfaces())
+    # ~4 bytes/token; JSON escaping and rationale need headroom beyond the raw file.
+    assert max_tokens * 4 > largest * 1.3

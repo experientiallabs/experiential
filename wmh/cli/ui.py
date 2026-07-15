@@ -54,6 +54,7 @@ from wmh.engine.play import PlayTurn, parse_action, play_turn
 from wmh.engine.world_model import WorldModel
 from wmh.providers import verify_all, verify_embedder
 from wmh.providers.base import ProviderConfig, ProviderKind, VerifyResult
+from wmh.providers.models import resolve_provider_model
 
 # A reader takes a fully-rendered prompt string and returns the user's typed line.
 PromptReader = Callable[[str], str]
@@ -68,13 +69,15 @@ _ACTIVITY_WINDOW_LINES = 8
 # in each list is the suggested default. Keep these in sync with the provider backends.
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "openai": ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini"],
-    "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
-    "bedrock": [
-        "us.anthropic.claude-opus-4-8",
-        "us.anthropic.claude-opus-4-7",
-        # haiku needs the dated inference-profile id; the undated alias is rejected by Bedrock
-        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "anthropic": [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
     ],
+    # Keep this picker curated to inference profiles verified by the normal interactive flow.
+    # The full canonical registry remains available to flags and programmatic callers.
+    "bedrock": ["claude-opus-4-8", "claude-opus-4-7", "claude-haiku-4-5"],
     # openai_responses (the Responses API) stays flag-only (`wmh build --provider
     # openai_responses`); the wizard list keeps to the four everyday backends.
     "azure": ["gpt-5.5", "gpt-5.4"],
@@ -86,7 +89,7 @@ _DEFAULT_REGIONS: dict[str, str] = {"bedrock": "us-east-1"}
 _JUDGE_MODEL_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5",
     "openai": "gpt-5.4-mini",
-    "bedrock": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "bedrock": "claude-haiku-4-5",
 }
 
 
@@ -125,8 +128,8 @@ class BuildParams(BaseModel):
     # None = not chosen yet: the wizard suggests the first provider with credentials present,
     # and the non-interactive path falls back to bedrock.
     provider: str | None = None
-    model: str = "us.anthropic.claude-opus-4-8"
-    # GEPA judge model id; None = pick the cheap per-provider default in the wizard/build.
+    model: str = "claude-opus-4-8"
+    # Canonical GEPA judge model type; None = pick the cheap per-provider default.
     judge_model: str | None = None
     region: str | None = None
     gepa_budget: int = 10
@@ -253,7 +256,7 @@ def select_provider_and_model(
         model = _select(
             console,
             ask,
-            "Serve model id",
+            "Serve model type",
             _PROVIDER_MODELS[provider],
             default_model,
             interactive=interactive,
@@ -266,7 +269,15 @@ def select_provider_and_model(
         # Live ping now, not at the end: a bad key or model id loops straight back to the
         # picker (the failed pick becomes the suggested retry default).
         console.print(f"verifying {provider}…")
-        ping = check(ProviderConfig(kind=ProviderKind(provider), model=model, region=region))
+        model_spec = resolve_provider_model(ProviderKind(provider), model)
+        ping = check(
+            ProviderConfig(
+                kind=ProviderKind(provider),
+                model_type=model_spec.model_type,
+                model=model_spec.model_id,
+                region=region,
+            )
+        )
         if ping.ok:
             console.print(f"  {_CHECK} {provider} ({escape(model)}) reachable")
             return provider, model, region
@@ -369,7 +380,7 @@ def run_build_wizard(
         judge_model = _select(
             console,
             ask,
-            "GEPA judge model id",
+            "GEPA judge model type",
             judge_options,
             judge_default,
             interactive=interactive,
@@ -379,7 +390,15 @@ def run_build_wizard(
         if judge_model == model:
             break  # the serve model was just verified
         console.print(f"verifying {provider} (judge)…")
-        ping = check(ProviderConfig(kind=ProviderKind(provider), model=judge_model, region=region))
+        judge_spec = resolve_provider_model(ProviderKind(provider), judge_model)
+        ping = check(
+            ProviderConfig(
+                kind=ProviderKind(provider),
+                model_type=judge_spec.model_type,
+                model=judge_spec.model_id,
+                region=region,
+            )
+        )
         if ping.ok:
             console.print(f"  {_CHECK} {provider} ({escape(judge_model)}) reachable")
             break

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "terminal-tasks",
+  "title": "Terminal tasks",
+  "description": "A bash terminal reconstructed from real terminal-agent sessions: file operations, package queries, text processing. Send shell commands and read the output the real shell would have produced.",
+  "task": "terminal-tasks",
+  "corpus": {
+    "traces": 71,
+    "steps": 158,
+    "source": "traces.otel.jsonl"
+  },
+  "provider": "bedrock",
+  "model_id": "us.anthropic.claude-opus-4-8",
+  "fidelity": {
+    "suite": "trace-scaling (open-loop RAG)",
+    "score": 0.8663,
+    "std": 0.0025,
+    "run_id": "docs/trace_scaling_results/terminal-tasks.json#base@160"
+  },
+  "cost_per_step_usd": null,
+  "latency_per_step_s": null,
+  "built_at": "2026-06-29T15:21:47-07:00",
+  "license": null,
+  "tags": [
+    "bash",
+    "terminal"
+  ]
+}

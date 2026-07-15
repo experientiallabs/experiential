@@ -1,0 +1,85 @@
+{
+  "name": "concurrency-scaling",
+  "benchmark": "terminal-tasks",
+  "side": "both",
+  "scenarios": 16,
+  "levels": [
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "points": [
+    {
+      "level": 1,
+      "trials": 2,
+      "world_wall_mean": 70.20594662499207,
+      "world_wall_std": 5.327563749990077,
+      "real_wall_mean": 245.7357989999873,
+      "real_wall_std": 0.34878158298670314,
+      "world_fidelity_mean": 0.9411764705882353,
+      "world_tokens_mean": 363610.0,
+      "world_cost_mean": 0.38831000000000004,
+      "speedup": 1.0,
+      "efficiency": 1.0,
+      "differential": 3.5002134550310267
+    },
+    {
+      "level": 2,
+      "trials": 2,
+      "world_wall_mean": 34.316639374999795,
+      "world_wall_std": 2.7866819170012604,
+      "real_wall_mean": 140.00274395900487,
+      "real_wall_std": 0.2250227499898756,
+      "world_fidelity_mean": 0.9411764705882353,
+      "world_tokens_mean": 363478.5,
+      "world_cost_mean": 0.3876524999999999,
+      "speedup": 2.045828143537219,
+      "efficiency": 1.0229140717686096,
+      "differential": 4.079733520205917
+    },
+    {
+      "level": 4,
+      "trials": 2,
+      "world_wall_mean": 19.01807056250982,
+      "world_wall_std": 2.647146937495563,
+      "real_wall_mean": 132.00096852099523,
+      "real_wall_std": 0.022150353994220495,
+      "world_fidelity_mean": 0.9411764705882353,
+      "world_tokens_mean": 363612.5,
+      "world_cost_mean": 0.3883225,
+      "speedup": 3.691538865324673,
+      "efficiency": 0.9228847163311682,
+      "differential": 6.940818107027521
+    },
+    {
+      "level": 8,
+      "trials": 2,
+      "world_wall_mean": 15.807078874509898,
+      "world_wall_std": 0.15021670849819202,
+      "real_wall_mean": 135.84222410450457,
+      "real_wall_std": 1.3065087294962723,
+      "world_fidelity_mean": 0.9411764705882353,
+      "world_tokens_mean": 363446.5,
+      "world_cost_mean": 0.3874925,
+      "speedup": 4.4414244518134485,
+      "efficiency": 0.5551780564766811,
+      "differential": 8.59375885847956
+    },
+    {
+      "level": 16,
+      "trials": 2,
+      "world_wall_mean": 19.62250618750113,
+      "world_wall_std": 1.1075603124918416,
+      "real_wall_mean": 140.71764697899926,
+      "real_wall_std": 0.32451393801602535,
+      "world_fidelity_mean": 0.9411764705882353,
+      "world_tokens_mean": 363650.5,
+      "world_cost_mean": 0.3885125,
+      "speedup": 3.5778277226234674,
+      "efficiency": 0.2236142326639667,
+      "differential": 7.1712372331232395
+    }
+  ]
+}

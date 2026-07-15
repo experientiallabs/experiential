@@ -27,8 +27,13 @@ files = ["../traces.otel.jsonl"]   # resolved relative to this file
 train_split = 0.7
 sample_turns = "all"
 seed = 0
-judge = "rubric"
 ```
+
+There is no judge knob: every suite is scored by the single `RubricJudge`. A pre-overhaul
+`judge = "..."` line makes the suite fail validation: loading the file directly (`wmh eval
+run path/to/suite.toml`) raises an error saying to delete the line, while name-based discovery
+skips the suite with that same message as a warning on stderr — if a suite is missing from
+`wmh eval list`, check the warnings.
 
 ## Running
 
@@ -40,7 +45,7 @@ wmh eval results tau-bench       # ... or one suite
 wmh eval <trace files...>        # ad hoc replay scoring, no suite needed
 ```
 
-Suite CLI flags (`--prompt`, `--judge`, `--train-split`, `--top-k`, …) override the suite's pinned config for one-off comparisons. Results are written under `.wmh/evals/` (local artifacts, not committed).
+Suite CLI flags (`--prompt`, `--train-split`, `--top-k`, …) override the suite's pinned config for one-off comparisons. Results are written under `.wmh/evals/` (local artifacts, not committed).
 
 ## How it layers
 
