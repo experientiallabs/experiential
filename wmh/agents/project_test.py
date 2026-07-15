@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Literal, overload
+
 import pytest
 from llm_waterfall import ChatResponse
 
+import wmh.agents.project as project_module
 from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
@@ -14,14 +17,25 @@ from wmh.providers.base import ProviderConfig, ProviderKind
 
 class _Files:
     def __init__(self) -> None:
-        self.values: dict[str, str] = {}
+        self.values: dict[str, str | bytes] = {}
 
     def write(self, path: str, data: str) -> object:
         self.values[path] = data
         return None
 
-    def read(self, path: str) -> str:
-        return self.values[path]
+    @overload
+    def read(self, path: str) -> str: ...
+
+    @overload
+    def read(self, path: str, *, format: Literal["bytes"]) -> bytes: ...
+
+    def read(self, path: str, *, format: Literal["bytes"] | None = None) -> str | bytes:
+        value = self.values[path]
+        if format == "bytes":
+            assert isinstance(value, bytes)
+            return value
+        assert isinstance(value, str)
+        return value
 
 
 class _Output:
@@ -158,3 +172,39 @@ def test_project_rejects_agents_with_uncontained_tools() -> None:
     )
     assert outcome.is_error is True
     assert outcome.content == "tool 'bash' not available"
+
+
+def test_project_exports_one_deterministic_regular_file_archive() -> None:
+    """One sandbox command archives project files without following links."""
+    sandbox = _Sandbox()
+    sandbox.files.values["/home/user/.wmh-agent-project.tar.gz"] = b"archive-bytes"
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    content = project.export_archive()
+
+    assert content == b"archive-bytes"
+    archive_command, cleanup_command = sandbox.commands.runs[-2:]
+    assert archive_command.startswith("cd /home/user/project && find . -mindepth 1 -xdev")
+    assert "-type f -o -type d" in archive_command
+    assert "sort -z" in archive_command
+    assert "--no-recursion" in archive_command
+    assert "--mtime=@0" in archive_command
+    assert "gzip -n" in archive_command
+    assert cleanup_command == "rm -f /home/user/.wmh-agent-project.tar.gz"
+
+
+def test_project_archive_rejects_oversize_and_closed_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archives stay within the portable limit and must precede teardown."""
+    sandbox = _Sandbox()
+    sandbox.files.values["/home/user/.wmh-agent-project.tar.gz"] = b"large"
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    monkeypatch.setattr(project_module, "MAX_PROJECT_ARCHIVE_BYTES", 4)
+
+    with pytest.raises(ValueError, match="archive exceeds 4 bytes"):
+        project.export_archive()
+
+    project.close()
+    with pytest.raises(RuntimeError, match="closed project"):
+        project.export_archive()

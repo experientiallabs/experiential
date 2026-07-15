@@ -122,7 +122,9 @@ vendored pi source and `LiveSession` runtime. `AgentProject` gives an agent a pe
 filesystem while starting a fresh session for each turn. `ProjectDeltaProposer` uses that ordinary
 agent/project pair to retain every earlier proposal and generate a sibling batch from one selected
 parent per search round. Proposal batch size controls search breadth; `k` independently controls
-the number of evaluation passes per scenario.
+the number of evaluation passes per scenario. Before teardown, callers can use
+`AgentProject.export_archive()` to download the complete regular-file project as one deterministic
+gzip tar archive for durable storage or later inspection.
 
 ## Providers
 

@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
@@ -26,14 +26,23 @@ from wmh.providers.base import ToolCallingProvider
 
 PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
+MAX_PROJECT_ARCHIVE_BYTES = 50 * 1024 * 1024
 _OUTPUT_CAP = 16_000
 _PROJECT_TOOLS = frozenset({"read_file", "write_file", "submit"})
+_PROJECT_ARCHIVE_PATH = "/home/user/.wmh-agent-project.tar.gz"
+_PROJECT_ARCHIVE_TIMEOUT_S = 300
 
 
 class ChannelFactory(Protocol):
     """Start one fresh runner channel in a project's sandbox."""
 
     def __call__(self, sandbox: SandboxHandle, workspace: str) -> Channel: ...
+
+
+class _BinarySandboxFiles(Protocol):
+    """Binary E2B file read used for one project archive download."""
+
+    def read(self, path: str, *, format: Literal["bytes"]) -> bytes | bytearray: ...
 
 
 @dataclass(frozen=True)
@@ -98,6 +107,43 @@ class AgentProject:
     def read_text(self, path: str) -> str:
         """Read one project-relative file."""
         return self._sandbox.files.read(self._absolute_path(path))
+
+    def export_archive(self) -> bytes:
+        """Export the complete project workspace as a deterministic gzip tar archive.
+
+        The sandbox performs one filesystem walk and one binary download, avoiding a network
+        round trip per proposal file. Only regular files and directories enter the archive;
+        links and special files are excluded. Metadata that would vary between runs is normalized.
+
+        Returns:
+            Portable gzip tar bytes with paths relative to the project workspace.
+
+        Raises:
+            RuntimeError: If the project has already been closed.
+            ValueError: If the compressed archive exceeds the portable size limit.
+        """
+        if self._finished_at is not None:
+            raise RuntimeError("cannot export a closed project")
+        workspace = shlex.quote(self.workspace)
+        archive_path = shlex.quote(_PROJECT_ARCHIVE_PATH)
+        self._sandbox.commands.run(
+            f"cd {workspace} && "
+            "find . -mindepth 1 -xdev \\( -type f -o -type d \\) -print0 | "
+            "sort -z | "
+            "tar --null --no-recursion --format=ustar --mtime=@0 --owner=0 --group=0 "
+            f"--numeric-owner -cf - --files-from=- | gzip -n > {archive_path}",
+            timeout=_PROJECT_ARCHIVE_TIMEOUT_S,
+        )
+        files = cast("_BinarySandboxFiles", self._sandbox.files)
+        try:
+            content = bytes(files.read(_PROJECT_ARCHIVE_PATH, format="bytes"))
+        finally:
+            self._sandbox.commands.run(f"rm -f {archive_path}", timeout=30)
+        if len(content) > MAX_PROJECT_ARCHIVE_BYTES:
+            raise ValueError(
+                f"project archive exceeds {MAX_PROJECT_ARCHIVE_BYTES} bytes: {len(content)}"
+            )
+        return content
 
     def run(
         self,
