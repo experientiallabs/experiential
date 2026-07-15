@@ -28,6 +28,7 @@ import tomli_w
 from wmh.config.store import validate_name
 from wmh.harness.doc import (
     CODE_RUNTIME_ID,
+    MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
     RUNTIME_KIND_ID,
     TEMPERATURE_ID,
@@ -168,6 +169,7 @@ def _render(doc: HarnessDoc) -> dict[str, str]:
                 "harness": {
                     "tools": doc.tools(),
                     "max_turns": doc.max_turns(),
+                    "max_output_tokens": doc.max_output_tokens(),
                     "temperature": doc.temperature(),
                     "runtime_kind": doc.runtime_kind(),
                 }
@@ -220,6 +222,14 @@ def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
         if "max_turns" in config:
             surfaces.append(
                 Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content=str(config["max_turns"]))
+            )
+        if "max_output_tokens" in config:
+            surfaces.append(
+                Surface(
+                    id=MAX_OUTPUT_TOKENS_ID,
+                    kind=SurfaceKind.PARAM,
+                    content=str(config["max_output_tokens"]),
+                )
             )
         if "temperature" in config:
             surfaces.append(

@@ -36,7 +36,7 @@ from pydantic import JsonValue
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
 from wmh.harness.runner_link import params_schema
-from wmh.harness.runtime import DEFAULT_MAX_TURNS, RunResult, StopReason
+from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TURNS, RunResult, StopReason
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import ToolSpec
 from wmh.providers.base import Provider, ToolCallingProvider
@@ -69,6 +69,7 @@ class _Episode:
         environment: AgentEnvironment,
         max_env_actions: int,
         max_turns: int,
+        max_output_tokens: int,
     ) -> None:
         self.instruction = instruction
         self.system_prompt = system_prompt
@@ -77,6 +78,7 @@ class _Episode:
         self.environment = environment
         self.max_env_actions = max_env_actions
         self.max_turns = max_turns
+        self.max_output_tokens = max_output_tokens
         self.steps: list[Step] = []
         self.answer: str = ""
         self.proxy_error: str = ""
@@ -88,6 +90,7 @@ class _Episode:
             "instruction": self.instruction,
             "system": self.system_prompt,
             "max_turns": self.max_turns,
+            "max_output_tokens": self.max_output_tokens,
             "tools": [
                 {"name": t.name, "description": t.description, "parameters": _params_schema(t)}
                 for t in self.tools
@@ -226,6 +229,7 @@ class PiRuntime:
         workdir: str | None = None,
         max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS,
         max_turns: int = DEFAULT_MAX_TURNS,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> None:
         if not isinstance(provider, ToolCallingProvider):
             raise TypeError("PiRuntime needs a ToolCallingProvider")
@@ -238,7 +242,10 @@ class PiRuntime:
         self._max_env_actions = max_env_actions
         if max_turns < 1:
             raise ValueError("max_turns must be >= 1")
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be >= 1")
         self._max_turns = max_turns
+        self._max_output_tokens = max_output_tokens
         for label, path in (("PI_RUNNER_DIR", PI_RUNNER_DIR), ("workdir", self._workdir)):
             if not _SAFE_REMOTE_PATH.match(path):
                 raise ValueError(
@@ -255,6 +262,7 @@ class PiRuntime:
             environment=environment,
             max_env_actions=self._max_env_actions,
             max_turns=self._max_turns,
+            max_output_tokens=self._max_output_tokens,
         )
         server = _ShimServer(("127.0.0.1", self._port), _ShimHandler)
         server.episode = episode

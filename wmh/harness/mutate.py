@@ -65,7 +65,8 @@ Surface kinds:
 - tool_policy — the tool list, one tool name per line. Valid names: \
 {", ".join(sorted(TOOL_REGISTRY))}. The `{SUBMIT.name}` tool is REQUIRED (without it a run \
 cannot end).
-- param — a scalar loop knob: `param:max-turns` (int >= 1), `param:temperature` (float in [0, 2]).
+- param — a scalar loop knob: `param:max-turns` (int >= 1), `param:max-output-tokens` for a
+  `pi-node` harness (int >= 1), or `param:temperature` (float in [0, 2]).
 - code — the agent's source. Either the singleton in-process `code:runtime` (contract above; must
   compile and define `run`), OR the pathful `code:<...>` files of a real multi-file harness (the
   vendored pi agent's own source). Editing a pathful `code:` surface REPLACES that file's whole

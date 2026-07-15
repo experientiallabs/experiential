@@ -316,6 +316,7 @@ class AgentProject:
             skill_bodies={skill.name: skill.body for skill in skills},
             provider=provider,
             turn_cap=agent.max_turns(),
+            max_output_tokens=agent.max_output_tokens(),
         )
         try:
             session.start()

@@ -8,8 +8,8 @@ lifecycle, and `E2BPiRuntime.run` end-to-end — the runner script speaks the sa
 environment answering tool calls is a plain host-side `AgentEnvironment` fake: the sandbox is only
 where the harness process lives, never where tool calls land.
 
-No TS-side test: the repo has no TypeScript test precedent (no *_test.ts outside the untouchable
-vendor tree, no root package.json), so runner_stdio.ts is covered by the frame-contract tests here.
+The TypeScript runners have no package-level test harness here, so source-contract checks below
+pin the host-provided model budget in addition to the Python frame-contract tests.
 """
 
 from __future__ import annotations
@@ -65,6 +65,16 @@ def test_all_pi_llm_bridges_forward_opaque_reasoning_details() -> None:
     for filename in ("runner_stdio.ts", "runner_live.ts", "runner_service.ts"):
         source = (entry / filename).read_text(encoding="utf-8")
         assert "delta.reasoning_details = msg.reasoning_details" in source
+
+
+def test_all_pi_entrypoints_use_the_host_output_budget() -> None:
+    """No execution mode may silently fall back to the old hard-coded 4k model ceiling."""
+    entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
+    for filename in ("entry.ts", "runner_stdio.ts", "runner_live.ts", "runner_service.ts"):
+        source = (entry / filename).read_text(encoding="utf-8")
+        assert "max_output_tokens" in source
+        assert "maxTokens: maxOutputTokens" in source
+        assert "maxTokens: 4096" not in source
 
 
 def _line(frame: JsonObject) -> str:
@@ -465,6 +475,7 @@ def _runtime(
     template: str | None = None,
     worker_fn: Callable[[ChatRequest], ChatResponse] | None = None,
     max_turns: int = 20,
+    max_output_tokens: int = 4096,
     episode_timeout_s: float = 300.0,
     should_cancel: Callable[[], bool] | None = None,
 ) -> E2BPiRuntime:
@@ -477,6 +488,7 @@ def _runtime(
         pool=pool,
         worker_fn=worker_fn,
         max_turns=max_turns,
+        max_output_tokens=max_output_tokens,
         episode_timeout_s=episode_timeout_s,
         should_cancel=should_cancel,
     )
@@ -942,7 +954,12 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
         return completion
 
     with E2BSandboxPool(sandbox_factory=factory) as pool:
-        result = _runtime(pool=pool, worker_fn=worker, max_turns=7).run("t1", "do it", env)
+        result = _runtime(
+            pool=pool,
+            worker_fn=worker,
+            max_turns=7,
+            max_output_tokens=16384,
+        ).run("t1", "do it", env)
 
     assert result.stop_reason is StopReason.SUBMITTED
     assert result.answer == "finished"
@@ -963,6 +980,7 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
     assert start["instruction"] == "do it" and start["system"] == "sys"
     assert start["files"] == {"src/agent.ts": "// a"}
     assert start["max_turns"] == 7
+    assert start["max_output_tokens"] == 16384
     assert start["episode_timeout_s"] == 300.0
     tool_names = {t["name"] for t in cast("list[JsonObject]", start["tools"])}
     assert tool_names >= {"bash", "submit"}

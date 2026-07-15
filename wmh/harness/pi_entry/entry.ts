@@ -36,6 +36,7 @@ interface Task {
 	system?: string;
 	tools: TaskTool[];
 	max_turns?: number;
+	max_output_tokens?: number;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -124,6 +125,13 @@ async function main(): Promise<void> {
 		configuredMaxTurns >= 1
 			? configuredMaxTurns
 			: DEFAULT_MAX_TURNS;
+	const configuredMaxOutputTokens = task.max_output_tokens;
+	const maxOutputTokens =
+		configuredMaxOutputTokens !== undefined &&
+		Number.isInteger(configuredMaxOutputTokens) &&
+		configuredMaxOutputTokens >= 1
+			? configuredMaxOutputTokens
+			: 4096;
 
 	const model: Model<"openai-completions"> = {
 		id: "stub-model",
@@ -135,7 +143,7 @@ async function main(): Promise<void> {
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
-		maxTokens: 4096,
+		maxTokens: maxOutputTokens,
 	};
 
 	// `submit` is provided by entry.ts (it drives /done + loop termination); drop any

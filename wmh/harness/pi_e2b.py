@@ -52,6 +52,7 @@ from wmh.harness.e2b_sandbox import (
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.runner_link import RunnerLink, WorkerFn
 from wmh.harness.runtime import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MAX_TURNS,
     RunResult,
     RuntimeCancelled,
@@ -1182,11 +1183,14 @@ class E2BPiRuntime:
         worker_fn: WorkerFn | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
         max_turns: int = DEFAULT_MAX_TURNS,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         episode_timeout_s: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         if max_turns < 1:
             raise ValueError("max_turns must be >= 1")
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be >= 1")
         if episode_timeout_s <= 0:
             raise ValueError("episode_timeout_s must be positive")
         self._provider = provider
@@ -1195,6 +1199,7 @@ class E2BPiRuntime:
         self._system_prompt = system_prompt
         self._worker_fn = worker_fn  # test seam, exactly like RunnerLink's
         self._max_turns = max_turns
+        self._max_output_tokens = max_output_tokens
         self._episode_timeout_s = episode_timeout_s
         self._should_cancel = should_cancel
         self._owns_pool = pool is None
@@ -1234,6 +1239,7 @@ class E2BPiRuntime:
                 files=self._files,
                 system_prompt=self._system_prompt,
                 max_turns=self._max_turns,
+                max_output_tokens=self._max_output_tokens,
                 episode_timeout_s=self._episode_timeout_s,
                 should_cancel=self._should_cancel,
             )

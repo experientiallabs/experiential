@@ -17,13 +17,17 @@ def test_default_and_meta_agents_are_independent_pi_documents() -> None:
     }
 
 
-def test_meta_agent_has_a_larger_turn_budget_without_mutating_default() -> None:
-    """Project exploration gets its own budget on its own HarnessDoc."""
+def test_meta_agent_has_larger_budgets_without_mutating_default() -> None:
+    """Project exploration gets its own turn and model-output budgets on its own HarnessDoc."""
     default = default_agent("default")
     meta = meta_agent("meta")
 
     assert default.max_turns() == 20
     assert meta.max_turns() == 60
+    assert default.max_output_tokens() == 4096
+    assert meta.max_output_tokens() == 16384
+    assert default.surface("param:max-output-tokens") is not None
+    assert meta.surface("param:max-output-tokens") is not None
 
 
 def test_meta_agent_uses_only_project_scoped_file_tools() -> None:

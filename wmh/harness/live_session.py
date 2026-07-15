@@ -23,7 +23,7 @@ New session frames (additive to the RunnerLink vocabulary; unknown types are ign
 sides, so eval episodes are unaffected):
 
   host -> runner
-    session_start {session_id, system, tools, files, turn_cap}
+    session_start {session_id, system, tools, files, turn_cap, max_output_tokens}
     user_message  {msg_id, text}
     abort         {reason}
     ping          {nonce}
@@ -50,6 +50,7 @@ from pydantic import JsonValue
 
 from wmh.core.types import JsonObject
 from wmh.harness.runner_link import Channel, TokenUsage, WorkerFn, params_schema
+from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
 from wmh.harness.tools import SUBMIT, ToolSpec
 from wmh.providers.base import ToolCallingProvider
 
@@ -150,6 +151,7 @@ class LiveSession:
         worker_fn: WorkerFn | None = None,
         actions_per_turn: int = DEFAULT_ACTIONS_PER_TURN,
         turn_cap: int = DEFAULT_TURN_CAP,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> None:
         self._channel = channel
         self._tools = list(tools)
@@ -170,6 +172,9 @@ class LiveSession:
             self._worker_fn = None
         self._actions_per_turn = actions_per_turn
         self._turn_cap = turn_cap
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be >= 1")
+        self._max_output_tokens = max_output_tokens
 
         self._inbox: queue.Queue[_Intent] = queue.Queue()
         self._session_id = uuid.uuid4().hex
@@ -207,6 +212,7 @@ class LiveSession:
                 "tools": self._tool_specs(),
                 "files": self._files,
                 "turn_cap": self._turn_cap,
+                "max_output_tokens": self._max_output_tokens,
             }
         )
         # The runner sends `state:idle` once the agent is constructed and ready for the first

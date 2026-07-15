@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmh.harness.doc import (
+    MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
     TEMPERATURE_ID,
     TOOL_POLICY_ID,
@@ -24,6 +25,7 @@ def _skill_surface(name: str = "count-words") -> Surface:
 def test_baseline_is_valid_and_derives_defaults() -> None:
     doc = HarnessDoc.baseline("base")
     assert doc.max_turns() == 20
+    assert doc.max_output_tokens() == 4096
     assert doc.temperature() == 0.7
     assert "submit" in doc.tools()
     assert doc.system_prompt()  # non-empty
@@ -76,6 +78,12 @@ def test_invalid_derived_values_fail_at_construction() -> None:
     bad_turns = Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="zero")
     with pytest.raises(ValidationError, match="integer"):
         HarnessDoc(name="x", surfaces=[core, bad_turns])
+    bad_output = Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="many")
+    with pytest.raises(ValidationError, match="integer"):
+        HarnessDoc(name="x", surfaces=[core, bad_output])
+    zero_output = Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="0")
+    with pytest.raises(ValidationError, match=">= 1"):
+        HarnessDoc(name="x", surfaces=[core, zero_output])
     bad_temp = Surface(id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content="9.5")
     with pytest.raises(ValidationError, match=r"\[0, 2\]"):
         HarnessDoc(name="x", surfaces=[core, bad_temp])
@@ -161,6 +169,7 @@ def _pi_doc() -> HarnessDoc:
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
             Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
+            Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
             Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
         ],
     )
@@ -218,6 +227,7 @@ def test_runtime_e2b_backend_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(shared, E2BPiRuntime)
     assert shared._pool is shared_pool  # noqa: SLF001 - pins the pool passthrough
     assert shared._max_turns == 7  # noqa: SLF001 - document parameter reaches the runner
+    assert shared._max_output_tokens == 16384  # noqa: SLF001 - same agent model contract
 
 
 def test_runtime_e2b_backend_rejects_in_process_runtime_kinds() -> None:

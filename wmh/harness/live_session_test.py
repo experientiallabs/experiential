@@ -49,11 +49,18 @@ def _drain(session: LiveSession) -> None:
 
 def test_start_waits_for_first_idle_state() -> None:
     channel = ScriptedChannel([{"type": "state", "status": "idle"}])
-    session = LiveSession(channel, tools=[], execute_tool=_no_tool, on_event=lambda e: None)
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda e: None,
+        max_output_tokens=16384,
+    )
     session.start()
     assert session.status == "idle"
     assert channel.sent[0]["type"] == "session_start"
     assert channel.sent[0]["turn_cap"] == 60
+    assert channel.sent[0]["max_output_tokens"] == 16384
 
 
 def test_start_surfaces_the_runner_construction_error() -> None:

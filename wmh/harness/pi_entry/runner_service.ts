@@ -122,6 +122,10 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		Number.isInteger(start.max_turns) && start.max_turns >= 1
 			? start.max_turns
 			: DEFAULT_MAX_TURNS;
+	const maxOutputTokens =
+		Number.isInteger(start.max_output_tokens) && start.max_output_tokens >= 1
+			? start.max_output_tokens
+			: 4096;
 	let doneSent = false;
 	let lastAssistantText = "";
 
@@ -135,7 +139,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
-		maxTokens: 4096,
+		maxTokens: maxOutputTokens,
 	};
 
 	const envTools: AgentTool<any>[] = (start.tools ?? [])

@@ -37,7 +37,13 @@ from wmh.harness.code_runtime import (
     CodeRuntime,
     compile_harness_code,
 )
-from wmh.harness.runtime import DEFAULT_MAX_TURNS, DEFAULT_SYSTEM_PROMPT, AgentRuntime, Runtime
+from wmh.harness.runtime import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_MAX_TURNS,
+    DEFAULT_SYSTEM_PROMPT,
+    AgentRuntime,
+    Runtime,
+)
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import DEFAULT_TOOLS, render_tools, resolve_tools
 from wmh.providers.base import Provider, ToolCallingProvider
@@ -49,10 +55,11 @@ if TYPE_CHECKING:
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-# Well-known surface ids. Only TOOL_POLICY and the two params are singletons; prompt and skill
+# Well-known surface ids. The tool policy and scalar parameters are singletons; prompt and skill
 # surfaces may be added freely (an update can split `prompt:core` into finer sections).
 TOOL_POLICY_ID = "tool_policy:main"
 MAX_TURNS_ID = "param:max-turns"
+MAX_OUTPUT_TOKENS_ID = "param:max-output-tokens"
 TEMPERATURE_ID = "param:temperature"
 RUNTIME_KIND_ID = "param:runtime-kind"  # absent/"kit-python" -> in-process; "pi-node" -> PiRuntime
 CODE_RUNTIME_ID = "code:runtime"
@@ -135,6 +142,7 @@ class HarnessDoc(BaseModel):
         # These validations construct the derived values; failures surface here, at the boundary.
         self.tools()
         self.max_turns()
+        self.max_output_tokens()
         self.temperature()
         for surface in self.surfaces:
             if surface.kind is SurfaceKind.SKILL:
@@ -201,6 +209,21 @@ class HarnessDoc(BaseModel):
             raise ValueError(f"{MAX_TURNS_ID} must be an integer, got {raw.content!r}") from exc
         if value < 1:
             raise ValueError(f"{MAX_TURNS_ID} must be >= 1, got {value}")
+        return value
+
+    def max_output_tokens(self) -> int:
+        """Return the per-model-call output cap carried by every pi execution mode."""
+        raw = self.surface(MAX_OUTPUT_TOKENS_ID)
+        if raw is None:
+            return DEFAULT_MAX_OUTPUT_TOKENS
+        try:
+            value = int(raw.content.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"{MAX_OUTPUT_TOKENS_ID} must be an integer, got {raw.content!r}"
+            ) from exc
+        if value < 1:
+            raise ValueError(f"{MAX_OUTPUT_TOKENS_ID} must be >= 1, got {value}")
         return value
 
     def temperature(self) -> float:
@@ -278,6 +301,7 @@ class HarnessDoc(BaseModel):
                     template=e2b_template,
                     pool=e2b_pool,
                     max_turns=self.max_turns(),
+                    max_output_tokens=self.max_output_tokens(),
                     should_cancel=should_cancel,
                 )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
@@ -303,6 +327,7 @@ class HarnessDoc(BaseModel):
                     system_prompt=self.assembled_prompt(skills),
                     files=code_files,
                     max_turns=self.max_turns(),
+                    max_output_tokens=self.max_output_tokens(),
                     should_cancel=should_cancel,
                 )
             from wmh.harness.pi_runtime import PiRuntime  # circular: pi_runtime imports doc
@@ -315,6 +340,7 @@ class HarnessDoc(BaseModel):
                 skills=skills,
                 system_prompt=self.assembled_prompt(skills),
                 max_turns=self.max_turns(),
+                max_output_tokens=self.max_output_tokens(),
             )
         if backend == "e2b":
             raise ValueError(

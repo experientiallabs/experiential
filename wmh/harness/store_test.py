@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
+from wmh.harness.doc import MAX_OUTPUT_TOKENS_ID, HarnessDoc, Surface, SurfaceKind
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 
 
@@ -84,7 +84,27 @@ def test_hand_authored_dir_without_doc_json_loads(tmp_path: Path) -> None:
     assert doc.system_prompt() == "You are careful."
     assert doc.tools() == ["bash", "submit"]
     assert doc.max_turns() == 7
+    assert doc.max_output_tokens() == 4096  # old exports keep the runtime default
     assert doc.temperature() == 0.2
+
+
+def test_model_output_budget_renders_and_reparses_without_doc_json(tmp_path: Path) -> None:
+    """The editable Pi model budget survives the portable config.toml representation."""
+    base = HarnessDoc.baseline("budgeted")
+    doc = HarnessDoc(
+        name="budgeted",
+        surfaces=[
+            *base.surfaces,
+            Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
+        ],
+    )
+    store = HarnessStore(tmp_path)
+    saved = store.save_version(doc)
+    version_dir = store.dir_for(doc.name) / f"v{saved.version}"
+    assert "max_output_tokens = 16384" in (version_dir / "config.toml").read_text()
+
+    (version_dir / "doc.json").unlink()
+    assert store.load(doc.name).max_output_tokens() == 16384
 
 
 def test_list_names_only_counts_dirs_with_versions(tmp_path: Path) -> None:
@@ -164,7 +184,7 @@ def test_pi_node_source_tree_renders_and_round_trips(tmp_path: Path) -> None:
     assert store.load("pi").doc_hash == doc.doc_hash
     # Without it, the rendered tree still reconstructs a pi-node harness with the identical code
     # files (id + path + content). The full doc hash need not match — config.toml materializes the
-    # effective max-turns/temperature the sparse doc omitted — but the source tree is preserved.
+    # effective scalar defaults the sparse doc omitted — but the source tree is preserved.
     (version_dir / "doc.json").unlink()
     reloaded = store.load("pi")
     assert reloaded.runtime_kind() == "pi-node"

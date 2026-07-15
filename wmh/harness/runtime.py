@@ -42,6 +42,9 @@ Work in small, verifiable steps: inspect state, act, check the result, then cont
 task is done, call `submit` with your answer. Prefer composing small bash commands over guessing."""
 
 DEFAULT_MAX_TURNS = 20  # small shell tasks converge well before this; raise for longer horizons
+# Per-call output budget used by the pi runtimes. This remains separate from the turn cap: a
+# reasoning model can exhaust one response before it emits a tool call even when many turns remain.
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 # Per-observation cap in the judge-facing transcript. Generous rather than tight: gold evidence
 # routinely lives deep in long outputs (`cat` of a produced file, `ls -R`), and truncating it away

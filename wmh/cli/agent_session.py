@@ -363,6 +363,7 @@ class LocalLiveDriver:
                 skill_bodies=skill_bodies,
                 provider=self._provider,
                 worker_fn=self._worker_fn,
+                max_output_tokens=self._doc.max_output_tokens(),
             )
             session.start()
             _console.print(

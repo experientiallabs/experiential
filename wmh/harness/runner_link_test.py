@@ -183,6 +183,7 @@ def test_episode_start_carries_task_tools_and_limits() -> None:
         system_prompt="sys",
         files={"src/agent.ts": "// a"},
         max_turns=7,
+        max_output_tokens=16384,
         episode_timeout_s=12.5,
     ).run("t1", "do it", _Env(), tools=_tools())
     start = _sent(ch, "episode_start")
@@ -191,6 +192,7 @@ def test_episode_start_carries_task_tools_and_limits() -> None:
     assert s["instruction"] == "do it" and s["system"] == "sys"
     assert s["files"] == {"src/agent.ts": "// a"}
     assert s["max_turns"] == 7
+    assert s["max_output_tokens"] == 16384
     assert s["episode_timeout_s"] == 12.5
     assert {t["name"] for t in s["tools"]} >= {"bash", "submit"}
 
@@ -455,6 +457,7 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
     import os as _os
 
     from wmh.harness.doc import (
+        MAX_OUTPUT_TOKENS_ID,
         MAX_TURNS_ID,
         RUNTIME_KIND_ID,
         TOOL_POLICY_ID,
@@ -487,6 +490,7 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
             Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
+            Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
             Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
         ],
     )
@@ -504,6 +508,7 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
         runtime = doc.runtime(provider)
         assert isinstance(runtime, RunnerLink)
         assert runtime._max_turns == 7  # noqa: SLF001 - document parameter reaches the link frame
+        assert runtime._max_output_tokens == 16384  # noqa: SLF001 - same agent model contract
     finally:
         set_active_channel(None)
         if prev is None:

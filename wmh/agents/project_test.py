@@ -168,7 +168,8 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     assert project.read_text("history/round-1.json") == "{}"
     assert project.read_text("result.txt") == "done"
     assert result.answer == "finished"
-    assert any(frame["type"] == "session_start" for frame in channel.sent)
+    [session_start] = [frame for frame in channel.sent if frame["type"] == "session_start"]
+    assert session_start["max_output_tokens"] == meta_agent().max_output_tokens() == 16384
     assert any(frame["type"] == "user_message" for frame in channel.sent)
     assert channel.closed is False
     assert sandbox.commands.runs[:2] == [

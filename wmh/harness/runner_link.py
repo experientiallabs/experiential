@@ -32,6 +32,7 @@ from llm_waterfall import ChatRequest, ChatResponse
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
 from wmh.harness.runtime import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MAX_TURNS,
     RunResult,
     RuntimeCancelled,
@@ -214,6 +215,7 @@ class RunnerLink:
         system_prompt: str = "",
         max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS,
         max_turns: int = DEFAULT_MAX_TURNS,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         episode_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
         cancel_poll_interval_s: float = DEFAULT_CANCEL_POLL_INTERVAL_S,
@@ -236,11 +238,14 @@ class RunnerLink:
         self._max_env_actions = max_env_actions
         if max_turns < 1:
             raise ValueError("max_turns must be >= 1")
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be >= 1")
         if episode_timeout_s is not None and episode_timeout_s <= 0:
             raise ValueError("episode_timeout_s must be positive when set")
         if cancel_poll_interval_s <= 0:
             raise ValueError("cancel_poll_interval_s must be positive")
         self._max_turns = max_turns
+        self._max_output_tokens = max_output_tokens
         self._episode_timeout_s = episode_timeout_s
         self._should_cancel = should_cancel
         self._cancel_poll_interval_s = cancel_poll_interval_s
@@ -292,6 +297,7 @@ class RunnerLink:
                 "files": self._files,
                 "max_env_actions": self._max_env_actions,
                 "max_turns": self._max_turns,
+                "max_output_tokens": self._max_output_tokens,
                 "episode_timeout_s": self._episode_timeout_s,
             }
         )

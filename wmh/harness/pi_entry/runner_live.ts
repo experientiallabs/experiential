@@ -398,6 +398,10 @@ class Session {
 
 	async start(frame: Frame): Promise<void> {
 		this.turnCap = Number(frame.turn_cap ?? 60);
+		const maxOutputTokens =
+			Number.isInteger(frame.max_output_tokens) && frame.max_output_tokens >= 1
+				? frame.max_output_tokens
+				: 4096;
 		const AgentCtor = await loadAgent(frame);
 		assertInteractive(AgentCtor);
 		this.bridge = await startLlmBridge(this.conn);
@@ -412,7 +416,7 @@ class Session {
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128000,
-			maxTokens: 4096,
+			maxTokens: maxOutputTokens,
 		};
 
 		const tools = this.buildTools(frame.tools ?? []);

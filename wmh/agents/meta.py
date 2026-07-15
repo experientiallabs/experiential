@@ -1,7 +1,7 @@
 """The project agent that proposes harness improvements."""
 
 from wmh.agents.default import default_agent
-from wmh.harness.doc import MAX_TURNS_ID, TOOL_POLICY_ID, HarnessDoc
+from wmh.harness.doc import MAX_OUTPUT_TOKENS_ID, MAX_TURNS_ID, TOOL_POLICY_ID, HarnessDoc
 
 META_AGENT_PROMPT = """You are the meta agent inside an optimizer project. Improve agent harnesses;
 do not solve their benchmark tasks yourself.
@@ -29,6 +29,10 @@ def meta_agent(name: str = "meta") -> HarnessDoc:
             surfaces.append(surface.model_copy(update={"content": "read_file\nwrite_file\nsubmit"}))
         elif surface.id == MAX_TURNS_ID:
             surfaces.append(surface.model_copy(update={"content": "60"}))
+        elif surface.id == MAX_OUTPUT_TOKENS_ID:
+            # GPT-5.5 high reasoning spends output tokens before its visible filesystem calls. A
+            # batch of three compact proposals needs the same 16k headroom as the direct proposer.
+            surfaces.append(surface.model_copy(update={"content": "16384"}))
         else:
             surfaces.append(surface)
     return HarnessDoc(name=name, surfaces=surfaces)
