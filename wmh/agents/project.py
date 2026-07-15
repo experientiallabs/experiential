@@ -127,7 +127,7 @@ class AgentProject:
         workspace = shlex.quote(self.workspace)
         archive_path = shlex.quote(_PROJECT_ARCHIVE_PATH)
         self._sandbox.commands.run(
-            f"cd {workspace} && "
+            f"set -eo pipefail; cd {workspace} && "
             "find . -mindepth 1 -xdev \\( -type f -o -type d \\) -print0 | "
             "sort -z | "
             "tar --null --no-recursion --format=ustar --mtime=@0 --owner=0 --group=0 "

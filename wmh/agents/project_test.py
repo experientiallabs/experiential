@@ -184,7 +184,9 @@ def test_project_exports_one_deterministic_regular_file_archive() -> None:
 
     assert content == b"archive-bytes"
     archive_command, cleanup_command = sandbox.commands.runs[-2:]
-    assert archive_command.startswith("cd /home/user/project && find . -mindepth 1 -xdev")
+    assert archive_command.startswith(
+        "set -eo pipefail; cd /home/user/project && find . -mindepth 1 -xdev"
+    )
     assert "-type f -o -type d" in archive_command
     assert "sort -z" in archive_command
     assert "--no-recursion" in archive_command
