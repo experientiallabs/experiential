@@ -414,8 +414,17 @@ class AgentProject:
     @staticmethod
     def _write_sandbox_file(sandbox: SandboxHandle, absolute: str, content: str) -> None:
         directory = str(PurePosixPath(absolute).parent)
-        sandbox.commands.run(f"mkdir -p {shlex.quote(directory)}", timeout=30)
-        sandbox.files.write(absolute, content)
+        for attempt in range(2):
+            try:
+                sandbox.commands.run(f"mkdir -p {shlex.quote(directory)}", timeout=30)
+                sandbox.files.write(absolute, content)
+                return
+            except Exception as error:  # noqa: BLE001 - classify the E2B transport boundary
+                # Both operations are idempotent: replaying ``mkdir -p`` and the same overwrite is
+                # safe even when the first request reached E2B but its response was disconnected.
+                # Keep the live project sandbox/session intact for a one-off control-plane drop.
+                if attempt > 0 or not _is_recoverable_transport_error(error):
+                    raise
 
     def _replace_sandbox(self) -> None:
         """Replace a transport-poisoned sandbox while retaining every project file."""
@@ -518,6 +527,11 @@ def _is_recoverable_session_error(error: Exception) -> bool:
     """Return whether one fresh live session may recover this transport failure."""
     if isinstance(error, _ProjectAgentTurnError):
         return False
+    return _is_recoverable_transport_error(error)
+
+
+def _is_recoverable_transport_error(error: Exception) -> bool:
+    """Return whether one idempotent E2B transport operation may be retried once."""
     error_type = type(error)
     if error_type.__module__ == "e2b.exceptions" and error_type.__name__ == "TimeoutException":
         return True

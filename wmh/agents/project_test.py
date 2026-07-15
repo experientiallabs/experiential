@@ -179,6 +179,70 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     assert channel.closed is True
 
 
+def test_project_retries_one_context_write_after_e2b_disconnect() -> None:
+    """A transient context-file transport drop cannot fan out into a failed proposal batch."""
+
+    class _DisconnectOnceCommands(_Commands):
+        def __init__(self) -> None:
+            super().__init__()
+            self.disconnect_next = False
+            self.attempts = 0
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            self.attempts += 1
+            if self.disconnect_next:
+                self.disconnect_next = False
+                raise RuntimeError("Server disconnected")
+            return super().run(cmd, background=background, **kwargs)
+
+    sandbox = _Sandbox()
+    commands = _DisconnectOnceCommands()
+    sandbox.commands = commands
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        sandbox_factory=lambda: pytest.fail("an idempotent write must not replace the sandbox"),
+    )
+    attempts_before = commands.attempts
+    commands.disconnect_next = True
+
+    project.write_text("context/round-0003/parent.json", '{"round": 3}')
+
+    assert commands.attempts - attempts_before == 2
+    assert project.read_text("context/round-0003/parent.json") == '{"round": 3}'
+    assert project.usage().count == 1
+    assert sandbox.killed is False
+
+
+def test_project_does_not_retry_non_transport_context_write_failure() -> None:
+    """A real filesystem failure still propagates after exactly one attempt."""
+
+    class _FailOnceCommands(_Commands):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_next = False
+            self.attempts = 0
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            self.attempts += 1
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("permission denied")
+            return super().run(cmd, background=background, **kwargs)
+
+    sandbox = _Sandbox()
+    commands = _FailOnceCommands()
+    sandbox.commands = commands
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    attempts_before = commands.attempts
+    commands.fail_next = True
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        project.write_text("context/round-0003/parent.json", '{"round": 3}')
+
+    assert commands.attempts - attempts_before == 1
+
+
 def test_project_reuses_one_agent_session_across_turns() -> None:
     sandbox = _Sandbox()
     channel = _Channel()
