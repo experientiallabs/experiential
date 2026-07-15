@@ -31,7 +31,7 @@ from wmh.harness.create import (
     create_harness,
     select_parent,
 )
-from wmh.harness.delta import HarnessDelta
+from wmh.harness.delta import GateRecord, HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.proposer import ProviderDeltaProposer
@@ -258,6 +258,88 @@ def test_create_stops_before_the_next_expensive_phase_when_cancelled() -> None:
         _run(provider, should_cancel=should_cancel)
 
     assert provider.meta_users == []
+
+
+def test_create_passes_cancellation_into_a_batched_provider_proposer() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        _run(
+            provider,
+            proposal_batch_size=3,
+            should_cancel=lambda: len(provider.meta_users) >= 1,
+        )
+
+    assert len(provider.meta_users) == 1
+
+
+def test_create_never_converts_explicit_proposer_cancellation_to_failures() -> None:
+    class _CancellingMetaProvider(RoleProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> Completion:
+            if "meta-agent improving an agent harness" in system:
+                raise HarnessSearchCancelled("harness search cancelled")
+            return super().complete(
+                system,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        _run(_CancellingMetaProvider())
+
+
+def test_cancellation_wins_before_accepted_lineage_and_callback_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    cancelled = False
+    crowned: list[str] = []
+    gate_delta = create_module.gate_delta
+
+    def cancelling_gate(
+        delta: HarnessDelta,
+        *,
+        child: ClosedLoopReport,
+        champion: ClosedLoopReport,
+        best_full: float,
+        suite: list[str],
+        child_holdout: ClosedLoopReport | None = None,
+        champion_holdout: ClosedLoopReport | None = None,
+    ) -> GateRecord:
+        nonlocal cancelled
+        verdict = gate_delta(
+            delta,
+            child=child,
+            champion=champion,
+            best_full=best_full,
+            suite=suite,
+            child_holdout=child_holdout,
+            champion_holdout=champion_holdout,
+        )
+        if verdict.accepted:
+            cancelled = True
+        return verdict
+
+    monkeypatch.setattr(create_module, "gate_delta", cancelling_gate)
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        _run(
+            provider,
+            should_cancel=lambda: cancelled,
+            on_accept=lambda doc, delta, score: crowned.append(doc.doc_hash),
+        )
+
+    assert crowned == []
 
 
 def test_create_audits_invalid_delta_without_spending_eval() -> None:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
+import pytest
 from llm_waterfall import ChatResponse
 
 from wmh.agents.meta import meta_agent
@@ -11,7 +13,7 @@ from wmh.agents.project import AgentProjectRun
 from wmh.harness.delta import FailureSignature, HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.proposer import ProjectDeltaProposer, ProposalFailure, ProviderDeltaProposer
-from wmh.harness.runner_link import TokenUsage
+from wmh.harness.runtime import HarnessSearchCancelled, TokenUsage
 from wmh.providers.base import (
     Completion,
     Message,
@@ -101,8 +103,10 @@ class _Project:
         agent: HarnessDoc,
         provider: ToolCallingProvider,
         instruction: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> AgentProjectRun:
-        del agent, provider
+        del agent, provider, should_cancel
         self.runs += 1
         assert f"exactly {len(self.outputs)}" in instruction
         round_dir = f"round-{self.runs:04d}"
@@ -119,8 +123,10 @@ class _InterruptedProject(_Project):
         agent: HarnessDoc,
         provider: ToolCallingProvider,
         instruction: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> AgentProjectRun:
-        del agent, provider, instruction
+        del agent, provider, instruction, should_cancel
         self.runs += 1
         round_dir = f"round-{self.runs:04d}"
         for index, output in enumerate(self.outputs, start=1):
@@ -136,8 +142,10 @@ class _FailedProject(_Project):
         agent: HarnessDoc,
         provider: ToolCallingProvider,
         instruction: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> AgentProjectRun:
-        del agent, provider, instruction
+        del agent, provider, instruction, should_cancel
         self.runs += 1
         raise RuntimeError("provider down")
 
@@ -169,6 +177,53 @@ def test_provider_proposer_isolates_one_failed_sibling_call() -> None:
     assert proposals[0] is not None and not isinstance(proposals[0], ProposalFailure)
     assert proposals[1] == ProposalFailure(reason="rate limited")
     assert proposals[2] is not None and not isinstance(proposals[2], ProposalFailure)
+
+
+def test_provider_proposer_checks_cancellation_between_sibling_calls() -> None:
+    parent = HarnessDoc.baseline("parent")
+    provider = _Provider(_payload(parent, "careful"))
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        ProviderDeltaProposer(provider).propose_batch(
+            parent,
+            _trigger(),
+            "evidence",
+            history=[],
+            count=3,
+            should_cancel=lambda: provider.calls >= 1,
+        )
+
+    assert provider.calls == 1
+
+
+def test_project_proposer_propagates_project_cancellation() -> None:
+    parent = HarnessDoc.baseline("parent")
+    callback = lambda: False  # noqa: E731 - identity is the behavior under test
+
+    class _CancellingProject(_Project):
+        def run(
+            self,
+            agent: HarnessDoc,
+            provider: ToolCallingProvider,
+            instruction: str,
+            *,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> AgentProjectRun:
+            del agent, provider, instruction
+            assert should_cancel is callback
+            raise HarnessSearchCancelled("harness search cancelled")
+
+    proposer = ProjectDeltaProposer(_CancellingProject([]), meta_agent(), _Provider("unused"))
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        proposer.propose_batch(
+            parent,
+            _trigger(),
+            "inspect failures",
+            history=[],
+            count=2,
+            should_cancel=callback,
+        )
 
 
 def test_project_proposer_uses_one_agent_turn_and_keeps_round_files() -> None:

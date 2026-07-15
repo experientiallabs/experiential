@@ -22,6 +22,7 @@ from wmh.harness.e2b_sandbox import (
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_e2b import start_live_runner
 from wmh.harness.runner_link import Channel, TokenUsage
+from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.harness.tools import resolve_tools
 from wmh.providers.base import ToolCallingProvider
 
@@ -153,6 +154,7 @@ class AgentProject:
         *,
         timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
         on_event: Callable[[SessionEvent], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> AgentProjectRun:
         """Run one turn of an ordinary agent against this persistent project.
 
@@ -163,6 +165,7 @@ class AgentProject:
         """
         if self._finished_at is not None:
             raise RuntimeError("cannot run an agent in a closed project")
+        _check_cancelled(should_cancel)
         if self._active_event_sink is not None:
             raise RuntimeError("a project agent turn is already running")
         unsupported = set(agent.tools()) - _PROJECT_TOOLS
@@ -173,7 +176,12 @@ class AgentProject:
         for attempt in range(2):
             try:
                 result = self._run_turn(
-                    agent, provider, instruction, timeout=timeout, on_event=on_event
+                    agent,
+                    provider,
+                    instruction,
+                    timeout=timeout,
+                    on_event=on_event,
+                    should_cancel=should_cancel,
                 )
                 usage_after = self._total_worker_usage()
                 return AgentProjectRun(
@@ -181,6 +189,8 @@ class AgentProject:
                     events=result.events,
                     worker_usage=_usage_delta(usage_after, usage_before),
                 )
+            except HarnessSearchCancelled:
+                raise
             except Exception as error:
                 if attempt > 0 or not _is_recoverable_session_error(error):
                     raise
@@ -203,6 +213,7 @@ class AgentProject:
         *,
         timeout: float,
         on_event: Callable[[SessionEvent], None] | None,
+        should_cancel: Callable[[], bool] | None,
     ) -> AgentProjectRun:
         """Execute one attempt using the compatible ordinary live session."""
         session = self._ensure_session(agent, provider)
@@ -240,15 +251,20 @@ class AgentProject:
             turn_started = True
             deadline = time.monotonic() + timeout
             while not turn_finished:
+                self._cancel_turn_if_requested(session, should_cancel)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     session.interrupt("project_run_timeout")
-                    session.pump(timeout=0)
+                    session.flush_pending_intents()
                     # An abort acknowledgement can arrive after this deadline. Retiring the
                     # session prevents that stale idle boundary from completing the next turn.
                     self._close_agent_session()
                     raise TimeoutError(f"project agent did not finish within {timeout:g}s")
-                if not session.pump(timeout=min(0.5, remaining)) and not turn_finished:
+                running = session.pump(timeout=min(0.5, remaining))
+                # A pump can synchronously run one provider completion. Observe cancellation as
+                # soon as it returns, before consuming a second model or tool request.
+                self._cancel_turn_if_requested(session, should_cancel)
+                if not running and not turn_finished:
                     if session.failure_message is not None:
                         raise RuntimeError(
                             f"project agent session failed: {session.failure_message}"
@@ -263,6 +279,20 @@ class AgentProject:
         finally:
             self._active_event_sink = None
         return AgentProjectRun(answer=answer, events=tuple(events), worker_usage=TokenUsage())
+
+    def _cancel_turn_if_requested(
+        self,
+        session: LiveSession,
+        should_cancel: Callable[[], bool] | None,
+    ) -> None:
+        """Abort and retire the active session at one cooperative cancellation boundary."""
+        if should_cancel is None or not should_cancel():
+            return
+        session.interrupt("harness_search_cancelled")
+        with contextlib.suppress(Exception):
+            session.flush_pending_intents()
+        self._close_agent_session()
+        raise HarnessSearchCancelled("harness search cancelled")
 
     def _ensure_session(self, agent: HarnessDoc, provider: ToolCallingProvider) -> LiveSession:
         """Return the compatible live session, starting one when the harness changed."""
@@ -493,6 +523,12 @@ def _is_recoverable_session_error(error: Exception) -> bool:
         return True
     text = str(error).lower()
     return any(marker in text for marker in _RECOVERABLE_SESSION_MARKERS)
+
+
+def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    """Fail before creating or retrying a project turn when search cancellation is already set."""
+    if should_cancel is not None and should_cancel():
+        raise HarnessSearchCancelled("harness search cancelled")
 
 
 def _usage_delta(after: TokenUsage, before: TokenUsage) -> TokenUsage:

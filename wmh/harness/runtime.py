@@ -54,6 +54,10 @@ _NUDGE = (
 )
 
 
+class HarnessSearchCancelled(RuntimeError):
+    """The caller requested that an optimizer search stop before its next costly phase."""
+
+
 class RuntimeCancelled(RuntimeError):
     """The caller cancelled an in-flight runtime episode.
 

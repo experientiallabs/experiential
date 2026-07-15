@@ -237,6 +237,16 @@ class LiveSession:
         """Queue an interrupt: abort the current run (does not end the session)."""
         self._inbox.put(_Interrupt(reason=reason))
 
+    def flush_pending_intents(self) -> None:
+        """Send queued controls without consuming another runner frame.
+
+        The driver uses this when it must abort and retire a session immediately. Calling
+        :meth:`pump` would also read one inbound frame, which could start another synchronous
+        provider or tool operation after cancellation was already observed.
+        """
+        if not self._closed:
+            self._drain_inbox()
+
     def end(self) -> None:
         """Queue a graceful end: abort any run, then shut the runner down."""
         self._inbox.put(_End())

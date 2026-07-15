@@ -37,7 +37,12 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.mutate import render_evidence
 from wmh.harness.proposer import DeltaProposer, ProposalFailure
-from wmh.harness.runtime import RuntimeCancelled, TokenUsage, combine_usage
+from wmh.harness.runtime import (
+    HarnessSearchCancelled,
+    RuntimeCancelled,
+    TokenUsage,
+    combine_usage,
+)
 from wmh.providers.base import Provider
 
 if TYPE_CHECKING:
@@ -57,10 +62,6 @@ ALL_PASS_MECHANISM = "none: all tasks pass"
 
 # Reports progress as (iteration, variant name, success_rate, accepted); iteration 0 is the seed.
 CreateProgress = Callable[[int, str, float, bool], None]
-
-
-class HarnessSearchCancelled(RuntimeError):
-    """The caller requested that a harness search stop before its next costly phase."""
 
 
 class PoolEntry(BaseModel):
@@ -543,12 +544,15 @@ def create_harness(
                         evidence,
                         history=archive.deltas,
                         count=proposal_batch_size,
+                        should_cancel=should_cancel,
                     )
                     if len(batch) != proposal_batch_size:
                         raise ValueError(
                             f"proposer returned {len(batch)} proposals; "
                             f"expected {proposal_batch_size}"
                         )
+                except HarnessSearchCancelled:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - provider/agent/transport failure
                     batch = [ProposalFailure(reason=str(exc))] * proposal_batch_size
                 _check_cancelled()
@@ -767,6 +771,11 @@ def create_harness(
                     reason=f"confirmation re-run ({outcome}): {'; '.join(notes)} | initially: "
                     + verdict.reason,
                 )
+            if verdict.accepted:
+                # Scoring checks cancellation on return, but gating and confirmation bookkeeping
+                # happen afterward. Check again at the acceptance commit boundary so a cancelled
+                # child never enters lineage or reaches the persistence callback.
+                _check_cancelled()
             delta.verdict = verdict
             archive.deltas.append(delta)
             docs[child.doc_hash] = child
@@ -808,6 +817,7 @@ def create_harness(
             if on_progress is not None:
                 on_progress(i, child.name, child_report.success_rate, verdict.accepted)
 
+        _check_cancelled()
         best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
         sandbox_usage = None
         if sandbox_pool is not None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -11,6 +12,7 @@ from wmh.core.types import JsonObject
 from wmh.harness.delta import FailureSignature, HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta
+from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import Provider, ToolCallingProvider
 
 
@@ -28,6 +30,8 @@ class AgentProject(Protocol):
         agent: HarnessDoc,
         provider: ToolCallingProvider,
         instruction: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> AgentProjectRun: ...
 
 
@@ -42,6 +46,7 @@ class DeltaProposer(Protocol):
         *,
         history: list[HarnessDelta],
         count: int,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[HarnessDelta | ProposalFailure | None]: ...
 
 
@@ -71,12 +76,14 @@ class ProviderDeltaProposer:
         *,
         history: list[HarnessDelta],
         count: int,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[HarnessDelta | ProposalFailure | None]:
         """Make ``count`` independent proposal calls against the same parent."""
         if count < 1:
             raise ValueError(f"proposal count must be positive, got {count}")
         proposals: list[HarnessDelta | ProposalFailure | None] = []
         for _ in range(count):
+            _check_cancelled(should_cancel)
             try:
                 proposal = propose_delta(
                     parent,
@@ -85,6 +92,8 @@ class ProviderDeltaProposer:
                     self._provider,
                     history=history,
                 )
+            except HarnessSearchCancelled:
+                raise
             except Exception as error:  # noqa: BLE001 - isolate one flaky sibling call
                 proposal = ProposalFailure(reason=str(error))
             proposals.append(proposal)
@@ -113,10 +122,12 @@ class ProjectDeltaProposer:
         *,
         history: list[HarnessDelta],
         count: int,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[HarnessDelta | ProposalFailure | None]:
         """Run one meta-agent turn that writes ``count`` proposal files."""
         if count < 1:
             raise ValueError(f"proposal count must be positive, got {count}")
+        _check_cancelled(should_cancel)
         self._round += 1
         round_dir = f"round-{self._round:04d}"
         context_dir = f"context/{round_dir}"
@@ -138,9 +149,17 @@ class ProjectDeltaProposer:
         self._project.write_text(f"{context_dir}/REQUEST.md", request)
         run_error: Exception | None = None
         try:
-            self._project.run(self._agent, self._provider, request)
+            self._project.run(
+                self._agent,
+                self._provider,
+                request,
+                should_cancel=should_cancel,
+            )
+        except HarnessSearchCancelled:
+            raise
         except Exception as error:  # noqa: BLE001 - durable project files may still be complete
             run_error = error
+        _check_cancelled(should_cancel)
 
         proposals: list[HarnessDelta | ProposalFailure | None] = []
         for index in range(1, count + 1):
@@ -170,6 +189,12 @@ class ProjectDeltaProposer:
                 else:
                     proposals.append(_stamp_project_preconditions(parent, proposal))
         return proposals
+
+
+def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    """Raise the shared search signal without converting it into a failed proposal slot."""
+    if should_cancel is not None and should_cancel():
+        raise HarnessSearchCancelled("harness search cancelled")
 
 
 def _parent_context(parent: HarnessDoc) -> JsonObject:

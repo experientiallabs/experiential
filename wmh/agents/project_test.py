@@ -11,6 +11,7 @@ from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
 from wmh.harness.live_session import SessionEvent
+from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 
@@ -383,6 +384,48 @@ def test_project_timeout_retires_the_session_before_the_next_turn() -> None:
     assert hanging.closed is True
     assert result.answer == "finished"
     assert starts == 2
+
+
+def test_project_cancellation_interrupts_and_retires_the_active_session() -> None:
+    """Cancellation after one blocking provider pump cannot start a second model call."""
+
+    class _CountingProvider(_MeteredProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete_chat(self, request: object) -> ChatResponse:
+            self.calls += 1
+            return super().complete_chat(request)
+
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+        {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}},
+    ]
+    provider = _CountingProvider()
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        project.run(
+            meta_agent(),
+            provider,
+            "produce a result",
+            timeout=1,
+            should_cancel=lambda: provider.calls >= 1,
+        )
+
+    assert provider.calls == 1
+    assert channel.closed is True
+    assert any(
+        frame.get("type") == "abort" and frame.get("reason") == "harness_search_cancelled"
+        for frame in channel.sent
+    )
 
 
 @pytest.mark.parametrize("reason", ["aborted", "turn_limit"])
