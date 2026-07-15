@@ -136,17 +136,28 @@ class ProjectDeltaProposer:
             count=count,
         )
         self._project.write_text(f"{context_dir}/REQUEST.md", request)
-        self._project.run(self._agent, self._provider, request)
+        run_error: Exception | None = None
+        try:
+            self._project.run(self._agent, self._provider, request)
+        except Exception as error:  # noqa: BLE001 - durable project files may still be complete
+            run_error = error
 
         proposals: list[HarnessDelta | ProposalFailure | None] = []
         for index in range(1, count + 1):
             try:
                 raw = self._project.read_text(f"{proposal_dir}/proposal-{index:02d}.json")
             except Exception:  # noqa: BLE001 - a missing output is one unusable proposal
-                proposals.append(None)
+                if run_error is None:
+                    proposals.append(None)
+                else:
+                    proposals.append(ProposalFailure(reason=str(run_error)))
                 continue
-            proposal = parse_delta(parent, trigger, raw)
-            proposals.append(_stamp_project_preconditions(parent, proposal))
+            try:
+                proposal = parse_delta(parent, trigger, raw)
+            except Exception as error:  # noqa: BLE001 - isolate one malformed sibling output
+                proposals.append(ProposalFailure(reason=f"invalid proposal output: {error}"))
+            else:
+                proposals.append(_stamp_project_preconditions(parent, proposal))
         return proposals
 
 

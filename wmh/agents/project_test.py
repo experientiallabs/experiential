@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from llm_waterfall import ChatResponse
 
+from wmh.agents import project as project_module
 from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
@@ -97,6 +98,44 @@ class _Provider:
     def complete_chat(self, request: object) -> ChatResponse:
         del request
         raise AssertionError("scripted channel never requests the worker")
+
+
+class _MeteredProvider(_Provider):
+    def complete_chat(self, request: object) -> ChatResponse:
+        del request
+        return ChatResponse.model_validate(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "working"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7},
+            }
+        )
+
+
+def test_default_project_channel_enables_safe_idle_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = _Sandbox()
+    channel = _Channel()
+    captured: dict[str, object] = {}
+
+    def start(sandbox_arg: object, **kwargs: object) -> _Channel:
+        captured["sandbox"] = sandbox_arg
+        captured.update(kwargs)
+        return channel
+
+    monkeypatch.setattr(project_module, "start_live_runner", start)
+
+    assert project_module._start_channel(sandbox, "/project") is channel  # noqa: SLF001
+    assert captured == {
+        "sandbox": sandbox,
+        "workspace": "/project",
+        "reconnect_while_idle": True,
+    }
 
 
 def test_project_preserves_files_and_runs_through_live_session() -> None:
@@ -215,6 +254,183 @@ def test_project_restarts_one_live_session_after_transport_disconnect() -> None:
     assert project.read_text("history/round-1.json") == '{"kept": true}'
     assert [frame["type"] for frame in disconnected.sent].count("user_message") == 1
     assert [frame["type"] for frame in recovered.sent].count("user_message") == 1
+
+
+def test_project_retries_a_transient_channel_send_failure() -> None:
+    """E2B stdin timeouts are transport failures even after LiveSession stringifies them."""
+
+    class _SendFailureChannel(_Channel):
+        def send(self, frame: JsonObject) -> None:
+            if frame.get("type") == "user_message":
+                raise RuntimeError("request timed out")
+            super().send(frame)
+
+    failed = _SendFailureChannel()
+    failed.inbound = [{"type": "state", "status": "idle"}]
+    recovered = _Channel()
+    channels = iter([failed, recovered])
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: next(channels),
+        owns_sandbox=False,
+    )
+
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    assert result.answer == "finished"
+    assert failed.closed is True
+    assert recovered.closed is False
+
+
+def test_project_counts_worker_usage_from_failed_and_recovered_attempts() -> None:
+    """A logical run reports tokens spent before and after its bounded recovery."""
+
+    class _DisconnectedAfterLlmChannel(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+                {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise RuntimeError("Server disconnected")
+
+    failed = _DisconnectedAfterLlmChannel()
+    recovered = _Channel()
+    recovered.inbound.insert(
+        2, {"type": "llm_request", "req_id": 3, "openai_body": {"messages": []}}
+    )
+    channels = iter([failed, recovered])
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: next(channels),
+        owns_sandbox=False,
+    )
+
+    result = project.run(meta_agent(), _MeteredProvider(), "produce a result", timeout=1)
+
+    assert result.answer == "finished"
+    assert result.worker_usage.calls == 2
+    assert result.worker_usage.input_tokens == 10
+    assert result.worker_usage.output_tokens == 14
+
+
+def test_project_replaces_owned_sandbox_and_restores_files_after_disconnect() -> None:
+    """A poisoned E2B transport is replaced without losing the project archive."""
+
+    class _DisconnectedChannel(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise RuntimeError("Server disconnected")
+
+    original = _Sandbox()
+    replacement = _Sandbox()
+    disconnected = _DisconnectedChannel()
+    recovered = _Channel()
+    replacement_calls = 0
+
+    def sandbox_factory() -> _Sandbox:
+        nonlocal replacement_calls
+        replacement_calls += 1
+        return replacement
+
+    project = AgentProject(
+        original,
+        channel_factory=lambda sandbox, workspace: (
+            recovered if sandbox is replacement else disconnected
+        ),
+        sandbox_factory=sandbox_factory,
+    )
+    project.write_text("history/round-1.json", '{"kept": true}')
+
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    archived = "/home/user/project/history/round-1.json"
+    assert result.answer == "finished"
+    assert replacement_calls == 1
+    assert original.killed is True
+    assert replacement.killed is False
+    assert replacement.files.values[archived] == '{"kept": true}'
+    assert project.read_text("history/round-1.json") == '{"kept": true}'
+    assert project.usage().count == 2
+
+
+def test_project_meters_overlapping_replacement_sandbox_lifetimes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacement bootstrap time bills both the old and new live sandboxes."""
+    ticks = iter([0.0, 10.0, 15.0, 30.0])
+    monkeypatch.setattr(project_module.time, "monotonic", lambda: next(ticks))
+    original = _Sandbox()
+    replacement = _Sandbox()
+    project = AgentProject(original, sandbox_factory=lambda: replacement)
+
+    project._replace_sandbox()  # noqa: SLF001
+    usage = project.usage()
+
+    assert usage.count == 2
+    assert usage.seconds == 35.0  # old: 0..15 plus replacement: 10..30
+
+
+def test_project_meters_a_replacement_that_fails_during_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A created sandbox is billable even if replay fails before it becomes active."""
+
+    class _BrokenCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del cmd, background, kwargs
+            raise RuntimeError("restore failed")
+
+    ticks = iter([0.0, 10.0, 20.0, 30.0])
+    monkeypatch.setattr(project_module.time, "monotonic", lambda: next(ticks))
+    original = _Sandbox()
+    replacement = _Sandbox()
+    replacement.commands = _BrokenCommands()
+    project = AgentProject(original, sandbox_factory=lambda: replacement)
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        project._replace_sandbox()  # noqa: SLF001
+    usage = project.usage()
+
+    assert replacement.killed is True
+    assert usage.count == 2
+    assert usage.seconds == 40.0  # original: 0..30 plus failed replacement: 10..20
+
+
+def test_project_retries_a_clean_premature_session_end() -> None:
+    """A clean EOF before the turn boundary is a recoverable runner lifecycle loss."""
+
+    ended = _Channel()
+    ended.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+    ]
+    recovered = _Channel()
+    channels = iter([ended, recovered])
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: next(channels),
+        owns_sandbox=False,
+    )
+
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    assert result.answer == "finished"
+    assert ended.closed is True
+    assert recovered.closed is False
 
 
 def test_project_rejects_paths_that_escape_its_workspace() -> None:

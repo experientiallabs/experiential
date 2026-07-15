@@ -111,6 +111,23 @@ class _Project:
         return AgentProjectRun(answer="done", events=(), worker_usage=TokenUsage())
 
 
+class _InterruptedProject(_Project):
+    """Write a prefix of the batch, then lose the runner's terminal control frame."""
+
+    def run(
+        self,
+        agent: HarnessDoc,
+        provider: ToolCallingProvider,
+        instruction: str,
+    ) -> AgentProjectRun:
+        del agent, provider, instruction
+        self.runs += 1
+        round_dir = f"round-{self.runs:04d}"
+        for index, output in enumerate(self.outputs, start=1):
+            self.files[f"proposals/{round_dir}/proposal-{index:02d}.json"] = output
+        raise RuntimeError("Server disconnected after durable writes")
+
+
 def test_provider_proposer_produces_requested_sibling_count() -> None:
     parent = HarnessDoc.baseline("parent")
     provider = _Provider(_payload(parent, "careful"))
@@ -185,3 +202,15 @@ def test_project_proposer_stamps_missing_parent_preconditions() -> None:
     proposal = proposals[0]
     assert isinstance(proposal, HarnessDelta)
     assert proposal.preconditions == {"prompt:core": parent.surface_hashes()["prompt:core"]}
+
+
+def test_project_proposer_salvages_outputs_written_before_runner_disconnect() -> None:
+    parent = HarnessDoc.baseline("parent")
+    project = _InterruptedProject([_payload(parent, "careful")])
+
+    proposals = ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).propose_batch(
+        parent, _trigger(), "inspect failures", history=[], count=2
+    )
+
+    assert isinstance(proposals[0], HarnessDelta)
+    assert proposals[1] == ProposalFailure(reason="Server disconnected after durable writes")

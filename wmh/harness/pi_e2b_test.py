@@ -82,6 +82,20 @@ class _ScriptedHandle:
             self._release.wait(2.0)  # self-releasing so the daemon reader never lingers
 
 
+class _DisconnectingHandle(_ScriptedHandle):
+    """Yield a prefix, optionally wait for a race gate, then drop the output stream."""
+
+    def __init__(self, events: list[_Event], *, gate: threading.Event | None = None) -> None:
+        super().__init__(events)
+        self._gate = gate
+
+    def __iter__(self) -> Iterator[_Event]:
+        yield from self._events
+        if self._gate is not None:
+            self._gate.wait(2.0)
+        raise RuntimeError("Server disconnected")
+
+
 class _Result:
     """A minimal CommandOutput for foreground runs."""
 
@@ -94,10 +108,17 @@ class _Result:
 class _FakeCommands:
     """Foreground runs are recorded and echoed; background=True returns the scripted handle."""
 
-    def __init__(self, handle: _ScriptedHandle) -> None:
+    def __init__(
+        self,
+        handle: _ScriptedHandle,
+        *,
+        reconnect_handles: list[_ScriptedHandle] | None = None,
+    ) -> None:
         self._handle = handle
+        self._reconnect_handles = list(reconnect_handles or [])
         self.calls: list[str] = []  # foreground commands, in order (installs, ...)
         self.background_cmds: list[str] = []
+        self.connects: list[tuple[int, float | None]] = []
         self.stdin: list[tuple[int, str]] = []
         self.fail_sends_from: int | None = None
         self.send_error: Exception = TimeoutException("request timed out")
@@ -116,6 +137,12 @@ class _FakeCommands:
             return self._handle
         self.calls.append(cmd)
         return _Result(stdout=f"ran: {cmd}")
+
+    def connect(self, pid: int, *, timeout: float | None = None) -> object:
+        self.connects.append((pid, timeout))
+        if not self._reconnect_handles:
+            raise RuntimeError("process connection unavailable")
+        return self._reconnect_handles.pop(0)
 
     def send_stdin(self, pid: int, data: str) -> None:
         self.stdin.append((pid, data))
@@ -141,8 +168,13 @@ class _FakeFiles:
 class FakeSandbox:
     """The `SandboxHandle` slice over a scripted runner process."""
 
-    def __init__(self, handle: _ScriptedHandle) -> None:
-        self.commands = _FakeCommands(handle)
+    def __init__(
+        self,
+        handle: _ScriptedHandle,
+        *,
+        reconnect_handles: list[_ScriptedHandle] | None = None,
+    ) -> None:
+        self.commands = _FakeCommands(handle, reconnect_handles=reconnect_handles)
         self.files = _FakeFiles()
         self.kills = 0
         self.timeouts: list[int] = []
@@ -179,6 +211,7 @@ def _channel(
     sandbox_timeout_s: int | None = None,
     timeout_refresh_interval_s: float = 300.0,
     max_episode_lifetime_s: float = 3_600.0,
+    reconnect_while_idle: bool = False,
 ) -> E2BStdioChannel:
     return E2BStdioChannel(
         fake,
@@ -186,6 +219,7 @@ def _channel(
         sandbox_timeout_s=sandbox_timeout_s,
         timeout_refresh_interval_s=timeout_refresh_interval_s,
         max_episode_lifetime_s=max_episode_lifetime_s,
+        reconnect_while_idle=reconnect_while_idle,
     )
 
 
@@ -410,6 +444,70 @@ def test_close_sends_shutdown_and_makes_the_stream_end_clean() -> None:
     assert channel.recv() is None  # host-initiated shutdown reads as a clean channel close
     shutdowns = [f for f in _sent_frames(fake) if f["type"] == "shutdown"]
     assert len(shutdowns) == 1
+
+
+def test_live_channel_reconnects_same_pid_after_an_idle_stream_drop() -> None:
+    """An idle reconnect preserves the runner transcript without surfacing a false process exit."""
+    idle: JsonObject = {"type": "state", "status": "idle"}
+    after_reconnect: JsonObject = {"type": "pong", "nonce": "still-here"}
+    dropped = _DisconnectingHandle(_stdout_events([idle]))
+    resumed = _ScriptedHandle(_stdout_events([after_reconnect]), hold_open=True)
+    fake = FakeSandbox(dropped, reconnect_handles=[resumed])
+    channel = _channel(fake, dropped, reconnect_while_idle=True)
+
+    assert channel.recv(timeout=2.0) == idle
+    assert channel.recv(timeout=2.0) == after_reconnect
+    assert fake.commands.connects == [(_PID, 0)]
+    assert "output stream failed" not in channel.stderr_tail()
+
+
+def test_live_channel_reconnects_when_an_idle_stream_ends_without_an_exception() -> None:
+    """The SDK can report a dropped HTTP stream as normal iterator exhaustion."""
+    idle: JsonObject = {"type": "state", "status": "idle"}
+    after_reconnect: JsonObject = {"type": "pong", "nonce": "still-here"}
+    ended = _ScriptedHandle(_stdout_events([idle]))
+    resumed = _ScriptedHandle(_stdout_events([after_reconnect]), hold_open=True)
+    fake = FakeSandbox(ended, reconnect_handles=[resumed])
+    channel = _channel(fake, ended, reconnect_while_idle=True)
+
+    assert channel.recv(timeout=2.0) == idle
+    assert channel.recv(timeout=2.0) == after_reconnect
+    assert fake.commands.connects == [(_PID, 0)]
+
+
+def test_live_channel_does_not_reconnect_a_busy_stream() -> None:
+    """Mid-turn reconnect cannot prove whether a semantic frame was lost, so it fails closed."""
+    running: JsonObject = {"type": "state", "status": "running"}
+    dropped = _DisconnectingHandle(_stdout_events([running]))
+    fake = FakeSandbox(
+        dropped,
+        reconnect_handles=[_ScriptedHandle([], hold_open=True)],
+    )
+    channel = _channel(fake, dropped, reconnect_while_idle=True)
+
+    assert channel.recv(timeout=2.0) == running
+    with pytest.raises(RuntimeError, match="Server disconnected"):
+        channel.recv(timeout=2.0)
+    assert fake.commands.connects == []
+
+
+def test_user_message_wins_the_race_with_idle_reconnect() -> None:
+    """Turn delivery clears the idle proof before stdin, so a concurrent drop is not resumed."""
+    gate = threading.Event()
+    idle: JsonObject = {"type": "state", "status": "idle"}
+    dropped = _DisconnectingHandle(_stdout_events([idle]), gate=gate)
+    fake = FakeSandbox(
+        dropped,
+        reconnect_handles=[_ScriptedHandle([], hold_open=True)],
+    )
+    channel = _channel(fake, dropped, reconnect_while_idle=True)
+
+    assert channel.recv(timeout=2.0) == idle
+    channel.send({"type": "user_message", "msg_id": "next", "text": "go"})
+    gate.set()
+    with pytest.raises(RuntimeError, match="Server disconnected"):
+        channel.recv(timeout=2.0)
+    assert fake.commands.connects == []
 
 
 # --- E2BSandboxPool ---

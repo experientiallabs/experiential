@@ -85,6 +85,7 @@ _PI_ENTRY_DIR = os.path.join(os.path.dirname(__file__), "pi_entry")
 _RUNNER_FILES = ("runner_stdio.ts", "runner_frames.ts")
 
 _STDERR_LINES = 50  # bounded diagnostics buffer: enough for a stack trace, never unbounded
+_IDLE_RECONNECT_DELAYS_S = (0.0, 0.25, 1.0)
 
 # A runner-originated heartbeat keeps the background command stream active while the host is
 # synchronously waiting on a slow provider call. Pooled evaluation channels also use the same
@@ -128,9 +129,11 @@ class E2BStdioChannel:
         sandbox_timeout_s: int | None = None,
         timeout_refresh_interval_s: float = _SANDBOX_TIMEOUT_REFRESH_S,
         max_episode_lifetime_s: float = MAX_EVAL_EPISODE_LIFETIME_S,
+        reconnect_while_idle: bool = False,
     ) -> None:
         self._sandbox = sandbox
         self._handle = handle
+        self._pid = handle.pid
         self._frames: queue.Queue[JsonObject | _Eof] = queue.Queue()
         self._stderr: deque[str] = deque(maxlen=stderr_lines)
         self._sandbox_timeout_s = sandbox_timeout_s
@@ -138,6 +141,12 @@ class E2BStdioChannel:
         self._max_episode_lifetime_s = max_episode_lifetime_s
         self._next_timeout_refresh_at = 0.0
         self._episode_renewal_deadline_at: float | None = None
+        self._reconnect_while_idle = reconnect_while_idle
+        # Guards the definitely-idle proof and the same-PID reconnect. A user message clears the
+        # proof while holding this lock *before* stdin delivery, so the reader cannot reconnect
+        # across a turn-start race where a semantic runner frame might be lost.
+        self._transport_lock = threading.Lock()
+        self._session_idle = False
         self._closed = False
         self._reader = threading.Thread(
             target=self._read_events, name="e2b-stdio-reader", daemon=True
@@ -145,17 +154,21 @@ class E2BStdioChannel:
         self._reader.start()
 
     def send(self, frame: JsonObject) -> None:
-        if frame.get("type") == "episode_start" and self._sandbox_timeout_s is not None:
+        kind = frame.get("type")
+        if kind == "episode_start" and self._sandbox_timeout_s is not None:
             now = time.monotonic()
             self._episode_renewal_deadline_at = now + self._max_episode_lifetime_s
             # The pool reset the lease immediately before this episode. Wait until the normal
             # refresh cadence instead of bursting one set_timeout call per sandbox at 30 seconds.
             self._next_timeout_refresh_at = now + self._timeout_refresh_interval_s
         line = base64.b64encode(json.dumps(frame).encode("utf-8")).decode("ascii") + "\n"
-        try:
-            self._sandbox.commands.send_stdin(self._handle.pid, line)
-        except OSError as exc:
-            raise _E2BChannelSendError("failed to send a frame to the E2B runner") from exc
+        with self._transport_lock:
+            if kind in {"session_start", "user_message"}:
+                self._session_idle = False
+            try:
+                self._sandbox.commands.send_stdin(self._pid, line)
+            except OSError as exc:
+                raise _E2BChannelSendError("failed to send a frame to the E2B runner") from exc
 
     def recv(self, timeout: float | None = None) -> JsonObject | None:
         """The next frame from the runner; blocks (up to `timeout` seconds when given).
@@ -179,10 +192,12 @@ class E2BStdioChannel:
 
     def close(self) -> None:
         """Ask the runner to exit (best-effort); marks the stream end as clean for recv."""
-        if self._closed:
-            return
-        self._closed = True
-        self._episode_renewal_deadline_at = None
+        with self._transport_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._session_idle = False
+            self._episode_renewal_deadline_at = None
         try:
             self.send({"type": "shutdown"})
         except Exception:  # noqa: BLE001 - the process/sandbox may already be gone; close is best-effort
@@ -198,22 +213,66 @@ class E2BStdioChannel:
 
     def _read_events(self) -> None:
         pending = ""
-        try:
-            for stdout, stderr, _pty in self._handle:
-                if stderr:
-                    for line in stderr.splitlines():
-                        if line.strip():
-                            self._stderr.append(line)
-                if not stdout:
+        handle = self._handle
+        while True:
+            try:
+                for stdout, stderr, _pty in handle:
+                    if stderr:
+                        for line in stderr.splitlines():
+                            if line.strip():
+                                self._stderr.append(line)
+                    if not stdout:
+                        continue
+                    pending += stdout
+                    while "\n" in pending:
+                        line, pending = pending.split("\n", 1)
+                        self._decode_line(line)
+            except Exception as exc:  # noqa: BLE001 - classified by definitely-idle reconnect
+                reconnected = self._reconnect_idle_stream()
+                if reconnected is not None:
+                    # A partially delivered line is not replay-safe. The runner writes one frame
+                    # per line; dropping the fragment lets the next complete frame resynchronize.
+                    pending = ""
+                    handle = reconnected
                     continue
-                pending += stdout
-                while "\n" in pending:
-                    line, pending = pending.split("\n", 1)
-                    self._decode_line(line)
-        except Exception as exc:  # noqa: BLE001 - a broken stream becomes EOF + a diagnostic, not a dead thread
-            self._stderr.append(f"[channel] output stream failed: {exc}")
-        finally:
+                self._stderr.append(f"[channel] output stream failed: {exc}")
+            else:
+                # E2B's stream generator may also end without an exception when the HTTP stream
+                # disappears before a process-end event. Same-PID reconnect remains safe only at
+                # the exact idle boundary; a real process exit simply makes connect fail.
+                reconnected = self._reconnect_idle_stream()
+                if reconnected is not None:
+                    pending = ""
+                    handle = reconnected
+                    continue
             self._frames.put(_EOF)
+            return
+
+    def _reconnect_idle_stream(self) -> CommandHandle | None:
+        """Reattach to the same live runner only while it is provably between turns.
+
+        E2B command streams can suffer a transient HTTP/2 disconnect while their process and
+        sandbox remain healthy. Reconnecting mid-turn is not safe because an LLM/tool/state frame
+        may have been lost. Once ``state:idle`` was decoded, however, the runner emits only filtered
+        transport heartbeats until the next host ``user_message``; same-PID reconnect is lossless.
+        """
+        if not self._reconnect_while_idle:
+            return None
+        for delay in _IDLE_RECONNECT_DELAYS_S:
+            if delay:
+                time.sleep(delay)
+            # Hold the proof across connect. `send(user_message)` takes this same lock and clears
+            # idle before stdin delivery, so it either happens entirely before or after reattach.
+            with self._transport_lock:
+                if self._closed or not self._session_idle:
+                    return None
+                try:
+                    handle = self._sandbox.commands.connect(self._pid, timeout=0)
+                except Exception:  # noqa: BLE001 - the next bounded attempt uses a fresh stream
+                    continue
+                self._handle = handle
+                return handle
+        return None
 
     def _decode_line(self, line: str) -> None:
         text = line.strip()
@@ -228,6 +287,12 @@ class E2BStdioChannel:
             if frame.get("type") == TRANSPORT_KEEPALIVE_TYPE:
                 self._refresh_sandbox_timeout()
                 return
+            if frame.get("type") == "state":
+                status = frame.get("status")
+                with self._transport_lock:
+                    # Only an exact idle acknowledgement is a replay-safety proof. Any new or
+                    # malformed state value conservatively disables transparent reconnect.
+                    self._session_idle = status == "idle"
             if frame.get("type") in {"done", "episode_error"}:
                 self._episode_renewal_deadline_at = None
             self._frames.put(cast("JsonObject", frame))
@@ -531,6 +596,7 @@ def start_live_runner(
     template: str | None = None,
     workspace: str = LIVE_WORKSPACE,
     hello_timeout: float = HELLO_TIMEOUT_S,
+    reconnect_while_idle: bool = False,
 ) -> E2BStdioChannel:
     """Bootstrap and start `runner_live.ts` on an already-created sandbox; return its channel.
 
@@ -555,7 +621,11 @@ def start_live_runner(
     # inject extra shell commands into the live sandbox.
     sandbox.commands.run(f"mkdir -p {shlex.quote(workspace)}", timeout=30)
     handle = sandbox.commands.run(LIVE_START_CMD, background=True, stdin=True, timeout=0)
-    channel = E2BStdioChannel(sandbox, cast("CommandHandle", handle))
+    channel = E2BStdioChannel(
+        sandbox,
+        cast("CommandHandle", handle),
+        reconnect_while_idle=reconnect_while_idle,
+    )
     try:
         deadline = time.monotonic() + hello_timeout
         while True:

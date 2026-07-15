@@ -13,6 +13,7 @@ from typing import Protocol
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
+    SandboxFactory,
     SandboxHandle,
     SandboxUsage,
     create_sandbox,
@@ -35,6 +36,10 @@ _RECOVERABLE_SESSION_MARKERS = (
     "broken pipe",
     "remoteprotocolerror",
     "readerror",
+    "pi runner process exited",
+    "session ended before completing its turn",
+    "live session runner did not become ready",
+    "channel send failed",
 )
 
 
@@ -68,20 +73,31 @@ class AgentProject:
         *,
         workspace: str = PROJECT_WORKSPACE,
         channel_factory: ChannelFactory | None = None,
+        sandbox_factory: SandboxFactory | None = None,
         owns_sandbox: bool = True,
     ) -> None:
         self._sandbox = sandbox
         self.workspace = workspace.rstrip("/")
         self._channel_factory = channel_factory or _start_channel
+        # Replacing a caller-owned sandbox would exceed this object's authority. Injected test or
+        # application sandboxes still get the bounded fresh-session retry in the same filesystem.
+        self._sandbox_factory = sandbox_factory if owns_sandbox else None
         self._owns_sandbox = owns_sandbox
-        self._started_at = time.monotonic()
+        self._active_sandbox_started_at = time.monotonic()
+        self._retired_sandbox_seconds = 0.0
+        self._sandbox_count = 1
         self._finished_at: float | None = None
+        # Every supported project mutation is mediated by write_text or the contained write_file
+        # tool. Keep an in-process mirror so a dead E2B transport can be replaced without
+        # discarding the prior proposals that make this a persistent meta-agent project.
+        self._file_contents: dict[str, str] = {}
         self._channel: Channel | None = None
         self._session: LiveSession | None = None
         self._session_agent_hash: str | None = None
         self._session_provider: ToolCallingProvider | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
-        self._sandbox.commands.run(f"mkdir -p {shlex.quote(self.workspace)}", timeout=30)
+        self._retired_worker_usage = TokenUsage()
+        self._initialize_sandbox(self._sandbox)
 
     @classmethod
     def create(
@@ -93,26 +109,33 @@ class AgentProject:
         metadata: dict[str, str] | None = None,
     ) -> AgentProject:
         """Create one owned E2B project sandbox."""
-        sandbox = create_sandbox(
-            default_sandbox_factory(
-                timeout=timeout,
-                template=template,
-                api_key=api_key,
-                metadata=metadata,
-            )
+        factory = default_sandbox_factory(
+            timeout=timeout,
+            template=template,
+            api_key=api_key,
+            metadata=metadata,
         )
-        return cls(sandbox)
+        sandbox = create_sandbox(factory)
+        return cls(sandbox, sandbox_factory=factory)
 
     def write_text(self, path: str, content: str) -> None:
         """Write one project-relative file without allowing path traversal."""
         absolute = self._absolute_path(path)
-        directory = str(PurePosixPath(absolute).parent)
-        self._sandbox.commands.run(f"mkdir -p {shlex.quote(directory)}", timeout=30)
-        self._sandbox.files.write(absolute, content)
+        self._write_sandbox_file(self._sandbox, absolute, content)
+        self._file_contents[self._relative_path(absolute)] = content
 
     def read_text(self, path: str) -> str:
         """Read one project-relative file."""
-        return self._sandbox.files.read(self._absolute_path(path))
+        absolute = self._absolute_path(path)
+        relative = self._relative_path(absolute)
+        try:
+            content = self._sandbox.files.read(absolute)
+        except Exception:
+            if relative in self._file_contents:
+                return self._file_contents[relative]
+            raise
+        self._file_contents[relative] = content
+        return content
 
     def run(
         self,
@@ -125,10 +148,10 @@ class AgentProject:
     ) -> AgentProjectRun:
         """Run one turn of an ordinary agent against this persistent project.
 
-        A transient runner-channel disconnect retires only the ordinary live
-        session and retries the turn once on a fresh channel. The E2B project
-        sandbox and its filesystem stay intact, so a recovered agent can still
-        inspect every earlier proposal and the current round context.
+        A transient runner-channel disconnect retries the turn once. Owned E2B
+        projects replace a transport-poisoned sandbox and replay their mirrored
+        filesystem first; injected test projects keep the sandbox and replace
+        only the ordinary live session.
         """
         if self._finished_at is not None:
             raise RuntimeError("cannot run an agent in a closed project")
@@ -138,15 +161,30 @@ class AgentProject:
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"project agents cannot use uncontained tools: {names}")
+        usage_before = self._total_worker_usage()
         for attempt in range(2):
             try:
-                return self._run_turn(
+                result = self._run_turn(
                     agent, provider, instruction, timeout=timeout, on_event=on_event
+                )
+                usage_after = self._total_worker_usage()
+                return AgentProjectRun(
+                    answer=result.answer,
+                    events=result.events,
+                    worker_usage=_usage_delta(usage_after, usage_before),
                 )
             except Exception as error:
                 if attempt > 0 or not _is_recoverable_session_error(error):
                     raise
-                self._close_agent_session()
+                if self._sandbox_factory is None:
+                    self._close_agent_session()
+                    continue
+                try:
+                    self._replace_sandbox()
+                except Exception as recovery_error:
+                    raise RuntimeError(
+                        f"{error}; fresh project sandbox recovery failed: {recovery_error}"
+                    ) from recovery_error
         raise AssertionError("unreachable")
 
     def _run_turn(
@@ -176,11 +214,6 @@ class AgentProject:
             if on_event is not None:
                 on_event(event)
 
-        usage_before = TokenUsage(
-            input_tokens=session.worker_usage.input_tokens,
-            output_tokens=session.worker_usage.output_tokens,
-            calls=session.worker_usage.calls,
-        )
         self._active_event_sink = sink
         try:
             session.send_user_message(instruction)
@@ -198,14 +231,9 @@ class AgentProject:
                             f"project agent session failed: {session.failure_message}"
                         )
                     raise RuntimeError("project agent session ended before completing its turn")
-            usage = TokenUsage(
-                input_tokens=session.worker_usage.input_tokens - usage_before.input_tokens,
-                output_tokens=session.worker_usage.output_tokens - usage_before.output_tokens,
-                calls=session.worker_usage.calls - usage_before.calls,
-            )
         finally:
             self._active_event_sink = None
-        return AgentProjectRun(answer=answer, events=tuple(events), worker_usage=usage)
+        return AgentProjectRun(answer=answer, events=tuple(events), worker_usage=TokenUsage())
 
     def _ensure_session(self, agent: HarnessDoc, provider: ToolCallingProvider) -> LiveSession:
         """Return the compatible live session, starting one when the harness changed."""
@@ -257,6 +285,10 @@ class AgentProject:
         self._channel = None
         self._session_agent_hash = None
         self._session_provider = None
+        if session is not None:
+            self._retired_worker_usage.input_tokens += session.worker_usage.input_tokens
+            self._retired_worker_usage.output_tokens += session.worker_usage.output_tokens
+            self._retired_worker_usage.calls += session.worker_usage.calls
         if session is not None and not session.closed:
             with contextlib.suppress(Exception):
                 session.end()
@@ -269,7 +301,20 @@ class AgentProject:
     def usage(self) -> SandboxUsage:
         """Return this project's sandbox lifetime meter."""
         ended = self._finished_at if self._finished_at is not None else time.monotonic()
-        return SandboxUsage(count=1, seconds=max(0.0, ended - self._started_at))
+        active_seconds = max(0.0, ended - self._active_sandbox_started_at)
+        return SandboxUsage(
+            count=self._sandbox_count,
+            seconds=self._retired_sandbox_seconds + active_seconds,
+        )
+
+    def _total_worker_usage(self) -> TokenUsage:
+        """Return worker usage across retired and currently attached live sessions."""
+        current = self._session.worker_usage if self._session is not None else TokenUsage()
+        return TokenUsage(
+            input_tokens=self._retired_worker_usage.input_tokens + current.input_tokens,
+            output_tokens=self._retired_worker_usage.output_tokens + current.output_tokens,
+            calls=self._retired_worker_usage.calls + current.calls,
+        )
 
     def close(self) -> None:
         """Kill an owned sandbox and finalize its usage meter."""
@@ -293,6 +338,68 @@ class AgentProject:
             raise ValueError(f"expected a relative project path, got {path!r}")
         return f"{self.workspace}/{candidate.as_posix()}"
 
+    def _relative_path(self, absolute: str) -> str:
+        """Return one already-contained absolute path relative to the project root."""
+        return PurePosixPath(absolute).relative_to(PurePosixPath(self.workspace)).as_posix()
+
+    def _initialize_sandbox(self, sandbox: SandboxHandle) -> None:
+        """Create the workspace and replay the authoritative project-file mirror."""
+        sandbox.commands.run(f"mkdir -p {shlex.quote(self.workspace)}", timeout=30)
+        for relative, content in self._file_contents.items():
+            absolute = f"{self.workspace}/{relative}"
+            self._write_sandbox_file(sandbox, absolute, content)
+
+    @staticmethod
+    def _write_sandbox_file(sandbox: SandboxHandle, absolute: str, content: str) -> None:
+        directory = str(PurePosixPath(absolute).parent)
+        sandbox.commands.run(f"mkdir -p {shlex.quote(directory)}", timeout=30)
+        sandbox.files.write(absolute, content)
+
+    def _replace_sandbox(self) -> None:
+        """Replace a transport-poisoned sandbox while retaining every project file."""
+        factory = self._sandbox_factory
+        if factory is None:
+            raise RuntimeError("project sandbox replacement is unavailable")
+        # Normal project writes are mirrored synchronously. This best-effort refresh also captures
+        # files produced directly by future custom harness code before replacing a still-readable
+        # sandbox; a poisoned command API simply falls back to the mediated-write mirror.
+        with contextlib.suppress(Exception):
+            self._refresh_file_mirror()
+        replacement = create_sandbox(factory)
+        replacement_started_at = time.monotonic()
+        self._sandbox_count += 1
+        try:
+            self._initialize_sandbox(replacement)
+        except Exception:
+            with contextlib.suppress(Exception):
+                replacement.kill()
+            self._retired_sandbox_seconds += max(0.0, time.monotonic() - replacement_started_at)
+            raise
+
+        previous = self._sandbox
+        self._close_agent_session()
+        now = time.monotonic()
+        self._retired_sandbox_seconds += max(0.0, now - self._active_sandbox_started_at)
+        self._active_sandbox_started_at = replacement_started_at
+        self._sandbox = replacement
+        if self._owns_sandbox:
+            with contextlib.suppress(Exception):
+                previous.kill()
+
+    def _refresh_file_mirror(self) -> None:
+        """Snapshot all text files currently visible in the project workspace."""
+        result = self._sandbox.commands.run(
+            f"find {shlex.quote(self.workspace)} -type f -print0", timeout=30
+        )
+        stdout = getattr(result, "stdout", "")
+        snapshot: dict[str, str] = {}
+        for absolute in str(stdout).split("\0"):
+            if not absolute:
+                continue
+            relative = self._relative_path(absolute)
+            snapshot[relative] = self._sandbox.files.read(absolute)
+        self._file_contents.update(snapshot)
+
     def _execute_tool(
         self,
         name: str,
@@ -303,10 +410,21 @@ class AgentProject:
         try:
             if name == "read_file":
                 path = self._tool_path(str(arguments.get("path", "")))
-                return _capped(self._sandbox.files.read(path))
+                relative = self._relative_path(path)
+                try:
+                    content = self._sandbox.files.read(path)
+                except Exception:
+                    if relative not in self._file_contents:
+                        raise
+                    content = self._file_contents[relative]
+                else:
+                    self._file_contents[relative] = content
+                return _capped(content)
             if name == "write_file":
                 path = self._tool_path(str(arguments.get("path", "")))
-                self._sandbox.files.write(path, str(arguments.get("content", "")))
+                content = str(arguments.get("content", ""))
+                self._write_sandbox_file(self._sandbox, path, content)
+                self._file_contents[self._relative_path(path)] = content
                 return ToolOutcome(content=f"wrote {path}")
         except Exception as error:  # noqa: BLE001 - tool errors are agent observations
             return ToolOutcome(content=f"{name} failed: {error}", is_error=True)
@@ -327,7 +445,10 @@ class AgentProject:
 
 
 def _start_channel(sandbox: SandboxHandle, workspace: str) -> Channel:
-    return start_live_runner(sandbox, workspace=workspace)
+    # Project turns can be separated by long evaluation waves. Reattach only across the runner's
+    # proven-idle state so its transcript survives an E2B stream reset without risking missed
+    # semantic frames mid-turn.
+    return start_live_runner(sandbox, workspace=workspace, reconnect_while_idle=True)
 
 
 def _is_recoverable_session_error(error: Exception) -> bool:
@@ -337,6 +458,15 @@ def _is_recoverable_session_error(error: Exception) -> bool:
         return True
     text = str(error).lower()
     return any(marker in text for marker in _RECOVERABLE_SESSION_MARKERS)
+
+
+def _usage_delta(after: TokenUsage, before: TokenUsage) -> TokenUsage:
+    """Subtract cumulative usage snapshots for one logical project run."""
+    return TokenUsage(
+        input_tokens=after.input_tokens - before.input_tokens,
+        output_tokens=after.output_tokens - before.output_tokens,
+        calls=after.calls - before.calls,
+    )
 
 
 def _capped(content: str, *, is_error: bool = False) -> ToolOutcome:

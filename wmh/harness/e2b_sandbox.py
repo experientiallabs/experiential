@@ -70,7 +70,7 @@ class CommandHandle(Protocol):
 
 
 class SandboxCommands(Protocol):
-    """The `sandbox.commands` slice: run (foreground or background) and stdin injection."""
+    """The `sandbox.commands` slice: run/connect commands and inject stdin."""
 
     def run(
         self,
@@ -80,6 +80,13 @@ class SandboxCommands(Protocol):
         stdin: bool | None = None,
         timeout: float | None = None,
     ) -> CommandOutput | CommandHandle: ...
+
+    def connect(
+        self,
+        pid: int,
+        *,
+        timeout: float | None = None,
+    ) -> CommandHandle: ...
 
     def send_stdin(self, pid: int, data: str) -> object: ...
 
