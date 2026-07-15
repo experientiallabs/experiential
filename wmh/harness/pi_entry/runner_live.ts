@@ -34,8 +34,10 @@ console.debug = toStderr;
 
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
 const TRANSPORT_KEEPALIVE_MS = 30_000;
+const LIVE_OUTBOX = process.env.WMH_LIVE_OUTBOX?.trim() || null;
 
 type Frame = Record<string, any>;
+type TransportEnvelope = { transport_seq: number; frame: Frame };
 
 function encodeFrame(frame: Frame): string {
 	return Buffer.from(JSON.stringify(frame), "utf8").toString("base64") + "\n";
@@ -52,6 +54,68 @@ function decodeFrame(line: string): Frame | null {
 	}
 }
 
+/**
+ * Durable, replayable copy of the semantic output stream.
+ *
+ * A frame file is published before the head watermark advances, and both writes use a temporary
+ * sibling plus rename. Readers may therefore trust every sequence through `head` without ever
+ * observing partial JSON. The decimal watermark also lets a replacement runner continue a
+ * pre-existing outbox without reusing committed sequence numbers.
+ */
+class DurableOutbox {
+	private readonly framesDir: string;
+	private readonly headPath: string;
+	private readonly tmpNamespace = `${process.pid}-${Date.now().toString(36)}-${process.hrtime.bigint().toString(36)}`;
+	private transportSeq = 0;
+	private tmpSeq = 0;
+
+	constructor(root: string) {
+		const resolvedRoot = path.resolve(root);
+		this.framesDir = path.join(resolvedRoot, "frames");
+		this.headPath = path.join(resolvedRoot, "head");
+		fs.mkdirSync(this.framesDir, { recursive: true });
+
+		if (fs.existsSync(this.headPath)) {
+			const current = fs.readFileSync(this.headPath, "utf8").trim();
+			const parsed = Number(current);
+			if (!Number.isSafeInteger(parsed) || parsed < 0) {
+				throw new Error(`invalid live outbox head at ${this.headPath}: ${JSON.stringify(current)}`);
+			}
+			this.transportSeq = parsed;
+		} else {
+			this.atomicWrite(this.headPath, "0\n");
+		}
+	}
+
+	publish(frame: Frame): TransportEnvelope {
+		const transport_seq = this.transportSeq + 1;
+		const envelope: TransportEnvelope = { transport_seq, frame };
+		const filename = `${String(transport_seq).padStart(20, "0")}.json`;
+		this.atomicWrite(path.join(this.framesDir, filename), JSON.stringify(envelope) + "\n");
+		this.atomicWrite(this.headPath, `${transport_seq}\n`);
+		this.transportSeq = transport_seq;
+		return envelope;
+	}
+
+	private atomicWrite(target: string, content: string): void {
+		const tmp = path.join(
+			path.dirname(target),
+			`.${path.basename(target)}.tmp-${this.tmpNamespace}-${++this.tmpSeq}`,
+		);
+		try {
+			fs.writeFileSync(tmp, content, { encoding: "utf8", flag: "wx" });
+			fs.renameSync(tmp, target);
+		} catch (error) {
+			try {
+				fs.unlinkSync(tmp);
+			} catch {
+				// The temp file may not have been created, or rename may already have consumed it.
+			}
+			throw error;
+		}
+	}
+}
+
 /** The stdio twin of runner_frames.FrameConn: `request` awaits a matching response by req_id;
  *  host-pushed frames (session_start, user_message, abort, ping, shutdown) fire handlers. */
 class StdioConn {
@@ -59,8 +123,12 @@ class StdioConn {
 	private waiters = new Map<number, (f: Frame) => void>();
 	private handlers = new Map<string, (f: Frame) => void>();
 	private reqSeq = 0;
+	private readonly outbox: DurableOutbox | null;
+	private lastInboundSeq = 0;
 
 	constructor() {
+		// Initialize the complete durable layout before `main` can emit its ready/hello frame.
+		this.outbox = LIVE_OUTBOX ? new DurableOutbox(LIVE_OUTBOX) : null;
 		process.stdin.setEncoding("utf8");
 		process.stdin.on("data", (chunk: string) => this.onData(chunk));
 		process.stdin.on("end", () => process.exit(0));
@@ -71,7 +139,13 @@ class StdioConn {
 	}
 
 	send(frame: Frame): void {
-		process.stdout.write(encodeFrame(frame));
+		if (!this.outbox) {
+			// Keep the original wire format byte-for-byte when durable transport is not requested.
+			process.stdout.write(encodeFrame(frame));
+			return;
+		}
+		const envelope = this.outbox.publish(frame);
+		process.stdout.write(encodeFrame(envelope));
 	}
 
 	request(type: string, payload: Frame): Promise<Frame> {
@@ -85,7 +159,9 @@ class StdioConn {
 	/** Keep the command stream active across the persistent session; timeout remains host-owned. */
 	startTransportKeepalive(): () => void {
 		const timer = setInterval(
-			() => this.send({ type: "transport_keepalive" }),
+			// Liveness ticks carry no semantic state: leave them on the legacy wire and out of the
+			// replay log so they neither advance the sequence nor create unbounded tiny files.
+			() => process.stdout.write(encodeFrame({ type: "transport_keepalive" })),
 			TRANSPORT_KEEPALIVE_MS,
 		);
 		timer.unref();
@@ -99,9 +175,58 @@ class StdioConn {
 			const line = this.buf.slice(0, nl);
 			this.buf = this.buf.slice(nl + 1);
 			const frame = decodeFrame(line);
-			if (frame) this.dispatch(frame);
+			if (frame) this.dispatchInbound(frame);
 			nl = this.buf.indexOf("\n");
 		}
+	}
+
+	private dispatchInbound(value: Frame): void {
+		if (!this.outbox) {
+			this.dispatch(value);
+			return;
+		}
+
+		const inboundSeq = value.transport_in_seq;
+		const frame = value.frame;
+		if (
+			typeof inboundSeq !== "number" ||
+			!Number.isSafeInteger(inboundSeq) ||
+			inboundSeq <= 0 ||
+			!frame ||
+			typeof frame !== "object" ||
+			Array.isArray(frame)
+		) {
+			this.send({
+				type: "transport_nack",
+				transport_in_seq: inboundSeq,
+				expected_transport_in_seq: this.lastInboundSeq + 1,
+			});
+			return;
+		}
+		if (inboundSeq <= this.lastInboundSeq) {
+			// The original dispatch succeeded but its ack notification was lost. Re-publish only
+			// the acknowledgement: repeating a response, prompt, or tool result is unsafe.
+			this.send({ type: "transport_ack", transport_in_seq: inboundSeq });
+			return;
+		}
+		if (inboundSeq !== this.lastInboundSeq + 1) {
+			this.send({
+				type: "transport_nack",
+				transport_in_seq: inboundSeq,
+				expected_transport_in_seq: this.lastInboundSeq + 1,
+			});
+			return;
+		}
+
+		this.lastInboundSeq = inboundSeq;
+		if (frame.type === "shutdown") {
+			// shutdown exits synchronously, so persist acceptance before dispatching it.
+			this.send({ type: "transport_ack", transport_in_seq: inboundSeq });
+			this.dispatch(frame);
+			return;
+		}
+		this.dispatch(frame);
+		this.send({ type: "transport_ack", transport_in_seq: inboundSeq });
 	}
 
 	private dispatch(frame: Frame): void {

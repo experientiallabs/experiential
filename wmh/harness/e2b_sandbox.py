@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
@@ -77,6 +77,7 @@ class SandboxCommands(Protocol):
         cmd: str,
         background: bool | None = None,
         *,
+        envs: dict[str, str] | None = None,
         stdin: bool | None = None,
         timeout: float | None = None,
     ) -> CommandOutput | CommandHandle: ...
@@ -88,7 +89,23 @@ class SandboxCommands(Protocol):
         timeout: float | None = None,
     ) -> CommandHandle: ...
 
-    def send_stdin(self, pid: int, data: str) -> object: ...
+    def send_stdin(
+        self,
+        pid: int,
+        data: str,
+        request_timeout: float | None = None,
+    ) -> object: ...
+
+    def list(self, request_timeout: float | None = None) -> Sequence[SandboxProcess]: ...
+
+    def kill(self, pid: int, request_timeout: float | None = None) -> object: ...
+
+
+class SandboxProcess(Protocol):
+    """The running-process field used to classify a durable runner stream EOF."""
+
+    @property
+    def pid(self) -> int: ...
 
 
 class SandboxFiles(Protocol):
@@ -96,7 +113,13 @@ class SandboxFiles(Protocol):
 
     def write(self, path: str, data: str) -> object: ...
 
-    def read(self, path: str) -> str: ...
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str: ...
 
 
 @runtime_checkable

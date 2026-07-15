@@ -38,7 +38,8 @@ class _FakeCommands:
     ) -> _Result:
         return _Result()
 
-    def send_stdin(self, pid: int, data: str) -> None:
+    def send_stdin(self, pid: int, data: str, request_timeout: float | None = None) -> None:
+        del pid, data, request_timeout
         return None
 
 
@@ -49,7 +50,14 @@ class _FakeFiles:
     def write(self, path: str, data: str) -> None:
         self.store[path] = data
 
-    def read(self, path: str) -> str:
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str:
+        del request_timeout, gzip
         return self.store[path]
 
 

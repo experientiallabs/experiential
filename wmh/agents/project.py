@@ -37,6 +37,10 @@ _RECOVERABLE_SESSION_MARKERS = (
     "remoteprotocolerror",
     "readerror",
     "pi runner process exited",
+    "pi live runner process exited",
+    "durable outbox",
+    "durable runner",
+    "failed to send a frame to the e2b runner",
     "session ended before completing its turn",
     "live session runner did not become ready",
     "channel send failed",
@@ -289,14 +293,17 @@ class AgentProject:
             self._retired_worker_usage.input_tokens += session.worker_usage.input_tokens
             self._retired_worker_usage.output_tokens += session.worker_usage.output_tokens
             self._retired_worker_usage.calls += session.worker_usage.calls
-        if session is not None and not session.closed:
-            with contextlib.suppress(Exception):
-                session.end()
-                session.pump(timeout=0)
         close = getattr(channel, "close", None)
         if callable(close):
             with contextlib.suppress(Exception):
                 close()
+        elif session is not None and not session.closed:
+            # Test/local channels without an owned close hook still get the protocol-level end.
+            # Real project channels close the runner directly above so cancellation never waits
+            # for two durable abort/shutdown acknowledgements from an unreachable process.
+            with contextlib.suppress(Exception):
+                session.end()
+                session.pump(timeout=0)
 
     def usage(self) -> SandboxUsage:
         """Return this project's sandbox lifetime meter."""
@@ -445,10 +452,11 @@ class AgentProject:
 
 
 def _start_channel(sandbox: SandboxHandle, workspace: str) -> Channel:
-    # Project turns can be separated by long evaluation waves. Reattach only across the runner's
-    # proven-idle state so its transcript survives an E2B stream reset without risking missed
-    # semantic frames mid-turn.
-    return start_live_runner(sandbox, workspace=workspace, reconnect_while_idle=True)
+    # Project turns can be separated by long evaluation waves. Their ordinary live runner writes
+    # every semantic output frame to a sequenced E2B outbox before stdout, so the shared
+    # LiveSession can replay a dropped command stream without replacing the agent, transcript, or
+    # project sandbox. Platform live sessions keep start_live_runner's established stdio default.
+    return start_live_runner(sandbox, workspace=workspace, durable_outbox=True)
 
 
 def _is_recoverable_session_error(error: Exception) -> bool:

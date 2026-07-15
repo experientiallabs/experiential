@@ -18,7 +18,9 @@ import base64
 import json
 import shlex
 import threading
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Iterator, Sequence
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -27,6 +29,7 @@ from llm_waterfall import ChatRequest, ChatResponse
 from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness import pi_e2b as pi_e2b_module
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage
+from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_e2b import (
     LIVE_START_CMD,
     NODE_INSTALL_CMD,
@@ -34,6 +37,7 @@ from wmh.harness.pi_e2b import (
     RUNNER_WORKDIR,
     START_CMD,
     TRANSPORT_KEEPALIVE_TYPE,
+    E2BDurableChannel,
     E2BPiRuntime,
     E2BSandboxPool,
     E2BStdioChannel,
@@ -63,6 +67,10 @@ def _stdout_events(frames: list[JsonObject]) -> list[_Event]:
     return [(_line(f), None, None) for f in frames]
 
 
+def _envelope(seq: int, frame: JsonObject) -> JsonObject:
+    return {"transport_seq": seq, "frame": frame}
+
+
 class _ScriptedHandle:
     """A fake background command handle: yields scripted (stdout, stderr, pty) events.
 
@@ -75,11 +83,16 @@ class _ScriptedHandle:
         self._events = list(events)
         self._hold_open = hold_open
         self._release = threading.Event()
+        self.disconnects = 0
 
     def __iter__(self) -> Iterator[_Event]:
         yield from self._events
         if self._hold_open:
             self._release.wait(2.0)  # self-releasing so the daemon reader never lingers
+
+    def disconnect(self) -> None:
+        self.disconnects += 1
+        self._release.set()
 
 
 class _DisconnectingHandle(_ScriptedHandle):
@@ -96,6 +109,18 @@ class _DisconnectingHandle(_ScriptedHandle):
         raise RuntimeError("Server disconnected")
 
 
+class _GatedHandle(_ScriptedHandle):
+    """Keep stdout silent until a test has consumed the same frame from disk."""
+
+    def __init__(self, events: list[_Event], gate: threading.Event) -> None:
+        super().__init__(events, hold_open=True)
+        self._gate = gate
+
+    def __iter__(self) -> Iterator[_Event]:
+        self._gate.wait(2.0)
+        yield from super().__iter__()
+
+
 class _Result:
     """A minimal CommandOutput for foreground runs."""
 
@@ -105,6 +130,11 @@ class _Result:
         self.exit_code = exit_code
 
 
+class _Process:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+
 class _FakeCommands:
     """Foreground runs are recorded and echoed; background=True returns the scripted handle."""
 
@@ -112,28 +142,38 @@ class _FakeCommands:
         self,
         handle: _ScriptedHandle,
         *,
-        reconnect_handles: list[_ScriptedHandle] | None = None,
+        reconnect_handles: Sequence[_ScriptedHandle] | None = None,
+        on_stdin: Callable[[str], None] | None = None,
     ) -> None:
         self._handle = handle
         self._reconnect_handles = list(reconnect_handles or [])
         self.calls: list[str] = []  # foreground commands, in order (installs, ...)
         self.background_cmds: list[str] = []
+        self.background_envs: list[dict[str, str] | None] = []
         self.connects: list[tuple[int, float | None]] = []
         self.stdin: list[tuple[int, str]] = []
+        self.stdin_request_timeouts: list[float | None] = []
+        self.running_pids = {_PID}
+        self.killed: list[int] = []
+        self.kill_request_timeouts: list[float | None] = []
         self.fail_sends_from: int | None = None
+        self.fail_before_delivery: set[int] = set()
         self.send_error: Exception = TimeoutException("request timed out")
+        self._on_stdin = on_stdin
 
     def run(
         self,
         cmd: str,
         background: bool | None = None,
         *,
+        envs: dict[str, str] | None = None,
         stdin: bool | None = None,
         timeout: float | None = None,
     ) -> object:
         if background:
             assert stdin is True  # the runner is useless without a writable stdin
             self.background_cmds.append(cmd)
+            self.background_envs.append(envs)
             return self._handle
         self.calls.append(cmd)
         return _Result(stdout=f"ran: {cmd}")
@@ -144,10 +184,24 @@ class _FakeCommands:
             raise RuntimeError("process connection unavailable")
         return self._reconnect_handles.pop(0)
 
-    def send_stdin(self, pid: int, data: str) -> None:
+    def send_stdin(self, pid: int, data: str, request_timeout: float | None = None) -> None:
         self.stdin.append((pid, data))
+        self.stdin_request_timeouts.append(request_timeout)
+        if len(self.stdin) in self.fail_before_delivery:
+            raise self.send_error
+        if self._on_stdin is not None:
+            self._on_stdin(data)
         if self.fail_sends_from is not None and len(self.stdin) >= self.fail_sends_from:
             raise self.send_error
+
+    def list(self, request_timeout: float | None = None) -> Sequence[_Process]:
+        del request_timeout
+        return [_Process(pid) for pid in self.running_pids]
+
+    def kill(self, pid: int, request_timeout: float | None = None) -> None:
+        self.killed.append(pid)
+        self.kill_request_timeouts.append(request_timeout)
+        self.running_pids.discard(pid)
 
 
 class _FakeFiles:
@@ -161,8 +215,78 @@ class _FakeFiles:
         self.writes.append(path)
         self.store[path] = data
 
-    def read(self, path: str) -> str:
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str:
+        del request_timeout, gzip
         return self.store[path]
+
+
+class _TransientFiles(_FakeFiles):
+    """Fail selected reads a bounded number of times to model E2B visibility/RPC races."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures: dict[str, int] = {}
+        self.request_timeouts: list[float | None] = []
+        self.gzip_values: list[bool] = []
+        self.read_calls: list[tuple[str, float | None, bool]] = []
+
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str:
+        self.request_timeouts.append(request_timeout)
+        self.gzip_values.append(gzip)
+        self.read_calls.append((path, request_timeout, gzip))
+        remaining = self.failures.get(path, 0)
+        if remaining:
+            self.failures[path] = remaining - 1
+            raise FileNotFoundError(path)
+        return super().read(path, request_timeout=request_timeout, gzip=gzip)
+
+
+class _LargeFrameFiles(_TransientFiles):
+    """Require the durable frame path's long, gzip-enabled read contract."""
+
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str:
+        if "/frames/" in path and ((request_timeout or 0) < 1.0 or not gzip):
+            raise TimeoutError("large replay frame needs a compressed multi-second read")
+        return super().read(path, request_timeout=request_timeout, gzip=gzip)
+
+
+class _BlockingFrameFiles(_FakeFiles):
+    """Hold one exact frame read until a cancellation test releases it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.frame_read_started = threading.Event()
+        self.release_frame_read = threading.Event()
+
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str:
+        if "/frames/" in path:
+            self.frame_read_started.set()
+            self.release_frame_read.wait(2.0)
+        return super().read(path, request_timeout=request_timeout, gzip=gzip)
 
 
 class FakeSandbox:
@@ -174,8 +298,15 @@ class FakeSandbox:
         *,
         reconnect_handles: list[_ScriptedHandle] | None = None,
     ) -> None:
-        self.commands = _FakeCommands(handle, reconnect_handles=reconnect_handles)
         self.files = _FakeFiles()
+        self.durable_dispatches: list[JsonObject] = []
+        self._last_durable_inbound_seq = 0
+        self.drop_durable_acks = 0
+        self.commands = _FakeCommands(
+            handle,
+            reconnect_handles=reconnect_handles,
+            on_stdin=self._accept_durable_inbound,
+        )
         self.kills = 0
         self.timeouts: list[int] = []
         self.dead = False
@@ -188,6 +319,49 @@ class FakeSandbox:
     def kill(self) -> bool:
         self.kills += 1
         return True
+
+    def _accept_durable_inbound(self, data: str) -> None:
+        """Model runner-side inbound dedupe and append its ack to the durable fake outbox."""
+        try:
+            value = json.loads(base64.b64decode(data.strip()))
+        except (ValueError, TypeError):
+            return
+        if not isinstance(value, dict):
+            return
+        inbound_seq = value.get("transport_in_seq")
+        frame = value.get("frame")
+        if (
+            isinstance(inbound_seq, bool)
+            or not isinstance(inbound_seq, int)
+            or inbound_seq <= 0
+            or not isinstance(frame, dict)
+        ):
+            return
+        head_paths = [path for path in self.files.store if path.endswith("/head")]
+        if not head_paths:
+            return  # legacy stdio runner: raw frames have no transport envelope anyway
+        root = head_paths[-1].removesuffix("/head")
+        output_seq = int(self.files.store[head_paths[-1]].strip()) + 1
+        ack: JsonObject
+        if inbound_seq == self._last_durable_inbound_seq + 1:
+            self._last_durable_inbound_seq = inbound_seq
+            self.durable_dispatches.append(cast("JsonObject", frame))
+            ack = {"type": "transport_ack", "transport_in_seq": inbound_seq}
+        elif inbound_seq <= self._last_durable_inbound_seq:
+            ack = {"type": "transport_ack", "transport_in_seq": inbound_seq}
+        else:
+            ack = {
+                "type": "transport_nack",
+                "transport_in_seq": inbound_seq,
+                "expected_transport_in_seq": self._last_durable_inbound_seq + 1,
+            }
+        if self.drop_durable_acks > 0:
+            self.drop_durable_acks -= 1
+            return
+        self.files.store[f"{root}/frames/{output_seq:020d}.json"] = json.dumps(
+            _envelope(output_seq, ack)
+        )
+        self.files.store[head_paths[-1]] = str(output_seq)
 
 
 class _RecordingEnv:
@@ -280,9 +454,15 @@ def _runtime(
 
 
 def _sent_frames(fake: FakeSandbox) -> list[JsonObject]:
-    """Decode every frame the host pushed into the runner's stdin."""
+    """Decode every logical frame the host pushed, unwrapping durable inbound envelopes."""
     lines = [data for _pid, data in fake.commands.stdin]
-    return [cast("JsonObject", json.loads(base64.b64decode(data.strip()))) for data in lines]
+    decoded = [cast("JsonObject", json.loads(base64.b64decode(data.strip()))) for data in lines]
+    return [
+        cast("JsonObject", value["frame"])
+        if isinstance(value.get("transport_in_seq"), int) and isinstance(value.get("frame"), dict)
+        else value
+        for value in decoded
+    ]
 
 
 def _of_kind(fake: FakeSandbox, kind: str) -> list[JsonObject]:
@@ -951,6 +1131,416 @@ def test_run_propagates_a_second_e2b_send_timeout(
     assert [len(_of_kind(fake, "llm_response")) for fake in made] == [1, 1]
     assert [fake.kills for fake in made] == [1, 1]
     pool.close()
+
+
+# --- durable live-session transport ---
+_OUTBOX = f"{RUNNER_WORKDIR}/test-outbox"
+_OUTBOX_STDERR = f"{_OUTBOX}/stderr.log"
+
+
+def _frame_path(seq: int) -> str:
+    return f"{_OUTBOX}/frames/{seq:020d}.json"
+
+
+def _store_outbox(fake: FakeSandbox, frames: list[JsonObject]) -> None:
+    for seq, frame in enumerate(frames, start=1):
+        fake.files.store[_frame_path(seq)] = json.dumps(_envelope(seq, frame))
+    fake.files.store[f"{_OUTBOX}/head"] = str(len(frames))
+
+
+def _durable_channel(
+    fake: FakeSandbox,
+    handle: _ScriptedHandle,
+    *,
+    frame_read_grace_s: float = 0.1,
+    stdout_silence_grace_s: float = 45.0,
+) -> E2BDurableChannel:
+    return E2BDurableChannel(
+        fake,
+        handle,
+        outbox_root=_OUTBOX,
+        stderr_path=_OUTBOX_STDERR,
+        poll_interval_s=0.005,
+        stream_death_grace_s=0.005,
+        frame_read_grace_s=frame_read_grace_s,
+        pid_probe_interval_s=0.005,
+        stdout_silence_grace_s=stdout_silence_grace_s,
+    )
+
+
+def test_durable_channel_backfills_a_stdout_gap_before_delivering_the_newer_frame() -> None:
+    one: JsonObject = {"type": "hello"}
+    two: JsonObject = {"type": "state", "status": "ready"}
+    three: JsonObject = {"type": "state", "status": "idle"}
+    handle = _ScriptedHandle(
+        _stdout_events([_envelope(1, one), _envelope(3, three)]), hold_open=True
+    )
+    fake = FakeSandbox(handle)
+    _store_outbox(fake, [one, two, three])
+    channel = _durable_channel(fake, handle)
+
+    assert [channel.recv(timeout=0.5) for _ in range(3)] == [one, two, three]
+
+
+def test_durable_channel_dedupes_the_same_sequence_from_disk_and_stdout() -> None:
+    hello: JsonObject = {"type": "hello"}
+    gate = threading.Event()
+    handle = _GatedHandle(_stdout_events([_envelope(1, hello), _envelope(1, hello)]), gate)
+    fake = FakeSandbox(handle)
+    _store_outbox(fake, [hello])
+    channel = _durable_channel(fake, handle)
+
+    assert channel.recv(timeout=0.5) == hello  # unary outbox wins the race
+    gate.set()  # both duplicate stdout notifications arrive afterward
+    with pytest.raises(TimeoutError):
+        channel.recv(timeout=0.05)
+
+
+def test_durable_channel_recovers_after_stdout_drops() -> None:
+    hello: JsonObject = {"type": "hello"}
+    idle: JsonObject = {"type": "state", "status": "idle"}
+    handle = _DisconnectingHandle(_stdout_events([_envelope(1, hello)]))
+    fake = FakeSandbox(handle)
+    _store_outbox(fake, [hello, idle])
+    channel = _durable_channel(fake, handle)
+
+    assert channel.recv(timeout=0.5) == hello
+    assert channel.recv(timeout=0.5) == idle
+    assert "Server disconnected" in channel.stderr_tail()
+
+
+def test_durable_channel_retries_a_transiently_missing_committed_frame() -> None:
+    hello: JsonObject = {"type": "hello"}
+    ready: JsonObject = {"type": "state", "status": "ready"}
+    handle = _ScriptedHandle(_stdout_events([_envelope(2, ready)]), hold_open=True)
+    fake = FakeSandbox(handle)
+    transient = _TransientFiles()
+    fake.files = transient
+    _store_outbox(fake, [hello, ready])
+    transient.failures[_frame_path(1)] = 2
+    channel = _durable_channel(fake, handle)
+
+    assert channel.recv(timeout=0.5) == hello
+    assert channel.recv(timeout=0.5) == ready
+    assert transient.failures[_frame_path(1)] == 0
+    assert transient.request_timeouts
+    head_calls = [call for call in transient.read_calls if call[0].endswith("/head")]
+    frame_calls = [call for call in transient.read_calls if "/frames/" in call[0]]
+    assert head_calls
+    assert all(timeout is not None and timeout <= 0.25 for _, timeout, _ in head_calls)
+    assert frame_calls
+    assert all(timeout == 5.0 and gzip for _, timeout, gzip in frame_calls)
+
+
+def test_durable_channel_replays_a_large_context_with_a_compressed_frame_budget() -> None:
+    frame: JsonObject = {
+        "type": "llm_request",
+        "req_id": 1,
+        "openai_body": {"messages": [{"role": "user", "content": "x" * 1_000_000}]},
+    }
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    files = _LargeFrameFiles()
+    fake.files = files
+    _store_outbox(fake, [frame])
+    channel = _durable_channel(fake, handle)
+
+    assert channel.recv(timeout=0.5) == frame
+    frame_calls = [call for call in files.read_calls if "/frames/" in call[0]]
+    assert frame_calls == [(_frame_path(1), 5.0, True)]
+
+
+def test_live_session_completes_exactly_once_across_a_durable_stdout_drop() -> None:
+    """A dropped notification stream cannot duplicate model/tool work during one real turn."""
+    frames: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "state", "status": "idle"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+        {
+            "type": "tool_request",
+            "req_id": 2,
+            "name": "bash",
+            "arguments": {"command": "pwd"},
+        },
+        {
+            "type": "tool_request",
+            "req_id": 3,
+            "name": "submit",
+            "arguments": {"answer": "done"},
+        },
+        {"type": "state", "status": "idle", "reason": "completed", "turns": 1},
+    ]
+    # stdout carries the opening frames, repeats the LLM request, then disconnects. The tool,
+    # submit, and final state must continue from the exact filesystem frames.
+    handle = _DisconnectingHandle(
+        _stdout_events(
+            [
+                _envelope(1, frames[0]),
+                _envelope(2, frames[1]),
+                _envelope(3, frames[2]),
+                _envelope(3, frames[2]),
+            ]
+        )
+    )
+    fake = FakeSandbox(handle)
+    _store_outbox(fake, frames)
+    channel = _durable_channel(fake, handle)
+    assert channel.recv(timeout=0.5) == {"type": "hello"}
+
+    worker_calls: list[ChatRequest] = []
+    tool_calls: list[str] = []
+    events: list[SessionEvent] = []
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        worker_calls.append(request)
+        return _completion("on it")
+
+    def execute(name: str, arguments: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
+        del arguments, emit
+        tool_calls.append(name)
+        return ToolOutcome(content="/home/user/project\n")
+
+    session = LiveSession(
+        channel,
+        tools=[TOOL_REGISTRY["bash"], SUBMIT],
+        execute_tool=execute,
+        on_event=events.append,
+        worker_fn=worker,
+    )
+    session.start()
+    events.clear()
+    session.send_user_message("finish once")
+    for _ in range(20):
+        session.pump(timeout=0.05)
+        if any(
+            event.kind == "state" and event.payload.get("reason") == "completed" for event in events
+        ):
+            break
+
+    assert session.status == "idle"
+    assert len(worker_calls) == 1
+    assert tool_calls == ["bash"]
+    dispatched_types = [frame["type"] for frame in fake.durable_dispatches]
+    assert dispatched_types.count("llm_response") == 1
+    assert dispatched_types.count("tool_response") == 2
+    assert [event.kind for event in events].count("assistant_message") == 1
+    assert [event.kind for event in events].count("tool_call") == 1
+    assert [event.kind for event in events].count("submit") == 1
+
+
+def test_durable_channel_fails_after_a_committed_frame_stays_corrupt() -> None:
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "1"
+    fake.files.store[_frame_path(1)] = "{not-json"
+    channel = _durable_channel(fake, handle, frame_read_grace_s=0.01)
+
+    with pytest.raises(RuntimeError, match="durable outbox frame 1 unavailable"):
+        channel.recv(timeout=0.5)
+
+
+def test_durable_channel_fails_when_stream_and_head_reads_stay_unavailable() -> None:
+    """A live PID cannot turn a combined output/filesystem outage into a six-hour spin."""
+    handle = _DisconnectingHandle([])
+    fake = FakeSandbox(handle)
+    channel = _durable_channel(fake, handle, frame_read_grace_s=0.01)
+
+    with pytest.raises(RuntimeError, match="durable outbox head unavailable"):
+        channel.recv(timeout=0.5)
+
+
+def test_durable_channel_rejects_an_unsequenced_semantic_stdout_frame() -> None:
+    handle = _ScriptedHandle(_stdout_events([{"type": "llm_request", "req_id": 1}]))
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    channel = _durable_channel(fake, handle)
+
+    with pytest.raises(RuntimeError, match="unsequenced or malformed semantic frame"):
+        channel.recv(timeout=0.5)
+
+
+def test_durable_channel_fails_when_silent_stream_and_head_reads_stay_unavailable() -> None:
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    channel = _durable_channel(
+        fake,
+        handle,
+        frame_read_grace_s=0.01,
+        stdout_silence_grace_s=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="durable outbox head unavailable"):
+        channel.recv(timeout=0.5)
+
+
+def test_durable_channel_pid_exit_includes_the_durable_stderr_tail() -> None:
+    handle = _DisconnectingHandle([])
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    fake.files.store[_OUTBOX_STDERR] = "runner booted\nfatal durable detail\n"
+    fake.commands.running_pids.clear()
+    channel = _durable_channel(fake, handle, frame_read_grace_s=0.01)
+
+    with pytest.raises(RuntimeError, match="fatal durable detail"):
+        channel.recv(timeout=0.5)
+
+
+def test_durable_channel_polls_disk_while_stdout_is_silently_open() -> None:
+    hello: JsonObject = {"type": "hello"}
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    _store_outbox(fake, [hello])
+    channel = _durable_channel(fake, handle)
+
+    assert channel.recv(timeout=0.5) == hello
+
+
+def test_start_live_runner_durable_handshake_survives_immediate_stdout_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pi_e2b_module.uuid, "uuid4", lambda: SimpleNamespace(hex="fixed-outbox-id"))
+    root = f"{RUNNER_WORKDIR}/live-outbox-fixed-outbox-id"
+    handle = _DisconnectingHandle([])
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{root}/head"] = "1"
+    fake.files.store[f"{root}/frames/{1:020d}.json"] = json.dumps(_envelope(1, {"type": "hello"}))
+
+    channel = start_live_runner(
+        fake, template="wmh-pi-node", durable_outbox=True, hello_timeout=0.5
+    )
+
+    assert isinstance(channel, E2BDurableChannel)
+    assert fake.commands.background_envs == [{"WMH_LIVE_OUTBOX": root}]
+    assert fake.commands.background_cmds == [f"{LIVE_START_CMD} 2>> {root}/stderr.log"]
+
+
+def test_durable_channel_close_sends_shutdown_and_kills_the_runner_once() -> None:
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    channel = _durable_channel(fake, handle)
+
+    channel.close()
+    channel.close()
+
+    assert channel._cleanup_done.wait(1.0)
+    assert [f.get("type") for f in _sent_frames(fake)] == ["shutdown"]
+    assert fake.commands.stdin_request_timeouts == [0.25]
+    assert fake.commands.killed == [_PID]
+    assert fake.commands.kill_request_timeouts == [0.25]
+    assert handle.disconnects == 1
+    assert channel.recv(timeout=0.01) is None
+
+
+def test_durable_channel_close_does_not_wait_for_an_inflight_frame_read() -> None:
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    files = _BlockingFrameFiles()
+    fake.files = files
+    _store_outbox(fake, [{"type": "state", "status": "idle"}])
+    channel = _durable_channel(fake, handle)
+    received: list[JsonObject | None] = []
+
+    receiver = threading.Thread(target=lambda: received.append(channel.recv(timeout=1.0)))
+    receiver.start()
+    assert files.frame_read_started.wait(0.5)
+
+    started = time.monotonic()
+    channel.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert channel._cleanup_done.wait(1.0)
+    assert fake.commands.killed == [_PID]
+    files.release_frame_read.set()
+    receiver.join(timeout=1.0)
+    assert not receiver.is_alive()
+    assert received == [None]
+
+
+def test_durable_channel_close_discards_a_prequeued_tool_request() -> None:
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    channel = _durable_channel(fake, handle)
+    channel._frames.put(
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "bash",
+            "arguments": {"command": "touch should-not-run"},
+        }
+    )
+
+    channel.close()
+
+    assert channel.recv(timeout=0.01) is None
+    assert channel.recv(timeout=0.01) is None
+    assert channel.recv(timeout=0.01) is None
+    assert channel._cleanup_done.wait(1.0)
+
+
+def test_durable_channel_bounds_normal_stdin_delivery() -> None:
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    channel = _durable_channel(fake, handle)
+
+    channel.send({"type": "ping", "nonce": "n"})
+
+    assert fake.commands.stdin_request_timeouts == [2.0]
+    assert fake.durable_dispatches == [{"type": "ping", "nonce": "n"}]
+
+
+def test_durable_channel_recovers_when_an_accepted_stdin_write_times_out() -> None:
+    """A delivered-then-timeout RPC resolves through its durable ack without replaying."""
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    fake.commands.fail_sends_from = 1
+    channel = _durable_channel(fake, handle)
+    frame: JsonObject = {"type": "user_message", "msg_id": "m1", "text": "improve"}
+
+    channel.send(frame)
+
+    assert len(fake.commands.stdin) == 1
+    assert fake.durable_dispatches == [frame]
+    with pytest.raises(TimeoutError):
+        channel.recv(timeout=0.02)  # the transport ack never leaks into LiveSession
+
+
+def test_durable_channel_retries_the_same_sequence_after_a_lost_ack() -> None:
+    """A duplicate physical write repairs ack loss without duplicate logical dispatch."""
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    fake.drop_durable_acks = 1
+    channel = _durable_channel(fake, handle)
+    frame: JsonObject = {"type": "tool_response", "req_id": 7, "content": "once"}
+
+    channel.send(frame)
+
+    assert len(fake.commands.stdin) == 2
+    wires = [json.loads(base64.b64decode(data.strip())) for _pid, data in fake.commands.stdin]
+    assert wires[0] == wires[1] == {"transport_in_seq": 1, "frame": frame}
+    assert fake.durable_dispatches == [frame]
+
+
+def test_durable_channel_retries_the_same_sequence_after_a_pre_delivery_timeout() -> None:
+    """A failed physical write retries once without advancing the logical sequence."""
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    fake.files.store[f"{_OUTBOX}/head"] = "0"
+    fake.commands.fail_before_delivery.add(1)
+    channel = _durable_channel(fake, handle)
+    frame: JsonObject = {"type": "session_start", "session_id": "s1"}
+
+    channel.send(frame)
+
+    assert len(fake.commands.stdin) == 2
+    wires = [json.loads(base64.b64decode(data.strip())) for _pid, data in fake.commands.stdin]
+    assert wires[0] == wires[1] == {"transport_in_seq": 1, "frame": frame}
+    assert fake.durable_dispatches == [frame]
 
 
 # --- live-session bootstrap (start_live_runner / session_entry_files) ---

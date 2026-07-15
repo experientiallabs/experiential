@@ -21,7 +21,14 @@ class _Files:
         self.values[path] = data
         return None
 
-    def read(self, path: str) -> str:
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str:
+        del request_timeout, gzip
         return self.values[path]
 
 
@@ -40,8 +47,8 @@ class _Commands:
         self.runs.append(cmd)
         return _Output()
 
-    def send_stdin(self, pid: int, data: str) -> object:
-        del pid, data
+    def send_stdin(self, pid: int, data: str, request_timeout: float | None = None) -> object:
+        del pid, data, request_timeout
         return None
 
 
@@ -116,7 +123,7 @@ class _MeteredProvider(_Provider):
         )
 
 
-def test_default_project_channel_enables_safe_idle_reconnect(
+def test_default_project_channel_enables_durable_outbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sandbox = _Sandbox()
@@ -134,7 +141,7 @@ def test_default_project_channel_enables_safe_idle_reconnect(
     assert captured == {
         "sandbox": sandbox,
         "workspace": "/project",
-        "reconnect_while_idle": True,
+        "durable_outbox": True,
     }
 
 
@@ -280,6 +287,65 @@ def test_project_retries_a_transient_channel_send_failure() -> None:
     assert result.answer == "finished"
     assert failed.closed is True
     assert recovered.closed is False
+
+
+def test_project_retries_an_initial_session_start_socket_failure() -> None:
+    """The direct LiveSession.start send reaches the same bounded recovery path."""
+
+    class _StartFailureChannel(_Channel):
+        def send(self, frame: JsonObject) -> None:
+            if frame.get("type") == "session_start":
+                raise RuntimeError("failed to send a frame to the E2B runner")
+            super().send(frame)
+
+    failed = _StartFailureChannel()
+    recovered = _Channel()
+    channels = iter([failed, recovered])
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: next(channels),
+        owns_sandbox=False,
+    )
+
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    assert result.answer == "finished"
+    assert failed.closed is True
+    assert recovered.closed is False
+
+
+def test_project_replaces_owned_sandbox_after_durable_outbox_failure() -> None:
+    """A corrupt durable transport still reaches the bounded fresh-sandbox fallback."""
+
+    class _CorruptOutboxChannel(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise RuntimeError("durable outbox frame 4 unavailable after 5s")
+
+    original = _Sandbox()
+    replacement = _Sandbox()
+    failed = _CorruptOutboxChannel()
+    recovered = _Channel()
+    project = AgentProject(
+        original,
+        channel_factory=lambda sandbox, workspace: recovered if sandbox is replacement else failed,
+        sandbox_factory=lambda: replacement,
+    )
+
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    assert result.answer == "finished"
+    assert original.killed is True
+    assert replacement.killed is False
+    assert project.usage().count == 2
 
 
 def test_project_counts_worker_usage_from_failed_and_recovered_attempts() -> None:
