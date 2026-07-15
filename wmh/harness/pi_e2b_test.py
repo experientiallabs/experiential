@@ -29,7 +29,7 @@ from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness import pi_e2b as pi_e2b_module
-from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage
+from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxFactory, SandboxUsage
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_e2b import (
     LIVE_START_CMD,
@@ -799,6 +799,31 @@ def test_pool_discards_an_unhealthy_sandbox_and_creates_a_fresh_one(
     fresh, _fresh_channel = pool.acquire()
     assert fresh is made[1] and fresh is not sandbox
     assert made[1].commands.calls.count(NODE_INSTALL_CMD) == 1  # the fresh one bootstrapped
+    pool.close()
+
+
+def test_pool_default_factory_tags_initial_and_replacement_sandboxes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}], [{"type": "hello"}]])
+    factory_calls: list[dict[str, object]] = []
+
+    def recording_default_factory(**kwargs: object) -> SandboxFactory:
+        factory_calls.append(kwargs)
+        return factory
+
+    monkeypatch.setattr(pi_e2b_module, "default_sandbox_factory", recording_default_factory)
+    metadata = {"optimizer_run_id": "run-1", "purpose": "evaluation"}
+    pool = E2BSandboxPool(template="tmpl", api_key="key", metadata=metadata)
+
+    sandbox, channel = pool.acquire()
+    pool.release(sandbox, channel, healthy=False)
+    replacement, _ = pool.acquire()
+
+    assert replacement is made[1]
+    assert len(made) == 2
+    assert factory_calls == [{"api_key": "key", "template": "tmpl", "metadata": metadata}]
     pool.close()
 
 

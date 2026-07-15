@@ -759,10 +759,12 @@ class _FakePool:
         *,
         template: str | None = None,
         api_key: str | None = None,
+        metadata: dict[str, str] | None = None,
         sandbox_factory: object = None,
         hello_timeout: float = 0.0,
     ) -> None:
         self.template = template
+        self.metadata = metadata
         self.channels: list[_ScriptedPoolChannel] = []
         self.releases: list[bool] = []
         self.retire_idle_calls = 0
@@ -905,6 +907,7 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
         k=3,
         harness_backend="e2b",
         e2b_template="tmpl-1",
+        e2b_metadata={"optimizer_run_id": "run-1", "purpose": "evaluation"},
     )
 
     # The judge passed the runner's submitted answer: the eval genuinely ran end to end.
@@ -912,6 +915,7 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
     assert concurrencies == [0]  # e2b default: every (task, attempt) cell at once
     [pool] = fake_pool_cls.instances  # ONE shared pool for the whole search
     assert pool.template == "tmpl-1"
+    assert pool.metadata == {"optimizer_run_id": "run-1", "purpose": "evaluation"}
     # Closed on return (finalizing the usage meter) and again by the finally — the real pool's
     # close is idempotent, so "at least once, before usage capture" is the contract.
     assert pool.closes >= 1

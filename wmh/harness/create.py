@@ -334,6 +334,7 @@ def create_harness(
     harness_backend: Literal["local", "e2b"] = "local",
     eval_concurrency: int | None = None,
     e2b_template: str | None = None,
+    e2b_metadata: dict[str, str] | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
     on_iteration: Callable[[IterationRecord], None] | None = None,
@@ -369,7 +370,8 @@ def create_harness(
     is how many (task, attempt) cells run at once; `None` means the backend default — 1
     (sequential) for local, 0 (every cell at once, one pooled sandbox each) for e2b.
     `e2b_template` names a prebaked sandbox template (node 22 + the pi runner deps) so e2b
-    rollouts skip bootstrap installs.
+    rollouts skip bootstrap installs. `e2b_metadata` tags every sandbox created by the shared
+    evaluation pool, including fresh replacements for retired runners.
 
     Verification is staged by cost: a child is first SCREENED on its own trigger cluster (the
     2-3 failing tasks its delta claims to fix, k passes) — if the cluster did not improve over
@@ -400,7 +402,7 @@ def create_harness(
         # Lazy: the e2b backend is an optional extra; local searches must import none of it.
         from wmh.harness.pi_e2b import E2BSandboxPool as _Pool
 
-        sandbox_pool = _Pool(template=e2b_template)
+        sandbox_pool = _Pool(template=e2b_template, metadata=e2b_metadata)
 
     try:
 

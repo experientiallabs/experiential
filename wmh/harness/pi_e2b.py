@@ -966,12 +966,15 @@ class E2BSandboxPool:
         *,
         template: str | None = None,
         api_key: str | None = None,
+        metadata: dict[str, str] | None = None,
         sandbox_factory: SandboxFactory | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
     ) -> None:
         self._template = template
         self._factory = sandbox_factory or default_sandbox_factory(
-            api_key=api_key, template=template
+            api_key=api_key,
+            template=template,
+            metadata=metadata,
         )
         self._hello_timeout = hello_timeout
         self._lock = threading.Lock()
