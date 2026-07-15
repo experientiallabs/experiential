@@ -130,7 +130,21 @@ class AgentProject:
     def write_text(self, path: str, content: str) -> None:
         """Write one project-relative file without allowing path traversal."""
         absolute = self._absolute_path(path)
-        self._write_sandbox_file(self._sandbox, absolute, content)
+        try:
+            self._write_sandbox_file(self._sandbox, absolute, content)
+        except Exception as error:
+            # Proposer context is written before ``run()``, so its recovery loop cannot own an
+            # exhausted control-plane retry. Replace an owned, transport-poisoned sandbox once,
+            # replay the established mirror, and then apply this idempotent overwrite there.
+            if self._sandbox_factory is None or not _is_recoverable_transport_error(error):
+                raise
+            try:
+                self._replace_sandbox()
+                self._write_sandbox_file(self._sandbox, absolute, content)
+            except Exception as recovery_error:
+                raise RuntimeError(
+                    f"{error}; fresh project sandbox recovery failed: {recovery_error}"
+                ) from recovery_error
         self._file_contents[self._relative_path(absolute)] = content
 
     def read_text(self, path: str) -> str:
@@ -537,6 +551,13 @@ def _is_recoverable_transport_error(error: Exception) -> bool:
     if error_type.__module__ == "e2b.exceptions" and error_type.__name__ == "TimeoutException":
         return True
     text = str(error).lower()
+    # httpcore can race an E2B HTTP/2 GOAWAY with request body delivery. h2 then surfaces a raw
+    # ProtocolError instead of httpx's usual transport wrapper. The pool will not reassign that
+    # unavailable closed connection, so the next idempotent control-plane request opens a fresh
+    # one. Match the state-machine shape rather than every h2 ProtocolError: malformed responses
+    # remain fatal.
+    if "invalid input connectioninputs." in text and "connectionstate.closed" in text:
+        return True
     return any(marker in text for marker in _RECOVERABLE_SESSION_MARKERS)
 
 

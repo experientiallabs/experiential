@@ -215,6 +215,124 @@ def test_project_retries_one_context_write_after_e2b_disconnect() -> None:
     assert sandbox.killed is False
 
 
+def test_project_retries_one_context_write_after_closed_http2_connection() -> None:
+    """A stale E2B HTTP/2 connection cannot invalidate an entire proposal batch."""
+
+    class _ClosedHttp2OnceCommands(_Commands):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_next = False
+            self.attempts = 0
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            self.attempts += 1
+            if self.close_next:
+                self.close_next = False
+                raise RuntimeError(
+                    "Invalid input ConnectionInputs.SEND_DATA in state ConnectionState.CLOSED"
+                )
+            return super().run(cmd, background=background, **kwargs)
+
+    sandbox = _Sandbox()
+    commands = _ClosedHttp2OnceCommands()
+    sandbox.commands = commands
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        sandbox_factory=lambda: pytest.fail("a fresh HTTP/2 request must reuse the project"),
+    )
+    attempts_before = commands.attempts
+    commands.close_next = True
+
+    project.write_text("context/round-0007/parent.json", '{"round": 7}')
+
+    assert commands.attempts - attempts_before == 2
+    assert project.read_text("context/round-0007/parent.json") == '{"round": 7}'
+    assert project.usage().count == 1
+    assert sandbox.killed is False
+
+
+def test_project_replaces_owned_sandbox_after_repeated_closed_http2_writes() -> None:
+    """An exhausted context-write retry reaches the project's bounded sandbox fallback."""
+
+    class _ClosedHttp2Commands(_Commands):
+        closed = False
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            if self.closed:
+                raise RuntimeError(
+                    "Invalid input ConnectionInputs.SEND_DATA in state ConnectionState.CLOSED"
+                )
+            return super().run(cmd, background=background, **kwargs)
+
+    original = _Sandbox()
+    original_commands = _ClosedHttp2Commands()
+    original.commands = original_commands
+    replacement = _Sandbox()
+    project = AgentProject(original, sandbox_factory=lambda: replacement)
+    project.write_text("history/round-0006.json", '{"kept": true}')
+    original_commands.closed = True
+
+    project.write_text("context/round-0007/parent.json", '{"round": 7}')
+
+    assert original.killed is True
+    assert replacement.killed is False
+    assert project.usage().count == 2
+    assert replacement.files.values["/home/user/project/history/round-0006.json"] == (
+        '{"kept": true}'
+    )
+    assert replacement.files.values["/home/user/project/context/round-0007/parent.json"] == (
+        '{"round": 7}'
+    )
+
+
+def test_context_write_recovery_restarts_an_idle_project_session() -> None:
+    """A poisoned next-round write preserves the archive and resumes on a fresh live session."""
+
+    class _ClosedHttp2Commands(_Commands):
+        closed = False
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            if self.closed:
+                raise RuntimeError(
+                    "Invalid input ConnectionInputs.SEND_DATA in state ConnectionState.CLOSED"
+                )
+            return super().run(cmd, background=background, **kwargs)
+
+    original = _Sandbox()
+    original_commands = _ClosedHttp2Commands()
+    original.commands = original_commands
+    replacement = _Sandbox()
+    original_channel = _Channel()
+    replacement_channel = _Channel()
+    project = AgentProject(
+        original,
+        channel_factory=lambda sandbox, workspace: (
+            replacement_channel if sandbox is replacement else original_channel
+        ),
+        sandbox_factory=lambda: replacement,
+    )
+    agent = meta_agent()
+    provider = _Provider()
+    project.write_text("history/round-0006.json", '{"kept": true}')
+    first = project.run(agent, provider, "round 6", timeout=1)
+    original_commands.closed = True
+
+    project.write_text("context/round-0007/parent.json", '{"round": 7}')
+    second = project.run(agent, provider, "round 7", timeout=1)
+
+    assert first.answer == second.answer == "finished"
+    assert original_channel.closed is True
+    assert replacement_channel.closed is False
+    assert original.killed is True
+    assert replacement.killed is False
+    assert project.usage().count == 2
+    assert project.read_text("history/round-0006.json") == '{"kept": true}'
+    assert project.read_text("context/round-0007/parent.json") == '{"round": 7}'
+    assert [frame["type"] for frame in original_channel.sent].count("user_message") == 1
+    assert [frame["type"] for frame in replacement_channel.sent].count("user_message") == 1
+
+
 def test_project_does_not_retry_non_transport_context_write_failure() -> None:
     """A real filesystem failure still propagates after exactly one attempt."""
 
