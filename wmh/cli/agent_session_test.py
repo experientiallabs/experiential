@@ -780,13 +780,13 @@ def test_run_session_flag_combinations_are_validated(monkeypatch: pytest.MonkeyP
 
 def test_run_dispatches_session_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     """--send/--attach/--end route to the detached command driver, unified in run."""
-    captured: list[dict[str, object]] = []
+    captured: list[dict[str, str | None]] = []
 
     class _Driver:
         def run(self) -> None:
             pass
 
-    def build(**kwargs: object) -> _Driver:
+    def build(**kwargs: str | None) -> _Driver:
         captured.append(kwargs)
         return _Driver()
 

@@ -16,7 +16,7 @@ import typer
 
 import wmh.cli.hosted_session as mod
 from wmh.cli.session_state import DetachedSessionState, SessionStateStore, WorkspaceCheckpoint
-from wmh.cli.workspace_sync import snapshot_from_archive, snapshot_workspace
+from wmh.cli.workspace_sync import FileState, snapshot_from_archive, snapshot_workspace
 from wmh.harness.workspace_patch import build_workspace_patch
 from wmh.platform.client import (
     PlatformError,
@@ -443,7 +443,7 @@ def test_send_catches_up_remote_patches_before_messaging(tmp_path: Path) -> None
     assert snapshot_from_archive(store.load_base_archive(state)).files == base_files(root)
 
 
-def base_files(root: Path) -> dict[str, object]:
+def base_files(root: Path) -> dict[str, FileState]:
     """The current on-disk manifest, for checkpoint equality assertions."""
     return dict(snapshot_workspace(root).files)
 
