@@ -10,6 +10,7 @@ from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
+from wmh.harness.live_session import SessionEvent
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 
@@ -123,6 +124,12 @@ class _MeteredProvider(_Provider):
         )
 
 
+class _FailingProvider(_Provider):
+    def complete_chat(self, request: object) -> ChatResponse:
+        del request
+        raise RuntimeError("provider down")
+
+
 def test_default_project_channel_enables_durable_outbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -223,6 +230,177 @@ def test_project_surfaces_a_mid_turn_runner_error() -> None:
     )
 
     with pytest.raises(RuntimeError, match="worker bridge disconnected"):
+        project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+
+def test_project_promotes_a_worker_error_after_the_runner_returns_idle() -> None:
+    """A provider failure cannot look like a normally completed project turn."""
+    sandbox = _Sandbox()
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+        {"type": "state", "status": "idle", "reason": "completed"},
+    ]
+    events: list[SessionEvent] = []
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="project agent session failed: worker LLM error: provider down",
+    ):
+        project.run(
+            meta_agent(),
+            _FailingProvider(),
+            "produce a result",
+            timeout=1,
+            on_event=events.append,
+        )
+
+    error = next(event for event in events if event.kind == "error")
+    assert error.payload == {"message": "worker LLM error: provider down"}
+    response = next(frame for frame in channel.sent if frame["type"] == "llm_response")
+    assert response["error"] == "provider down"
+
+
+def test_project_does_not_retry_a_provider_error_that_looks_like_transport() -> None:
+    """Provider text cannot borrow the project transport's retry ownership."""
+
+    class _TransportLookingProvider(_Provider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete_chat(self, request: object) -> ChatResponse:
+            del request
+            self.calls += 1
+            raise RuntimeError("Server disconnected without sending a response")
+
+    failed = _Channel()
+    failed.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+        {"type": "state", "status": "idle", "reason": "completed"},
+    ]
+    recovered = _Channel()
+    channels = iter([failed, recovered])
+    starts = 0
+
+    def channel_factory(sandbox: object, workspace: str) -> _Channel:
+        nonlocal starts
+        del sandbox, workspace
+        starts += 1
+        return next(channels)
+
+    provider = _TransportLookingProvider()
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=channel_factory,
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="worker LLM error: Server disconnected without sending a response",
+    ):
+        project.run(meta_agent(), provider, "produce a result", timeout=1)
+
+    assert provider.calls == 1
+    assert starts == 1
+    assert failed.closed is False
+
+
+def test_project_ignores_idle_until_the_new_turn_reports_running() -> None:
+    """A stale idle frame cannot complete a newly queued project turn."""
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "idle", "reason": "stale_abort"},
+        {"type": "state", "status": "running"},
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "submit",
+            "arguments": {"answer": "fresh"},
+        },
+        {"type": "state", "status": "idle", "reason": "completed"},
+    ]
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    assert result.answer == "fresh"
+
+
+def test_project_timeout_retires_the_session_before_the_next_turn() -> None:
+    """A late abort boundary cannot leak from a timed-out turn into its successor."""
+
+    class _HangingChannel(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise TimeoutError
+
+    hanging = _HangingChannel()
+    recovered = _Channel()
+    channels = iter([hanging, recovered])
+    starts = 0
+
+    def channel_factory(sandbox: object, workspace: str) -> _Channel:
+        nonlocal starts
+        del sandbox, workspace
+        starts += 1
+        return next(channels)
+
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=channel_factory,
+        owns_sandbox=False,
+    )
+    agent = meta_agent()
+    provider = _Provider()
+
+    with pytest.raises(TimeoutError, match="project agent did not finish"):
+        project.run(agent, provider, "timed-out turn", timeout=0.001)
+    result = project.run(agent, provider, "next turn", timeout=1)
+
+    assert hanging.closed is True
+    assert result.answer == "finished"
+    assert starts == 2
+
+
+@pytest.mark.parametrize("reason", ["aborted", "turn_limit"])
+def test_project_promotes_unsuccessful_terminal_turn_reasons(reason: str) -> None:
+    """A bounded/aborted agent turn cannot masquerade as a completed proposal turn."""
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "state", "status": "idle", "reason": reason},
+    ]
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(RuntimeError, match=f"turn ended with reason: {reason}"):
         project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
 
 

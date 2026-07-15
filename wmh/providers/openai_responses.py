@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
-from wmh.providers import _openai_common
+from wmh.providers import _openai_common, _responses_common
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -77,6 +79,16 @@ class OpenAIResponsesProvider:
                 store=False,
             )
         return Completion(text=_response_text(response), usage=_usage_from_response(response))
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a full structured request through the native Responses API."""
+        return _responses_common.complete_chat(
+            self._get_client().responses,
+            self.config.model,
+            request,
+            reasoning_effort=self.config.reasoning_effort,
+            allow_sampling=False,
+        )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed text through OpenAI's embeddings API.

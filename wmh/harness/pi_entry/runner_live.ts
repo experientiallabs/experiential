@@ -275,6 +275,7 @@ function startLlmBridge(conn: StdioConn): Promise<Bridge> {
 					const choice = reply.completion?.choices?.[0] ?? {};
 					const msg = choice.message ?? {};
 					const delta: any = { role: "assistant", content: msg.content ?? "" };
+					if (msg.reasoning_details) delta.reasoning_details = msg.reasoning_details;
 					if (msg.tool_calls) {
 						delta.tool_calls = msg.tool_calls.map((tc: any, i: number) => ({
 							index: i,

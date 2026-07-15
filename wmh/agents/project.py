@@ -62,6 +62,10 @@ class AgentProjectRun:
     worker_usage: TokenUsage
 
 
+class _ProjectAgentTurnError(RuntimeError):
+    """A worker/provider error reported by a live agent turn, not its transport."""
+
+
 class AgentProject:
     """A persistent filesystem that can run project-scoped pi agents.
 
@@ -205,16 +209,28 @@ class AgentProject:
         events: list[SessionEvent] = []
         answer = ""
         turn_started = False
+        turn_running = False
         turn_finished = False
+        turn_terminal_reason: str | None = None
+        turn_error: str | None = None
 
         def sink(event: SessionEvent) -> None:
-            nonlocal answer, turn_finished
+            nonlocal answer, turn_error, turn_finished, turn_running, turn_terminal_reason
             events.append(event)
             if event.kind == "submit":
                 submitted = event.payload.get("answer")
                 answer = submitted if isinstance(submitted, str) else ""
-            elif turn_started and event.kind == "state" and event.payload.get("status") == "idle":
-                turn_finished = True
+            elif event.kind == "error" and turn_error is None:
+                message = event.payload.get("message")
+                turn_error = message if isinstance(message, str) else "project agent session error"
+            elif turn_started and event.kind == "state":
+                status = event.payload.get("status")
+                if status == "running":
+                    turn_running = True
+                elif status == "idle" and turn_running:
+                    turn_finished = True
+                    reason = event.payload.get("reason")
+                    turn_terminal_reason = reason if isinstance(reason, str) else None
             if on_event is not None:
                 on_event(event)
 
@@ -228,6 +244,9 @@ class AgentProject:
                 if remaining <= 0:
                     session.interrupt("project_run_timeout")
                     session.pump(timeout=0)
+                    # An abort acknowledgement can arrive after this deadline. Retiring the
+                    # session prevents that stale idle boundary from completing the next turn.
+                    self._close_agent_session()
                     raise TimeoutError(f"project agent did not finish within {timeout:g}s")
                 if not session.pump(timeout=min(0.5, remaining)) and not turn_finished:
                     if session.failure_message is not None:
@@ -235,6 +254,12 @@ class AgentProject:
                             f"project agent session failed: {session.failure_message}"
                         )
                     raise RuntimeError("project agent session ended before completing its turn")
+            if turn_error is not None:
+                raise _ProjectAgentTurnError(f"project agent session failed: {turn_error}")
+            if turn_terminal_reason in {"aborted", "turn_limit"}:
+                raise _ProjectAgentTurnError(
+                    f"project agent turn ended with reason: {turn_terminal_reason}"
+                )
         finally:
             self._active_event_sink = None
         return AgentProjectRun(answer=answer, events=tuple(events), worker_usage=TokenUsage())
@@ -461,6 +486,8 @@ def _start_channel(sandbox: SandboxHandle, workspace: str) -> Channel:
 
 def _is_recoverable_session_error(error: Exception) -> bool:
     """Return whether one fresh live session may recover this transport failure."""
+    if isinstance(error, _ProjectAgentTurnError):
+        return False
     error_type = type(error)
     if error_type.__module__ == "e2b.exceptions" and error_type.__name__ == "TimeoutException":
         return True

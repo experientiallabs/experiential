@@ -20,6 +20,7 @@ import shlex
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -56,6 +57,14 @@ class TimeoutException(Exception):
 
 
 TimeoutException.__module__ = "e2b.exceptions"
+
+
+def test_all_pi_llm_bridges_forward_opaque_reasoning_details() -> None:
+    """Every runner preserves stateless Responses reasoning through Pi's SSE parser."""
+    entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
+    for filename in ("runner_stdio.ts", "runner_live.ts", "runner_service.ts"):
+        source = (entry / filename).read_text(encoding="utf-8")
+        assert "delta.reasoning_details = msg.reasoning_details" in source
 
 
 def _line(frame: JsonObject) -> str:

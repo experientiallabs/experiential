@@ -155,9 +155,20 @@ class ProjectDeltaProposer:
             try:
                 proposal = parse_delta(parent, trigger, raw)
             except Exception as error:  # noqa: BLE001 - isolate one malformed sibling output
-                proposals.append(ProposalFailure(reason=f"invalid proposal output: {error}"))
+                proposals.append(
+                    ProposalFailure(
+                        reason=(
+                            str(run_error)
+                            if run_error is not None
+                            else f"invalid proposal output: {error}"
+                        )
+                    )
+                )
             else:
-                proposals.append(_stamp_project_preconditions(parent, proposal))
+                if proposal is None and run_error is not None:
+                    proposals.append(ProposalFailure(reason=str(run_error)))
+                else:
+                    proposals.append(_stamp_project_preconditions(parent, proposal))
         return proposals
 
 

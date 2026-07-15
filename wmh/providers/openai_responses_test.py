@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from llm_waterfall import ChatRequest
 
 from wmh.providers.base import DEFAULT_MAX_TOKENS, Message, ProviderConfig, ProviderKind
 from wmh.providers.openai_responses import OpenAIResponsesProvider
@@ -24,6 +25,24 @@ class _FakeResponsesResponse:
         self.output_text = output_text
         self.usage = usage
         self.output = output or []
+
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        """Return the native Responses shape used by structured completion tests."""
+        assert mode == "json"
+        return {
+            "model": "gpt-5.5-2026-05-01",
+            "status": "completed",
+            "service_tier": "priority",
+            "output": self.output,
+            "usage": (
+                {
+                    "input_tokens": self.usage.input_tokens,
+                    "output_tokens": self.usage.output_tokens,
+                }
+                if self.usage is not None
+                else None
+            ),
+        }
 
 
 class _FakeResponses:
@@ -141,6 +160,89 @@ def test_reasoning_omitted_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     provider.complete("", [Message(role="user", content="ping")])
 
     assert "reasoning" not in responses.last_kwargs
+
+
+def test_complete_chat_uses_native_responses_resource_without_legacy_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeResponsesResponse(
+        "",
+        _FakeUsage(17, 9),
+        output=[
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "read_file",
+                "arguments": '{"path":"README.md"}',
+            }
+        ],
+    )
+    responses = _FakeResponses(response)
+    provider = OpenAIResponsesProvider(_config())
+    fake = type("ResponsesOnlyClient", (), {"responses": responses})()
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    completion = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "model": "worker",
+                "messages": [{"role": "user", "content": "inspect"}],
+                "max_completion_tokens": 2048,
+                "store": False,
+            }
+        )
+    )
+
+    assert responses.last_kwargs == {
+        "model": "gpt-5.4-mini",
+        "input": [{"role": "user", "content": "inspect"}],
+        "stream": False,
+        "store": False,
+        "max_output_tokens": 2048,
+        "reasoning": {"effort": "low"},
+        "include": ["reasoning.encrypted_content"],
+    }
+    assert completion.choices[0].finish_reason == "tool_calls"
+    assert completion.choices[0].message.tool_calls is not None
+    assert completion.choices[0].message.tool_calls[0].id == "call-1"
+    assert completion.token_usage().input_tokens == 17
+    assert completion.wire_payload()["service_tier"] == "priority"
+
+
+def test_complete_chat_never_forwards_sampling_for_gpt5_without_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeResponsesResponse(
+        "",
+        _FakeUsage(3, 2),
+        output=[
+            {
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "ok"}],
+            }
+        ],
+    )
+    responses = _FakeResponses(response)
+    provider = OpenAIResponsesProvider(
+        ProviderConfig(kind=ProviderKind.OPENAI_RESPONSES, model="gpt-5.5")
+    )
+    fake = type("ResponsesOnlyClient", (), {"responses": responses})()
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "go"}],
+                "temperature": 0.2,
+                "top_p": 0.8,
+            }
+        )
+    )
+
+    assert "temperature" not in responses.last_kwargs
+    assert "top_p" not in responses.last_kwargs
+    assert responses.last_kwargs["include"] == ["reasoning.encrypted_content"]
 
 
 def test_embed_uses_openai_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:

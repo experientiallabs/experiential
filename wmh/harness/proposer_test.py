@@ -128,6 +128,20 @@ class _InterruptedProject(_Project):
         raise RuntimeError("Server disconnected after durable writes")
 
 
+class _FailedProject(_Project):
+    """Fail the project turn before any proposal output reaches durable storage."""
+
+    def run(
+        self,
+        agent: HarnessDoc,
+        provider: ToolCallingProvider,
+        instruction: str,
+    ) -> AgentProjectRun:
+        del agent, provider, instruction
+        self.runs += 1
+        raise RuntimeError("provider down")
+
+
 def test_provider_proposer_produces_requested_sibling_count() -> None:
     parent = HarnessDoc.baseline("parent")
     provider = _Provider(_payload(parent, "careful"))
@@ -214,3 +228,40 @@ def test_project_proposer_salvages_outputs_written_before_runner_disconnect() ->
 
     assert isinstance(proposals[0], HarnessDelta)
     assert proposals[1] == ProposalFailure(reason="Server disconnected after durable writes")
+
+
+def test_project_proposer_only_salvages_fully_parsed_outputs_after_failure() -> None:
+    parent = HarnessDoc.baseline("parent")
+    project = _InterruptedProject([_payload(parent, "careful"), "{"])
+
+    proposals = ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).propose_batch(
+        parent, _trigger(), "inspect failures", history=[], count=3
+    )
+
+    assert isinstance(proposals[0], HarnessDelta)
+    assert proposals[1:] == [
+        ProposalFailure(reason="Server disconnected after durable writes"),
+        ProposalFailure(reason="Server disconnected after durable writes"),
+    ]
+
+
+def test_project_proposer_keeps_a_clean_malformed_output_unusable() -> None:
+    parent = HarnessDoc.baseline("parent")
+    project = _Project(["{"])
+
+    proposals = ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).propose_batch(
+        parent, _trigger(), "inspect failures", history=[], count=1
+    )
+
+    assert proposals == [None]
+
+
+def test_project_proposer_marks_every_missing_output_as_a_proposal_failure() -> None:
+    parent = HarnessDoc.baseline("parent")
+    project = _FailedProject([])
+
+    proposals = ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).propose_batch(
+        parent, _trigger(), "inspect failures", history=[], count=3
+    )
+
+    assert proposals == [ProposalFailure(reason="provider down")] * 3

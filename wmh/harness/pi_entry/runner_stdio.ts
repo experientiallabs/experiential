@@ -166,6 +166,7 @@ function startLlmBridge(conn: StdioConn): Promise<Bridge> {
 					const choice = reply.completion?.choices?.[0] ?? {};
 					const msg = choice.message ?? {};
 					const delta: any = { role: "assistant", content: msg.content ?? "" };
+					if (msg.reasoning_details) delta.reasoning_details = msg.reasoning_details;
 					if (msg.tool_calls) {
 						// Keep `function` explicitly nested (the streaming OpenAI shape the pi parser
 						// expects); index each call.

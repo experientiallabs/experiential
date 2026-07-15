@@ -148,6 +148,7 @@ class ChatFunctionDefinition(BaseModel):
     name: str
     description: str = ""
     parameters: JsonObject = Field(default_factory=dict)
+    strict: bool | None = None
 
 
 class ChatTool(BaseModel):
