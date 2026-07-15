@@ -37,7 +37,7 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.mutate import render_evidence
 from wmh.harness.proposer import DeltaProposer, ProposalFailure
-from wmh.harness.runtime import TokenUsage, combine_usage
+from wmh.harness.runtime import RuntimeCancelled, TokenUsage, combine_usage
 from wmh.providers.base import Provider
 
 if TYPE_CHECKING:
@@ -352,8 +352,10 @@ def create_harness(
     waiting for the search to finish.
 
     ``should_cancel`` is checked before and after every score wave, before each proposal slot,
-    and after each batched proposer call. Returning true raises :class:`HarnessSearchCancelled`
-    before the next costly phase while the normal ``finally`` path retires sandbox resources.
+    and after each batched proposer call. E2B runtimes also poll it while waiting for runner
+    frames, so cancellation aborts the active wave without judging partial cells. A provider/tool
+    call already in progress remains bounded by that call's own timeout. Cancellation raises
+    :class:`HarnessSearchCancelled` while the normal ``finally`` path retires sandbox resources.
 
     Every rollout scores against the world-model simulation — the environment is always sim.
     `harness_backend` picks where the harness PROCESS executes: `local` (the default) runs it
@@ -442,17 +444,29 @@ def create_harness(
                 # The pi process runs in pooled sandboxes; every cell at once by default. Tool calls
                 # still route to the world model — the environment is sim regardless of backend.
                 concurrency = eval_concurrency if eval_concurrency is not None else 0
-                runtime = doc.runtime(agent_provider, backend="e2b", e2b_pool=sandbox_pool)
-            report = evaluate_closed_loop(
-                split,
-                world_model,
-                agent_provider,
-                judge,
-                label=doc.name,
-                k=k_eff,
-                concurrency=concurrency,
-                runtime=runtime,
-            )
+                runtime = doc.runtime(
+                    agent_provider,
+                    backend="e2b",
+                    e2b_pool=sandbox_pool,
+                    should_cancel=should_cancel,
+                )
+            try:
+                report = evaluate_closed_loop(
+                    split,
+                    world_model,
+                    agent_provider,
+                    judge,
+                    label=doc.name,
+                    k=k_eff,
+                    concurrency=concurrency,
+                    runtime=runtime,
+                    should_cancel=should_cancel,
+                )
+            except RuntimeCancelled as exc:
+                # Cancelled cells are not scoreable outcomes: do not judge them. Converting at the
+                # search boundary preserves the public cancellation contract while the surrounding
+                # finally closes the shared pool and retires every active evaluator sandbox.
+                raise HarnessSearchCancelled("harness search cancelled") from exc
             _check_cancelled()
             # Tally the pi worker's self-metered tokens across every score wave (seed, screens,
             # full splits, holdout, confirmations): its LLM calls bypass the Provider, so this is

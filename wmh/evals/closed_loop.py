@@ -26,7 +26,14 @@ from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.environment import AgentEnvironment
-from wmh.harness.runtime import AgentRuntime, RunResult, Runtime, TokenUsage, combine_usage
+from wmh.harness.runtime import (
+    AgentRuntime,
+    RunResult,
+    Runtime,
+    RuntimeCancelled,
+    TokenUsage,
+    combine_usage,
+)
 from wmh.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
@@ -114,6 +121,7 @@ def evaluate_with_env(
     k: int = DEFAULT_K,
     concurrency: int = 1,
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> ClosedLoopReport:
     """Score the agent on `tasks` against whatever env `make_env` opens, k passes per task.
 
@@ -131,11 +139,14 @@ def evaluate_with_env(
         for task in tasks:
             verdicts: list[GoldVerdict] = []
             for attempt in range(k):
+                _check_cancelled(should_cancel)
                 result = _run_once(task, make_env, runtime)
                 usages.append(result.worker_usage)
+                _check_cancelled(should_cancel)
                 verdict = judge.score(
                     task.instruction, result.answer, result.transcript(), task.gold
                 )
+                _check_cancelled(should_cancel)
                 verdicts.append(verdict)
                 if on_progress is not None:
                     on_progress(task.task_id, attempt + 1, verdict)
@@ -156,6 +167,7 @@ def evaluate_with_env(
             k=k,
             concurrency=concurrency,
             on_progress=on_progress,
+            should_cancel=should_cancel,
         )
         for index, task in enumerate(tasks):
             verdicts = by_cell[index * k : (index + 1) * k]  # cells are task-major, attempt-minor
@@ -191,6 +203,7 @@ def evaluate_closed_loop(
     concurrency: int = 1,
     runtime: Runtime | None = None,
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> ClosedLoopReport:
     """Score the fixed agent on `tasks` against `world_model` (`wmh eval --mode closed-loop`).
 
@@ -210,6 +223,7 @@ def evaluate_closed_loop(
             k=k,
             concurrency=concurrency,
             on_progress=on_progress,
+            should_cancel=should_cancel,
         )
 
     if concurrency == 1:
@@ -276,6 +290,7 @@ def _run_cells_concurrently(
     k: int,
     concurrency: int,
     on_progress: Callable[[str, int, GoldVerdict], None] | None,
+    should_cancel: Callable[[], bool] | None,
 ) -> tuple[list[GoldVerdict], list[TokenUsage | None]]:
     """Run every (task, attempt) cell on a thread pool; verdicts return in cell order.
 
@@ -296,8 +311,11 @@ def _run_cells_concurrently(
     usage_slots: list[TokenUsage | None] = [None] * len(cells)
 
     def run_cell(task: TaskSpec) -> tuple[GoldVerdict, TokenUsage | None]:
+        _check_cancelled(should_cancel)
         result = _run_once(task, make_env, runtime)
+        _check_cancelled(should_cancel)
         verdict = judge.score(task.instruction, result.answer, result.transcript(), task.gold)
+        _check_cancelled(should_cancel)
         return verdict, result.worker_usage
 
     pool = ThreadPoolExecutor(max_workers=max_workers)
@@ -322,3 +340,8 @@ def _run_cells_concurrently(
             raise RuntimeError("a cell completed without producing a verdict")
         verdicts.append(slot)
     return verdicts, usage_slots
+
+
+def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise RuntimeCancelled("runtime evaluation cancelled")

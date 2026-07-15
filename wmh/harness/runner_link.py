@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import struct
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -30,11 +31,18 @@ from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runtime import RunResult, StopReason, TokenUsage
+from wmh.harness.runtime import (
+    DEFAULT_MAX_TURNS,
+    RunResult,
+    RuntimeCancelled,
+    StopReason,
+    TokenUsage,
+)
 from wmh.harness.tools import ToolSpec
 from wmh.providers.base import ToolCallingProvider
 
 DEFAULT_MAX_ENV_ACTIONS = 40
+DEFAULT_CANCEL_POLL_INTERVAL_S = 0.5
 
 
 # --------------------------------------------------------------------------------------------------
@@ -77,7 +85,7 @@ class Channel(Protocol):
     """A bidirectional frame channel to the runner peer (a socket, or a test double)."""
 
     def send(self, frame: JsonObject) -> None: ...
-    def recv(self) -> JsonObject | None: ...
+    def recv(self, timeout: float | None = None) -> JsonObject | None: ...
 
 
 class SocketChannel:
@@ -85,12 +93,38 @@ class SocketChannel:
 
     def __init__(self, sock: _SupportsSocket) -> None:
         self._sock = sock
+        self._recv_buffer = bytearray()
 
     def send(self, frame: JsonObject) -> None:
         write_frame(self._sock, frame)
 
-    def recv(self) -> JsonObject | None:
-        return read_frame(self._sock)
+    def recv(self, timeout: float | None = None) -> JsonObject | None:
+        settimeout = getattr(self._sock, "settimeout", None)
+        gettimeout = getattr(self._sock, "gettimeout", None)
+        previous = gettimeout() if timeout is not None and callable(gettimeout) else None
+        if timeout is not None and callable(settimeout):
+            settimeout(timeout)
+        try:
+            if not self._fill_recv_buffer(4):
+                return None
+            (length,) = struct.unpack(">I", self._recv_buffer[:4])
+            if not self._fill_recv_buffer(4 + length):
+                return None
+            body = bytes(self._recv_buffer[4 : 4 + length])
+            del self._recv_buffer[: 4 + length]
+            return cast("JsonObject", json.loads(body))
+        finally:
+            if timeout is not None and callable(settimeout):
+                settimeout(previous)
+
+    def _fill_recv_buffer(self, size: int) -> bool:
+        """Read through ``size`` bytes while preserving partial frames across timed polls."""
+        while len(self._recv_buffer) < size:
+            chunk = self._sock.recv(size - len(self._recv_buffer))
+            if not chunk:
+                return False
+            self._recv_buffer += chunk
+        return True
 
 
 # The process-wide runner channel doc.runtime(PI_TRANSPORT=link) drives. A search/eval sets it once
@@ -179,6 +213,10 @@ class RunnerLink:
         files: dict[str, str] | None = None,
         system_prompt: str = "",
         max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS,
+        max_turns: int = DEFAULT_MAX_TURNS,
+        episode_timeout_s: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        cancel_poll_interval_s: float = DEFAULT_CANCEL_POLL_INTERVAL_S,
     ) -> None:
         self._channel = channel
         # Tools bound at construction make RunnerLink satisfy the runtime contract closed-loop eval
@@ -196,6 +234,16 @@ class RunnerLink:
         self._files = files or {}
         self._system_prompt = system_prompt
         self._max_env_actions = max_env_actions
+        if max_turns < 1:
+            raise ValueError("max_turns must be >= 1")
+        if episode_timeout_s is not None and episode_timeout_s <= 0:
+            raise ValueError("episode_timeout_s must be positive when set")
+        if cancel_poll_interval_s <= 0:
+            raise ValueError("cancel_poll_interval_s must be positive")
+        self._max_turns = max_turns
+        self._episode_timeout_s = episode_timeout_s
+        self._should_cancel = should_cancel
+        self._cancel_poll_interval_s = cancel_poll_interval_s
 
     def run(
         self,
@@ -212,7 +260,28 @@ class RunnerLink:
             max_env_actions=self._max_env_actions,
         )
         episode_id = uuid.uuid4().hex
-        self._channel.send(
+        self._check_cancelled()
+        deadline = (
+            time.monotonic() + self._episode_timeout_s
+            if self._episode_timeout_s is not None
+            else None
+        )
+        usage = TokenUsage()
+
+        def send_frame(frame: JsonObject) -> RunResult | None:
+            try:
+                self._channel.send(frame)
+            except Exception:
+                self._check_cancelled()
+                if deadline is not None and time.monotonic() >= deadline:
+                    return self._budget_result(task_id, episode, instruction, usage)
+                raise
+            self._check_cancelled()
+            if deadline is not None and time.monotonic() >= deadline:
+                return self._budget_result(task_id, episode, instruction, usage)
+            return None
+
+        stopped = send_frame(
             {
                 "type": "episode_start",
                 "episode_id": episode_id,
@@ -222,18 +291,56 @@ class RunnerLink:
                 "tools": episode.tool_specs(),
                 "files": self._files,
                 "max_env_actions": self._max_env_actions,
+                "max_turns": self._max_turns,
+                "episode_timeout_s": self._episode_timeout_s,
             }
         )
-        usage = TokenUsage()
+        if stopped is not None:
+            return stopped
         while True:
-            frame = self._channel.recv()
+            self._check_cancelled()
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return self._budget_result(task_id, episode, instruction, usage)
+            recv_timeout = remaining
+            if self._should_cancel is not None:
+                recv_timeout = (
+                    self._cancel_poll_interval_s
+                    if recv_timeout is None
+                    else min(recv_timeout, self._cancel_poll_interval_s)
+                )
+            try:
+                frame = self._channel.recv(timeout=recv_timeout)
+            except TimeoutError:
+                self._check_cancelled()
+                if deadline is not None and time.monotonic() >= deadline:
+                    return self._budget_result(task_id, episode, instruction, usage)
+                if self._should_cancel is not None:
+                    continue
+                raise
+            except Exception:
+                self._check_cancelled()
+                if deadline is not None and time.monotonic() >= deadline:
+                    return self._budget_result(task_id, episode, instruction, usage)
+                raise
+            self._check_cancelled()
+            if deadline is not None and time.monotonic() >= deadline:
+                return self._budget_result(task_id, episode, instruction, usage)
             if frame is None:  # channel closed before the episode finished
                 return self._error_result(
                     task_id, episode, instruction, "runner channel closed", usage=usage
                 )
             kind = frame.get("type")
             if kind == "llm_request":
-                self._answer_llm(episode_id, frame, usage)
+                response = self._llm_response(episode_id, frame, usage)
+                self._check_cancelled()
+                if deadline is not None and time.monotonic() >= deadline:
+                    return self._budget_result(task_id, episode, instruction, usage)
+                # A send timeout is transport failure with an uncertain delivery state. Let it
+                # propagate so the owning runtime retires rather than sending a second response.
+                stopped = send_frame(response)
+                if stopped is not None:
+                    return stopped
             elif kind == "tool_request":
                 name = frame.get("name")
                 args = frame.get("arguments")
@@ -241,7 +348,10 @@ class RunnerLink:
                     name if isinstance(name, str) else "",
                     args if isinstance(args, dict) else {},
                 )
-                self._channel.send(
+                self._check_cancelled()
+                if deadline is not None and time.monotonic() >= deadline:
+                    return self._budget_result(task_id, episode, instruction, usage)
+                stopped = send_frame(
                     {
                         "type": "tool_response",
                         "episode_id": episode_id,
@@ -249,6 +359,8 @@ class RunnerLink:
                         **obs,
                     }
                 )
+                if stopped is not None:
+                    return stopped
             elif kind == "done":
                 answer = frame.get("answer")
                 episode.answer = answer if isinstance(answer, str) else ""
@@ -271,7 +383,28 @@ class RunnerLink:
                 )
             # unknown frame types are ignored (forward-compatible)
 
-    def _answer_llm(self, episode_id: str, frame: JsonObject, usage: TokenUsage) -> None:
+    def _check_cancelled(self) -> None:
+        if self._should_cancel is not None and self._should_cancel():
+            raise RuntimeCancelled("runtime episode cancelled")
+
+    def _budget_result(
+        self,
+        task_id: str,
+        episode: HostEpisode,
+        instruction: str,
+        usage: TokenUsage,
+    ) -> RunResult:
+        assert self._episode_timeout_s is not None
+        return self._error_result(
+            task_id,
+            episode,
+            instruction,
+            f"evaluation episode exceeded {self._episode_timeout_s:g}s wall budget",
+            stop=StopReason.BUDGET,
+            usage=usage,
+        )
+
+    def _llm_response(self, episode_id: str, frame: JsonObject, usage: TokenUsage) -> JsonObject:
         req_id = frame.get("req_id")
         body = frame.get("openai_body")
         try:
@@ -295,9 +428,7 @@ class RunnerLink:
                 "req_id": req_id,
                 "error": str(exc),
             }
-        # A send timeout is transport failure with an uncertain delivery state. Let it propagate
-        # so the owning runtime retires the channel instead of sending a second response frame.
-        self._channel.send(response)
+        return response
 
     @staticmethod
     def _error_result(
@@ -306,9 +437,10 @@ class RunnerLink:
         instruction: str,
         note: str,
         *,
+        stop: StopReason | None = None,
         usage: TokenUsage | None = None,
     ) -> RunResult:
-        stop = StopReason.MAX_TURNS if episode.steps else StopReason.ERROR
+        resolved_stop = stop or (StopReason.MAX_TURNS if episode.steps else StopReason.ERROR)
         episode.steps.append(
             Step(
                 action=Action(kind=ActionKind.MESSAGE, content="(runner link)"),
@@ -320,7 +452,7 @@ class RunnerLink:
         return RunResult(
             task_id=task_id,
             steps=episode.steps,
-            stop_reason=stop,
+            stop_reason=resolved_stop,
             answer="",
             turns=len(episode.steps),
             worker_usage=usage if usage is not None and usage.calls else None,

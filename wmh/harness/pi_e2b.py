@@ -34,6 +34,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, cast, overload
 
@@ -50,7 +51,12 @@ from wmh.harness.e2b_sandbox import (
 )
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.runner_link import RunnerLink, WorkerFn
-from wmh.harness.runtime import RunResult
+from wmh.harness.runtime import (
+    DEFAULT_MAX_TURNS,
+    RunResult,
+    RuntimeCancelled,
+    StopReason,
+)
 from wmh.harness.tools import ToolSpec
 from wmh.providers.base import ToolCallingProvider
 
@@ -114,6 +120,9 @@ _SANDBOX_TIMEOUT_REFRESH_S = 300.0
 # Renewal must not turn mutated agent code into an unbounded cost leak. A legitimate slow episode
 # may cross the base 15-minute lease, but one cell still gets a hard one-hour sandbox lifetime.
 MAX_EVAL_EPISODE_LIFETIME_S = 3_600.0
+# A score cell must finish much sooner than the E2B lease-renewal safety cap. This wall budget is
+# host-enforced by RunnerLink and may be exceeded only by one already-running provider/tool call.
+DEFAULT_EVAL_EPISODE_TIMEOUT_S = 300.0
 _MAX_RETIRE_WORKERS = 16
 
 
@@ -192,9 +201,9 @@ class E2BStdioChannel:
     def recv(self, timeout: float | None = None) -> JsonObject | None:
         """The next frame from the runner; blocks (up to `timeout` seconds when given).
 
-        The optional `timeout` is beyond the `Channel` protocol (which always blocks) — it exists
-        for the hello handshake. Timing out raises `TimeoutError`; a dead runner process raises
-        `RuntimeError`; both messages include the recent stderr.
+        Timing out raises `TimeoutError`; a dead runner process raises `RuntimeError`; both
+        messages include the recent stderr. RunnerLink uses bounded receives for evaluation wall
+        budgets and cooperative cancellation; the hello handshake uses the same contract.
         """
         try:
             item = self._frames.get(timeout=timeout)
@@ -1002,6 +1011,16 @@ class E2BSandboxPool:
         with self._lock:
             self._created += 1
             self._started[id(sandbox)] = time.monotonic()
+            if not self._closed:
+                # Register before bootstrap so cancellation can kill cold-start sandboxes that
+                # are still installing dependencies or waiting for the runner hello.
+                self._all.append(sandbox)
+                registered = True
+            else:
+                registered = False
+        if not registered:
+            self._retire(sandbox)
+            raise RuntimeError("E2BSandboxPool is closed")
         try:
             self._bootstrap(sandbox)
             channel = self._start_runner(sandbox)
@@ -1010,7 +1029,6 @@ class E2BSandboxPool:
             raise
         with self._lock:
             if not self._closed:
-                self._all.append(sandbox)
                 return sandbox, channel
         self._retire(sandbox)  # closed while we were bootstrapping: don't leak the sandbox
         raise RuntimeError("E2BSandboxPool is closed")
@@ -1056,8 +1074,13 @@ class E2BSandboxPool:
             self._closed = True
             sandboxes, self._all = self._all, []
             self._idle = []
-        for sandbox in sandboxes:
-            self._retire(sandbox)
+        if len(sandboxes) == 1:
+            self._retire(sandboxes[0])
+        elif sandboxes:
+            # Cancellation commonly lands during a full-concurrency eval wave. Retiring every
+            # active lease in parallel keeps teardown latency bounded by one E2B kill request.
+            with ThreadPoolExecutor(max_workers=min(_MAX_RETIRE_WORKERS, len(sandboxes))) as pool:
+                list(pool.map(self._retire, sandboxes))
 
     def usage(self) -> SandboxUsage:
         """The pool's spend meter so far: sandbox count and total lifetime seconds."""
@@ -1070,8 +1093,11 @@ class E2BSandboxPool:
         """Finalize the sandbox's lifetime on the meter, then kill it (best-effort)."""
         with self._lock:
             started = self._started.pop(id(sandbox), None)
-            if started is not None:
-                self._retired_seconds += time.monotonic() - started
+            if started is None:
+                return  # another close/release path already retired this exact lease
+            self._all = [item for item in self._all if item is not sandbox]
+            self._idle = [item for item in self._idle if item[0] is not sandbox]
+            self._retired_seconds += time.monotonic() - started
         _kill_quietly(sandbox)
 
     def __enter__(self) -> E2BSandboxPool:
@@ -1152,21 +1178,35 @@ class E2BPiRuntime:
         pool: E2BSandboxPool | None = None,
         worker_fn: WorkerFn | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
+        max_turns: int = DEFAULT_MAX_TURNS,
+        episode_timeout_s: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> None:
+        if max_turns < 1:
+            raise ValueError("max_turns must be >= 1")
+        if episode_timeout_s <= 0:
+            raise ValueError("episode_timeout_s must be positive")
         self._provider = provider
         self._files = dict(files)
         self._tools = list(tools)
         self._system_prompt = system_prompt
         self._worker_fn = worker_fn  # test seam, exactly like RunnerLink's
+        self._max_turns = max_turns
+        self._episode_timeout_s = episode_timeout_s
+        self._should_cancel = should_cancel
         self._owns_pool = pool is None
         self._pool = pool or E2BSandboxPool(
             template=template, api_key=api_key, hello_timeout=hello_timeout
         )
 
     def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+        if self._should_cancel is not None and self._should_cancel():
+            raise RuntimeCancelled("runtime episode cancelled")
         try:
             return self._run_episode(task_id, instruction, environment)
         except Exception as exc:
+            if self._should_cancel is not None and self._should_cancel():
+                raise RuntimeCancelled("runtime episode cancelled") from exc
             if not _is_retryable_transport_error(exc):
                 raise
             # Transport death (stream drop, sandbox lifetime, dead runner) — the failed
@@ -1190,9 +1230,14 @@ class E2BPiRuntime:
                 worker_fn=self._worker_fn,
                 files=self._files,
                 system_prompt=self._system_prompt,
+                max_turns=self._max_turns,
+                episode_timeout_s=self._episode_timeout_s,
+                should_cancel=self._should_cancel,
             )
             result = link.run(task_id, instruction, environment)
-            healthy = True
+            # A wall-budget stop may leave the runner mid-turn. Never reuse or retry it: the
+            # partial result is scoreable, but the sandbox's protocol state is not trustworthy.
+            healthy = result.stop_reason is not StopReason.BUDGET
             return result
         finally:
             self._pool.release(sandbox, channel, healthy=healthy)
@@ -1211,6 +1256,8 @@ class E2BPiRuntime:
 
 def _is_retryable_transport_error(exc: Exception) -> bool:
     """Whether an episode exception means its E2B transport is no longer trustworthy."""
+    if isinstance(exc, RuntimeCancelled):
+        return False
     if isinstance(exc, (RuntimeError, TimeoutError)):
         return True
     # Keep the E2B SDK optional at import time. Its TimeoutException is not a built-in

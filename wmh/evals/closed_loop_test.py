@@ -10,7 +10,7 @@ import threading
 
 import pytest
 
-from wmh.core.types import Action, ActionKind, Observation
+from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
 from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import (
     ClosedLoopReport,
@@ -21,7 +21,7 @@ from wmh.evals.closed_loop import (
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runtime import RunResult, StopReason
+from wmh.harness.runtime import RunResult, RuntimeCancelled, StopReason
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
@@ -269,6 +269,83 @@ def test_rollout_exception_propagates_and_does_not_hang() -> None:
         evaluate_with_env(
             tasks, lambda task: _StaticEnv(), ExplodingRuntime(), _AnswerJudge(), k=2, concurrency=0
         )
+
+
+@pytest.mark.parametrize("concurrency", [1, 0])
+def test_cancellation_after_rollout_skips_the_judge(concurrency: int) -> None:
+    cancelled = threading.Event()
+
+    class CancellingRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            cancelled.set()
+            return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="pass")
+
+    class CountingJudge(_AnswerJudge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def score(
+            self, instruction: str, answer: str, transcript: str, gold: list[str]
+        ) -> GoldVerdict:
+            self.calls += 1
+            return super().score(instruction, answer, transcript, gold)
+
+    judge = CountingJudge()
+    with pytest.raises(RuntimeCancelled, match="cancelled"):
+        evaluate_with_env(
+            [TaskSpec(task_id="cancel", instruction="x", gold=["g"])],
+            lambda task: _StaticEnv(),
+            CancellingRuntime(),
+            judge,
+            k=1,
+            concurrency=concurrency,
+            should_cancel=cancelled.is_set,
+        )
+
+    assert judge.calls == 0
+
+
+@pytest.mark.parametrize("concurrency", [1, 0])
+def test_budget_result_with_partial_transcript_is_still_judged(concurrency: int) -> None:
+    class BudgetRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            return RunResult(
+                task_id=task_id,
+                stop_reason=StopReason.BUDGET,
+                steps=[
+                    Step(
+                        action=Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={}),
+                        observation=Observation(content="partial work"),
+                        state_before=EnvState(),
+                        task=instruction,
+                    )
+                ],
+            )
+
+    class CapturingJudge(_AnswerJudge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transcripts: list[str] = []
+
+        def score(
+            self, instruction: str, answer: str, transcript: str, gold: list[str]
+        ) -> GoldVerdict:
+            self.transcripts.append(transcript)
+            return super().score(instruction, answer, transcript, gold)
+
+    judge = CapturingJudge()
+    evaluate_with_env(
+        [TaskSpec(task_id="budget", instruction="x", gold=["g"])],
+        lambda task: _StaticEnv(),
+        BudgetRuntime(),
+        judge,
+        k=1,
+        concurrency=concurrency,
+    )
+
+    assert len(judge.transcripts) == 1
+    assert "partial work" in judge.transcripts[0]
 
 
 def test_rollout_exception_surfaces_while_other_cells_are_still_in_flight() -> None:

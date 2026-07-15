@@ -5,7 +5,14 @@ from __future__ import annotations
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, Observation
-from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
+from wmh.harness.doc import (
+    MAX_TURNS_ID,
+    RUNTIME_KIND_ID,
+    TOOL_POLICY_ID,
+    HarnessDoc,
+    Surface,
+    SurfaceKind,
+)
 from wmh.harness.pi_runtime import PiRuntime, _Episode, _params_schema
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
@@ -45,6 +52,7 @@ def _episode(env: _Env, *, budget: int = 40) -> _Episode:
         provider=_Provider(),
         environment=env,
         max_env_actions=budget,
+        max_turns=7,
     )
 
 
@@ -54,6 +62,7 @@ def test_task_json_shape() -> None:
 
     tj = json.loads(json.dumps(ep.task_json()))
     assert tj["instruction"] == "do it" and tj["system"] == "sys"
+    assert tj["max_turns"] == 7
     names = {t["name"] for t in tj["tools"]}
     assert "bash" in names and "submit" in names
     schema = json.loads(json.dumps(_params_schema(TOOL_REGISTRY["bash"])))
@@ -103,6 +112,7 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
             Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
             Surface(
                 id="code:src-agent-ts",
                 kind=SurfaceKind.CODE,
@@ -117,4 +127,6 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
 
     from wmh.providers.base import Provider
 
-    assert isinstance(doc.runtime(cast("Provider", _P())), PiRuntime)
+    runtime = doc.runtime(cast("Provider", _P()))
+    assert isinstance(runtime, PiRuntime)
+    assert runtime._max_turns == 7  # noqa: SLF001 - document parameter reaches entry.ts

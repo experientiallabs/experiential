@@ -54,6 +54,16 @@ _NUDGE = (
 )
 
 
+class RuntimeCancelled(RuntimeError):
+    """The caller cancelled an in-flight runtime episode.
+
+    This is deliberately distinct from a normal ``RunResult`` stop reason: evaluation must not
+    send cancelled cells to a judge, and transport owners must not retry them as infrastructure
+    failures. Runtimes that cannot interrupt an active provider call raise this immediately after
+    that bounded call returns.
+    """
+
+
 @runtime_checkable
 class Runtime(Protocol):
     """What closed-loop eval drives: any object that can run one episode against an environment.

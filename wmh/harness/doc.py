@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -234,6 +235,7 @@ class HarnessDoc(BaseModel):
         backend: str = "local",
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Runtime:
         """The configured agent runtime this document describes.
 
@@ -275,6 +277,8 @@ class HarnessDoc(BaseModel):
                     system_prompt=self.assembled_prompt(skills),
                     template=e2b_template,
                     pool=e2b_pool,
+                    max_turns=self.max_turns(),
+                    should_cancel=should_cancel,
                 )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
             # host set via runner_link.set_active_channel) instead of the per-episode SSH shim; the
@@ -298,6 +302,8 @@ class HarnessDoc(BaseModel):
                     provider=structured_provider,
                     system_prompt=self.assembled_prompt(skills),
                     files=code_files,
+                    max_turns=self.max_turns(),
+                    should_cancel=should_cancel,
                 )
             from wmh.harness.pi_runtime import PiRuntime  # circular: pi_runtime imports doc
 
@@ -308,6 +314,7 @@ class HarnessDoc(BaseModel):
                 temperature=self.temperature(),
                 skills=skills,
                 system_prompt=self.assembled_prompt(skills),
+                max_turns=self.max_turns(),
             )
         if backend == "e2b":
             raise ValueError(

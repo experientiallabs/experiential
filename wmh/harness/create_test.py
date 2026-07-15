@@ -662,7 +662,8 @@ class _ScriptedPoolChannel:
     def send(self, frame: JsonObject) -> None:
         self.sent.append(frame)
 
-    def recv(self) -> JsonObject | None:
+    def recv(self, timeout: float | None = None) -> JsonObject | None:
+        del timeout
         return self._script.pop(0) if self._script else None
 
 
@@ -793,6 +794,7 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
         k: int,
         concurrency: int,
         runtime: Runtime | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ClosedLoopReport:
         concurrencies.append(concurrency)
         return real_evaluate(
@@ -804,6 +806,7 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
             k=k,
             concurrency=concurrency,
             runtime=runtime,
+            should_cancel=should_cancel,
         )
 
     monkeypatch.setattr(create_module, "evaluate_closed_loop", spying_evaluate)
@@ -866,6 +869,45 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
     assert pool.closes == 1  # the try/finally tears the pool down even on failure
 
 
+def test_runtime_cancellation_aborts_the_wave_without_judging_and_closes_pool(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    from wmh.harness.pi_e2b import E2BPiRuntime
+    from wmh.harness.runtime import RuntimeCancelled
+
+    provider = RoleProvider()
+    callback_seen = False
+
+    def should_cancel() -> bool:
+        return False
+
+    def cancelled_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
+        nonlocal callback_seen
+        runtime = kwargs.get("runtime")
+        assert isinstance(runtime, E2BPiRuntime)
+        callback_seen = runtime._should_cancel is should_cancel  # noqa: SLF001
+        raise RuntimeCancelled("runtime episode cancelled")
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", cancelled_evaluate)
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        create_harness(
+            "winner",
+            _pi_seed(),
+            _tasks(),
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            harness_backend="e2b",
+            should_cancel=should_cancel,
+        )
+
+    assert callback_seen
+    [pool] = fake_pool_cls.instances
+    assert pool.closes == 1
+
+
 def test_e2b_pool_retires_idle_runners_once_per_proposal_batch(
     monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
 ) -> None:
@@ -912,7 +954,9 @@ def test_eval_concurrency_overrides_both_backend_defaults(
         k: int,
         concurrency: int,
         runtime: Runtime | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ClosedLoopReport:
+        del should_cancel
         concurrencies.append(concurrency)
         return _canned_report(1.0, k=k)
 
@@ -962,7 +1006,9 @@ def test_create_sums_worker_usage_across_score_waves(
         k: int,
         concurrency: int,
         runtime: Runtime | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ClosedLoopReport:
+        del should_cancel
         report = _canned_report(0.5, k=k)
         return report.model_copy(
             update={"worker_usage": TokenUsage(input_tokens=100, output_tokens=10, calls=2)}

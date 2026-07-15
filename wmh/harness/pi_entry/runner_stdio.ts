@@ -39,7 +39,9 @@ console.warn = toStderr;
 console.debug = toStderr;
 
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
-const MAX_TURNS = Number(process.env.PI_MAX_TURNS ?? "20");
+const configuredMaxTurns = Number(process.env.PI_MAX_TURNS ?? "20");
+const DEFAULT_MAX_TURNS =
+	Number.isInteger(configuredMaxTurns) && configuredMaxTurns >= 1 ? configuredMaxTurns : 20;
 const TRANSPORT_KEEPALIVE_MS = 30_000;
 
 type Frame = Record<string, any>;
@@ -214,6 +216,10 @@ async function loadAgent(start: Frame): Promise<[any, () => void]> {
 
 async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 	const episodeId = start.episode_id;
+	const maxTurns =
+		Number.isInteger(start.max_turns) && start.max_turns >= 1
+			? start.max_turns
+			: DEFAULT_MAX_TURNS;
 	let doneSent = false;
 	let lastAssistantText = "";
 	let bridge: Bridge | null = null;
@@ -278,7 +284,7 @@ async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 			}
 			if (event.type === "turn_end") {
 				turns += 1;
-				if (turns >= MAX_TURNS) agent.abort();
+				if (turns >= maxTurns) agent.abort();
 			}
 		});
 

@@ -44,7 +44,7 @@ from wmh.harness.pi_e2b import (
     session_entry_files,
     start_live_runner,
 )
-from wmh.harness.runtime import Runtime, StopReason
+from wmh.harness.runtime import Runtime, RuntimeCancelled, StopReason
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY, ToolSpec
 
 _Event = tuple[str | None, str | None, str | None]
@@ -289,6 +289,20 @@ class _BlockingFrameFiles(_FakeFiles):
         return super().read(path, request_timeout=request_timeout, gzip=gzip)
 
 
+class _BlockingBootstrapFiles(_FakeFiles):
+    """Hold the first bootstrap write so pool cancellation can race cold start."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, path: str, data: str) -> None:
+        self.started.set()
+        self.release.wait(2.0)
+        super().write(path, data)
+
+
 class FakeSandbox:
     """The `SandboxHandle` slice over a scripted runner process."""
 
@@ -441,6 +455,9 @@ def _runtime(
     pool: E2BSandboxPool | None = None,
     template: str | None = None,
     worker_fn: Callable[[ChatRequest], ChatResponse] | None = None,
+    max_turns: int = 20,
+    episode_timeout_s: float = 300.0,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> E2BPiRuntime:
     return E2BPiRuntime(
         provider=_Provider(),
@@ -450,6 +467,9 @@ def _runtime(
         template=template,
         pool=pool,
         worker_fn=worker_fn,
+        max_turns=max_turns,
+        episode_timeout_s=episode_timeout_s,
+        should_cancel=should_cancel,
     )
 
 
@@ -789,6 +809,53 @@ def test_pool_close_kills_everything_and_acquire_after_close_raises(
     pool.close()  # idempotent
 
 
+def test_inflight_release_after_pool_close_does_not_kill_the_lease_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    sandbox, channel = pool.acquire()
+
+    pool.close()
+    pool.release(sandbox, channel, healthy=False)  # in-flight episode unwinds after cancellation
+
+    assert made[0].kills == 1
+
+
+def test_pool_close_kills_a_sandbox_while_its_bootstrap_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation retires cold-start leases without waiting for their bootstrap RPC."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    handle = _ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True)
+    fake = FakeSandbox(handle)
+    files = _BlockingBootstrapFiles()
+    fake.files = files
+    pool = E2BSandboxPool(sandbox_factory=lambda: fake)
+    errors: list[BaseException] = []
+
+    def acquire() -> None:
+        try:
+            pool.acquire()
+        except BaseException as exc:  # noqa: BLE001 - the worker hands its failure to the test
+            errors.append(exc)
+
+    worker = threading.Thread(target=acquire)
+    worker.start()
+    assert files.started.wait(1.0)
+
+    pool.close()
+    assert fake.kills == 1  # killed before the blocked bootstrap call is released
+
+    files.release.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert "closed" in str(errors[0])
+    assert fake.kills == 1  # bootstrap cleanup is idempotent after close already retired it
+
+
 def test_pool_acquire_without_hello_raises_with_stderr_and_kills_the_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -841,7 +908,7 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
         return completion
 
     with E2BSandboxPool(sandbox_factory=factory) as pool:
-        result = _runtime(pool=pool, worker_fn=worker).run("t1", "do it", env)
+        result = _runtime(pool=pool, worker_fn=worker, max_turns=7).run("t1", "do it", env)
 
     assert result.stop_reason is StopReason.SUBMITTED
     assert result.answer == "finished"
@@ -861,6 +928,8 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
     start = _of_kind(fake, "episode_start")[0]
     assert start["instruction"] == "do it" and start["system"] == "sys"
     assert start["files"] == {"src/agent.ts": "// a"}
+    assert start["max_turns"] == 7
+    assert start["episode_timeout_s"] == 300.0
     tool_names = {t["name"] for t in cast("list[JsonObject]", start["tools"])}
     assert tool_names >= {"bash", "submit"}
     llm = _of_kind(fake, "llm_response")[0]
@@ -920,6 +989,51 @@ def test_pi_episode_error_is_not_retried_and_keeps_the_sandbox_reusable(
     assert recovered.answer == "next episode"
     assert len(made) == 1
     assert made[0].kills == 0
+    pool.close()
+
+
+def test_episode_wall_budget_retires_without_retry_or_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for(
+        [
+            [{"type": "hello"}],
+            [{"type": "hello"}, {"type": "done", "answer": "fresh"}],
+        ]
+    )
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    runtime = _runtime(pool=pool, episode_timeout_s=0.01)
+
+    expired = runtime.run("t1", "first", _RecordingEnv())
+    recovered = runtime.run("t2", "second", _RecordingEnv())
+
+    assert expired.stop_reason is StopReason.BUDGET
+    assert "wall budget" in expired.transcript()
+    assert recovered.answer == "fresh"
+    assert len(made) == 2  # no retry for the expired episode; the next episode gets a fresh lease
+    assert made[0].kills == 1
+    pool.close()
+
+
+def test_runtime_cancellation_retires_the_active_sandbox_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    checks = 0
+
+    def should_cancel() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    with pytest.raises(RuntimeCancelled, match="cancelled"):
+        _runtime(pool=pool, should_cancel=should_cancel).run("t1", "first", _RecordingEnv())
+
+    assert len(made) == 1
+    assert made[0].kills == 1
     pool.close()
 
 

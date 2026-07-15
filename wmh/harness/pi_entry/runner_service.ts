@@ -29,7 +29,9 @@ import { FrameConn, type Frame } from "./runner_frames.ts";
 
 const [HOST, PORT] = (process.env.PI_LINK_ADDR ?? "127.0.0.1:8900").split(":");
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
-const MAX_TURNS = Number(process.env.PI_MAX_TURNS ?? "20");
+const configuredMaxTurns = Number(process.env.PI_MAX_TURNS ?? "20");
+const DEFAULT_MAX_TURNS =
+	Number.isInteger(configuredMaxTurns) && configuredMaxTurns >= 1 ? configuredMaxTurns : 20;
 
 function assistantText(msg: any): string {
 	if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return "";
@@ -115,6 +117,10 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 	const bridge = await startLlmBridge(conn);
 	const [AgentCtor, cleanupSrc] = await loadAgent(start);
 	const episodeId = start.episode_id;
+	const maxTurns =
+		Number.isInteger(start.max_turns) && start.max_turns >= 1
+			? start.max_turns
+			: DEFAULT_MAX_TURNS;
 	let doneSent = false;
 	let lastAssistantText = "";
 
@@ -173,7 +179,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		}
 		if (event.type === "turn_end") {
 			turns += 1;
-			if (turns >= MAX_TURNS) agent.abort();
+			if (turns >= maxTurns) agent.abort();
 		}
 	});
 

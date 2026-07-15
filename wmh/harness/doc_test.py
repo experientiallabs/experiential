@@ -160,6 +160,7 @@ def _pi_doc() -> HarnessDoc:
             Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
             Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
         ],
     )
@@ -216,6 +217,7 @@ def test_runtime_e2b_backend_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     shared = _pi_doc().runtime(provider, backend="e2b", e2b_pool=shared_pool)
     assert isinstance(shared, E2BPiRuntime)
     assert shared._pool is shared_pool  # noqa: SLF001 - pins the pool passthrough
+    assert shared._max_turns == 7  # noqa: SLF001 - document parameter reaches the runner
 
 
 def test_runtime_e2b_backend_rejects_in_process_runtime_kinds() -> None:
