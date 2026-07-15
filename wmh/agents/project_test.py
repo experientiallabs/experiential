@@ -180,6 +180,43 @@ def test_project_surfaces_a_mid_turn_runner_error() -> None:
         project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
 
 
+def test_project_restarts_one_live_session_after_transport_disconnect() -> None:
+    """A dropped runner stream retries once without replacing project storage."""
+
+    class _DisconnectedChannel(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise RuntimeError("Server disconnected")
+
+    sandbox = _Sandbox()
+    disconnected = _DisconnectedChannel()
+    recovered = _Channel()
+    channels = iter([disconnected, recovered])
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: next(channels),
+        owns_sandbox=False,
+    )
+    project.write_text("history/round-1.json", '{"kept": true}')
+
+    result = project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    assert result.answer == "finished"
+    assert disconnected.closed is True
+    assert recovered.closed is False
+    assert project.read_text("history/round-1.json") == '{"kept": true}'
+    assert [frame["type"] for frame in disconnected.sent].count("user_message") == 1
+    assert [frame["type"] for frame in recovered.sent].count("user_message") == 1
+
+
 def test_project_rejects_paths_that_escape_its_workspace() -> None:
     project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
 

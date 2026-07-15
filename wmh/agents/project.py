@@ -28,6 +28,14 @@ PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
 _OUTPUT_CAP = 16_000
 _PROJECT_TOOLS = frozenset({"read_file", "write_file", "submit"})
+_RECOVERABLE_SESSION_MARKERS = (
+    "server disconnected",
+    "connection reset",
+    "connection closed",
+    "broken pipe",
+    "remoteprotocolerror",
+    "readerror",
+)
 
 
 class ChannelFactory(Protocol):
@@ -115,7 +123,13 @@ class AgentProject:
         timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
         on_event: Callable[[SessionEvent], None] | None = None,
     ) -> AgentProjectRun:
-        """Run one turn of an ordinary agent against this persistent project."""
+        """Run one turn of an ordinary agent against this persistent project.
+
+        A transient runner-channel disconnect retires only the ordinary live
+        session and retries the turn once on a fresh channel. The E2B project
+        sandbox and its filesystem stay intact, so a recovered agent can still
+        inspect every earlier proposal and the current round context.
+        """
         if self._finished_at is not None:
             raise RuntimeError("cannot run an agent in a closed project")
         if self._active_event_sink is not None:
@@ -124,6 +138,27 @@ class AgentProject:
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"project agents cannot use uncontained tools: {names}")
+        for attempt in range(2):
+            try:
+                return self._run_turn(
+                    agent, provider, instruction, timeout=timeout, on_event=on_event
+                )
+            except Exception as error:
+                if attempt > 0 or not _is_recoverable_session_error(error):
+                    raise
+                self._close_agent_session()
+        raise AssertionError("unreachable")
+
+    def _run_turn(
+        self,
+        agent: HarnessDoc,
+        provider: ToolCallingProvider,
+        instruction: str,
+        *,
+        timeout: float,
+        on_event: Callable[[SessionEvent], None] | None,
+    ) -> AgentProjectRun:
+        """Execute one attempt using the compatible ordinary live session."""
         session = self._ensure_session(agent, provider)
         events: list[SessionEvent] = []
         answer = ""
@@ -223,8 +258,9 @@ class AgentProject:
         self._session_agent_hash = None
         self._session_provider = None
         if session is not None and not session.closed:
-            session.end()
-            session.pump(timeout=0)
+            with contextlib.suppress(Exception):
+                session.end()
+                session.pump(timeout=0)
         close = getattr(channel, "close", None)
         if callable(close):
             with contextlib.suppress(Exception):
@@ -292,6 +328,15 @@ class AgentProject:
 
 def _start_channel(sandbox: SandboxHandle, workspace: str) -> Channel:
     return start_live_runner(sandbox, workspace=workspace)
+
+
+def _is_recoverable_session_error(error: Exception) -> bool:
+    """Return whether one fresh live session may recover this transport failure."""
+    error_type = type(error)
+    if error_type.__module__ == "e2b.exceptions" and error_type.__name__ == "TimeoutException":
+        return True
+    text = str(error).lower()
+    return any(marker in text for marker in _RECOVERABLE_SESSION_MARKERS)
 
 
 def _capped(content: str, *, is_error: bool = False) -> ToolOutcome:
