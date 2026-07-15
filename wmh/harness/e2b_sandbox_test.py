@@ -7,11 +7,17 @@ locally-defined `RateLimitException` stands in for e2b's, and a plain fake satis
 
 from __future__ import annotations
 
+import sys
 import time
+from types import ModuleType
 
 import pytest
 
-from wmh.harness.e2b_sandbox import SandboxHandle, create_sandbox
+from wmh.harness.e2b_sandbox import (
+    SandboxHandle,
+    create_sandbox,
+    default_sandbox_factory,
+)
 
 
 class RateLimitException(Exception):
@@ -168,6 +174,41 @@ def test_create_sandbox_does_not_retry_non_capacity_errors(
         create_sandbox(factory)
     assert len(attempts) == 1  # auth/template/config errors fail immediately
     assert sleeps == []
+
+
+def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSandbox()
+    calls: list[dict[str, object]] = []
+
+    class _SandboxSdk:
+        @staticmethod
+        def create(**kwargs: object) -> FakeSandbox:
+            calls.append(kwargs)
+            return fake
+
+    e2b = ModuleType("e2b")
+    e2b.Sandbox = _SandboxSdk  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "e2b", e2b)
+    metadata = {"kind": "optimizer-evaluator", "run_id": "run-1"}
+
+    factory = default_sandbox_factory(
+        api_key="key",
+        template="tmpl",
+        timeout=61.9,
+        metadata=metadata,
+    )
+
+    assert factory() is fake
+    assert calls == [
+        {
+            "template": "tmpl",
+            "timeout": 61,
+            "api_key": "key",
+            "metadata": metadata,
+        }
+    ]
 
 
 def test_fake_sandbox_satisfies_the_sandbox_handle_protocol() -> None:
