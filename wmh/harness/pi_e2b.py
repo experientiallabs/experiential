@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import math
 import os
 import queue
 import shlex
@@ -85,6 +86,16 @@ _RUNNER_FILES = ("runner_stdio.ts", "runner_frames.ts")
 
 _STDERR_LINES = 50  # bounded diagnostics buffer: enough for a stack trace, never unbounded
 
+# A runner-originated heartbeat keeps the background command stream active while the host is
+# synchronously waiting on a slow provider call. Pooled evaluation channels also use the same
+# heartbeat to renew the sandbox lease; live-session callers own their own idle/suspend lifecycle
+# and therefore leave renewal disabled.
+TRANSPORT_KEEPALIVE_TYPE = "transport_keepalive"
+_SANDBOX_TIMEOUT_REFRESH_S = 300.0
+# Renewal must not turn mutated agent code into an unbounded cost leak. A legitimate slow episode
+# may cross the base 15-minute lease, but one cell still gets a hard one-hour sandbox lifetime.
+MAX_EVAL_EPISODE_LIFETIME_S = 3_600.0
+
 
 class _Eof:
     """Reader-thread sentinel: the runner process's output stream ended."""
@@ -109,12 +120,24 @@ class E2BStdioChannel:
     """
 
     def __init__(
-        self, sandbox: SandboxHandle, handle: CommandHandle, *, stderr_lines: int = _STDERR_LINES
+        self,
+        sandbox: SandboxHandle,
+        handle: CommandHandle,
+        *,
+        stderr_lines: int = _STDERR_LINES,
+        sandbox_timeout_s: int | None = None,
+        timeout_refresh_interval_s: float = _SANDBOX_TIMEOUT_REFRESH_S,
+        max_episode_lifetime_s: float = MAX_EVAL_EPISODE_LIFETIME_S,
     ) -> None:
         self._sandbox = sandbox
         self._handle = handle
         self._frames: queue.Queue[JsonObject | _Eof] = queue.Queue()
         self._stderr: deque[str] = deque(maxlen=stderr_lines)
+        self._sandbox_timeout_s = sandbox_timeout_s
+        self._timeout_refresh_interval_s = timeout_refresh_interval_s
+        self._max_episode_lifetime_s = max_episode_lifetime_s
+        self._next_timeout_refresh_at = 0.0
+        self._episode_renewal_deadline_at: float | None = None
         self._closed = False
         self._reader = threading.Thread(
             target=self._read_events, name="e2b-stdio-reader", daemon=True
@@ -122,6 +145,12 @@ class E2BStdioChannel:
         self._reader.start()
 
     def send(self, frame: JsonObject) -> None:
+        if frame.get("type") == "episode_start" and self._sandbox_timeout_s is not None:
+            now = time.monotonic()
+            self._episode_renewal_deadline_at = now + self._max_episode_lifetime_s
+            # The pool reset the lease immediately before this episode. Wait until the normal
+            # refresh cadence instead of bursting one set_timeout call per sandbox at 30 seconds.
+            self._next_timeout_refresh_at = now + self._timeout_refresh_interval_s
         line = base64.b64encode(json.dumps(frame).encode("utf-8")).decode("ascii") + "\n"
         try:
             self._sandbox.commands.send_stdin(self._handle.pid, line)
@@ -153,6 +182,7 @@ class E2BStdioChannel:
         if self._closed:
             return
         self._closed = True
+        self._episode_renewal_deadline_at = None
         try:
             self.send({"type": "shutdown"})
         except Exception:  # noqa: BLE001 - the process/sandbox may already be gone; close is best-effort
@@ -195,9 +225,38 @@ class E2BStdioChannel:
             self._stderr.append(f"[stdout] {text}")  # not a frame; keep it as a diagnostic
             return
         if isinstance(frame, dict):
+            if frame.get("type") == TRANSPORT_KEEPALIVE_TYPE:
+                self._refresh_sandbox_timeout()
+                return
+            if frame.get("type") in {"done", "episode_error"}:
+                self._episode_renewal_deadline_at = None
             self._frames.put(cast("JsonObject", frame))
         else:
             self._stderr.append(f"[stdout] {text}")
+
+    def _refresh_sandbox_timeout(self) -> None:
+        """Renew a pooled eval sandbox lease without surfacing the heartbeat as a protocol frame.
+
+        A provider call can keep one episode active longer than E2B's 900-second sandbox timeout.
+        The runner remains responsive during that host-side wait and emits transport heartbeats;
+        refreshing here prevents E2B from killing an otherwise healthy in-flight episode. A
+        transient refresh failure stays diagnostic-only and the next heartbeat retries it.
+        """
+        timeout = self._sandbox_timeout_s
+        deadline = self._episode_renewal_deadline_at
+        if timeout is None or deadline is None:
+            return
+        now = time.monotonic()
+        if now < self._next_timeout_refresh_at or now >= deadline:
+            return
+        # Shorten the final lease so the sandbox still dies at the absolute episode deadline.
+        refreshed_timeout = min(timeout, max(1, math.ceil(deadline - now)))
+        try:
+            self._sandbox.set_timeout(refreshed_timeout)
+        except Exception as exc:  # noqa: BLE001 - retry on the next heartbeat; I/O remains authoritative
+            self._stderr.append(f"[channel] sandbox timeout refresh failed: {exc}")
+            return
+        self._next_timeout_refresh_at = now + self._timeout_refresh_interval_s
 
 
 class E2BSandboxPool:
@@ -332,11 +391,20 @@ class E2BSandboxPool:
         )
 
     def _start_runner(self, sandbox: SandboxHandle) -> E2BStdioChannel:
+        # Bootstrap can consume much of the creation-time lease on a template-less sandbox. Reset
+        # it immediately before the long-lived runner starts; subsequent in-flight heartbeats keep
+        # extending it while an episode is active.
+        timeout = int(DEFAULT_SANDBOX_TIMEOUT_S)
+        sandbox.set_timeout(timeout)
         # timeout=0 = no command-connection limit (SDK-documented): the runner must outlive every
         # episode on this sandbox; the sandbox's own lifetime is the real bound.
         handle = sandbox.commands.run(START_CMD, background=True, stdin=True, timeout=0)
         # background=True always yields a handle; the union return type is the protocol's.
-        channel = E2BStdioChannel(sandbox, cast("CommandHandle", handle))
+        channel = E2BStdioChannel(
+            sandbox,
+            cast("CommandHandle", handle),
+            sandbox_timeout_s=timeout,
+        )
         self._await_hello(channel)
         return channel
 

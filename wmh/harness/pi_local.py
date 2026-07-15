@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TextIO, cast
 
 from wmh.core.types import JsonObject
-from wmh.harness.pi_e2b import HELLO_TIMEOUT_S, PI_NPM_PACKAGES, session_entry_files
+from wmh.harness.pi_e2b import (
+    HELLO_TIMEOUT_S,
+    PI_NPM_PACKAGES,
+    TRANSPORT_KEEPALIVE_TYPE,
+    session_entry_files,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -198,6 +203,8 @@ class LocalStdioChannel:
                     self._stderr.append(f"[stdout] {text}")
                     continue
                 if isinstance(frame, dict):
+                    if frame.get("type") == TRANSPORT_KEEPALIVE_TYPE:
+                        continue
                     self._frames.put(cast("JsonObject", frame))
                 else:
                     self._stderr.append(f"[stdout] {text}")

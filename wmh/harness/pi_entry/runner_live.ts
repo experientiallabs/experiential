@@ -33,6 +33,7 @@ console.warn = toStderr;
 console.debug = toStderr;
 
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
+const TRANSPORT_KEEPALIVE_MS = 30_000;
 
 type Frame = Record<string, any>;
 
@@ -79,6 +80,16 @@ class StdioConn {
 			this.waiters.set(req_id, resolve);
 			this.send({ type, req_id, ...payload });
 		});
+	}
+
+	/** Keep the command stream active across the persistent session; timeout remains host-owned. */
+	startTransportKeepalive(): () => void {
+		const timer = setInterval(
+			() => this.send({ type: "transport_keepalive" }),
+			TRANSPORT_KEEPALIVE_MS,
+		);
+		timer.unref();
+		return () => clearInterval(timer);
 	}
 
 	private onData(chunk: string): void {
@@ -397,6 +408,9 @@ class Session {
 
 function main(): void {
 	const conn = new StdioConn();
+	// AgentProject deliberately keeps this ordinary live session between proposal turns. Keep the
+	// output stream attached while idle too; host-side E2B timeout/idle-suspend policy is separate.
+	conn.startTransportKeepalive();
 	const session = new Session(conn);
 	conn.on("shutdown", () => process.exit(0));
 	conn.on("session_start", (start) => {

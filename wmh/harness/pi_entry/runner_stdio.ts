@@ -40,6 +40,7 @@ console.debug = toStderr;
 
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
 const MAX_TURNS = Number(process.env.PI_MAX_TURNS ?? "20");
+const TRANSPORT_KEEPALIVE_MS = 30_000;
 
 type Frame = Record<string, any>;
 
@@ -92,6 +93,16 @@ class StdioConn {
 			this.waiters.set(req_id, resolve);
 			this.send({ type, req_id, ...payload });
 		});
+	}
+
+	/** Keep the E2B command stream and its pooled sandbox lease alive during one active episode. */
+	startTransportKeepalive(): () => void {
+		const timer = setInterval(
+			() => this.send({ type: "transport_keepalive" }),
+			TRANSPORT_KEEPALIVE_MS,
+		);
+		timer.unref();
+		return () => clearInterval(timer);
 	}
 
 	private onData(chunk: string): void {
@@ -207,6 +218,7 @@ async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 	let lastAssistantText = "";
 	let bridge: Bridge | null = null;
 	let cleanupSrc: () => void = () => {};
+	const stopTransportKeepalive = conn.startTransportKeepalive();
 
 	try {
 		const [AgentCtor, cleanup] = await loadAgent(start);
@@ -275,6 +287,7 @@ async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 	} catch (e) {
 		if (!doneSent) conn.send({ type: "episode_error", episode_id: episodeId, note: String(e) });
 	} finally {
+		stopTransportKeepalive();
 		bridge?.close();
 		cleanupSrc();
 	}

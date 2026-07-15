@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 import wmh.harness.pi_local as mod
+from wmh.harness.pi_e2b import TRANSPORT_KEEPALIVE_TYPE
 from wmh.harness.pi_local import (
     LocalStdioChannel,
     ensure_local_pi_runtime,
@@ -110,3 +111,17 @@ def test_local_stdio_channel_round_trips_frames_and_cleans_run_dir(tmp_path: Pat
     channel.close()
     assert process.terminated
     assert not run_dir.exists()
+
+
+def test_local_stdio_channel_filters_transport_keepalives() -> None:
+    """Runner liveness is transport-only and never leaks into an interactive session."""
+    process = _FakeProcess(
+        [
+            {"type": TRANSPORT_KEEPALIVE_TYPE},
+            {"type": "hello", "mode": "session"},
+        ]
+    )
+    channel = LocalStdioChannel(cast("mod._TextProcess", process))
+
+    assert channel.recv(timeout=1) == {"type": "hello", "mode": "session"}
+    channel.close()

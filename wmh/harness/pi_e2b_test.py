@@ -33,6 +33,7 @@ from wmh.harness.pi_e2b import (
     PI_NPM_PACKAGES,
     RUNNER_WORKDIR,
     START_CMD,
+    TRANSPORT_KEEPALIVE_TYPE,
     E2BPiRuntime,
     E2BSandboxPool,
     E2BStdioChannel,
@@ -171,8 +172,21 @@ class _RecordingEnv:
         pass
 
 
-def _channel(fake: FakeSandbox, handle: _ScriptedHandle) -> E2BStdioChannel:
-    return E2BStdioChannel(fake, handle)
+def _channel(
+    fake: FakeSandbox,
+    handle: _ScriptedHandle,
+    *,
+    sandbox_timeout_s: int | None = None,
+    timeout_refresh_interval_s: float = 300.0,
+    max_episode_lifetime_s: float = 3_600.0,
+) -> E2BStdioChannel:
+    return E2BStdioChannel(
+        fake,
+        handle,
+        sandbox_timeout_s=sandbox_timeout_s,
+        timeout_refresh_interval_s=timeout_refresh_interval_s,
+        max_episode_lifetime_s=max_episode_lifetime_s,
+    )
 
 
 def _tools() -> list[ToolSpec]:
@@ -289,6 +303,90 @@ def test_non_frame_stdout_noise_becomes_a_diagnostic_not_a_frame() -> None:
     assert "stray print!!" in channel.stderr_tail()
 
 
+def test_transport_keepalive_renews_a_pooled_lease_without_becoming_a_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active runner heartbeats keep E2B alive but stay below RunnerLink's protocol."""
+    now = [100.0]
+    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
+    keepalive: JsonObject = {"type": TRANSPORT_KEEPALIVE_TYPE}
+    hello: JsonObject = {"type": "hello"}
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    channel = _channel(fake, handle, sandbox_timeout_s=900)
+
+    channel.send({"type": "episode_start"})
+    channel._decode_line(_line(keepalive))  # noqa: SLF001 - exercise the reader's exact decoder
+    assert fake.timeouts == []  # the pool's initial reset covers the first refresh window
+    now[0] += 300
+    channel._decode_line(_line(keepalive))  # noqa: SLF001
+    channel._decode_line(_line(keepalive))  # noqa: SLF001 - throttled at the same timestamp
+    channel._decode_line(_line(hello))  # noqa: SLF001
+    assert channel.recv(timeout=2.0) == hello
+    assert fake.timeouts == [900]
+
+
+def test_transport_keepalive_stops_renewing_at_the_episode_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A yielding bad candidate cannot turn lease renewal into an unbounded sandbox leak."""
+    now = [100.0]
+    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
+    keepalive: JsonObject = {"type": TRANSPORT_KEEPALIVE_TYPE}
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    channel = _channel(
+        fake,
+        handle,
+        sandbox_timeout_s=900,
+        timeout_refresh_interval_s=300,
+        max_episode_lifetime_s=600,
+    )
+
+    channel.send({"type": "episode_start"})
+    now[0] += 300
+    channel._decode_line(_line(keepalive))  # noqa: SLF001
+    now[0] += 300
+    channel._decode_line(_line(keepalive))  # noqa: SLF001
+
+    assert fake.timeouts == [300]  # the final refresh expires exactly at the hard deadline
+
+
+def test_transport_keepalive_refresh_failure_is_nonfatal_and_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A control-plane blip cannot poison the frame stream; the next heartbeat retries."""
+
+    class FlakyTimeoutSandbox(FakeSandbox):
+        def __init__(self, handle: _ScriptedHandle) -> None:
+            super().__init__(handle)
+            self.refresh_attempts = 0
+
+        def set_timeout(self, timeout: int) -> None:
+            self.refresh_attempts += 1
+            if self.refresh_attempts == 1:
+                raise RuntimeError("temporary control-plane failure")
+            super().set_timeout(timeout)
+
+    now = [100.0]
+    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
+    keepalive: JsonObject = {"type": TRANSPORT_KEEPALIVE_TYPE}
+    hello: JsonObject = {"type": "hello"}
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FlakyTimeoutSandbox(handle)
+    channel = _channel(fake, handle, sandbox_timeout_s=900)
+
+    channel.send({"type": "episode_start"})
+    now[0] += 300
+    channel._decode_line(_line(keepalive))  # noqa: SLF001
+    channel._decode_line(_line(keepalive))  # noqa: SLF001
+    channel._decode_line(_line(hello))  # noqa: SLF001
+    assert channel.recv(timeout=2.0) == hello
+    assert fake.refresh_attempts == 2
+    assert fake.timeouts == [900]
+    assert "sandbox timeout refresh failed" in channel.stderr_tail()
+
+
 def test_recv_after_process_exit_raises_with_recent_stderr() -> None:
     events: list[_Event] = [
         (_line({"type": "hello"}), None, None),
@@ -326,6 +424,8 @@ def test_pool_acquire_creates_bootstraps_starts_runner_and_awaits_hello(
     fake = made[0]
     # Bootstrap: runner files up, node 22 + pinned pi deps installed, the runner started.
     assert fake.files.store[f"{RUNNER_WORKDIR}/runner_stdio.ts"].startswith("/**")
+    assert TRANSPORT_KEEPALIVE_TYPE in fake.files.store[f"{RUNNER_WORKDIR}/runner_stdio.ts"]
+    assert ".unref()" in fake.files.store[f"{RUNNER_WORKDIR}/runner_stdio.ts"]
     assert f"{RUNNER_WORKDIR}/runner_frames.ts" in fake.files.store
     assert fake.commands.calls[0] == NODE_INSTALL_CMD
     assert all(pkg in fake.commands.calls[1] for pkg in PI_NPM_PACKAGES)
@@ -549,11 +649,11 @@ def test_acquire_extends_the_lifetime_of_a_reused_sandbox(
     pool = E2BSandboxPool(sandbox_factory=factory)
     sandbox, channel = pool.acquire()
     [fake] = made
-    assert fake.timeouts == []  # fresh sandboxes carry their creation-time lifetime
+    assert fake.timeouts == [900]  # reset after bootstrap, immediately before the runner starts
     pool.release(sandbox, channel, healthy=True)
     again, _ = pool.acquire()
     assert again is sandbox
-    assert fake.timeouts == [900]  # the reuse extended the countdown
+    assert fake.timeouts == [900, 900]  # the reuse extended the countdown again
     pool.close()
 
 
@@ -732,16 +832,30 @@ def test_session_entry_files_returns_the_live_runner_source() -> None:
     files = session_entry_files()
     assert "runner_live.ts" in files
     assert files["runner_live.ts"].startswith("/**")
+    assert TRANSPORT_KEEPALIVE_TYPE in files["runner_live.ts"]
+    assert ".unref()" in files["runner_live.ts"]
+    assert "conn.startTransportKeepalive();" in files["runner_live.ts"]
 
 
 def test_start_live_runner_bootstraps_starts_and_consumes_hello() -> None:
-    fake = FakeSandbox(_ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True))
+    fake = FakeSandbox(
+        _ScriptedHandle(
+            _stdout_events(
+                [
+                    {"type": TRANSPORT_KEEPALIVE_TYPE},
+                    {"type": "hello"},
+                ]
+            ),
+            hold_open=True,
+        )
+    )
     channel = start_live_runner(fake, template=None)
     # runner_live.ts uploaded; node 22 + pi deps installed; workspace ensured; runner started.
     assert f"{RUNNER_WORKDIR}/runner_live.ts" in fake.files.store
     assert fake.commands.calls[0] == NODE_INSTALL_CMD
     assert any("mkdir -p" in c for c in fake.commands.calls)
     assert fake.commands.background_cmds == [LIVE_START_CMD]
+    assert fake.timeouts == []  # Platform owns live-session timeout and idle/suspend behavior
     # The hello was consumed; the channel is idle and ready for session frames.
     with pytest.raises(TimeoutError):
         channel.recv(timeout=0.05)
