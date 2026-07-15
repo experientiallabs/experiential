@@ -175,6 +175,7 @@ class LiveSession:
         self._session_id = uuid.uuid4().hex
         self._status: str = "starting"
         self._closed = False
+        self._failure_message: str | None = None
         self._actions_this_turn = 0
         self._aborting = False
         self._pending_ping: str | None = None
@@ -190,6 +191,11 @@ class LiveSession:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def failure_message(self) -> str | None:
+        """Return the runner or channel error that closed this session, when one exists."""
+        return self._failure_message
 
     def start(self, hello_timeout: float = 60.0) -> None:
         """Send `session_start` and block until the runner reports its first idle state."""
@@ -213,6 +219,10 @@ class LiveSession:
             if self._handle_frame(frame):
                 if self._status in ("idle", "running"):
                     return
+                if self._closed:
+                    break
+        if self._failure_message is not None:
+            raise RuntimeError(f"live session runner did not become ready: {self._failure_message}")
         raise RuntimeError("live session runner did not become ready")
 
     # -- driver-facing intents (thread-safe) -----------------------------------------------------
@@ -295,7 +305,8 @@ class LiveSession:
                 self._pending_ping = None
         elif kind == "episode_error":
             note = frame.get("note")
-            self._emit("error", {"message": note if isinstance(note, str) else "runner error"})
+            self._failure_message = note if isinstance(note, str) else "runner error"
+            self._emit("error", {"message": self._failure_message})
             self._mark_closed("failed")
         elif kind == "hello":
             pass  # the pool already consumed the handshake; a duplicate is harmless
@@ -443,7 +454,8 @@ class LiveSession:
             return None
         except Exception as exc:  # noqa: BLE001 - a dead runner ends the session, not the process
             if not self._closed:
-                self._emit("error", {"message": str(exc)})
+                self._failure_message = str(exc)
+                self._emit("error", {"message": self._failure_message})
                 self._mark_closed("failed")
             return None
         if frame is None and not self._closed:
@@ -456,7 +468,8 @@ class LiveSession:
         try:
             self._channel.send(frame)
         except Exception as exc:  # noqa: BLE001 - a broken channel ends the session cleanly
-            self._emit("error", {"message": f"channel send failed: {exc}"})
+            self._failure_message = f"channel send failed: {exc}"
+            self._emit("error", {"message": self._failure_message})
             self._mark_closed("failed")
 
     def _mark_closed(self, status: str) -> None:

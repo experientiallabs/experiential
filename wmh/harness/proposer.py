@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from wmh.agents.project import AgentProjectRun
+from wmh.core.types import JsonObject
 from wmh.harness.delta import FailureSignature, HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta
@@ -120,7 +121,9 @@ class ProjectDeltaProposer:
         round_dir = f"round-{self._round:04d}"
         context_dir = f"context/{round_dir}"
         proposal_dir = f"proposals/{round_dir}"
-        self._project.write_text(f"{context_dir}/parent.json", parent.model_dump_json(indent=2))
+        self._project.write_text(
+            f"{context_dir}/parent.json", json.dumps(_parent_context(parent), indent=2)
+        )
         self._project.write_text(f"{context_dir}/evidence.md", evidence)
         self._project.write_text(
             f"{context_dir}/history.json",
@@ -142,8 +145,49 @@ class ProjectDeltaProposer:
             except Exception:  # noqa: BLE001 - a missing output is one unusable proposal
                 proposals.append(None)
                 continue
-            proposals.append(parse_delta(parent, trigger, raw))
+            proposal = parse_delta(parent, trigger, raw)
+            proposals.append(_stamp_project_preconditions(parent, proposal))
         return proposals
+
+
+def _parent_context(parent: HarnessDoc) -> JsonObject:
+    """Serialize a parent with the computed identities a project agent must copy."""
+    return {
+        "name": parent.name,
+        "version": parent.version,
+        "doc_hash": parent.doc_hash,
+        "surfaces": [
+            {
+                "id": surface.id,
+                "kind": surface.kind.value,
+                "content": surface.content,
+                "content_hash": surface.content_hash,
+                "budget": surface.budget,
+                "path": surface.path,
+            }
+            for surface in parent.surfaces
+        ],
+    }
+
+
+def _stamp_project_preconditions(
+    parent: HarnessDoc, proposal: HarnessDelta | None
+) -> HarnessDelta | None:
+    """Stamp missing concurrency metadata from the exact project-round parent.
+
+    The ordinary agent still chooses every semantic operation. The host owns this mechanical
+    identity field because it wrote the immutable parent snapshot for the same synchronous round.
+    An explicitly supplied but incorrect hash is preserved so normal validation rejects it.
+    """
+    if proposal is None:
+        return None
+    for op in proposal.ops:
+        if op.op not in ("replace", "remove") or op.surface_id in proposal.preconditions:
+            continue
+        surface = parent.surface(op.surface_id)
+        if surface is not None:
+            proposal.preconditions[op.surface_id] = surface.content_hash
+    return proposal
 
 
 def _project_request(*, workspace: str, context_dir: str, proposal_dir: str, count: int) -> str:

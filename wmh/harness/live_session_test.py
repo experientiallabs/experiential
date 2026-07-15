@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import pytest
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import JsonObject
@@ -53,6 +54,16 @@ def test_start_waits_for_first_idle_state() -> None:
     assert session.status == "idle"
     assert channel.sent[0]["type"] == "session_start"
     assert channel.sent[0]["turn_cap"] == 60
+
+
+def test_start_surfaces_the_runner_construction_error() -> None:
+    channel = ScriptedChannel(
+        [{"type": "episode_error", "note": "could not import the agent harness"}]
+    )
+    session = LiveSession(channel, tools=[], execute_tool=_no_tool, on_event=lambda e: None)
+
+    with pytest.raises(RuntimeError, match="could not import the agent harness"):
+        session.start()
 
 
 def test_full_turn_emits_ordered_events_and_answers_frames() -> None:

@@ -104,7 +104,7 @@ class _Project:
     ) -> AgentProjectRun:
         del agent, provider
         self.runs += 1
-        assert "exactly 2" in instruction
+        assert f"exactly {len(self.outputs)}" in instruction
         round_dir = f"round-{self.runs:04d}"
         for index, output in enumerate(self.outputs, start=1):
             self.files[f"proposals/{round_dir}/proposal-{index:02d}.json"] = output
@@ -165,3 +165,23 @@ def test_project_proposer_uses_one_agent_turn_and_keeps_round_files() -> None:
     assert "context/round-0002/history.json" in project.files
     assert "proposal-01.json" in project.files["context/round-0002/REQUEST.md"]
     assert all(project.files[path] == content for path, content in first_files.items())
+    parent_context = json.loads(project.files["context/round-0001/parent.json"])
+    assert parent_context["doc_hash"] == parent.doc_hash
+    assert {
+        surface["id"]: surface["content_hash"] for surface in parent_context["surfaces"]
+    } == parent.surface_hashes()
+
+
+def test_project_proposer_stamps_missing_parent_preconditions() -> None:
+    parent = HarnessDoc.baseline("parent")
+    raw = json.loads(_payload(parent, "careful"))
+    raw["preconditions"] = {}
+    project = _Project([json.dumps(raw)])
+
+    proposals = ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).propose_batch(
+        parent, _trigger(), "inspect failures", history=[], count=1
+    )
+
+    proposal = proposals[0]
+    assert isinstance(proposal, HarnessDelta)
+    assert proposal.preconditions == {"prompt:core": parent.surface_hashes()["prompt:core"]}

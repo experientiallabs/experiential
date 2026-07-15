@@ -48,8 +48,10 @@ class AgentProjectRun:
 class AgentProject:
     """A persistent filesystem that can run project-scoped pi agents.
 
-    The project owns environment state, while :class:`LiveSession` owns agent execution. A new
-    session is created for each ``run`` call, but every session sees the same sandbox filesystem.
+    The project owns environment state, while :class:`LiveSession` owns ordinary agent execution.
+    Repeated ``run`` calls for the same agent and provider reuse one live session and its
+    transcript.
+    Changing the agent harness or provider starts a new session against the same filesystem.
     """
 
     def __init__(
@@ -66,6 +68,11 @@ class AgentProject:
         self._owns_sandbox = owns_sandbox
         self._started_at = time.monotonic()
         self._finished_at: float | None = None
+        self._channel: Channel | None = None
+        self._session: LiveSession | None = None
+        self._session_agent_hash: str | None = None
+        self._session_provider: ToolCallingProvider | None = None
+        self._active_event_sink: Callable[[SessionEvent], None] | None = None
         self._sandbox.commands.run(f"mkdir -p {shlex.quote(self.workspace)}", timeout=30)
 
     @classmethod
@@ -108,12 +115,16 @@ class AgentProject:
         timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
         on_event: Callable[[SessionEvent], None] | None = None,
     ) -> AgentProjectRun:
-        """Run one project-contained agent session against the persistent filesystem."""
+        """Run one turn of an ordinary agent against this persistent project."""
+        if self._finished_at is not None:
+            raise RuntimeError("cannot run an agent in a closed project")
+        if self._active_event_sink is not None:
+            raise RuntimeError("a project agent turn is already running")
         unsupported = set(agent.tools()) - _PROJECT_TOOLS
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"project agents cannot use uncontained tools: {names}")
-        channel = self._channel_factory(self._sandbox, self.workspace)
+        session = self._ensure_session(agent, provider)
         events: list[SessionEvent] = []
         answer = ""
         turn_started = False
@@ -130,20 +141,13 @@ class AgentProject:
             if on_event is not None:
                 on_event(event)
 
-        skills = agent.skills()
-        session = LiveSession(
-            channel,
-            tools=resolve_tools(agent.tools()),
-            execute_tool=self._execute_tool,
-            on_event=sink,
-            files={surface.path: surface.content for surface in agent.code_files() if surface.path},
-            system_prompt=agent.assembled_prompt(),
-            skill_bodies={skill.name: skill.body for skill in skills},
-            provider=provider,
-            turn_cap=agent.max_turns(),
+        usage_before = TokenUsage(
+            input_tokens=session.worker_usage.input_tokens,
+            output_tokens=session.worker_usage.output_tokens,
+            calls=session.worker_usage.calls,
         )
+        self._active_event_sink = sink
         try:
-            session.start()
             session.send_user_message(instruction)
             turn_started = True
             deadline = time.monotonic() + timeout
@@ -154,21 +158,77 @@ class AgentProject:
                     session.pump(timeout=0)
                     raise TimeoutError(f"project agent did not finish within {timeout:g}s")
                 if not session.pump(timeout=min(0.5, remaining)) and not turn_finished:
+                    if session.failure_message is not None:
+                        raise RuntimeError(
+                            f"project agent session failed: {session.failure_message}"
+                        )
                     raise RuntimeError("project agent session ended before completing its turn")
             usage = TokenUsage(
-                input_tokens=session.worker_usage.input_tokens,
-                output_tokens=session.worker_usage.output_tokens,
-                calls=session.worker_usage.calls,
+                input_tokens=session.worker_usage.input_tokens - usage_before.input_tokens,
+                output_tokens=session.worker_usage.output_tokens - usage_before.output_tokens,
+                calls=session.worker_usage.calls - usage_before.calls,
             )
         finally:
-            if not session.closed:
-                session.end()
-                session.pump(timeout=0)
+            self._active_event_sink = None
+        return AgentProjectRun(answer=answer, events=tuple(events), worker_usage=usage)
+
+    def _ensure_session(self, agent: HarnessDoc, provider: ToolCallingProvider) -> LiveSession:
+        """Return the compatible live session, starting one when the harness changed."""
+        if (
+            self._session is not None
+            and not self._session.closed
+            and self._session_agent_hash == agent.doc_hash
+            and self._session_provider is provider
+        ):
+            return self._session
+        self._close_agent_session()
+        channel = self._channel_factory(self._sandbox, self.workspace)
+        skills = agent.skills()
+        session = LiveSession(
+            channel,
+            tools=resolve_tools(agent.tools()),
+            execute_tool=self._execute_tool,
+            on_event=self._emit_session_event,
+            files={surface.path: surface.content for surface in agent.code_files() if surface.path},
+            system_prompt=agent.assembled_prompt(),
+            skill_bodies={skill.name: skill.body for skill in skills},
+            provider=provider,
+            turn_cap=agent.max_turns(),
+        )
+        try:
+            session.start()
+        except Exception:
             close = getattr(channel, "close", None)
             if callable(close):
                 with contextlib.suppress(Exception):
                     close()
-        return AgentProjectRun(answer=answer, events=tuple(events), worker_usage=usage)
+            raise
+        self._channel = channel
+        self._session = session
+        self._session_agent_hash = agent.doc_hash
+        self._session_provider = provider
+        return session
+
+    def _emit_session_event(self, event: SessionEvent) -> None:
+        """Route session events to the currently active project turn."""
+        if self._active_event_sink is not None:
+            self._active_event_sink(event)
+
+    def _close_agent_session(self) -> None:
+        """Close the current agent session without touching the project filesystem."""
+        session = self._session
+        channel = self._channel
+        self._session = None
+        self._channel = None
+        self._session_agent_hash = None
+        self._session_provider = None
+        if session is not None and not session.closed:
+            session.end()
+            session.pump(timeout=0)
+        close = getattr(channel, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
 
     def usage(self) -> SandboxUsage:
         """Return this project's sandbox lifetime meter."""
@@ -179,6 +239,7 @@ class AgentProject:
         """Kill an owned sandbox and finalize its usage meter."""
         if self._finished_at is not None:
             return
+        self._close_agent_session()
         self._finished_at = time.monotonic()
         if self._owns_sandbox:
             with contextlib.suppress(Exception):

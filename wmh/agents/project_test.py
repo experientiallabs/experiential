@@ -116,11 +116,68 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     assert result.answer == "finished"
     assert any(frame["type"] == "session_start" for frame in channel.sent)
     assert any(frame["type"] == "user_message" for frame in channel.sent)
-    assert channel.closed is True
+    assert channel.closed is False
     assert sandbox.commands.runs[:2] == [
         "mkdir -p /home/user/project",
         "mkdir -p /home/user/project/history",
     ]
+    project.close()
+    assert channel.closed is True
+
+
+def test_project_reuses_one_agent_session_across_turns() -> None:
+    sandbox = _Sandbox()
+    channel = _Channel()
+    channel.inbound.extend(
+        [
+            {"type": "state", "status": "running"},
+            {
+                "type": "tool_request",
+                "req_id": 3,
+                "name": "submit",
+                "arguments": {"answer": "second"},
+            },
+            {"type": "state", "status": "idle", "reason": "completed"},
+        ]
+    )
+    starts = 0
+
+    def channel_factory(sandbox: object, workspace: str) -> _Channel:
+        nonlocal starts
+        del sandbox, workspace
+        starts += 1
+        return channel
+
+    project = AgentProject(sandbox, channel_factory=channel_factory, owns_sandbox=False)
+    agent = meta_agent()
+    provider = _Provider()
+
+    first = project.run(agent, provider, "first turn", timeout=1)
+    second = project.run(agent, provider, "second turn", timeout=1)
+
+    assert first.answer == "finished"
+    assert second.answer == "second"
+    assert starts == 1
+    assert [frame["type"] for frame in channel.sent].count("session_start") == 1
+    assert [frame["type"] for frame in channel.sent].count("user_message") == 2
+
+
+def test_project_surfaces_a_mid_turn_runner_error() -> None:
+    sandbox = _Sandbox()
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "episode_error", "note": "worker bridge disconnected"},
+    ]
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(RuntimeError, match="worker bridge disconnected"):
+        project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
 
 
 def test_project_rejects_paths_that_escape_its_workspace() -> None:
