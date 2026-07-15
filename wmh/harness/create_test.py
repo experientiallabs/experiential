@@ -682,6 +682,7 @@ class _FakePool:
         self.template = template
         self.channels: list[_ScriptedPoolChannel] = []
         self.releases: list[bool] = []
+        self.retire_idle_calls = 0
         self.closes = 0
         _FakePool.instances.append(self)
 
@@ -695,6 +696,10 @@ class _FakePool:
 
     def release(self, sandbox: object, channel: object, *, healthy: bool) -> None:
         self.releases.append(healthy)
+
+    def retire_idle(self) -> int:
+        self.retire_idle_calls += 1
+        return 0
 
     def close(self) -> None:
         self.closes += 1
@@ -859,6 +864,35 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
         )
     [pool] = fake_pool_cls.instances
     assert pool.closes == 1  # the try/finally tears the pool down even on failure
+
+
+def test_e2b_pool_retires_idle_runners_once_per_proposal_batch(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """Round boundaries rotate eval streams without rotating between sibling proposals."""
+    provider = RoleProvider()
+    monkeypatch.setattr(
+        create_module,
+        "evaluate_closed_loop",
+        lambda *a, **k: _canned_report(0.5, k=k.get("k", 3)),
+    )
+
+    result = create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=2,
+        proposal_batch_size=3,
+        harness_backend="e2b",
+    )
+
+    assert result.rounds == 2 and len(result.iteration_records) == 6
+    [pool] = fake_pool_cls.instances
+    assert pool.retire_idle_calls == 2  # once per batch, never between its three siblings
 
 
 def test_eval_concurrency_overrides_both_backend_defaults(

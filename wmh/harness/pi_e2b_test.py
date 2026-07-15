@@ -26,7 +26,7 @@ from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness import pi_e2b as pi_e2b_module
-from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
+from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage
 from wmh.harness.pi_e2b import (
     LIVE_START_CMD,
     NODE_INSTALL_CMD,
@@ -548,6 +548,34 @@ def test_pool_reuses_a_healthy_sandbox_without_rebootstrap(
     assert made[0].commands.calls.count(NODE_INSTALL_CMD) == 1  # bootstrap paid once
     assert made[0].commands.background_cmds == [START_CMD]  # one runner process
     pool.close()
+
+
+def test_pool_retire_idle_rotates_only_free_sandboxes_and_preserves_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A round boundary kills idle streams, leaves in-flight work, and meters both lifetimes."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    now = [10.0]
+    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
+    factory, made = _factory_for([[{"type": "hello"}], [{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    idle, idle_channel = pool.acquire()
+    in_flight, in_flight_channel = pool.acquire()
+    pool.release(idle, idle_channel, healthy=True)
+
+    now[0] = 14.0
+    assert pool.retire_idle() == 1
+    assert made[0].kills == 1
+    assert made[1].kills == 0  # an active episode is outside the idle rotation boundary
+    assert pool.usage() == SandboxUsage(count=2, seconds=8.0)
+
+    pool.release(in_flight, in_flight_channel, healthy=True)
+    reused, _ = pool.acquire()
+    assert reused is in_flight  # work that was active at the boundary remains safely reusable
+    assert len(made) == 2
+    now[0] = 16.0
+    pool.close()
+    assert pool.usage() == SandboxUsage(count=2, seconds=10.0)
 
 
 def test_pool_discards_an_unhealthy_sandbox_and_creates_a_fresh_one(

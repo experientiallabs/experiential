@@ -360,7 +360,9 @@ def create_harness(
     in/from this process exactly as before; `e2b` runs the real pi agent inside E2B sandboxes
     (pi-node seeds only — that harness's context management is the thing under search), with its
     tool calls still answered by the world model host-side. One `E2BSandboxPool` is shared across
-    every `_score` wave so sandbox bootstraps amortize over the whole search. `eval_concurrency`
+    score waves within a proposal batch, then its idle runners are retired before the next batch's
+    proposer call. This amortizes bootstrap work across sibling proposals without carrying E2B
+    command streams through the potentially long proposal gap between rounds. `eval_concurrency`
     is how many (task, attempt) cells run at once; `None` means the backend default — 1
     (sequential) for local, 0 (every cell at once, one pooled sandbox each) for e2b.
     `e2b_template` names a prebaked sandbox template (node 22 + the pi runner deps) so e2b
@@ -507,6 +509,11 @@ def create_harness(
             proposal_index = ((i - 1) % proposal_batch_size) + 1
             champion_score = reports[champion_hash].success_rate
             if proposal_index == 1:
+                # The previous round's eval runners would otherwise sit idle through this
+                # potentially long proposer call. Retire only idle runners now; subsequent score
+                # waves for this batch still share the newly warmed pool.
+                if sandbox_pool is not None:
+                    sandbox_pool.retire_idle()
                 parent_entry = select_parent(pool, children_counts, seed=round_index)
                 parent = docs[parent_entry.doc_hash]
                 parent_report = reports[parent_entry.doc_hash]

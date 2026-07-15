@@ -33,6 +33,7 @@ import shlex
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import cast
 
 from wmh.core.types import JsonObject
@@ -96,6 +97,7 @@ _SANDBOX_TIMEOUT_REFRESH_S = 300.0
 # Renewal must not turn mutated agent code into an unbounded cost leak. A legitimate slow episode
 # may cross the base 15-minute lease, but one cell still gets a hard one-hour sandbox lifetime.
 MAX_EVAL_EPISODE_LIFETIME_S = 3_600.0
+_MAX_RETIRE_WORKERS = 16
 
 
 class _Eof:
@@ -325,16 +327,18 @@ class E2BStdioChannel:
 
 
 class E2BSandboxPool:
-    """Bootstrapped sandboxes with a running pi runner, reused across episodes and docs.
+    """Bootstrapped sandboxes with a running pi runner, reused within a proposal batch.
 
     The bootstrap (runner files + node 22 + pi's npm deps unless a template prebakes them) is
     doc-independent — a mutated harness's code surfaces travel per-episode in
-    `episode_start.files` — so one pool serves a whole search: `create_harness` opens it once and
-    every `_score` wave reuses warm sandboxes instead of re-paying installs. Concurrent episodes
-    acquire distinct sandboxes; a sandbox whose episode raised is discarded (the runner process
-    is in an unknown state — reuse could cross frames between episodes). `close()` kills
-    everything; the pool lock guards only the free lists, so parallel bootstraps never serialize
-    behind one sandbox's multi-minute npm install.
+    `episode_start.files` — so one pool serves a whole search. `create_harness` retires the idle
+    pool at each round boundary before the proposer runs, preventing long proposer/evaluation gaps
+    from leaving stale E2B command streams alive; score waves for sibling proposals in that round
+    still reuse warm sandboxes instead of re-paying installs. Concurrent episodes acquire distinct
+    sandboxes; a sandbox whose episode raised is discarded (the runner process is in an unknown
+    state — reuse could cross frames between episodes). `close()` kills everything; the pool lock
+    guards only the free lists, so parallel bootstraps never serialize behind one sandbox's
+    multi-minute npm install.
     """
 
     def __init__(
@@ -411,6 +415,29 @@ class E2BSandboxPool:
             if sandbox in self._all:
                 self._all.remove(sandbox)
         self._retire(sandbox)
+
+    def retire_idle(self) -> int:
+        """Retire every sandbox currently idle, preserving any episode still in flight.
+
+        The idle set is detached atomically so a concurrent acquire cannot reclaim a stream that
+        this call is about to kill. Teardown happens outside the pool lock and in a bounded worker
+        set: a normal E2B evaluation wave can leave dozens of idle sandboxes, and serial network
+        teardown would otherwise add material latency before every proposer call. Usage remains
+        cumulative because each sandbox still passes through ``_retire`` exactly once.
+
+        Returns the number retired, primarily for diagnostics and tests.
+        """
+        with self._lock:
+            idle, self._idle = self._idle, []
+            idle_ids = {id(sandbox) for sandbox, _channel in idle}
+            self._all = [sandbox for sandbox in self._all if id(sandbox) not in idle_ids]
+        sandboxes = [sandbox for sandbox, _channel in idle]
+        if len(sandboxes) == 1:
+            self._retire(sandboxes[0])
+        elif sandboxes:
+            with ThreadPoolExecutor(max_workers=min(_MAX_RETIRE_WORKERS, len(sandboxes))) as pool:
+                list(pool.map(self._retire, sandboxes))
+        return len(sandboxes)
 
     def close(self) -> None:
         """Kill every pooled sandbox; safe to call more than once."""
