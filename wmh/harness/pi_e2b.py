@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import cast
+from typing import Literal, cast, overload
 
 from wmh.core.types import JsonObject
 from wmh.harness.e2b_sandbox import (
@@ -1226,6 +1226,30 @@ def session_entry_files() -> dict[str, str]:
     from the installed wmh package and writes them into the sandbox at start).
     """
     return {name: _read_entry(name) for name in _LIVE_RUNNER_FILES}
+
+
+@overload
+def start_live_runner(
+    sandbox: SandboxHandle,
+    *,
+    template: str | None = None,
+    workspace: str = LIVE_WORKSPACE,
+    hello_timeout: float = HELLO_TIMEOUT_S,
+    reconnect_while_idle: bool = False,
+    durable_outbox: Literal[False] = False,
+) -> E2BStdioChannel: ...
+
+
+@overload
+def start_live_runner(
+    sandbox: SandboxHandle,
+    *,
+    template: str | None = None,
+    workspace: str = LIVE_WORKSPACE,
+    hello_timeout: float = HELLO_TIMEOUT_S,
+    reconnect_while_idle: bool = False,
+    durable_outbox: Literal[True],
+) -> E2BDurableChannel: ...
 
 
 def start_live_runner(
