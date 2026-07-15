@@ -39,6 +39,7 @@ from wmh.cli.session_state import (
 from wmh.cli.workspace_sync import (
     WorkspaceSnapshot,
     WorkspaceSyncError,
+    apply_patch_to_snapshot,
     apply_workspace_patch,
     snapshot_from_archive,
     snapshot_workspace,
@@ -114,7 +115,13 @@ class LiveWorkspace:
         )
         result = apply_workspace_patch(self.root, content)
         self.conflicts.update(result.conflicts)
-        self.synchronized = snapshot_workspace(self.root)
+        # Advance the base by base+patch, never by re-reading the directory:
+        # a disk snapshot here would absorb not-yet-uploaded local edits into
+        # the base, so they would never upload (and the final sync could even
+        # delete them). Conflicted paths stay at their base state.
+        self.synchronized = apply_patch_to_snapshot(
+            self.synchronized, content, conflicts=result.conflicts
+        )
         if before_ack is not None:
             before_ack()
         self._client.acknowledge_agent_workspace_patch(self._agent_id, self._session_id, revision)
@@ -491,12 +498,12 @@ class DetachedCommandDriver:
     def _send(self, stream: _Stream) -> None:
         """Catch up, deliver one message, and stream its turn until idle."""
         text = self._text if self._text is not None else ""
+        self._push_workspace(stream)
         if self._catch_up(stream) == "terminal":
             self._finish_terminal(
                 stream, failure_note="the session ended before the message could be sent"
             )
             return
-        self._push_workspace(stream)
         self._client.post_agent_session_command(
             stream.state.agent_id, stream.state.session_id, "user_message", text=text
         )
@@ -514,10 +521,10 @@ class DetachedCommandDriver:
 
     def _attach(self, stream: _Stream) -> None:
         """Catch up, then stream interactively until the user detaches or ends."""
+        self._push_workspace(stream)
         if self._catch_up(stream) == "terminal":
             self._finish_terminal(stream)
             return
-        self._push_workspace(stream)
         stream.render = True
         reader = AttachedCommandReader(self._client, stream.state.agent_id, stream.state.session_id)
         reader.start()
@@ -535,8 +542,8 @@ class DetachedCommandDriver:
 
     def _end(self, stream: _Stream) -> None:
         """Catch up, push local edits, end the session, and run the final sync."""
+        self._push_workspace(stream)
         if self._catch_up(stream) != "terminal":
-            self._push_workspace(stream)
             remote = self._client.end_agent_session(stream.state.agent_id, stream.state.session_id)
             if remote.status not in TERMINAL_STATUSES:
                 outcome = self._stream_until(stream, stop=lambda: False)
@@ -610,8 +617,7 @@ class DetachedCommandDriver:
                     return "stopped"
                 now = time.monotonic()
                 if stream.workspace is not None and now - last_push >= _WORKSPACE_SYNC_TICK_S:
-                    stream.workspace.push_local()
-                    self._persist(stream, stream.cursor)
+                    self._push_workspace(stream)
                     last_push = now
                 if now - last_probe >= _STALE_PROBE_S:
                     # The detail read lazily reconciles a dead driver so the
@@ -675,10 +681,20 @@ class DetachedCommandDriver:
     # -- checkpointing -----------------------------------------------------------------------
 
     def _push_workspace(self, stream: _Stream) -> None:
-        """Upload local edits made since the checkpoint, then persist it."""
+        """Upload local edits made since the checkpoint, then persist it.
+
+        A workspace whose sandbox is not accepting patches yet (booting, or
+        winding down) is tolerated: the streaming loop retries every tick, and
+        an end falls back to the conflict-preserving final sync.
+        """
         if stream.workspace is None:
             return
-        stream.workspace.push_local()
+        try:
+            stream.workspace.push_local()
+        except PlatformError as error:
+            if error.status_code not in {409, 503}:
+                raise
+            _console.print("[dim]local changes will sync once the workspace is running[/dim]")
         self._persist(stream, stream.cursor)
 
     def _persist(self, stream: _Stream, cursor: int) -> None:

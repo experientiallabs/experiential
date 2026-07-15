@@ -14,8 +14,12 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from wmh.harness.workspace_patch import PatchFileState, parse_workspace_patch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 MAX_WORKSPACE_ARCHIVE_BYTES = 50 * 1024 * 1024
 MAX_WORKSPACE_UNPACKED_BYTES = 512 * 1024 * 1024
@@ -115,10 +119,52 @@ def snapshot_from_archive(content: bytes) -> WorkspaceSnapshot:
     Raises:
         WorkspaceSyncError: If the bytes are not a safe regular-file archive.
     """
+    files = {
+        path: FileState(
+            sha256=hashlib.sha256(body, usedforsecurity=False).hexdigest(),
+            mode=stat.S_IMODE(mode),
+        )
+        for path, (body, mode) in _archive_files(content).items()
+    }
+    return WorkspaceSnapshot(archive=content, files=files)
+
+
+def apply_patch_to_snapshot(
+    snapshot: WorkspaceSnapshot, content: bytes, *, conflicts: Iterable[str] = ()
+) -> WorkspaceSnapshot:
+    """Advance a synchronized base by the patch operations that landed locally.
+
+    The base must reflect only synchronized content. Re-reading the local
+    directory here would absorb not-yet-uploaded local edits into the base,
+    so they would never upload and the final sync could even delete them.
+    Conflicted paths keep their base state: the disagreement stays visible to
+    both sides until the terminal reconciliation.
+
+    Raises:
+        WorkspaceSyncError: If the patch or the rebuilt base violates limits.
+    """
+    try:
+        patch = parse_workspace_patch(content)
+    except Exception as error:  # noqa: BLE001 - normalize to the sync error surface
+        raise WorkspaceSyncError(f"workspace patch is invalid: {error}") from error
+    rejected = set(conflicts)
+    files = _archive_files(snapshot.archive)
+    for operation in patch.operations:
+        if operation.path in rejected:
+            continue
+        if operation.after is None:
+            files.pop(operation.path, None)
+        else:
+            files[operation.path] = (patch.files[operation.path], operation.after.mode)
+    return _snapshot_from_files(files)
+
+
+def _archive_files(content: bytes) -> dict[str, tuple[bytes, int]]:
+    """Read a checkpoint archive's regular files as ``{path: (bytes, mode)}``."""
     if len(content) > MAX_WORKSPACE_ARCHIVE_BYTES:
         msg = f"workspace archive exceeds {MAX_WORKSPACE_ARCHIVE_BYTES} compressed bytes"
         raise WorkspaceSyncError(msg)
-    files: dict[str, FileState] = {}
+    files: dict[str, tuple[bytes, int]] = {}
     total = 0
     try:
         with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
@@ -144,16 +190,40 @@ def snapshot_from_archive(content: bytes) -> WorkspaceSnapshot:
                     raise WorkspaceSyncError(f"workspace file has no content: {member.name}")
                 with source:
                     body = source.read()
-                files[relative] = FileState(
-                    sha256=hashlib.sha256(body, usedforsecurity=False).hexdigest(),
-                    mode=stat.S_IMODE(member.mode),
-                )
+                files[relative] = (body, stat.S_IMODE(member.mode))
     except WorkspaceSyncError:
         raise
     except (tarfile.TarError, OSError, EOFError) as error:
         msg = "workspace must be a valid gzip tar archive"
         raise WorkspaceSyncError(msg) from error
-    return WorkspaceSnapshot(archive=content, files=files)
+    return files
+
+
+def _snapshot_from_files(files: dict[str, tuple[bytes, int]]) -> WorkspaceSnapshot:
+    """Build a deterministic snapshot archive plus manifest from file contents."""
+    total = sum(len(body) for body, _mode in files.values())
+    if total > MAX_WORKSPACE_UNPACKED_BYTES:
+        msg = f"workspace files exceed {MAX_WORKSPACE_UNPACKED_BYTES} uncompressed bytes"
+        raise WorkspaceSyncError(msg)
+    buffer = io.BytesIO()
+    manifest: dict[str, FileState] = {}
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path in sorted(files):
+            body, mode = files[path]
+            info = tarfile.TarInfo(path)
+            info.size = len(body)
+            info.mode = stat.S_IMODE(mode)
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(body))
+            manifest[path] = FileState(
+                sha256=hashlib.sha256(body, usedforsecurity=False).hexdigest(),
+                mode=stat.S_IMODE(mode),
+            )
+    content = buffer.getvalue()
+    if len(content) > MAX_WORKSPACE_ARCHIVE_BYTES:
+        msg = f"workspace archive exceeds {MAX_WORKSPACE_ARCHIVE_BYTES} compressed bytes"
+        raise WorkspaceSyncError(msg)
+    return WorkspaceSnapshot(archive=content, files=manifest)
 
 
 def sync_workspace(

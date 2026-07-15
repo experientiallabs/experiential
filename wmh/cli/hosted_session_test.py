@@ -698,3 +698,58 @@ def test_failed_session_end_exits_nonzero_after_cleanup(tmp_path: Path) -> None:
 
     assert raised.value.exit_code == 1
     assert store.load("sess-1") is None
+
+
+def test_remote_patch_does_not_absorb_unpushed_local_edits(tmp_path: Path) -> None:
+    """A local edit made while detached must still upload after a patch lands.
+
+    Reproduces the preview bug: advancing the base by re-snapshotting the local
+    directory swallowed unpushed local files, so they never reached the sandbox
+    and the final sync could even delete them.
+    """
+    (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(tmp_path)
+    patch = build_workspace_patch(base.archive, _archive({"answer.txt": b"during"}))
+    assert patch is not None
+    (tmp_path / "local-only.txt").write_text("unpushed", encoding="utf-8")
+    client = _FakeClient()
+    client.patches["patch-1"] = patch
+    workspace = mod.LiveWorkspace(
+        cast("mod.PlatformClient", client), "agent-1", "sess-1", tmp_path, base
+    )
+
+    workspace.apply_remote_patch("patch-1")
+
+    assert "local-only.txt" not in workspace.synchronized.files
+    assert workspace.push_local()
+    assert len(client.uploaded_patches) == 1
+
+
+def test_attach_uploads_local_edits_before_rebasing_on_remote_patches(tmp_path: Path) -> None:
+    """Catch-up pushes local changes first so a pending patch cannot swallow them."""
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+    patch = build_workspace_patch(base.archive, _archive({"answer.txt": b"during"}))
+    assert patch is not None
+    (root / "local-only.txt").write_text("created while detached", encoding="utf-8")
+    client = _FakeClient()
+    client.session_states = [_session(workspace_sync=True)]
+    client.patches["patch-1"] = patch
+    client.pages = [
+        _page([_event(1, "workspace_patch", revision="patch-1")], 1, "running"),
+        _page([], 1, "running"),
+        _page(
+            [_event(2, "user_message", text="hi"), _event(3, "state", status="idle")],
+            3,
+            "running",
+        ),
+    ]
+
+    _command_driver(client, store, action="send", text="hi").run()
+
+    assert len(client.uploaded_patches) >= 1
+    assert client.calls.index("upload_patch") < client.calls.index("patch:patch-1")
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "during"

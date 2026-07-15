@@ -12,6 +12,7 @@ import pytest
 
 from wmh.cli.workspace_sync import (
     WorkspaceSyncError,
+    apply_patch_to_snapshot,
     apply_workspace_patch,
     snapshot_from_archive,
     snapshot_workspace,
@@ -193,3 +194,37 @@ def test_snapshot_from_archive_rejects_unsafe_entries(tmp_path: Path) -> None:
         archive.addfile(info)
     with pytest.raises(WorkspaceSyncError, match="regular file"):
         snapshot_from_archive(buffer.getvalue())
+
+
+def test_apply_patch_to_snapshot_advances_base_without_reading_disk(tmp_path: Path) -> None:
+    """The synchronized base advances by base+patch, never by re-reading local files."""
+    (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(tmp_path)
+    patch = build_workspace_patch(base.archive, _archive({"answer.txt": (b"during", 0o644)}))
+    assert patch is not None
+    # A local, not-yet-uploaded edit must stay out of the advanced base.
+    (tmp_path / "local-only.txt").write_text("unpushed", encoding="utf-8")
+
+    advanced = apply_patch_to_snapshot(base, patch, conflicts=())
+
+    assert set(advanced.files) == {"answer.txt"}
+    assert advanced.files["answer.txt"] != base.files["answer.txt"]
+    restored = snapshot_from_archive(advanced.archive)
+    assert restored.files == advanced.files
+
+
+def test_apply_patch_to_snapshot_keeps_conflicted_paths_at_their_base(tmp_path: Path) -> None:
+    """A locally-conflicted operation leaves the base unchanged for that path."""
+    (tmp_path / "same.txt").write_text("before", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("keep", encoding="utf-8")
+    base = snapshot_workspace(tmp_path)
+    patch = build_workspace_patch(
+        base.archive,
+        _archive({"same.txt": (b"remote", 0o644), "other.txt": (b"changed", 0o644)}),
+    )
+    assert patch is not None
+
+    advanced = apply_patch_to_snapshot(base, patch, conflicts=("same.txt",))
+
+    assert advanced.files["same.txt"] == base.files["same.txt"]
+    assert advanced.files["other.txt"] != base.files["other.txt"]
