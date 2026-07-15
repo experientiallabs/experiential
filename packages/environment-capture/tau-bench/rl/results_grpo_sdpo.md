@@ -113,3 +113,36 @@ schema narrowed vs upstream. Serving: cross-region + cross-geo judge waterfalls 
 US-wide Opus brownout mid-eval); score timeout ≥ the full waterfall budget; never bounce
 the eval WM under a live sequential pass. Checkpoints: drained LoRA adapter →
 merge-into-text-model → splice-over-base-snapshot → vLLM with `qwen3_xml` parser.
+
+## Kimi replication (gui-tasks, #117 corpus) — head-to-head complete
+
+Env of record: **haiku-kimi-era** (D86 re-pin — haiku-backed gui WM, measured fidelity
+0.714 vs sonnet-5's 0.581; temp-0 env steps, rubric judge, no seed_state by corpus
+design). Same env/config/judge for every row; policy Qwen3.5-9B, n=80 episodes/row
+(40 eval scenarios × 2), all clean. Raw records: box-7
+`~/output/b3_kimi_haikuera_{base,grpo150,sft}.jsonl`; wandb `kimi-haikuera-*`.
+
+| arm | success | mean reward | vs base |
+|---|---|---|---|
+| base | 0.113 | — | — |
+| GRPO full-train (150 scen × n=8, 267 steps) | 0.250 | — | **+13.7 pts; paired +0.100** (13W-12L, n=40) |
+| **offline SFT on the Kimi-K2.6 demonstrations (LoRA, 776 eps)** | **0.8375** | **0.867** | **+72.5 pts** |
+
+**The kimi answer as measured in-WM: offline SFT dominates on-policy WM training by a
+wide margin.** Honest caveats, cutting both ways:
+
+1. **Evaluation collusion** — the eval WM is built from the *same* Kimi-K2.6
+   demonstration traces the SFT policy imitates; a WM with memorized dynamics likely
+   flatters imitation policies. Only a real-env row could resolve this, and kimi has
+   none (no macOS harness; not building one per D78). SFT episodes were audited:
+   legitimate multi-step completions, not WM-echo artifacts.
+2. **Asymmetric information** — SFT distills a frontier CUA teacher; GRPO self-improves
+   a 9B model against its own rollouts. Different information sources, not a pure
+   algorithm comparison.
+3. Training-env == eval-env for GRPO (haiku both) — caveat stated at the re-pin (D86);
+   partially offset by the SFT comparator sharing the exact same eval env.
+
+Synthesis for the writeup: on-policy WM training delivers a real but modest gain where
+no teacher exists (+13.7); when frontier demonstrations exist, imitation is far
+stronger at least in-WM. The natural next question — SFT-then-GRPO stacking — is out
+of sprint scope (D78).
