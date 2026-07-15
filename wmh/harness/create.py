@@ -59,6 +59,10 @@ ALL_PASS_MECHANISM = "none: all tasks pass"
 CreateProgress = Callable[[int, str, float, bool], None]
 
 
+class HarnessSearchCancelled(RuntimeError):
+    """The caller requested that a harness search stop before its next costly phase."""
+
+
 class PoolEntry(BaseModel):
     """One accepted variant, as the parent-selection pool sees it."""
 
@@ -333,6 +337,7 @@ def create_harness(
     on_note: Callable[[str], None] | None = None,
     on_iteration: Callable[[IterationRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
 
@@ -345,6 +350,10 @@ def create_harness(
     moment a delta is accepted, with the new champion doc, its delta (verdict attached),
     and its full-suite score, so callers can persist champions in real time instead of
     waiting for the search to finish.
+
+    ``should_cancel`` is checked before and after every score wave, before each proposal slot,
+    and after each batched proposer call. Returning true raises :class:`HarnessSearchCancelled`
+    before the next costly phase while the normal ``finally`` path retires sandbox resources.
 
     Every rollout scores against the world-model simulation — the environment is always sim.
     `harness_backend` picks where the harness PROCESS executes: `local` (the default) runs it
@@ -390,6 +399,10 @@ def create_harness(
 
     try:
 
+        def _check_cancelled() -> None:
+            if should_cancel is not None and should_cancel():
+                raise HarnessSearchCancelled("harness search cancelled")
+
         def _note(message: str) -> None:
             # Narration for iterations that produce NO on_progress event (unusable/invalid/screened
             # proposals): without it a run whose proposals all fail looks like it never iterated.
@@ -409,6 +422,7 @@ def create_harness(
         def _score(
             doc: HarnessDoc, split: list[TaskSpec], *, k_override: int | None = None
         ) -> ClosedLoopReport:
+            _check_cancelled()
             k_eff = k if k_override is None else k_override
             if harness_backend == "local":
                 concurrency = eval_concurrency if eval_concurrency is not None else 1
@@ -437,6 +451,7 @@ def create_harness(
                 concurrency=concurrency,
                 runtime=runtime,
             )
+            _check_cancelled()
             # Tally the pi worker's self-metered tokens across every score wave (seed, screens,
             # full splits, holdout, confirmations): its LLM calls bypass the Provider, so this is
             # the only record. None on backends whose runtimes don't self-meter (local).
@@ -487,6 +502,7 @@ def create_harness(
         ] = []
         total_attempts = iterations * proposal_batch_size
         for i in range(1, total_attempts + 1):
+            _check_cancelled()
             round_index = ((i - 1) // proposal_batch_size) + 1
             proposal_index = ((i - 1) % proposal_batch_size) + 1
             champion_score = reports[champion_hash].success_rate
@@ -514,6 +530,7 @@ def create_harness(
                         )
                 except Exception as exc:  # noqa: BLE001 - provider/agent/transport failure
                     batch = [ProposalFailure(reason=str(exc))] * proposal_batch_size
+                _check_cancelled()
                 proposal_queue.extend((parent, parent_report, trigger, delta) for delta in batch)
 
             parent, parent_report, trigger, delta = proposal_queue.pop(0)

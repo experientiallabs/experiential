@@ -25,6 +25,7 @@ from wmh.evals.tasks import TaskSpec
 from wmh.harness import create as create_module
 from wmh.harness.create import (
     CreateResult,
+    HarnessSearchCancelled,
     PoolEntry,
     cluster_failures,
     create_harness,
@@ -149,6 +150,7 @@ def _run(
     on_progress: Callable[[int, str, float, bool], None] | None = None,
     on_note: Callable[[str], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> CreateResult:
     return create_harness(
         "winner",
@@ -165,6 +167,7 @@ def _run(
         on_progress=on_progress,
         on_note=on_note,
         on_accept=on_accept,
+        should_cancel=should_cancel,
     )
 
 
@@ -240,6 +243,21 @@ def test_create_skips_unusable_proposals() -> None:
         (1, "unusable"),
         (2, "unusable"),
     ]
+
+
+def test_create_stops_before_the_next_expensive_phase_when_cancelled() -> None:
+    provider = RoleProvider(meta_reply="not json at all")
+    checks = 0
+
+    def should_cancel() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 2
+
+    with pytest.raises(HarnessSearchCancelled):
+        _run(provider, should_cancel=should_cancel)
+
+    assert provider.meta_users == []
 
 
 def test_create_audits_invalid_delta_without_spending_eval() -> None:
