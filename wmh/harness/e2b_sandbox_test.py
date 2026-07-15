@@ -189,7 +189,7 @@ def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
             return fake
 
     e2b = ModuleType("e2b")
-    e2b.Sandbox = _SandboxSdk  # type: ignore[attr-defined]
+    e2b.__dict__["Sandbox"] = _SandboxSdk
     monkeypatch.setitem(sys.modules, "e2b", e2b)
     metadata = {"kind": "optimizer-evaluator", "run_id": "run-1"}
 
