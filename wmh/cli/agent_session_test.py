@@ -15,6 +15,7 @@ from llm_waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatRespon
 from typer.testing import CliRunner
 
 import wmh.cli.agent_session as mod
+import wmh.cli.hosted_session as hosted_mod
 from wmh.cli import app
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.workspace_patch import build_workspace_patch
@@ -490,27 +491,6 @@ def test_local_driver_returns_nonzero_when_the_runner_fails(
     assert channel.closed
 
 
-def test_conflicted_local_patch_does_not_advance_the_synchronized_base(tmp_path: Path) -> None:
-    """A rejected same-file edit remains outside the platform-accepted snapshot."""
-    path = tmp_path / "answer.txt"
-    path.write_text("before", encoding="utf-8")
-    initial = mod.snapshot_workspace(tmp_path)
-    path.write_text("local", encoding="utf-8")
-
-    class _Client:
-        def upload_agent_workspace_patch(self, *_args: object, **_kwargs: object) -> object:
-            return type("Result", (), {"conflicts": ("answer.txt",)})()
-
-    driver = mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", _Client()), "agent-1", "Agent", tmp_path, "work"
-    )
-
-    synchronized = driver._push_local_patch("session-1", initial)
-
-    assert synchronized is initial
-    assert driver._live_conflicts == {"answer.txt"}
-
-
 def test_remote_agent_driver_syncs_final_e2b_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -617,7 +597,7 @@ def test_failed_hosted_session_is_not_hidden_by_workspace_conflicts(
     client = _HostedClient()
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
     monkeypatch.setattr(
-        mod,
+        hosted_mod,
         "sync_workspace",
         lambda *_args, **_kwargs: type(
             "Result", (), {"applied": (), "conflicts": ("answer.txt",)}
@@ -760,3 +740,103 @@ def test_remote_agent_driver_applies_live_workspace_patch(
     assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "during"
     assert client.patch_acks == ["patch-1"]
     assert client.closed
+
+
+# -- detached session flags -------------------------------------------------------------------
+
+
+def test_run_session_flag_combinations_are_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The detached options keep one unambiguous meaning per invocation."""
+    monkeypatch.setattr(
+        mod, "_build_session_command_driver", lambda **_kw: pytest.fail("must not build")
+    )
+    monkeypatch.setattr(mod, "_build_driver", lambda **_kw: pytest.fail("must not build"))
+    runner = CliRunner()
+
+    exclusive = runner.invoke(app, ["run", "-s", "hi", "-a"])
+    assert exclusive.exit_code != 0
+    assert "mutually exclusive" in exclusive.output
+
+    dangling_session = runner.invoke(app, ["run", "--session", "sess-1"])
+    assert dangling_session.exit_code != 0
+    assert "--session" in dangling_session.output
+
+    send_with_target = runner.invoke(app, ["run", "agent-1", "-s", "hi"])
+    assert send_with_target.exit_code != 0
+
+    detach_without_target = runner.invoke(app, ["run", "-d"])
+    assert detach_without_target.exit_code != 0
+    assert "agent id" in detach_without_target.output
+
+    send_with_upload = runner.invoke(app, ["run", "-s", "hi", "-u", "."])
+    assert send_with_upload.exit_code != 0
+
+    send_with_task = runner.invoke(app, ["run", "-s", "hi", "--task", "x"])
+    assert send_with_task.exit_code != 0
+
+    detach_with_send = runner.invoke(app, ["run", "agent-1", "-d", "-s", "hi"])
+    assert detach_with_send.exit_code != 0
+
+
+def test_run_dispatches_session_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--send/--attach/--end route to the detached command driver, unified in run."""
+    captured: list[dict[str, object]] = []
+
+    class _Driver:
+        def run(self) -> None:
+            pass
+
+    def build(**kwargs: object) -> _Driver:
+        captured.append(kwargs)
+        return _Driver()
+
+    monkeypatch.setattr(mod, "_build_session_command_driver", build)
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["run", "--send", "do it"]).exit_code == 0
+    assert runner.invoke(app, ["run", "-a", "--session", "sess-2"]).exit_code == 0
+    assert runner.invoke(app, ["run", "--end"]).exit_code == 0
+
+    assert captured == [
+        {"action": "send", "text": "do it", "session_override": None},
+        {"action": "attach", "text": None, "session_override": "sess-2"},
+        {"action": "end", "text": None, "session_override": None},
+    ]
+
+
+def test_build_driver_detach_returns_start_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--detach on an agent id builds the detached start driver, not the streamer."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    client = _FakeClient()
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+
+    driver = mod._build_driver(
+        target="a1",
+        jail_root=None,
+        provider=None,
+        model=None,
+        task="do it",
+        detach=True,
+    )
+
+    assert isinstance(driver, hosted_mod.DetachedStartDriver)
+
+
+def test_build_driver_detach_rejects_world_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """World-model sessions are interactive only; --detach names agents."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    client = _FakeClient()
+    client.target_kind = "world_model"
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+
+    with pytest.raises(typer.BadParameter, match="agent"):
+        mod._build_driver(
+            target="wm-1",
+            jail_root=None,
+            provider=None,
+            model=None,
+            task=None,
+            detach=True,
+        )

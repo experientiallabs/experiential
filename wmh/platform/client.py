@@ -126,6 +126,7 @@ class RemoteAgentSession(BaseModel):
     workspace_sync: bool
     launched_from: str
     starting_detail: str | None = None
+    ended_reason: str | None = None
     error: str | None = None
 
 
@@ -291,6 +292,18 @@ class PlatformClient:
     def get_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
         """Read current hosted agent session state."""
         response = self._client.get(f"/api/agents/{agent_id}/sessions/{session_id}")
+        self._raise_for_error(response)
+        return RemoteAgentSession.model_validate(response.json())
+
+    def resolve_agent_session(self, session_id: str) -> RemoteAgentSession:
+        """Resolve a bare session id to its owning agent and current state."""
+        response = self._client.get(f"/api/agent-sessions/{session_id}")
+        self._raise_for_error(response)
+        return RemoteAgentSession.model_validate(response.json())
+
+    def end_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
+        """Request an end, reconciling directly when the hosted driver is gone."""
+        response = self._client.post(f"/api/agents/{agent_id}/sessions/{session_id}/end")
         self._raise_for_error(response)
         return RemoteAgentSession.model_validate(response.json())
 

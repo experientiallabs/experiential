@@ -76,6 +76,26 @@ wmh run <agent-id> -u . --task "fix the failing tests"
 wmh run --task "fix the failing tests"   # built-in pi harness, also platform-backed when logged in
 ```
 
+Hosted agent sessions can also run detached: start one, return to your shell, and keep working
+with it from later commands (or from the web app, where it remains an ordinary live session):
+
+```bash
+wmh run <agent-id> -d                    # start hosted, remember as the current session, return
+wmh run <agent-id> -u . --detach         # same, with workspace upload + live sync
+wmh run -s "Do this task"                # send a message, stream that turn until idle, exit
+wmh run -a                               # attach interactively; :detach leaves it running
+wmh run --end                            # end it explicitly, with the final workspace sync
+wmh run --session <session-id> --send "Do this task"   # address a specific session
+```
+
+The current-session reference (and, with `-u`, a synchronization checkpoint) lives in WMH user
+state under `~/.wmh/sessions/`, not in your repository. Every send/attach/end first catches up:
+workspace changes the agent made while nothing was attached are applied locally, and local edits
+made since the checkpoint are uploaded, before the command proceeds. Detaching (Ctrl-D,
+`:detach`, or a second Ctrl-C) never ends the hosted session; only `--end` or the interactive
+`:end` command does. Detached sessions still observe the platform's idle timeout: an idle
+session eventually ends on its own, and the next `wmh run --end` reconciles its final workspace.
+
 For a deployment-protected preview whose public discovery route is not available to a
 non-browser client, pair its browser and backend URLs explicitly:
 

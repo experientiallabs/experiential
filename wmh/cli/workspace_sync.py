@@ -105,6 +105,57 @@ def snapshot_workspace(root: Path) -> WorkspaceSnapshot:
     return WorkspaceSnapshot(archive=content, files=files)
 
 
+def snapshot_from_archive(content: bytes) -> WorkspaceSnapshot:
+    """Rehydrate a snapshot (archive plus manifest) from persisted archive bytes.
+
+    Detached sessions persist their last synchronized archive between CLI
+    invocations; the manifest is recomputed from the archive itself so the
+    checkpoint has a single source of truth.
+
+    Raises:
+        WorkspaceSyncError: If the bytes are not a safe regular-file archive.
+    """
+    if len(content) > MAX_WORKSPACE_ARCHIVE_BYTES:
+        msg = f"workspace archive exceeds {MAX_WORKSPACE_ARCHIVE_BYTES} compressed bytes"
+        raise WorkspaceSyncError(msg)
+    files: dict[str, FileState] = {}
+    total = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+            members = archive.getmembers()
+            if len(members) > MAX_WORKSPACE_ENTRIES:
+                msg = f"workspace archive has more than {MAX_WORKSPACE_ENTRIES} entries"
+                raise WorkspaceSyncError(msg)
+            for member in members:
+                relative = _normalized_name(member.name)
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    msg = f"workspace entry must be a regular file or directory: {member.name}"
+                    raise WorkspaceSyncError(msg)
+                if relative in files:
+                    raise WorkspaceSyncError(f"duplicate workspace path: {relative}")
+                total += member.size
+                if total > MAX_WORKSPACE_UNPACKED_BYTES:
+                    msg = f"workspace expands beyond {MAX_WORKSPACE_UNPACKED_BYTES} bytes"
+                    raise WorkspaceSyncError(msg)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise WorkspaceSyncError(f"workspace file has no content: {member.name}")
+                with source:
+                    body = source.read()
+                files[relative] = FileState(
+                    sha256=hashlib.sha256(body, usedforsecurity=False).hexdigest(),
+                    mode=stat.S_IMODE(member.mode),
+                )
+    except WorkspaceSyncError:
+        raise
+    except (tarfile.TarError, OSError, EOFError) as error:
+        msg = "workspace must be a valid gzip tar archive"
+        raise WorkspaceSyncError(msg) from error
+    return WorkspaceSnapshot(archive=content, files=files)
+
+
 def sync_workspace(
     root: Path,
     initial: WorkspaceSnapshot,

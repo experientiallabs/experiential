@@ -13,6 +13,7 @@ import pytest
 from wmh.cli.workspace_sync import (
     WorkspaceSyncError,
     apply_workspace_patch,
+    snapshot_from_archive,
     snapshot_workspace,
     sync_workspace,
     write_conflict_archive,
@@ -157,3 +158,38 @@ def test_sync_rejects_traversal_and_links(tmp_path: Path) -> None:
         archive.addfile(info)
     with pytest.raises(WorkspaceSyncError, match="regular file or directory"):
         sync_workspace(tmp_path, initial, buffer.getvalue())
+
+
+def test_snapshot_from_archive_rehydrates_the_manifest(tmp_path: Path) -> None:
+    """A persisted checkpoint archive restores the exact snapshot it was saved from."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "b.py").write_text("print('b')", encoding="utf-8")
+    original = snapshot_workspace(tmp_path)
+
+    restored = snapshot_from_archive(original.archive)
+
+    assert restored.files == original.files
+    assert restored.archive == original.archive
+
+
+def test_snapshot_from_archive_rejects_malformed_bytes() -> None:
+    """Corrupted checkpoint bytes are a clean error, never a silent empty base."""
+    with pytest.raises(WorkspaceSyncError, match="gzip tar"):
+        snapshot_from_archive(b"not a tar archive")
+
+
+def test_snapshot_from_archive_rejects_unsafe_entries(tmp_path: Path) -> None:
+    """Traversal and non-regular entries cannot enter a rehydrated manifest."""
+    with pytest.raises(WorkspaceSyncError, match="unsafe"):
+        snapshot_from_archive(_archive({"../escape": (b"bad", 0o644)}))
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        archive.addfile(info)
+    with pytest.raises(WorkspaceSyncError, match="regular file"):
+        snapshot_from_archive(buffer.getvalue())

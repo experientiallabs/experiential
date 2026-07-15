@@ -226,6 +226,51 @@ def test_hosted_agent_session_without_workspace_posts_create_directly() -> None:
     assert seen == ["POST /api/agents/agent-1/sessions"]
 
 
+def test_detached_session_resolution_and_end_routes() -> None:
+    """A bare session id resolves to its agent, and end uses the reconciling route."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/api/agent-sessions/sess-9":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "sess-9",
+                    "agent_id": "agent-2",
+                    "status": "running",
+                    "workspace_sync": False,
+                    "launched_from": "cli",
+                },
+            )
+        assert request.url.path == "/api/agents/agent-2/sessions/sess-9/end"
+        return httpx.Response(
+            202,
+            json={
+                "id": "sess-9",
+                "agent_id": "agent-2",
+                "status": "failed",
+                "workspace_sync": False,
+                "launched_from": "cli",
+                "ended_reason": "stalled",
+                "error": "driver heartbeat went stale",
+            },
+        )
+
+    with _client(handler) as client:
+        resolved = client.resolve_agent_session("sess-9")
+        ended = client.end_agent_session(resolved.agent_id, resolved.id)
+
+    assert resolved.agent_id == "agent-2"
+    assert resolved.status == "running"
+    assert ended.status == "failed"
+    assert ended.ended_reason == "stalled"
+    assert seen == [
+        "GET /api/agent-sessions/sess-9",
+        "POST /api/agents/agent-2/sessions/sess-9/end",
+    ]
+
+
 def test_hosted_agent_session_accepts_future_launch_origins() -> None:
     """A compatible platform origin extension does not break session decoding."""
     session = RemoteAgentSession.model_validate(
