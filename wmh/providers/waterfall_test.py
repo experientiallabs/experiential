@@ -112,6 +112,20 @@ def test_to_backend_maps_config_fields() -> None:
     )
 
 
+def test_to_backend_resolves_model_chat_parameters() -> None:
+    """Waterfall backends inherit token-field compatibility from the WMH catalog."""
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="kimi-k2.6",
+        model="custom-kimi-deployment",
+        deployment="custom-kimi-deployment",
+    )
+
+    backend = to_backend(config)
+
+    assert backend.chat_max_tokens_field == "max_tokens"
+
+
 def test_to_backend_rejects_kinds_without_real_adapters() -> None:
     # openai_responses has no package equivalent (the package speaks chat-completions).
     with pytest.raises(ValueError, match="no llm-waterfall backend"):
@@ -273,6 +287,22 @@ def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
     path.write_text('[[chain.c]]\nkind = "bedrock"\nmodel = "m"\napi_key = "sk-x"\n')
     with pytest.raises(ValueError, match="api_key only applies"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
+
+
+def test_fallback_config_preserves_custom_token_field(tmp_path: Path) -> None:
+    path = tmp_path / "fallback.toml"
+    path.write_text(
+        '[[chain.c]]\nkind = "openai"\nmodel = "custom"\nchat_max_tokens_field = "max_tokens"\n'
+    )
+
+    provider = provider_or_chain(
+        ProviderConfig(kind=ProviderKind.OPENAI, model="custom"),
+        path=path,
+    )
+
+    assert isinstance(provider, WaterfallProvider)
+    assert isinstance(provider._waterfall, Waterfall)
+    assert provider._waterfall.backends[0].chat_max_tokens_field == "max_tokens"
 
 
 def test_azure_rung_maps_endpoint_deployment_and_key(

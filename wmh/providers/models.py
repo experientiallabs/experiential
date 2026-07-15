@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict
 
 from wmh.providers.base import ProviderKind
@@ -12,8 +13,9 @@ class ProviderModel(BaseModel):
 
     ``model_type`` is the provider-independent identity used in product and
     configuration surfaces. ``model_id`` is the provider-specific value sent
-    over the wire. Keeping both prevents Bedrock inference-profile ids and
-    Azure deployment names from leaking into model identity.
+    over the wire. ``chat_max_tokens_field`` records which output-token field
+    the model accepts on OpenAI-compatible chat requests. Keeping these
+    together prevents provider details from leaking into product catalogs.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -21,6 +23,7 @@ class ProviderModel(BaseModel):
     provider: ProviderKind
     model_type: str
     model_id: str
+    chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
 
 
 _MODELS: tuple[ProviderModel, ...] = (
@@ -105,8 +108,14 @@ _MODELS: tuple[ProviderModel, ...] = (
         provider=ProviderKind.AZURE_OPENAI,
         model_type="deepseek-v4-pro",
         model_id="deepseek-v4-pro",
+        chat_max_tokens_field="max_tokens",
     ),
-    ProviderModel(provider=ProviderKind.AZURE_OPENAI, model_type="kimi-k2.6", model_id="kimi-k2.6"),
+    ProviderModel(
+        provider=ProviderKind.AZURE_OPENAI,
+        model_type="kimi-k2.6",
+        model_id="kimi-k2.6",
+        chat_max_tokens_field="max_tokens",
+    ),
 )
 
 
@@ -126,3 +135,16 @@ def resolve_provider_model(provider: ProviderKind, model: str) -> ProviderModel:
         if spec.provider is provider and model in (spec.model_type, spec.model_id):
             return spec
     return ProviderModel(provider=provider, model_type=model, model_id=model)
+
+
+def resolve_chat_max_tokens_field(
+    provider: ProviderKind,
+    model: str,
+    *,
+    fallback: ChatMaxTokensField = "max_completion_tokens",
+) -> ChatMaxTokensField:
+    """Resolve a known model contract, or preserve a custom endpoint's fallback."""
+    for spec in _MODELS:
+        if spec.provider is provider and model in (spec.model_type, spec.model_id):
+            return spec.chat_max_tokens_field
+    return fallback

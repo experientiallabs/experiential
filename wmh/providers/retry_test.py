@@ -4,8 +4,20 @@ from __future__ import annotations
 
 import pytest
 
-from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmh.providers.retry import RetryingProvider
+from wmh.providers.base import (
+    ChatRequest,
+    ChatResponse,
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    ToolCallingProvider,
+)
+from wmh.providers.retry import (
+    RetryingProvider,
+    RetryingToolCallingProvider,
+    wrap_provider_with_retries,
+)
 
 
 class _Throttle(Exception):
@@ -40,6 +52,28 @@ class FlakyProvider:
 
     def verify(self):  # noqa: ANN201
         raise NotImplementedError
+
+
+class FlakyToolCallingProvider(FlakyProvider):
+    """Raises capacity errors from structured calls, then succeeds."""
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        _ = request
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise _Throttle()
+        return ChatResponse.model_validate(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            }
+        )
 
 
 def test_retries_capacity_errors_with_backoff_and_narration() -> None:
@@ -79,3 +113,33 @@ def test_non_capacity_errors_propagate_immediately() -> None:
     with pytest.raises(Auth):
         retrying.complete("s", [Message(role="user", content="hi")])
     assert provider.calls == 1
+
+
+def test_tool_calling_retry_preserves_structured_surface() -> None:
+    events: list[tuple[int, int, float]] = []
+    slept: list[float] = []
+    provider = FlakyToolCallingProvider(failures=1)
+    retrying = RetryingToolCallingProvider(
+        provider,
+        on_retry=lambda attempt, total, delay, error: events.append((attempt, total, delay)),
+        sleep=slept.append,
+    )
+
+    assert isinstance(retrying, ToolCallingProvider)
+    response = retrying.complete_chat(ChatRequest())
+
+    assert response.token_usage().input_tokens == 11
+    assert response.token_usage().output_tokens == 7
+    assert provider.calls == 2
+    assert events == [(1, 3, 1.0)]
+    assert slept == [1.0]
+
+
+def test_retry_factory_preserves_only_the_underlying_provider_capabilities() -> None:
+    structured = wrap_provider_with_retries(FlakyToolCallingProvider(failures=0))
+    text_only = wrap_provider_with_retries(FlakyProvider(failures=0))
+
+    assert isinstance(structured, RetryingToolCallingProvider)
+    assert isinstance(structured, ToolCallingProvider)
+    assert type(text_only) is RetryingProvider
+    assert not isinstance(text_only, ToolCallingProvider)

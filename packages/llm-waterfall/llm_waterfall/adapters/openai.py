@@ -63,9 +63,8 @@ class OpenAIAdapter:
     ) -> tuple[str, TokenUsage]:
         """One chat completion.
 
-        `max_completion_tokens` (not the deprecated `max_tokens`) and no default temperature
-        keeps this compatible with GPT-5.x reasoning models, which reject the legacy field and
-        non-default sampling params.
+        The backend contract selects the output-token field. Omitting a default temperature keeps
+        this compatible with GPT-5.x reasoning models, which reject non-default sampling params.
         """
         wire: list[dict[str, str]] = []
         if system:
@@ -74,19 +73,14 @@ class OpenAIAdapter:
         api_messages = cast("list[ChatCompletionMessageParam]", wire)
         chat = self._get_client().chat.completions
         model = self._request_model()
-        if temperature is None:
-            response = chat.create(
-                model=model,
-                messages=api_messages,
-                max_completion_tokens=max_tokens,
-            )
-        else:
-            response = chat.create(
-                model=model,
-                messages=api_messages,
-                max_completion_tokens=max_tokens,
-                temperature=temperature,
-            )
+        payload: dict[str, object] = {
+            "model": model,
+            "messages": api_messages,
+            self.backend.chat_max_tokens_field: max_tokens,
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        response = chat.create(**cast("Any", payload))
         if not response.choices:
             # Content filtering (and some error modes) can return zero choices; surface it
             # clearly rather than letting choices[0] raise a bare IndexError.

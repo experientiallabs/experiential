@@ -46,6 +46,13 @@ _Event = tuple[str | None, str | None, str | None]
 _PID = 4242
 
 
+class TimeoutException(Exception):
+    """SDK-shaped timeout exception without importing the optional E2B package."""
+
+
+TimeoutException.__module__ = "e2b.exceptions"
+
+
 def _line(frame: JsonObject) -> str:
     """One frame as the runner would emit it: base64(JSON) + newline."""
     return base64.b64encode(json.dumps(frame).encode("utf-8")).decode("ascii") + "\n"
@@ -91,6 +98,8 @@ class _FakeCommands:
         self.calls: list[str] = []  # foreground commands, in order (installs, ...)
         self.background_cmds: list[str] = []
         self.stdin: list[tuple[int, str]] = []
+        self.fail_sends_from: int | None = None
+        self.send_error: Exception = TimeoutException("request timed out")
 
     def run(
         self,
@@ -109,6 +118,8 @@ class _FakeCommands:
 
     def send_stdin(self, pid: int, data: str) -> None:
         self.stdin.append((pid, data))
+        if self.fail_sends_from is not None and len(self.stdin) >= self.fail_sends_from:
+            raise self.send_error
 
 
 class _FakeFiles:
@@ -481,6 +492,31 @@ def test_two_runtimes_sharing_a_pool_reuse_warm_sandboxes(
         assert (starts[0]["instruction"], starts[1]["instruction"]) == ("first", "second")
 
 
+def test_pi_episode_error_is_not_retried_and_keeps_the_sandbox_reusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner-reported episode failure stays a result, not a transport retry."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "episode_error", "note": "pi failed"},
+        {"type": "done", "answer": "next episode"},
+    ]
+    factory, made = _factory_for([script])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    runtime = _runtime(pool=pool)
+
+    failed = runtime.run("t1", "first", _RecordingEnv())
+    recovered = runtime.run("t2", "second", _RecordingEnv())
+
+    assert failed.stop_reason is StopReason.ERROR
+    assert "pi failed" in failed.steps[-1].observation.content
+    assert recovered.answer == "next episode"
+    assert len(made) == 1
+    assert made[0].kills == 0
+    pool.close()
+
+
 def test_close_kills_a_private_pool_but_never_a_shared_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -577,6 +613,117 @@ def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(
     assert result.answer == "recovered"
     assert len(made) == 2
     assert made[0].kills == 1  # the dead attempt's sandbox was discarded, not reused
+    pool.close()
+
+
+def test_run_retries_e2b_send_timeout_once_on_a_fresh_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncertain send retires its sandbox and replays the episode on a fresh one."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "done", "answer": "recovered"},
+    ]
+    factory, made = _factory_for([script, script])
+
+    def timeout_first_factory() -> FakeSandbox:
+        fake = factory()
+        if len(made) == 1:
+            # episode_start is send 1; fail the response send and every attempted resend.
+            fake.commands.fail_sends_from = 2
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=timeout_first_factory)
+    result = _runtime(pool=pool).run("t1", "do it", _RecordingEnv())
+
+    assert result.stop_reason is StopReason.SUBMITTED
+    assert result.answer == "recovered"
+    assert len(made) == 2
+    assert len(_of_kind(made[0], "llm_response")) == 1
+    assert made[0].kills == 1
+    pool.close()
+
+
+def test_run_retries_broken_pipe_once_on_a_fresh_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw socket-style send failure also retires the uncertain sandbox."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "done", "answer": "recovered"},
+    ]
+    factory, made = _factory_for([script, script])
+
+    def broken_first_factory() -> FakeSandbox:
+        fake = factory()
+        if len(made) == 1:
+            fake.commands.fail_sends_from = 2
+            fake.commands.send_error = BrokenPipeError("broken pipe")
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=broken_first_factory)
+    result = _runtime(pool=pool).run("t1", "do it", _RecordingEnv())
+
+    assert result.answer == "recovered"
+    assert len(made) == 2
+    assert made[0].kills == 1
+    pool.close()
+
+
+def test_environment_os_error_propagates_without_episode_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool-side OS failure is not mistaken for an E2B transport failure."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+    ]
+    factory, made = _factory_for([script, script])
+
+    class FailingEnv(_RecordingEnv):
+        def execute(self, action: Action) -> Observation:
+            self.actions.append(action)
+            raise OSError("tool filesystem failed")
+
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    env = FailingEnv()
+    with pytest.raises(OSError, match="tool filesystem failed"):
+        _runtime(pool=pool).run("t1", "do it", env)
+
+    assert len(env.actions) == 1
+    assert len(made) == 1
+    assert made[0].kills == 1
+    pool.close()
+
+
+def test_run_propagates_a_second_e2b_send_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fresh-sandbox recovery is attempted once, then the transport failure escapes."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+    factory, made = _factory_for([script, script])
+
+    def timeout_factory() -> FakeSandbox:
+        fake = factory()
+        fake.commands.fail_sends_from = 2
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=timeout_factory)
+    with pytest.raises(TimeoutException, match="request timed out"):
+        _runtime(pool=pool).run("t1", "do it", _RecordingEnv())
+
+    assert len(made) == 2
+    assert [len(_of_kind(fake, "llm_response")) for fake in made] == [1, 1]
+    assert [fake.kills for fake in made] == [1, 1]
     pool.close()
 
 

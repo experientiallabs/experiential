@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import pytest
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
@@ -41,6 +42,15 @@ class _FakeChannel:
 
     def recv(self) -> JsonObject | None:
         return self._script.pop(0) if self._script else None
+
+
+class _ResponseSendTimeoutChannel(_FakeChannel):
+    """Records the attempted response, then fails every response transport send."""
+
+    def send(self, frame: JsonObject) -> None:
+        self.sent.append(frame)
+        if frame.get("type") == "llm_response":
+            raise TimeoutError("transport send timed out")
 
 
 def _tools() -> list:
@@ -178,9 +188,25 @@ def test_worker_fn_error_is_reported_not_crashed() -> None:
     ]
     ch = _FakeChannel(script)
     result = RunnerLink(ch, worker_fn=boom).run("t1", "x", _Env(), tools=_tools())
-    resp = _sent(ch, "llm_response")[0]
+    responses = _sent(ch, "llm_response")
+    assert len(responses) == 1
+    resp = responses[0]
     assert "provider down" in resp["error"]  # surfaced to the runner, host survives
     assert result.stop_reason is StopReason.SUBMITTED
+
+
+def test_llm_response_send_timeout_propagates_without_error_response_retry() -> None:
+    """A transport send failure is not mislabeled as a provider failure or sent twice."""
+    script = [{"type": "llm_request", "req_id": 1, "openai_body": {}}]
+    ch = _ResponseSendTimeoutChannel(script)
+
+    with pytest.raises(TimeoutError, match="transport send timed out"):
+        _link(ch).run("t1", "x", _Env(), tools=_tools())
+
+    responses = _sent(ch, "llm_response")
+    assert len(responses) == 1
+    assert "completion" in responses[0]
+    assert "error" not in responses[0]
 
 
 def test_channel_close_without_done_reports_error() -> None:

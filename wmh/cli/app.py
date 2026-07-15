@@ -87,7 +87,7 @@ from wmh.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmh.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmh.providers.base import Embedder, EmbedderKind, Provider
 from wmh.providers.models import resolve_provider_model
-from wmh.providers.retry import RetryingProvider
+from wmh.providers.retry import wrap_provider_with_retries
 from wmh.retrieval import HashingEmbedder, get_embedder
 from wmh.scenarios import (
     ChecklistJudge,
@@ -1160,7 +1160,7 @@ def scenarios_verify(
         store = WorldModelStore(root)
         model_dir = store.resolve(_resolve_name(store, name))
         override = _provider_config(provider or "bedrock", model or "claude-opus-4-8", region)
-        llm = RetryingProvider(providers.get_provider(override))
+        llm = wrap_provider_with_retries(providers.get_provider(override))
         world_model = WorldModel.load(str(model_dir), llm)
     else:
         world_model, _resolved_name, llm = _load_model(name, root)
@@ -1410,7 +1410,7 @@ def demo(
                 check=lambda cfg: verify_all([cfg])[0],
             )
             switched = _provider_config(provider_name, model_type, region)
-            provider = RetryingProvider(
+            provider = wrap_provider_with_retries(
                 providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
             )
             wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
@@ -1672,7 +1672,7 @@ def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, nam
     resolved_name = _resolve_name(store, name)
     model_dir = store.resolve(resolved_name)
     config = load_config(model_dir)
-    provider = RetryingProvider(
+    provider = wrap_provider_with_retries(
         providers.get_provider(config.serve_provider_config()),
         on_retry=_NARRATOR.on_retry,
         sleep=_NARRATOR.sleep,

@@ -76,7 +76,7 @@ class OpenAIProvider:
             self._get_client().chat.completions,
             self.config.model,
             request,
-            max_tokens_field=self.config.chat_max_tokens_field,
+            max_tokens_field=self.config.resolved_chat_max_tokens_field(),
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
