@@ -24,10 +24,10 @@ completes, so a mid-run failure keeps every finished row. Policy backends:
 no effect there) or `vllm:<model>@<base-url>` (Qwen3.5-9B on the wake/sleep server's vLLM,
 which does honor --temperature).
 
-Examples:
-    uv run python packages/environment-capture/tau-bench/rl/icl.py --mode base --scenarios eval --limit 2
-    uv run python packages/environment-capture/tau-bench/rl/icl.py --mode collect --scenarios train --wm haiku
-    uv run python packages/environment-capture/tau-bench/rl/icl.py --mode multi --scenarios eval --wm gpt-5.5 \
+Examples (from the repo root, script at packages/environment-capture/tau-bench/rl/icl.py):
+    uv run python <script> --mode base --scenarios eval --limit 2
+    uv run python <script> --mode collect --scenarios train --wm haiku
+    uv run python <script> --mode multi --scenarios eval --wm gpt-5.5 \
         --policy vllm:Qwen/Qwen3.5-9B@http://localhost:8001/v1
 """
 
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from collections import defaultdict
@@ -49,8 +50,8 @@ from wmh.engine.world_model import WorldModel
 from wmh.env import DONE_SIGNAL, Scenario, WorldModelEnv, run_episode
 from wmh.optimize.reward import EpisodeScore
 from wmh.providers.base import Message, Provider, ProviderConfig, ProviderKind
-from wmh.providers.waterfall import WaterfallProvider
 from wmh.providers.registry import get_provider
+from wmh.providers.waterfall import WaterfallProvider
 
 _HERE = Path(__file__).resolve().parent
 _MODEL_DIR = _HERE.parent / "models" / "tau-bench"
@@ -454,6 +455,8 @@ def main() -> int:
 
     out = args.out or _HERE / f"icl_{args.mode}_{args.scenarios}_wm-{args.wm}.results.jsonl"
     kept_rows: list[RowResult] = []
+    write_target = out  # retry passes write to a tmp file and atomically replace at the end,
+    # so an interrupted sweep never destroys the prior rows (fresh runs keep per-row appends)
     if args.retry_errors:
         # Failed rows only ever lost their JUDGE call (or env error) — the fix is to redo those
         # scenarios and splice, not re-pay for the rows that scored.
@@ -476,11 +479,19 @@ def main() -> int:
                 retry_counts[key] -= 1
                 retry_list.append(scenario)
         scenarios = retry_list
+        unmatched = {k: v for k, v in retry_counts.items() if v > 0}
+        if unmatched:
+            raise SystemExit(
+                "retry-errors could not match these errored rows against the current scenario "
+                "selection (check --episodes-per-scenario/--limit match the original run): "
+                f"{unmatched}"
+            )
         print(f"retry-errors: {len(kept_rows)} rows kept, {len(scenarios)} scenarios to re-run")
     attempts = args.attempts if args.mode == "single" else 1
+    if args.retry_errors:
+        write_target = out.with_suffix(out.suffix + ".retry-tmp")
     rows: list[RowResult] = list(kept_rows)
-    collected: list[MemoryRecord] = []
-    with out.open("w", encoding="utf-8") as sink:  # rows land as they finish, not at the end
+    with write_target.open("w", encoding="utf-8") as sink:  # rows land as they finish
         for row in kept_rows:
             sink.write(row.model_dump_json() + "\n")
         sink.flush()
@@ -517,22 +528,29 @@ def main() -> int:
                         "scenario_index": i,
                     }
                 )
-            if args.mode == "collect" and final.error is None:
-                collected.append(
-                    MemoryRecord(
-                        scenario_id=final.scenario_id,
-                        domain=final.domain,
-                        success=final.success,
-                        reward=final.reward,
-                        critique=final.critique,
-                    )
-                )
 
+
+    if args.retry_errors:
+        os.replace(write_target, out)
     if args.mode == "collect":
+        # Rebuild memory from EVERY scored row of the final results (kept + new): a retry pass
+        # must never truncate memory to just the retried scenarios. Judge-parse failures are
+        # excluded — an "Unparseable reward-judge reply" is not a learning.
+        records = [
+            MemoryRecord(
+                scenario_id=r.scenario_id,
+                domain=r.domain,
+                success=r.success,
+                reward=r.reward,
+                critique=r.critique,
+            )
+            for r in rows
+            if r.error is None and not r.critique.startswith("Unparseable reward-judge reply")
+        ]
         args.memory.write_text(
-            "\n".join(r.model_dump_json() for r in collected) + "\n", encoding="utf-8"
+            "\n".join(r.model_dump_json() for r in records) + "\n", encoding="utf-8"
         )
-        print(f"memory -> {args.memory} ({len(collected)} records)")
+        print(f"memory -> {args.memory} ({len(records)} records)")
     print(f"\n== icl --mode {args.mode} --scenarios {args.scenarios} --wm {args.wm} ==")
     print(_summarize(rows))
     print(f"rows -> {out}")

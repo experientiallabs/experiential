@@ -82,19 +82,19 @@ telecom train tasks were all leakage-filtered).
 
 ```bash
 # policy server (box-8): PATH must include /data/venv/bin (ninja — JIT compile crashes without it)
+# corpus: fetch first via environment_capture.hub.fetch_corpus('tau-bench')
 vllm serve Qwen/Qwen3.5-9B --port 8001 --reasoning-parser qwen3 ...   # see D47
 ssh -f -N -L 8011:localhost:8001 h100-dev-box-8
 
-uv run python examples/tau-bench/rl/icl.py --mode collect --scenarios train --wm gpt-5.5 \
+uv run python packages/environment-capture/tau-bench/rl/icl.py --mode collect --scenarios train --wm gpt-5.5 \
     --policy "vllm:Qwen/Qwen3.5-9B@http://localhost:8011/v1"
-uv run python examples/tau-bench/rl/icl.py --mode single --scenarios eval \
+uv run python packages/environment-capture/tau-bench/rl/icl.py --mode single --scenarios eval \
     --episodes-per-scenario 2 --attempts 2 --wm gpt-5.5 --policy "vllm:Qwen/..."
-uv run python examples/tau-bench/rl/icl.py --mode multi --scenarios eval \
+uv run python packages/environment-capture/tau-bench/rl/icl.py --mode multi --scenarios eval \
     --episodes-per-scenario 2 --wm gpt-5.5 --policy "vllm:Qwen/..."
 ```
 
-Raw per-row records (actions, rewards, critiques, costs): `icl_*_gpt55_qwen.results.jsonl`
-(committed alongside this file). Ops gotchas hit standing this up: vLLM 0.17 dropped
+Raw per-row records (actions, rewards, critiques, costs): `.agents/docs/research/icl_eval_results/icl_*_gpt55_qwen.results.jsonl`. Ops gotchas hit standing this up: vLLM 0.17 dropped
 `--disable-log-requests`; ssh-launched vLLM dies without `setsid` + stdin redirect AND
 crashes on first inference if PATH lacks `ninja`; local port 8001 was already tunneled to
 BENCH-A's AgentWorld server (use another local port).

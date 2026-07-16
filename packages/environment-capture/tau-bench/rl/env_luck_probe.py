@@ -18,7 +18,7 @@ and compare reward spread. If seeded stdev drops well below the temperature-0 fl
 scenario-pinned world state is the principled env-luck fix and becomes the core of
 ScenarioSuite v2 (D19/D64): a scenario = task + seed_state, not task alone.
 
-Run:  uv run python examples/tau-bench/rl/env_luck_probe.py [--sessions 6] [--steps 4]
+Run:  uv run python packages/environment-capture/tau-bench/rl/env_luck_probe.py [--sessions N] [--min-steps A --max-steps B]
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ from wmh.core.types import Action, EnvState, Trace
 from wmh.engine import ingest, split_traces_3way
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.providers.waterfall import WaterfallProvider
 from wmh.providers.registry import get_provider
+from wmh.providers.waterfall import WaterfallProvider
 
 _HERE = Path(__file__).resolve().parent
 _MODEL_DIR = _HERE.parent / "models" / "tau-bench"
@@ -109,7 +109,13 @@ def _replay(
     seed_state: EnvState | None,
     rubric: str | None = None,
 ) -> tuple[float, str]:
-    session = wm.new_session(task=task, seed_state=seed_state)
+    # Methodology guards (both bugs found in review — each contaminates the variance being
+    # measured): (1) deep-copy the seed so the WM's in-place scratchpad appends don't leak one
+    # session's imagined notes into the next session's starting state; (2) enrich=False so a
+    # session's PREDICTED observations never enter the shared retrieval buffer as demos for
+    # later sessions (order-dependent self-reinforcement would bias stdev low).
+    seed = seed_state.model_copy(deep=True) if seed_state is not None else None
+    session = wm.new_session(task=task, seed_state=seed, enrich=False)
     for action in actions:
         wm.step(session.id, action)
     score = wm.score_session(session.id, rubric=rubric)
