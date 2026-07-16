@@ -19,7 +19,8 @@ def test_embedded_apps_define_endpoints_and_shippable_credentials_only() -> None
     assert set(EMBEDDED_APPS) == {"github", "google", "slack"}
     # Embedded client ids are public identifiers; a client SECRET must never ship.
     assert all(app.client_secret is None for app in EMBEDDED_APPS.values())
-    # Google and Slack apps are not registered yet (env overrides required meanwhile).
+    # Google (secret-requiring token exchange, pending the hosted relay) and Slack (app not
+    # registered yet) stay unembedded; env overrides cover both meanwhile.
     assert EMBEDDED_APPS["google"].client_id == ""
     assert EMBEDDED_APPS["slack"].client_id == ""
 
@@ -44,9 +45,9 @@ def test_embedded_apps_define_endpoints_and_shippable_credentials_only() -> None
 
 def test_get_app_without_a_client_id_points_at_the_env_var() -> None:
     with pytest.raises(ConnectError) as excinfo:
-        get_app("google")
+        get_app("slack")
     message = str(excinfo.value)
-    assert "WMH_GOOGLE_CLIENT_ID" in message
+    assert "WMH_SLACK_CLIENT_ID" in message
     assert "docs/connectors.md" in message
 
 

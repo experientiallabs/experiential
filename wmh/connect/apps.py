@@ -29,6 +29,10 @@ EMBEDDED_APPS: dict[str, OAuthApp] = {
     ),
     "google": OAuthApp(
         name="google",
+        # Not embedded: Google's Desktop-client token exchange requires the client secret even
+        # with PKCE, and a secret never ships in the repo. The planned zero-setup path points
+        # token_url at a hosted stateless exchange holding the registered client's secret
+        # platform-side; until then Google is bring-your-own client via the env overrides.
         client_id="",
         auth_url="https://accounts.google.com/o/oauth2/v2/auth",
         token_url="https://oauth2.googleapis.com/token",

@@ -140,10 +140,13 @@ a separate browser consent per service.
 
 ### Setup
 
-1. In Google Cloud Console, create an OAuth client and enable the APIs you need (Google
-   Calendar API, Google Drive API, Gmail API).
-2. Point the harness at your OAuth client (Google requires the client secret even for installed
-   apps; it is not treated as confidential in that setup):
+Bring your own OAuth client for now: Google's Desktop-client token exchange requires the
+client secret even with PKCE, and no secret ever ships in this repo, so there is no embedded
+Google app yet (a zero-setup path is planned: a hosted stateless token exchange holding a
+registered client's secret platform-side). Create a client in Google Cloud Console (Desktop
+app type), enable the APIs you need (Google Calendar API, Google Drive API, Gmail API), add
+the matching read-only scopes on the consent screen, publish it to production (testing-mode
+refresh tokens expire after seven days), and point the harness at it:
 
 ```bash
 export WMH_GOOGLE_CLIENT_ID="...apps.googleusercontent.com"
@@ -393,7 +396,8 @@ wmh context pull brave --query wmh --since 2026-06-01 --until 2026-07-01
 
 OAuth endpoint and scope configuration per provider is embedded in `wmh/connect/apps.py`
 (`EMBEDDED_APPS`), together with the registered client ids where they exist: GitHub ships
-embedded today; Google and Slack are pending registration, so those OAuth paths need a
+embedded today; Google (its token exchange demands a client secret, which never ships in the
+repo; a hosted exchange is planned) and Slack (app pending registration) need a
 bring-your-own client via environment overrides meanwhile. A client id is a public identifier
 for a native app (RFC 8252): flows are secured by PKCE or the device grant, and no client secret
 ever ships in the repo. Env overrides always win over whatever is embedded:
@@ -419,10 +423,11 @@ API key, no OAuth app at all.
   OAuth client. The consent screen must request exactly the three read-only scopes
   (`calendar.readonly`, `drive.readonly`, `gmail.readonly`). Note `gmail.readonly` and
   `drive.readonly` are **restricted** scopes: shipping the app to the public requires Google's
-  OAuth verification and, for Gmail, a CASA security assessment; until that clears, the
-  embedded client stays in testing mode and users bring their own client. Google requires the
-  client secret even for installed apps (it is not treated as confidential there), so embedding
-  it is expected.
+  OAuth verification and, for Gmail, a CASA security assessment. The client secret never lands
+  in the repo (Google's token exchange requires one even for installed apps, but publishing it
+  enables client impersonation and quota abuse): it belongs in the hosted token exchange, and
+  the embedded `token_url` will point there once that endpoint is deployed. Until then users
+  bring their own client via the env overrides.
 - **Slack**: one distributed Slack app created from a manifest, installed once, requesting the
   user scopes below. Distribution must be enabled (Manage Distribution) so any workspace can
   install it; note the non-Marketplace history rate cap in the Slack caveats above, and that
