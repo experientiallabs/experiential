@@ -167,7 +167,8 @@ def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
     core = {"build", "list", "serve", "demo", "eval", "play", "download", "knowledge"}
     platform = {"login", "logout", "status", "push", "pull", "run"}
-    assert names == core | platform
+    connectors = {"connect"}  # `wmh context` is a sub-app, not a root command
+    assert names == core | platform | connectors
 
 
 def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture

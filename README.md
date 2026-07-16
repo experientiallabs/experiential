@@ -28,6 +28,15 @@ A frontier LLM acts as the *environment* your agent steps against, reconstructed
 
 Already have traces in **Braintrust, Arize Phoenix, Langfuse, LangSmith, PostHog, or Mastra** — or just chat/tool-call logs? Pick the source right in `wmh build` (`--source <name>` with `--file` or `--pull`, or choose it in the wizard); it's normalized into the harness's trace format via one pluggable interface, no separate step. See [`docs/ingest.md`](./docs/ingest.md).
 
+### Bring your own context
+
+Traces show how your environment behaves; your team's tools hold what it knows. `wmh connect
+github|google-calendar|google-drive|gmail|slack|notion|brave` authorizes a service once, `wmh
+context pull` snapshots issues, docs, mail, messages, events, or web search results into a
+replayable bundle, and `wmh context attach` renders it into a model's knowledge base so the env
+stops guessing at entities and rules it could simply know. See
+[`docs/connectors.md`](./docs/connectors.md).
+
 ## Try it
 
 ```bash

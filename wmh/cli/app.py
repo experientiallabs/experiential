@@ -37,6 +37,7 @@ from rich.table import Table
 
 import wmh.providers as providers
 from wmh.cli.agent_session import register as register_agent_session_commands
+from wmh.cli.connect_cmds import register as register_connect_commands
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmh.cli.harness_app import harness_app
 from wmh.cli.platform_cmds import register as register_platform_commands
@@ -141,6 +142,7 @@ app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
 register_platform_commands(app)
 register_agent_session_commands(app)
+register_connect_commands(app)
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
