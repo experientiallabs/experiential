@@ -612,6 +612,8 @@ def create_harness(
                 HarnessDelta | ProposalFailure | None,
             ]
         ] = []
+        batch_cluster_key: FailureClusterKey | None = None
+        batch_cluster_expansion_recorded = False
         total_attempts = iterations * proposal_batch_size
         for i in range(1, total_attempts + 1):
             _check_cancelled()
@@ -628,14 +630,15 @@ def create_harness(
                 parent = docs[parent_entry.doc_hash]
                 parent_report = reports[parent_entry.doc_hash]
                 clusters = cluster_failures(parent_report, tasks)
-                key: FailureClusterKey | None = None
+                batch_cluster_key = None
+                batch_cluster_expansion_recorded = False
                 if clusters:
                     trigger = select_failure_cluster(
                         clusters,
                         failure_cluster_expansions,
                         parent_doc_hash=parent.doc_hash,
                     )
-                    key = _failure_cluster_key(parent.doc_hash, trigger)
+                    batch_cluster_key = _failure_cluster_key(parent.doc_hash, trigger)
                 else:
                     trigger = FailureSignature(mechanism=ALL_PASS_MECHANISM)
                 evidence = render_evidence(trigger, parent_report, tasks)
@@ -658,13 +661,6 @@ def create_harness(
                 except Exception as exc:  # noqa: BLE001 - provider/agent/transport failure
                     batch = [ProposalFailure(reason=str(exc))] * proposal_batch_size
                 _check_cancelled()
-                # Discount a cluster only after the proposer produced at least one candidate that
-                # can enter validation. A transient project/provider failure learned nothing about
-                # the mechanism and must not consume that cluster's search allocation.
-                if key is not None and any(
-                    isinstance(candidate, HarnessDelta) for candidate in batch
-                ):
-                    failure_cluster_expansions[key] = failure_cluster_expansions.get(key, 0) + 1
                 proposal_queue.extend((parent, parent_report, trigger, delta) for delta in batch)
 
             parent, parent_report, trigger, delta = proposal_queue.pop(0)
@@ -790,6 +786,16 @@ def create_harness(
                     "(e2b runs pi-node only); skipped",
                 )
                 continue
+
+            # Discount the selected cluster only when this batch produces its first child that can
+            # actually enter evaluation. Parsed-but-duplicate, inapplicable, or backend-invalid
+            # deltas teach the search nothing about that failure mechanism. Sibling proposals share
+            # one batch expansion, so later evaluable children must not discount it again.
+            if batch_cluster_key is not None and not batch_cluster_expansion_recorded:
+                failure_cluster_expansions[batch_cluster_key] = (
+                    failure_cluster_expansions.get(batch_cluster_key, 0) + 1
+                )
+                batch_cluster_expansion_recorded = True
 
             # Only an evaluable child counts as a real expansion. Provider faults,
             # unusable replies, duplicates, and invalid deltas leave the parent fresh.

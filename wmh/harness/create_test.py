@@ -515,6 +515,48 @@ def test_create_does_not_discount_a_cluster_when_the_proposer_failed() -> None:
     assert [trigger.task_ids for trigger in proposer.triggers] == [["t1"], ["t1"]]
 
 
+def test_create_does_not_discount_a_cluster_when_every_delta_is_invalid() -> None:
+    """Parsed deltas spend no cluster allocation until one can enter evaluation."""
+    seed = HarnessDoc.baseline("seed")
+    stale = json.dumps(
+        {
+            "expected_effect": "fix the selected failure",
+            "preconditions": {"prompt:core": "0" * 32},
+            "ops": [
+                {
+                    "op": "replace",
+                    "surface_id": "prompt:core",
+                    "content": _CAREFUL_PROMPT,
+                    "rationale": "exercise the invalid-before-eval path",
+                }
+            ],
+        }
+    )
+    provider = RoleProvider(meta_reply=stale, judge_fn=lambda _user: False)
+    tasks = [
+        TaskSpec(task_id="t1", instruction="first failure", gold=["alpha assertion"]),
+        TaskSpec(task_id="t2", instruction="second failure", gold=["beta assertion"]),
+    ]
+
+    result = create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=2,
+        k=1,
+    )
+
+    assert result.skipped == 2
+    assert "[TARGET] t1" in provider.meta_users[0]
+    assert "[TARGET] t1" in provider.meta_users[1]
+    assert "[other] t2" in provider.meta_users[0]
+    assert "[other] t2" in provider.meta_users[1]
+
+
 # -- parent selection --------------------------------------------------------------------------
 
 
