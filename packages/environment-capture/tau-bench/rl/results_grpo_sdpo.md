@@ -184,3 +184,19 @@ with B2's terminal result (WM-trained −0.042 real vs SFT −0.163) the honest 
 benchmark picture is: WM training's real-env value is benchmark-dependent, and
 in-WM deltas systematically overstate it unless the WM's action interface is as strict
 as deployment (D86.5 queued substrate fix).
+
+### ⚠️ CORRECTION (2026-07-15, same day): the row above violated the pinned harness config
+
+The 0.600 row was served **with** `--reasoning-parser qwen3`; the pinned real-gym config
+(D70, the config under which base 0.900 was measured) is **without** it — tau2's strict
+message validation rejects pure-think turns (B2 saw 10/14 sims die the same way), and
+think-in-content lifts both rows ~20pts (base 68.6%→90.0%). Consequences:
+
+1. The "reasoning-only deployment failures" above are **not a novel finding** — they are
+   B2's documented D70 gotcha, reproduced by mis-serving. Struck as a claim.
+2. 0.600 vs 0.900 is not a valid comparison (config mismatch worth ~20pts on base).
+3. The row is being re-run under the pinned config (no reasoning parser, think-in-content,
+   same everything else) as `b3_grpo0020_v2`; the table below supersedes the one above.
+
+Lesson recorded: before running any cross-chat-comparable row, grep DECISIONS.md for the
+harness's pinned serving config — the protocol lives there, not in the harness's --help.
