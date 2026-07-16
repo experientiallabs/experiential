@@ -339,6 +339,7 @@ def create_harness(
     on_note: Callable[[str], None] | None = None,
     on_iteration: Callable[[IterationRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
+    on_sandbox_usage: Callable[[SandboxUsage], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
@@ -353,6 +354,10 @@ def create_harness(
     and its full-suite score, so callers can persist champions in real time instead of
     waiting for the search to finish.
 
+    ``on_sandbox_usage`` fires after the shared E2B pool is successfully closed on every exit
+    path, including failures and cancellation, so callers can persist already-incurred evaluator
+    spend without requiring a partial result. An unproven close raises instead of publishing a
+    falsely final meter.
     ``should_cancel`` is checked before and after every score wave, before each proposal slot,
     and after each batched proposer call. E2B runtimes also poll it while waiting for runner
     frames, so cancellation aborts the active wave without judging partial cells. A provider/tool
@@ -405,6 +410,7 @@ def create_harness(
         sandbox_pool = _Pool(template=e2b_template, metadata=e2b_metadata)
 
     cancelled: HarnessSearchCancelled | None = None
+    result: CreateResult | None = None
     try:
 
         def _check_cancelled() -> None:
@@ -822,11 +828,7 @@ def create_harness(
 
         _check_cancelled()
         best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
-        sandbox_usage = None
-        if sandbox_pool is not None:
-            sandbox_pool.close()  # idempotent; finalize lifetimes so the meter is complete
-            sandbox_usage = sandbox_pool.usage()
-        return CreateResult(
+        result = CreateResult(
             best=best,
             best_score=reports[champion_hash].success_rate,
             archive=archive,
@@ -840,16 +842,21 @@ def create_harness(
             rounds=iterations,
             proposal_batch_size=proposal_batch_size,
             worker_usage=combine_usage(worker_usages),
-            sandbox_usage=sandbox_usage,
         )
+        return result
     except HarnessSearchCancelled as error:
         cancelled = error
         raise
     finally:
         if sandbox_pool is not None:
             sandbox_pool.close()
+            usage = sandbox_pool.usage()
+            if result is not None:
+                result.sandbox_usage = usage
             if cancelled is not None:
-                cancelled.sandbox_usage = sandbox_pool.usage()
+                cancelled.sandbox_usage = usage
+            if on_sandbox_usage is not None:
+                on_sandbox_usage(usage)
 
 
 def _suite_rate(report: ClosedLoopReport, suite: list[str]) -> float:

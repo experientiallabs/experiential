@@ -28,8 +28,14 @@ import pytest
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
+from wmh.harness import e2b_sandbox as e2b_sandbox_module
 from wmh.harness import pi_e2b as pi_e2b_module
-from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxFactory, SandboxUsage
+from wmh.harness.e2b_sandbox import (
+    E2B_TEMPLATE_ENV,
+    SandboxCleanupError,
+    SandboxFactory,
+    SandboxUsage,
+)
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_e2b import (
     LIVE_START_CMD,
@@ -349,7 +355,8 @@ class FakeSandbox:
             raise RuntimeError("sandbox not found")
         self.timeouts.append(timeout)
 
-    def kill(self) -> bool:
+    def kill(self, request_timeout: float | None = None) -> bool:
+        del request_timeout
         self.kills += 1
         return True
 
@@ -853,6 +860,75 @@ def test_pool_close_kills_everything_and_acquire_after_close_raises(
     with pytest.raises(RuntimeError, match="closed"):
         pool.acquire()
     pool.close()  # idempotent
+
+
+def test_pool_failed_kill_stays_live_in_usage_and_a_later_close_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unproven kill remains owned and billable until a retry succeeds."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    monkeypatch.setattr(e2b_sandbox_module.time, "sleep", lambda delay: None)
+    now = [10.0]
+    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
+    factory, made = _factory_for([[{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    pool.acquire()
+    fake = made[0]
+    attempts = 0
+
+    def broken_kill(request_timeout: float | None = None) -> bool:
+        nonlocal attempts
+        del request_timeout
+        attempts += 1
+        raise RuntimeError("control plane unavailable")
+
+    monkeypatch.setattr(fake, "kill", broken_kill)
+    now[0] = 14.0
+    with pytest.raises(SandboxCleanupError, match="failed to prove cleanup") as raised:
+        pool.close()
+    assert attempts == 3
+    assert raised.value.resource == "evaluator_sandbox_pool"
+    assert raised.value.sandbox_usage == SandboxUsage(count=1, seconds=4.0)
+    assert pool.usage() == SandboxUsage(count=1, seconds=4.0)
+
+    now[0] = 16.0
+    assert pool.usage() == SandboxUsage(count=1, seconds=6.0)
+
+    def successful_kill(request_timeout: float | None = None) -> bool:
+        nonlocal attempts
+        del request_timeout
+        attempts += 1
+        return True
+
+    monkeypatch.setattr(fake, "kill", successful_kill)
+    pool.close()
+    assert attempts == 4
+    assert pool.usage() == SandboxUsage(count=1, seconds=6.0)
+    pool.close()  # proved cleanup remains idempotent
+
+
+def test_pool_close_attempts_every_sandbox_when_one_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed teardown cannot prevent sibling leases from being released."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    monkeypatch.setattr(e2b_sandbox_module.time, "sleep", lambda delay: None)
+    factory, made = _factory_for([[{"type": "hello"}], [{"type": "hello"}]])
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    pool.acquire()
+    pool.acquire()
+
+    def broken_kill(request_timeout: float | None = None) -> bool:
+        del request_timeout
+        made[0].kills += 1
+        raise RuntimeError("control plane unavailable")
+
+    monkeypatch.setattr(made[0], "kill", broken_kill)
+    with pytest.raises(SandboxCleanupError, match="1 of 2"):
+        pool.close()
+
+    assert made[0].kills == 3
+    assert made[1].kills == 1
 
 
 def test_inflight_release_after_pool_close_does_not_kill_the_lease_twice(

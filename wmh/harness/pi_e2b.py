@@ -43,11 +43,13 @@ from wmh.harness.e2b_sandbox import (
     DEFAULT_SANDBOX_TIMEOUT_S,
     E2B_TEMPLATE_ENV,
     CommandHandle,
+    SandboxCleanupError,
     SandboxFactory,
     SandboxHandle,
     SandboxUsage,
     create_sandbox,
     default_sandbox_factory,
+    kill_sandbox,
 )
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.runner_link import RunnerLink, WorkerFn
@@ -986,6 +988,10 @@ class E2BSandboxPool:
         # live sandboxes are counted from their _started stamp. Keyed by id() — SandboxHandle is
         # a protocol, not hashable-by-contract.
         self._started: dict[int, float] = {}
+        # An exact lease can be reached concurrently by pool.close() and an in-flight episode's
+        # release(). The event makes one caller own each kill attempt while every other caller
+        # waits for its proof before deciding whether a retry is still needed.
+        self._retiring: dict[int, threading.Event] = {}
         self._created = 0
         self._retired_seconds = 0.0
 
@@ -1044,9 +1050,6 @@ class E2BSandboxPool:
                 if not self._closed:
                     self._idle.append((sandbox, channel))
                     return
-        with self._lock:
-            if sandbox in self._all:
-                self._all.remove(sandbox)
         self._retire(sandbox)
 
     def retire_idle(self) -> int:
@@ -1062,29 +1065,17 @@ class E2BSandboxPool:
         """
         with self._lock:
             idle, self._idle = self._idle, []
-            idle_ids = {id(sandbox) for sandbox, _channel in idle}
-            self._all = [sandbox for sandbox in self._all if id(sandbox) not in idle_ids]
         sandboxes = [sandbox for sandbox, _channel in idle]
-        if len(sandboxes) == 1:
-            self._retire(sandboxes[0])
-        elif sandboxes:
-            with ThreadPoolExecutor(max_workers=min(_MAX_RETIRE_WORKERS, len(sandboxes))) as pool:
-                list(pool.map(self._retire, sandboxes))
+        self._retire_many(sandboxes)
         return len(sandboxes)
 
     def close(self) -> None:
         """Kill every pooled sandbox; safe to call more than once."""
         with self._lock:
             self._closed = True
-            sandboxes, self._all = self._all, []
+            sandboxes = list(self._all)
             self._idle = []
-        if len(sandboxes) == 1:
-            self._retire(sandboxes[0])
-        elif sandboxes:
-            # Cancellation commonly lands during a full-concurrency eval wave. Retiring every
-            # active lease in parallel keeps teardown latency bounded by one E2B kill request.
-            with ThreadPoolExecutor(max_workers=min(_MAX_RETIRE_WORKERS, len(sandboxes))) as pool:
-                list(pool.map(self._retire, sandboxes))
+        self._retire_many(sandboxes)
 
     def usage(self) -> SandboxUsage:
         """The pool's spend meter so far: sandbox count and total lifetime seconds."""
@@ -1094,15 +1085,60 @@ class E2BSandboxPool:
             return SandboxUsage(count=self._created, seconds=self._retired_seconds + live)
 
     def _retire(self, sandbox: SandboxHandle) -> None:
-        """Finalize the sandbox's lifetime on the meter, then kill it (best-effort)."""
-        with self._lock:
-            started = self._started.pop(id(sandbox), None)
-            if started is None:
-                return  # another close/release path already retired this exact lease
-            self._all = [item for item in self._all if item is not sandbox]
-            self._idle = [item for item in self._idle if item[0] is not sandbox]
-            self._retired_seconds += time.monotonic() - started
-        _kill_quietly(sandbox)
+        """Kill one lease, finalizing its meter only after teardown is proved."""
+        sandbox_id = id(sandbox)
+        while True:
+            with self._lock:
+                if sandbox_id not in self._started:
+                    return  # another close/release path proved this exact lease gone
+                owner_done = self._retiring.get(sandbox_id)
+                if owner_done is None:
+                    owner_done = threading.Event()
+                    self._retiring[sandbox_id] = owner_done
+                    # Never make a lease available again once retirement begins. Keep it in
+                    # _all until kill succeeds so a later close() can retry a failed cleanup.
+                    self._idle = [item for item in self._idle if item[0] is not sandbox]
+                    break
+            owner_done.wait()
+
+        try:
+            kill_sandbox(sandbox)
+            retired_at = time.monotonic()
+            with self._lock:
+                started = self._started.pop(sandbox_id)
+                self._all = [item for item in self._all if item is not sandbox]
+                self._retired_seconds += retired_at - started
+        finally:
+            with self._lock:
+                self._retiring.pop(sandbox_id, None)
+                owner_done.set()
+
+    def _retire_many(self, sandboxes: list[SandboxHandle]) -> None:
+        """Retire every requested lease and report all unproven cleanup as one failure."""
+        if not sandboxes:
+            return
+
+        def retire(sandbox: SandboxHandle) -> SandboxCleanupError | None:
+            try:
+                self._retire(sandbox)
+            except SandboxCleanupError as error:
+                return error
+            return None
+
+        if len(sandboxes) == 1:
+            failures = [retire(sandboxes[0])]
+        else:
+            # Cancellation commonly lands during a full-concurrency eval wave. Retiring every
+            # active lease in parallel keeps teardown latency bounded by one E2B retry sequence.
+            with ThreadPoolExecutor(max_workers=min(_MAX_RETIRE_WORKERS, len(sandboxes))) as pool:
+                failures = list(pool.map(retire, sandboxes))
+        errors = [error for error in failures if error is not None]
+        if errors:
+            raise SandboxCleanupError(
+                f"failed to prove cleanup for {len(errors)} of {len(sandboxes)} E2B sandboxes",
+                resource="evaluator_sandbox_pool",
+                sandbox_usage=self.usage(),
+            ) from errors[0]
 
     def __enter__(self) -> E2BSandboxPool:
         return self
@@ -1202,18 +1238,19 @@ class E2BPiRuntime:
         self._max_output_tokens = max_output_tokens
         self._episode_timeout_s = episode_timeout_s
         self._should_cancel = should_cancel
+        self._aborted = threading.Event()
         self._owns_pool = pool is None
         self._pool = pool or E2BSandboxPool(
             template=template, api_key=api_key, hello_timeout=hello_timeout
         )
 
     def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
-        if self._should_cancel is not None and self._should_cancel():
+        if self._cancel_requested():
             raise RuntimeCancelled("runtime episode cancelled")
         try:
             return self._run_episode(task_id, instruction, environment)
         except Exception as exc:
-            if self._should_cancel is not None and self._should_cancel():
+            if self._cancel_requested():
                 raise RuntimeCancelled("runtime episode cancelled") from exc
             if not _is_retryable_transport_error(exc):
                 raise
@@ -1241,7 +1278,7 @@ class E2BPiRuntime:
                 max_turns=self._max_turns,
                 max_output_tokens=self._max_output_tokens,
                 episode_timeout_s=self._episode_timeout_s,
-                should_cancel=self._should_cancel,
+                should_cancel=self._cancel_requested,
             )
             result = link.run(task_id, instruction, environment)
             # A wall-budget stop may leave the runner mid-turn. Never reuse or retry it: the
@@ -1250,6 +1287,14 @@ class E2BPiRuntime:
             return result
         finally:
             self._pool.release(sandbox, channel, healthy=healthy)
+
+    def abort(self) -> None:
+        """Stop every sibling episode and close the shared pool before its caller joins them."""
+        self._aborted.set()
+        self._pool.close()
+
+    def _cancel_requested(self) -> bool:
+        return self._aborted.is_set() or (self._should_cancel is not None and self._should_cancel())
 
     def close(self) -> None:
         """Close the private pool; a no-op when the pool is shared (its owner closes it)."""
@@ -1405,14 +1450,6 @@ def _no_hello_live(
     tail = channel.stderr_tail()
     suffix = f"; recent runner stderr:\n{tail}" if tail else ""
     return f"live runner sent no hello within {timeout:g}s ({start_cmd!r}){suffix}"
-
-
-def _kill_quietly(sandbox: SandboxHandle) -> None:
-    """Best-effort sandbox teardown; a dead sandbox is already gone."""
-    try:
-        sandbox.kill()
-    except Exception:  # noqa: BLE001 - teardown must never mask the original error
-        pass
 
 
 def _no_hello(timeout: float, channel: E2BStdioChannel) -> str:

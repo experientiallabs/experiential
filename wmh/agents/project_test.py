@@ -10,6 +10,8 @@ from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
+from wmh.harness import e2b_sandbox as e2b_sandbox_module
+from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -63,7 +65,23 @@ class _Sandbox:
     def set_timeout(self, timeout: int) -> None:
         del timeout
 
-    def kill(self) -> object:
+    def kill(self, request_timeout: float | None = None) -> object:
+        del request_timeout
+        self.killed = True
+        return None
+
+
+class _FlakyKillSandbox(_Sandbox):
+    def __init__(self, *, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.kill_attempts = 0
+
+    def kill(self, request_timeout: float | None = None) -> object:
+        del request_timeout
+        self.kill_attempts += 1
+        if self.kill_attempts <= self.failures:
+            raise RuntimeError("control plane unavailable")
         self.killed = True
         return None
 
@@ -878,6 +896,81 @@ def test_project_meters_a_replacement_that_fails_during_restore(
     assert replacement.killed is True
     assert usage.count == 2
     assert usage.seconds == 40.0  # original: 0..30 plus failed replacement: 10..20
+
+
+def test_project_initialization_failure_releases_only_an_owned_sandbox() -> None:
+    """Constructor setup cannot orphan an owned project or kill a caller-owned lease."""
+
+    class _BrokenCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del cmd, background, kwargs
+            raise RuntimeError("workspace setup failed")
+
+    owned = _Sandbox()
+    owned.commands = _BrokenCommands()
+    with pytest.raises(RuntimeError, match="workspace setup failed"):
+        AgentProject(owned)
+    assert owned.killed is True
+
+    caller_owned = _Sandbox()
+    caller_owned.commands = _BrokenCommands()
+    with pytest.raises(RuntimeError, match="workspace setup failed"):
+        AgentProject(caller_owned, owns_sandbox=False)
+    assert caller_owned.killed is False
+
+
+def test_project_failed_close_keeps_usage_live_and_retries_every_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed meta-project kill remains billable and retryable instead of looking final."""
+    now = [0.0]
+    monkeypatch.setattr(project_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(e2b_sandbox_module.time, "sleep", lambda delay: None)
+    sandbox = _FlakyKillSandbox(failures=3)
+    project = AgentProject(sandbox)
+
+    now[0] = 5.0
+    with pytest.raises(SandboxCleanupError, match="1 of 1") as raised:
+        project.close()
+    assert sandbox.kill_attempts == 3
+    assert raised.value.resource == "meta_project_sandbox"
+    assert raised.value.sandbox_usage == SandboxUsage(count=1, seconds=5.0)
+    assert project.usage().seconds == 5.0
+
+    now[0] = 8.0
+    assert project.usage().seconds == 8.0
+    project.close()
+    assert sandbox.kill_attempts == 4
+    assert sandbox.killed is True
+    assert project.usage().seconds == 8.0
+    project.close()
+
+
+def test_project_retains_old_and_replacement_leases_after_failed_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovery cannot drop the old sandbox handle when its kill is unproven."""
+    now = [0.0]
+    monkeypatch.setattr(project_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(e2b_sandbox_module.time, "sleep", lambda delay: None)
+    original = _FlakyKillSandbox(failures=3)
+    replacement = _Sandbox()
+    project = AgentProject(original, sandbox_factory=lambda: replacement)
+
+    now[0] = 10.0
+    with pytest.raises(SandboxCleanupError, match="cleanup failed"):
+        project._replace_sandbox()  # noqa: SLF001
+
+    now[0] = 20.0
+    usage = project.usage()
+    assert usage.count == 2
+    assert usage.seconds == 30.0  # old: 0..20 plus replacement: 10..20
+
+    project.close()
+    assert original.kill_attempts == 4
+    assert original.killed is True
+    assert replacement.killed is True
+    assert project.usage().seconds == 30.0
 
 
 def test_project_retries_a_clean_premature_session_end() -> None:

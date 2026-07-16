@@ -13,11 +13,13 @@ from typing import Protocol
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
+    SandboxCleanupError,
     SandboxFactory,
     SandboxHandle,
     SandboxUsage,
     create_sandbox,
     default_sandbox_factory,
+    kill_sandbox,
 )
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_e2b import start_live_runner
@@ -95,6 +97,12 @@ class AgentProject:
         self._active_sandbox_started_at = time.monotonic()
         self._retired_sandbox_seconds = 0.0
         self._sandbox_count = 1
+        # A lease remains live until E2B confirms its kill. Replacement failures retain both
+        # handles here so usage keeps accruing and close() can retry every unproven teardown.
+        self._live_sandboxes: dict[int, tuple[SandboxHandle, float]] = {
+            id(sandbox): (sandbox, self._active_sandbox_started_at)
+        }
+        self._closing = False
         self._finished_at: float | None = None
         # Every supported project mutation is mediated by write_text or the contained write_file
         # tool. Keep an in-process mirror so a dead E2B transport can be replaced without
@@ -106,7 +114,15 @@ class AgentProject:
         self._session_provider: ToolCallingProvider | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
         self._retired_worker_usage = TokenUsage()
-        self._initialize_sandbox(self._sandbox)
+        try:
+            self._initialize_sandbox(self._sandbox)
+        except Exception as error:
+            if self._owns_sandbox:
+                try:
+                    self._retire_sandbox(self._sandbox)
+                except SandboxCleanupError as cleanup_error:
+                    raise cleanup_error from error
+            raise
 
     @classmethod
     def create(
@@ -129,6 +145,8 @@ class AgentProject:
 
     def write_text(self, path: str, content: str) -> None:
         """Write one project-relative file without allowing path traversal."""
+        if self._closing:
+            raise RuntimeError("cannot write to a closed project")
         absolute = self._absolute_path(path)
         try:
             self._write_sandbox_file(self._sandbox, absolute, content)
@@ -149,6 +167,8 @@ class AgentProject:
 
     def read_text(self, path: str) -> str:
         """Read one project-relative file."""
+        if self._closing:
+            raise RuntimeError("cannot read from a closed project")
         absolute = self._absolute_path(path)
         relative = self._relative_path(absolute)
         try:
@@ -177,7 +197,7 @@ class AgentProject:
         filesystem first; injected test projects keep the sandbox and replace
         only the ordinary live session.
         """
-        if self._finished_at is not None:
+        if self._closing:
             raise RuntimeError("cannot run an agent in a closed project")
         _check_cancelled(should_cancel)
         if self._active_event_sink is not None:
@@ -377,8 +397,10 @@ class AgentProject:
 
     def usage(self) -> SandboxUsage:
         """Return this project's sandbox lifetime meter."""
-        ended = self._finished_at if self._finished_at is not None else time.monotonic()
-        active_seconds = max(0.0, ended - self._active_sandbox_started_at)
+        now = time.monotonic()
+        active_seconds = sum(
+            max(0.0, now - started_at) for _sandbox, started_at in self._live_sandboxes.values()
+        )
         return SandboxUsage(
             count=self._sandbox_count,
             seconds=self._retired_sandbox_seconds + active_seconds,
@@ -394,14 +416,35 @@ class AgentProject:
         )
 
     def close(self) -> None:
-        """Kill an owned sandbox and finalize its usage meter."""
+        """Release every owned lease, retaining unproven kills for a later retry."""
         if self._finished_at is not None:
             return
+        self._closing = True
         self._close_agent_session()
+        if not self._owns_sandbox:
+            finished_at = time.monotonic()
+            for _sandbox, started_at in self._live_sandboxes.values():
+                self._retired_sandbox_seconds += max(0.0, finished_at - started_at)
+            self._live_sandboxes.clear()
+            self._finished_at = finished_at
+            return
+
+        leases = list(self._live_sandboxes.values())
+        failures: list[SandboxCleanupError] = []
+        for sandbox, _started_at in leases:
+            try:
+                self._retire_sandbox(sandbox)
+            except SandboxCleanupError as error:
+                failures.append(error)
+        if failures:
+            raise SandboxCleanupError(
+                "failed to prove cleanup for "
+                f"{len(failures)} of {len(leases)} "
+                "meta-project E2B sandboxes",
+                resource="meta_project_sandbox",
+                sandbox_usage=self.usage(),
+            ) from failures[0]
         self._finished_at = time.monotonic()
-        if self._owns_sandbox:
-            with contextlib.suppress(Exception):
-                self._sandbox.kill()
 
     def __enter__(self) -> AgentProject:
         return self
@@ -454,23 +497,32 @@ class AgentProject:
         replacement = create_sandbox(factory)
         replacement_started_at = time.monotonic()
         self._sandbox_count += 1
+        self._live_sandboxes[id(replacement)] = (replacement, replacement_started_at)
         try:
             self._initialize_sandbox(replacement)
-        except Exception:
-            with contextlib.suppress(Exception):
-                replacement.kill()
-            self._retired_sandbox_seconds += max(0.0, time.monotonic() - replacement_started_at)
+        except Exception as error:
+            try:
+                self._retire_sandbox(replacement)
+            except SandboxCleanupError as cleanup_error:
+                raise cleanup_error from error
             raise
 
         previous = self._sandbox
         self._close_agent_session()
-        now = time.monotonic()
-        self._retired_sandbox_seconds += max(0.0, now - self._active_sandbox_started_at)
         self._active_sandbox_started_at = replacement_started_at
         self._sandbox = replacement
         if self._owns_sandbox:
-            with contextlib.suppress(Exception):
-                previous.kill()
+            self._retire_sandbox(previous)
+
+    def _retire_sandbox(self, sandbox: SandboxHandle) -> None:
+        """Finalize one lease only after E2B confirms that it is gone."""
+        lease = self._live_sandboxes.get(id(sandbox))
+        if lease is None:
+            return
+        kill_sandbox(sandbox)
+        retired_at = time.monotonic()
+        _handle, started_at = self._live_sandboxes.pop(id(sandbox))
+        self._retired_sandbox_seconds += max(0.0, retired_at - started_at)
 
     def _refresh_file_mirror(self) -> None:
         """Snapshot all text files currently visible in the project workspace."""

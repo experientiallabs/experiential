@@ -16,7 +16,7 @@ The environment is a factory parameter: `evaluate_closed_loop` binds it to the w
 from __future__ import annotations
 
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
@@ -298,10 +298,11 @@ def _run_cells_concurrently(
     caller can slice per task and aggregate deterministically. `on_progress` fires from THIS
     thread as futures land (gepa.py precedent: UI callbacks must be a serial stream). A rollout or
     judge call that raises is a real failure: pending cells are cancelled and the exception
-    propagates IMMEDIATELY (fail-fast, scenario_fidelity precedent) — never swallowed into a
-    verdict, and never held back while in-flight cells (minutes-long sandbox rollouts) drain:
-    the pool is shut down with wait=False, so still-running cells finish on their own threads
-    and release their environments through `_run_once`'s finally.
+    propagates after owned work drains — never swallowed into a verdict. Any failure drains
+    already-started cells before returning while cancelling cells
+    that have not started: those threads can still own billable provider calls, rollout
+    persistence, and sandbox leases, so the caller must not terminalize the enclosing run while
+    they remain active. Every cell releases its environment through ``_run_once``'s ``finally``.
     """
     cells = [(task, attempt) for task in tasks for attempt in range(k)]
     if not cells:
@@ -321,16 +322,49 @@ def _run_cells_concurrently(
     pool = ThreadPoolExecutor(max_workers=max_workers)
     try:
         futures = {pool.submit(run_cell, task): i for i, (task, _attempt) in enumerate(cells)}
-        for future in as_completed(futures):
-            index = futures[future]
-            verdict, usage = future.result()  # a raised rollout/judge exception propagates here
-            slots[index] = verdict
-            usage_slots[index] = usage
-            if on_progress is not None:
-                task, attempt = cells[index]
-                on_progress(task.task_id, attempt + 1, verdict)
-    except BaseException:
-        pool.shutdown(wait=False, cancel_futures=True)
+        pending = set(futures)
+        while pending:
+            done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+            # Do not rely on a cell reaching RunnerLink before noticing API cancellation: all
+            # cells may still be inside cold E2B startup. This caller-side poll aborts the shared
+            # runtime below, which closes registered sandboxes before the ownership drain.
+            _check_cancelled(should_cancel)
+            for future in sorted(done, key=futures.__getitem__):
+                index = futures[future]
+                verdict, usage = future.result()  # a rollout/judge exception propagates here
+                slots[index] = verdict
+                usage_slots[index] = usage
+                if on_progress is not None:
+                    task, attempt = cells[index]
+                    on_progress(task.task_id, attempt + 1, verdict)
+    except BaseException as error:
+        cancelled = isinstance(error, RuntimeCancelled)
+        if not cancelled and isinstance(error, Exception) and should_cancel is not None:
+            try:
+                cancelled = should_cancel()
+            except Exception:  # noqa: BLE001 - preserve the cell's original failure
+                pass
+        abort_error: BaseException | None = None
+        abort = getattr(runtime, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except BaseException as candidate:  # noqa: BLE001 - cleanup must survive the drain
+                abort_error = candidate
+        pool.shutdown(wait=True, cancel_futures=True)
+        if abort_error is not None and callable(abort):
+            # A worker's release() during the drain may have retried and proved the exact lease
+            # whose first abort failed. Re-run the idempotent close before declaring a leak.
+            try:
+                abort()
+            except BaseException as candidate:  # noqa: BLE001 - this is the final cleanup proof
+                abort_error = candidate
+            else:
+                abort_error = None
+        if abort_error is not None:
+            raise abort_error from error
+        if cancelled and not isinstance(error, RuntimeCancelled):
+            raise RuntimeCancelled("runtime evaluation cancelled") from error
         raise
     else:
         pool.shutdown(wait=True)

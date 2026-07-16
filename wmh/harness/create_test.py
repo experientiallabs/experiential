@@ -769,6 +769,7 @@ class _FakePool:
         self.releases: list[bool] = []
         self.retire_idle_calls = 0
         self.closes = 0
+        self.close_failures = 0
         _FakePool.instances.append(self)
 
     def usage(self) -> SandboxUsage:
@@ -788,6 +789,10 @@ class _FakePool:
 
     def close(self) -> None:
         self.closes += 1
+        if self.closes <= self.close_failures:
+            from wmh.harness.e2b_sandbox import SandboxCleanupError
+
+            raise SandboxCleanupError("evaluator cleanup unproven")
 
 
 @pytest.fixture
@@ -916,9 +921,8 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
     [pool] = fake_pool_cls.instances  # ONE shared pool for the whole search
     assert pool.template == "tmpl-1"
     assert pool.metadata == {"optimizer_run_id": "run-1", "purpose": "evaluation"}
-    # Closed on return (finalizing the usage meter) and again by the finally — the real pool's
-    # close is idempotent, so "at least once, before usage capture" is the contract.
-    assert pool.closes >= 1
+    # One finally owns teardown and mutates the returned model with the finalized meter.
+    assert pool.closes == 1
     assert result.sandbox_usage is not None
     assert result.sandbox_usage.count == len(pool.channels)  # the fake meters per acquire
     assert len(pool.channels) == 3  # one pooled runner episode per (task, attempt) cell
@@ -935,6 +939,7 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
     monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
 ) -> None:
     provider = RoleProvider()
+    observed_usage: list[SandboxUsage] = []
 
     def exploding_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
         raise RuntimeError("boom mid-eval")
@@ -950,9 +955,46 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
             ProviderDeltaProposer(provider),
             GoldJudge(provider),
             harness_backend="e2b",
+            on_sandbox_usage=observed_usage.append,
         )
     [pool] = fake_pool_cls.instances
     assert pool.closes == 1  # the try/finally tears the pool down even on failure
+    assert observed_usage == [SandboxUsage(count=0, seconds=0.0)]
+
+
+def test_e2b_cleanup_failure_replaces_cancellation_and_withholds_final_usage(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """Cancellation cannot look clean when evaluator release remains unproven."""
+    from wmh.harness.e2b_sandbox import SandboxCleanupError
+    from wmh.harness.runtime import RuntimeCancelled
+
+    provider = RoleProvider()
+    observed_usage: list[SandboxUsage] = []
+
+    def cancelled_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
+        del args, kwargs
+        [pool] = fake_pool_cls.instances
+        pool.close_failures = 1
+        raise RuntimeCancelled("runtime episode cancelled")
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", cancelled_evaluate)
+
+    with pytest.raises(SandboxCleanupError, match="cleanup unproven") as raised:
+        create_harness(
+            "winner",
+            _pi_seed(),
+            _tasks(),
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            harness_backend="e2b",
+            on_sandbox_usage=observed_usage.append,
+        )
+
+    assert isinstance(raised.value.__context__, HarnessSearchCancelled)
+    assert observed_usage == []
 
 
 def test_runtime_cancellation_aborts_the_wave_without_judging_and_closes_pool(

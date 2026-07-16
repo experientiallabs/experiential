@@ -14,9 +14,11 @@ from types import ModuleType
 import pytest
 
 from wmh.harness.e2b_sandbox import (
+    SandboxCleanupError,
     SandboxHandle,
     create_sandbox,
     default_sandbox_factory,
+    kill_sandbox,
 )
 
 
@@ -82,7 +84,8 @@ class FakeSandbox:
             raise RuntimeError("sandbox not found")
         self.timeouts.append(timeout)
 
-    def kill(self) -> bool:
+    def kill(self, request_timeout: float | None = None) -> bool:
+        del request_timeout
         self.kills += 1
         return True
 
@@ -173,6 +176,74 @@ def test_create_sandbox_does_not_retry_non_capacity_errors(
     with pytest.raises(ValueError, match="template does not exist"):
         create_sandbox(factory)
     assert len(attempts) == 1  # auth/template/config errors fail immediately
+    assert sleeps == []
+
+
+def test_kill_sandbox_retries_transient_errors_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    fake = FakeSandbox()
+    attempts = 0
+
+    request_timeouts: list[float | None] = []
+
+    def flaky_kill(request_timeout: float | None = None) -> bool:
+        nonlocal attempts
+        attempts += 1
+        request_timeouts.append(request_timeout)
+        if attempts < 3:
+            raise RuntimeError("connection closed")
+        return True
+
+    monkeypatch.setattr(fake, "kill", flaky_kill)
+
+    kill_sandbox(fake)
+
+    assert attempts == 3
+    assert sleeps == [0.1, 0.5]
+    assert request_timeouts == [5.0, 5.0, 5.0]
+
+
+def test_kill_sandbox_fails_closed_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    fake = FakeSandbox()
+    attempts = 0
+
+    def broken_kill(request_timeout: float | None = None) -> bool:
+        nonlocal attempts
+        del request_timeout
+        attempts += 1
+        raise RuntimeError("control plane unavailable")
+
+    monkeypatch.setattr(fake, "kill", broken_kill)
+
+    with pytest.raises(SandboxCleanupError, match="cleanup failed after 3 attempts"):
+        kill_sandbox(fake)
+
+    assert attempts == 3
+    assert sleeps == [0.1, 0.5]
+
+
+def test_kill_sandbox_accepts_explicit_already_gone_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    fake = FakeSandbox()
+
+    def gone(request_timeout: float | None = None) -> bool:
+        del request_timeout
+        raise RuntimeError("sandbox not found")
+
+    monkeypatch.setattr(fake, "kill", gone)
+
+    kill_sandbox(fake)
+
     assert sleeps == []
 
 
