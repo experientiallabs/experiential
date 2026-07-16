@@ -39,7 +39,7 @@ def _clean_axes(ax) -> None:
 def kimi_three_bar() -> None:
     fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=200)
     labels = ["base\nQwen3.5-9B", "GRPO\n(on-policy in the WM)", "offline SFT\n(Kimi-K2.6 demos)"]
-    values = [0.113, 0.250, 0.8375]
+    values = [0.330, 0.240, 0.830]
     colors = [_INK, _BLUE, _PURPLE]
     bars = ax.bar(labels, values, width=0.52, color=colors)
     for bar, v in zip(bars, values):
@@ -54,20 +54,24 @@ def kimi_three_bar() -> None:
             color=_INK,
         )
     ax.annotate(
-        "+13.7 pts\npaired +0.100", (1, 0.250), textcoords="offset points", xytext=(30, 18),
+        "paired −0.079\n(33W-43L)", (1, 0.240), textcoords="offset points", xytext=(30, 18),
         ha="left", fontsize=8.5, color=_BLUE,
+    )
+    ax.annotate(
+        "paired +0.518\n(74W-7L)", (2, 0.830), textcoords="offset points", xytext=(-100, -6),
+        ha="right", fontsize=8.5, color=_PURPLE,
     )
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("success rate (WM eval)", fontsize=9, color=_MUTED)
     _clean_axes(ax)
     fig.text(
         0.055, 0.945,
-        "kimi (gui-tasks): offline SFT dominates on-policy WM training, in-WM",
+        "kimi (gui-tasks): offline SFT dominates; GRPO is negative",
         fontsize=12.5, fontweight="bold", color=_INK,
     )
     fig.text(
         0.055, 0.895,
-        "haiku-kimi-era WM eval (fidelity 0.714, temp-0, rubric judge) · n=80 episodes/row",
+        "haiku-kimi-era WM eval · pinned D73 protocol (100 scenarios × 1 ep) — D90.6 rows of record",
         fontsize=8.5, color=_MUTED,
     )
     fig.text(
