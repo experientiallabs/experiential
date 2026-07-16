@@ -1,12 +1,12 @@
-"""Serve the prebuilt tau-bench WM in EVAL configuration (BENCH-B shared protocol).
+"""Serve the prebuilt tau-bench WM in AZURE GPT-5.5 EVAL configuration (D69).
 
-Env backend = PINNED GPT-5.5 (OpenAI; different family from the Haiku training WM —
-strongest circularity blunting available). Reward judge = Opus 4.8 on Bedrock us-east-1
-(D12 pins it for fidelity rows; third family vs both WM backends avoids same-family bias).
+Env backend = GPT-5.5 via Azure Foundry (same pinned base model as the dead OpenAI key,
+different serving stack — a THIRD era, not a refresh: base measured 0.675 vs 0.550).
+Reward judge = Opus 4.8 on Bedrock (cross-geo waterfall).
 
-Requires OPENAI_API_KEY (gitignored .env at the repo root) and AWS creds for Bedrock.
+Requires AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT and AWS creds (gitignored .env).
 
-Run from the wmh repo root:  uv run python .agents/scripts/serve_tau_eval.py [port]
+Run from the wmh repo root:  uv run python .agents/scripts/serve_tau_eval_azure.py [port]
 """
 
 from __future__ import annotations

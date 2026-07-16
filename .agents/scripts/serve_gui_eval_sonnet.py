@@ -1,13 +1,10 @@
-"""Serve the gui-tasks WM for B3 training runs: Haiku 4.5 with a cross-region waterfall.
+"""Serve the gui-tasks WM in sonnet-era EVAL configuration (D71/D76).
 
-Same provider swap as .agents/scripts/serve_tau_haiku.py, but wrapped in a
-FallbackProvider chain of the SAME dated haiku profile id across regions
-(us-east-1 -> us-west-2 -> us-east-2). Bulk GRPO rollouts (n=8 concurrent episodes,
-each stepping the WM) hit per-region Bedrock throttling — observed as multi-minute
-step stalls during B2's PPO smoke. Failing over across regions keeps the ENV MODEL
-IDENTICAL (a cross-model fallback would silently change the environment mid-training).
+Env backend = sonnet-5 (cross-region waterfall, temp-0 steps per the D66/D78 substrate
+floor); reward judge = Opus 4.8 on a cross-geo waterfall (EU-first under US brownouts).
+Superseded as the official kimi env by the D86 haiku re-pin; kept for the sonnet-era rows.
 
-Run from the wmh repo root:  uv run python .agents/scripts/serve_gui_train_b3.py [port]
+Run from the wmh repo root:  uv run python .agents/scripts/serve_gui_eval_sonnet.py [port]
 """
 
 from __future__ import annotations
@@ -54,10 +51,6 @@ def main() -> None:
         for r in REGIONS
     ]
     provider = FallbackProvider(chain)
-    judge_chain = [
-        get_provider(ProviderConfig(kind=ProviderKind.BEDROCK, model=JUDGE_MODEL, region=r))
-        for r in ("eu-west-1", "eu-central-1", "us-east-1", "us-west-2")
-    ]
     judge_chain = [
         get_provider(
             ProviderConfig(

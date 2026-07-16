@@ -1,12 +1,12 @@
-"""Serve the prebuilt tau-bench WM in EVAL configuration (BENCH-B shared protocol).
+"""Serve the prebuilt tau-bench WM in INTERIM Opus EVAL configuration (D66).
 
-Env backend = PINNED GPT-5.5 (OpenAI; different family from the Haiku training WM —
-strongest circularity blunting available). Reward judge = Opus 4.8 on Bedrock us-east-1
-(D12 pins it for fidelity rows; third family vs both WM backends avoids same-family bias).
+Env backend = Opus 4.8 on Bedrock (cross-geo waterfall) — interim replacement after the
+OpenAI account deactivation; rows on this env are only comparable to other opus-era rows.
+Reward judge = Opus 4.8 (same-family and env==judge caveats stated in the results doc).
 
-Requires OPENAI_API_KEY (gitignored .env at the repo root) and AWS creds for Bedrock.
+Requires AWS creds for Bedrock.
 
-Run from the wmh repo root:  uv run python .agents/scripts/serve_tau_eval.py [port]
+Run from the wmh repo root:  uv run python .agents/scripts/serve_tau_eval_opus.py [port]
 """
 
 from __future__ import annotations
