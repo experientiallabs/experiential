@@ -1308,3 +1308,43 @@ def test_second_interrupt_during_the_handler_detaches_cleanly(tmp_path: Path) ->
     assert client.end_calls == []
     # The session reference survives the detach for the next command.
     assert store.load("sess-1") is not None
+
+
+def test_end_tolerates_a_sandbox_that_ended_mid_command(tmp_path: Path) -> None:
+    """A session ending between pre-check and push still reaches the final handoff.
+
+    The platform's patch-upload route answers 409 ("workspace is not running")
+    for any non-running session, which the tolerant push defers; the catch-up
+    then observes the terminal state and the finalize path runs normally.
+    """
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+    (root / "answer.txt").write_text("local edit while detached", encoding="utf-8")
+
+    class _EndedSandboxClient(_FakeClient):
+        def upload_agent_workspace_patch(
+            self, agent_id: str, session_id: str, content: bytes
+        ) -> WorkspacePatchResult:
+            raise PlatformError("workspace is not running", status_code=409)
+
+    client = _EndedSandboxClient()
+    client.session_states = [
+        _session(workspace_sync=True),
+        _session("ended", workspace_sync=True),
+    ]
+    client.final_archive = _archive({"answer.txt": b"final"})
+    client.pages = [_page([], 0, "ended")]
+
+    with pytest.raises(typer.Exit) as raised:
+        _command_driver(client, store, action="end").run()
+
+    # The local edit conflicts with the final content and is preserved; the
+    # handoff still completed (download, recovery archive, ack, cleanup).
+    assert raised.value.exit_code == 2
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "local edit while detached"
+    assert (root / ".wmh-conflicts" / "sess-1.tar.gz").is_file()
+    assert client.final_acked
+    assert store.load("sess-1") is None
