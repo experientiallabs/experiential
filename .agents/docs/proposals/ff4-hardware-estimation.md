@@ -193,6 +193,63 @@ Corrections adopted: battery speedup is >30× (not "~15×"); "65% of DL failures
 denominator conflation — the defensible number is 8.8% of ALL failures (largest DL-specific
 category). PCB dollar figures must be labeled vendor-estimates in any launch material.
 
+## Value-per-prediction model (v0)
+
+The anchors above are raw ingredients; to compare use cases we normalize to the **expected value
+of one WM prediction** — the blend of direct cost, weighted time, and safety the launch page
+should quote per domain:
+
+```
+V_query = p_act × [ C_direct  +  λ_t · T_saved  +  p_tail · C_tail ]  −  p_reg · C_reg
+```
+
+- **p_act** — probability the prediction changes an action (a run skipped, a config chosen, a
+  failure pre-empted). A prediction that confirms what you'd do anyway is worth ~0.
+- **C_direct** — direct cost of the real measurement avoided (compute $, materials, tool time).
+- **λ_t · T_saved** — loop latency converted to $: engineer-blocked time at λ_t ≈ $100/hr
+  (loaded); calendar/product-delay time is worth far more and is flagged per-domain rather than
+  folded into λ_t.
+- **p_tail · C_tail** — safety/tail term: probability × cost of the catastrophic outcome the
+  prediction can pre-empt (respin, outage, hardware damage).
+- **p_reg · C_reg** — the regression tax (from the DB literature): probability the estimator
+  causes a *worse* action than the default × its cost. This is what kills deployed estimators;
+  it must be measured, not assumed zero.
+
+A WM query costs c ≈ $0.001–0.05 (one LLM inference), so **ROI = V_query / c**. Three leverage
+modes matter when reading the table: **per-gate** (one prediction gates one run), **per-search**
+(thousands of predictions multiply one search's throughput), and **per-policy** (one prediction
+sets a fleet-wide operating point — value scales with the fleet, not the query).
+
+| Use case | p_act (est.) | C_direct avoided | Time term | Tail term | **V_query (order)** | Dominant | Mode |
+|---|---|---|---|---|---|---|---|
+| ml-memory / OOM (v1) | 5–10% of submissions | 1–8 GPU-hr wasted = $2–56 | 0.5–4 hr turnaround = $50–400 | — | **$3–45** | time | per-gate, high volume |
+| vllm-serving config (v1) | 70–90% of sweep points | ~140 GPU-hr ≈ $700/config (Vidur ÷ "hundreds") | days of setup per trial | SLO breach (unpriced) | **$300–600** | cost | per-gate / per-search |
+| fpga-pnr (v1) | ~50% of candidates | 0.5–6 hr tool+seat = $60–1,500 | engineer wait, same hours | — | **$30–1,000** | time+cost | per-gate |
+| Pre-silicon / tape-out risk | rare, decisive | — | months of slip | Δp≈1% × $10–40M masks | **$10⁵ per averted-risk query** | safety | per-gate, low volume |
+| Battery cycle-life (bridge) | ~90% of protocol candidates | channel + lab $10³–10⁴ (est., unpublished) | **6 months calendar** per test | thermal events (unpriced) | **$10³–10⁴ + months** | time | per-gate |
+| PCB bring-up (bridge) | 10–50% catch rate | respin $10K–86K (vendor-grade) | 1–4 weeks per spin | field failure | **$10³–4×10⁴** | cost+time | per-gate |
+| Power/thermal operating point | one decision per fleet/quarter | 10–25% energy × fleet-year (8-GPU node ≈ $30K/yr at 15%) | — | throttle/damage envelope | **$10²–10⁴ per policy** | cost (fleet-scaled) | per-policy |
+| Kernel/code search | 50–90% pruned | benchmark/verify $0.01–0.5 | queue seconds | — | **$0.01–0.5** | cost | per-search ×10³–10⁵ |
+| LLM routing | ~50% routable | model-cost delta $0.005–0.05/query | latency win (cheap model faster) | quality regression | **$0.003–0.03** | cost | per-gate ×10⁶⁺/day |
+| CI test selection | 2/3 of executions | $10⁻³–10⁻² per execution | dev feedback latency | escaped regression = C_reg driver | **$0.001–0.01** | cost | per-gate ×10⁸/day |
+| DB plan/cardinality | tail queries only | median ~0; tail 10–1000× slowdown | analyst wait | silent 10⁸ misestimate | **$0.001–0.1 (tail-skewed)** | safety-of-tail | per-gate ×10⁶⁺/day |
+| Media encoding ladder | ~80% of ladder points | 10–100 CPU-hr ≈ $0.3–3/encode | none critical | — | **$0.3–3** | cost | per-search |
+
+**How to read it.** Value per prediction spans ~8 orders of magnitude, and the portfolio splits
+cleanly: **high-value/low-volume** decisions (tape-out, PCB, battery, serving-config — one good
+prediction pays for millions of WM queries) versus **low-value/high-volume** streams (routing,
+CI, DB, kernels — value comes from aggregate throughput and the regression tax dominates the
+design). Our v1 trio deliberately samples the middle of the curve (per-query $3–$1,000) where
+ground truth is cheap enough to *measure* p_act and p_reg honestly rather than assume them —
+exactly the two parameters this table currently estimates. The launch page should print this
+table with v1's p_act/p_reg cells filled in from our own experiments, and the bridge domains
+(battery, PCB, tape-out) quoted as the value gradient the same estimator climbs next.
+
+**Caveats.** All non-anchor cells are order-of-magnitude estimates (assumptions inline);
+λ_t=$100/hr is a choice, not a fact; product-delay time (battery's 6 months, tape-out's slip)
+is priced qualitatively because published $/week-of-delay numbers don't exist; PCB inputs are
+vendor-grade. The model's purpose is ranking and framing, not accounting.
+
 ## v1 choice (user, 2026-07-05): start with the simplest three and see how they perform
 
 1. **ml-memory** — torch train/infer sweeps on M3 Max (MPS/CPU); optional CUDA leg on the H100
