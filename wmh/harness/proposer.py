@@ -130,7 +130,7 @@ class ProjectDeltaProposer:
         self._project = project
         self._agent = agent
         self._provider = provider
-        self._round = 0
+        self._iteration = 0
         self._evaluation_dirs: dict[str, str] = {}
         self._proposal_files: dict[str, str] = {}
         self._parent_manifests: dict[str, JsonObject] = {}
@@ -152,10 +152,10 @@ class ProjectDeltaProposer:
             raise ValueError(f"proposal count must be positive, got {count}")
         self._should_cancel = should_cancel
         _check_cancelled(should_cancel)
-        self._round += 1
-        round_dir = f"round-{self._round:04d}"
-        context_dir = f"context/{round_dir}"
-        proposal_dir = f"proposals/{round_dir}"
+        self._iteration += 1
+        iteration_dir = f"iteration-{self._iteration:04d}"
+        context_dir = f"context/{iteration_dir}"
+        proposal_dir = f"proposals/{iteration_dir}"
         parent_context = self._parent_manifests.get(parent.doc_hash)
         if parent_context is None:
             parent_context = _materialize_parent(
@@ -415,7 +415,7 @@ class ProjectDeltaProposer:
                 )
                 self._evaluation_dirs.setdefault(
                     stamped.delta_id,
-                    f"evaluations/{round_dir}/proposal-{index:02d}",
+                    f"evaluations/{iteration_dir}/proposal-{index:02d}",
                 )
             elif terminal_error is not None:
                 proposals.append(ProposalFailure(reason=str(terminal_error)))
@@ -431,7 +431,7 @@ class ProjectDeltaProposer:
         return proposals
 
     def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
-        """Persist one candidate's judged evidence for later project-agent rounds."""
+        """Persist one candidate's judged evidence for later project-agent iterations."""
         should_cancel = self._should_cancel
         _check_cancelled(should_cancel)
         root = self._evaluation_dirs.get(
@@ -487,7 +487,7 @@ def _read_project_text(
     *,
     should_cancel: Callable[[], bool] | None,
 ) -> str:
-    """Read one project output without hiding cancellation behind the next round."""
+    """Read one project output without hiding cancellation behind the next iteration."""
     _check_cancelled(should_cancel)
     content = project.read_text(path)
     _check_cancelled(should_cancel)
@@ -641,7 +641,7 @@ def _project_history_entry(
 ) -> JsonObject:
     """Compact judged metadata while raw proposals retain exact replacement payloads.
 
-    Re-serializing every prior full code surface into every later round makes persistent history
+    Re-serializing every prior full code surface into every later iteration makes persistent history
     quadratic in run length. The project already owns each raw proposal file, so history carries
     queryable identities, rationales, sizes, and verdicts plus a direct pointer to the exact bytes.
     """
@@ -681,10 +681,10 @@ def _project_history_entry(
 def _stamp_project_preconditions(
     parent: HarnessDoc, proposal: HarnessDelta | None
 ) -> HarnessDelta | None:
-    """Stamp missing concurrency metadata from the exact project-round parent.
+    """Stamp missing concurrency metadata from the exact project-iteration parent.
 
     The ordinary agent still chooses every semantic operation. The host owns this mechanical
-    identity field because it wrote the immutable parent snapshot for the same synchronous round.
+    identity field because it wrote the immutable parent snapshot for the same iteration.
     An explicitly supplied but incorrect hash is preserved so normal validation rejects it.
     """
     if proposal is None:
@@ -869,11 +869,11 @@ def _project_repair_request(
         if preserve_runtime_kind
         else "produce a valid resolved runtime kind"
     )
-    return f"""Repair exactly {len(errors)} invalid proposal slot(s) from this round.
+    return f"""Repair exactly {len(errors)} invalid proposal slot(s) from this iteration.
 This is repair turn {repair_turn} of {_MAX_PROJECT_REPAIR_TURNS}.
 
 Read the host validation report: {workspace}/{validation_path}
-It contains the exact error for each invalid slot. Re-read the original round request at
+It contains the exact error for each invalid slot. Re-read the original iteration request at
 {workspace}/{request_path} and its supplied parent manifests as needed, then rewrite ONLY these
 invalid files:
 {invalid_outputs}
@@ -913,7 +913,10 @@ def _project_request(
             "the search backend makes the final executability decision."
         )
     )
-    return f"""Produce exactly {count} independent harness proposals for this optimization round.
+    heading = (
+        f"Produce exactly {count} independent harness proposals for this optimization iteration."
+    )
+    return f"""{heading}
 
 Read:
 - parent manifest: {absolute_context}/parent.json
@@ -927,7 +930,7 @@ Read:
 - earlier raw proposals, when useful: {workspace}/proposals/
 - earlier candidate evaluation manifests and traces: {workspace}/evaluations/
 
-Write exactly these files, without changing earlier rounds:
+Write exactly these files, without changing earlier iterations:
 {outputs}
 
 Each file must be one JSON object:

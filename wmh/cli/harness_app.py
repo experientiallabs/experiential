@@ -25,7 +25,7 @@ from wmh.engine import load_world_model
 from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec, load_tasks
-from wmh.harness.create import create_harness
+from wmh.harness.create import ProposalRecord, create_harness
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
 from wmh.harness.proposer import ProviderDeltaProposer
@@ -211,24 +211,44 @@ def create(
     )
     _console.print(
         f"searching from [bold]{seed_doc.name}[/bold] against world model "
-        f"[bold]{model_name}[/bold]: {iterations} round(s), "
-        f"{proposal_batch_size} proposal(s)/round, k={k}, {len(tasks)} task(s) "
+        f"[bold]{model_name}[/bold]: {iterations} iteration(s), "
+        f"{proposal_batch_size} proposal(s)/iteration, k={k}, {len(tasks)} task(s) "
         f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
         f"{meta_note}{backend_note}"
     )
     if interactive and not yes and not Confirm.ask("Proceed?", default=True):
         raise typer.Exit(0)
 
-    def _progress(iteration: int, variant: str, score: float, accepted: bool) -> None:
+    def _progress(iteration: int, variant: str, score: float, changed: bool) -> None:
         tag = "seed" if iteration == 0 else f"iter {iteration}"
-        gate = "[green]accepted[/green]" if accepted else "[yellow]rejected[/yellow]"
-        _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {gate}")
+        state = (
+            "seed"
+            if iteration == 0
+            else "[green]selected[/green]"
+            if changed
+            else "[yellow]unchanged[/yellow]"
+        )
+        _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {state}")
 
     def _note(message: str) -> None:
-        # Iterations that die before scoring (unusable/invalid/screened proposals) emit no
-        # _progress event; without this a run whose proposals all fail looks frozen after
-        # the seed line.
+        # Dead proposals narrate here; scored proposals use the structured callback below.
         _console.print(f"  [dim]{message}[/dim]")
+
+    def _proposal(record: ProposalRecord) -> None:
+        if record.outcome != "scored":
+            return
+        assert record.candidate is not None and record.score is not None
+        state = (
+            "[green]selected[/green]"
+            if record.selected
+            else "[cyan]eligible, not selected[/cyan]"
+            if record.gate_eligible
+            else "[yellow]rejected by gate[/yellow]"
+        )
+        _console.print(
+            f"  [iteration {record.iteration} proposal {record.proposal_index}] "
+            f"{record.candidate}: success_rate={record.score:.3f} {state}"
+        )
 
     result = create_harness(
         name,
@@ -247,13 +267,14 @@ def create(
         e2b_template=e2b_template,
         on_progress=_progress,
         on_note=_note,
+        on_proposal=_proposal,
     )
     saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
-    accepted = len(result.archive.accepted())
+    selected = len(result.archive.accepted())
     _console.print(
         f"[green]created[/green] [bold]{name}[/bold] v{saved.version} (champion) "
         f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
-        f"{accepted} accepted, {result.skipped} skipped -> {store.dir_for(name)}"
+        f"{selected} selected, {result.skipped} skipped -> {store.dir_for(name)}"
     )
     backend_hint = " --harness-backend e2b" if harness_backend == "e2b" else ""
     _console.print(

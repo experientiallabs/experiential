@@ -26,15 +26,15 @@ from wmh.harness import create as create_module
 from wmh.harness.create import (
     CreateResult,
     HarnessSearchCancelled,
-    PoolEntry,
+    ProposalRecord,
     cluster_failures,
     create_harness,
     select_failure_cluster,
-    select_parent,
 )
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.mutate import parse_delta
 from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runtime import Runtime
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
@@ -150,6 +150,7 @@ def _run(
     holdout: list[TaskSpec] | None = None,
     on_progress: Callable[[int, str, float, bool], None] | None = None,
     on_note: Callable[[str], None] | None = None,
+    on_proposal: Callable[[ProposalRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> CreateResult:
@@ -167,6 +168,7 @@ def _run(
         holdout=holdout,
         on_progress=on_progress,
         on_note=on_note,
+        on_proposal=on_proposal,
         on_accept=on_accept,
         should_cancel=should_cancel,
     )
@@ -182,7 +184,7 @@ def test_create_accepts_improving_delta_and_promotes_suite() -> None:
     assert result.best_score == 1.0
     assert result.best.name == "winner"
     assert result.best.system_prompt() == _CAREFUL_PROMPT
-    assert progress == [(0, "seed", 0.0, True), (1, "winner-g1", 1.0, True)]
+    assert progress == [(0, "seed", 0.0, True), (1, "winner-i1-p1", 1.0, True)]
 
     [delta] = result.archive.deltas
     assert delta.verdict is not None and delta.verdict.accepted
@@ -240,7 +242,7 @@ def test_create_skips_unusable_proposals() -> None:
     assert result.archive.deltas == []  # nothing to audit: no delta object ever existed
     assert result.best.name == "winner"  # even a search with no children yields the renamed seed
     # Every iteration is recorded even when its proposal dies before producing anything.
-    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+    assert [(r.iteration, r.outcome) for r in result.proposal_records] == [
         (1, "unusable"),
         (2, "unusable"),
     ]
@@ -557,28 +559,6 @@ def test_create_does_not_discount_a_cluster_when_every_delta_is_invalid() -> Non
     assert "[other] t2" in provider.meta_users[1]
 
 
-# -- parent selection --------------------------------------------------------------------------
-
-
-def _entry(doc_hash: str, success_rate: float) -> PoolEntry:
-    return PoolEntry(doc_hash=doc_hash, name=doc_hash, success_rate=success_rate)
-
-
-def test_select_parent_is_deterministic_and_discounts_expanded_parents() -> None:
-    entries = [_entry("a", 0.5), _entry("b", 1.0)]
-    assert select_parent(entries, {}, seed=7) == select_parent(entries, {}, seed=7)
-    picks_fresh = [select_parent(entries, {}, seed=s).doc_hash for s in range(50)]
-    picks_worn = [select_parent(entries, {"b": 9}, seed=s).doc_hash for s in range(50)]
-    # Both variants are reachable, and expanding a parent shrinks its share of selections.
-    assert set(picks_fresh) == {"a", "b"}
-    assert picks_worn.count("b") < picks_fresh.count("b")
-
-
-def test_select_parent_rejects_empty_pool() -> None:
-    with pytest.raises(ValueError, match="empty"):
-        select_parent([], {}, seed=1)
-
-
 # -- staged verification: screening + history ---------------------------------------------------
 
 
@@ -598,13 +578,13 @@ def test_screen_rejects_delta_that_does_not_improve_its_trigger() -> None:
     assert delta.verdict is not None and not delta.verdict.accepted
     assert delta.verdict.reason.startswith("screened out")
     # The dead iteration is still a first-class record, with its screen means attached.
-    [record] = result.iteration_records
+    [record] = result.proposal_records
     assert record.iteration == 1 and record.outcome == "screened"
     assert record.screen_child is not None and record.screen_parent is not None
-    # The cheap screen replaced the full eval: only the seed has a full-split report,
-    # and no child progress event ever fired.
+    # The cheap screen replaced the full eval: only the seed has a full-split report. The
+    # iteration still emits one unchanged champion checkpoint.
     assert len(result.reports) == 1
-    assert [e[0] for e in progress] == [0]
+    assert progress == [(0, "seed", 0.0, True), (1, "seed", 0.0, False)]
 
 
 def test_screen_uses_assertion_fraction_to_admit_partial_improvement() -> None:
@@ -661,7 +641,7 @@ def test_screen_uses_assertion_fraction_to_admit_partial_improvement() -> None:
     )
 
     assert result.screened == 0
-    [record] = result.iteration_records
+    [record] = result.proposal_records
     assert record.outcome == "scored"
     assert record.screen_child == record.screen_parent == 0.0
     assert record.screen_parent_fraction == 0.0
@@ -792,7 +772,7 @@ def test_feedback_persistence_failure_does_not_abort_scored_search() -> None:
     )
 
     assert result.best_score == 1.0
-    assert len(result.iteration_records) == 1
+    assert len(result.proposal_records) == 1
     assert any("screen feedback could not be persisted" in note for note in notes)
     assert any("full feedback could not be persisted" in note for note in notes)
 
@@ -985,7 +965,7 @@ def test_flaky_holdout_veto_is_overturned_by_confirmation() -> None:
 
 
 def test_wide_holdout_regression_skips_confirmation() -> None:
-    # Same setup as the round-2 holdout test: the child ALWAYS fails held-out. -1.0 is far
+    # Same setup as the second-iteration holdout test: the child ALWAYS fails held-out. -1.0 is far
     # beyond the narrow margin, so no re-measurement is spent and the plain rejection stands.
     seed = HarnessDoc.baseline("seed")
 
@@ -1456,7 +1436,7 @@ def test_e2b_pool_retires_idle_runners_once_per_proposal_batch(
         harness_backend="e2b",
     )
 
-    assert result.rounds == 2 and len(result.iteration_records) == 6
+    assert result.iterations == 2 and len(result.proposal_records) == 6
     [pool] = fake_pool_cls.instances
     assert pool.retire_idle_calls == 2  # once per batch, never between its three siblings
 
@@ -1673,7 +1653,7 @@ def test_proposer_call_failure_skips_the_iteration_not_the_run() -> None:
     assert len(notes) == 2
     assert all("proposer call failed" in note for note in notes)
     assert all("max_tokens above model output limit" in note for note in notes)
-    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+    assert [(r.iteration, r.outcome) for r in result.proposal_records] == [
         (1, "proposer_error"),
         (2, "proposer_error"),
     ]
@@ -1701,8 +1681,99 @@ class _SequencedMetaProvider(RoleProvider):
         return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
 
 
+class _RankedMetaProvider(_SequencedMetaProvider):
+    """Give weak and strong proposal prompts distinct, deterministic task scores."""
+
+    def __init__(self, replies: list[str]) -> None:
+        super().__init__(replies)
+        self._judge_fn = lambda user: (
+            "done-strong" in user or ("done-weak" in user and "task one" in user)
+        )
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> Completion:
+        special = (
+            "grade whether an agent completed a task",
+            "meta-agent improving an agent harness",
+            "You ARE the environment",
+        )
+        if not any(marker in system for marker in special):
+            if "strong agent" in system:
+                answer = "done-strong"
+            elif "weak agent" in system:
+                answer = "done-weak"
+            else:
+                answer = "done"
+            return Completion(text=json.dumps({"tool": "submit", "arguments": {"answer": answer}}))
+        return super().complete(
+            system,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+
+class _ParentRecordingProposer:
+    """Propose against the live parent and remember each iteration's parent hash."""
+
+    def __init__(self) -> None:
+        self.parent_hashes: list[str] = []
+
+    def propose_batch(
+        self,
+        parent: HarnessDoc,
+        trigger: FailureSignature,
+        evidence: str,
+        *,
+        history: list[HarnessDelta],
+        count: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[HarnessDelta | ProposalFailure | None]:
+        del evidence, history, should_cancel
+        self.parent_hashes.append(parent.doc_hash)
+        prompt = f"{_CAREFUL_PROMPT} Iteration {len(self.parent_hashes)}."
+        proposal = parse_delta(parent, trigger, _meta_reply(parent, prompt))
+        assert proposal is not None and count == 1
+        return [proposal]
+
+
+class _FeedbackRecordingProposer:
+    """Return scripted siblings and retain the final evaluation feedback for each."""
+
+    def __init__(self, prompts: list[str]) -> None:
+        self.prompts = prompts
+        self.feedback: list[tuple[str, str, str]] = []
+
+    def propose_batch(
+        self,
+        parent: HarnessDoc,
+        trigger: FailureSignature,
+        evidence: str,
+        *,
+        history: list[HarnessDelta],
+        count: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[HarnessDelta | ProposalFailure | None]:
+        del evidence, history, should_cancel
+        assert count == len(self.prompts)
+        proposals: list[HarnessDelta | ProposalFailure | None] = [
+            parse_delta(parent, trigger, _meta_reply(parent, prompt)) for prompt in self.prompts
+        ]
+        assert all(proposal is not None for proposal in proposals)
+        return proposals
+
+    def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+        self.feedback.append((delta.delta_id, stage, content))
+
+
 def test_proposal_batch_is_generated_before_siblings_are_evaluated() -> None:
-    """One round expands one parent into independently tracked sibling candidates."""
+    """One iteration expands one parent into independently tracked sibling candidates."""
     seed = HarnessDoc.baseline("seed")
     provider = _SequencedMetaProvider(
         [
@@ -1714,15 +1785,310 @@ def test_proposal_batch_is_generated_before_siblings_are_evaluated() -> None:
     result = _run(provider, iterations=1, proposal_batch_size=2)
 
     assert len(provider.meta_users) == 2
-    assert [(record.round, record.proposal_index) for record in result.iteration_records] == [
+    assert [(record.iteration, record.proposal_index) for record in result.proposal_records] == [
         (1, 1),
         (1, 2),
     ]
-    assert [record.candidate for record in result.iteration_records] == [
-        "winner-g1-p1",
-        "winner-g1-p2",
+    assert [record.candidate for record in result.proposal_records] == [
+        "winner-i1-p1",
+        "winner-i1-p2",
     ]
     assert len(result.archive.deltas) == 2
+
+
+def test_iteration_batch_commits_one_winner_and_one_progress_point() -> None:
+    """Three eligible siblings yield one deterministic winner and one champion update."""
+    seed = HarnessDoc.baseline("seed")
+    provider = _SequencedMetaProvider(
+        [_meta_reply(seed, f"{_CAREFUL_PROMPT} Candidate {index}.") for index in range(1, 4)]
+    )
+    progress: list[tuple[int, str, float, bool]] = []
+    proposals: list[ProposalRecord] = []
+    crowned: list[str] = []
+
+    result = create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=1,
+        proposal_batch_size=3,
+        on_progress=lambda i, n, r, a: progress.append((i, n, r, a)),
+        on_proposal=proposals.append,
+        on_accept=lambda doc, delta, score: crowned.append(doc.name),
+    )
+
+    assert result.iterations == 1
+    assert len(result.proposal_records) == 3
+    assert [(record.iteration, record.proposal_index) for record in result.proposal_records] == [
+        (1, 1),
+        (1, 2),
+        (1, 3),
+    ]
+    assert [record.gate_eligible for record in result.proposal_records] == [True, True, True]
+    assert [record.selected for record in result.proposal_records] == [True, False, False]
+    assert len(proposals) == 3
+    assert crowned == ["winner-i1-p1"]
+    assert progress == [
+        (0, "seed", 0.0, True),
+        (1, "winner-i1-p1", 1.0, True),
+    ]
+    assert [delta.verdict.accepted for delta in result.archive.deltas if delta.verdict] == [
+        True,
+        False,
+        False,
+    ]
+
+
+def test_duplicate_sibling_is_archived_without_duplicate_evaluation() -> None:
+    """The search boundary rejects duplicate sibling deltas before spending another screen."""
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+
+    result = _run(provider, iterations=1, proposal_batch_size=2)
+
+    assert result.skipped == 1
+    assert len(result.archive.deltas) == 2
+    assert [record.outcome for record in result.proposal_records] == ["scored", "invalid"]
+    assert [record.selected for record in result.proposal_records] == [True, False]
+    assert "already-proposed" in (result.proposal_records[1].reason or "")
+    assert len(result.reports) == 2  # seed plus the first sibling, never the duplicate
+
+
+def test_cancellation_during_later_sibling_commits_no_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later-sibling cancellation cannot publish an earlier sibling as the winner."""
+    seed = HarnessDoc.baseline("seed")
+    provider = _SequencedMetaProvider(
+        [
+            _meta_reply(seed, _CAREFUL_PROMPT),
+            _meta_reply(seed, f"{_CAREFUL_PROMPT} Another candidate."),
+        ]
+    )
+    cancelled = False
+    gate_delta = create_module.gate_delta
+
+    def cancel_after_first_gate(
+        delta: HarnessDelta,
+        *,
+        child: ClosedLoopReport,
+        champion: ClosedLoopReport,
+        best_full: float,
+        suite: list[str],
+        child_holdout: ClosedLoopReport | None = None,
+        champion_holdout: ClosedLoopReport | None = None,
+    ) -> GateRecord:
+        nonlocal cancelled
+        verdict = gate_delta(
+            delta,
+            child=child,
+            champion=champion,
+            best_full=best_full,
+            suite=suite,
+            child_holdout=child_holdout,
+            champion_holdout=champion_holdout,
+        )
+        cancelled = True
+        return verdict
+
+    monkeypatch.setattr(create_module, "gate_delta", cancel_after_first_gate)
+    progress: list[tuple[int, str, float, bool]] = []
+    crowned: list[str] = []
+    proposals: list[ProposalRecord] = []
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        _run(
+            provider,
+            proposal_batch_size=2,
+            should_cancel=lambda: cancelled,
+            on_progress=lambda i, n, r, a: progress.append((i, n, r, a)),
+            on_accept=lambda doc, delta, score: crowned.append(doc.doc_hash),
+            on_proposal=proposals.append,
+        )
+
+    assert progress == [(0, "seed", 0.0, True)]
+    assert crowned == []
+    assert proposals == []
+
+
+@pytest.mark.parametrize(
+    ("prompts", "selected"),
+    [
+        (["You are a weak agent.", "You are a strong agent."], [False, True]),
+        (["You are a strong agent.", "You are a weak agent."], [True, False]),
+    ],
+)
+def test_iteration_selects_best_eligible_score_independent_of_proposal_order(
+    prompts: list[str], selected: list[bool]
+) -> None:
+    """Full success outranks assertion fraction and proposal order within a frozen batch."""
+    seed = HarnessDoc.baseline("seed")
+    provider = _RankedMetaProvider([_meta_reply(seed, prompt) for prompt in prompts])
+    tasks = [
+        TaskSpec(task_id="t1", instruction="task one", gold=["the work completed"]),
+        TaskSpec(task_id="t2", instruction="task two", gold=["the work completed"]),
+    ]
+    crowned: list[str] = []
+
+    result = create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=1,
+        proposal_batch_size=2,
+        k=1,
+        on_accept=lambda doc, delta, score: crowned.append(doc.system_prompt()),
+    )
+
+    assert result.best_score == 1.0
+    assert result.best.system_prompt() == "You are a strong agent."
+    assert [record.gate_eligible for record in result.proposal_records] == [True, True]
+    assert [record.selected for record in result.proposal_records] == selected
+    assert crowned == ["You are a strong agent."]
+    accepted = result.archive.accepted()
+    assert len(accepted) == 1
+    winner_hash = next(
+        record.candidate_doc_hash for record in result.proposal_records if record.selected
+    )
+    assert accepted[0].child_doc_hash == winner_hash
+    assert winner_hash is not None
+    assert result.archive.reconstruct(winner_hash).system_prompt() == "You are a strong agent."
+    loser_hash = next(
+        record.candidate_doc_hash for record in result.proposal_records if not record.selected
+    )
+    assert loser_hash is not None
+    with pytest.raises(ValueError, match="not in this archive"):
+        result.archive.reconstruct(loser_hash)
+    loser_delta = next(
+        delta
+        for delta in result.archive.deltas
+        if delta.verdict is not None and not delta.verdict.accepted
+    )
+    assert loser_delta.verdict is not None
+    assert "gate eligible but not selected" in loser_delta.verdict.reason
+
+
+def test_full_feedback_records_final_batch_selection() -> None:
+    """Eligible losers teach the proposer that ranking, not the gate, rejected them."""
+    provider = _RankedMetaProvider([])
+    proposer = _FeedbackRecordingProposer(["You are a weak agent.", "You are a strong agent."])
+    tasks = [
+        TaskSpec(task_id="t1", instruction="task one", gold=["the work completed"]),
+        TaskSpec(task_id="t2", instruction="task two", gold=["the work completed"]),
+    ]
+
+    result = create_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        tasks,
+        _wm(provider),
+        provider,
+        proposer,
+        GoldJudge(provider),
+        iterations=1,
+        proposal_batch_size=2,
+        k=1,
+    )
+
+    loser = next(
+        delta
+        for delta in result.archive.deltas
+        if delta.verdict is not None and not delta.verdict.accepted
+    )
+    winner = result.archive.accepted()[0]
+    loser_feedback = next(
+        content
+        for delta_id, stage, content in proposer.feedback
+        if delta_id == loser.delta_id and stage == "full"
+    )
+    winner_feedback = next(
+        content
+        for delta_id, stage, content in proposer.feedback
+        if delta_id == winner.delta_id and stage == "full"
+    )
+    assert "gate eligible but not selected" in loser_feedback
+    assert "gate eligible but not selected" not in winner_feedback
+
+
+def test_sibling_holdout_gates_use_frozen_iteration_champion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selected-looking first sibling cannot become the second sibling's gate baseline."""
+    seed = HarnessDoc.baseline("seed")
+    provider = _SequencedMetaProvider(
+        [
+            _meta_reply(seed, _CAREFUL_PROMPT),
+            _meta_reply(seed, f"{_CAREFUL_PROMPT} Another candidate."),
+        ]
+    )
+    provider._judge_fn = lambda user: (
+        True if "the holdout task" in user else "done-verified" in user
+    )
+    holdout = [TaskSpec(task_id="h1", instruction="the holdout task", gold=["still works"])]
+    gate_delta = create_module.gate_delta
+    holdout_gate_champions: list[tuple[float, float]] = []
+
+    def capture_gate_baselines(
+        delta: HarnessDelta,
+        *,
+        child: ClosedLoopReport,
+        champion: ClosedLoopReport,
+        best_full: float,
+        suite: list[str],
+        child_holdout: ClosedLoopReport | None = None,
+        champion_holdout: ClosedLoopReport | None = None,
+    ) -> GateRecord:
+        if child_holdout is not None and champion_holdout is not None:
+            holdout_gate_champions.append((champion.success_rate, champion_holdout.success_rate))
+        return gate_delta(
+            delta,
+            child=child,
+            champion=champion,
+            best_full=best_full,
+            suite=suite,
+            child_holdout=child_holdout,
+            champion_holdout=champion_holdout,
+        )
+
+    monkeypatch.setattr(create_module, "gate_delta", capture_gate_baselines)
+
+    result = _run(provider, proposal_batch_size=2, holdout=holdout)
+
+    assert holdout_gate_champions == [(0.0, 1.0), (0.0, 1.0)]
+    assert [record.gate_eligible for record in result.proposal_records] == [True, True]
+    assert [record.selected for record in result.proposal_records] == [True, False]
+
+
+def test_next_iteration_proposes_from_previous_iteration_winner() -> None:
+    """The selected winner is the next parent, with no stepping-stone parent pool."""
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider()
+    proposer = _ParentRecordingProposer()
+
+    result = create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        proposer,
+        GoldJudge(provider),
+        iterations=2,
+        proposal_batch_size=1,
+    )
+
+    assert len(result.archive.accepted()) == 2
+    first_winner_hash = result.proposal_records[0].candidate_doc_hash
+    assert proposer.parent_hashes == [seed.doc_hash, first_winner_hash]
+    assert [record.selected for record in result.proposal_records] == [True, True]
 
 
 def test_on_accept_delivers_the_new_champion_the_moment_it_is_crowned() -> None:
@@ -1760,38 +2126,19 @@ def test_dead_iteration_ends_early_and_the_search_moves_on() -> None:
     assert result.skipped == 1
     assert result.best_score == 1.0
     assert result.best.system_prompt() == _CAREFUL_PROMPT
-    assert [e[0] for e in progress] == [0, 2]  # the dead iteration fires no progress event
-    assert [(r.iteration, r.outcome) for r in result.iteration_records] == [
+    assert [e[0] for e in progress] == [0, 1, 2]
+    assert progress[1] == (1, "seed", 0.0, False)
+    assert [(r.iteration, r.outcome) for r in result.proposal_records] == [
         (1, "unusable"),
         (2, "scored"),
     ]
-    scored = result.iteration_records[-1]
-    assert scored.accepted is True and scored.score == 1.0
-    assert scored.candidate == "winner-g2"
+    scored = result.proposal_records[-1]
+    assert scored.selected is True and scored.score == 1.0
+    assert scored.candidate == "winner-i2-p1"
 
 
-def test_dead_proposals_do_not_discount_the_selected_parent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Selection freshness changes only after a valid child is constructed."""
-    observed_counts: list[dict[str, int]] = []
-
-    def capture_selection(
-        entries: list[PoolEntry], children_counts: dict[str, int], seed: int
-    ) -> PoolEntry:
-        del seed
-        observed_counts.append(dict(children_counts))
-        return entries[0]
-
-    monkeypatch.setattr(create_module, "select_parent", capture_selection)
-    result = _run(RoleProvider(meta_reply="not json"), iterations=2)
-
-    assert result.skipped == 2
-    assert observed_counts == [{}, {}]
-
-
-def test_skipped_iterations_narrate_through_on_note() -> None:
-    """Every iteration whose proposal dies before scoring reports itself.
+def test_skipped_proposals_narrate_through_on_note() -> None:
+    """Every proposal that dies before scoring narrates itself.
 
     Regression: a run whose proposals were all unusable (e.g. truncated meta replies on huge
     pi code surfaces) emitted NO progress events at all; five iterations looked like one.
@@ -1801,10 +2148,9 @@ def test_skipped_iterations_narrate_through_on_note() -> None:
     result = _run(provider, iterations=3, on_note=notes.append)
 
     assert result.skipped == 3
-    assert len(notes) == 3
-    assert all("proposal unusable" in note for note in notes)
     assert [note.split(":")[0] for note in notes] == [
         "iteration 1/3",
         "iteration 2/3",
         "iteration 3/3",
     ]
+    assert all("proposal unusable" in note for note in notes)

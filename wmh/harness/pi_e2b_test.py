@@ -801,7 +801,7 @@ def test_pool_reuses_a_healthy_sandbox_without_rebootstrap(
 def test_pool_retire_idle_rotates_only_free_sandboxes_and_preserves_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A round boundary kills idle streams, leaves in-flight work, and meters both lifetimes."""
+    """An iteration boundary kills idle streams and meters both runner lifetimes."""
     monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
     now = [10.0]
     monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])

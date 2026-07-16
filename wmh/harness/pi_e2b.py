@@ -766,7 +766,7 @@ class E2BDurableChannel:
             self._last_outbox_error = f"head read failed: {exc}"
             now = time.monotonic()
             # Treat only uninterrupted failures as one outage. AgentProject does not pump this
-            # channel while it is idle between proposal rounds, so a long idle gap must not make
+            # channel while it is idle between proposal iterations, so a long idle gap must not make
             # the next isolated read failure look ancient.
             if self._last_head_failure_at is None or now - self._last_head_failure_at > max(
                 1.0, self._poll_interval_s * 4
@@ -967,8 +967,9 @@ class E2BSandboxPool:
     The bootstrap (runner files + node 22 + pi's npm deps unless a template prebakes them) is
     doc-independent — a mutated harness's code surfaces travel per-episode in
     `episode_start.files` — so one pool serves a whole search. `create_harness` retires the idle
-    pool at each round boundary before the proposer runs, preventing long proposer/evaluation gaps
-    from leaving stale E2B command streams alive; score waves for sibling proposals in that round
+    pool at each iteration boundary before the proposer runs, preventing long
+    proposer/evaluation gaps from leaving stale E2B command streams alive; score waves for
+    sibling proposals in that iteration
     still reuse warm sandboxes instead of re-paying installs. Concurrent episodes acquire distinct
     sandboxes; a sandbox whose episode raised is discarded (the runner process is in an unknown
     state — reuse could cross frames between episodes). `close()` kills everything; the pool lock

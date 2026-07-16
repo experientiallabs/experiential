@@ -1,10 +1,10 @@
 """`wmh harness create`: budgeted search over harness deltas, gated by non-regression.
 
-The loop: select a parent from the accepted pool (stepping-stone weighting — good scores favored,
-already-expanded parents discounted), cluster the parent's failures into mechanisms, ask the
-proposer for a sibling batch of `HarnessDelta` objects against a size-weighted, expansion-
-discounted cluster, apply each atomically, score each child closed-loop against the world model,
-and gate acceptance:
+Each iteration freezes the current champion, clusters its failures into mechanisms, and asks the
+proposer for a sibling batch of `HarnessDelta` objects against one size-weighted,
+expansion-discounted cluster. Every sibling is applied and evaluated against that same frozen
+champion. After the full batch resolves, at most one gate-eligible sibling becomes the next
+iteration's champion:
 
 - **Tier 1 — regression suite**: the child's score on the suite (tasks the search has already
   mastered) must not drop below the champion's. Newly-passing tasks promote into the suite on
@@ -13,21 +13,20 @@ and gate acceptance:
 - **Tier 3 — held-out (optional)**: with a holdout task file, the child must also be no worse than
   the champion on tasks the proposer never saw evidence from.
 
-Ties pass every tier: with k passes per task, scores are coarse, and "no worse" is the contract.
-Every proposed delta — accepted, rejected, or invalid-before-eval — is recorded in the archive
-with its verdict, so the archive is a queryable lineage of audited updates, not a pile of
-snapshots. Parent SELECTION is deterministic — a blake2b hash of the iteration index replaces RNG
-(per the repo's no-entropy rule) — but the run as a whole is only as reproducible as its
-providers: proposals and rollouts sample real models at temperature.
+Ties pass every gate tier: with k passes per task, scores are coarse, and "no worse" is the
+eligibility contract. When multiple siblings are eligible, full success wins, then assertion
+fraction, then lower proposal index. Every proposed delta, whether selected, rejected, or invalid
+before eval, is recorded in the archive with its verdict. The run as a whole is only as
+reproducible as its providers because proposals and rollouts sample real models at temperature.
 """
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_loop
@@ -51,10 +50,6 @@ if TYPE_CHECKING:
     # the pool is actually constructed.
     from wmh.harness.pi_e2b import E2BSandboxPool
 
-# Selection floor: a zero-scoring variant keeps a small chance of being expanded, so early
-# pools with no successes still make progress instead of dividing by zero interest.
-_SELECTION_FLOOR = 0.05
-
 # Non-regression tolerance: fmean over identical verdicts must compare equal, never fail a gate
 # on float noise.
 _TIE_EPS = 1e-9
@@ -63,16 +58,8 @@ ALL_PASS_MECHANISM = "none: all tasks pass"
 
 FailureClusterKey = tuple[str, str, tuple[str, ...]]
 
-# Reports progress as (iteration, variant name, success_rate, accepted); iteration 0 is the seed.
+# Reports (iteration, champion name, success rate, changed); iteration 0 is the seed.
 CreateProgress = Callable[[int, str, float, bool], None]
-
-
-class PoolEntry(BaseModel):
-    """One accepted variant, as the parent-selection pool sees it."""
-
-    doc_hash: str
-    name: str
-    success_rate: float
 
 
 class DeltaArchive(BaseModel):
@@ -103,21 +90,18 @@ class DeltaArchive(BaseModel):
         return docs[doc_hash]
 
 
-class IterationRecord(BaseModel):
-    """One proposal attempt, scored or dead, in order: the complete search history.
+class ProposalRecord(BaseModel):
+    """One proposal in an iteration's sibling batch, in stable proposal order.
 
-    Every search round proposes a sibling batch from one selected parent. A dead attempt
-    (every outcome but "scored") ends early: the proposal died before a full-split eval,
-    the search moves straight to the next sibling, and the record here is what remains of it.
-    Callers render these as records and plot points, so a run full of dead proposals shows its
-    work instead of looking like it never iterated. `champion_score` is the champion's
-    full-suite rate when the iteration resolved: the honest y-level for plotting a dead
-    iteration (the line it failed to move).
+    A dead proposal (every outcome but ``scored``) ends before a full-split evaluation. Scored
+    proposals distinguish gate eligibility from final selection: several siblings may satisfy
+    the frozen non-regression gate, but only the best eligible sibling is selected. The
+    ``champion_score`` is always the frozen pre-iteration champion score, which is the comparison
+    baseline and the honest plotting level for a dead proposal.
     """
 
-    iteration: int
-    round: int
-    proposal_index: int
+    iteration: int = Field(ge=1)
+    proposal_index: int = Field(ge=1)
     outcome: Literal["scored", "screened", "invalid", "unusable", "proposer_error"]
     candidate: str | None = None
     candidate_doc_hash: str | None = None
@@ -127,13 +111,28 @@ class IterationRecord(BaseModel):
     ops: list[str] = Field(default_factory=list)  # "replace prompt:main" style summaries
     rationales: list[str] = Field(default_factory=list)
     reason: str | None = None
-    score: float | None = None  # full-suite success rate; scored attempts only
-    accepted: bool | None = None  # gate verdict; scored attempts only
+    score: float | None = None  # full-suite success rate; scored proposals only
+    gate_eligible: bool | None = None  # frozen non-regression gate; scored proposals only
+    selected: bool = False  # true only for the iteration winner
     screen_child: float | None = None  # trigger-cluster means; screened attempts only
     screen_parent: float | None = None
     screen_child_fraction: float | None = None  # denser assertion-level screen signal
     screen_parent_fraction: float | None = None
-    champion_score: float | None = None
+    champion_score: float
+
+    @model_validator(mode="after")
+    def _validate_state(self) -> ProposalRecord:
+        """Reject impossible scored, dead, and selected record combinations."""
+        if self.outcome == "scored":
+            if self.score is None or self.gate_eligible is None:
+                raise ValueError("scored proposals require score and gate_eligible")
+            if self.candidate is None or self.candidate_doc_hash is None or self.delta_id is None:
+                raise ValueError("scored proposals require candidate and delta identities")
+        elif self.score is not None or self.gate_eligible is not None or self.selected:
+            raise ValueError("dead proposals cannot carry score, gate eligibility, or selection")
+        if self.selected and not self.gate_eligible:
+            raise ValueError("selected proposals must be gate eligible")
+        return self
 
 
 class CreateResult(BaseModel):
@@ -145,11 +144,11 @@ class CreateResult(BaseModel):
     reports: dict[str, ClosedLoopReport] = Field(default_factory=dict)  # by doc_hash
     holdout_reports: dict[str, ClosedLoopReport] = Field(default_factory=dict)  # by doc_hash
     suite: list[str] = Field(default_factory=list)  # final regression suite (task ids)
-    skipped: int = 0  # iterations whose proposal was unusable or invalid (they end early)
-    iteration_records: list[IterationRecord] = Field(default_factory=list)  # every iteration
+    skipped: int = 0  # proposals unusable or invalid before evaluation
+    proposal_records: list[ProposalRecord] = Field(default_factory=list)
     screened: int = 0  # deltas rejected at the cheap trigger-cluster screen (no full eval spent)
     confirmations: int = 0  # narrow vetoes retried at higher k (see `narrow_failing_tiers`)
-    rounds: int = 0
+    iterations: int = 0
     proposal_batch_size: int = 1
     # Spend meters over the WHOLE search (seed, screens, full splits, holdout, confirmations).
     # worker_usage: worker-LLM tokens from self-metering runtimes (the pi worker path; None on
@@ -157,6 +156,18 @@ class CreateResult(BaseModel):
     # lifetime seconds (None on the local backend).
     worker_usage: TokenUsage | None = None
     sandbox_usage: SandboxUsage | None = None
+
+
+@dataclass
+class _ScoredProposal:
+    """One fully scored sibling awaiting iteration-level winner selection."""
+
+    proposal_index: int
+    child: HarnessDoc
+    delta: HarnessDelta
+    report: ClosedLoopReport
+    gate: GateRecord
+    record: ProposalRecord
 
 
 def cluster_failures(report: ClosedLoopReport, tasks: list[TaskSpec]) -> list[FailureSignature]:
@@ -230,7 +241,7 @@ def select_failure_cluster(
 ) -> FailureSignature:
     """Choose a high-impact cluster without getting trapped on one exhausted failure.
 
-    A cluster's priority is ``task_count / (1 + prior_rounds_on_this_parent)``. Large mechanisms
+    A cluster's priority is ``task_count / (1 + prior_iterations_on_this_parent)``. Large mechanisms
     still receive proportionally more search budget, but equally sized singleton failures rotate
     after one batch instead of a deterministic ``clusters[0]`` absorbing the entire run. The
     stable mechanism/task ordering resolves exact ties without entropy.
@@ -240,9 +251,9 @@ def select_failure_cluster(
 
     def _priority(cluster: FailureSignature) -> tuple[float, str, tuple[str, ...]]:
         key = _failure_cluster_key(parent_doc_hash, cluster)
-        rounds = expansion_counts.get(key, 0)
+        prior_iterations = expansion_counts.get(key, 0)
         return (
-            -(len(cluster.task_ids) / (1 + rounds)),
+            -(len(cluster.task_ids) / (1 + prior_iterations)),
             cluster.mechanism,
             tuple(cluster.task_ids),
         )
@@ -252,31 +263,6 @@ def select_failure_cluster(
 
 def _failure_cluster_key(parent_doc_hash: str, cluster: FailureSignature) -> FailureClusterKey:
     return parent_doc_hash, cluster.mechanism, tuple(cluster.task_ids)
-
-
-def select_parent(
-    entries: list[PoolEntry], children_counts: dict[str, int], seed: int
-) -> PoolEntry:
-    """Pick the next parent by stepping-stone weighting, deterministically.
-
-    Weight = (success_rate + floor) / (1 + children_count): better variants are favored, but each
-    expansion discounts a parent so the search spreads over the pool instead of hill-climbing one
-    lineage. The "random" point is blake2b(seed) mapped to [0, 1) over the cumulative weights —
-    reproducible, no RNG.
-    """
-    if not entries:
-        raise ValueError("cannot select a parent from an empty pool")
-    weights = [
-        (entry.success_rate + _SELECTION_FLOOR) / (1 + children_counts.get(entry.doc_hash, 0))
-        for entry in entries
-    ]
-    point = _fraction(str(seed)) * sum(weights)
-    cumulative = 0.0
-    for entry, weight in zip(entries, weights, strict=True):
-        cumulative += weight
-        if point < cumulative:
-            return entry
-    return entries[-1]  # floating-point edge: the point landed exactly on the total
 
 
 def narrow_failing_tiers(
@@ -416,22 +402,22 @@ def create_harness(
     e2b_metadata: dict[str, str] | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
-    on_iteration: Callable[[IterationRecord], None] | None = None,
+    on_proposal: Callable[[ProposalRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
     on_sandbox_usage: Callable[[SandboxUsage], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> CreateResult:
     """Search for a better harness under a fixed eval budget; the champion is renamed to `name`.
 
-    Scores the seed first, then runs `iterations` proposal rounds. Each round asks the proposer
-    for `proposal_batch_size` sibling deltas against one selected parent before any sibling is
-    evaluated. A dead proposal (unusable/invalid proposal, or one
-    screened out on its own trigger cluster) ends early and cheaply: it is counted
-    (`skipped`/`screened`), recorded in `iteration_records`, narrated via `on_note`, and
-    the search moves straight to the next iteration. Never fatal. `on_accept` fires the
-    moment a delta is accepted, with the new champion doc, its delta (verdict attached),
-    and its full-suite score, so callers can persist champions in real time instead of
-    waiting for the search to finish.
+    Scores the seed first, then runs ``iterations`` proposal batches. Each iteration asks the
+    proposer for ``proposal_batch_size`` siblings against the frozen champion, evaluates every
+    sibling against that same snapshot, and selects at most one winner. A dead proposal
+    (unusable, invalid, or screened out on its trigger cluster) ends early and cheaply. It is
+    counted, recorded in ``proposal_records``, and narrated via ``on_note`` without aborting its
+    siblings. ``on_proposal`` receives every final record in stable proposal order after
+    selection. ``on_progress`` receives the seed plus exactly one champion point per iteration,
+    including an unchanged point when no proposal wins. ``on_accept`` fires at most once per
+    iteration with the selected champion, its final delta verdict, and its full-suite score.
 
     ``on_sandbox_usage`` fires after the shared E2B pool is successfully closed on every exit
     path, including failures and cancellation, so callers can persist already-incurred evaluator
@@ -450,7 +436,7 @@ def create_harness(
     tool calls still answered by the world model host-side. One `E2BSandboxPool` is shared across
     score waves within a proposal batch, then its idle runners are retired before the next batch's
     proposer call. This amortizes bootstrap work across sibling proposals without carrying E2B
-    command streams through the potentially long proposal gap between rounds. `eval_concurrency`
+    command streams through the potentially long proposal gap between iterations. `eval_concurrency`
     is how many (task, attempt) cells run at once; `None` means the backend default — 1
     (sequential) for local, 0 (every cell at once, one pooled sandbox each) for e2b.
     `e2b_template` names a prebaked sandbox template (node 22 + the pi runner deps) so e2b
@@ -461,7 +447,7 @@ def create_harness(
     2-3 failing tasks its delta claims to fix, k passes). The screen is lexicographic: full-task
     success first, then assertion-level partial credit, so a real partial fix is not flattened
     into a binary tie. If neither signal improves, the delta is rejected and archived for a
-    fraction of a full eval's cost, and no `on_progress` event fires. Repeated batches discount
+    fraction of a full eval's cost. Repeated iterations discount
     their cluster on that parent, preventing one environment-limited singleton from absorbing the
     whole run. Held-out evals run only for children that pass tiers 1-2, so a bad delta costs at
     most one full-split eval. Every judged delta (screened, rejected, or accepted) is fed back to
@@ -509,7 +495,6 @@ def create_harness(
         reports: dict[str, ClosedLoopReport] = {}
         holdout_reports: dict[str, ClosedLoopReport] = {}
         archive = DeltaArchive(seed=seed_doc)
-        children_counts: dict[str, int] = {}
         failure_cluster_expansions: dict[FailureClusterKey, int] = {}
         skipped = 0
         screened = 0
@@ -577,13 +562,6 @@ def create_harness(
         if on_progress is not None:
             on_progress(0, seed_doc.name, seed_report.success_rate, True)
 
-        pool = [
-            PoolEntry(
-                doc_hash=seed_doc.doc_hash,
-                name=seed_doc.name,
-                success_rate=seed_report.success_rate,
-            )
-        ]
         champion_hash = seed_doc.doc_hash
         best_full = seed_report.success_rate
         # The regression suite: tasks the champion lineage has fully passed. Wins promote in
@@ -594,270 +572,207 @@ def create_harness(
             if seed_report.per_task[task.task_id].success_rate >= 1.0 - _TIE_EPS
         )
 
-        iteration_records: list[IterationRecord] = []
+        proposal_records: list[ProposalRecord] = []
 
-        def _dead(record: IterationRecord, note: str) -> None:
-            # A dead iteration is a first-class search event: recorded, streamed, narrated.
-            # It ends early (no full eval was spent) and the search moves straight on.
-            iteration_records.append(record)
-            if on_iteration is not None:
-                on_iteration(record)
-            _note(note)
-
-        proposal_queue: list[
-            tuple[
-                HarnessDoc,
-                ClosedLoopReport,
-                FailureSignature,
-                HarnessDelta | ProposalFailure | None,
-            ]
-        ] = []
-        batch_cluster_key: FailureClusterKey | None = None
-        batch_cluster_expansion_recorded = False
-        total_attempts = iterations * proposal_batch_size
-        for i in range(1, total_attempts + 1):
-            _check_cancelled()
-            round_index = ((i - 1) // proposal_batch_size) + 1
-            proposal_index = ((i - 1) % proposal_batch_size) + 1
-            champion_score = reports[champion_hash].success_rate
-            if proposal_index == 1:
-                # The previous round's eval runners would otherwise sit idle through this
-                # potentially long proposer call. Retire only idle runners now; subsequent score
-                # waves for this batch still share the newly warmed pool.
-                if sandbox_pool is not None:
-                    sandbox_pool.retire_idle()
-                parent_entry = select_parent(pool, children_counts, seed=round_index)
-                parent = docs[parent_entry.doc_hash]
-                parent_report = reports[parent_entry.doc_hash]
-                clusters = cluster_failures(parent_report, tasks)
-                batch_cluster_key = None
-                batch_cluster_expansion_recorded = False
-                if clusters:
-                    trigger = select_failure_cluster(
-                        clusters,
-                        failure_cluster_expansions,
-                        parent_doc_hash=parent.doc_hash,
-                    )
-                    batch_cluster_key = _failure_cluster_key(parent.doc_hash, trigger)
-                else:
-                    trigger = FailureSignature(mechanism=ALL_PASS_MECHANISM)
-                evidence = render_evidence(trigger, parent_report, tasks)
-                try:
-                    batch = proposer.propose_batch(
-                        parent,
-                        trigger,
-                        evidence,
-                        history=archive.deltas,
-                        count=proposal_batch_size,
-                        should_cancel=should_cancel,
-                    )
-                    if len(batch) != proposal_batch_size:
-                        raise ValueError(
-                            f"proposer returned {len(batch)} proposals; "
-                            f"expected {proposal_batch_size}"
-                        )
-                except HarnessSearchCancelled:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - provider/agent/transport failure
-                    batch = [ProposalFailure(reason=str(exc))] * proposal_batch_size
-                _check_cancelled()
-                proposal_queue.extend((parent, parent_report, trigger, delta) for delta in batch)
-
-            parent, parent_report, trigger, delta = proposal_queue.pop(0)
-            label = _proposal_label(
-                round_index,
-                proposal_index,
-                rounds=iterations,
-                batch_size=proposal_batch_size,
+        def _stage_dead(records: list[ProposalRecord], record: ProposalRecord) -> None:
+            """Stage one dead proposal for ordered publication after batch selection."""
+            records.append(record)
+            _note(
+                _dead_proposal_note(
+                    record,
+                    iterations=iterations,
+                    batch_size=proposal_batch_size,
+                )
             )
-            if isinstance(delta, ProposalFailure):
-                skipped += 1
-                _dead(
-                    IterationRecord(
-                        iteration=i,
-                        round=round_index,
-                        proposal_index=proposal_index,
-                        outcome="proposer_error",
-                        trigger=trigger,
-                        reason=delta.reason,
-                        champion_score=champion_score,
-                    ),
-                    f"{label}: proposer call failed ({delta.reason}); skipped",
+
+        for iteration_index in range(1, iterations + 1):
+            _check_cancelled()
+            # Eval runners from the previous iteration would otherwise sit idle through the
+            # potentially long proposer call. Sibling score waves still share the newly warmed
+            # pool for this whole iteration.
+            if sandbox_pool is not None:
+                sandbox_pool.retire_idle()
+
+            frozen_champion_hash = champion_hash
+            parent = docs[frozen_champion_hash]
+            parent_report = reports[frozen_champion_hash]
+            frozen_champion_score = parent_report.success_rate
+            frozen_best_full = best_full
+            frozen_suite = list(suite)
+            frozen_champion_holdout = holdout_reports.get(frozen_champion_hash)
+            clusters = cluster_failures(parent_report, tasks)
+            batch_cluster_key: FailureClusterKey | None = None
+            batch_cluster_expansion_recorded = False
+            if clusters:
+                trigger = select_failure_cluster(
+                    clusters,
+                    failure_cluster_expansions,
+                    parent_doc_hash=parent.doc_hash,
                 )
-                continue
-            if delta is None:
-                skipped += 1
-                _dead(
-                    IterationRecord(
-                        iteration=i,
-                        round=round_index,
-                        proposal_index=proposal_index,
-                        outcome="unusable",
-                        trigger=trigger,
-                        reason="unparseable or truncated meta reply",
-                        champion_score=champion_score,
-                    ),
-                    f"{label}: proposal unusable (unparseable or truncated meta reply); skipped",
-                )
-                continue
-            ops_summary = [f"{op.op} {op.surface_id}" for op in delta.ops]
-            rationales = [op.rationale[:1_000] for op in delta.ops]
-            expected_effect = delta.expected_effect[:1_000]
-            if any(d.delta_id == delta.delta_id for d in archive.deltas):
-                # The proposer re-proposed a delta this run already judged. Re-evaluating it
-                # would spend a screen (or worse) to learn a known verdict; skip without spend.
-                # The duplicate is NOT re-archived; the original carries the verdict.
-                skipped += 1
-                _dead(
-                    IterationRecord(
-                        iteration=i,
-                        round=round_index,
-                        proposal_index=proposal_index,
-                        outcome="invalid",
-                        delta_id=delta.delta_id,
-                        trigger=delta.trigger,
-                        expected_effect=expected_effect,
-                        ops=ops_summary,
-                        rationales=rationales,
-                        reason="duplicate of an already-judged delta",
-                        champion_score=champion_score,
-                    ),
-                    f"{label}: proposal duplicates an already-judged delta; skipped",
-                )
-                continue
+                batch_cluster_key = _failure_cluster_key(parent.doc_hash, trigger)
+            else:
+                trigger = FailureSignature(mechanism=ALL_PASS_MECHANISM)
+            evidence = render_evidence(trigger, parent_report, tasks)
             try:
-                child_name = (
-                    f"{name}-g{round_index}"
-                    if proposal_batch_size == 1
-                    else f"{name}-g{round_index}-p{proposal_index}"
+                batch = proposer.propose_batch(
+                    parent,
+                    trigger,
+                    evidence,
+                    history=archive.deltas,
+                    count=proposal_batch_size,
+                    should_cancel=should_cancel,
                 )
-                child = apply_delta(parent, delta, child_name)
-            except ValueError as exc:
-                delta.verdict = GateRecord(accepted=False, reason=f"invalid before eval: {exc}")
-                archive.deltas.append(delta)
-                skipped += 1
-                _dead(
-                    IterationRecord(
-                        iteration=i,
-                        round=round_index,
-                        proposal_index=proposal_index,
-                        outcome="invalid",
-                        delta_id=delta.delta_id,
-                        trigger=delta.trigger,
-                        expected_effect=expected_effect,
-                        ops=ops_summary,
-                        rationales=rationales,
-                        reason=f"invalid before eval: {exc}",
-                        champion_score=champion_score,
-                    ),
-                    f"{label}: delta invalid before eval ({exc}); skipped",
-                )
-                continue
-            if harness_backend == "e2b" and child.runtime_kind() != "pi-node":
-                # A delta that abandons the pi-node runtime cannot execute on this backend:
-                # `doc.runtime(backend="e2b")` would raise mid-score and abort the whole search.
-                # Reject-and-archive it like any other invalid-before-eval proposal.
-                delta.verdict = GateRecord(
-                    accepted=False,
-                    reason=(
-                        f"invalid before eval: runtime kind {child.runtime_kind()!r} cannot "
-                        "run on harness_backend='e2b' (pi-node only)"
-                    ),
-                )
-                archive.deltas.append(delta)
-                skipped += 1
-                _dead(
-                    IterationRecord(
-                        iteration=i,
-                        round=round_index,
-                        proposal_index=proposal_index,
-                        outcome="invalid",
-                        candidate=child.name,
-                        candidate_doc_hash=child.doc_hash,
-                        delta_id=delta.delta_id,
-                        trigger=delta.trigger,
-                        expected_effect=expected_effect,
-                        ops=ops_summary,
-                        rationales=rationales,
-                        reason=str(delta.verdict.reason),
-                        champion_score=champion_score,
-                    ),
-                    f"{label}: delta abandoned the pi-node runtime "
-                    "(e2b runs pi-node only); skipped",
-                )
-                continue
-
-            # Discount the selected cluster only when this batch produces its first child that can
-            # actually enter evaluation. Parsed-but-duplicate, inapplicable, or backend-invalid
-            # deltas teach the search nothing about that failure mechanism. Sibling proposals share
-            # one batch expansion, so later evaluable children must not discount it again.
-            if batch_cluster_key is not None and not batch_cluster_expansion_recorded:
-                failure_cluster_expansions[batch_cluster_key] = (
-                    failure_cluster_expansions.get(batch_cluster_key, 0) + 1
-                )
-                batch_cluster_expansion_recorded = True
-
-            # Only an evaluable child counts as a real expansion. Provider faults,
-            # unusable replies, duplicates, and invalid deltas leave the parent fresh.
-            children_counts[parent.doc_hash] = children_counts.get(parent.doc_hash, 0) + 1
-
-            # Cheap screen: before a full-split eval, the delta must improve the very cluster it
-            # was proposed to fix. Compare task success first, then assertion-level partial credit:
-            # a 0%-to-75% assertion lift must not be flattened into the same "0 vs 0" as no effect.
-            screen_child_value: float | None = None
-            screen_parent_value: float | None = None
-            screen_child_fraction_value: float | None = None
-            screen_parent_fraction_value: float | None = None
-            screen_tasks = [t for t in tasks if t.task_id in set(trigger.task_ids)]
-            if screen_tasks:
-                screen_report = _score(child, screen_tasks)
-                parent_mean = _suite_rate(parent_report, sorted(trigger.task_ids))
-                child_mean = _suite_rate(screen_report, sorted(trigger.task_ids))
-                parent_fraction = _suite_fraction(parent_report, sorted(trigger.task_ids))
-                child_fraction = _suite_fraction(screen_report, sorted(trigger.task_ids))
-                screen_child_value = child_mean
-                screen_parent_value = parent_mean
-                screen_child_fraction_value = child_fraction
-                screen_parent_fraction_value = parent_fraction
-                success_regressed = child_mean < parent_mean - _TIE_EPS
-                success_tied = abs(child_mean - parent_mean) <= _TIE_EPS
-                fraction_did_not_improve = child_fraction <= parent_fraction + _TIE_EPS
-                feedback_error = _record_proposer_evaluation(
-                    proposer,
-                    delta,
-                    stage="screen",
-                    report=screen_report,
-                    tasks=screen_tasks,
-                    summary=(
-                        f"trigger success {child_mean:.3f} vs parent {parent_mean:.3f}; "
-                        f"assertion fraction {child_fraction:.3f} vs parent "
-                        f"{parent_fraction:.3f}"
-                    ),
-                )
-                if feedback_error is not None:
-                    _note(
-                        f"{label}: screen feedback could not be persisted "
-                        f"({feedback_error}); continuing"
+                if len(batch) != proposal_batch_size:
+                    raise ValueError(
+                        f"proposer returned {len(batch)} proposals; expected {proposal_batch_size}"
                     )
-                if success_regressed or (success_tied and fraction_did_not_improve):
+            except HarnessSearchCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - provider/agent/transport failure
+                batch = [ProposalFailure(reason=str(exc))] * proposal_batch_size
+            _check_cancelled()
+
+            batch_records: list[ProposalRecord] = []
+            batch_deltas: list[HarnessDelta] = []
+            scored_proposals: list[_ScoredProposal] = []
+            seen_delta_ids = {delta.delta_id for delta in archive.deltas}
+            seen_child_hashes = {
+                delta.child_doc_hash for delta in archive.deltas if delta.child_doc_hash is not None
+            }
+
+            for proposal_index, delta in enumerate(batch, 1):
+                _check_cancelled()
+                label = _proposal_label(
+                    iteration_index,
+                    proposal_index,
+                    iterations=iterations,
+                    batch_size=proposal_batch_size,
+                )
+                if isinstance(delta, ProposalFailure):
+                    skipped += 1
+                    _stage_dead(
+                        batch_records,
+                        ProposalRecord(
+                            iteration=iteration_index,
+                            proposal_index=proposal_index,
+                            outcome="proposer_error",
+                            trigger=trigger,
+                            reason=delta.reason,
+                            champion_score=frozen_champion_score,
+                        ),
+                    )
+                    continue
+                if delta is None:
+                    skipped += 1
+                    _stage_dead(
+                        batch_records,
+                        ProposalRecord(
+                            iteration=iteration_index,
+                            proposal_index=proposal_index,
+                            outcome="unusable",
+                            trigger=trigger,
+                            reason="unparseable or truncated meta reply",
+                            champion_score=frozen_champion_score,
+                        ),
+                    )
+                    continue
+                ops_summary = [f"{op.op} {op.surface_id}" for op in delta.ops]
+                rationales = [op.rationale[:1_000] for op in delta.ops]
+                expected_effect = delta.expected_effect[:1_000]
+                if delta.delta_id in seen_delta_ids:
+                    # The proposer re-proposed a delta this run already judged. Re-evaluating it
+                    # would spend a screen (or worse) to learn a known verdict; skip without spend.
+                    # Preserve this proposal as a distinct rejected archive entry so history remains
+                    # complete, including duplicates inside the current sibling batch.
+                    delta.verdict = GateRecord(
+                        accepted=False,
+                        reason="invalid before eval: duplicate of an already-proposed delta",
+                    )
+                    batch_deltas.append(delta)
+                    skipped += 1
+                    _stage_dead(
+                        batch_records,
+                        ProposalRecord(
+                            iteration=iteration_index,
+                            proposal_index=proposal_index,
+                            outcome="invalid",
+                            delta_id=delta.delta_id,
+                            trigger=delta.trigger,
+                            expected_effect=expected_effect,
+                            ops=ops_summary,
+                            rationales=rationales,
+                            reason="duplicate of an already-proposed delta",
+                            champion_score=frozen_champion_score,
+                        ),
+                    )
+                    continue
+                seen_delta_ids.add(delta.delta_id)
+                batch_deltas.append(delta)
+                try:
+                    child_name = f"{name}-i{iteration_index}-p{proposal_index}"
+                    child = apply_delta(parent, delta, child_name)
+                except ValueError as exc:
+                    delta.verdict = GateRecord(accepted=False, reason=f"invalid before eval: {exc}")
+                    skipped += 1
+                    _stage_dead(
+                        batch_records,
+                        ProposalRecord(
+                            iteration=iteration_index,
+                            proposal_index=proposal_index,
+                            outcome="invalid",
+                            delta_id=delta.delta_id,
+                            trigger=delta.trigger,
+                            expected_effect=expected_effect,
+                            ops=ops_summary,
+                            rationales=rationales,
+                            reason=f"invalid before eval: {exc}",
+                            champion_score=frozen_champion_score,
+                        ),
+                    )
+                    continue
+                if child.doc_hash in seen_child_hashes:
+                    delta.verdict = GateRecord(
+                        accepted=False,
+                        reason="invalid before eval: duplicate of an already-proposed child",
+                    )
+                    skipped += 1
+                    _stage_dead(
+                        batch_records,
+                        ProposalRecord(
+                            iteration=iteration_index,
+                            proposal_index=proposal_index,
+                            outcome="invalid",
+                            candidate=child.name,
+                            candidate_doc_hash=child.doc_hash,
+                            delta_id=delta.delta_id,
+                            trigger=delta.trigger,
+                            expected_effect=expected_effect,
+                            ops=ops_summary,
+                            rationales=rationales,
+                            reason="duplicate of an already-proposed child",
+                            champion_score=frozen_champion_score,
+                        ),
+                    )
+                    continue
+                seen_child_hashes.add(child.doc_hash)
+                if harness_backend == "e2b" and child.runtime_kind() != "pi-node":
+                    # A delta that abandons the pi-node runtime cannot execute on this backend:
+                    # `doc.runtime(backend="e2b")` would raise mid-score and abort the whole search.
+                    # Reject-and-archive it like any other invalid-before-eval proposal.
                     delta.verdict = GateRecord(
                         accepted=False,
                         reason=(
-                            f"screened out: trigger success {child_mean:.2f} vs parent "
-                            f"{parent_mean:.2f}; assertion fraction {child_fraction:.2f} vs "
-                            f"parent {parent_fraction:.2f} over {len(screen_tasks)} task(s), "
-                            f"k={k}; "
-                            "the delta did not improve its own target"
+                            f"invalid before eval: runtime kind {child.runtime_kind()!r} cannot "
+                            "run on harness_backend='e2b' (pi-node only)"
                         ),
                     )
-                    archive.deltas.append(delta)
-                    screened += 1
-                    _dead(
-                        IterationRecord(
-                            iteration=i,
-                            round=round_index,
+                    skipped += 1
+                    _stage_dead(
+                        batch_records,
+                        ProposalRecord(
+                            iteration=iteration_index,
                             proposal_index=proposal_index,
-                            outcome="screened",
+                            outcome="invalid",
                             candidate=child.name,
                             candidate_doc_hash=child.doc_hash,
                             delta_id=delta.delta_id,
@@ -866,154 +781,292 @@ def create_harness(
                             ops=ops_summary,
                             rationales=rationales,
                             reason=str(delta.verdict.reason),
-                            screen_child=child_mean,
-                            screen_parent=parent_mean,
-                            screen_child_fraction=child_fraction,
-                            screen_parent_fraction=parent_fraction,
-                            champion_score=champion_score,
+                            champion_score=frozen_champion_score,
                         ),
-                        f"{label}: screened out: trigger success "
-                        f"{child_mean:.2f} vs parent {parent_mean:.2f}; assertion fraction "
-                        f"{child_fraction:.2f} vs parent {parent_fraction:.2f}",
                     )
                     continue
 
-            child_report = _score(child, tasks)
-            pre_verdict = gate_delta(
-                delta,
-                child=child_report,
-                champion=reports[champion_hash],
-                best_full=best_full,
-                suite=suite,
-            )
-            # The held-out tier is measured for every candidate that could still be accepted —
-            # including candidates whose suite/full veto is narrow enough for a confirmation
-            # re-run. A confirmation may overturn a veto; it must never bypass the held-out tier.
-            could_accept = pre_verdict.accepted or (
-                confirm_narrow_vetoes
-                and narrow_failing_tiers(pre_verdict, k=k, n_suite=len(suite), n_holdout=0)
-                is not None
-            )
-            if holdout and could_accept:
-                child_holdout = _score(child, holdout)
-                holdout_reports[child.doc_hash] = child_holdout
-                if champion_hash not in holdout_reports:
-                    holdout_reports[champion_hash] = _score(docs[champion_hash], holdout)
-                verdict = gate_delta(
+                # Discount the selected cluster only when this batch produces its first child
+                # that can enter evaluation. Parsed-but-duplicate, inapplicable, or
+                # backend-invalid deltas teach the search nothing about that failure mechanism.
+                # Siblings share one expansion, so later children must not discount it again.
+                if batch_cluster_key is not None and not batch_cluster_expansion_recorded:
+                    failure_cluster_expansions[batch_cluster_key] = (
+                        failure_cluster_expansions.get(batch_cluster_key, 0) + 1
+                    )
+                    batch_cluster_expansion_recorded = True
+
+                # Before a full-split eval, the delta must improve its target cluster. Compare
+                # task success first, then assertion-level partial credit, so a 0%-to-75%
+                # assertion lift is not flattened into the same "0 vs 0" as no effect.
+                screen_child_value: float | None = None
+                screen_parent_value: float | None = None
+                screen_child_fraction_value: float | None = None
+                screen_parent_fraction_value: float | None = None
+                screen_tasks = [t for t in tasks if t.task_id in set(trigger.task_ids)]
+                if screen_tasks:
+                    screen_report = _score(child, screen_tasks)
+                    parent_mean = _suite_rate(parent_report, sorted(trigger.task_ids))
+                    child_mean = _suite_rate(screen_report, sorted(trigger.task_ids))
+                    parent_fraction = _suite_fraction(parent_report, sorted(trigger.task_ids))
+                    child_fraction = _suite_fraction(screen_report, sorted(trigger.task_ids))
+                    screen_child_value = child_mean
+                    screen_parent_value = parent_mean
+                    screen_child_fraction_value = child_fraction
+                    screen_parent_fraction_value = parent_fraction
+                    success_regressed = child_mean < parent_mean - _TIE_EPS
+                    success_tied = abs(child_mean - parent_mean) <= _TIE_EPS
+                    fraction_did_not_improve = child_fraction <= parent_fraction + _TIE_EPS
+                    feedback_error = _record_proposer_evaluation(
+                        proposer,
+                        delta,
+                        stage="screen",
+                        report=screen_report,
+                        tasks=screen_tasks,
+                        summary=(
+                            f"trigger success {child_mean:.3f} vs parent {parent_mean:.3f}; "
+                            f"assertion fraction {child_fraction:.3f} vs parent "
+                            f"{parent_fraction:.3f}"
+                        ),
+                    )
+                    if feedback_error is not None:
+                        _note(
+                            f"{label}: screen feedback could not be persisted "
+                            f"({feedback_error}); continuing"
+                        )
+                    if success_regressed or (success_tied and fraction_did_not_improve):
+                        delta.verdict = GateRecord(
+                            accepted=False,
+                            reason=(
+                                f"screened out: trigger success {child_mean:.2f} vs parent "
+                                f"{parent_mean:.2f}; assertion fraction {child_fraction:.2f} vs "
+                                f"parent {parent_fraction:.2f} over {len(screen_tasks)} task(s), "
+                                f"k={k}; "
+                                "the delta did not improve its own target"
+                            ),
+                        )
+                        screened += 1
+                        _stage_dead(
+                            batch_records,
+                            ProposalRecord(
+                                iteration=iteration_index,
+                                proposal_index=proposal_index,
+                                outcome="screened",
+                                candidate=child.name,
+                                candidate_doc_hash=child.doc_hash,
+                                delta_id=delta.delta_id,
+                                trigger=delta.trigger,
+                                expected_effect=expected_effect,
+                                ops=ops_summary,
+                                rationales=rationales,
+                                reason=str(delta.verdict.reason),
+                                screen_child=child_mean,
+                                screen_parent=parent_mean,
+                                screen_child_fraction=child_fraction,
+                                screen_parent_fraction=parent_fraction,
+                                champion_score=frozen_champion_score,
+                            ),
+                        )
+                        continue
+
+                child_report = _score(child, tasks)
+                pre_verdict = gate_delta(
                     delta,
                     child=child_report,
-                    champion=reports[champion_hash],
-                    best_full=best_full,
-                    suite=suite,
-                    child_holdout=child_holdout,
-                    champion_holdout=holdout_reports[champion_hash],
+                    champion=parent_report,
+                    best_full=frozen_best_full,
+                    suite=frozen_suite,
                 )
-            else:
-                verdict = pre_verdict
-            tiers = (
-                narrow_failing_tiers(verdict, k=k, n_suite=len(suite), n_holdout=len(holdout or []))
-                if confirm_narrow_vetoes
+                # The held-out tier is measured for every candidate that could still be accepted,
+                # including candidates whose suite/full veto is narrow enough for a confirmation
+                # re-run. A confirmation may overturn a veto, but never bypass the held-out tier.
+                could_accept = pre_verdict.accepted or (
+                    confirm_narrow_vetoes
+                    and narrow_failing_tiers(
+                        pre_verdict, k=k, n_suite=len(frozen_suite), n_holdout=0
+                    )
+                    is not None
+                )
+                if holdout and could_accept:
+                    child_holdout = _score(child, holdout)
+                    holdout_reports[child.doc_hash] = child_holdout
+                    if frozen_champion_holdout is None:
+                        frozen_champion_holdout = _score(parent, holdout)
+                        holdout_reports[frozen_champion_hash] = frozen_champion_holdout
+                    verdict = gate_delta(
+                        delta,
+                        child=child_report,
+                        champion=parent_report,
+                        best_full=frozen_best_full,
+                        suite=frozen_suite,
+                        child_holdout=child_holdout,
+                        champion_holdout=frozen_champion_holdout,
+                    )
+                else:
+                    verdict = pre_verdict
+                tiers = (
+                    narrow_failing_tiers(
+                        verdict,
+                        k=k,
+                        n_suite=len(frozen_suite),
+                        n_holdout=len(holdout or []),
+                    )
+                    if confirm_narrow_vetoes
+                    else None
+                )
+                if tiers:
+                    confirmations += 1
+                    confirmed_ok = True
+                    notes: list[str] = []
+                    for tier in tiers:
+                        tier_tasks = (
+                            [t for t in tasks if t.task_id in set(frozen_suite)]
+                            if tier == "suite"
+                            else list(holdout or [])
+                        )
+                        child_re = _score(child, tier_tasks, k_override=2 * k)
+                        champ_re = _score(parent, tier_tasks, k_override=2 * k)
+                        re_delta = child_re.success_rate - champ_re.success_rate
+                        re_fraction_delta = child_re.mean_fraction - champ_re.mean_fraction
+                        notes.append(
+                            f"{tier} re-measured at k={2 * k}: success {re_delta:+.3f}, "
+                            f"assertion fraction {re_fraction_delta:+.3f}"
+                        )
+                        if re_delta < -_TIE_EPS or (
+                            abs(re_delta) <= _TIE_EPS and re_fraction_delta < -_TIE_EPS
+                        ):
+                            confirmed_ok = False
+                    outcome = "veto overturned" if confirmed_ok else "regression confirmed"
+                    verdict = GateRecord(
+                        suite_delta=verdict.suite_delta,
+                        suite_fraction_delta=verdict.suite_fraction_delta,
+                        full_delta=verdict.full_delta,
+                        full_fraction_delta=verdict.full_fraction_delta,
+                        holdout_delta=verdict.holdout_delta,
+                        holdout_fraction_delta=verdict.holdout_fraction_delta,
+                        accepted=confirmed_ok,
+                        reason=f"confirmation re-run ({outcome}): {'; '.join(notes)} | initially: "
+                        + verdict.reason,
+                    )
+                docs[child.doc_hash] = child
+                reports[child.doc_hash] = child_report
+                record = ProposalRecord(
+                    iteration=iteration_index,
+                    proposal_index=proposal_index,
+                    outcome="scored",
+                    candidate=child.name,
+                    candidate_doc_hash=child.doc_hash,
+                    delta_id=delta.delta_id,
+                    trigger=delta.trigger,
+                    expected_effect=expected_effect,
+                    ops=ops_summary,
+                    rationales=rationales,
+                    reason=str(verdict.reason),
+                    score=child_report.success_rate,
+                    gate_eligible=verdict.accepted,
+                    screen_child=screen_child_value,
+                    screen_parent=screen_parent_value,
+                    screen_child_fraction=screen_child_fraction_value,
+                    screen_parent_fraction=screen_parent_fraction_value,
+                    champion_score=frozen_champion_score,
+                )
+                batch_records.append(record)
+                scored_proposals.append(
+                    _ScoredProposal(
+                        proposal_index=proposal_index,
+                        child=child,
+                        delta=delta,
+                        report=child_report,
+                        gate=verdict,
+                        record=record,
+                    )
+                )
+
+            _check_cancelled()
+            eligible = [candidate for candidate in scored_proposals if candidate.gate.accepted]
+            winner = (
+                max(
+                    eligible,
+                    key=lambda candidate: (
+                        candidate.report.success_rate,
+                        candidate.report.mean_fraction,
+                        -candidate.proposal_index,
+                    ),
+                )
+                if eligible
                 else None
             )
-            if tiers:
-                confirmations += 1
-                confirmed_ok = True
-                notes: list[str] = []
-                for tier in tiers:
-                    tier_tasks = (
-                        [t for t in tasks if t.task_id in set(suite)]
-                        if tier == "suite"
-                        else list(holdout or [])
+            for candidate in scored_proposals:
+                gate_eligible = candidate.gate.accepted
+                if winner is candidate:
+                    final_gate = candidate.gate
+                elif gate_eligible:
+                    assert winner is not None
+                    final_gate = candidate.gate.model_copy(
+                        update={
+                            "accepted": False,
+                            "reason": (
+                                "gate eligible but not selected: "
+                                f"proposal {winner.proposal_index} ranked higher by full success, "
+                                "assertion fraction, then proposal order | " + candidate.gate.reason
+                            ),
+                        }
                     )
-                    child_re = _score(child, tier_tasks, k_override=2 * k)
-                    champ_re = _score(docs[champion_hash], tier_tasks, k_override=2 * k)
-                    re_delta = child_re.success_rate - champ_re.success_rate
-                    re_fraction_delta = child_re.mean_fraction - champ_re.mean_fraction
-                    notes.append(
-                        f"{tier} re-measured at k={2 * k}: success {re_delta:+.3f}, "
-                        f"assertion fraction {re_fraction_delta:+.3f}"
+                else:
+                    final_gate = candidate.gate
+                candidate.delta.verdict = final_gate
+                candidate.record.gate_eligible = gate_eligible
+                candidate.record.selected = winner is candidate
+                candidate.record.reason = final_gate.reason
+
+            # Full-stage history must describe final selection, not preliminary gate eligibility.
+            # Persist it before the atomic commit so cancellation cannot publish a partial winner.
+            for candidate in scored_proposals:
+                assert candidate.delta.verdict is not None
+                feedback_error = _record_proposer_evaluation(
+                    proposer,
+                    candidate.delta,
+                    stage="full",
+                    report=candidate.report,
+                    tasks=tasks,
+                    summary=candidate.delta.verdict.reason,
+                )
+                if feedback_error is not None:
+                    _note(
+                        f"iteration {iteration_index}/{iterations} proposal "
+                        f"{candidate.proposal_index}/{proposal_batch_size}: full feedback could "
+                        f"not be persisted ({feedback_error}); continuing"
                     )
-                    if re_delta < -_TIE_EPS or (
-                        abs(re_delta) <= _TIE_EPS and re_fraction_delta < -_TIE_EPS
-                    ):
-                        confirmed_ok = False
-                outcome = "veto overturned" if confirmed_ok else "regression confirmed"
-                verdict = GateRecord(
-                    suite_delta=verdict.suite_delta,
-                    suite_fraction_delta=verdict.suite_fraction_delta,
-                    full_delta=verdict.full_delta,
-                    full_fraction_delta=verdict.full_fraction_delta,
-                    holdout_delta=verdict.holdout_delta,
-                    holdout_fraction_delta=verdict.holdout_fraction_delta,
-                    accepted=confirmed_ok,
-                    reason=f"confirmation re-run ({outcome}): {'; '.join(notes)} | initially: "
-                    + verdict.reason,
-                )
-            if verdict.accepted:
-                # Scoring checks cancellation on return, but gating and confirmation bookkeeping
-                # happen afterward. Check again at the acceptance commit boundary so a cancelled
-                # child never enters lineage or reaches the persistence callback.
-                _check_cancelled()
-            feedback_error = _record_proposer_evaluation(
-                proposer,
-                delta,
-                stage="full",
-                report=child_report,
-                tasks=tasks,
-                summary=verdict.reason,
-            )
-            if feedback_error is not None:
-                _note(
-                    f"{label}: full feedback could not be persisted ({feedback_error}); continuing"
-                )
-            delta.verdict = verdict
-            archive.deltas.append(delta)
-            docs[child.doc_hash] = child
-            reports[child.doc_hash] = child_report
-            if verdict.accepted:
-                pool.append(
-                    PoolEntry(
-                        doc_hash=child.doc_hash,
-                        name=child.name,
-                        success_rate=child_report.success_rate,
-                    )
-                )
-                champion_hash = child.doc_hash
-                best_full = max(best_full, child_report.success_rate)
+
+            # One commit boundary for the whole iteration. Diagnostic notes may already have
+            # streamed, but cancellation before this point publishes no archive lineage,
+            # champion, suite, acceptance/proposal callback, or champion checkpoint.
+            _check_cancelled()
+            archive.deltas.extend(batch_deltas)
+            if winner is not None:
+                champion_hash = winner.child.doc_hash
+                best_full = max(best_full, winner.report.success_rate)
                 promoted = {
                     task_id
-                    for task_id, outcome in child_report.per_task.items()
+                    for task_id, outcome in winner.report.per_task.items()
                     if outcome.success_rate >= 1.0 - _TIE_EPS
                 }
                 suite = sorted(set(suite) | promoted)
                 if on_accept is not None:
-                    on_accept(child, delta, child_report.success_rate)
-            record = IterationRecord(
-                iteration=i,
-                round=round_index,
-                proposal_index=proposal_index,
-                outcome="scored",
-                candidate=child.name,
-                candidate_doc_hash=child.doc_hash,
-                delta_id=delta.delta_id,
-                trigger=delta.trigger,
-                expected_effect=expected_effect,
-                ops=ops_summary,
-                rationales=rationales,
-                reason=str(verdict.reason),
-                score=child_report.success_rate,
-                accepted=verdict.accepted,
-                screen_child=screen_child_value,
-                screen_parent=screen_parent_value,
-                screen_child_fraction=screen_child_fraction_value,
-                screen_parent_fraction=screen_parent_fraction_value,
-                champion_score=reports[champion_hash].success_rate,
-            )
-            iteration_records.append(record)
-            if on_iteration is not None:
-                on_iteration(record)
+                    on_accept(winner.child, winner.delta, winner.report.success_rate)
+
+            proposal_records.extend(batch_records)
+            if on_proposal is not None:
+                for record in batch_records:
+                    on_proposal(record)
             if on_progress is not None:
-                on_progress(i, child.name, child_report.success_rate, verdict.accepted)
+                champion = docs[champion_hash]
+                on_progress(
+                    iteration_index,
+                    champion.name,
+                    reports[champion_hash].success_rate,
+                    winner is not None,
+                )
 
         _check_cancelled()
         best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
@@ -1025,10 +1078,10 @@ def create_harness(
             holdout_reports=holdout_reports,
             suite=suite,
             skipped=skipped,
-            iteration_records=iteration_records,
+            proposal_records=proposal_records,
             screened=screened,
             confirmations=confirmations,
-            rounds=iterations,
+            iterations=iterations,
             proposal_batch_size=proposal_batch_size,
             worker_usage=combine_usage(worker_usages),
         )
@@ -1108,14 +1161,28 @@ def _record_proposer_evaluation(
     return None
 
 
-def _proposal_label(round_index: int, proposal_index: int, *, rounds: int, batch_size: int) -> str:
-    """Human-readable attempt identity that stays concise for singleton batches."""
+def _proposal_label(
+    iteration_index: int, proposal_index: int, *, iterations: int, batch_size: int
+) -> str:
+    """Human-readable proposal identity that stays concise for singleton batches."""
     if batch_size == 1:
-        return f"iteration {round_index}/{rounds}"
-    return f"round {round_index}/{rounds} proposal {proposal_index}/{batch_size}"
+        return f"iteration {iteration_index}/{iterations}"
+    return f"iteration {iteration_index}/{iterations} proposal {proposal_index}/{batch_size}"
 
 
-def _fraction(text: str) -> float:
-    """Stable hash of `text` mapped to [0, 1) — the repo's RNG-free randomness convention."""
-    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, "big") / 2**64
+def _dead_proposal_note(record: ProposalRecord, *, iterations: int, batch_size: int) -> str:
+    """Render one dead proposal for the lightweight narration callback."""
+    label = _proposal_label(
+        record.iteration,
+        record.proposal_index,
+        iterations=iterations,
+        batch_size=batch_size,
+    )
+    reason = record.reason or "no reason reported"
+    if record.outcome == "proposer_error":
+        return f"{label}: proposer call failed ({reason}); skipped"
+    if record.outcome == "unusable":
+        return f"{label}: proposal unusable ({reason}); skipped"
+    if record.outcome == "invalid":
+        return f"{label}: {reason}; skipped"
+    return f"{label}: {reason}"

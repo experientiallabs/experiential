@@ -136,9 +136,9 @@ class _Project:
         del agent, provider, should_cancel, writable_files
         self.runs += 1
         assert f"exactly {len(self.outputs)}" in instruction
-        round_dir = f"round-{self.runs:04d}"
+        iteration_dir = f"iteration-{self.runs:04d}"
         for index, output in enumerate(self.outputs, start=1):
-            self.files[f"proposals/{round_dir}/proposal-{index:02d}.json"] = output
+            self.files[f"proposals/{iteration_dir}/proposal-{index:02d}.json"] = output
         return AgentProjectRun(answer="done", events=(), worker_usage=TokenUsage())
 
 
@@ -176,9 +176,9 @@ class _InterruptedProject(_Project):
     ) -> AgentProjectRun:
         del agent, provider, instruction, should_cancel, writable_files
         self.runs += 1
-        round_dir = f"round-{self.runs:04d}"
+        iteration_dir = f"iteration-{self.runs:04d}"
         for index, output in enumerate(self.outputs, start=1):
-            self.files[f"proposals/{round_dir}/proposal-{index:02d}.json"] = output
+            self.files[f"proposals/{iteration_dir}/proposal-{index:02d}.json"] = output
         raise RuntimeError("Server disconnected after durable writes")
 
 
@@ -200,7 +200,7 @@ class _FailedProject(_Project):
 
 
 class _RepairingProject(_Project):
-    """Drive one proposal round with explicit per-turn rewrites of the same slot files."""
+    """Drive one proposal iteration with explicit per-turn rewrites of the same slot files."""
 
     def __init__(
         self,
@@ -237,7 +237,7 @@ class _RepairingProject(_Project):
             writes = self.repairs[repair_index] if repair_index < len(self.repairs) else {}
             writes = {**self.extra_rewrites, **writes}
         for index, output in writes.items():
-            self.files[f"proposals/round-0001/proposal-{index:02d}.json"] = output
+            self.files[f"proposals/iteration-0001/proposal-{index:02d}.json"] = output
         if self.runs == 1 and self.initial_error is not None:
             raise RuntimeError(self.initial_error)
         return AgentProjectRun(answer="done", events=(), worker_usage=TokenUsage())
@@ -247,7 +247,7 @@ class _RestoreFailingProject(_RepairingProject):
     """Lose the durable-write channel while the host restores a valid sibling."""
 
     def write_text(self, path: str, content: str) -> None:
-        if self.runs >= 2 and path == "proposals/round-0001/proposal-01.json":
+        if self.runs >= 2 and path == "proposals/iteration-0001/proposal-01.json":
             raise RuntimeError("valid sibling restoration failed")
         super().write_text(path, content)
 
@@ -358,7 +358,7 @@ def test_project_proposer_checks_cancellation_between_context_writes() -> None:
     assert project.runs == 0
 
 
-def test_project_proposer_uses_one_agent_turn_and_keeps_round_files() -> None:
+def test_project_proposer_uses_one_agent_turn_and_keeps_iteration_files() -> None:
     parent = HarnessDoc.baseline("parent")
     project = _Project([_payload(parent, "careful"), _payload(parent, "verify")])
     provider = _Provider("unused")
@@ -379,19 +379,19 @@ def test_project_proposer_uses_one_agent_turn_and_keeps_round_files() -> None:
     assert len(proposals) == 2
     assert len(second) == 2
     assert all(proposal is not None for proposal in proposals)
-    assert "context/round-0001/parent.json" in project.files
-    assert "context/round-0001/evidence.json" in project.files
-    assert "context/round-0001/history.json" in project.files
-    assert "context/round-0002/history.json" in project.files
-    assert "proposal-01.json" in project.files["context/round-0002/REQUEST.md"]
-    assert "failure evidence manifest" in project.files["context/round-0002/REQUEST.md"]
-    assert "content_files in listed order" in project.files["context/round-0002/REQUEST.md"]
+    assert "context/iteration-0001/parent.json" in project.files
+    assert "context/iteration-0001/evidence.json" in project.files
+    assert "context/iteration-0001/history.json" in project.files
+    assert "context/iteration-0002/history.json" in project.files
+    assert "proposal-01.json" in project.files["context/iteration-0002/REQUEST.md"]
+    assert "failure evidence manifest" in project.files["context/iteration-0002/REQUEST.md"]
+    assert "content_files in listed order" in project.files["context/iteration-0002/REQUEST.md"]
     assert all(project.files[path] == content for path, content in first_files.items())
     assert {path for path in project.files if path.startswith("parents/")} == {
         path for path in first_files if path.startswith("parents/")
     }
-    parent_context = json.loads(project.files["context/round-0001/parent.json"])
-    surface_manifests = _parent_surface_manifests(project, "context/round-0001/parent.json")
+    parent_context = json.loads(project.files["context/iteration-0001/parent.json"])
+    surface_manifests = _parent_surface_manifests(project, "context/iteration-0001/parent.json")
     assert parent_context["doc_hash"] == parent.doc_hash
     assert {
         surface["id"]: surface["content_hash"] for surface in surface_manifests
@@ -431,8 +431,8 @@ def test_project_parent_manifest_splits_large_surfaces_below_read_cap() -> None:
         parent, _trigger(), "inspect failures", history=[], count=1
     )
 
-    manifest_text = project.files["context/round-0001/parent.json"]
-    surfaces = _parent_surface_manifests(project, "context/round-0001/parent.json")
+    manifest_text = project.files["context/iteration-0001/parent.json"]
+    surfaces = _parent_surface_manifests(project, "context/iteration-0001/parent.json")
     code_surface = next(surface for surface in surfaces if surface["id"] == "code:large")
     relative_files = [
         path.removeprefix(f"{project.workspace}/")
@@ -456,9 +456,9 @@ def test_real_pi_parent_manifest_itself_fits_one_project_read() -> None:
         parent, _trigger(), "inspect failures", history=[], count=1
     )
 
-    manifest_text = project.files["context/round-0001/parent.json"]
+    manifest_text = project.files["context/iteration-0001/parent.json"]
     manifest = json.loads(manifest_text)
-    surfaces = _parent_surface_manifests(project, "context/round-0001/parent.json")
+    surfaces = _parent_surface_manifests(project, "context/iteration-0001/parent.json")
     assert len(manifest_text) < 16_000
     assert manifest["surface_count"] == len(parent.surfaces)
     assert len(surfaces) == len(parent.surfaces)
@@ -490,9 +490,11 @@ def test_project_context_preserves_evidence_and_compacts_judged_history() -> Non
     proposer.propose_batch(parent, _trigger(), evidence, history=history, count=1)
 
     evidence_manifest, evidence_chunks = _manifest_content(
-        project, "context/round-0002/evidence.json"
+        project, "context/iteration-0002/evidence.json"
     )
-    history_manifest, history_chunks = _manifest_content(project, "context/round-0002/history.json")
+    history_manifest, history_chunks = _manifest_content(
+        project, "context/iteration-0002/history.json"
+    )
     reconstructed_history = "".join(history_chunks)
     judged_history = json.loads(reconstructed_history)
 
@@ -510,7 +512,7 @@ def test_project_context_preserves_evidence_and_compacts_judged_history() -> Non
     assert all("content" not in entry["ops"][0] for entry in judged_history)
     assert all(entry["ops"][0]["content_length"] == len(large_change) for entry in judged_history)
     assert judged_history[0]["proposal_file"] is None
-    assert judged_history[1]["proposal_file"].endswith("/proposals/round-0001/proposal-01.json")
+    assert judged_history[1]["proposal_file"].endswith("/proposals/iteration-0001/proposal-01.json")
 
 
 def test_project_proposer_persists_candidate_evaluation_beside_its_proposal() -> None:
@@ -525,7 +527,7 @@ def test_project_proposer_persists_candidate_evaluation_beside_its_proposal() ->
 
     proposer.record_evaluation(proposal, stage="screen", content=evidence)
 
-    manifest_path = "evaluations/round-0001/proposal-01/screen.json"
+    manifest_path = "evaluations/iteration-0001/proposal-01/screen.json"
     manifest, chunks = _manifest_content(project, manifest_path)
     assert manifest["delta_id"] == proposal.delta_id
     assert manifest["stage"] == "screen"
@@ -598,22 +600,22 @@ def test_project_proposer_repairs_skill_frontmatter_and_protects_valid_sibling()
     assert all(isinstance(proposal, HarnessDelta) for proposal in proposals)
     assert project.write_grants == [
         (
-            "proposals/round-0001/proposal-01.json",
-            "proposals/round-0001/proposal-02.json",
+            "proposals/iteration-0001/proposal-01.json",
+            "proposals/iteration-0001/proposal-02.json",
         ),
-        ("proposals/round-0001/proposal-02.json",),
+        ("proposals/iteration-0001/proposal-02.json",),
     ]
-    assert project.files["proposals/round-0001/proposal-01.json"] == valid_raw
+    assert project.files["proposals/iteration-0001/proposal-01.json"] == valid_raw
     assert "name: <slug>" in project.instructions[0]
     assert "rewrite ONLY these" in project.instructions[1]
     assert "invalid files:" in project.instructions[1]
-    assert "proposals/round-0001/proposal-02.json" in project.instructions[1]
+    assert "proposals/iteration-0001/proposal-02.json" in project.instructions[1]
     assert "Do not rewrite them" in project.instructions[1]
     first_report = json.loads(
-        project.files["context/round-0001/proposal-validation-attempt-01.json"]
+        project.files["context/iteration-0001/proposal-validation-attempt-01.json"]
     )
     final_report = json.loads(
-        project.files["context/round-0001/proposal-validation-attempt-02.json"]
+        project.files["context/iteration-0001/proposal-validation-attempt-02.json"]
     )
     assert first_report["valid_slots"] == [1]
     assert "skill file has no frontmatter" in first_report["errors"][0]["reason"]
@@ -665,7 +667,7 @@ def test_project_proposer_repairs_history_and_sibling_duplicates() -> None:
     assert all(isinstance(proposal, HarnessDelta) for proposal in proposals)
     delta_ids = [proposal.delta_id for proposal in proposals if isinstance(proposal, HarnessDelta)]
     assert len(delta_ids) == len(set(delta_ids)) == 3
-    report = json.loads(project.files["context/round-0001/proposal-validation-attempt-01.json"])
+    report = json.loads(project.files["context/iteration-0001/proposal-validation-attempt-01.json"])
     reasons = [error["reason"] for error in report["errors"]]
     assert any("duplicates valid sibling proposal-01" in reason for reason in reasons)
     assert any("already present in judged history" in reason for reason in reasons)
@@ -724,7 +726,7 @@ def test_project_proposer_repairs_semantically_identical_children_and_no_ops() -
     )
 
     assert all(isinstance(proposal, HarnessDelta) for proposal in proposals)
-    report = json.loads(project.files["context/round-0001/proposal-validation-attempt-01.json"])
+    report = json.loads(project.files["context/iteration-0001/proposal-validation-attempt-01.json"])
     reasons = [error["reason"] for error in report["errors"]]
     assert any("duplicates valid sibling proposal-01" in reason for reason in reasons)
     assert any("semantic no-op" in reason for reason in reasons)
@@ -742,7 +744,7 @@ def test_project_proposer_never_returns_a_delta_that_remains_invalid_after_two_r
     assert project.runs == 3
     assert "skill file has no frontmatter" in _proposal_failure_reason(proposals[0])
     final_report = json.loads(
-        project.files["context/round-0001/proposal-validation-attempt-03.json"]
+        project.files["context/iteration-0001/proposal-validation-attempt-03.json"]
     )
     assert final_report["valid_slots"] == []
     assert "skill file has no frontmatter" in final_report["errors"][0]["reason"]
@@ -769,7 +771,7 @@ def test_project_proposer_repairs_partial_durable_outputs_after_runner_disconnec
     assert project.runs == 2
     assert all(isinstance(proposal, HarnessDelta) for proposal in proposals)
     final_report = json.loads(
-        project.files["context/round-0001/proposal-validation-attempt-02.json"]
+        project.files["context/iteration-0001/proposal-validation-attempt-02.json"]
     )
     assert final_report["valid_slots"] == [1, 2]
     assert final_report["errors"] == []
@@ -804,7 +806,7 @@ def test_project_proposer_rejects_a_runtime_kind_switch_when_fixed_before_search
     assert "must preserve the parent's runtime kind 'kit-python'" in _proposal_failure_reason(
         proposals[0]
     )
-    report = json.loads(project.files["context/round-0001/proposal-validation-attempt-03.json"])
+    report = json.loads(project.files["context/iteration-0001/proposal-validation-attempt-03.json"])
     assert "must preserve the parent's runtime kind 'kit-python'" in report["errors"][0]["reason"]
 
 
@@ -860,7 +862,7 @@ def test_project_proposer_repairs_an_unknown_runtime_kind_before_search() -> Non
     )
 
     assert "unsupported runtime kind 'pi-nod'" in _proposal_failure_reason(proposals[0])
-    report = json.loads(project.files["context/round-0001/proposal-validation-attempt-03.json"])
+    report = json.loads(project.files["context/iteration-0001/proposal-validation-attempt-03.json"])
     assert "unsupported runtime kind 'pi-nod'" in report["errors"][0]["reason"]
 
 
