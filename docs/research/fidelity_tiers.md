@@ -1,10 +1,31 @@
 # Fidelity tiers: decisions and learnings
 
-*WS-A3, 2026-07-02 (updated 2026-07-10). How the `--fidelity low|medium|high|max` build
+*WS-A3, 2026-07-02 (updated 2026-07-16). How the `--fidelity low|medium|high|max` build
 tiers and the runtime `--max-fidelity` switch were designed, what was measured, and the traps
 hit on the way. Raw per-suite ladder JSONs live in the workspace layer
 (`.agents/docs/research/fidelity_tiers/`, PR #55); the numbers below are complete without
 them.*
+
+## Monotonicity: a strong estimate + an incumbent floor (2026-07-16)
+
+The tiers are **improve-or-hold by construction**, and `low` is no longer plain base RAG:
+
+- **`low` ships the corpus-signature's strongest ESTIMATED config** — `signature_estimate`
+  reads the zero-token `CorpusSignature` and returns the D27 matrix winner for the corpus shape
+  (tool-call → `reason`, curl-heavy → `reason+fetch`, pinned repo → `reason+workspace`,
+  content-heavy bash → `reason+kb`, else `reason`). No LLM calls. This is the ladder's floor: a
+  strong prior, not a cold start.
+- **Every searching tier (medium/high/max) seeds that same deterministic estimate as an
+  incumbent floor** and only replaces it when a challenger beats it by more than the
+  judge/selection noise band (`_NOISE_MARGIN = 0.01`). Separate `wmh build --fidelity …`
+  invocations recompute the identical estimate from the signature, so the floor is consistent
+  across tiers without running the lower tier first.
+
+This directly fixes the old non-monotonicity: the pre-2026-07-16 ladder ran an *independent*
+search per tier, so a fluke +0.002 on the selection sample could crown a config that then lost
+on test — which is how tau went **low 0.865 → medium 0.891 → high 0.886 → max 0.882** (peaking
+at medium, then declining). With the incumbent floor a higher tier can only match or beat the
+config a lower tier would have shipped.
 
 ## The design (D30)
 
@@ -14,10 +35,10 @@ Python API:
 
 | tier | prompt | retrieval phi | config search |
 |---|---|---|---|
-| low | base (no GEPA) | hashing (offline) | — |
-| medium | GEPA, 4 iterations | hashing | cheap frontier only (base/reason/grounding), 4 val traces |
-| high | GEPA, 4 iterations | hashing | signature-pruned full menu, 4 val traces |
-| max | GEPA, 16 iterations | hashing | full ladder, 12 val traces |
+| low | base (no GEPA) | hashing (offline) | none — ships the signature estimate (the floor) |
+| medium | GEPA, 4 iterations | hashing | cheap frontier (base/reason/grounding), 4 val traces, incumbent=estimate |
+| high | GEPA, 4 iterations | hashing | signature-pruned full menu, 4 val traces, incumbent=estimate |
+| max | GEPA, 16 iterations | hashing | full ladder, 12 val traces, incumbent=estimate |
 
 **Evidence audit (2026-07-08, user-prompted "each ingredient must improve, not just cost
 more"):** two ingredients failed and were removed. (1) Semantic embeddings for high/max: PR
