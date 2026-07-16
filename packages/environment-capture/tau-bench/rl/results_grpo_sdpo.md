@@ -260,3 +260,30 @@ deviation, so within-era paired comparisons remain internally consistent — but
 do not match the pin. Remediation per D90(6): full-100 rerun (`kimi-haikuera100-*`,
 100 × 1, same env/config/judge) — those rows supersede the n=40 rows as rows of record
 when they land; the n=40 rows above stay as correction-trail provenance.
+
+### D90.6 RESOLUTION (2026-07-16): full-100 rows landed — the kimi GRPO headline FLIPS
+
+Rows of record (pinned D73 protocol: ALL 100 eval scenarios × 1 episode, haiku-kimi-era,
+same env/config/judge as the n=40 rows; SFT with enable_thinking=false). Raw records
+committed: `.agents/docs/research/kimi_eval_results/b3_kimi_haikuera100_*.jsonl`;
+wandb `kimi-haikuera100-*`.
+
+| arm | success | mean reward | paired vs base |
+|---|---|---|---|
+| base | 0.330 | 0.364 | — |
+| GRPO full-train (150×8) | 0.240 | 0.286 | **−0.079 (33W-43L of 100)** |
+| **offline SFT (Kimi-K2.6 demos)** | **0.830** | **0.882** | **+0.518 (74W-7L of 100)** |
+
+1. **The "+13.7 / first positive kimi Δ" headline was a subsample artifact and is
+   WITHDRAWN.** On the full pinned set GRPO is *negative* (paired −0.079). The first-40
+   prefix happened to be far harder for base (0.113 there vs 0.330 full-set), flattering
+   the trained arm. Combined with the strong in-run training curve (rolling 37%→85% on
+   train scenarios), the honest mechanism is **overfitting to the training distribution
+   with negative transfer to held-out scenarios** — consistent with the program's
+   in-WM-fragility finding (cross-era table above), now demonstrated across scenario
+   subsets as well as grader swaps.
+2. **SFT's dominance is robust to the protocol fix** (0.8375 on the 40-subset → 0.830
+   full-set; paired +0.518, 74W-7L) — the evaluation-collusion caveat still applies to
+   its absolute level, but its ranking above base and GRPO is not subsample-sensitive.
+3. Kimi scoreboard line of record: **trained ✓ / in-WM Δ (pinned protocol) GRPO −0.079,
+   offline SFT +0.518 / real-env Δ n-a (no macOS harness).**
