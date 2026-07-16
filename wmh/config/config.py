@@ -54,6 +54,10 @@ class TierSpec:
     # roughly nothing extra to serve). Tiers ration the expensive knobs (GEPA iterations,
     # kb/verify scoring), but a nearly-free grounding win should be discoverable cheaply.
     cheap_frontier_only: bool
+    # True = ship the corpus-signature's strongest ESTIMATED config with no LLM search (the
+    # `low` tier). It's the ladder's floor: a strong prior that every searching tier seeds its
+    # incumbent from and can only improve on, so low->max is monotonic by construction.
+    estimate_only: bool
     # Recommend provider-backed semantic phi. Kept as a field for explicit opt-in experiments,
     # but NO tier sets it: semantic retrieval was measured WORSE than lexical hashing on every
     # benchmark (PR #72 matrix: ada-002 terminal 0.790 vs hashing 0.818, swe 0.635 vs 0.640 —
@@ -64,6 +68,9 @@ class TierSpec:
 
 
 FIDELITY_TIERS: dict[FidelityTier, TierSpec] = {
+    # Low no longer means "plain base RAG": it ships the signature's strongest ESTIMATED
+    # config (reason / +fetch / +workspace / +kb by corpus shape — see `signature_estimate`)
+    # with zero LLM search. Free, and a strong floor the higher tiers can only build on.
     FidelityTier.LOW: TierSpec(
         gepa_budget=0,
         gepa_val_cap=0,
@@ -71,6 +78,7 @@ FIDELITY_TIERS: dict[FidelityTier, TierSpec] = {
         search_budget=0,
         full_ladder=False,
         cheap_frontier_only=False,
+        estimate_only=True,
         semantic_embeddings=False,
     ),
     # Medium still searches the CHEAP frontier: grounding levers serve at ~base cost and score
@@ -83,6 +91,7 @@ FIDELITY_TIERS: dict[FidelityTier, TierSpec] = {
         search_budget=4,
         full_ladder=False,
         cheap_frontier_only=True,
+        estimate_only=False,
         semantic_embeddings=False,
     ),
     # High's GEPA stays at medium's 4 iterations: the 8-iteration increment measured ~noise
@@ -97,6 +106,7 @@ FIDELITY_TIERS: dict[FidelityTier, TierSpec] = {
         search_budget=4,
         full_ladder=False,
         cheap_frontier_only=False,
+        estimate_only=False,
         semantic_embeddings=False,
     ),
     FidelityTier.MAX: TierSpec(
@@ -106,6 +116,7 @@ FIDELITY_TIERS: dict[FidelityTier, TierSpec] = {
         search_budget=12,
         full_ladder=True,
         cheap_frontier_only=False,
+        estimate_only=False,
         semantic_embeddings=False,
     ),
 }

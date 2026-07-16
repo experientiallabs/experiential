@@ -30,6 +30,13 @@ from wmh.retrieval import EmbeddingRetriever
 # of the GEPA build, large enough to separate candidates beyond judge noise on most corpora.
 DEFAULT_VAL_CAP = 8
 
+# A challenger must beat the incumbent's mean fidelity by more than this to displace it. Sized
+# above the per-cell judge/selection noise measured in the D37 ladder (±0.003–0.014): without
+# it, a fluke +0.002 on the selection sample promoted a config that then LOST on test, which is
+# exactly how the old independent-per-tier search went non-monotonic (tau high 0.886 < medium
+# 0.891). The incumbent floor makes each tier improve-or-hold, never regress.
+_NOISE_MARGIN = 0.01
+
 
 @dataclass(frozen=True)
 class CandidateConfig:
@@ -100,6 +107,30 @@ class CorpusSignature:
             mean_obs_chars=fmean(len(s.observation.content) for s in steps),
             tool_call_share=fmean(0.0 if s.action.name == "bash" else 1.0 for s in steps),
         )
+
+
+def signature_estimate(signature: CorpusSignature, *, has_pins: bool = False) -> CandidateConfig:
+    """The single strongest config the measured lever matrix predicts for this corpus — free.
+
+    This is the `low` tier's shipped config and the incumbent FLOOR every searching tier seeds
+    from, so the ladder starts from a strong prior and can only improve. Deterministic from the
+    signature, so separate `wmh build --fidelity {medium,high,max}` invocations all carry the
+    identical floor. Rules are the D27 recommendations:
+    - tool-call APIs (tau-like): reasoning alone won (.899 -> .919).
+    - curl-heavy shells (terminal-like): live fetch of the action's own URL won (+0.040).
+    - pinned code repos (swe-like): workspace grounding won (+0.065).
+    - free-form, content-heavy bash otherwise: the knowledge base helped most.
+    - anything else: reasoning is the safe, cheap default.
+    """
+    if signature.tool_call_share >= 0.5:
+        return DEFAULT_CANDIDATES[1]  # reason
+    if signature.curl_get_share >= 0.10:
+        return FETCH_CANDIDATE
+    if has_pins:
+        return WORKSPACE_CANDIDATE
+    if signature.mean_obs_chars >= 600:
+        return DEFAULT_CANDIDATES[2]  # reason+kb
+    return DEFAULT_CANDIDATES[1]  # reason
 
 
 def select_candidates(
@@ -243,6 +274,7 @@ def search_max_fidelity(
     candidates: Sequence[CandidateConfig] | None = None,
     full_ladder: bool = False,
     cheap_only: bool = False,
+    incumbent: CandidateConfig | None = None,
     knowledge_text: str | None = None,
     source_pins: str | None = None,
     on_candidate_start: Callable[[str], None] | None = None,
@@ -254,9 +286,13 @@ def search_max_fidelity(
     levers that can matter for this corpus (`full_ladder=True` skips the pruning — the max
     tier's "be certain" mode). Leak-free by construction: demos and the candidate knowledge
     base both come from `train` only, and the scored `val` traces are the build's held-out
-    split. The winner is the highest mean fidelity, ties resolved toward the earlier (cheaper)
-    candidate — so `base` (plain RAG) stays the answer unless an agentic config measurably
-    beats it.
+    split.
+
+    `incumbent` is the floor the search may improve on but never regress below (the lower tier's
+    winner / the `low`-tier signature estimate). It is always scored on the same sample, and a
+    challenger only displaces it when it beats it by more than `_NOISE_MARGIN` — this is what
+    makes the tier ladder monotonic (improve-or-hold) instead of chasing selection noise. With
+    no incumbent the winner is just the highest mean fidelity, cheapest-config tie-break.
     """
     scored_val = val[:val_cap]
     if candidates is None:
@@ -267,6 +303,8 @@ def search_max_fidelity(
             has_pins=source_pins is not None,
             cheap_only=cheap_only,
         )
+    if incumbent is not None and not any(c.label == incumbent.label for c in candidates):
+        candidates = (incumbent, *candidates)
     source = SourceResolver.from_file(source_pins) if source_pins is not None else None
     tree = RepoTreeResolver(source.pins) if source is not None else None
     # The candidate KB, seeded once (train-only) and reused for every knowledge candidate.
@@ -278,7 +316,7 @@ def search_max_fidelity(
         kb_text = seeded_knowledge_text(train, provider)
 
     scores: dict[str, float] = {}
-    best: CandidateConfig = candidates[0]
+    best: CandidateConfig = incumbent if incumbent is not None else candidates[0]
     best_score = -1.0
     for candidate in candidates:
         if on_candidate_start is not None:
@@ -310,6 +348,12 @@ def search_max_fidelity(
             on_candidate_done(candidate.label, report.mean_score)
         if report.mean_score > best_score:
             best, best_score = candidate, report.mean_score
+
+    if incumbent is not None:
+        # Improve-or-hold: keep the incumbent unless a challenger clears it by > the noise band.
+        incumbent_score = scores.get(incumbent.label, -1.0)
+        if best.label != incumbent.label and best_score <= incumbent_score + _NOISE_MARGIN:
+            best = next(c for c in candidates if c.label == incumbent.label)
 
     return AutoFidelityReport(
         winner_label=best.label,

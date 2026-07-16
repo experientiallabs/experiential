@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -754,8 +755,12 @@ def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:
     assert "fetched" in result.output
 
 
-def test_download_all_expands_to_the_manifest(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+def test_download_all_expands_to_the_published_list(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    # `all` means "everything actually on the Hub" (live list), not the static registry — a
+    # registry entry that isn't published yet would 404.
     fetched: list[str] = []
+    published = [SimpleNamespace(benchmark=n, last_modified=None) for n in ("a-bench", "b-bench")]
+    monkeypatch.setattr(cli_app_module, "published_corpora", lambda: published)
     monkeypatch.setattr(
         cli_app_module,
         "fetch_corpus",
@@ -764,7 +769,28 @@ def test_download_all_expands_to_the_manifest(monkeypatch, tmp_path: Path) -> No
     monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "all"])
     assert result.exit_code == 0, result.output
-    assert fetched == sorted(cli_app_module.CORPORA)
+    assert fetched == ["a-bench", "b-bench"]
+
+
+def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    # One unpublished dataset must not abort the remaining downloads (it used to kill `all`
+    # mid-loop, alphabetically stranding everything after the 404).
+    import urllib.error
+
+    fetched: list[str] = []
+
+    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
+        if name == "broken":
+            raise urllib.error.HTTPError("https://hub/x", 404, "nf", None, None)  # type: ignore[arg-type]
+        fetched.append(name)
+        return tmp_path
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "a-bench", "broken", "z-bench"])
+    assert fetched == ["a-bench", "z-bench"]  # kept going past the 404
+    assert result.exit_code != 0  # ...but the failure is still reported at the end
+    assert "broken" in result.output
 
 
 def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001

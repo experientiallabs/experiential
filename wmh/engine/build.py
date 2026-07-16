@@ -14,9 +14,12 @@ from wmh.config import ArtifactPaths, HarnessConfig, save_config
 from wmh.core.types import Trace
 from wmh.engine.autoconfig import (
     DEFAULT_VAL_CAP,
+    AutoFidelityReport,
     CorpusSignature,
+    WinnerSpec,
     search_max_fidelity,
     select_candidates,
+    signature_estimate,
 )
 from wmh.engine.knowledge import KnowledgeBase, seed_knowledge
 from wmh.engine.prompts import BASE_ENV_PROMPT
@@ -112,6 +115,7 @@ def build(
     fidelity_budget: int = DEFAULT_VAL_CAP,
     full_search: bool = False,
     cheap_search: bool = False,
+    estimate_only: bool = False,
     gepa_val_cap: int | None = None,
 ) -> OptimizeResult:
     """Ingest traces and run the full build, creating + persisting the artifact under `root`.
@@ -226,7 +230,24 @@ def build(
         result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used
     )
 
-    if max_fidelity:
+    if estimate_only:
+        # Low tier: ship the signature's strongest ESTIMATED config with no LLM search — the
+        # ladder's floor. Persisted as the winner so `--max-fidelity` serves it and so the
+        # higher tiers (rebuilt separately) seed the identical incumbent from the same signature.
+        signature = CorpusSignature.from_traces(train or traces)
+        estimate = signature_estimate(signature, has_pins=False)
+        if estimate.knowledge and not paths.knowledge.is_dir():
+            seed_knowledge(KnowledgeBase(paths.knowledge), train or traces, provider)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.auto_fidelity.write_text(
+            AutoFidelityReport(
+                winner_label=estimate.label,
+                considered=[estimate.label],
+                winner_spec=WinnerSpec.from_candidate(estimate),
+            ).model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+    elif max_fidelity:
         # Score the candidate configs on the held-out split with the prompt the artifact will
         # serve (leak-free: demos + candidate KB from train only; `test or train` mirrors GEPA's
         # tiny-corpus fallback). The result is a RUNTIME menu, not a serve default: the report is
@@ -242,8 +263,11 @@ def build(
         # seeded dir is removed again — a plain artifact stays knowledge-free.
         kb_seeded_for_search = False
         signature = CorpusSignature.from_traces(train or traces)
+        # The floor: the same estimate the `low` tier ships. Every searching tier carries it as
+        # its incumbent, so medium/high/max improve-or-hold on low, never regress (monotonic).
+        incumbent = signature_estimate(signature, has_pins=False)
         menu = select_candidates(signature, full_ladder=full_search, cheap_only=cheap_search)
-        if any(c.knowledge for c in menu) and not paths.knowledge.is_dir():
+        if (any(c.knowledge for c in menu) or incumbent.knowledge) and not paths.knowledge.is_dir():
             seed_knowledge(KnowledgeBase(paths.knowledge), train or traces, provider)
             kb_seeded_for_search = True
         kb = KnowledgeBase(paths.knowledge)
@@ -257,6 +281,7 @@ def build(
             val_cap=fidelity_budget,
             full_ladder=full_search,
             cheap_only=cheap_search,
+            incumbent=incumbent,
             # Whatever the artifact's KB renders (even empty) is what candidates measure —
             # passing None here would let the search re-extract a DIFFERENT ephemeral KB
             # and crown a winner the shipped artifact cannot reproduce.

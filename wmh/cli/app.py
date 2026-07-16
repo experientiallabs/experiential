@@ -517,6 +517,7 @@ def build(
             fidelity_budget=spec.search_budget,
             full_search=spec.full_ladder,
             cheap_search=spec.cheap_frontier_only,
+            estimate_only=spec.estimate_only,
             gepa_val_cap=spec.gepa_val_cap or None,
         )
     record = tracker.record_summary()
@@ -639,7 +640,12 @@ def download(
     """
     selected = list(benchmarks or [])
     if selected == ["all"]:
-        selected = sorted(CORPORA)
+        # Prefer the Hub's live list: the static registry can name corpora that aren't
+        # published yet (a 404 mid-loop used to abort the remaining downloads).
+        try:
+            selected = sorted(corpus.benchmark for corpus in published_corpora())
+        except urllib.error.URLError:
+            selected = sorted(CORPORA)
     if not selected:
         try:
             published = published_corpora()
@@ -664,6 +670,7 @@ def download(
             _console, "Download which data bundle?", [*choices, "all"], notes=notes
         )
         selected = choices if picked == "all" else [picked]
+    failures: list[str] = []
     for name in selected:
         existing = corpus_path(name).exists()
         try:
@@ -671,10 +678,11 @@ def download(
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
         except urllib.error.HTTPError as exc:
-            raise typer.BadParameter(
-                f"{name}: the Hub answered {exc.code} for {exc.url}; the dataset may not be "
-                "published yet — `wmh download` with no arguments lists what is"
-            ) from exc
+            # One unpublished/broken dataset must not abort the REST of a multi-download:
+            # record it, keep fetching, and fail (with every name) at the end.
+            failures.append(f"{name}: the Hub answered {exc.code} for {exc.url}")
+            _console.print(f"[yellow]skipping {name}: Hub answered {exc.code}[/yellow]")
+            continue
         except urllib.error.URLError as exc:
             raise typer.BadParameter(
                 f"{name}: could not reach the Hub ({exc.reason}); check the connection and re-run"
@@ -682,6 +690,11 @@ def download(
             ) from exc
         state = "kept local" if existing and not force else "fetched"
         _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+    if failures:
+        raise typer.BadParameter(
+            "some datasets could not be downloaded (unpublished? `wmh download` with no "
+            "arguments lists what is):\n  " + "\n  ".join(failures)
+        )
 
 
 def _fetch_with_progress(name: str, *, force: bool) -> Path:

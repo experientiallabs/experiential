@@ -459,6 +459,43 @@ def test_build_low_tier_skips_gepa(tmp_path) -> None:  # noqa: ANN001
     assert ArtifactPaths(root).optimized_prompt.read_text(encoding="utf-8") == BASE_ENV_PROMPT
 
 
+def test_build_estimate_only_ships_the_signature_config_without_search(tmp_path) -> None:  # noqa: ANN001
+    # The low tier: no GEPA, no LLM search, but a real winner (the signature estimate) is
+    # persisted so --max-fidelity serves it and the higher tiers seed the same floor.
+    import json as _json
+
+    root = tmp_path / ".wmh"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=0,
+        train_split=0.5,
+    )
+
+    class _NoSearchProvider(FakeProvider):
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
+            assert "improve the system prompt" not in system, "estimate tier must not run GEPA"
+            assert "grade a world model" not in system, "estimate tier must not score candidates"
+            return super().complete(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+
+    build(
+        config,
+        file=_tiny_trace_file(tmp_path),
+        root=str(root),
+        serve_provider=_NoSearchProvider(),
+        embedder=HashingEmbedder(dim=64),
+        estimate_only=True,
+    )
+    report = _json.loads((root / "auto_fidelity.json").read_text(encoding="utf-8"))
+    # The tiny fixture is a tool-call corpus -> the matrix estimate is `reason`.
+    assert report["winner_label"] == "reason"
+    assert report["winner_spec"]["reasoning"] is True
+    assert report["scores"] == {}  # nothing was scored — pure estimate
+
+
 def test_build_default_runs_no_search(tmp_path) -> None:  # noqa: ANN001
     root = tmp_path / ".wmh"
     config = HarnessConfig(

@@ -10,6 +10,7 @@ from wmh.engine.autoconfig import (
     CorpusSignature,
     search_max_fidelity,
     select_candidates,
+    signature_estimate,
 )
 from wmh.optimize.judge import JudgeResult
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
@@ -171,3 +172,43 @@ def test_select_candidates_is_a_price_ordered_frontier() -> None:
     assert "reason+workspace" in [
         c.label for c in select_candidates(swe, full_ladder=True, has_pins=True)
     ]
+
+
+def test_signature_estimate_follows_the_measured_matrix() -> None:
+    tau = CorpusSignature(curl_get_share=0.0, mean_obs_chars=414, tool_call_share=1.0)
+    terminal = CorpusSignature(curl_get_share=0.43, mean_obs_chars=1236, tool_call_share=0.0)
+    swe = CorpusSignature(curl_get_share=0.0, mean_obs_chars=889, tool_call_share=0.0)
+    thin = CorpusSignature(curl_get_share=0.0, mean_obs_chars=100, tool_call_share=0.0)
+    assert signature_estimate(tau).label == "reason"  # tool-call API
+    assert signature_estimate(terminal).label == "reason+fetch"  # curl-heavy
+    assert signature_estimate(swe, has_pins=True).label == "reason+workspace"  # pinned repo
+    assert signature_estimate(swe).label == "reason+kb"  # content-heavy bash, no pins
+    assert signature_estimate(thin).label == "reason"  # safe cheap default
+
+
+def test_incumbent_floor_holds_unless_beaten_by_the_noise_margin() -> None:
+    # A challenger that beats the incumbent by LESS than the margin must not displace it —
+    # this is the monotonicity guard (a fluke +0.002 on the selection sample used to promote
+    # a config that then lost on test).
+    incumbent = CandidateConfig(label="reason", reasoning=True)
+    challengers = [incumbent, CandidateConfig(label="reason+kb", reasoning=True, knowledge=True)]
+
+    def run(label_scores: dict[str, float]) -> str:
+        judge = _ModeAwareJudge(label_scores)
+        return search_max_fidelity(
+            "BASE",
+            _traces(20),
+            _traces(6),
+            _FakeProvider(),
+            judge,
+            None,
+            val_cap=3,
+            candidates=challengers,
+            incumbent=incumbent,
+            on_candidate_start=lambda label: setattr(judge, "active_label", label),
+        ).winner_label
+
+    # +0.005 < 0.01 margin -> keep the incumbent
+    assert run({"reason": 0.90, "reason+kb": 0.905}) == "reason"
+    # +0.05 > margin -> upgrade
+    assert run({"reason": 0.90, "reason+kb": 0.95}) == "reason+kb"
