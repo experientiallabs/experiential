@@ -23,7 +23,17 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
-from llm_waterfall import Backend, CompletionResult, EmbeddingResult, RetryPolicy, Waterfall
+from llm_waterfall import (
+    Backend,
+    ChatMaxTokensField,
+    ChatRequest,
+    ChatResponse,
+    ChatResult,
+    CompletionResult,
+    EmbeddingResult,
+    RetryPolicy,
+    Waterfall,
+)
 from llm_waterfall import Message as WfMessage
 from llm_waterfall import VerifyResult as WfVerifyResult
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -74,6 +84,7 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
         api_version=config.api_version,
         embed_model=config.embed_model,
         embed_dim=config.embed_dim,
+        chat_max_tokens_field=config.resolved_chat_max_tokens_field(),
     )
 
 
@@ -88,6 +99,8 @@ class WaterfallLike(Protocol):
         temperature: float | None = None,
         max_tokens: int = 4096,
     ) -> CompletionResult: ...
+
+    def complete_chat(self, request: ChatRequest) -> ChatResult: ...
 
     def embed(self, texts: Sequence[str]) -> EmbeddingResult: ...
 
@@ -146,6 +159,10 @@ class WaterfallProvider:
             ),
             model=result.model_used,  # true attribution even when a fallback served
         )
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a structured agent request through the configured failover chain."""
+        return self._waterfall.complete_chat(request).response
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._waterfall.embed(texts).vectors
@@ -212,6 +229,7 @@ class _Rung(BaseModel):
     api_key: str | None = None
     embed_model: str | None = None
     embed_dim: int | None = None
+    chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
 
 
 def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Chain:
@@ -247,6 +265,7 @@ def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Cha
                 api_version=rung.api_version,
                 embed_model=rung.embed_model,
                 embed_dim=rung.embed_dim,
+                chat_max_tokens_field=rung.chat_max_tokens_field,
             )
         )
         profiles.append(rung.profile)
@@ -266,7 +285,8 @@ def _parse_fallback_config(path: Path) -> tuple[dict[str, Chain], str | None]:
     if not isinstance(chains_raw, dict) or not chains_raw:
         raise ValueError(
             f"{path}: no chains found; define rungs as [[chain.<name>]] entries "
-            "(kind/model/profile/region/api_key/embed_model/embed_dim per rung)"
+            "(kind/model/profile/region/api_key/embed_model/embed_dim/chat_max_tokens_field "
+            "per rung)"
         )
     chains = {name: _parse_rungs(path, name, entries) for name, entries in chains_raw.items()}
     default = data.get("default")

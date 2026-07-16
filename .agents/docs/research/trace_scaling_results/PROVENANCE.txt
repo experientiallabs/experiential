@@ -1,0 +1,10 @@
+JUDGE PROVENANCE — every AblationReport JSON in this directory was scored with rubric-v1
+(pre-#83): the UNWEIGHTED mean of the five RubricJudge dimensions. Main uses rubric-v2 (#83):
+a factuality-weighted headline (factuality weight 0.5, validity flag, factuality<=0.1 clamp),
+which scores strictly LOWER on identical predictions (~0.58 where v1 scored ~0.70). Re-running
+the reproduce commands on main will produce lower absolute numbers; the cross-condition
+comparisons (which config/count beats which) are what these results are read for.
+
+Serve+judge models: trace_scaling_results/ = Opus 4.8; rag_opt_results/ & rag_topk_results/ =
+mixed Opus 4.8 (top_k A/B) and Sonnet 4.6 (opt-vs-unopt, embedder/key A/B, factuality, contam).
+See .agents/docs/reference/rag-scaling-methodology.md for the full per-file index.

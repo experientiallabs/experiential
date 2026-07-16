@@ -29,12 +29,14 @@ from wmh.config.store import validate_name
 from wmh.harness.doc import (
     CODE_RUNTIME_ID,
     MAX_TURNS_ID,
+    RUNTIME_KIND_ID,
     TEMPERATURE_ID,
     TOOL_POLICY_ID,
     HarnessDoc,
     Surface,
     SurfaceKind,
 )
+from wmh.harness.pi_vendor import code_surface_id
 from wmh.harness.skills import Skill
 
 HARNESSES_DIR = "harnesses"
@@ -46,6 +48,9 @@ _CONFIG_FILE = "config.toml"
 _RUNTIME_FILE = "runtime.py"
 _SKILLS_DIR = "skills"
 _ALIASES_FILE = "aliases.toml"
+
+# Top-level render filenames a pathful code surface must not shadow (skills/ is guarded by prefix).
+_RESERVED_FILES = frozenset({_DOC_FILE, _SYSTEM_FILE, _CONFIG_FILE, _RUNTIME_FILE})
 
 
 class HarnessStore:
@@ -164,6 +169,7 @@ def _render(doc: HarnessDoc) -> dict[str, str]:
                     "tools": doc.tools(),
                     "max_turns": doc.max_turns(),
                     "temperature": doc.temperature(),
+                    "runtime_kind": doc.runtime_kind(),
                 }
             }
         ),
@@ -173,6 +179,14 @@ def _render(doc: HarnessDoc) -> dict[str, str]:
     code = doc.surface(CODE_RUNTIME_ID)
     if code is not None:
         files[_RUNTIME_FILE] = code.content
+    # Pathful code surfaces (a pi-node harness's vendored source) render to their own paths, so
+    # the export is the harness's real directory tree — what the agent view browses and what an
+    # execution sandbox downloads. Their `code_surface_id` is recovered from the path on reparse.
+    for surface in doc.code_files():
+        assert surface.path is not None  # code_files() only returns pathful surfaces
+        if surface.path in _RESERVED_FILES or surface.path.startswith(f"{_SKILLS_DIR}/"):
+            raise ValueError(f"code surface path {surface.path!r} collides with a reserved file")
+        files[surface.path] = surface.content
     return files
 
 
@@ -213,6 +227,16 @@ def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
                     id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content=str(config["temperature"])
                 )
             )
+        # runtime_kind classifies the harness (pi-node vs in-process); a default "kit-python" is
+        # implicit, so only a non-default value needs its own surface on reconstruction.
+        if config.get("runtime_kind") and config["runtime_kind"] != "kit-python":
+            surfaces.append(
+                Surface(
+                    id=RUNTIME_KIND_ID,
+                    kind=SurfaceKind.PARAM,
+                    content=str(config["runtime_kind"]),
+                )
+            )
     runtime_path = directory / _RUNTIME_FILE
     if runtime_path.exists():
         surfaces.append(
@@ -231,4 +255,20 @@ def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
                     id=f"skill:{skill.name}", kind=SurfaceKind.SKILL, content=skill.to_markdown()
                 )
             )
+    # Everything else under the dir is a pathful code surface (a pi-node harness's source tree):
+    # the inverse of `_render`'s per-path write, keyed back to its `code_surface_id`.
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(directory).as_posix()
+        if rel in _RESERVED_FILES or rel == _ALIASES_FILE or rel.startswith(f"{_SKILLS_DIR}/"):
+            continue
+        surfaces.append(
+            Surface(
+                id=code_surface_id(rel),
+                kind=SurfaceKind.CODE,
+                path=rel,
+                content=path.read_text(encoding="utf-8"),
+            )
+        )
     return HarnessDoc(name=name, surfaces=surfaces)

@@ -2,22 +2,18 @@
 
 No socket, no node, no Bedrock. A `FakeChannel` plays the runner side (emits tool_request /
 llm_request / done frames and records what the host sent back); a fake `AgentEnvironment` stands in
-for the world model; `worker_fn` is injected so the worker-LLM callback needs no provider. The
-frame codec and the Bedrock translation (shared with the SSH shim) are unit-tested directly.
+for the world model; `worker_fn` is injected so the worker-LLM callback needs no provider.
 """
 
 from __future__ import annotations
 
 from typing import Any, cast
 
+import pytest
+from llm_waterfall import ChatRequest, ChatResponse
+
 from wmh.core.types import Action, JsonObject, Observation
-from wmh.harness.runner_link import (
-    RunnerLink,
-    bedrock_to_completion,
-    openai_to_bedrock,
-    read_frame,
-    write_frame,
-)
+from wmh.harness.runner_link import RunnerLink, read_frame, write_frame
 from wmh.harness.runtime import StopReason
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
@@ -48,17 +44,41 @@ class _FakeChannel:
         return self._script.pop(0) if self._script else None
 
 
+class _ResponseSendTimeoutChannel(_FakeChannel):
+    """Records the attempted response, then fails every response transport send."""
+
+    def send(self, frame: JsonObject) -> None:
+        self.sent.append(frame)
+        if frame.get("type") == "llm_response":
+            raise TimeoutError("transport send timed out")
+
+
 def _tools() -> list:
     return [TOOL_REGISTRY["bash"], SUBMIT]
 
 
+def _completion(
+    content: str = "ok", *, input_tokens: int = 0, output_tokens: int = 0
+) -> ChatResponse:
+    return ChatResponse.model_validate(
+        {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+            },
+        }
+    )
+
+
 def _link(channel: _FakeChannel, **kw) -> RunnerLink:  # noqa: ANN003
     # worker_fn returns a fixed completion so the llm_request path needs no provider.
-    return RunnerLink(
-        channel,
-        worker_fn=lambda body: {"choices": [{"message": {"content": "ok"}}]},
-        **kw,
-    )
+    return RunnerLink(channel, worker_fn=lambda request: _completion(), **kw)
 
 
 def _sent(channel: _FakeChannel, kind: str) -> list:
@@ -139,11 +159,11 @@ def test_env_action_budget_enforced() -> None:
 
 
 def test_llm_request_answered_via_worker_fn() -> None:
-    calls: list[JsonObject] = []
+    calls: list[ChatRequest] = []
 
-    def worker(body: JsonObject) -> JsonObject:
-        calls.append(body)
-        return {"choices": [{"message": {"content": "hi", "role": "assistant"}}]}
+    def worker(request: ChatRequest) -> ChatResponse:
+        calls.append(request)
+        return _completion("hi")
 
     script = [
         {"type": "llm_request", "req_id": 7, "openai_body": {"messages": [{"role": "user"}]}},
@@ -158,7 +178,8 @@ def test_llm_request_answered_via_worker_fn() -> None:
 
 
 def test_worker_fn_error_is_reported_not_crashed() -> None:
-    def boom(body: JsonObject) -> JsonObject:
+    def boom(request: ChatRequest) -> ChatResponse:
+        del request
         raise RuntimeError("provider down")
 
     script = [
@@ -167,9 +188,25 @@ def test_worker_fn_error_is_reported_not_crashed() -> None:
     ]
     ch = _FakeChannel(script)
     result = RunnerLink(ch, worker_fn=boom).run("t1", "x", _Env(), tools=_tools())
-    resp = _sent(ch, "llm_response")[0]
+    responses = _sent(ch, "llm_response")
+    assert len(responses) == 1
+    resp = responses[0]
     assert "provider down" in resp["error"]  # surfaced to the runner, host survives
     assert result.stop_reason is StopReason.SUBMITTED
+
+
+def test_llm_response_send_timeout_propagates_without_error_response_retry() -> None:
+    """A transport send failure is not mislabeled as a provider failure or sent twice."""
+    script = [{"type": "llm_request", "req_id": 1, "openai_body": {}}]
+    ch = _ResponseSendTimeoutChannel(script)
+
+    with pytest.raises(TimeoutError, match="transport send timed out"):
+        _link(ch).run("t1", "x", _Env(), tools=_tools())
+
+    responses = _sent(ch, "llm_response")
+    assert len(responses) == 1
+    assert "completion" in responses[0]
+    assert "error" not in responses[0]
 
 
 def test_channel_close_without_done_reports_error() -> None:
@@ -196,7 +233,7 @@ def test_tools_bound_at_construction_satisfy_runtime_contract() -> None:
         {"type": "done", "answer": "done"},
     ]
     ch = _FakeChannel(script)
-    link = RunnerLink(ch, tools=_tools(), worker_fn=lambda body: {"choices": [{"message": {}}]})
+    link = RunnerLink(ch, tools=_tools(), worker_fn=lambda request: _completion())
     result = link.run("t1", "do it", env)  # no tools= : uses the constructor's
     assert result.stop_reason is StopReason.SUBMITTED
     assert [a.name for a in env.actions] == ["bash"]
@@ -220,34 +257,6 @@ def test_multiple_episodes_over_one_channel() -> None:
     assert (starts[0]["instruction"], starts[1]["instruction"]) == ("first", "second")
 
 
-# --- shared Bedrock translation (offline) ---
-def test_openai_to_bedrock_maps_tools_and_tool_results() -> None:
-    body: JsonObject = {
-        "messages": [
-            {"role": "system", "content": "be nice"},
-            {"role": "user", "content": "look up u1"},
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {"id": "c1", "function": {"name": "get_user", "arguments": '{"id":"u1"}'}}
-                ],
-            },
-            {"role": "tool", "tool_call_id": "c1", "content": "found u1"},
-        ],
-        "tools": [
-            {"function": {"name": "get_user", "description": "d", "parameters": {"type": "object"}}}
-        ],
-    }
-    system, msgs, tool_config = openai_to_bedrock(body)
-    assert system == [{"text": "be nice"}]
-    assert tool_config is not None
-    assert cast(Any, tool_config)["tools"][0]["toolSpec"]["name"] == "get_user"
-    # assistant toolUse + tool result present
-    blocks = [b for m in cast(Any, msgs) for b in m["content"]]
-    assert any("toolUse" in b for b in blocks)
-    assert any("toolResult" in b for b in blocks)
-
-
 def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
     import os as _os
 
@@ -260,6 +269,9 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
 
         def complete(self, *a, **k) -> object:  # noqa: ANN002, ANN003
             raise NotImplementedError
+
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            return _completion()
 
         def embed(self, texts) -> list:  # noqa: ANN001
             return [[0.0] for _ in texts]
@@ -296,22 +308,25 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
             _os.environ["PI_TRANSPORT"] = prev
 
 
-def test_bedrock_to_completion_shape() -> None:
-    resp: JsonObject = {
-        "output": {
-            "message": {
-                "content": [
-                    {"text": "sure"},
-                    {"toolUse": {"toolUseId": "t1", "name": "get_user", "input": {"id": "u1"}}},
-                ]
-            }
-        },
-        "stopReason": "tool_use",
-    }
-    completion = cast(Any, bedrock_to_completion(resp))
-    choice = completion["choices"][0]
-    assert choice["finish_reason"] == "tool_calls"
-    assert choice["message"]["content"] == "sure"
-    tc = choice["message"]["tool_calls"][0]
-    assert tc["function"]["name"] == "get_user"
-    assert tc["function"]["arguments"] == '{"id": "u1"}'
+def test_worker_usage_accumulates_across_llm_requests() -> None:
+    """Each answered llm_request adds its completion usage to RunResult.worker_usage."""
+    replies = iter([_completion("a", input_tokens=100, output_tokens=7), _completion("b")])
+    script = [
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "llm_request", "req_id": 2, "openai_body": {}},
+        {"type": "done", "answer": "fin"},
+    ]
+    ch = _FakeChannel(script)
+    result = RunnerLink(ch, worker_fn=lambda request: next(replies)).run(
+        "t1", "x", _Env(), tools=_tools()
+    )
+    assert result.worker_usage is not None
+    assert result.worker_usage.calls == 2
+    assert result.worker_usage.input_tokens == 100
+    assert result.worker_usage.output_tokens == 7
+    # No llm_request at all -> usage stays None (not zero: the runtime reported nothing).
+    quiet = RunnerLink(
+        _FakeChannel([{"type": "done", "answer": "ok"}]),
+        worker_fn=lambda request: _completion(),
+    ).run("t2", "x", _Env(), tools=_tools())
+    assert quiet.worker_usage is None

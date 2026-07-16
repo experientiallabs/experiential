@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from llm_waterfall import ChatRequest, ChatResponse
+
 from wmh.core.types import Action, Observation
 from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
 from wmh.harness.pi_runtime import PiRuntime, _Episode, _params_schema
@@ -20,11 +22,27 @@ class _Env:
         pass
 
 
+class _Provider:
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        del request
+        return ChatResponse.model_validate(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+
 def _episode(env: _Env, *, budget: int = 40) -> _Episode:
     return _Episode(
         instruction="do it",
         system_prompt="sys",
         tools=[TOOL_REGISTRY["bash"], SUBMIT],
+        provider=_Provider(),
         environment=env,
         max_env_actions=budget,
     )
@@ -69,6 +87,9 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
 
         def complete(self, *a, **k) -> object:  # noqa: ANN002, ANN003
             raise NotImplementedError
+
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            return _Provider().complete_chat(request)
 
         def embed(self, texts) -> list:  # noqa: ANN001
             return [[0.0] for _ in texts]

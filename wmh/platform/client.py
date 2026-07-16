@@ -12,13 +12,16 @@ import hashlib
 import json
 from importlib import metadata
 from pathlib import Path
+from typing import Literal
 
 import httpx
+from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import BaseModel
 
-from wmh.core.types import JsonValue
+from wmh.core.types import Action, JsonValue, Observation
 
 _TIMEOUT_SECONDS = 120.0
+_WORKSPACE_TIMEOUT_SECONDS = 300.0
 
 
 class PlatformError(RuntimeError):
@@ -44,21 +47,11 @@ class OrgInfo(BaseModel):
     name: str
 
 
-class ProjectInfo(BaseModel):
-    """One project visible to the credential."""
-
-    id: str
-    org_id: str
-    slug: str
-    name: str
-
-
 class WhoAmI(BaseModel):
     """Response of ``GET /api/whoami``."""
 
     actor: ActorInfo
     orgs: list[OrgInfo]
-    projects: list[ProjectInfo]
 
 
 class RemoteWorldModel(BaseModel):
@@ -103,6 +96,81 @@ class PushedHarnessVersion(BaseModel):
     version: int
     doc_hash: str
     created: bool  # False when the push was an idempotent repeat of the tip
+
+
+class RunTarget(BaseModel):
+    """A platform id resolved to one executable resource kind."""
+
+    id: str
+    kind: Literal["world_model", "agent"]
+    org_id: str
+    name: str
+    display_name: str | None = None
+    status: str
+
+
+class RemoteWorldModelSession(BaseModel):
+    """The slice of a hosted world-model session needed by ``wmh run``."""
+
+    id: str
+    world_model_id: str
+    status: str
+
+
+class RemoteAgentSession(BaseModel):
+    """Hosted E2B agent session state needed by the CLI driver."""
+
+    id: str
+    agent_id: str
+    status: str
+    workspace_sync: bool
+    launched_from: str
+    starting_detail: str | None = None
+    error: str | None = None
+
+
+class RemoteAgentSessionEvent(BaseModel):
+    """One durable event from a hosted agent session transcript."""
+
+    seq: int
+    kind: Literal[
+        "user_message",
+        "assistant_message",
+        "tool_call",
+        "tool_output",
+        "tool_result",
+        "submit",
+        "state",
+        "status",
+        "error",
+        "workspace_patch",
+    ]
+    payload: dict[str, JsonValue]
+
+
+class RemoteAgentEventPage(BaseModel):
+    """One poll page of hosted transcript events and current session status."""
+
+    events: list[RemoteAgentSessionEvent]
+    last_seq: int
+    status: str
+
+
+class WorkspacePatchResult(BaseModel):
+    """Paths accepted or rejected while applying a live workspace patch."""
+
+    applied: list[str]
+    conflicts: list[str]
+
+
+class LocalPiRunInfo(BaseModel):
+    """An org-scoped platform usage record for the built-in local pi harness."""
+
+    id: str
+    org_id: str
+    status: str
+    worker_provider: str
+    worker_model: str
 
 
 def fetch_cli_config(web_url: str, *, transport: httpx.BaseTransport | None = None) -> str | None:
@@ -169,17 +237,141 @@ class PlatformClient:
         self._raise_for_error(response)
         return WhoAmI.model_validate(response.json())
 
+    # -- unified runs --------------------------------------------------------------------------
+
+    def resolve_run_target(self, target_id: str) -> RunTarget:
+        """Resolve an opaque platform id without guessing from failed requests."""
+        response = self._client.get(f"/api/run-targets/{target_id}")
+        self._raise_for_error(response)
+        return RunTarget.model_validate(response.json())
+
+    def create_world_model_session(
+        self, world_model_id: str, *, task: str | None = None
+    ) -> RemoteWorldModelSession:
+        """Open a hosted session for a platform world model."""
+        response = self._client.post(
+            f"/api/world-models/{world_model_id}/sessions", json={"task": task}
+        )
+        self._raise_for_error(response)
+        return RemoteWorldModelSession.model_validate(response.json())
+
+    def step_world_model_session(self, session_id: str, action: Action) -> Observation:
+        """Advance a hosted world-model session by one action."""
+        response = self._client.post(
+            f"/api/sessions/{session_id}/step",
+            json={"action": action.model_dump(mode="json")},
+        )
+        self._raise_for_error(response)
+        return Observation.model_validate(response.json()["observation"])
+
+    def create_agent_session(
+        self,
+        agent_id: str,
+        *,
+        workspace: bytes | None,
+        instruction: str | None = None,
+    ) -> RemoteAgentSession:
+        """Create a hosted agent session, optionally staging a local snapshot."""
+        payload: dict[str, JsonValue] = {"instruction": instruction}
+        if workspace is not None:
+            upload = self._client.post(
+                f"/api/agents/{agent_id}/workspace-uploads",
+                files={"workspace": ("workspace.tar.gz", workspace, "application/gzip")},
+                timeout=_WORKSPACE_TIMEOUT_SECONDS,
+            )
+            self._raise_for_error(upload)
+            payload["workspace_upload_id"] = str(upload.json()["id"])
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions",
+            json=payload,
+        )
+        self._raise_for_error(response)
+        return RemoteAgentSession.model_validate(response.json())
+
+    def get_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
+        """Read current hosted agent session state."""
+        response = self._client.get(f"/api/agents/{agent_id}/sessions/{session_id}")
+        self._raise_for_error(response)
+        return RemoteAgentSession.model_validate(response.json())
+
+    def list_agent_session_events(
+        self, agent_id: str, session_id: str, *, after: int
+    ) -> RemoteAgentEventPage:
+        """Poll hosted transcript events after one durable sequence cursor."""
+        response = self._client.get(
+            f"/api/agents/{agent_id}/sessions/{session_id}/events",
+            params={"after": after},
+        )
+        self._raise_for_error(response)
+        return RemoteAgentEventPage.model_validate(response.json())
+
+    def post_agent_session_command(
+        self, agent_id: str, session_id: str, kind: str, *, text: str | None = None
+    ) -> None:
+        """Steer, interrupt, or end one hosted agent session."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions/{session_id}/commands",
+            json={"kind": kind, "text": text},
+        )
+        self._raise_for_error(response)
+
+    def upload_agent_workspace_patch(
+        self, agent_id: str, session_id: str, content: bytes
+    ) -> WorkspacePatchResult:
+        """Apply local changes conditionally to a running hosted workspace."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches",
+            files={"patch": ("workspace-patch.tar.gz", content, "application/gzip")},
+            timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(response)
+        return WorkspacePatchResult.model_validate(response.json())
+
+    def download_agent_workspace_patch(
+        self, agent_id: str, session_id: str, revision: str
+    ) -> bytes:
+        """Download one remote-to-local live workspace patch."""
+        response = self._client.get(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches/{revision}",
+            timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(response)
+        return response.content
+
+    def acknowledge_agent_workspace_patch(
+        self, agent_id: str, session_id: str, revision: str
+    ) -> None:
+        """Remove a remote patch after it is safely reflected or reported locally."""
+        response = self._client.post(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches/{revision}/ack"
+        )
+        self._raise_for_error(response)
+
+    def download_agent_workspace(self, agent_id: str, session_id: str) -> bytes:
+        """Download a terminal hosted session's final E2B workspace snapshot."""
+        response = self._client.get(
+            f"/api/agents/{agent_id}/sessions/{session_id}/workspace",
+            timeout=_WORKSPACE_TIMEOUT_SECONDS,
+        )
+        self._raise_for_error(response)
+        return response.content
+
+    def acknowledge_agent_workspace(self, agent_id: str, session_id: str) -> None:
+        """Confirm the final archive is safe locally so platform objects can be removed."""
+        response = self._client.post(f"/api/agents/{agent_id}/sessions/{session_id}/workspace/ack")
+        self._raise_for_error(response)
+
     # -- world models --------------------------------------------------------------------------
 
-    def list_world_models(self, project_id: str) -> list[RemoteWorldModel]:
-        response = self._client.get(f"/api/projects/{project_id}/world-models")
+    def list_world_models(self, org_id: str) -> list[RemoteWorldModel]:
+        response = self._client.get(f"/api/orgs/{org_id}/world-models")
         self._raise_for_error(response)
         rows = response.json().get("world_models", [])
         return [RemoteWorldModel.model_validate(row) for row in rows]
 
     def push_model_bundle(
         self,
-        project_id: str,
+        org_id: str,
         name: str,
         bundle_path: Path,
         sha256: str,
@@ -193,7 +385,7 @@ class PlatformClient:
         through the API.
         """
         ticket_response = self._client.post(
-            f"/api/projects/{project_id}/world-models/{name}/bundle/uploads"
+            f"/api/orgs/{org_id}/world-models/{name}/bundle/uploads"
         )
         self._raise_for_error(ticket_response)
         ticket = ticket_response.json()
@@ -216,7 +408,7 @@ class PlatformClient:
             raise PlatformError(msg, status_code=upload_response.status_code)
 
         finalize = self._client.post(
-            f"/api/projects/{project_id}/world-models/{name}/bundle",
+            f"/api/orgs/{org_id}/world-models/{name}/bundle",
             json={
                 "staging_path": ticket["staging_path"],
                 "sha256": sha256,
@@ -227,7 +419,7 @@ class PlatformClient:
         self._raise_for_error(finalize)
         return RemoteWorldModel.model_validate(finalize.json())
 
-    def download_model_bundle(self, project_id: str, name: str, dest: Path) -> str:
+    def download_model_bundle(self, org_id: str, name: str, dest: Path) -> str:
         """Stream a model's bundle from storage to ``dest``, verifying its digest.
 
         The API hands back an expiring signed URL plus the recorded sha256;
@@ -237,7 +429,7 @@ class PlatformClient:
         Returns:
             The verified sha256 hex digest.
         """
-        response = self._client.get(f"/api/projects/{project_id}/world-models/{name}/bundle")
+        response = self._client.get(f"/api/orgs/{org_id}/world-models/{name}/bundle")
         self._raise_for_error(response)
         payload = response.json()
         declared = str(payload["sha256"])
@@ -262,42 +454,75 @@ class PlatformClient:
 
     # -- harnesses -----------------------------------------------------------------------------
 
-    def list_harnesses(self, project_id: str) -> list[RemoteHarness]:
-        response = self._client.get(f"/api/projects/{project_id}/harnesses")
+    def list_harnesses(self, org_id: str) -> list[RemoteHarness]:
+        response = self._client.get(f"/api/orgs/{org_id}/harnesses")
         self._raise_for_error(response)
         rows = response.json().get("harnesses", [])
         return [RemoteHarness.model_validate(row) for row in rows]
 
     def get_harness(
-        self, project_id: str, name: str
+        self, org_id: str, name: str
     ) -> tuple[RemoteHarness, list[RemoteHarnessVersion]]:
-        response = self._client.get(f"/api/projects/{project_id}/harnesses/{name}")
+        response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}")
         self._raise_for_error(response)
         payload = response.json()
         harness = RemoteHarness.model_validate(payload["harness"])
         versions = [RemoteHarnessVersion.model_validate(row) for row in payload["versions"]]
         return harness, versions
 
-    def get_harness_version(self, project_id: str, name: str, version: int) -> HarnessVersionDoc:
-        response = self._client.get(
-            f"/api/projects/{project_id}/harnesses/{name}/versions/{version}"
-        )
+    def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
+        response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}/versions/{version}")
         self._raise_for_error(response)
         return HarnessVersionDoc.model_validate(response.json())
 
     def push_harness_version(
         self,
-        project_id: str,
+        org_id: str,
         name: str,
         doc: dict[str, JsonValue],
         doc_hash: str,
     ) -> PushedHarnessVersion:
         response = self._client.post(
-            f"/api/projects/{project_id}/harnesses/{name}/versions",
+            f"/api/orgs/{org_id}/harnesses/{name}/versions",
             json={"doc": doc, "doc_hash": doc_hash},
         )
         self._raise_for_error(response)
         return PushedHarnessVersion.model_validate(response.json())
+
+    # -- built-in local pi runs ---------------------------------------------------------------
+
+    def create_local_pi_run(self, org_id: str) -> LocalPiRunInfo:
+        """Open a metered platform run for WMH's built-in local pi harness."""
+        response = self._client.post(f"/api/orgs/{org_id}/local-pi-runs")
+        self._raise_for_error(response)
+        return LocalPiRunInfo.model_validate(response.json())
+
+    def complete_local_pi_worker(
+        self, org_id: str, run_id: str, request: ChatRequest
+    ) -> ChatResponse:
+        """Answer one built-in pi worker turn through the platform."""
+        response = self._client.post(
+            f"/api/orgs/{org_id}/local-pi-runs/{run_id}/worker-completion",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+        self._raise_for_error(response)
+        return ChatResponse.model_validate(response.json())
+
+    def finish_local_pi_run(
+        self,
+        org_id: str,
+        run_id: str,
+        *,
+        status: str,
+        ended_reason: str,
+        error: str | None = None,
+    ) -> None:
+        """Report the terminal transition of a built-in local pi run."""
+        response = self._client.post(
+            f"/api/orgs/{org_id}/local-pi-runs/{run_id}/finish",
+            json={"status": status, "ended_reason": ended_reason, "error": error},
+        )
+        self._raise_for_error(response)
 
     # -- internals -----------------------------------------------------------------------------
 

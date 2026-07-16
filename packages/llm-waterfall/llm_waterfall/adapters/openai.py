@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from llm_waterfall.adapters.base import missing_sdk_error
-from llm_waterfall.types import Backend, EmbeddingsUnsupported, Message, TokenUsage
+from llm_waterfall.types import (
+    Backend,
+    ChatRequest,
+    ChatResponse,
+    EmbeddingsUnsupported,
+    Message,
+    TokenUsage,
+)
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -56,9 +63,8 @@ class OpenAIAdapter:
     ) -> tuple[str, TokenUsage]:
         """One chat completion.
 
-        `max_completion_tokens` (not the deprecated `max_tokens`) and no default temperature
-        keeps this compatible with GPT-5.x reasoning models, which reject the legacy field and
-        non-default sampling params.
+        The backend contract selects the output-token field. Omitting a default temperature keeps
+        this compatible with GPT-5.x reasoning models, which reject non-default sampling params.
         """
         wire: list[dict[str, str]] = []
         if system:
@@ -67,19 +73,14 @@ class OpenAIAdapter:
         api_messages = cast("list[ChatCompletionMessageParam]", wire)
         chat = self._get_client().chat.completions
         model = self._request_model()
-        if temperature is None:
-            response = chat.create(
-                model=model,
-                messages=api_messages,
-                max_completion_tokens=max_tokens,
-            )
-        else:
-            response = chat.create(
-                model=model,
-                messages=api_messages,
-                max_completion_tokens=max_tokens,
-                temperature=temperature,
-            )
+        payload: dict[str, object] = {
+            "model": model,
+            "messages": api_messages,
+            self.backend.chat_max_tokens_field: max_tokens,
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        response = chat.create(**cast("Any", payload))
         if not response.choices:
             # Content filtering (and some error modes) can return zero choices; surface it
             # clearly rather than letting choices[0] raise a bare IndexError.
@@ -92,6 +93,17 @@ class OpenAIAdapter:
             else TokenUsage()
         )
         return text, token_usage
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a full OpenAI-compatible tool-calling request through this backend."""
+        payload = request.provider_payload(
+            self._request_model(), max_tokens_field=self.backend.chat_max_tokens_field
+        )
+        # The OpenAI SDK's input TypedDict is intentionally not our public contract. This one
+        # narrow cast sits at the SDK boundary after ChatRequest validated the structured core;
+        # provider_payload preserves forward-compatible extra fields emitted by agent SDKs.
+        response = self._get_client().chat.completions.create(**cast("Any", payload))
+        return ChatResponse.model_validate(response.model_dump(mode="json"))
 
     def _request_model(self) -> str:
         """The id sent as `model` on the wire (Azure overrides this with the deployment)."""

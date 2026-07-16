@@ -1,0 +1,135 @@
+{
+  "name": "gepa-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "t64_b0",
+        "params": {
+          "n_train": 64,
+          "budget": 0
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.888
+        },
+        {
+          "seed": 1,
+          "score": 0.896
+        }
+      ],
+      "mean": 0.892,
+      "std": 0.0040000000000000036
+    },
+    {
+      "condition": {
+        "label": "t64_b1",
+        "params": {
+          "n_train": 64,
+          "budget": 1
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.887
+        },
+        {
+          "seed": 1,
+          "score": 0.887
+        }
+      ],
+      "mean": 0.887,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t64_b2",
+        "params": {
+          "n_train": 64,
+          "budget": 2
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.878
+        },
+        {
+          "seed": 1,
+          "score": 0.908
+        }
+      ],
+      "mean": 0.893,
+      "std": 0.015000000000000013
+    },
+    {
+      "condition": {
+        "label": "t64_b4",
+        "params": {
+          "n_train": 64,
+          "budget": 4
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.89
+        },
+        {
+          "seed": 1,
+          "score": 0.9
+        }
+      ],
+      "mean": 0.895,
+      "std": 0.0050000000000000044
+    },
+    {
+      "condition": {
+        "label": "t64_b8",
+        "params": {
+          "n_train": 64,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.872
+        },
+        {
+          "seed": 1,
+          "score": 0.892
+        }
+      ],
+      "mean": 0.882,
+      "std": 0.010000000000000009
+    },
+    {
+      "condition": {
+        "label": "t64_b16",
+        "params": {
+          "n_train": 64,
+          "budget": 16
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.883
+        },
+        {
+          "seed": 1,
+          "score": 0.886219512195122
+        }
+      ],
+      "mean": 0.884609756097561,
+      "std": 0.001609756097560977
+    }
+  ]
+}

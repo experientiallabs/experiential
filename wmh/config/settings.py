@@ -29,28 +29,42 @@ class ModelRole(BaseModel):
     region: str | None = None  # AWS Bedrock region
     endpoint: str | None = None  # Azure OpenAI / custom base URL
     deployment: str | None = None  # Azure OpenAI deployment name
+    api_version: str | None = None  # Azure OpenAI API version (azure roles get a default)
 
 
 class ModelsSettings(BaseModel):
     """Role-based model defaults for this project (`.wmh/settings.toml`, `[models.<role>]`).
 
-    Three roles keep the surface small: `worker` does quality-critical generation (scenario
+    Four roles keep the surface small: `worker` does quality-critical generation (scenario
     synthesis, cluster naming, agent rollouts); `judge` grades (checklist judging, inline
     validity gates) and should be a different model family from `worker` so the grader carries
     no self-preference bias toward the generator's outputs; `summary` does high-volume cheap
-    extraction (trace facets/digests). Unset `judge`/`summary` fall back to `worker`; explicit
-    CLI flags override everything.
+    extraction (trace facets/digests); `meta` is the harness-search delta proposer, which
+    needs a long-context, long-output model (one proposal holds every harness surface in its
+    prompt and replies with a complete replacement surface). Unset `judge`/`summary` fall back
+    to `worker`; explicit CLI flags override everything.
     """
 
     worker: ModelRole | None = None
     judge: ModelRole | None = None
     summary: ModelRole | None = None
+    meta: ModelRole | None = None
 
     def resolve(self, role: str) -> ModelRole | None:
-        """The configured role, with unset `judge`/`summary` falling back to `worker`."""
-        if role not in ("worker", "judge", "summary"):
-            raise ValueError(f"unknown model role {role!r}; expected worker, judge, or summary")
+        """The configured role, with unset `judge`/`summary` falling back to `worker`.
+
+        `meta` deliberately does NOT fall back to `worker`: the scenario worker is picked for
+        generation quality per token, not for the proposer's long-context/long-output needs,
+        so an unset `meta` returns None and the caller keeps its own default (`wmh harness
+        create` uses the world model's provider).
+        """
+        if role not in ("worker", "judge", "summary", "meta"):
+            raise ValueError(
+                f"unknown model role {role!r}; expected worker, judge, summary, or meta"
+            )
         configured: ModelRole | None = getattr(self, role)
+        if role == "meta":
+            return configured
         return configured or self.worker
 
 

@@ -93,11 +93,11 @@ def _exists(image: str) -> bool:
     ).returncode == 0
 
 
-def _build_tools_image(*, no_cache: bool) -> None:
+def _build_tools_image(tag: str, *, no_cache: bool) -> None:
     """`docker build` the fresh tools image (curl/python3/jq), streaming the apt install live."""
     with tempfile.TemporaryDirectory(prefix="wmh-tt-build-") as ctx:
         (Path(ctx) / "Dockerfile").write_text(_DOCKERFILE, encoding="utf-8")
-        cmd = ["docker", "build", "-t", _IMAGE_TAG]
+        cmd = ["docker", "build", "-t", tag]
         if no_cache:
             cmd.append("--no-cache")
         cmd.append(ctx)
@@ -112,7 +112,12 @@ def main() -> None:
     parser.add_argument("--corpus", default=str(_DEFAULT_CORPUS), help="terminal-tasks OTel corpus.")
     parser.add_argument(
         "--trace", type=int, default=None,
-        help="Held-out trace to replay (default: the simplest = fewest commands).",
+        help="Held-out trace to replay by index (default: the simplest = fewest commands).",
+    )
+    parser.add_argument(
+        "--trace-id", default=None,
+        help="Replay the trace with this exact trace_id (overrides --trace). Use this to pin the "
+        "SAME scenario the world-model side ran, since index order differs between the two sides.",
     )
     parser.add_argument("--train-split", type=float, default=0.7, help="Train/holdout ratio.")
     parser.add_argument(
@@ -127,7 +132,14 @@ def main() -> None:
     pool = _holdout(traces, args.train_split)
     if not pool:
         raise SystemExit(f"no traces in {args.corpus}; nothing to run")
-    if args.trace is None:
+    if args.trace_id is not None:
+        # Pin by stable trace_id so this side replays EXACTLY the world side's scenario, regardless
+        # of how the two loaders order the corpus.
+        by_id = {t["trace_id"]: t for t in traces}
+        if args.trace_id not in by_id:
+            raise SystemExit(f"--trace-id {args.trace_id} not found in {args.corpus}")
+        trace = by_id[args.trace_id]
+    elif args.trace is None:
         # Default: the simplest scenario — fewest recorded commands (matches the wmh side's default).
         trace = min(pool, key=lambda t: len(t["commands"]))
     elif 0 <= args.trace < len(pool):
@@ -144,19 +156,24 @@ def main() -> None:
         + (" [--no-cache]\n" if no_cache else " [cached]\n")
     )
 
+    # Per-run unique image tag so concurrent cold builds are fully isolated — no shared tag to
+    # clobber (as if each ran on its own machine). With --cache we reuse the fixed shared tag.
+    run_id = uuid.uuid4().hex[:8]
+    image_tag = _IMAGE_TAG if args.cache else f"wmh-terminal-tasks:{run_id}"
+
     start = time.monotonic()
     if args.cache and _exists(_IMAGE_TAG):
         print(f"--- tools image {_IMAGE_TAG} already built (cached) ---\n")
     else:
-        print("--- building the tools image ---")
-        _build_tools_image(no_cache=no_cache)
+        print(f"--- building the tools image {image_tag} ---")
+        _build_tools_image(image_tag, no_cache=no_cache)
         print()
     build_done = time.monotonic()
     print(f"[container built from scratch in {build_done - start:.1f}s]\n")
 
-    container = f"wmh-real-{uuid.uuid4().hex[:8]}"
+    container = f"wmh-real-{run_id}"
     rc = subprocess.run(
-        ["docker", "run", "-d", "--name", container, "-w", "/work", "--rm", _IMAGE_TAG,
+        ["docker", "run", "-d", "--name", container, "-w", "/work", "--rm", image_tag,
          "sleep", "2h"],
         stdout=subprocess.DEVNULL,
     ).returncode
@@ -176,6 +193,10 @@ def main() -> None:
     finally:
         subprocess.run(["docker", "rm", "-f", container], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
+        # Remove the per-run image (unless it's the shared cached tag) so each run leaves no state.
+        if image_tag != _IMAGE_TAG:
+            subprocess.run(["docker", "rmi", "-f", image_tag], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
 
     total = time.monotonic() - start
     print(

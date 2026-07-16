@@ -16,6 +16,7 @@ from wmh.providers.base import (
     ProviderKind,
     VerifyResult,
 )
+from wmh.providers.models import ProviderModel, model_types_for_provider, resolve_provider_model
 from wmh.providers.registry import get_provider, verify_all, verify_embedder
 from wmh.providers.waterfall import WaterfallProvider, provider_or_chain
 
@@ -23,6 +24,7 @@ __all__ = [
     "Provider",
     "ProviderConfig",
     "ProviderKind",
+    "ProviderModel",
     "EmbedderKind",
     "DEFAULT_MAX_TOKENS",
     "Completion",
@@ -33,4 +35,6 @@ __all__ = [
     "WaterfallProvider",
     "verify_all",
     "verify_embedder",
+    "model_types_for_provider",
+    "resolve_provider_model",
 ]

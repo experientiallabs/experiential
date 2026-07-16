@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from wmh.config.card import CardCorpus, ModelCard, TracesSource
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
+from wmh.engine.knowledge import KnowledgeBase
 from wmh.engine.world_model import WorldModel
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
@@ -141,9 +142,13 @@ def _build_client(tmp_path: Path) -> TestClient:
 
 def test_build_routes_run_a_build_and_stream_events(tmp_path: Path) -> None:
     client = _build_client(tmp_path)
-    traces = tmp_path / "t.jsonl"
-    traces.write_text("{}\n", encoding="utf-8")
-    started = client.post("/world_models/builds", json={"name": "fresh", "file": str(traces)})
+    upload = client.post(
+        "/world_models/builds/uploads",
+        files={"file": ("t.jsonl", b"{}\n", "application/jsonl")},
+    )
+    started = client.post(
+        "/world_models/builds", json={"name": "fresh", "file": upload.json()["file"]}
+    )
     assert started.status_code == 202
     build_id = started.json()["build_id"]
     # Poll until the background build reaches a terminal state.
@@ -166,6 +171,17 @@ def test_build_routes_unavailable_without_manager() -> None:
     assert resp.status_code == 503
 
 
+def test_build_route_rejects_server_local_path(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("{}\n", encoding="utf-8")
+
+    response = client.post("/world_models/builds", json={"name": "fresh", "file": str(secret)})
+
+    assert response.status_code == 422
+    assert "upload" in response.json()["detail"]
+
+
 def test_upload_rejects_foreign_origin(tmp_path: Path) -> None:
     client = _build_client(tmp_path)
     resp = client.post(
@@ -180,6 +196,18 @@ def test_upload_rejects_foreign_origin(tmp_path: Path) -> None:
         headers={"Origin": "http://localhost:6001"},
     )
     assert ok.status_code == 200
+
+
+def test_upload_returns_opaque_filename(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+    response = client.post(
+        "/world_models/builds/uploads",
+        files={"file": ("traces.jsonl", b"{}\n", "application/jsonl")},
+    )
+
+    assert response.status_code == 200
+    upload = response.json()["file"]
+    assert Path(upload).name == upload
 
 
 def test_session_lifecycle_and_step_are_namespaced() -> None:
@@ -279,6 +307,53 @@ def test_end_session_returns_usage_and_frees_the_session() -> None:
     assert response.status_code == 200
     assert "events" in response.json() or "run_id" in response.json()
     assert client.get(f"/world_models/airline/sessions/{session_id}").status_code == 404
+
+
+def _knowledge_world_model(tmp_path) -> WorldModel:  # noqa: ANN001 - pytest fixture
+    kb = KnowledgeBase(tmp_path / "knowledge")
+    kb.write_file("rules.md", "- gate: auth required")
+    retriever = EmbeddingRetriever(HashingEmbedder(dim=32))
+    return WorldModel(FakeProvider(), retriever, top_k=1, knowledge=kb)
+
+
+def test_knowledge_read_lists_files(tmp_path) -> None:  # noqa: ANN001 - pytest fixture
+    client = _client({"airline": _knowledge_world_model(tmp_path)})
+    response = client.get("/world_models/airline/knowledge")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is True
+    assert body["files"]["rules.md"] == "- gate: auth required"
+
+
+def test_knowledge_read_on_model_without_kb_reports_disabled() -> None:
+    client = _client()
+    response = client.get("/world_models/airline/knowledge")
+    assert response.status_code == 200
+    assert response.json() == {"enabled": False, "files": {}}
+
+
+def test_knowledge_put_replaces_one_file(tmp_path) -> None:  # noqa: ANN001 - pytest fixture
+    client = _client({"airline": _knowledge_world_model(tmp_path)})
+    put = client.put(
+        "/world_models/airline/knowledge/rules.md",
+        json={"content": "- gate: auth AND ownership required"},
+    )
+    assert put.status_code == 200
+    body = client.get("/world_models/airline/knowledge").json()
+    assert body["files"]["rules.md"] == "- gate: auth AND ownership required"
+
+
+def test_knowledge_put_without_kb_is_a_clear_conflict() -> None:
+    client = _client()
+    response = client.put("/world_models/airline/knowledge/rules.md", json={"content": "x"})
+    assert response.status_code == 409
+    assert "knowledge" in response.json()["detail"]
+
+
+def test_knowledge_put_rejects_non_markdown_names(tmp_path) -> None:  # noqa: ANN001
+    client = _client({"airline": _knowledge_world_model(tmp_path)})
+    response = client.put("/world_models/airline/knowledge/evil.txt", json={"content": "x"})
+    assert response.status_code == 400
 
 
 def test_traces_none_for_plain_injected_model() -> None:

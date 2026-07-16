@@ -1,0 +1,25 @@
+{
+  "name": "gepa-scaling-law",
+  "seeds": [
+    0
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "t64_b8",
+        "params": {
+          "n_train": 64,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8997439024390244
+        }
+      ],
+      "mean": 0.8997439024390244,
+      "std": 0.0
+    }
+  ]
+}

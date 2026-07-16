@@ -11,15 +11,19 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from typing import TypeVar
 
 from llm_waterfall import is_capacity_error
 
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
     Completion,
     Message,
     Provider,
     ProviderConfig,
+    ToolCallingProvider,
     VerifyResult,
 )
 
@@ -28,6 +32,7 @@ _DELAYS = (1.0, 3.0, 9.0)
 
 # on_retry(attempt_number, total_attempts, delay_seconds, error)
 RetryCallback = Callable[[int, int, float, Exception], None]
+_T = TypeVar("_T")
 
 
 class RetryingProvider:
@@ -71,7 +76,7 @@ class RetryingProvider:
     def verify(self) -> VerifyResult:
         return self._provider.verify()
 
-    def _retry(self, call):  # noqa: ANN001, ANN202 - generic over the wrapped call's return
+    def _retry(self, call: Callable[[], _T]) -> _T:
         total = len(self._delays)
         for attempt, delay in enumerate(self._delays, start=1):
             try:
@@ -83,3 +88,52 @@ class RetryingProvider:
                     self._on_retry(attempt, total, delay, exc)
                 self._sleep(delay)
         return call()  # final attempt: let any error propagate
+
+
+class RetryingToolCallingProvider(RetryingProvider):
+    """Capacity retries that preserve structured agent completions."""
+
+    def __init__(
+        self,
+        provider: Provider,
+        on_retry: RetryCallback | None = None,
+        *,
+        delays: tuple[float, ...] = _DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Wrap a provider that implements both provider protocols.
+
+        Args:
+            provider: Provider with the structured ``complete_chat`` capability.
+            on_retry: Optional callback before each capacity-error backoff.
+            delays: Backoff seconds before successive attempts.
+            sleep: Sleep implementation, injectable for tests.
+
+        Raises:
+            TypeError: If ``provider`` lacks structured tool calling.
+        """
+        if not isinstance(provider, ToolCallingProvider):
+            msg = "RetryingToolCallingProvider requires a ToolCallingProvider"
+            raise TypeError(msg)
+        super().__init__(provider, on_retry=on_retry, delays=delays, sleep=sleep)
+        self._tool_calling_provider = provider
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Retry one structured completion when capacity classification allows it."""
+        return self._retry(lambda: self._tool_calling_provider.complete_chat(request))
+
+
+def wrap_provider_with_retries(
+    provider: Provider,
+    on_retry: RetryCallback | None = None,
+    *,
+    delays: tuple[float, ...] = _DELAYS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> RetryingProvider:
+    """Apply retries without changing the provider's runtime capabilities."""
+    wrapper = (
+        RetryingToolCallingProvider
+        if isinstance(provider, ToolCallingProvider)
+        else RetryingProvider
+    )
+    return wrapper(provider, on_retry=on_retry, delays=delays, sleep=sleep)

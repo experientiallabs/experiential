@@ -149,3 +149,81 @@ def test_runtime_backend_selector() -> None:
     # Unknown backends are rejected.
     with pytest.raises(ValueError, match="unknown backend"):
         coded.runtime(provider, backend="bogus")
+
+
+def _pi_doc() -> HarnessDoc:
+    from wmh.harness.doc import RUNTIME_KIND_ID
+
+    return HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+            Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+        ],
+    )
+
+
+def _stub_provider():  # noqa: ANN202 - returns the casted Provider protocol below
+    from typing import cast
+
+    from llm_waterfall import ChatRequest, ChatResponse
+
+    from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
+
+    class _P:
+        config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+
+        def complete(self, system: str, messages: list[Message], **k) -> Completion:  # noqa: ANN003
+            raise NotImplementedError
+
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            del request
+            return ChatResponse.model_validate(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[0.0] for _ in texts]
+
+        def verify(self) -> object:
+            raise NotImplementedError
+
+    return cast("Provider", _P())
+
+
+def test_runtime_e2b_backend_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """backend='e2b' on a pi-node doc: E2BPiRuntime, with the template flag beating the env."""
+    from wmh.harness.pi_e2b import E2BPiRuntime, E2BSandboxPool
+
+    provider = _stub_provider()
+    monkeypatch.setenv("WMH_E2B_TEMPLATE", "env-tmpl")
+    # An explicit template (the --e2b-template flag) beats the env var: it pins the runtime's
+    # private pool (env-var resolution is bootstrap-time, covered in pi_e2b_test).
+    explicit = _pi_doc().runtime(provider, backend="e2b", e2b_template="flag-tmpl")
+    assert isinstance(explicit, E2BPiRuntime)
+    assert explicit._pool._template == "flag-tmpl"  # noqa: SLF001 - pins the flag > env precedence
+    # A shared pool (a whole search's) is used as-is; the runtime never builds a private one.
+    shared_pool = E2BSandboxPool()
+    shared = _pi_doc().runtime(provider, backend="e2b", e2b_pool=shared_pool)
+    assert isinstance(shared, E2BPiRuntime)
+    assert shared._pool is shared_pool  # noqa: SLF001 - pins the pool passthrough
+
+
+def test_runtime_e2b_backend_rejects_in_process_runtime_kinds() -> None:
+    """backend='e2b' only moves a pi-node harness PROCESS; in-process kinds must raise."""
+    from wmh.harness.doc import code_baseline
+
+    provider = _stub_provider()
+    with pytest.raises(ValueError, match="use backend='local'"):
+        HarnessDoc.baseline("b").runtime(provider, backend="e2b")
+    with pytest.raises(ValueError, match="use backend='local'"):
+        code_baseline("c").runtime(provider, backend="e2b")

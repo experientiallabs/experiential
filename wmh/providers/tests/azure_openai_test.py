@@ -168,6 +168,111 @@ def test_verify_reports_failure_without_raising(monkeypatch: pytest.MonkeyPatch)
     assert result.kind is ProviderKind.AZURE_OPENAI
 
 
+def _endpoint_config(endpoint: str) -> ProviderConfig:
+    return ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        endpoint=endpoint,
+        deployment="gpt55-deploy",
+        api_version="2024-10-21",
+    )
+
+
+def test_config_endpoint_never_receives_the_real_azure_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config-controlled endpoint (untrusted bundle) must not get AZURE_OPENAI_API_KEY."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://trusted.openai.azure.com")
+    monkeypatch.delenv("WMH_ENDPOINT_API_KEY", raising=False)
+    client = AzureOpenAIProvider(_endpoint_config("https://attacker.host"))._get_client()
+    assert client.api_key != "az-real-secret"
+
+
+def test_config_endpoint_uses_dedicated_key_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Auth for a config endpoint comes from WMH_ENDPOINT_API_KEY, mirroring OpenAIProvider."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "endpoint-token")
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    client = AzureOpenAIProvider(_endpoint_config("https://attacker.host"))._get_client()
+    assert client.api_key == "endpoint-token"
+
+
+def test_trusted_env_endpoint_uses_the_real_azure_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator-supplied AZURE_OPENAI_ENDPOINT keeps using the real AZURE_OPENAI_API_KEY."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://trusted.openai.azure.com")
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "endpoint-token")
+    # config.endpoint matching the trusted env endpoint is still trusted.
+    client = AzureOpenAIProvider(_endpoint_config("https://trusted.openai.azure.com"))._get_client()
+    assert client.api_key == "az-real-secret"
+
+
+def test_trusted_endpoint_matches_despite_trailing_slash_and_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trailing slash or casing difference must not strip the real key from a trusted host."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://Trusted.openai.azure.com")
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "endpoint-token")
+    client = AzureOpenAIProvider(
+        _endpoint_config("https://trusted.openai.azure.com/")
+    )._get_client()
+    assert client.api_key == "az-real-secret"
+
+
+def test_case_sensitive_path_difference_is_untrusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path that differs only by case is a different (untrusted) resource: no real key."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://proxy.example.com/Azure")
+    monkeypatch.delenv("WMH_ENDPOINT_API_KEY", raising=False)
+    client = AzureOpenAIProvider(_endpoint_config("https://proxy.example.com/azure"))._get_client()
+    assert client.api_key != "az-real-secret"
+
+
+def test_query_string_difference_is_untrusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config endpoint that differs only by query is a different resource: no real key."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://proxy.example.com/azure?tenant=trusted")
+    monkeypatch.delenv("WMH_ENDPOINT_API_KEY", raising=False)
+    client = AzureOpenAIProvider(
+        _endpoint_config("https://proxy.example.com/azure?tenant=attacker")
+    )._get_client()
+    assert client.api_key != "az-real-secret"
+
+
+def test_no_config_endpoint_falls_back_to_env_and_real_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no config.endpoint, the SDK uses AZURE_OPENAI_ENDPOINT + the real key."""
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://trusted.openai.azure.com")
+    provider = AzureOpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="gpt-5.5",
+            deployment="gpt55-deploy",
+            api_version="2024-10-21",
+        )
+    )
+    assert provider._get_client().api_key == "az-real-secret"
+
+
+def test_missing_endpoint_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No config.endpoint and no AZURE_OPENAI_ENDPOINT is a clear config error."""
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    provider = AzureOpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="gpt-5.5",
+            deployment="gpt55-deploy",
+            api_version="2024-10-21",
+        )
+    )
+    with pytest.raises(ValueError, match="endpoint"):
+        provider._get_client()
+
+
 @pytest.mark.skipif(
     not {"AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"}.issubset(__import__("os").environ),
     reason="no Azure OpenAI creds; skipping live smoke test",

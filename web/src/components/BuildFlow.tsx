@@ -92,6 +92,7 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
   const onUpload = useCallback(async (file: File) => {
     setUploading(true);
     setError(null);
+    setTracesPath("");
     try {
       setTracesPath(await uploadTraces(file));
     } catch (e) {
@@ -210,9 +211,9 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
           <div className="flex gap-2">
             <input
               value={tracesPath}
-              onChange={(e) => setTracesPath(e.target.value)}
+              readOnly
               disabled={running}
-              placeholder="/path/to/traces.otel.jsonl"
+              placeholder="Upload a traces file"
               className="flex-1 rounded-md border border-line px-3 py-2 font-mono text-xs outline-none focus:border-accent disabled:opacity-50"
             />
             <label className="cursor-pointer rounded-md border border-line px-3 py-2 text-sm text-ink-soft hover:border-accent">
@@ -222,7 +223,11 @@ export function BuildFlow({ serveHint }: { serveHint: string }) {
                 accept=".jsonl,.json"
                 className="hidden"
                 disabled={running}
-                onChange={(e) => e.target.files?.[0] && onUpload(e.target.files[0])}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (file) void onUpload(file);
+                }}
               />
             </label>
           </div>

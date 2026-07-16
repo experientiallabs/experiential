@@ -162,5 +162,5 @@ export async function uploadTraces(file: File): Promise<string> {
     body,
   });
   if (!res.ok) throw await toApiError(res);
-  return (await res.json()).path as string;
+  return (await res.json()).file as string;
 }

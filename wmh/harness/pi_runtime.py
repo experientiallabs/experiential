@@ -4,10 +4,9 @@ The harness under search is the pi agent's own source: each file is a `code:` su
 `path`. To run one task the runtime materializes those files into a checkout on a runner box,
 starts a local shim, and drives pi headless through it (`wmh/harness/pi_entry/entry.ts`):
 
-- pi's LLM calls hit the shim's OpenAI-compatible `/v1/chat/completions`, which proxies to a real
-  function-calling model (the *agent*). pi drives tools through native function-calling, which the
-  text-only kit cannot express, so the agent model is a genuine OpenAI-compatible endpoint rather
-  than the world-model provider.
+- pi's LLM calls hit the shim's OpenAI-compatible `/v1/chat/completions`; the shim validates the
+  structured request and delegates it to the caller's tool-calling provider. Provider-owned auth,
+  routing, translation, retries, and waterfall failover stay on the control host.
 - pi's task tools POST `/tool`, which the runtime answers from the `AgentEnvironment` (the world
   model in simulation, the real backend in the transfer check). These calls are the recorded
   transcript the judge grades.
@@ -30,32 +29,22 @@ import re
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, cast
+
+from llm_waterfall import ChatRequest
+from pydantic import JsonValue
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runner_link import WorkerConfig, params_schema, worker_completion
+from wmh.harness.runner_link import params_schema
 from wmh.harness.runtime import RunResult, StopReason
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import ToolSpec
-from wmh.providers.base import Provider
+from wmh.providers.base import Provider, ToolCallingProvider
 
 # The runner: node runs here, reached over SSH. The checkout keeps pi's node_modules; per-episode
 # source is overwritten from the harness surfaces.
 PI_RUNNER_HOST = os.environ.get("PI_RUNNER_HOST", "kion@nucbox.local")
 PI_RUNNER_DIR = os.environ.get("PI_RUNNER_DIR", "~/pi-run")
-# The agent model pi talks to. Two backends:
-#   PI_AGENT_BACKEND=openai (default) -> transparent proxy to an OpenAI-compatible endpoint.
-#   PI_AGENT_BACKEND=bedrock          -> the shim translates pi's OpenAI chat request to a Bedrock
-#                                        Converse call (host-side, boto3) and back to OpenAI SSE, so
-#                                        a Bedrock model (e.g. Claude Haiku) can be the worker
-#                                        without pi needing AWS creds or a Bedrock transport.
-PI_AGENT_BACKEND = os.environ.get("PI_AGENT_BACKEND", "openai")
-PI_AGENT_BASE_URL = os.environ.get("PI_AGENT_BASE_URL", "https://api.deepseek.com/v1")
-PI_AGENT_MODEL = os.environ.get("PI_AGENT_MODEL", "deepseek-chat")
-PI_AGENT_KEY_ENV = os.environ.get("PI_AGENT_KEY_ENV", "DEEPSEEK_API_KEY")
-PI_AGENT_REGION = os.environ.get("PI_AGENT_REGION", os.environ.get("AWS_REGION", "us-east-1"))
-
 DEFAULT_MAX_ENV_ACTIONS = 40
 _ENTRY_TS = os.path.join(os.path.dirname(__file__), "pi_entry", "entry.ts")
 # Runner paths are interpolated into remote shell commands, so restrict them to characters that
@@ -76,12 +65,14 @@ class _Episode:
         instruction: str,
         system_prompt: str,
         tools: list[ToolSpec],
+        provider: ToolCallingProvider,
         environment: AgentEnvironment,
         max_env_actions: int,
     ) -> None:
         self.instruction = instruction
         self.system_prompt = system_prompt
         self.tools = tools
+        self.provider = provider
         self.environment = environment
         self.max_env_actions = max_env_actions
         self.steps: list[Step] = []
@@ -181,89 +172,38 @@ class _ShimHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, status=404)
 
     def _serve_completion(self, body: JsonObject) -> None:
-        """Answer pi's chat-completion from the configured worker backend, as OpenAI SSE.
-
-        openai backend: transparent passthrough preserving OpenAI's chunk framing (tool_calls,
-        finish_reason). bedrock backend: translate to a Bedrock Converse call and synthesize the
-        SSE reply. `Connection: close` + closing the socket delimits the body and forces a fresh
-        socket for pi's next turn.
-        """
-        if PI_AGENT_BACKEND == "bedrock":
-            self._serve_completion_bedrock(body)
-            return
-        import urllib.error
-        import urllib.request
-
-        key = os.environ.get(PI_AGENT_KEY_ENV, "")
-        body["model"] = PI_AGENT_MODEL
-        body["stream"] = True
-        req = urllib.request.Request(
-            PI_AGENT_BASE_URL.rstrip("/") + "/chat/completions",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-            method="POST",
-        )
+        """Delegate pi's structured request to the provider and synthesize OpenAI SSE."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
         try:
-            with urllib.request.urlopen(req, timeout=180) as upstream:
-                for chunk in iter(lambda: upstream.read(2048), b""):
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-        except urllib.error.HTTPError as exc:  # capture upstream body for diagnosis
-            detail = exc.read().decode("utf-8", "replace")[:800]
-            self._ep.proxy_error = f"{exc.code}: {detail}"
-            err = json.dumps({"error": {"message": f"agent proxy {exc.code}"}})
-            self.wfile.write(f"data: {err}\n\ndata: [DONE]\n\n".encode())
-        except Exception as exc:  # noqa: BLE001 - never crash the shim
-            self._ep.proxy_error = str(exc)
-            err = json.dumps({"error": {"message": f"agent proxy failed: {exc}"}})
-            self.wfile.write(f"data: {err}\n\ndata: [DONE]\n\n".encode())
-
-    def _serve_completion_bedrock(self, body: JsonObject) -> None:
-        """Translate pi's OpenAI chat request to a Bedrock Converse call, reply as OpenAI SSE.
-
-        Non-streaming Converse on the host (boto3, host AWS creds), then synthesized as two SSE
-        chunks (delta, then finish_reason) + [DONE] — the framing pi's openai-completions parser
-        expects. The worker model never sees AWS creds; they stay on the control host.
-        """
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        try:
-            # The Bedrock translation + Converse call is shared with the frame transport
-            # (runner_link.worker_completion); here we only re-frame its completion object as the
-            # two SSE chunks pi's openai-completions parser expects.
-            cfg = WorkerConfig(backend="bedrock", model=PI_AGENT_MODEL, region=PI_AGENT_REGION)
-            completion = cast("Any", worker_completion(body, cfg))
-            choice = completion["choices"][0]
-            msg = choice["message"]
-            delta: dict[str, Any] = {"role": "assistant", "content": msg.get("content", "")}
-            tcs = msg.get("tool_calls")
-            if tcs:  # streaming delta: index per call, function object kept explicitly nested
+            completion = self._ep.provider.complete_chat(ChatRequest.model_validate(body))
+            choice = completion.choices[0]
+            message = choice.message
+            content = message.content if isinstance(message.content, str) else ""
+            delta: dict[str, JsonValue] = {"role": "assistant", "content": content}
+            if message.tool_calls:
                 delta["tool_calls"] = [
                     {
                         "index": i,
-                        "id": tc.get("id"),
-                        "type": tc.get("type", "function"),
-                        "function": tc.get("function", {}),
+                        **tool_call.model_dump(mode="json"),
                     }
-                    for i, tc in enumerate(tcs)
+                    for i, tool_call in enumerate(message.tool_calls)
                 ]
-            fin = choice.get("finish_reason")
             first = {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-            last = {"choices": [{"index": 0, "delta": {}, "finish_reason": fin}]}
+            last = {
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": choice.finish_reason or "stop"}
+                ]
+            }
             self.wfile.write(f"data: {json.dumps(first)}\n\n".encode())
             self.wfile.write(f"data: {json.dumps(last)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
         except Exception as exc:  # noqa: BLE001 - never crash the shim
             self._ep.proxy_error = str(exc)
-            err = json.dumps({"error": {"message": f"bedrock worker failed: {exc}"}})
+            err = json.dumps({"error": {"message": f"agent provider failed: {exc}"}})
             self.wfile.write(f"data: {err}\n\ndata: [DONE]\n\n".encode())
 
 
@@ -283,8 +223,9 @@ class PiRuntime:
         workdir: str | None = None,
         max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS,
     ) -> None:
-        # `provider` is unused for the agent LLM (pi talks to PI_AGENT_* directly); kept for the
-        # Runtime constructor contract the doc dispatches through.
+        if not isinstance(provider, ToolCallingProvider):
+            raise TypeError("PiRuntime needs a ToolCallingProvider")
+        self._provider = provider
         self._files = files
         self._tools = tools
         self._system_prompt = system_prompt
@@ -303,6 +244,7 @@ class PiRuntime:
             instruction=instruction,
             system_prompt=self._system_prompt,
             tools=self._tools,
+            provider=self._provider,
             environment=environment,
             max_env_actions=self._max_env_actions,
         )

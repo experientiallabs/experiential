@@ -1,0 +1,51 @@
+{
+  "name": "trace-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "reason@160",
+        "params": {
+          "mode": "reason",
+          "n_train": 160
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8832323232323233
+        },
+        {
+          "seed": 1,
+          "score": 0.885959595959596
+        }
+      ],
+      "mean": 0.8845959595959596,
+      "std": 0.0013636363636363447
+    },
+    {
+      "condition": {
+        "label": "reason+kb@160",
+        "params": {
+          "mode": "reason+kb",
+          "n_train": 160
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9012727272727272
+        },
+        {
+          "seed": 1,
+          "score": 0.8862020202020201
+        }
+      ],
+      "mean": 0.8937373737373737,
+      "std": 0.007535353535353562
+    }
+  ]
+}

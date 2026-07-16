@@ -6,6 +6,8 @@ so we can assert exact top-k ordering by cosine similarity without any network.
 
 from __future__ import annotations
 
+import pytest
+
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval.retriever import EmbeddingRetriever, Retriever
@@ -139,3 +141,39 @@ def test_save_load_empty_buffer(tmp_path) -> None:  # noqa: ANN001 - pytest fixt
     dst = EmbeddingRetriever(HashingEmbedder(dim=16))
     dst.load(tmp_path / "index")
     assert dst.topk(EnvState(), _step("alpha", 1, "a").action, k=3) == []
+
+
+class _RecordingEmbedder:
+    """Records the exact texts it was asked to embed; returns a fixed vector for each."""
+
+    def __init__(self) -> None:
+        self.config = ProviderConfig(kind=ProviderKind.ANTHROPIC, model="m")
+        self.seen: list[str] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.seen.extend(texts)
+        return [[1.0, 0.0] for _ in texts]
+
+
+def test_key_mode_action_embeds_command_only_not_state_scaffolding() -> None:
+    step = Step(
+        action=Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "ls -la"}),
+        observation=Observation(content="out"),
+    )
+    rec = _RecordingEmbedder()
+    EmbeddingRetriever(rec, key_mode="action").index([Trace(trace_id="t", steps=[step])])
+    key = rec.seen[0]
+    assert "ls -la" in key and "bash" in key
+    assert "STATE:" not in key and "ACTION kind=" not in key  # no scaffolding
+
+    rec2 = _RecordingEmbedder()
+    EmbeddingRetriever(rec2, key_mode="state_action").index([Trace(trace_id="t", steps=[step])])
+    assert "STATE:" in rec2.seen[0]  # default keeps the full summary
+
+
+def test_key_mode_rejects_unknown() -> None:
+    emb = _RecordingEmbedder()
+    # The Literal type rules this out statically; the runtime guard still defends untyped callers
+    # (e.g. a raw CLI string), which is what this asserts.
+    with pytest.raises(ValueError, match="key_mode"):
+        EmbeddingRetriever(emb, key_mode="bogus")  # ty: ignore[invalid-argument-type]

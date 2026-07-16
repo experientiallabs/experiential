@@ -10,22 +10,31 @@ from llm_waterfall.pricing import ModelPrice, cost_usd, price_for
 from llm_waterfall.types import (
     Attempt,
     Backend,
+    ChatMaxTokensField,
+    ChatRequest,
+    ChatResponse,
+    ChatResult,
     CompletionResult,
     EmbeddingResult,
     EmbeddingsUnsupported,
     Message,
     RetryPolicy,
     TokenUsage,
+    ToolCallingUnsupported,
     VerifyResult,
     WaterfallExhausted,
 )
 from llm_waterfall.waterfall import Waterfall
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = [
     "Attempt",
     "Backend",
+    "ChatMaxTokensField",
+    "ChatRequest",
+    "ChatResponse",
+    "ChatResult",
     "CompletionResult",
     "EmbeddingResult",
     "EmbeddingsUnsupported",
@@ -33,6 +42,7 @@ __all__ = [
     "ModelPrice",
     "RetryPolicy",
     "TokenUsage",
+    "ToolCallingUnsupported",
     "VerifyResult",
     "Waterfall",
     "WaterfallExhausted",

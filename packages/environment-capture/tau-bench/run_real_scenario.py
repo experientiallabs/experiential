@@ -79,7 +79,12 @@ def main() -> None:
     parser.add_argument("--corpus", default=str(_DEFAULT_CORPUS), help="tau2-bench OTel corpus.")
     parser.add_argument(
         "--trace", type=int, default=None,
-        help="Held-out trace to replay (default: the simplest = fewest tool calls).",
+        help="Held-out trace to replay by index (default: the simplest = fewest tool calls).",
+    )
+    parser.add_argument(
+        "--trace-id", default=None,
+        help="Replay the trace with this exact trace_id (overrides --trace). Use this to pin the "
+        "SAME scenario the world-model side ran, since index order differs between the two sides.",
     )
     parser.add_argument("--train-split", type=float, default=0.7, help="Train/holdout ratio.")
     args = parser.parse_args()
@@ -88,7 +93,14 @@ def main() -> None:
     pool = _holdout(traces, args.train_split)
     if not pool:
         raise SystemExit(f"no traces in {args.corpus}; nothing to run")
-    if args.trace is None:
+    if args.trace_id is not None:
+        # Pin by stable trace_id so this side replays EXACTLY the world side's scenario, regardless
+        # of how the two loaders order the corpus.
+        by_id = {t["trace_id"]: t for t in traces}
+        if args.trace_id not in by_id:
+            raise SystemExit(f"--trace-id {args.trace_id} not found in {args.corpus}")
+        trace = by_id[args.trace_id]
+    elif args.trace is None:
         # Default: the simplest scenario — fewest recorded tool calls (matches the wmh side).
         trace = min(pool, key=lambda t: len(t["calls"]))
     elif 0 <= args.trace < len(pool):

@@ -6,8 +6,11 @@ import json
 from typing import TYPE_CHECKING, TypedDict, cast
 
 from wmh.core.types import JsonValue
+from wmh.providers._bedrock_chat import converse_request, converse_response
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -145,6 +148,11 @@ class BedrockProvider:
             output_tokens=data["usage"]["output_tokens"],
         )
         return Completion(text=text, usage=usage)
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a full structured agent request through Bedrock Converse."""
+        raw = self._get_client().converse(**converse_request(request, self.config.model))
+        return converse_response(raw, self.config.model)
 
     def _complete_converse(
         self,

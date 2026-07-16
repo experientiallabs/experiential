@@ -13,6 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from wmh.cli import app
+from wmh.cli.app import _CONCURRENCY_ISOLATION_FLAGS
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, verify_via_ping
 
 # `wmh.cli`'s `app` attribute (the Typer object) shadows the `wmh.cli.app` submodule on
@@ -130,8 +131,8 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
             str(root),
             "--provider",
             "bedrock",
-            "--gepa-budget",
-            "4",
+            "--fidelity",
+            "low",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -164,9 +165,37 @@ def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_pa
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    core = {"build", "list", "serve", "demo", "eval", "play", "download"}
-    platform = {"login", "logout", "status", "push", "pull"}
+    core = {"build", "list", "serve", "demo", "eval", "play", "download", "knowledge"}
+    platform = {"login", "logout", "status", "push", "pull", "run"}
     assert names == core | platform
+
+
+def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture
+    from wmh.config import save_config
+    from wmh.config.config import HarnessConfig
+    from wmh.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmh"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(), root=model_dir)
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "knowledge" in result.output  # the folder path (the real editing surface)
+    assert "rules.md" in result.output
+    assert "gate: auth required" in result.output
+
+
+def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # noqa: ANN001
+    from wmh.config import save_config
+    from wmh.config.config import HarnessConfig
+
+    root = tmp_path / ".wmh"
+    save_config(HarnessConfig(), root=root / "models" / "airline")
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "empty" in result.output.lower()
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -366,8 +395,18 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
 
     chain = FakeProvider()
     pinned = FakeProvider()
-    monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: chain)
-    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: pinned)
+    configs: list[ProviderConfig] = []
+
+    def provider_or_chain(config: ProviderConfig, **kw) -> FakeProvider:  # noqa: ANN003
+        configs.append(config)
+        return chain
+
+    def get_provider(config: ProviderConfig) -> FakeProvider:
+        configs.append(config)
+        return pinned
+
+    monkeypatch.setattr(providers_pkg, "provider_or_chain", provider_or_chain)
+    monkeypatch.setattr(providers_pkg, "get_provider", get_provider)
 
     result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--no-rag"])
 
@@ -378,6 +417,11 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
     assert judge_systems_pinned  # every judge call went to the pinned backend
     prediction_systems = [s for s in chain.systems if "grade a world model" not in s]
     assert prediction_systems  # predictions went through the chain
+    assert [config.model for config in configs] == [
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-8",
+    ]
+    assert all(config.model_type == "claude-opus-4-8" for config in configs)
 
 
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -496,7 +540,7 @@ def test_build_interactive_wizard_creates_model(
             "1",  # model: us.anthropic.claude-opus-4-8
             "us-east-1",
             "",  # judge model: accept the bedrock default (dated haiku)
-            "4",  # gepa budget
+            "1",  # fidelity: low (RAG only)
             "1",  # embedder: hashing
         ]
     )
@@ -584,6 +628,64 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
+
+
+def test_research_concurrency_rejects_level_above_scenarios_fixed_n() -> None:
+    # Fixed-N: a level above --scenarios would silently cap concurrency at N and duplicate the
+    # N-worker point, so it must fail fast (guard fires before any suite/corpus resolution).
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "any-suite", "--scenarios", "4", "--levels", "1,2,4,8"],
+    )
+    assert result.exit_code != 0
+    assert "levels goes up to 8" in result.output
+
+
+def test_research_concurrency_allows_levels_up_to_scenarios() -> None:
+    # levels == scenarios is fine; the guard must not fire (a later stage may still fail).
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "any-suite", "--scenarios", "8", "--levels", "1,2,4,8"],
+    )
+    assert "levels goes up to" not in result.output
+
+
+def test_swe_bench_concurrency_forces_cache_shared() -> None:
+    # swe-bench's fixed-N sweep must force --cache-shared (build shared base+env once, cold-build
+    # the per-instance image each level) — NOT --no-family-purge, which would rebuild the base per
+    # scenario and let concurrent workers clobber each other's shared images.
+    forced = _CONCURRENCY_ISOLATION_FLAGS["swe-bench"]
+    assert "--cache-shared" in forced
+    assert "--no-family-purge" not in forced
+
+
+def test_research_concurrency_rejects_non_integer_levels() -> None:
+    # A typo in --levels must produce a friendly BadParameter, not a raw int() traceback.
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "any-suite", "--scenarios", "8", "--levels", "1,2,foo,8"],
+    )
+    assert result.exit_code != 0
+    assert "--levels must be a comma-separated list of integers" in result.output
+
+
+def test_research_concurrency_rejects_bad_select() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "concurrency",
+            "any-suite",
+            "--select",
+            "bogus",
+            "--scenarios",
+            "4",
+            "--levels",
+            "1,2,4",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--select must be one of" in result.output
 
 
 def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001

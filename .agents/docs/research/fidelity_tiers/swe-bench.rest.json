@@ -1,0 +1,34 @@
+{
+  "high": {
+    "fidelity": 0.7791764705882354,
+    "error_flag_accuracy": 0.9529411764705882,
+    "n_steps": 85,
+    "winner": "reason+verify",
+    "considered": [
+      "base",
+      "reason",
+      "reason+kb",
+      "reason+verify"
+    ],
+    "embeddings": "semantic",
+    "gepa_budget": 8,
+    "serve_calls": 991,
+    "serve_cost_usd": 86.978
+  },
+  "max": {
+    "fidelity": 0.7807999999999999,
+    "error_flag_accuracy": 0.9529411764705882,
+    "n_steps": 85,
+    "winner": "reason+verify",
+    "considered": [
+      "base",
+      "reason",
+      "reason+kb",
+      "reason+verify"
+    ],
+    "embeddings": "semantic",
+    "gepa_budget": 16,
+    "serve_calls": 1587,
+    "serve_cost_usd": 156.012
+  }
+}

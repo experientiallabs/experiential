@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import stat
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -50,12 +52,12 @@ class BuildRouteRequest(BaseModel):
     """Inputs for one serve-side build - the `wmh build` wizard's fields over HTTP."""
 
     name: str
-    file: str  # server-local path to exported traces (use the uploads route from a browser)
+    file: str  # opaque filename returned by POST /world_models/builds/uploads
     title: str = ""
     description: str = ""
     tags: list[str] = Field(default_factory=list)
     provider: str = "bedrock"
-    model: str = "us.anthropic.claude-opus-4-8"
+    model: str = "claude-opus-4-8"
     region: str | None = None
     gepa_budget: int = 50
     train_split: float = 0.8
@@ -225,13 +227,61 @@ class BuildManager:
     def uploads_dir(self) -> Path:
         return self._store.root / "uploads"
 
+    def _snapshot_upload(self, filename: str) -> Path:
+        """Copy one validated upload into a private, immutable build input."""
+        if (
+            not filename
+            or filename in {".", ".."}
+            or Path(filename).name != filename
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise ValueError(
+                "invalid traces file reference; upload traces via "
+                "POST /world_models/builds/uploads and pass its returned filename"
+            )
+        upload = self.uploads_dir / filename
+        try:
+            source = upload.open("rb")
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"no uploaded traces file named {filename!r}; upload one via "
+                "POST /world_models/builds/uploads"
+            ) from None
+        except OSError:
+            raise ValueError(
+                "invalid traces file reference; upload traces via POST /world_models/builds/uploads"
+            ) from None
+
+        with source:
+            opened = os.fstat(source.fileno())
+            try:
+                linked = upload.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                raise ValueError("uploaded traces file changed while the build started") from None
+            same_file = (opened.st_dev, opened.st_ino) == (linked.st_dev, linked.st_ino)
+            if not stat.S_ISREG(linked.st_mode) or not same_file:
+                raise ValueError("uploaded traces file must be a regular file")
+
+            inputs_dir = self._store.root / "build-inputs"
+            inputs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            inputs_dir.chmod(0o700)
+            snapshot = inputs_dir / f"{uuid.uuid4().hex}.jsonl"
+            destination_fd = os.open(
+                snapshot,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o400,
+            )
+            try:
+                with os.fdopen(destination_fd, "wb") as destination:
+                    shutil.copyfileobj(source, destination)
+            except Exception:
+                snapshot.unlink(missing_ok=True)
+                raise
+        return snapshot
+
     def start(self, request: BuildRouteRequest) -> str:
         """Validate and launch a build, returning its id. Raises before spending anything."""
-        if not Path(request.file).is_file():
-            raise FileNotFoundError(
-                f"no traces file at {request.file!r}; upload one via "
-                "POST /world_models/builds/uploads or pass a server-local path"
-            )
         config = HarnessConfig.for_build(
             serve_provider=ProviderKind(request.provider),
             serve_model=request.model,
@@ -257,9 +307,13 @@ class BuildManager:
             self._reserved.add(request.name)
         # Fail fast on bad creds BEFORE launching the thread, so the client gets a real error
         # instead of a build that "succeeds" with a useless held-out-0.0 model.
+        traces_file: Path | None = None
         try:
+            traces_file = self._snapshot_upload(request.file)
             self._verify_fn(config)
         except Exception:
+            if traces_file is not None:
+                traces_file.unlink(missing_ok=True)
             with self._lock:
                 self._reserved.discard(request.name)
             raise
@@ -268,14 +322,27 @@ class BuildManager:
             self._builds[state.build_id] = state
         thread = threading.Thread(
             target=self._run,
-            args=(state, request, config),
+            args=(state, request, config, traces_file),
             name=f"wmh-build-{request.name}",
             daemon=True,  # never block `wmh serve` shutdown on an in-flight build
         )
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            traces_file.unlink(missing_ok=True)
+            with self._lock:
+                self._builds.pop(state.build_id, None)
+                self._reserved.discard(request.name)
+            raise
         return state.build_id
 
-    def _run(self, state: _BuildState, request: BuildRouteRequest, config: HarnessConfig) -> None:
+    def _run(
+        self,
+        state: _BuildState,
+        request: BuildRouteRequest,
+        config: HarnessConfig,
+        traces_file: Path,
+    ) -> None:
         reporter = _RecordingReporter(state)
         model_dir = self._store.model_dir(request.name)
         # If the dir already exists, this build did not create it - never delete it on failure
@@ -283,7 +350,7 @@ class BuildManager:
         preexisting = model_dir.exists()
         try:
             # Only the pipeline itself can leave a partial/broken artifact worth cleaning up.
-            self._build_fn(config, file=request.file, root=str(model_dir), reporter=reporter)
+            self._build_fn(config, file=str(traces_file), root=str(model_dir), reporter=reporter)
         except Exception as exc:  # noqa: BLE001 - report any failure to the client, never a dead silent thread
             # Remove the partial artifact so a failed build doesn't leave a model that `exists()`
             # then treats as real (bricking retries with 409 and serving a broken model) - but
@@ -294,6 +361,7 @@ class BuildManager:
             state.finish(BuildStatus.FAILED, error=str(exc))
             return
         finally:
+            traces_file.unlink(missing_ok=True)
             with self._lock:
                 self._reserved.discard(request.name)
         # The model artifact is complete on disk. Writing the card and joining the live serving

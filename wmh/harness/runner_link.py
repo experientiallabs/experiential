@@ -12,24 +12,27 @@ transport adds ZERO dependency on either side (Python stdlib here; Node stdlib i
 episode-driving logic is decoupled from the socket behind the `Channel` protocol so a scripted
 in-process peer can exercise the whole broker offline (see runner_link_test.py).
 
-Only the frame transport is new; the worker-LLM translation (`openai_to_bedrock`,
-`bedrock_to_completion`) and the tool budget/step recording (`HostEpisode`) are the same logic the
-SSH shim in `pi_runtime.py` runs, lifted here so both transports share one implementation.
+The link is provider-neutral: the caller supplies a structured tool-calling provider, which owns
+authentication, routing, wire translation, retries, and failover. RunnerLink only validates and
+brokers frames plus environment tool calls.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import struct
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
+
+from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runtime import RunResult, StopReason
+from wmh.harness.runtime import RunResult, StopReason, TokenUsage
 from wmh.harness.tools import ToolSpec
+from wmh.providers.base import ToolCallingProvider
 
 DEFAULT_MAX_ENV_ACTIONS = 40
 
@@ -90,37 +93,6 @@ class SocketChannel:
         return read_frame(self._sock)
 
 
-# --------------------------------------------------------------------------------------------------
-# Worker-LLM completion (host-side; creds never leave this process).
-# --------------------------------------------------------------------------------------------------
-@dataclass
-class WorkerConfig:
-    """How the host answers worker-LLM requests. Creds are read from the environment, host-side."""
-
-    backend: str = "openai"  # "openai": OpenAI-compatible endpoint | "bedrock": Converse via boto3
-    model: str = ""
-    region: str = "us-east-1"
-    base_url: str = ""
-    key_env: str = ""
-
-
-def worker_config_from_env() -> WorkerConfig:
-    """Build the worker config from the same PI_AGENT_* env knobs PiRuntime reads.
-
-    So `doc.runtime()` under PI_TRANSPORT=link answers the worker LLM the same way the SSH shim
-    does (e.g. PI_AGENT_BACKEND=bedrock + PI_AGENT_MODEL=<Haiku profile>).
-    """
-    # Defaults mirror pi_runtime.PI_AGENT_* exactly, so PI_TRANSPORT=link on an otherwise-default
-    # (deepseek) SSH setup works without extra env, not sending keyless/model-less requests.
-    return WorkerConfig(
-        backend=os.environ.get("PI_AGENT_BACKEND", "openai"),
-        model=os.environ.get("PI_AGENT_MODEL", "deepseek-chat"),
-        region=os.environ.get("PI_AGENT_REGION", os.environ.get("AWS_REGION", "us-east-1")),
-        base_url=os.environ.get("PI_AGENT_BASE_URL", "https://api.deepseek.com/v1"),
-        key_env=os.environ.get("PI_AGENT_KEY_ENV", "DEEPSEEK_API_KEY"),
-    )
-
-
 # The process-wide runner channel doc.runtime(PI_TRANSPORT=link) drives. A search/eval sets it once
 # (its runner connection is process-scoped infra), so create_harness's internal doc.runtime() calls
 # reach the runner without threading a channel through every signature; cleared at teardown.
@@ -134,174 +106,6 @@ def set_active_channel(channel: Channel | None) -> None:
 
 def active_channel() -> Channel | None:
     return _ACTIVE_CHANNEL
-
-
-def worker_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
-    """Answer one worker-LLM request, returning a single OpenAI chat.completion object.
-
-    Unlike the SSH shim (which streamed raw SSE), the framed transport carries one finished
-    completion object — the runner synthesizes whatever its parser needs locally.
-    """
-    if cfg.backend == "bedrock":
-        return _bedrock_completion(body, cfg)
-    return _openai_completion(body, cfg)
-
-
-def _openai_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
-    import urllib.request
-
-    b = dict(body)
-    if cfg.model:
-        b["model"] = cfg.model
-    b["stream"] = False
-    key = os.environ.get(cfg.key_env, "") if cfg.key_env else ""
-    req = urllib.request.Request(
-        cfg.base_url.rstrip("/") + "/chat/completions",
-        data=json.dumps(b).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=180) as resp:  # noqa: S310 - fixed https endpoint
-        return cast("JsonObject", json.loads(resp.read()))
-
-
-def _bedrock_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
-    import boto3
-
-    system, messages, tool_config = openai_to_bedrock(body)
-    mt = body.get("max_tokens")
-    inf: dict[str, Any] = {"maxTokens": mt if isinstance(mt, int) else 4096}
-    if body.get("temperature") is not None:
-        inf["temperature"] = body["temperature"]
-    kwargs: dict[str, Any] = {"modelId": cfg.model, "messages": messages, "inferenceConfig": inf}
-    if system:
-        kwargs["system"] = system
-    if tool_config:
-        kwargs["toolConfig"] = tool_config
-    client = boto3.client("bedrock-runtime", region_name=cfg.region)
-    return bedrock_to_completion(client.converse(**kwargs))
-
-
-def _text(content: object) -> str:
-    return content if isinstance(content, str) else str(content)
-
-
-def openai_to_bedrock(body: JsonObject) -> tuple[list, list, dict | None]:
-    """OpenAI chat request -> (system blocks, Bedrock messages, toolConfig).
-
-    Maps assistant tool_calls -> toolUse, role:"tool" results -> toolResult (grouped into a user
-    turn), and OpenAI function tools -> Bedrock toolSpec. Consecutive same-role turns are merged so
-    the Converse alternation contract holds.
-    """
-    b = cast("Any", body)
-    system: list[Any] = []
-    msgs: list[Any] = []
-
-    def _push(role: str, content: list[Any]) -> None:
-        if msgs and msgs[-1]["role"] == role:
-            msgs[-1]["content"].extend(content)
-        else:
-            msgs.append({"role": role, "content": content})
-
-    for m in b.get("messages", []):
-        role = m.get("role")
-        content = m.get("content")
-        if role == "system":
-            if content:
-                system.append({"text": _text(content)})
-        elif role == "tool":
-            result = {
-                "toolResult": {
-                    "toolUseId": m.get("tool_call_id", ""),
-                    "content": [{"text": _text(content)}],
-                }
-            }
-            _push("user", [result])
-        elif role == "assistant":
-            blocks: list[Any] = []
-            if content:
-                blocks.append({"text": _text(content)})
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except (ValueError, TypeError):
-                    args = {}
-                use = {"toolUseId": tc.get("id", ""), "name": fn.get("name", ""), "input": args}
-                blocks.append({"toolUse": use})
-            if blocks:
-                _push("assistant", blocks)
-        elif content:  # user (and any other) -> plain text user turn
-            _push("user", [{"text": _text(content)}])
-
-    tools = b.get("tools") or []
-    tool_config: dict[str, Any] | None = None
-    if tools:
-        specs = []
-        for t in tools:
-            fn = t.get("function", t)
-            params = fn.get("parameters", {"type": "object", "properties": {}})
-            specs.append(
-                {
-                    "toolSpec": {
-                        "name": fn.get("name", ""),
-                        "description": fn.get("description", ""),
-                        "inputSchema": {"json": params},
-                    }
-                }
-            )
-        tool_config = {"tools": specs}
-        # Carry OpenAI tool_choice -> Bedrock toolChoice so a forced/required tool call is not
-        # silently downgraded to auto. "auto"/absent = Bedrock's default (no explicit toolChoice).
-        choice = b.get("tool_choice")
-        if choice == "required":
-            tool_config["toolChoice"] = {"any": {}}
-        elif isinstance(choice, dict) and choice.get("type") == "function":
-            name = choice.get("function", {}).get("name")
-            if name:
-                tool_config["toolChoice"] = {"tool": {"name": name}}
-        elif choice == "none":
-            tool_config = None  # caller asked the model NOT to use tools
-    return system, msgs, tool_config
-
-
-def bedrock_to_completion(resp: JsonObject) -> JsonObject:
-    """Bedrock Converse output -> one OpenAI chat.completion object (non-streaming)."""
-    message = cast("Any", resp).get("output", {}).get("message", {})
-    text_parts: list[str] = []
-    tool_calls: list[Any] = []
-    for block in message.get("content", []):
-        if "text" in block:
-            text_parts.append(block["text"])
-        elif "toolUse" in block:
-            tu = block["toolUse"]
-            tool_calls.append(
-                {
-                    "id": tu.get("toolUseId", ""),
-                    "type": "function",
-                    "function": {
-                        "name": tu.get("name", ""),
-                        "arguments": json.dumps(tu.get("input", {})),
-                    },
-                }
-            )
-    msg: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
-    if tool_calls:
-        msg["tool_calls"] = tool_calls
-    stop = cast("Any", resp).get("stopReason", "end_turn")
-    # Map Bedrock stop reasons to OpenAI finish_reasons. A blocked/filtered response is surfaced as
-    # "content_filter" rather than looking like a normal "stop", so downstream can tell it apart.
-    finish = {
-        "tool_use": "tool_calls",
-        "max_tokens": "length",
-        "content_filtered": "content_filter",
-        "guardrail_intervened": "content_filter",
-    }.get(stop, "stop")
-    return {
-        "id": "chatcmpl-runnerlink",
-        "object": "chat.completion",
-        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-    }
 
 
 def params_schema(tool: ToolSpec) -> JsonObject:
@@ -353,7 +157,7 @@ class HostEpisode:
 
 
 # The worker function the host uses to answer llm_request frames; injectable for tests.
-WorkerFn = Any  # Callable[[JsonObject], JsonObject]
+WorkerFn = Callable[[ChatRequest], ChatResponse]
 
 
 class RunnerLink:
@@ -370,7 +174,7 @@ class RunnerLink:
         channel: Channel,
         *,
         tools: list[ToolSpec] | None = None,
-        worker: WorkerConfig | None = None,
+        provider: ToolCallingProvider | None = None,
         worker_fn: WorkerFn | None = None,
         files: dict[str, str] | None = None,
         system_prompt: str = "",
@@ -381,10 +185,14 @@ class RunnerLink:
         # drives — `run(task_id, instruction, environment)` — while `run(..., tools=...)` still lets
         # a caller (or the conformance tests) override per episode.
         self._tools = tools or []
-        cfg = worker or WorkerConfig()
-        self._worker_cfg = cfg
-        # worker_fn lets tests answer llm_request without a real provider; defaults to the real one.
-        self._worker_fn: WorkerFn = worker_fn or (lambda body: worker_completion(body, cfg))
+        if worker_fn is None and provider is None:
+            raise ValueError("RunnerLink needs a ToolCallingProvider or worker_fn")
+        # worker_fn lets tests answer llm_request without a real provider.
+        if worker_fn is not None:
+            self._worker_fn = worker_fn
+        else:
+            assert provider is not None
+            self._worker_fn = provider.complete_chat
         self._files = files or {}
         self._system_prompt = system_prompt
         self._max_env_actions = max_env_actions
@@ -416,13 +224,16 @@ class RunnerLink:
                 "max_env_actions": self._max_env_actions,
             }
         )
+        usage = TokenUsage()
         while True:
             frame = self._channel.recv()
             if frame is None:  # channel closed before the episode finished
-                return self._error_result(task_id, episode, instruction, "runner channel closed")
+                return self._error_result(
+                    task_id, episode, instruction, "runner channel closed", usage=usage
+                )
             kind = frame.get("type")
             if kind == "llm_request":
-                self._answer_llm(episode_id, frame)
+                self._answer_llm(episode_id, frame, usage)
             elif kind == "tool_request":
                 name = frame.get("name")
                 args = frame.get("arguments")
@@ -447,39 +258,56 @@ class RunnerLink:
                     stop_reason=StopReason.SUBMITTED,
                     answer=episode.answer,
                     turns=len(episode.steps),
+                    worker_usage=usage if usage.calls else None,
                 )
             elif kind == "episode_error":
                 note = frame.get("note")
                 return self._error_result(
-                    task_id, episode, instruction, note if isinstance(note, str) else "runner error"
+                    task_id,
+                    episode,
+                    instruction,
+                    note if isinstance(note, str) else "runner error",
+                    usage=usage,
                 )
             # unknown frame types are ignored (forward-compatible)
 
-    def _answer_llm(self, episode_id: str, frame: JsonObject) -> None:
+    def _answer_llm(self, episode_id: str, frame: JsonObject, usage: TokenUsage) -> None:
         req_id = frame.get("req_id")
         body = frame.get("openai_body")
         try:
-            completion = self._worker_fn(body if isinstance(body, dict) else {})
-            self._channel.send(
-                {
-                    "type": "llm_response",
-                    "episode_id": episode_id,
-                    "req_id": req_id,
-                    "completion": completion,
-                }
-            )
+            request = ChatRequest.model_validate(body if isinstance(body, dict) else {})
+            completion = self._worker_fn(request)
+            # Meter the worker leg from the provider's structured response.
+            usage.calls += 1
+            reported = completion.token_usage()
+            usage.input_tokens += reported.input_tokens
+            usage.output_tokens += reported.output_tokens
+            response: JsonObject = {
+                "type": "llm_response",
+                "episode_id": episode_id,
+                "req_id": req_id,
+                "completion": completion.wire_payload(),
+            }
         except Exception as exc:  # noqa: BLE001 - report to the runner, never crash the host
-            self._channel.send(
-                {
-                    "type": "llm_response",
-                    "episode_id": episode_id,
-                    "req_id": req_id,
-                    "error": str(exc),
-                }
-            )
+            response = {
+                "type": "llm_response",
+                "episode_id": episode_id,
+                "req_id": req_id,
+                "error": str(exc),
+            }
+        # A send timeout is transport failure with an uncertain delivery state. Let it propagate
+        # so the owning runtime retires the channel instead of sending a second response frame.
+        self._channel.send(response)
 
     @staticmethod
-    def _error_result(task_id: str, episode: HostEpisode, instruction: str, note: str) -> RunResult:
+    def _error_result(
+        task_id: str,
+        episode: HostEpisode,
+        instruction: str,
+        note: str,
+        *,
+        usage: TokenUsage | None = None,
+    ) -> RunResult:
         stop = StopReason.MAX_TURNS if episode.steps else StopReason.ERROR
         episode.steps.append(
             Step(
@@ -495,4 +323,5 @@ class RunnerLink:
             stop_reason=stop,
             answer="",
             turns=len(episode.steps),
+            worker_usage=usage if usage is not None and usage.calls else None,
         )

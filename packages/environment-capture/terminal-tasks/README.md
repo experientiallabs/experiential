@@ -67,6 +67,13 @@ reconstructs from action + retrieved steps + teacher-forced history).
 
 The output is OTel-GenAI span JSONL that `wmh.ingest.otel_genai` reads directly.
 
+## Concurrency scaling law
+
+This corpus is one benchmark in the world-model-vs-real-sandbox concurrency study — does
+reconstructing observations with a world model beat standing up the real environment? Method,
+per-benchmark numbers, and the figure live in
+[`docs/research/concurrency_scaling_law.md`](../../docs/research/concurrency_scaling_law.md).
+
 ## Run ONE real scenario (the real-environment side of the comparison)
 
 ### One command: `run.sh`

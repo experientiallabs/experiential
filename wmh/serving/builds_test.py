@@ -21,11 +21,12 @@ from wmh.serving.builds import (
 
 
 def _request(tmp_path: Path, name: str = "fresh") -> BuildRouteRequest:
-    traces = tmp_path / "traces.jsonl"
+    traces = tmp_path / ".wmh" / "uploads" / "traces.jsonl"
+    traces.parent.mkdir(parents=True, exist_ok=True)
     traces.write_text("{}\n", encoding="utf-8")
     return BuildRouteRequest(
         name=name,
-        file=str(traces),
+        file=traces.name,
         title="Fresh model",
         description="Built from the test corpus.",
     )
@@ -86,6 +87,49 @@ def test_successful_build_reports_events_and_writes_card(tmp_path: Path) -> None
     assert card.built_at is not None
 
 
+def test_build_receives_private_upload_snapshot(tmp_path: Path) -> None:
+    received: list[str] = []
+
+    def _capture(config, *, file: str, root: str, reporter) -> None:  # noqa: ANN001
+        received.append(file)
+        _ok_build_fn(config, file=file, root=root, reporter=reporter)
+
+    manager, _ = _manager(tmp_path, build_fn=_capture)
+    request = _request(tmp_path)
+    manager.wait(manager.start(request))
+
+    assert len(received) == 1
+    snapshot = Path(received[0])
+    assert snapshot.parent != manager.uploads_dir
+    assert snapshot.name != request.file
+    assert not snapshot.exists()
+
+
+def test_build_uses_snapshot_if_upload_is_replaced_after_start(tmp_path: Path) -> None:
+    gate = threading.Event()
+    received: list[str] = []
+
+    def _read_after_release(config, *, file: str, root: str, reporter) -> None:  # noqa: ANN001
+        gate.wait(5)
+        received.append(Path(file).read_text(encoding="utf-8"))
+        _ok_build_fn(config, file=file, root=root, reporter=reporter)
+
+    manager, _ = _manager(tmp_path, build_fn=_read_after_release)
+    request = _request(tmp_path)
+    uploaded = manager.uploads_dir / request.file
+    uploaded.write_text("uploaded\n", encoding="utf-8")
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("server secret\n", encoding="utf-8")
+
+    build_id = manager.start(request)
+    uploaded.unlink()
+    uploaded.symlink_to(secret)
+    gate.set()
+    manager.wait(build_id)
+
+    assert received == ["uploaded\n"]
+
+
 def test_failed_build_surfaces_error(tmp_path: Path) -> None:
     manager, registered = _manager(tmp_path, build_fn=_failing_build_fn)
     build_id = manager.start(_request(tmp_path))
@@ -99,9 +143,42 @@ def test_failed_build_surfaces_error(tmp_path: Path) -> None:
 
 def test_start_rejects_missing_traces_file(tmp_path: Path) -> None:
     request = _request(tmp_path)
-    Path(request.file).unlink()
     manager, _ = _manager(tmp_path)
+    (manager.uploads_dir / request.file).unlink()
     with pytest.raises(FileNotFoundError, match="traces"):
+        manager.start(request)
+
+
+def test_start_rejects_absolute_path_outside_uploads(tmp_path: Path) -> None:
+    traces = tmp_path / "traces.jsonl"
+    traces.write_text("{}\n", encoding="utf-8")
+    request = BuildRouteRequest(name="fresh", file=str(traces))
+    manager, _ = _manager(tmp_path)
+
+    with pytest.raises(ValueError, match="upload"):
+        manager.start(request)
+
+
+def test_start_rejects_parent_traversal(tmp_path: Path) -> None:
+    manager, _ = _manager(tmp_path)
+    secret = manager.uploads_dir.parent / "secret.jsonl"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("{}\n", encoding="utf-8")
+    request = BuildRouteRequest(name="fresh", file="../secret.jsonl")
+
+    with pytest.raises(ValueError, match="upload"):
+        manager.start(request)
+
+
+def test_start_rejects_upload_symlink_escape(tmp_path: Path) -> None:
+    manager, _ = _manager(tmp_path)
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("{}\n", encoding="utf-8")
+    manager.uploads_dir.mkdir(parents=True)
+    (manager.uploads_dir / "escape.jsonl").symlink_to(secret)
+    request = BuildRouteRequest(name="fresh", file="escape.jsonl")
+
+    with pytest.raises(ValueError, match="upload"):
         manager.start(request)
 
 

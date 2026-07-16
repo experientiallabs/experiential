@@ -12,6 +12,7 @@ facet embeddings only.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 
 from pydantic import BaseModel, ValidationError
@@ -198,8 +199,16 @@ class FacetExtractor:
             outcome=Outcome.UNKNOWN,
         )
 
-    def extract_all(self, traces: list[Trace]) -> list[TraceFacet]:
-        """Extract facets for every trace, in order."""
+    def extract_all(self, traces: list[Trace], *, concurrency: int = 8) -> list[TraceFacet]:
+        """Extract facets for every trace, in order.
+
+        Each facet is one independent LLM call, so they run on a small thread pool
+        (`pool.map` preserves input order and propagates exceptions — the replay.py
+        precedent); `concurrency=1` keeps the sequential loop.
+        """
+        if concurrency > 1 and len(traces) > 1:
+            with ThreadPoolExecutor(max_workers=min(concurrency, len(traces))) as pool:
+                return list(pool.map(self.extract, traces))
         return [self.extract(trace) for trace in traces]
 
 

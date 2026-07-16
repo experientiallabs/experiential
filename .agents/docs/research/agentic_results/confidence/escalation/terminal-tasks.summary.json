@@ -1,0 +1,42 @@
+[
+  {
+    "suite": "terminal-tasks",
+    "tau": 0.9,
+    "seed": 0,
+    "fidelity": 0.8564,
+    "escalation_rate": 0.3333,
+    "serve_cost_usd": 1.404,
+    "calls": 132,
+    "n_steps": 99
+  },
+  {
+    "suite": "terminal-tasks",
+    "tau": 1.0,
+    "seed": 0,
+    "fidelity": 0.8741,
+    "escalation_rate": 0.9798,
+    "serve_cost_usd": 3.012,
+    "calls": 196,
+    "n_steps": 99
+  },
+  {
+    "suite": "terminal-tasks",
+    "tau": 0.9,
+    "seed": 1,
+    "fidelity": 0.8641,
+    "escalation_rate": 0.2525,
+    "serve_cost_usd": 1.323,
+    "calls": 124,
+    "n_steps": 99
+  },
+  {
+    "suite": "terminal-tasks",
+    "tau": 1.0,
+    "seed": 1,
+    "fidelity": 0.8795,
+    "escalation_rate": 1.0,
+    "serve_cost_usd": 3.254,
+    "calls": 198,
+    "n_steps": 99
+  }
+]

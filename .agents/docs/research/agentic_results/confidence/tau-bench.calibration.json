@@ -1,0 +1,1055 @@
+{
+  "suite": "tau-bench",
+  "good_threshold": 0.8,
+  "modes": {
+    "base": {
+      "n_steps": 328,
+      "fidelity": 0.9013,
+      "statement_rate": 0.0,
+      "mean_confidence": null
+    },
+    "base+conf": {
+      "n_steps": 328,
+      "fidelity": 0.9143,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.7375,
+      "ece_good": 0.1546,
+      "ece_vs_judge_score": 0.1768,
+      "brier_good": 0.0867,
+      "calibration_mse": 0.0549,
+      "auroc_good": 0.9504,
+      "auroc_good_at_0.5": 0.891,
+      "spearman_conf_score": 0.7186,
+      "overconfidence": -0.1768,
+      "reliability": {
+        "0.2": {
+          "n": 2,
+          "mean_judge_score": 0.6,
+          "frac_good": 0.0
+        },
+        "0.3": {
+          "n": 17,
+          "mean_judge_score": 0.7018,
+          "frac_good": 0.4706
+        },
+        "0.4": {
+          "n": 36,
+          "mean_judge_score": 0.6207,
+          "frac_good": 0.1389
+        },
+        "0.5": {
+          "n": 27,
+          "mean_judge_score": 0.8539,
+          "frac_good": 0.6667
+        },
+        "0.6": {
+          "n": 19,
+          "mean_judge_score": 0.9074,
+          "frac_good": 0.8421
+        },
+        "0.7": {
+          "n": 44,
+          "mean_judge_score": 0.9819,
+          "frac_good": 0.9773
+        },
+        "0.8": {
+          "n": 23,
+          "mean_judge_score": 0.9327,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 121,
+          "mean_judge_score": 0.9956,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 39,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9143,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9143,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9143,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.3,
+          "coverage": 0.9939,
+          "fidelity_covered": 0.9162,
+          "sub_tau_share": 0.0061
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9421,
+          "fidelity_covered": 0.928,
+          "sub_tau_share": 0.0579
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.8323,
+          "fidelity_covered": 0.9685,
+          "sub_tau_share": 0.1677
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.75,
+          "fidelity_covered": 0.9811,
+          "sub_tau_share": 0.25
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.6921,
+          "fidelity_covered": 0.9873,
+          "sub_tau_share": 0.3079
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.5579,
+          "fidelity_covered": 0.9886,
+          "sub_tau_share": 0.4421
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.4878,
+          "fidelity_covered": 0.9966,
+          "sub_tau_share": 0.5122
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.1189,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.8811
+        }
+      ]
+    },
+    "base+conf@10": {
+      "n_steps": 328,
+      "fidelity": 0.8888,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.7155,
+      "ece_good": 0.182,
+      "ece_vs_judge_score": 0.1733,
+      "brier_good": 0.0883,
+      "calibration_mse": 0.0515,
+      "auroc_good": 0.9739,
+      "auroc_good_at_0.5": 0.8444,
+      "spearman_conf_score": 0.7535,
+      "overconfidence": -0.1733,
+      "reliability": {
+        "0.2": {
+          "n": 1,
+          "mean_judge_score": 0.56,
+          "frac_good": 0.0
+        },
+        "0.3": {
+          "n": 15,
+          "mean_judge_score": 0.5187,
+          "frac_good": 0.0
+        },
+        "0.4": {
+          "n": 45,
+          "mean_judge_score": 0.5951,
+          "frac_good": 0.0444
+        },
+        "0.5": {
+          "n": 22,
+          "mean_judge_score": 0.8358,
+          "frac_good": 0.6364
+        },
+        "0.6": {
+          "n": 40,
+          "mean_judge_score": 0.9043,
+          "frac_good": 0.875
+        },
+        "0.7": {
+          "n": 43,
+          "mean_judge_score": 0.9483,
+          "frac_good": 0.9302
+        },
+        "0.8": {
+          "n": 25,
+          "mean_judge_score": 0.9681,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 101,
+          "mean_judge_score": 0.9987,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 36,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.8888,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.8888,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 1.0,
+          "fidelity_covered": 0.8888,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.3,
+          "coverage": 0.997,
+          "fidelity_covered": 0.8898,
+          "sub_tau_share": 0.003
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9512,
+          "fidelity_covered": 0.9077,
+          "sub_tau_share": 0.0488
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.814,
+          "fidelity_covered": 0.9603,
+          "sub_tau_share": 0.186
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.747,
+          "fidelity_covered": 0.9715,
+          "sub_tau_share": 0.253
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.625,
+          "fidelity_covered": 0.9846,
+          "sub_tau_share": 0.375
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.4939,
+          "fidelity_covered": 0.9943,
+          "sub_tau_share": 0.5061
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.4177,
+          "fidelity_covered": 0.9991,
+          "sub_tau_share": 0.5823
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.1098,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.8902
+        }
+      ]
+    },
+    "base+conf@50": {
+      "n_steps": 328,
+      "fidelity": 0.9047,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.7168,
+      "ece_good": 0.1588,
+      "ece_vs_judge_score": 0.1879,
+      "brier_good": 0.0934,
+      "calibration_mse": 0.0575,
+      "auroc_good": 0.9593,
+      "auroc_good_at_0.5": 0.8578,
+      "spearman_conf_score": 0.7458,
+      "overconfidence": -0.1879,
+      "reliability": {
+        "0.3": {
+          "n": 13,
+          "mean_judge_score": 0.58,
+          "frac_good": 0.0769
+        },
+        "0.4": {
+          "n": 48,
+          "mean_judge_score": 0.6537,
+          "frac_good": 0.2083
+        },
+        "0.5": {
+          "n": 29,
+          "mean_judge_score": 0.8128,
+          "frac_good": 0.6207
+        },
+        "0.6": {
+          "n": 22,
+          "mean_judge_score": 0.9476,
+          "frac_good": 0.9091
+        },
+        "0.7": {
+          "n": 67,
+          "mean_judge_score": 0.962,
+          "frac_good": 0.9701
+        },
+        "0.8": {
+          "n": 11,
+          "mean_judge_score": 0.9945,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 94,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 44,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9047,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9047,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9047,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.3,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9047,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9604,
+          "fidelity_covered": 0.9181,
+          "sub_tau_share": 0.0396
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.814,
+          "fidelity_covered": 0.9656,
+          "sub_tau_share": 0.186
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.7256,
+          "fidelity_covered": 0.9842,
+          "sub_tau_share": 0.2744
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.6585,
+          "fidelity_covered": 0.9879,
+          "sub_tau_share": 0.3415
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.4543,
+          "fidelity_covered": 0.9996,
+          "sub_tau_share": 0.5457
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.4207,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.5793
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.1341,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.8659
+        }
+      ]
+    },
+    "base+confwhy": {
+      "n_steps": 328,
+      "fidelity": 0.9172,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.797,
+      "ece_good": 0.1159,
+      "ece_vs_judge_score": 0.1202,
+      "brier_good": 0.0573,
+      "calibration_mse": 0.0359,
+      "auroc_good": 0.9842,
+      "auroc_good_at_0.5": 0.92,
+      "spearman_conf_score": 0.747,
+      "overconfidence": -0.1202,
+      "reliability": {
+        "0.1": {
+          "n": 2,
+          "mean_judge_score": 0.55,
+          "frac_good": 0.0
+        },
+        "0.2": {
+          "n": 4,
+          "mean_judge_score": 0.6125,
+          "frac_good": 0.0
+        },
+        "0.3": {
+          "n": 13,
+          "mean_judge_score": 0.6223,
+          "frac_good": 0.0769
+        },
+        "0.4": {
+          "n": 32,
+          "mean_judge_score": 0.6049,
+          "frac_good": 0.125
+        },
+        "0.5": {
+          "n": 16,
+          "mean_judge_score": 0.8448,
+          "frac_good": 0.75
+        },
+        "0.6": {
+          "n": 9,
+          "mean_judge_score": 0.8531,
+          "frac_good": 0.6667
+        },
+        "0.7": {
+          "n": 34,
+          "mean_judge_score": 0.971,
+          "frac_good": 0.9706
+        },
+        "0.8": {
+          "n": 23,
+          "mean_judge_score": 0.9746,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 69,
+          "mean_judge_score": 0.974,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 126,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9172,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9172,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 0.9939,
+          "fidelity_covered": 0.9194,
+          "sub_tau_share": 0.0061
+        },
+        {
+          "tau": 0.3,
+          "coverage": 0.9817,
+          "fidelity_covered": 0.9232,
+          "sub_tau_share": 0.0183
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9421,
+          "fidelity_covered": 0.9359,
+          "sub_tau_share": 0.0579
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.8445,
+          "fidelity_covered": 0.9741,
+          "sub_tau_share": 0.1555
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.7957,
+          "fidelity_covered": 0.982,
+          "sub_tau_share": 0.2043
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.7683,
+          "fidelity_covered": 0.9867,
+          "sub_tau_share": 0.2317
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.6646,
+          "fidelity_covered": 0.9891,
+          "sub_tau_share": 0.3354
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.5945,
+          "fidelity_covered": 0.9908,
+          "sub_tau_share": 0.4055
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.3841,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.6159
+        }
+      ]
+    },
+    "reason": {
+      "n_steps": 328,
+      "fidelity": 0.912,
+      "statement_rate": 0.0,
+      "mean_confidence": null
+    },
+    "reason+conf": {
+      "n_steps": 328,
+      "fidelity": 0.9156,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.772,
+      "ece_good": 0.1262,
+      "ece_vs_judge_score": 0.1437,
+      "brier_good": 0.0705,
+      "calibration_mse": 0.0367,
+      "auroc_good": 0.9733,
+      "auroc_good_at_0.5": 0.8758,
+      "spearman_conf_score": 0.7247,
+      "overconfidence": -0.1437,
+      "reliability": {
+        "0.2": {
+          "n": 1,
+          "mean_judge_score": 0.52,
+          "frac_good": 0.0
+        },
+        "0.3": {
+          "n": 8,
+          "mean_judge_score": 0.605,
+          "frac_good": 0.125
+        },
+        "0.4": {
+          "n": 33,
+          "mean_judge_score": 0.6352,
+          "frac_good": 0.1212
+        },
+        "0.5": {
+          "n": 31,
+          "mean_judge_score": 0.7521,
+          "frac_good": 0.5161
+        },
+        "0.6": {
+          "n": 11,
+          "mean_judge_score": 0.9142,
+          "frac_good": 0.9091
+        },
+        "0.7": {
+          "n": 29,
+          "mean_judge_score": 0.9571,
+          "frac_good": 0.931
+        },
+        "0.8": {
+          "n": 38,
+          "mean_judge_score": 0.9848,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 124,
+          "mean_judge_score": 0.9876,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 53,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9156,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9156,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9156,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.3,
+          "coverage": 0.997,
+          "fidelity_covered": 0.9169,
+          "sub_tau_share": 0.003
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9726,
+          "fidelity_covered": 0.9247,
+          "sub_tau_share": 0.0274
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.872,
+          "fidelity_covered": 0.9581,
+          "sub_tau_share": 0.128
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.7774,
+          "fidelity_covered": 0.9831,
+          "sub_tau_share": 0.2226
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.7439,
+          "fidelity_covered": 0.9862,
+          "sub_tau_share": 0.2561
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.6555,
+          "fidelity_covered": 0.9902,
+          "sub_tau_share": 0.3445
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.5396,
+          "fidelity_covered": 0.9913,
+          "sub_tau_share": 0.4604
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.1616,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.8384
+        }
+      ]
+    },
+    "reason+confwhy": {
+      "n_steps": 328,
+      "fidelity": 0.906,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.7921,
+      "ece_good": 0.0875,
+      "ece_vs_judge_score": 0.1142,
+      "brier_good": 0.0639,
+      "calibration_mse": 0.0337,
+      "auroc_good": 0.9679,
+      "auroc_good_at_0.5": 0.8809,
+      "spearman_conf_score": 0.8209,
+      "overconfidence": -0.1139,
+      "reliability": {
+        "0.1": {
+          "n": 1,
+          "mean_judge_score": 0.27,
+          "frac_good": 0.0
+        },
+        "0.2": {
+          "n": 6,
+          "mean_judge_score": 0.555,
+          "frac_good": 0.0
+        },
+        "0.3": {
+          "n": 17,
+          "mean_judge_score": 0.67,
+          "frac_good": 0.2941
+        },
+        "0.4": {
+          "n": 32,
+          "mean_judge_score": 0.6431,
+          "frac_good": 0.1875
+        },
+        "0.5": {
+          "n": 17,
+          "mean_judge_score": 0.69,
+          "frac_good": 0.5294
+        },
+        "0.6": {
+          "n": 14,
+          "mean_judge_score": 0.9063,
+          "frac_good": 1.0
+        },
+        "0.7": {
+          "n": 20,
+          "mean_judge_score": 0.9256,
+          "frac_good": 0.85
+        },
+        "0.8": {
+          "n": 13,
+          "mean_judge_score": 0.9785,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 88,
+          "mean_judge_score": 0.9766,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 120,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.906,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.906,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 0.997,
+          "fidelity_covered": 0.9079,
+          "sub_tau_share": 0.003
+        },
+        {
+          "tau": 0.3,
+          "coverage": 0.9787,
+          "fidelity_covered": 0.9145,
+          "sub_tau_share": 0.0213
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9268,
+          "fidelity_covered": 0.9282,
+          "sub_tau_share": 0.0732
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.8293,
+          "fidelity_covered": 0.9617,
+          "sub_tau_share": 0.1707
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.7774,
+          "fidelity_covered": 0.9799,
+          "sub_tau_share": 0.2226
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.7348,
+          "fidelity_covered": 0.9841,
+          "sub_tau_share": 0.2652
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.6738,
+          "fidelity_covered": 0.9894,
+          "sub_tau_share": 0.3262
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.6341,
+          "fidelity_covered": 0.9901,
+          "sub_tau_share": 0.3659
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.3659,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.6341
+        }
+      ]
+    },
+    "reason+gateverify@0.6": {
+      "n_steps": 328,
+      "fidelity": 0.9207,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.7764,
+      "ece_good": 0.1707,
+      "ece_vs_judge_score": 0.1445,
+      "brier_good": 0.0668,
+      "calibration_mse": 0.0372,
+      "auroc_good": 0.9758,
+      "auroc_good_at_0.5": 0.7875,
+      "spearman_conf_score": 0.7027,
+      "overconfidence": -0.1444,
+      "reliability": {
+        "0.3": {
+          "n": 7,
+          "mean_judge_score": 0.7614,
+          "frac_good": 0.5714
+        },
+        "0.4": {
+          "n": 42,
+          "mean_judge_score": 0.6259,
+          "frac_good": 0.0714
+        },
+        "0.5": {
+          "n": 11,
+          "mean_judge_score": 0.6691,
+          "frac_good": 0.0909
+        },
+        "0.6": {
+          "n": 20,
+          "mean_judge_score": 0.9149,
+          "frac_good": 0.95
+        },
+        "0.7": {
+          "n": 36,
+          "mean_judge_score": 0.9672,
+          "frac_good": 0.9722
+        },
+        "0.8": {
+          "n": 34,
+          "mean_judge_score": 0.9848,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 122,
+          "mean_judge_score": 0.9871,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 56,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9207,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9207,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9207,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.3,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9207,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9787,
+          "fidelity_covered": 0.9242,
+          "sub_tau_share": 0.0213
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.8506,
+          "fidelity_covered": 0.9691,
+          "sub_tau_share": 0.1494
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.8171,
+          "fidelity_covered": 0.9815,
+          "sub_tau_share": 0.1829
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.7561,
+          "fidelity_covered": 0.9868,
+          "sub_tau_share": 0.2439
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.6463,
+          "fidelity_covered": 0.9902,
+          "sub_tau_share": 0.3537
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.5427,
+          "fidelity_covered": 0.9912,
+          "sub_tau_share": 0.4573
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.1707,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.8293
+        }
+      ]
+    },
+    "reason+verify+conf": {
+      "n_steps": 328,
+      "fidelity": 0.9192,
+      "statement_rate": 1.0,
+      "mean_confidence": 0.7732,
+      "ece_good": 0.139,
+      "ece_vs_judge_score": 0.1461,
+      "brier_good": 0.0657,
+      "calibration_mse": 0.036,
+      "auroc_good": 0.975,
+      "auroc_good_at_0.5": 0.9156,
+      "spearman_conf_score": 0.6925,
+      "overconfidence": -0.1461,
+      "reliability": {
+        "0.1": {
+          "n": 1,
+          "mean_judge_score": 0.53,
+          "frac_good": 0.0
+        },
+        "0.2": {
+          "n": 1,
+          "mean_judge_score": 0.51,
+          "frac_good": 0.0
+        },
+        "0.3": {
+          "n": 8,
+          "mean_judge_score": 0.6825,
+          "frac_good": 0.375
+        },
+        "0.4": {
+          "n": 37,
+          "mean_judge_score": 0.6162,
+          "frac_good": 0.1081
+        },
+        "0.5": {
+          "n": 21,
+          "mean_judge_score": 0.7731,
+          "frac_good": 0.4286
+        },
+        "0.6": {
+          "n": 9,
+          "mean_judge_score": 0.9118,
+          "frac_good": 0.8889
+        },
+        "0.7": {
+          "n": 31,
+          "mean_judge_score": 0.9707,
+          "frac_good": 0.9677
+        },
+        "0.8": {
+          "n": 32,
+          "mean_judge_score": 0.9866,
+          "frac_good": 1.0
+        },
+        "0.9": {
+          "n": 151,
+          "mean_judge_score": 0.9874,
+          "frac_good": 1.0
+        },
+        "1.0": {
+          "n": 37,
+          "mean_judge_score": 1.0,
+          "frac_good": 1.0
+        }
+      },
+      "risk_coverage": [
+        {
+          "tau": 0.0,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9192,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.1,
+          "coverage": 1.0,
+          "fidelity_covered": 0.9192,
+          "sub_tau_share": 0.0
+        },
+        {
+          "tau": 0.2,
+          "coverage": 0.997,
+          "fidelity_covered": 0.9204,
+          "sub_tau_share": 0.003
+        },
+        {
+          "tau": 0.3,
+          "coverage": 0.9939,
+          "fidelity_covered": 0.9217,
+          "sub_tau_share": 0.0061
+        },
+        {
+          "tau": 0.4,
+          "coverage": 0.9695,
+          "fidelity_covered": 0.9277,
+          "sub_tau_share": 0.0305
+        },
+        {
+          "tau": 0.5,
+          "coverage": 0.8567,
+          "fidelity_covered": 0.9687,
+          "sub_tau_share": 0.1433
+        },
+        {
+          "tau": 0.6,
+          "coverage": 0.7927,
+          "fidelity_covered": 0.9845,
+          "sub_tau_share": 0.2073
+        },
+        {
+          "tau": 0.7,
+          "coverage": 0.7652,
+          "fidelity_covered": 0.9871,
+          "sub_tau_share": 0.2348
+        },
+        {
+          "tau": 0.8,
+          "coverage": 0.6707,
+          "fidelity_covered": 0.9894,
+          "sub_tau_share": 0.3293
+        },
+        {
+          "tau": 0.9,
+          "coverage": 0.5732,
+          "fidelity_covered": 0.9899,
+          "sub_tau_share": 0.4268
+        },
+        {
+          "tau": 1.0,
+          "coverage": 0.1128,
+          "fidelity_covered": 1.0,
+          "sub_tau_share": 0.8872
+        }
+      ]
+    }
+  }
+}

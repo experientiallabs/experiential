@@ -26,6 +26,7 @@ from pydantic import BaseModel, JsonValue
 
 from wmh.config.card import ModelCard, load_card
 from wmh.config.config import ARTIFACT_DIR, ArtifactPaths, HarnessConfig
+from wmh.providers.models import resolve_provider_model
 
 # The implicit model name used when the user does not pass `--name`.
 DEFAULT_MODEL_NAME = "default"
@@ -153,10 +154,11 @@ class WorldModelStore:
             if isinstance(frontier, list):
                 frontier_size = len(frontier)
         serve = config.serve_provider_config()
+        model_type = serve.model_type or resolve_provider_model(serve.kind, serve.model).model_type
         return ModelInfo(
             name=name,
             serve_provider=serve.kind.value,
-            serve_model=serve.model,
+            serve_model=model_type,
             held_out_accuracy=accuracy,
             rollouts_used=rollouts,
             frontier_size=frontier_size,
