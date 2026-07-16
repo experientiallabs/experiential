@@ -370,6 +370,7 @@ class _Stream:
     workspace: LiveWorkspace | None
     render: bool
     cursor: int = 0
+    pending_ack: str | None = None
     pending_text: str | None = None
     message_seen: bool = False
     turn_idle: bool = False
@@ -400,6 +401,7 @@ class DetachedCommandDriver:
         self._sink = sink
         self._interrupts = 0
         self._persisted_snapshot: WorkspaceSnapshot | None = None
+        self._salvage_reason: str | None = None
 
     def run(self) -> None:
         """Resolve the session, catch up, and run the requested action."""
@@ -426,7 +428,9 @@ class DetachedCommandDriver:
             workspace=workspace,
             render=persisted,
             cursor=state.cursor,
+            pending_ack=state.workspace.pending_ack if state.workspace is not None else None,
         )
+        self._retry_pending_ack(stream)
         match self._action:
             case "send":
                 self._send(stream)
@@ -528,7 +532,9 @@ class DetachedCommandDriver:
             workspace=workspace,
             render=False,
             cursor=state.cursor,
+            pending_ack=state.workspace.pending_ack if state.workspace is not None else None,
         )
+        self._retry_pending_ack(stream)
         self._finish_terminal(stream)
 
     def _load_workspace(self, state: DetachedSessionState, persisted: bool) -> LiveWorkspace | None:
@@ -538,16 +544,22 @@ class DetachedCommandDriver:
         root = Path(state.workspace.root)
         if not root.is_dir():
             if self._action == "end":
-                _console.print(
-                    f"[yellow]the synchronized workspace {root} no longer exists; ending "
-                    "without a final sync[/yellow]"
-                )
+                self._salvage_reason = f"the synchronized workspace {root} no longer exists"
                 return None
             raise typer.BadParameter(
-                f"the synchronized workspace {root} no longer exists; restore it, or end "
-                f"the session with `wmh run --session {state.session_id} --end`"
+                f"the synchronized workspace {root} no longer exists; restore it, or run "
+                f"`wmh run --session {state.session_id} --end` to save the final "
+                "workspace without a local sync"
             )
-        base = self._store.load_base_archive(state)
+        try:
+            base = self._store.load_base_archive(state)
+        except SessionStateError as error:
+            # `--end` still completes the handoff without a local sync; the
+            # stored error messages point other actions at exactly that.
+            if self._action == "end":
+                self._salvage_reason = str(error)
+                return None
+            raise
         synchronized = snapshot_from_archive(base)
         self._persisted_snapshot = synchronized
         return LiveWorkspace(
@@ -637,6 +649,12 @@ class DetachedCommandDriver:
                     "[yellow]no final workspace archive is available; it may already "
                     "have been synchronized[/yellow]"
                 )
+        elif (
+            stream.persisted
+            and stream.state.workspace is not None
+            and self._salvage_reason is not None
+        ):
+            self._salvage_final_workspace(stream)
         terminal = self._client.get_agent_session(stream.state.agent_id, stream.state.session_id)
         if stream.persisted:
             self._store.delete(stream.state.session_id)
@@ -650,6 +668,61 @@ class DetachedCommandDriver:
             raise typer.Exit(code=1)
         if conflicted:
             raise typer.Exit(code=2)
+
+    def _salvage_final_workspace(self, stream: _Stream) -> None:
+        """Save the final archive without a local sync when the checkpoint is unusable.
+
+        The handoff is still acknowledged so the platform can remove its
+        private archive object; the user's data lands as a recovery archive
+        (under the workspace root when it exists, else in WMH state, where it
+        survives the state cleanup).
+        """
+        state = stream.state
+        try:
+            content = self._client.download_agent_workspace(state.agent_id, state.session_id)
+        except PlatformError as error:
+            if error.status_code != 404:
+                # Keep local state so `wmh run --end` can retry the handoff.
+                raise
+            _console.print(
+                "[yellow]no final workspace archive is available; it may already "
+                "have been synchronized[/yellow]"
+            )
+            return
+        workspace_state = state.workspace
+        root = Path(workspace_state.root) if workspace_state is not None else None
+        if root is not None and root.is_dir():
+            recovery = write_conflict_archive(root, state.session_id, content)
+        else:
+            recovery = self._store.write_recovery_archive(state.session_id, content)
+        self._client.acknowledge_agent_workspace(state.agent_id, state.session_id)
+        _console.print(
+            f"[yellow]final workspace saved without a local sync "
+            f"({self._salvage_reason}).[/yellow]\n"
+            f"The full E2B result is at [bold]{recovery}[/bold]."
+        )
+
+    def _retry_pending_ack(self, stream: _Stream) -> None:
+        """Deliver a patch acknowledgement a previous invocation could not send."""
+        workspace_state = stream.state.workspace
+        if (
+            not stream.persisted
+            or workspace_state is None
+            or workspace_state.pending_ack is None
+        ):
+            return
+        revision = workspace_state.pending_ack
+        try:
+            self._client.acknowledge_agent_workspace_patch(
+                stream.state.agent_id, stream.state.session_id, revision
+            )
+        except PlatformError as error:
+            # 404 means the object is already gone (acknowledged after all, or
+            # removed with the session); anything else stays retryable.
+            if error.status_code != 404:
+                raise
+        stream.pending_ack = None
+        self._persist(stream, stream.cursor)
 
     # -- event loop --------------------------------------------------------------------------
 
@@ -727,9 +800,16 @@ class DetachedCommandDriver:
                     )
                     stream.foreign_patch_noted = True
                 return
-            stream.workspace.apply_remote_patch(
-                patch_revision(event), before_ack=lambda: self._persist(stream, event.seq)
-            )
+            revision = patch_revision(event)
+
+            def checkpoint_before_ack() -> None:
+                stream.cursor = event.seq
+                stream.pending_ack = revision
+                self._persist(stream, event.seq)
+
+            stream.workspace.apply_remote_patch(revision, before_ack=checkpoint_before_ack)
+            stream.pending_ack = None
+            self._persist(stream, stream.cursor)
             return
         if event.kind == "status":
             detail = event.payload.get("message") or event.payload.get("status")
@@ -760,12 +840,15 @@ class DetachedCommandDriver:
         state = stream.state
         workspace_state = state.workspace
         archive: bytes | None = None
-        if stream.workspace is not None and workspace_state is not None:
-            workspace_state = workspace_state.model_copy(
-                update={"conflicts": tuple(sorted(stream.workspace.conflicts))}
-            )
-            if stream.workspace.synchronized is not self._persisted_snapshot:
-                archive = stream.workspace.synchronized.archive
+        if workspace_state is not None:
+            update: dict[str, tuple[str, ...] | str | None] = {
+                "pending_ack": stream.pending_ack
+            }
+            if stream.workspace is not None:
+                update["conflicts"] = tuple(sorted(stream.workspace.conflicts))
+                if stream.workspace.synchronized is not self._persisted_snapshot:
+                    archive = stream.workspace.synchronized.archive
+            workspace_state = workspace_state.model_copy(update=update)
         if cursor == state.cursor and workspace_state == state.workspace and archive is None:
             return
         updated = state.model_copy(update={"cursor": cursor, "workspace": workspace_state})

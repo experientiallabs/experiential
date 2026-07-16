@@ -47,6 +47,9 @@ class WorkspaceCheckpoint(BaseModel):
     root: str
     base_sha256: str = ""
     conflicts: tuple[str, ...] = ()
+    # A patch applied locally whose acknowledgement did not reach the platform
+    # yet; the next command retries it so the server object never leaks.
+    pending_ack: str | None = None
 
 
 class DetachedSessionState(BaseModel):
@@ -139,6 +142,17 @@ class SessionStateStore:
             )
             raise SessionStateError(msg)
         return content
+
+    def write_recovery_archive(self, session_id: str, content: bytes) -> Path:
+        """Save a final workspace archive that could not be synchronized locally.
+
+        The file deliberately survives :meth:`delete`: it is the user's data,
+        not session state.
+        """
+        self._ensure_directory()
+        path = self._directory / f"{self._validated(session_id)}.recovered.tar.gz"
+        self._write_bytes(path, content)
+        return path
 
     def delete(self, session_id: str) -> None:
         """Remove the state, its checkpoint archives, and a matching current pointer."""

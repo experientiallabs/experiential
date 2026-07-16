@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import tarfile
 import threading
 from pathlib import Path
@@ -1021,3 +1022,189 @@ def test_attach_end_command_runs_the_final_handoff(
     assert client.end_calls == [("agent-1", "sess-1")]
     assert store.load("sess-1") is None
     assert store.current_session_id() is None
+
+
+def _workspace_session_store(tmp_path: Path) -> tuple[SessionStateStore, Path, bytes]:
+    """A current detached session with a checkpointed workspace root."""
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+    return store, root, base.archive
+
+
+def _terminal_end_client(final_archive: bytes | None) -> _FakeClient:
+    """A client for an end flow that reaches the terminal state in one page."""
+    client = _FakeClient()
+    client.session_states = [
+        _session(workspace_sync=True),
+        _session("ended", workspace_sync=True),
+    ]
+    client.final_archive = final_archive
+    client.pages = [
+        _page([], 0, "running"),
+        _page([], 0, "ended"),
+    ]
+    return client
+
+
+def test_end_with_missing_base_archive_salvages_the_final_workspace(tmp_path: Path) -> None:
+    """--end without a usable checkpoint still saves the archive and acknowledges."""
+    store, root, _base = _workspace_session_store(tmp_path)
+    (archive_path,) = (tmp_path / "state").glob("sess-1.workspace-*.tar.gz")
+    archive_path.unlink()
+    client = _terminal_end_client(_archive({"answer.txt": b"final"}))
+
+    _command_driver(client, store, action="end").run()
+
+    assert "final_download" in client.calls
+    assert client.final_acked
+    recovery = root / ".wmh-conflicts" / "sess-1.tar.gz"
+    assert recovery.is_file()
+    with tarfile.open(recovery) as archive:
+        member = archive.extractfile("answer.txt")
+        assert member is not None
+        assert member.read() == b"final"
+    # No local sync ran: the working tree is untouched.
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "before"
+    assert store.load("sess-1") is None
+
+
+def test_end_with_corrupt_base_archive_salvages_the_final_workspace(tmp_path: Path) -> None:
+    """A checkpoint that fails its integrity check degrades to the same salvage."""
+    store, root, _base = _workspace_session_store(tmp_path)
+    (archive_path,) = (tmp_path / "state").glob("sess-1.workspace-*.tar.gz")
+    archive_path.write_bytes(b"tampered")
+    client = _terminal_end_client(_archive({"answer.txt": b"final"}))
+
+    _command_driver(client, store, action="end").run()
+
+    assert client.final_acked
+    assert (root / ".wmh-conflicts" / "sess-1.tar.gz").is_file()
+    assert store.load("sess-1") is None
+
+
+def test_end_with_missing_root_salvages_to_the_state_directory(tmp_path: Path) -> None:
+    """With the synced directory gone, the archive lands in WMH state and survives."""
+    store, root, _base = _workspace_session_store(tmp_path)
+    shutil.rmtree(root)
+    client = _terminal_end_client(_archive({"answer.txt": b"final"}))
+
+    _command_driver(client, store, action="end").run()
+
+    assert client.final_acked
+    recovery = tmp_path / "state" / "sess-1.recovered.tar.gz"
+    assert recovery.is_file()
+    # State cleanup must not take the user's data with it.
+    assert store.load("sess-1") is None
+    assert recovery.is_file()
+    with tarfile.open(recovery) as archive:
+        member = archive.extractfile("answer.txt")
+        assert member is not None
+        assert member.read() == b"final"
+
+
+def test_send_with_missing_base_archive_points_at_end(tmp_path: Path) -> None:
+    """Non-end actions on an unusable checkpoint point at the now-working --end."""
+    store, _root, _base = _workspace_session_store(tmp_path)
+    (archive_path,) = (tmp_path / "state").glob("sess-1.workspace-*.tar.gz")
+    archive_path.unlink()
+    client = _FakeClient()
+    client.session_states = [_session(workspace_sync=True)]
+
+    with pytest.raises(typer.BadParameter, match="--end"):
+        _command_driver(client, store, action="send", text="hi").run()
+
+    assert store.load("sess-1") is not None
+
+
+def test_failed_patch_ack_is_retried_on_the_next_command(tmp_path: Path) -> None:
+    """A patch whose acknowledgement failed is re-acked before the next catch-up."""
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+    patch = build_workspace_patch(base.archive, _archive({"answer.txt": b"during"}))
+    assert patch is not None
+
+    class _AckFailsClient(_FakeClient):
+        def acknowledge_agent_workspace_patch(
+            self, agent_id: str, session_id: str, revision: str
+        ) -> None:
+            raise PlatformError("backend unavailable", status_code=503)
+
+    first = _AckFailsClient()
+    first.session_states = [_session(workspace_sync=True)]
+    first.patches["patch-1"] = patch
+    first.pages = [_page([_event(1, "workspace_patch", revision="patch-1")], 1, "running")]
+
+    with pytest.raises(typer.BadParameter):
+        _command_driver(first, store, action="send", text="hi").run()
+
+    # The patch landed locally and the checkpoint remembers the unsent ack.
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "during"
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.workspace is not None
+    assert state.workspace.pending_ack == "patch-1"
+
+    second = _FakeClient()
+    second.session_states = [_session(workspace_sync=True)]
+    second.pages = [
+        _page([], 1, "running"),
+        _page(
+            [_event(2, "user_message", text="hi"), _event(3, "state", status="idle")],
+            3,
+            "running",
+        ),
+    ]
+
+    _command_driver(second, store, action="send", text="hi").run()
+
+    assert second.patch_acks == ["patch-1"]
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.workspace is not None
+    assert state.workspace.pending_ack is None
+
+
+def test_pending_ack_tolerates_an_already_removed_patch(tmp_path: Path) -> None:
+    """A 404 on the ack retry means the object is gone; the marker still clears."""
+    root = tmp_path / "work"
+    root.mkdir()
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.workspace is not None
+    store.save(
+        state.model_copy(
+            update={"workspace": state.workspace.model_copy(update={"pending_ack": "patch-9"})}
+        )
+    )
+
+    class _GoneClient(_FakeClient):
+        def acknowledge_agent_workspace_patch(
+            self, agent_id: str, session_id: str, revision: str
+        ) -> None:
+            raise PlatformError("workspace patch not found", status_code=404)
+
+    client = _GoneClient()
+    client.session_states = [_session(workspace_sync=True)]
+    client.pages = [
+        _page([], 0, "running"),
+        _page(
+            [_event(1, "user_message", text="hi"), _event(2, "state", status="idle")],
+            2,
+            "running",
+        ),
+    ]
+
+    _command_driver(client, store, action="send", text="hi").run()
+
+    reloaded = store.load("sess-1")
+    assert reloaded is not None
+    assert reloaded.workspace is not None
+    assert reloaded.workspace.pending_ack is None
