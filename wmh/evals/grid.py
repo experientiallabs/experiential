@@ -149,18 +149,30 @@ def merge_results(results: list[GridResult]) -> GridResult:
     if not results:
         raise ValueError("merge_results requires at least one GridResult")
     head = results[0]
-    # Guard the two invariants that make merged cells comparable in one chart: every result must
-    # score the SAME suite and be graded by the SAME judge version. Merging across either would
-    # present incomparable fidelities side by side (rubric-v1 scores run ~0.12 above rubric-v2),
-    # which is exactly what `judge_version` exists to prevent, so fail loudly instead.
-    suites = {r.suite for r in results}
-    if len(suites) > 1:
-        raise ValueError(f"merge_results needs one suite; got {sorted(suites)}")
-    versions = {r.judge_version for r in results}
-    if len(versions) > 1:
-        raise ValueError(
-            f"merge_results needs one judge_version (not comparable); got {sorted(versions)}"
-        )
+    # Every result merged into one chart must be directly comparable: same suite, same judge
+    # (model + rubric version), and the SAME held-out split + retrieval config. Drift in any of
+    # these means the cells were scored on different bands or on different scales, so merging them
+    # would put incomparable fidelities side by side (rubric-v1 runs ~0.12 above rubric-v2; a
+    # different train_split/val_frac/seed reserves a different test band). The self-hosted grid
+    # runs in a SEPARATE process, so a flag typo there is a realistic way to get silent drift.
+    # Fail loudly instead of taking the first result's metadata and hiding the mismatch.
+    comparability_fields = (
+        "suite",
+        "judge_model",
+        "judge_version",
+        "train_split",
+        "val_frac",
+        "top_k",
+        "seed",
+        "sample_turns",
+    )
+    for field in comparability_fields:
+        values = {getattr(r, field) for r in results}
+        if len(values) > 1:
+            raise ValueError(
+                f"merge_results needs one {field} (cells not comparable across values); "
+                f"got {sorted(str(v) for v in values)}"
+            )
     merged = GridResult(
         suite=head.suite,
         judge_model=head.judge_model,

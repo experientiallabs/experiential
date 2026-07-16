@@ -798,3 +798,21 @@ def test_download_picker_lists_published_and_fetches_choice(
     assert result.exit_code == 0, result.output
     assert fetched == ["gaia2"]
     assert "not downloaded" in result.output  # picker showed local status
+
+
+def test_grid_output_paths_never_collide() -> None:
+    # Regression: `--out foo.json` must NOT make the chart PNG overwrite the just-written result
+    # JSON. The JSON and PNG always get distinct suffixes off the same stem.
+    from wmh.cli.app import _grid_output_paths
+
+    default = Path("/tmp/grid/suite-run.json")
+    for out in ("foo.json", "foo.png", "foo", "dir/bar.json"):
+        json_path, png_path = _grid_output_paths(out, default)
+        assert json_path.suffix == ".json"
+        assert png_path.suffix == ".png"
+        assert json_path != png_path  # the bug: these were equal for `--out foo.json`
+        assert json_path.stem == png_path.stem == Path(out).stem
+    # No --out: fall back to the default JSON dest + its .png sibling.
+    json_path, png_path = _grid_output_paths(None, default)
+    assert json_path == default
+    assert png_path == default.with_suffix(".png")

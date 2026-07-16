@@ -1085,6 +1085,20 @@ def _parse_model_specs(models: str | None) -> list[ModelSpec]:
     return specs
 
 
+def _grid_output_paths(out: str | None, default_json: Path) -> tuple[Path, Path]:
+    """Result-JSON and chart-PNG destinations for a grid run.
+
+    With `--out`, the JSON and PNG share the stem but ALWAYS take distinct suffixes, so passing
+    `--out foo.json` can never make the PNG write clobber the result JSON at the same path (and
+    `--out foo.png` still lands the JSON next to it). Without `--out`, use the default JSON dest and
+    its `.png` sibling.
+    """
+    if out is None:
+        return default_json, default_json.with_suffix(".png")
+    base = Path(out)
+    return base.with_suffix(".json"), base.with_suffix(".png")
+
+
 def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each maps to one flag
     selector: str,
     *,
@@ -1142,11 +1156,11 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
         )
     run_id = uuid4().hex
     default_dest = Path(results_root) / "grid" / f"{suite.name}-{run_id}.json"
-    dest = Path(out).with_suffix(".json") if out else default_dest
+    dest, png = _grid_output_paths(out, default_dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(result.model_dump_json(indent=2), encoding="utf-8")
     _console.print(f"wrote grid result -> {dest}")
-    png = Path(out) if out else dest.with_suffix(".png")
+    png.parent.mkdir(parents=True, exist_ok=True)
     plot_grid(
         result,
         png,
@@ -1172,7 +1186,8 @@ def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | N
             f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
             f"n={cell.n_steps}{cost}"
         )
-    png = Path(out) if out else Path(paths[0]).with_suffix(".merged.png")
+    # Force a .png suffix so `--out foo.json` writes a real PNG file, never a PNG mislabeled .json.
+    png = Path(out).with_suffix(".png") if out else Path(paths[0]).with_suffix(".merged.png")
     plot_grid(
         merged,
         png,
@@ -1193,7 +1208,7 @@ def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
         res = GridResult.model_validate_json(Path(p).read_text(encoding="utf-8"))
         by_suite.setdefault(res.suite, []).append(res)
     merged = {suite: merge_results(rs) for suite, rs in by_suite.items()}
-    png = Path(out) if out else Path("grid-heatmap.png")
+    png = Path(out).with_suffix(".png") if out else Path("grid-heatmap.png")
     plot_grid_heatmap(merged, png)
     _console.print(f"wrote grid heatmap -> {png} ({len(merged)} benchmarks)")
 

@@ -291,27 +291,49 @@ def test_merge_results_concatenates_cells_and_keeps_first_metadata() -> None:
     assert merged.total_test_traces == 12
 
 
-def test_merge_results_rejects_mismatched_suite_or_judge_version() -> None:
-    def _r(suite: str, version: str) -> GridResult:
+def test_merge_results_rejects_incomparable_results() -> None:
+    def _r(  # noqa: PLR0913 - one keyword per comparability field, each with a default
+        *,
+        suite: str = "tau-bench",
+        judge_version: str = "rubric-v2",
+        train_split: float = 0.7,
+        val_frac: float = 0.15,
+        top_k: int = 5,
+        seed: int = 0,
+        model: str = "GPT-5.5",
+    ) -> GridResult:
         return GridResult(
             suite=suite,
             judge_model="us.anthropic.claude-opus-4-8",
             judge_provider="bedrock",
-            judge_version=version,
-            train_split=0.7,
-            top_k=5,
-            seed=0,
+            judge_version=judge_version,
+            train_split=train_split,
+            val_frac=val_frac,
+            top_k=top_k,
+            seed=seed,
             sample_turns="all",
-            cells=[_cell("GPT-5.5", "base", 0.6)],
+            cells=[_cell(model, "base", 0.6)],
         )
 
     # Different suites must not be merged into one chart.
     with pytest.raises(ValueError, match="one suite"):
-        merge_results([_r("tau-bench", "rubric-v2"), _r("swe-bench", "rubric-v2")])
-    # Different judge versions score on different scales and must not be merged (the whole point
-    # of stamping judge_version).
+        merge_results([_r(), _r(suite="swe-bench")])
+    # Different judge versions score on different scales (the whole point of stamping it).
     with pytest.raises(ValueError, match="judge_version"):
-        merge_results([_r("tau-bench", "rubric-v2"), _r("tau-bench", "rubric-v1")])
+        merge_results([_r(), _r(judge_version="rubric-v1")])
+    # Drifted split/retrieval flags reserve a different held-out band -> not comparable. The
+    # self-hosted grid runs in a separate process where such drift is realistic.
+    with pytest.raises(ValueError, match="train_split"):
+        merge_results([_r(), _r(train_split=0.8)])
+    with pytest.raises(ValueError, match="val_frac"):
+        merge_results([_r(), _r(val_frac=0.1)])
+    with pytest.raises(ValueError, match="seed"):
+        merge_results([_r(), _r(seed=1)])
+    with pytest.raises(ValueError, match="top_k"):
+        merge_results([_r(), _r(top_k=8)])
+    # Identical comparability fields -> merges fine.
+    merged = merge_results([_r(), _r(model="Qwen")])
+    assert [c.model_label for c in merged.cells] == ["GPT-5.5", "Qwen"]
 
 
 def test_run_grid_falls_back_to_2way_when_no_room_for_val_band(tmp_path) -> None:  # noqa: ANN001
