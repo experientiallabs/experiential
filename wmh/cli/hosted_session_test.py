@@ -1348,3 +1348,35 @@ def test_end_tolerates_a_sandbox_that_ended_mid_command(tmp_path: Path) -> None:
     assert (root / ".wmh-conflicts" / "sess-1.tar.gz").is_file()
     assert client.final_acked
     assert store.load("sess-1") is None
+
+
+def test_finish_terminal_survives_a_vanished_session_record(tmp_path: Path) -> None:
+    """A 404 on the post-handoff status read must not strand local state forever."""
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+
+    class _VanishingClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gets = 0
+
+        def get_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
+            self.gets += 1
+            if self.gets > 1:
+                raise PlatformError(f"Agent not found: {agent_id}", status_code=404)
+            return super().get_agent_session(agent_id, session_id)
+
+    client = _VanishingClient()
+    client.session_states = [_session(workspace_sync=True)]
+    client.final_archive = _archive({"answer.txt": b"final"})
+    client.pages = [_page([], 0, "ended")]
+
+    _command_driver(client, store, action="end").run()
+
+    assert client.final_acked
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "final"
+    assert store.load("sess-1") is None
+    assert store.current_session_id() is None

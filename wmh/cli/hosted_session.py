@@ -655,15 +655,31 @@ class DetachedCommandDriver:
             and self._salvage_reason is not None
         ):
             self._salvage_final_workspace(stream)
-        terminal = self._client.get_agent_session(stream.state.agent_id, stream.state.session_id)
+        terminal: RemoteAgentSession | None
+        try:
+            terminal = self._client.get_agent_session(
+                stream.state.agent_id, stream.state.session_id
+            )
+        except PlatformError as error:
+            # The record (or its agent) can vanish between the handoff and
+            # this read; local state must still be cleared, or it is stuck
+            # with no CLI path to remove it.
+            if error.status_code != 404:
+                raise
+            terminal = None
         if stream.persisted:
             self._store.delete(stream.state.session_id)
         if failure_note is not None:
             _console.print(f"[red]{failure_note}[/red]")
-        if terminal.status == "failed":
+        if terminal is not None and terminal.status == "failed":
             _console.print(f"[red]session failed: {terminal.error or 'unknown error'}[/red]")
             raise typer.Exit(code=1)
-        _console.print(f"[dim]session ended ({terminal.ended_reason or terminal.status})[/dim]")
+        detail = (
+            terminal.ended_reason or terminal.status
+            if terminal is not None
+            else "no longer visible on the platform"
+        )
+        _console.print(f"[dim]session ended ({detail})[/dim]")
         if failure_note is not None:
             raise typer.Exit(code=1)
         if conflicted:
