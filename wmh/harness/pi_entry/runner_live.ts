@@ -4,7 +4,8 @@
  * Where runner_stdio.ts runs ONE fire-and-forget episode, this runner hosts ONE long-lived pi
  * Agent for an interactive multi-turn session: the host sends `session_start` once (materializing
  * the champion's code surfaces), then `user_message` / `abort` / `ping` frames over the session's
- * life, and the runner drives the same Agent across every turn on one accumulating transcript.
+ * life. Interactive sessions retain one transcript; filesystem-backed projects can instead scope
+ * conversation to each outer turn while reusing the same Agent, runner, and project filesystem.
  * The transport, the localhost LLM bridge (credentials stay host-side), and the env-tools-as-
  * `tool_request` contract are identical to runner_stdio.ts — deliberately re-mirrored rather than
  * imported, because runner_stdio boots per-episode helpers and this runner's lifecycle differs.
@@ -285,7 +286,12 @@ function startLlmBridge(conn: StdioConn): Promise<Bridge> {
 						}));
 					}
 					const first = { choices: [{ index: 0, delta, finish_reason: null }] };
-					const last = { choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }] };
+					const last = {
+						choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }],
+						// Pi uses the latest assistant usage to estimate occupied context. Without this,
+						// it falls back to chars/4 and can prematurely clamp the next output budget.
+						usage: reply.completion?.usage,
+					};
 					res.write(`data: ${JSON.stringify(first)}\n\n`);
 					res.write(`data: ${JSON.stringify(last)}\n\n`);
 					res.end("data: [DONE]\n\n");
@@ -389,6 +395,7 @@ class Session {
 	private running = false;
 	private turns = 0;
 	private turnCap = 60;
+	private conversationScope: "session" | "turn" = "session";
 	private interrupted = false;
 	private hitTurnCap = false;
 
@@ -398,6 +405,7 @@ class Session {
 
 	async start(frame: Frame): Promise<void> {
 		this.turnCap = Number(frame.turn_cap ?? 60);
+		this.conversationScope = frame.conversation_scope === "turn" ? "turn" : "session";
 		const maxOutputTokens =
 			Number.isInteger(frame.max_output_tokens) && frame.max_output_tokens >= 1
 				? frame.max_output_tokens
@@ -501,6 +509,13 @@ class Session {
 		this.turns = 0;
 		this.interrupted = false;
 		this.hitTurnCap = false;
+		if (this.conversationScope === "turn") {
+			// AgentProject stores durable memory in its filesystem and gives every outer task a
+			// self-contained request. Retaining all prior task transcripts duplicates that state,
+			// grows input cost without bound, and makes pi clamp maxTokens to 1 near its context cap.
+			// Reset only here, while idle: tool calls within this logical turn still share context.
+			this.agent.state.messages = [];
+		}
 		this.sendState("running");
 		try {
 			await this.agent.prompt(text);

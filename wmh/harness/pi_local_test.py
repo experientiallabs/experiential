@@ -45,7 +45,9 @@ def _node_22() -> str:
     return node
 
 
-def _start_live_runner(node: str, env: dict[str, str]) -> subprocess.Popen[str]:
+def _start_live_runner(
+    node: str, env: dict[str, str], *, cwd: Path | None = None
+) -> subprocess.Popen[str]:
     runner = Path(mod.__file__).with_name("pi_entry") / "runner_live.ts"
     return subprocess.Popen(  # noqa: S603 - resolved local Node executable, no shell
         [node, "--experimental-strip-types", str(runner)],
@@ -54,6 +56,7 @@ def _start_live_runner(node: str, env: dict[str, str]) -> subprocess.Popen[str]:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        cwd=cwd,
     )
 
 
@@ -62,6 +65,9 @@ def _read_live_frame(process: subprocess.Popen[str]) -> dict[str, object]:
     ready, _, _ = select.select([process.stdout], [], [], 5)
     assert ready, "live runner did not emit a frame within five seconds"
     wire = process.stdout.readline().strip()
+    if not wire:
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        raise AssertionError(f"live runner exited before its next frame: {stderr}")
     return cast("dict[str, object]", json.loads(base64.b64decode(wire)))
 
 
@@ -200,6 +206,53 @@ def test_live_runner_durable_outbox_precedes_sequenced_stdout(tmp_path: Path) ->
         assert list(outbox.rglob(".*.tmp-*")) == []
     finally:
         _stop_live_runner(process, durable_inbound_seq=2)
+
+
+def test_live_runner_turn_scope_clears_only_the_prior_outer_turn(tmp_path: Path) -> None:
+    """Project turns reuse one runner but never accumulate an unbounded chat transcript."""
+    node = _node_22()
+    env = os.environ.copy()
+    env.pop("WMH_LIVE_OUTBOX", None)
+    env["NODE_NO_WARNINGS"] = "1"
+    process = _start_live_runner(node, env, cwd=tmp_path)
+    agent_source = """export class Agent {
+  state = { messages: [] };
+  listeners = [];
+  constructor(_options) {}
+  subscribe(listener) { this.listeners.push(listener); return () => {}; }
+  steer(_message) {}
+  abort() {}
+  async prompt(text) {
+    if (this.state.messages.length !== 0) throw new Error("prior outer turn was retained");
+    this.state.messages = [{ role: "user", text }];
+    for (const listener of this.listeners) await listener({ type: "turn_end" });
+  }
+}
+"""
+    try:
+        assert _read_live_frame(process)["type"] == "hello"
+        _send_live_frame(
+            process,
+            {
+                "type": "session_start",
+                "files": {"src/agent.ts": agent_source},
+                "tools": [],
+                "conversation_scope": "turn",
+            },
+        )
+        assert _read_live_frame(process) == {"type": "state", "status": "idle", "turns": 0}
+
+        for index in range(2):
+            _send_live_frame(
+                process,
+                {"type": "user_message", "msg_id": f"m{index}", "text": f"round {index}"},
+            )
+            assert _read_live_frame(process)["status"] == "running"
+            terminal = _read_live_frame(process)
+            assert terminal["status"] == "idle"
+            assert terminal["reason"] == "completed"
+    finally:
+        _stop_live_runner(process)
 
 
 class _FakeProcess:

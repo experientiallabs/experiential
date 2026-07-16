@@ -73,8 +73,9 @@ class AgentProject:
     """A persistent filesystem that can run project-scoped pi agents.
 
     The project owns environment state, while :class:`LiveSession` owns ordinary agent execution.
-    Repeated ``run`` calls for the same agent and provider reuse one live session and its
-    transcript.
+    Repeated ``run`` calls for the same agent and provider reuse one live session and runner, while
+    each outer project task gets a fresh model transcript. The project filesystem is the durable
+    memory shared across those tasks.
     Changing the agent harness or provider starts a new session against the same filesystem.
     """
 
@@ -372,6 +373,10 @@ class AgentProject:
                 turn_cap=agent.max_turns(),
                 max_output_tokens=agent.max_output_tokens(),
                 temperature=agent.temperature(),
+                # Project files are durable memory. Replaying every prior project task in the
+                # model transcript only duplicates that state and eventually collapses pi's
+                # available output budget as context fills.
+                conversation_scope="turn",
             )
             session.start()
         except Exception:

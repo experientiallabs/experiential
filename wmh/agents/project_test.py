@@ -197,6 +197,7 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     assert result.answer == "finished"
     [session_start] = [frame for frame in channel.sent if frame["type"] == "session_start"]
     assert session_start["max_output_tokens"] == meta_agent().max_output_tokens() == 16384
+    assert session_start["conversation_scope"] == "turn"
     assert any(frame["type"] == "user_message" for frame in channel.sent)
     assert channel.closed is False
     assert sandbox.commands.runs[:2] == [
@@ -537,7 +538,7 @@ def test_project_does_not_retry_non_transport_context_write_failure() -> None:
     assert commands.attempts - attempts_before == 1
 
 
-def test_project_reuses_one_agent_session_across_turns() -> None:
+def test_project_reuses_one_agent_runner_across_fresh_project_turns() -> None:
     sandbox = _Sandbox()
     channel = _Channel()
     channel.inbound.extend(
@@ -572,6 +573,12 @@ def test_project_reuses_one_agent_session_across_turns() -> None:
     assert starts == 1
     assert [frame["type"] for frame in channel.sent].count("session_start") == 1
     assert [frame["type"] for frame in channel.sent].count("user_message") == 2
+    assert (
+        next(frame for frame in channel.sent if frame["type"] == "session_start")[
+            "conversation_scope"
+        ]
+        == "turn"
+    )
 
 
 def test_project_surfaces_a_mid_turn_runner_error() -> None:

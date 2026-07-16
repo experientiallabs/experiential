@@ -63,6 +63,35 @@ def test_start_waits_for_first_idle_state() -> None:
     assert channel.sent[0]["turn_cap"] == 60
     assert channel.sent[0]["max_output_tokens"] == 16384
     assert channel.sent[0]["temperature"] == 0.35
+    assert channel.sent[0]["conversation_scope"] == "session"
+
+
+def test_start_can_scope_conversation_to_each_outer_turn() -> None:
+    channel = ScriptedChannel([{"type": "state", "status": "idle"}])
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda e: None,
+        conversation_scope="turn",
+    )
+
+    session.start()
+
+    assert channel.sent[0]["conversation_scope"] == "turn"
+
+
+def test_rejects_unknown_conversation_scope() -> None:
+    channel = ScriptedChannel([])
+
+    with pytest.raises(ValueError, match="conversation_scope"):
+        LiveSession(
+            channel,
+            tools=[],
+            execute_tool=_no_tool,
+            on_event=lambda e: None,
+            conversation_scope="message",  # ty: ignore[invalid-argument-type]
+        )
 
 
 def test_start_surfaces_the_runner_construction_error() -> None:

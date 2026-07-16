@@ -23,7 +23,8 @@ New session frames (additive to the RunnerLink vocabulary; unknown types are ign
 sides, so eval episodes are unaffected):
 
   host -> runner
-    session_start {session_id, system, tools, files, turn_cap, max_output_tokens, temperature}
+    session_start {session_id, system, tools, files, turn_cap, max_output_tokens, temperature,
+                   conversation_scope}
     user_message  {msg_id, text}
     abort         {reason}
     ping          {nonce}
@@ -76,6 +77,7 @@ EventKind = Literal[
     "state",
     "error",
 ]
+ConversationScope = Literal["session", "turn"]
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,7 @@ class LiveSession:
         turn_cap: int = DEFAULT_TURN_CAP,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 0.7,
+        conversation_scope: ConversationScope = "session",
     ) -> None:
         self._channel = channel
         self._tools = list(tools)
@@ -179,8 +182,11 @@ class LiveSession:
             raise ValueError("max_output_tokens must be >= 1")
         if not 0.0 <= temperature <= 2.0:
             raise ValueError("temperature must be in [0, 2]")
+        if conversation_scope not in ("session", "turn"):
+            raise ValueError("conversation_scope must be 'session' or 'turn'")
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
+        self._conversation_scope = conversation_scope
 
         self._inbox: queue.Queue[_Intent] = queue.Queue()
         self._session_id = uuid.uuid4().hex
@@ -220,6 +226,7 @@ class LiveSession:
                 "turn_cap": self._turn_cap,
                 "max_output_tokens": self._max_output_tokens,
                 "temperature": self._temperature,
+                "conversation_scope": self._conversation_scope,
             }
         )
         # The runner sends `state:idle` once the agent is constructed and ready for the first

@@ -74,6 +74,14 @@ def test_all_pi_llm_bridges_forward_opaque_reasoning_details() -> None:
         assert "delta.reasoning_details = msg.reasoning_details" in source
 
 
+def test_all_pi_llm_bridges_forward_usage_for_context_accounting() -> None:
+    """Pi must see real usage instead of estimating an ever-growing transcript by characters."""
+    entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
+    for filename in ("runner_stdio.ts", "runner_live.ts", "runner_service.ts"):
+        source = (entry / filename).read_text(encoding="utf-8")
+        assert "usage: reply.completion?.usage" in source
+
+
 def test_all_pi_entrypoints_use_the_host_output_budget() -> None:
     """No execution mode may silently fall back to the old hard-coded 4k model ceiling."""
     entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
@@ -1840,6 +1848,8 @@ def test_session_entry_files_returns_the_live_runner_source() -> None:
     assert TRANSPORT_KEEPALIVE_TYPE in files["runner_live.ts"]
     assert ".unref()" in files["runner_live.ts"]
     assert "conn.startTransportKeepalive();" in files["runner_live.ts"]
+    assert 'frame.conversation_scope === "turn"' in files["runner_live.ts"]
+    assert "this.agent.state.messages = [];" in files["runner_live.ts"]
 
 
 def test_start_live_runner_bootstraps_starts_and_consumes_hello() -> None:

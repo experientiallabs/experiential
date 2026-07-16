@@ -78,7 +78,12 @@ function startLlmBridge(conn: FrameConn): Promise<Bridge> {
 						}));
 					}
 					const first = { choices: [{ index: 0, delta, finish_reason: null }] };
-					const last = { choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }] };
+					const last = {
+						choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }],
+						// Pi uses the latest assistant usage to estimate occupied context. Without this,
+						// it falls back to chars/4 and can prematurely clamp the next output budget.
+						usage: reply.completion?.usage,
+					};
 					res.write(`data: ${JSON.stringify(first)}\n\n`);
 					res.write(`data: ${JSON.stringify(last)}\n\n`);
 					res.end("data: [DONE]\n\n");
