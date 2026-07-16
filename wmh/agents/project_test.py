@@ -198,6 +198,8 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     [session_start] = [frame for frame in channel.sent if frame["type"] == "session_start"]
     assert session_start["max_output_tokens"] == meta_agent().max_output_tokens() == 16384
     assert session_start["conversation_scope"] == "turn"
+    assert project._session is not None  # noqa: SLF001 - runtime wiring contract
+    assert project._session._actions_per_turn == meta_agent().max_turns() == 60  # noqa: SLF001
     assert any(frame["type"] == "user_message" for frame in channel.sent)
     assert channel.closed is False
     assert sandbox.commands.runs[:2] == [

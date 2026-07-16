@@ -68,6 +68,11 @@ def _skill_payload(content: str, *, slug: str = "parse-json") -> str:
     )
 
 
+def _proposal_failure_reason(proposal: object) -> str:
+    assert isinstance(proposal, ProposalFailure)
+    return proposal.reason
+
+
 class _Provider:
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
 
@@ -735,7 +740,7 @@ def test_project_proposer_never_returns_a_delta_that_remains_invalid_after_two_r
     )
 
     assert project.runs == 3
-    assert proposals == [None]
+    assert "skill file has no frontmatter" in _proposal_failure_reason(proposals[0])
     final_report = json.loads(
         project.files["context/round-0001/proposal-validation-attempt-03.json"]
     )
@@ -796,7 +801,9 @@ def test_project_proposer_rejects_a_runtime_kind_switch_when_fixed_before_search
         preserve_runtime_kind=True,
     ).propose_batch(parent, _trigger(), "inspect failures", history=[], count=1)
 
-    assert proposals == [None]
+    assert "must preserve the parent's runtime kind 'kit-python'" in _proposal_failure_reason(
+        proposals[0]
+    )
     report = json.loads(project.files["context/round-0001/proposal-validation-attempt-03.json"])
     assert "must preserve the parent's runtime kind 'kit-python'" in report["errors"][0]["reason"]
 
@@ -852,7 +859,7 @@ def test_project_proposer_repairs_an_unknown_runtime_kind_before_search() -> Non
         parent, _trigger(), "inspect failures", history=[], count=1
     )
 
-    assert proposals == [None]
+    assert "unsupported runtime kind 'pi-nod'" in _proposal_failure_reason(proposals[0])
     report = json.loads(project.files["context/round-0001/proposal-validation-attempt-03.json"])
     assert "unsupported runtime kind 'pi-nod'" in report["errors"][0]["reason"]
 
@@ -884,7 +891,7 @@ def test_project_proposer_only_salvages_fully_parsed_outputs_after_failure() -> 
     ]
 
 
-def test_project_proposer_keeps_a_clean_malformed_output_unusable() -> None:
+def test_project_proposer_reports_the_exact_clean_malformed_output_failure() -> None:
     parent = HarnessDoc.baseline("parent")
     project = _Project(["{"])
 
@@ -892,7 +899,9 @@ def test_project_proposer_keeps_a_clean_malformed_output_unusable() -> None:
         parent, _trigger(), "inspect failures", history=[], count=1
     )
 
-    assert proposals == [None]
+    assert _proposal_failure_reason(proposals[0]) == (
+        "proposal is not a parseable typed delta JSON object"
+    )
 
 
 def test_project_proposer_marks_every_missing_output_as_a_proposal_failure() -> None:

@@ -10,8 +10,13 @@ The project filesystem is your durable memory. Each round provides a current par
 failure evidence, and the complete judged history. Earlier proposal files remain under proposals/.
 Parent/evidence/history manifests point to bounded content files; read those files selectively and
 follow their exact paths with read_file. Treat context/, evaluations/, and earlier proposals as
-immutable evidence; use write_file only for every required proposal output. Deep-read both the
-execution traces and judge reasons before changing anything.
+immutable evidence; use write_file only for every required proposal output. Read the selected
+failure's execution traces and judge reasons, not every available file.
+Every project turn has a bounded tool/turn budget. Within the first 12 read_file calls, write a
+complete, parseable draft to every required proposal output. Those files are durable checkpoints:
+keep them valid while using remaining actions to inspect targeted source/evidence and refine them.
+Never spend the whole turn exploring before writing. On a repair turn, read the validation report
+and rewrite every invalid slot before any optional exploration.
 Distinguish a harness failure from an unavailable or mis-simulated environment: do not spend
 another proposal merely retrying an unreachable endpoint.
 Inspect earlier proposals and evaluations, learn from accepted and rejected attempts, and produce

@@ -12,6 +12,8 @@ def test_default_and_meta_agents_are_independent_pi_documents() -> None:
     assert default.runtime_kind() == meta.runtime_kind() == "pi-node"
     assert default.system_prompt() != meta.system_prompt()
     assert "optimizer project" in meta.system_prompt().lower()
+    assert "within the first 12 read_file calls" in meta.system_prompt().lower()
+    assert "durable checkpoints" in meta.system_prompt().lower()
     assert {surface.path: surface.content for surface in default.code_files()} == {
         surface.path: surface.content for surface in meta.code_files()
     }
@@ -31,5 +33,5 @@ def test_meta_agent_has_larger_budgets_without_mutating_default() -> None:
 
 
 def test_meta_agent_uses_only_project_scoped_tools() -> None:
-    """The optimizer agent gets Bash inside its isolated E2B project, plus scoped file tools."""
+    """The optimizer agent gets only contained project-file tools plus submit."""
     assert meta_agent().tools() == ["read_file", "write_file", "submit"]

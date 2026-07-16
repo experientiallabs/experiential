@@ -21,7 +21,12 @@ from wmh.harness.e2b_sandbox import (
     default_sandbox_factory,
     kill_sandbox,
 )
-from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
+from wmh.harness.live_session import (
+    DEFAULT_ACTIONS_PER_TURN,
+    LiveSession,
+    SessionEvent,
+    ToolOutcome,
+)
 from wmh.harness.pi_e2b import start_live_runner
 from wmh.harness.runner_link import Channel, TokenUsage
 from wmh.harness.runtime import HarnessSearchCancelled
@@ -370,6 +375,10 @@ class AgentProject:
                 system_prompt=agent.assembled_prompt(),
                 skill_bodies={skill.name: skill.body for skill in skills},
                 provider=provider,
+                # Project agents explore a durable filesystem and can legitimately need one
+                # project action per model turn. Never let LiveSession's generic 40-action default
+                # silently undercut a harness that explicitly raises its turn budget.
+                actions_per_turn=max(DEFAULT_ACTIONS_PER_TURN, agent.max_turns()),
                 turn_cap=agent.max_turns(),
                 max_output_tokens=agent.max_output_tokens(),
                 temperature=agent.temperature(),

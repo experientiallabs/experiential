@@ -420,7 +420,14 @@ class ProjectDeltaProposer:
             elif terminal_error is not None:
                 proposals.append(ProposalFailure(reason=str(terminal_error)))
             else:
-                proposals.append(None)
+                proposals.append(
+                    ProposalFailure(
+                        reason=validation.errors.get(
+                            index,
+                            "proposal slot remained invalid after bounded repair turns",
+                        )
+                    )
+                )
         return proposals
 
     def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
@@ -877,8 +884,9 @@ These siblings already passed host preflight. Do not rewrite them:
 Every repaired file must follow the original typed delta JSON schema, apply cleanly to that same
 parent, {runtime_constraint}, produce a child document different from the parent, differ from
 judged history, and differ from every sibling. A skill's content must include the complete
-four-line frontmatter shown in the original request. Validate every rewritten file before calling
-submit with a short summary."""
+four-line frontmatter shown in the original request. Rewrite every invalid file immediately after
+reading the validation report; only then spend remaining actions on optional evidence. Validate
+every rewritten file before calling submit with a short summary."""
 
 
 def _project_request(
@@ -959,6 +967,8 @@ Typed surface constraints (host preflight enforces all of these before evaluatio
   history or another sibling, even through differently ordered operations.
 
 Every proposal must be focused, valid against the same supplied parent, and meaningfully different
-from its siblings. The host will parse, stamp mechanical missing preconditions, deep-copy apply,
-and de-duplicate every file. Invalid slots receive at most two repair turns and are never evaluated.
-After all files exist, call submit with a short summary."""
+from its siblings. Your project tool budget is bounded: after reading the three root manifests,
+write a complete, parseable draft to every output before doing deeper optional exploration. Keep
+those files valid as you refine them. The host will parse, stamp mechanical missing preconditions,
+deep-copy apply, and de-duplicate every file. Invalid slots receive at most two repair turns and
+are never evaluated. After all files exist, call submit with a short summary."""
