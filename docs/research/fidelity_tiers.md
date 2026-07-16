@@ -37,8 +37,8 @@ Python API:
 |---|---|---|---|
 | low | base (no GEPA) | hashing (offline) | none — ships the signature estimate (the floor) |
 | medium | GEPA, 4 iterations | hashing | cheap frontier (base/reason/grounding), 4 val traces, incumbent=estimate |
-| high | GEPA, 4 iterations | hashing | signature-pruned full menu, 4 val traces, incumbent=estimate |
-| max | GEPA, 16 iterations | hashing | full ladder, 12 val traces, incumbent=estimate |
+| high | GEPA, 4 iterations | hashing | signature-pruned full menu, 8 val traces, incumbent=estimate |
+| max | GEPA, 16 iterations | hashing | full ladder, 16 val traces, incumbent=estimate |
 
 **Evidence audit (2026-07-08, user-prompted "each ingredient must improve, not just cost
 more"):** two ingredients failed and were removed. (1) Semantic embeddings for high/max: PR
