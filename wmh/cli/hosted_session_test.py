@@ -819,3 +819,37 @@ def test_end_reruns_cleanly_while_the_session_is_ending(tmp_path: Path) -> None:
 
     assert client.end_calls == [("agent-1", "sess-1")]
     assert store.load("sess-1") is None
+
+
+def test_try_push_local_tolerates_a_workspace_that_is_not_ready(tmp_path: Path) -> None:
+    """A booting or winding-down sandbox defers the push; real failures still raise."""
+    (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(tmp_path)
+    (tmp_path / "answer.txt").write_text("local", encoding="utf-8")
+
+    class _NotReadyClient(_FakeClient):
+        def __init__(self, status_code: int) -> None:
+            super().__init__()
+            self.status_code = status_code
+
+        def upload_agent_workspace_patch(
+            self, agent_id: str, session_id: str, content: bytes
+        ) -> WorkspacePatchResult:
+            raise PlatformError("workspace is not running", status_code=self.status_code)
+
+    for status_code in (409, 503):
+        workspace = mod.LiveWorkspace(
+            cast("mod.PlatformClient", _NotReadyClient(status_code)),
+            "agent-1",
+            "sess-1",
+            tmp_path,
+            base,
+        )
+        assert workspace.try_push_local() is False
+        assert workspace.synchronized is base
+
+    failing = mod.LiveWorkspace(
+        cast("mod.PlatformClient", _NotReadyClient(500)), "agent-1", "sess-1", tmp_path, base
+    )
+    with pytest.raises(PlatformError):
+        failing.try_push_local()

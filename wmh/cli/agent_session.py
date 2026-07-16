@@ -664,7 +664,7 @@ class RemoteAgentDriver:
                     self._client.post_agent_session_command(self._target_id, session_id, "end")
                     end_sent = True
                 if workspace is not None and now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S:
-                    workspace.push_local()
+                    workspace.try_push_local()
                     last_workspace_push = now
                 time.sleep(0.5)
             except KeyboardInterrupt:

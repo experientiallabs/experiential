@@ -159,6 +159,21 @@ class LiveWorkspace:
         self.synchronized = current
         return True
 
+    def try_push_local(self) -> bool:
+        """Push local edits, tolerating a workspace that cannot accept patches yet.
+
+        A sandbox that is still booting (or winding down) answers 409/503; the
+        caller's sync loop retries on its next tick, and an end falls back to
+        the conflict-preserving final sync. Anything else still raises.
+        """
+        try:
+            return self.push_local()
+        except PlatformError as error:
+            if error.status_code not in {409, 503}:
+                raise
+            _console.print("[dim]local changes will sync once the workspace is running[/dim]")
+            return False
+
     def _record_conflicts(self, conflicts: Iterable[str]) -> list[str]:
         """Track conflicts, returning only ones not already reported."""
         fresh = [path for path in conflicts if path not in self.conflicts]
@@ -716,20 +731,10 @@ class DetachedCommandDriver:
     # -- checkpointing -----------------------------------------------------------------------
 
     def _push_workspace(self, stream: _Stream) -> None:
-        """Upload local edits made since the checkpoint, then persist it.
-
-        A workspace whose sandbox is not accepting patches yet (booting, or
-        winding down) is tolerated: the streaming loop retries every tick, and
-        an end falls back to the conflict-preserving final sync.
-        """
+        """Upload local edits made since the checkpoint, then persist it."""
         if stream.workspace is None:
             return
-        try:
-            stream.workspace.push_local()
-        except PlatformError as error:
-            if error.status_code not in {409, 503}:
-                raise
-            _console.print("[dim]local changes will sync once the workspace is running[/dim]")
+        stream.workspace.try_push_local()
         self._persist(stream, stream.cursor)
 
     def _persist(self, stream: _Stream, cursor: int) -> None:
