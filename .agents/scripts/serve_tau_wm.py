@@ -5,12 +5,17 @@ cannot diverge between the training env and the eval env:
 
 - ``train``: env + reward judge on Bedrock Haiku 4.5 (dated profile id — cost control;
   the artifact's built-in Opus provider is overridden at load). ``WMH_ENV_TEMPERATURE``
-  optionally pins the env's sampling temperature (judge unaffected): at the provider
-  default 0.7, the WM imagines materially different case circumstances per session —
-  measured live: identical 4-step action replays scored {0.95, 0.15, 0.3, 0.15, 0.65,
-  0.95} (stdev 0.34) across fresh sessions, which drowns group-relative advantages in
-  environment luck. Pinning ~0 makes same-actions → same-verdict, so within-group
-  reward differences reflect the policy again.
+  optionally pins the env's sampling temperature (judge unaffected). KNOWN LIMIT: the
+  pin only reaches backends whose request path forwards sampling params (OpenAI, Nova,
+  Converse third-party). The default Haiku env rides ``BedrockProvider.complete()``'s
+  Anthropic invoke_model path, which omits sampling params by endpoint contract
+  (wmh/providers/bedrock.py) — so for Bedrock-Anthropic env models the pin is INERT and
+  the env samples at the API default. This matches the D62/D65 measurements: identical
+  4-step action replays scored {0.95, 0.15, 0.3, 0.15, 0.65, 0.95} (stdev 0.34), and
+  even nominal temp-0 only reached ~0.24 — temperature pins token sampling, not the
+  imagined world. The operative env-luck fix is ``seed_state`` (scenario v2 pins), which
+  the probe measured near-deterministic. Do not attribute variance reduction to this
+  env var on Bedrock-Anthropic envs; see the PR #73 board correction (2026-07-15).
 - ``eval`` (D71/D76 sonnet-era; supersedes the D30 GPT-5.5 env, terminated D68): env on
   Bedrock sonnet-5 (+ the artifact's RAG), reward judge on Opus 4.8, rubrics passed by
   the caller where the benchmark pins them. Rows from this env are labeled sonnet-era
@@ -67,9 +72,10 @@ JUDGE_MODEL = "us.anthropic.claude-opus-4-8"  # the artifact's own serve model i
 
 class FallbackProvider:
     """Sequential same-call failover that FORWARDS temperature (unlike WaterfallProvider,
-    which drops sampling params by design). The temperature pass-through is load-bearing
-    here: WMH_ENV_TEMPERATURE (D62/D64) and the judge's explicit temperature=0.0 must
-    reach the backend or the training substrate silently changes.
+    which drops sampling params by design). The pass-through keeps the pin alive as far
+    as the provider seam; whether it reaches the wire is then per-backend —
+    Bedrock-Anthropic models drop sampling params at the request layer (see the module
+    docstring), OpenAI/Nova/Converse paths honor them.
     """
 
     def __init__(self, chain: list[Provider]) -> None:
@@ -133,6 +139,9 @@ class PinnedTemperatureProvider:
     Wraps ONLY the WM's serve provider: callers' temperature arguments (the WM never
     passes one, so it otherwise gets the 0.7 provider default) are replaced, while the
     reward judge keeps its own unwrapped provider and its explicit temperature=0.0.
+    INERT for Bedrock-Anthropic env models — that request path omits sampling params
+    (see the module docstring); the value is only honored by OpenAI/Nova/Converse
+    backends.
     """
 
     def __init__(self, inner: Provider, temperature: float) -> None:

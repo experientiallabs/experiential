@@ -5,7 +5,9 @@ reconstruction fidelity determine how well the trained policy transfers to the *
 environment?
 
 **Setup.** One REINFORCE++ n=4 group-baseline smoke (1 epoch × the 58-scenario informative
-curriculum, same seed and scenario order, temp-0 env substrate, reward judge pinned to
+curriculum, same seed and scenario order, identical env substrate (the nominal temp-0
+pin is inert on Bedrock-Anthropic request paths — identical across cells either way,
+so cross-cell comparability holds), reward judge pinned to
 Haiku 4.5) per training-WM backend; the resulting checkpoint (uniform rule: the last
 pre-collapse drain) is evaluated on the **real tau2 benchmark** — real gym, real LLM
 user-simulator, real grader — over the 20 pinned held-out tasks × 2 trials, paired

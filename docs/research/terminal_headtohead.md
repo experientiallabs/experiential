@@ -7,8 +7,10 @@ benchmark?
 **Setup.** Same base Qwen3.5-9B, two training recipes, two evaluation channels:
 
 - **WM-trained** — REINFORCE++ n=4 group-baseline against the terminal world model on the
-  D62/D65/D66 reward substrate (temp-0 env + seeded case facts), 412 episodes, checkpoint =
-  last pre-decline drain (`drain-0075`).
+  D62/D65/D66 reward substrate (seeded case facts pinning the imagined world; the nominal
+  temp-0 env pin was later found inert on the Bedrock-Anthropic request path — seeding is
+  the operative variance fix), 412 episodes, checkpoint = last pre-decline drain
+  (`drain-0075`).
 - **Offline SFT** — LoRA on 228 recorded demonstration episodes from the terminal corpus
   (D26 leakage rule: any train trace whose task appears in the pinned eval set is dropped).
 - **In-WM channel** — seeded sonnet-era WM eval (Bedrock Sonnet 5 env + Opus 4.8 judge)
