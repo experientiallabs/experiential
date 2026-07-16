@@ -246,3 +246,17 @@ noise. **This is the primary open question the program's in-WM deltas carry**; t
 pre-registered discriminator is B2's D90.1 confirmatory pass on the untouched tau
 val-split (one pre-declared pass, no reruns), and the queued substrate fix (D86.5:
 WM action-parser strictness = deployment strictness) closes the adjacent loophole.
+
+### ⚠️ D90.6 CORRECTION (2026-07-16): the kimi rows deviated from the D73 pin, undeclared
+
+What was actually run in every kimi row (haiku-era AND the superseded sonnet-era):
+the **first 40 scenarios — a positional prefix in pin-file order — of the pinned
+100-scenario eval set, × 2 episodes each** (80 eps/row). Verified against the pin file:
+the scenarios are exactly indices 0–39. Source of the deviation: the tau protocol shape
+(`--num-scenarios 40 --epochs 2`) carried over into the kimi eval chain instead of the
+D73 gui protocol (ALL 100 scenarios × 1 episode). The subsample was positional, not
+random, and was not declared. All three arms (base/GRPO/SFT) share the identical
+deviation, so within-era paired comparisons remain internally consistent — but the rows
+do not match the pin. Remediation per D90(6): full-100 rerun (`kimi-haikuera100-*`,
+100 × 1, same env/config/judge) — those rows supersede the n=40 rows as rows of record
+when they land; the n=40 rows above stay as correction-trail provenance.
