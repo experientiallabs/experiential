@@ -404,6 +404,7 @@ def create_harness(
 
         sandbox_pool = _Pool(template=e2b_template, metadata=e2b_metadata)
 
+    cancelled: HarnessSearchCancelled | None = None
     try:
 
         def _check_cancelled() -> None:
@@ -841,9 +842,14 @@ def create_harness(
             worker_usage=combine_usage(worker_usages),
             sandbox_usage=sandbox_usage,
         )
+    except HarnessSearchCancelled as error:
+        cancelled = error
+        raise
     finally:
         if sandbox_pool is not None:
             sandbox_pool.close()
+            if cancelled is not None:
+                cancelled.sandbox_usage = sandbox_pool.usage()
 
 
 def _suite_rate(report: ClosedLoopReport, suite: list[str]) -> float:

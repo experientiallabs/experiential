@@ -18,6 +18,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
+from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.environment import AgentEnvironment, is_env_action
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import (
@@ -58,7 +59,21 @@ _NUDGE = (
 
 
 class HarnessSearchCancelled(RuntimeError):
-    """The caller requested that an optimizer search stop before its next costly phase."""
+    """The caller requested that an optimizer search stop before its next costly phase.
+
+    ``sandbox_usage`` is populated by ``create_harness`` after its evaluator
+    pool has been closed, so a caller can persist already-incurred E2B spend
+    even though cancellation intentionally produces no partial search result.
+    """
+
+    def __init__(
+        self,
+        message: str = "harness search cancelled",
+        *,
+        sandbox_usage: SandboxUsage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.sandbox_usage = sandbox_usage
 
 
 class RuntimeCancelled(RuntimeError):

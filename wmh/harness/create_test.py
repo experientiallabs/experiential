@@ -976,7 +976,7 @@ def test_runtime_cancellation_aborts_the_wave_without_judging_and_closes_pool(
 
     monkeypatch.setattr(create_module, "evaluate_closed_loop", cancelled_evaluate)
 
-    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+    with pytest.raises(HarnessSearchCancelled, match="cancelled") as raised:
         create_harness(
             "winner",
             _pi_seed(),
@@ -992,6 +992,7 @@ def test_runtime_cancellation_aborts_the_wave_without_judging_and_closes_pool(
     assert callback_seen
     [pool] = fake_pool_cls.instances
     assert pool.closes == 1
+    assert raised.value.sandbox_usage == SandboxUsage(count=0, seconds=0.0)
 
 
 def test_e2b_pool_retires_idle_runners_once_per_proposal_batch(
