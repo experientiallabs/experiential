@@ -705,11 +705,7 @@ class DetachedCommandDriver:
     def _retry_pending_ack(self, stream: _Stream) -> None:
         """Deliver a patch acknowledgement a previous invocation could not send."""
         workspace_state = stream.state.workspace
-        if (
-            not stream.persisted
-            or workspace_state is None
-            or workspace_state.pending_ack is None
-        ):
+        if not stream.persisted or workspace_state is None or workspace_state.pending_ack is None:
             return
         revision = workspace_state.pending_ack
         try:
@@ -769,13 +765,17 @@ class DetachedCommandDriver:
                 time.sleep(_POLL_INTERVAL_S)
             except KeyboardInterrupt:
                 self._interrupts += 1
-                if self._interrupts == 1:
+                if self._interrupts >= 2:
+                    return "detached"
+                # The next Ctrl-C frequently lands inside this handler (the
+                # print or the HTTP post); it must detach, not crash out.
+                try:
                     _console.print("\n[yellow]interrupting (press Ctrl-C again to detach)[/yellow]")
                     with contextlib.suppress(PlatformError):
                         self._client.post_agent_session_command(
                             stream.state.agent_id, stream.state.session_id, "interrupt"
                         )
-                else:
+                except KeyboardInterrupt:
                     return "detached"
 
     def _poll(self, stream: _Stream) -> RemoteAgentEventPage:
@@ -785,6 +785,10 @@ class DetachedCommandDriver:
         )
         for event in page.events:
             self._handle_event(stream, event)
+            # Advance per event, not only per page: a Ctrl-C landing mid-page
+            # must resume after the events already processed (re-fetching a
+            # patch event whose object was acknowledged would 404).
+            stream.cursor = event.seq
         stream.cursor = page.last_seq
         self._persist(stream, page.last_seq)
         return page
@@ -841,9 +845,7 @@ class DetachedCommandDriver:
         workspace_state = state.workspace
         archive: bytes | None = None
         if workspace_state is not None:
-            update: dict[str, tuple[str, ...] | str | None] = {
-                "pending_ack": stream.pending_ack
-            }
+            update: dict[str, tuple[str, ...] | str | None] = {"pending_ack": stream.pending_ack}
             if stream.workspace is not None:
                 update["conflicts"] = tuple(sorted(stream.workspace.conflicts))
                 if stream.workspace.synchronized is not self._persisted_snapshot:

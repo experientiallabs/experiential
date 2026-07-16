@@ -242,3 +242,17 @@ def test_sync_never_conflicts_a_path_that_converged(tmp_path: Path) -> None:
     assert result.conflicts == ()
     assert result.applied == ()
     assert (tmp_path / "same.txt").read_text(encoding="utf-8") == "A"
+
+
+def test_sync_conflicts_when_remote_deletion_meets_a_local_directory(tmp_path: Path) -> None:
+    """A non-file occupying a remotely-deleted path is a conflict, not convergence."""
+    (tmp_path / "same.txt").write_text("B", encoding="utf-8")
+    initial = snapshot_workspace(tmp_path)
+    (tmp_path / "same.txt").unlink()
+    (tmp_path / "same.txt").mkdir()
+    final = _archive({})
+
+    result = sync_workspace(tmp_path, initial, final)
+
+    assert result.conflicts == ("same.txt",)
+    assert (tmp_path / "same.txt").is_dir()

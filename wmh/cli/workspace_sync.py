@@ -272,12 +272,18 @@ def sync_workspace(
                 continue
             target = resolved / relative
             now = current.get(relative)
+            # A directory/link/special file occupying the path is always a
+            # conflict: the manifests cannot see it, so no equality below is
+            # trustworthy.
+            if _has_non_file_collision(target, now):
+                conflicts.append(relative)
+                continue
             # Local and remote agreeing (content and mode) is synchronization,
             # not a conflict, even for a path protected by an earlier live
             # disagreement that has since reconverged.
             if now == after:
                 continue
-            if relative in protected_paths or _has_non_file_collision(target, now) or now != before:
+            if relative in protected_paths or now != before:
                 conflicts.append(relative)
                 continue
             try:

@@ -491,9 +491,7 @@ class RemoteAgentCommandReader(threading.Thread):
                 self._agent_id, self._session_id, kind, text=text
             )
         except PlatformError as error:
-            _console.print(
-                f"[red]{kind} failed:[/red] {error} (still attached; try again)"
-            )
+            _console.print(f"[red]{kind} failed:[/red] {error} (still attached; try again)")
             return False
         return True
 
@@ -683,12 +681,21 @@ class RemoteAgentDriver:
             except KeyboardInterrupt:
                 self._interrupts += 1
                 kind = "interrupt" if self._interrupts == 1 else "end"
-                _console.print(
-                    "\n[yellow]interrupting (press Ctrl-C again to end)[/yellow]"
-                    if kind == "interrupt"
-                    else "\n[yellow]ending session[/yellow]"
-                )
-                self._client.post_agent_session_command(self._target_id, session_id, kind)
+                # The next Ctrl-C frequently lands inside this handler (the
+                # print or the HTTP post); escalate to the end action instead
+                # of crashing out with the session still live.
+                try:
+                    _console.print(
+                        "\n[yellow]interrupting (press Ctrl-C again to end)[/yellow]"
+                        if kind == "interrupt"
+                        else "\n[yellow]ending session[/yellow]"
+                    )
+                    self._client.post_agent_session_command(self._target_id, session_id, kind)
+                except KeyboardInterrupt:
+                    self._interrupts += 1
+                    with contextlib.suppress(KeyboardInterrupt, PlatformError):
+                        _console.print("\n[yellow]ending session[/yellow]")
+                        self._client.post_agent_session_command(self._target_id, session_id, "end")
                 continue
 
 

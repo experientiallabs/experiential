@@ -1137,3 +1137,52 @@ def test_reader_keeps_reading_after_a_failed_steer_post(
     assert reader.eof.is_set()
     assert not reader.detach.is_set()
     assert "failed" in capsys.readouterr().out
+
+
+def test_second_interrupt_during_the_plain_handler_still_ends(tmp_path: Path) -> None:
+    """A Ctrl-C landing inside the plain-run interrupt handler escalates to end."""
+
+    class _Client:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+            self.polls = 0
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "sess-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            self.polls += 1
+            if self.polls == 1:
+                raise KeyboardInterrupt
+            return type("Page", (), {"events": [], "last_seq": 0, "status": "ended"})()
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            _ = text
+            self.commands.append(kind)
+            if kind == "interrupt":
+                raise KeyboardInterrupt
+
+        def get_agent_session(self, *_args: object) -> object:
+            return type("Session", (), {"status": "ended", "error": None})()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _NoReader:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    client = _Client()
+    driver, _store = _plain_driver(client, tmp_path)
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(mod, "RemoteAgentCommandReader", _NoReader)
+        driver.run()
+
+    assert client.commands == ["interrupt", "end"]
+    assert client.closed

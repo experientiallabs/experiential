@@ -1208,3 +1208,103 @@ def test_pending_ack_tolerates_an_already_removed_patch(tmp_path: Path) -> None:
     assert reloaded is not None
     assert reloaded.workspace is not None
     assert reloaded.workspace.pending_ack is None
+
+
+def test_interrupt_mid_page_does_not_refetch_processed_events(tmp_path: Path) -> None:
+    """Resuming after Ctrl-C polls past processed events, so acked patches never 404."""
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+    patch = build_workspace_patch(base.archive, _archive({"answer.txt": b"during"}))
+    assert patch is not None
+    client = _FakeClient()
+    client.session_states = [_session(workspace_sync=True)]
+    client.patches["patch-1"] = patch
+    client.pages = [
+        _page([], 0, "running"),
+        _page(
+            [
+                _event(1, "workspace_patch", revision="patch-1"),
+                _event(2, "assistant_message", text="mid-turn"),
+            ],
+            2,
+            "running",
+        ),
+        _page(
+            [
+                _event(2, "assistant_message", text="mid-turn"),
+                _event(3, "user_message", text="hi"),
+                _event(4, "state", status="idle"),
+            ],
+            4,
+            "running",
+        ),
+    ]
+    interrupted = False
+
+    def sink(event: object) -> None:
+        nonlocal interrupted
+        if getattr(event, "kind", "") == "assistant_message" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+
+    driver = mod.DetachedCommandDriver(
+        client=cast("mod.PlatformClient", client),
+        credentials=_credentials(),
+        state_store=store,
+        action="send",
+        text="hi",
+        session_override=None,
+        sink=sink,
+    )
+    driver.run()
+
+    # The patch downloaded exactly once and the resume polled past its event.
+    assert client.calls.count("patch:patch-1") == 1
+    assert "events after=1" in client.calls
+    assert ("interrupt", None) in client.commands
+
+
+def test_second_interrupt_during_the_handler_detaches_cleanly(tmp_path: Path) -> None:
+    """A Ctrl-C landing inside the interrupt handler detaches instead of crashing."""
+    store = _store_with_session(tmp_path)
+
+    class _InterruptRacedClient(_FakeClient):
+        def post_agent_session_command(
+            self, agent_id: str, session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            super().post_agent_session_command(agent_id, session_id, kind, text=text)
+            if kind == "interrupt":
+                raise KeyboardInterrupt
+
+    client = _InterruptRacedClient()
+    client.pages = [
+        _page([], 0, "running"),
+        _page([_event(1, "assistant_message", text="working")], 1, "running"),
+    ]
+    interrupted = False
+
+    def sink(event: object) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+
+    driver = mod.DetachedCommandDriver(
+        client=cast("mod.PlatformClient", client),
+        credentials=_credentials(),
+        state_store=store,
+        action="send",
+        text="hi",
+        session_override=None,
+        sink=sink,
+    )
+    driver.run()
+
+    assert ("interrupt", None) in client.commands
+    assert not any(kind == "end" for kind, _ in client.commands)
+    assert client.end_calls == []
+    # The session reference survives the detach for the next command.
+    assert store.load("sess-1") is not None
