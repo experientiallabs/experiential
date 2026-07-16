@@ -458,12 +458,12 @@ class RemoteAgentCommandReader(threading.Thread):
             for raw in sys.stdin:
                 line = raw.strip()
                 if line in {":quit", ":q", ":exit", ":end"}:
-                    self._post("end")
-                    return
-                if line == ":detach":
+                    if self._post("end"):
+                        return
+                elif line == ":detach":
                     self.detach.set()
                     return
-                if line == ":stop":
+                elif line == ":stop":
                     self._post("interrupt")
                 elif line.startswith(":"):
                     # An unknown command must never reach the agent as chat.
@@ -472,7 +472,7 @@ class RemoteAgentCommandReader(threading.Thread):
                     )
                 elif line:
                     self._post("user_message", text=line)
-        except (OSError, PlatformError):
+        except OSError:
             pass
         finally:
             # EOF keeps its plain-run meaning (end once the run settles); a
@@ -480,9 +480,22 @@ class RemoteAgentCommandReader(threading.Thread):
             if not self.detach.is_set():
                 self.eof.set()
 
-    def _post(self, kind: str, *, text: str | None = None) -> None:
-        """Post one command through the authenticated platform client."""
-        self._client.post_agent_session_command(self._agent_id, self._session_id, kind, text=text)
+    def _post(self, kind: str, *, text: str | None = None) -> bool:
+        """Post one command; a transient failure warns and keeps the reader alive.
+
+        Returns:
+            Whether the command was accepted.
+        """
+        try:
+            self._client.post_agent_session_command(
+                self._agent_id, self._session_id, kind, text=text
+            )
+        except PlatformError as error:
+            _console.print(
+                f"[red]{kind} failed:[/red] {error} (still attached; try again)"
+            )
+            return False
+        return True
 
 
 class RemoteAgentDriver:

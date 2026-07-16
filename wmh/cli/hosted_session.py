@@ -306,7 +306,7 @@ class AttachedCommandReader(threading.Thread):
         self._agent_id = agent_id
         self._session_id = session_id
         self.detach = threading.Event()
-        self.end_failed = False
+        self.ended = threading.Event()
 
     def run(self) -> None:
         """Map lines to hosted commands; leaving the terminal detaches, never ends."""
@@ -320,15 +320,19 @@ class AttachedCommandReader(threading.Thread):
                     return
                 if line == ":end":
                     # A failed end must be reported, never silently converted
-                    # into a detach that leaves the session running.
+                    # into a detach that leaves the session running; after a
+                    # successful end the driver streams to the final handoff,
+                    # so a following EOF must not look like a detach either.
                     try:
                         self._client.end_agent_session(self._agent_id, self._session_id)
                     except PlatformError as error:
-                        self.end_failed = True
                         _console.print(
                             f"[red]end failed:[/red] {error} "
                             "(retry [bold]:end[/bold], or run `wmh run --end` later)"
                         )
+                    else:
+                        self.ended.set()
+                        return
                 elif line == ":stop":
                     self._post("interrupt")
                 elif line.startswith(":"):
@@ -338,16 +342,23 @@ class AttachedCommandReader(threading.Thread):
                     )
                 elif line:
                     self._post("user_message", text=line)
-        except (OSError, PlatformError):
+        except OSError:
             pass
         finally:
             # Closed stdin means the terminal went away, not that the hosted
-            # session should end. Ending stays explicit (:end or --end).
-            self.detach.set()
+            # session should end. Ending stays explicit (:end or --end); after
+            # one, the driver keeps streaming to the final handoff.
+            if not self.ended.is_set():
+                self.detach.set()
 
     def _post(self, kind: str, *, text: str | None = None) -> None:
-        """Post one command through the authenticated platform client."""
-        self._client.post_agent_session_command(self._agent_id, self._session_id, kind, text=text)
+        """Post one command; a transient failure warns and keeps the reader alive."""
+        try:
+            self._client.post_agent_session_command(
+                self._agent_id, self._session_id, kind, text=text
+            )
+        except PlatformError as error:
+            _console.print(f"[red]{kind} failed:[/red] {error} (still attached; try again)")
 
 
 @dataclass

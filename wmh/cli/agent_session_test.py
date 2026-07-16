@@ -22,6 +22,7 @@ from wmh.cli.session_state import DetachedSessionState, SessionStateError, Sessi
 from wmh.cli.workspace_sync import snapshot_from_archive
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.workspace_patch import build_workspace_patch
+from wmh.platform.client import PlatformError
 from wmh.platform.credentials import PlatformCredentials
 
 if TYPE_CHECKING:
@@ -1104,3 +1105,35 @@ def test_world_model_loop_rejects_detach(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     driver._loop("sess-1")
+
+
+def test_reader_keeps_reading_after_a_failed_steer_post(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A transient post failure warns and keeps the session attached, never ends it."""
+
+    class _FlakyClient:
+        def __init__(self) -> None:
+            self.posted: list[tuple[str, str | None]] = []
+            self.failed_once = False
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            if kind == "user_message" and not self.failed_once:
+                self.failed_once = True
+                raise PlatformError("backend unavailable", status_code=503)
+            self.posted.append((kind, text))
+
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO("hello\n:stop\n"))
+    client = _FlakyClient()
+    reader = mod.RemoteAgentCommandReader(cast("mod.PlatformClient", client), "a", "s")
+
+    reader.run()
+
+    # The failed steer was reported, the reader kept going, and only true
+    # stdin EOF set the eof flag; nothing ended or detached the session.
+    assert client.posted == [("interrupt", None)]
+    assert reader.eof.is_set()
+    assert not reader.detach.is_set()
+    assert "failed" in capsys.readouterr().out

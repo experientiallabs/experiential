@@ -773,7 +773,7 @@ def test_attached_reader_reports_a_failed_end_and_keeps_reading(
     # The reader kept consuming input after the failed end (the :stop landed),
     # and only stdin EOF flipped the detach event.
     assert client.commands == [("interrupt", None)]
-    assert reader.end_failed
+    assert not reader.ended.is_set()
     assert reader.detach.is_set()
 
 
@@ -954,3 +954,70 @@ def test_partially_conflicted_push_advances_accepted_sibling_paths(tmp_path: Pat
     disk = snapshot_workspace(tmp_path)
     assert workspace.synchronized.files["other.txt"] == disk.files["other.txt"]
     assert workspace.synchronized.files["answer.txt"] == base.files["answer.txt"]
+
+
+def test_attached_reader_keeps_reading_after_a_failed_steer_post(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A transient steer failure warns and keeps reading; it never becomes a detach."""
+
+    class _FlakyClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_once = False
+
+        def post_agent_session_command(
+            self, agent_id: str, session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            if kind == "user_message" and not self.failed_once:
+                self.failed_once = True
+                raise PlatformError("backend unavailable", status_code=503)
+            super().post_agent_session_command(agent_id, session_id, kind, text=text)
+
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO("hello\n:stop\n"))
+    client = _FlakyClient()
+    reader = mod.AttachedCommandReader(cast("mod.PlatformClient", client), "a", "s")
+
+    reader.run()
+
+    assert client.commands == [("interrupt", None)]
+    assert reader.detach.is_set()  # via true EOF only, after both lines were read
+    assert not reader.ended.is_set()
+    assert "failed" in capsys.readouterr().out
+
+
+def test_attached_reader_end_success_stops_reading_without_detach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful :end must not fall through to an EOF-driven detach."""
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(":end\nnever sent\n"))
+    client = _FakeClient()
+    reader = mod.AttachedCommandReader(cast("mod.PlatformClient", client), "a", "s")
+
+    reader.run()
+
+    assert client.end_calls == [("a", "s")]
+    assert reader.ended.is_set()
+    assert not reader.detach.is_set()
+    assert client.commands == []
+
+
+def test_attach_end_command_runs_the_final_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """printf ':end' | wmh run -a must finalize and clean up, not report a detach."""
+    store = _store_with_session(tmp_path)
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(":end\n"))
+    client = _FakeClient()
+    client.session_states = [_session("running"), _session("ended")]
+    client.pages = [
+        _page([], 0, "running"),
+        _page([], 0, "ending"),
+        _page([], 0, "ended"),
+    ]
+
+    _command_driver(client, store, action="attach").run()
+
+    assert client.end_calls == [("agent-1", "sess-1")]
+    assert store.load("sess-1") is None
+    assert store.current_session_id() is None
