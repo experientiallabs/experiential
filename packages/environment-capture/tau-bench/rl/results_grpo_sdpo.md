@@ -146,3 +146,41 @@ Synthesis for the writeup: on-policy WM training delivers a real but modest gain
 no teacher exists (+13.7); when frontier demonstrations exist, imitation is far
 stronger at least in-WM. The natural next question — SFT-then-GRPO stacking — is out
 of sprint scope (D78).
+
+## Real-env row: GRPO smoke ckpt on real tau2 (D86.3) — negative, mechanism identified
+
+Protocol: B2's `tau_real_eval.py` harness — the same 20 pinned eval scenarios resolved
+to real tau2 (domain, task_id) via provenance, real domain tools over the real JSON DB,
+real tau2 grader, pinned Opus 4.8 user-simulator, temperature 1.0, 2 trials/task (n=40).
+Comparator: B2's base real row of record (0.900, n=40, same protocol). Raw records:
+`.agents/docs/research/real_tau_eval_results/real_tau_grpo0020_b3.jsonl`.
+
+| arm | real success | airline (n=14) | retail (n=16) | telecom (n=10) |
+|---|---|---|---|---|
+| base (B2, row of record) | **0.900** | 13/14 | 13/16 | 10/10 |
+| GRPO smoke ckpt (in-WM 0.658) | **0.600** | 9/14 | 10/16 | 5/10 |
+
+**Real Δ = −0.300 (paired per-scenario: −0.300, 0W-10L across 20 scenarios).** The
+in-WM +10 does not survive contact with the real environment — it inverts.
+
+Failure decomposition:
+- **6/40 episodes (15 pts of the 30-pt gap) are deployment-format failures**: the
+  checkpoint emits reasoning-only replies (all text inside the think channel, empty
+  content, no tool call) on specific hard prompts — 5 of 10 telecom episodes plus one
+  retail. tau2's strict message validation rejects them (retried 4×/task across two
+  passes: 100% persistent). Scored as reward 0 per the RFT2 precedent (D82): these are
+  policy failures at the deployment boundary, not infra. Base had ZERO such failures on
+  the identical harness — the behavior is WM-training-acquired. This is the program's
+  **third instance of the deployment-format channel** (RFT2 corrupted tool syntax,
+  terminal empty-commands) and the mildest: the model still solves tasks (24 real
+  successes), it just intermittently swallows its answer into the reasoning channel.
+- The remaining 15 pts are genuine real-env underperformance spread across domains
+  (scored-only success 0.706 — still 19 pts below base).
+
+Program synthesis (tau, final): GRPO's +10 in-WM (gpt-5.5 era, replicated n=79) was
+already known to compress to ≈0 under eval-env swaps (opus/azure eras); the real-env row
+resolves the question — **the smoke ckpt's in-WM gain is not real transfer**. Combined
+with B2's terminal result (WM-trained −0.042 real vs SFT −0.163) the honest cross-
+benchmark picture is: WM training's real-env value is benchmark-dependent, and
+in-WM deltas systematically overstate it unless the WM's action interface is as strict
+as deployment (D86.5 queued substrate fix).
