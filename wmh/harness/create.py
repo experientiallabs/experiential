@@ -558,12 +558,16 @@ def create_harness(
                 # Cancelled cells are not scoreable outcomes: do not judge them. Converting at the
                 # search boundary preserves the public cancellation contract while the surrounding
                 # finally closes the shared pool and retires every active evaluator sandbox.
-                raise HarnessSearchCancelled("harness search cancelled") from exc
-            _check_cancelled()
+                raise HarnessSearchCancelled(
+                    "harness search cancelled", worker_usage=exc.worker_usage
+                ) from exc
             # Tally the pi worker's self-metered tokens across every score wave (seed, screens,
             # full splits, holdout, confirmations): its LLM calls bypass the Provider, so this is
             # the only record. None on backends whose runtimes don't self-meter (local).
             worker_usages.append(report.worker_usage)
+            # Append first so a cancellation that lands after evaluation but before
+            # the report is consumed still carries the completed wave's spend.
+            _check_cancelled()
             return report
 
         seed_report = _score(seed_doc, tasks)
@@ -1024,6 +1028,11 @@ def create_harness(
         )
         return result
     except HarnessSearchCancelled as error:
+        # A cancellation inside evaluation carries that wave's completed and
+        # partial cells. Waves that returned normally were appended above. The
+        # search exception is the authoritative aggregate for callers because
+        # cancellation intentionally has no partial CreateResult.
+        error.worker_usage = combine_usage([*worker_usages, error.worker_usage])
         cancelled = error
         raise
     finally:

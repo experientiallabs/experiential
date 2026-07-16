@@ -362,15 +362,19 @@ def test_cancellation_during_worker_call_suppresses_the_llm_response() -> None:
         nonlocal cancelled
         del request
         cancelled = True
-        return _completion()
+        return _completion(input_tokens=17, output_tokens=5)
 
     ch = _FakeChannel([{"type": "llm_request", "req_id": 1, "openai_body": {}}])
-    with pytest.raises(RuntimeCancelled, match="cancelled"):
+    with pytest.raises(RuntimeCancelled, match="cancelled") as raised:
         RunnerLink(ch, worker_fn=worker, should_cancel=lambda: cancelled).run(
             "t1", "x", _Env(), tools=_tools()
         )
 
     assert _sent(ch, "llm_response") == []
+    assert raised.value.worker_usage is not None
+    assert raised.value.worker_usage.input_tokens == 17
+    assert raised.value.worker_usage.output_tokens == 5
+    assert raised.value.worker_usage.calls == 1
 
 
 def test_wall_deadline_during_worker_call_suppresses_the_llm_response(

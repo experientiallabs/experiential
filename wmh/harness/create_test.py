@@ -1343,6 +1343,53 @@ def test_runtime_cancellation_aborts_the_wave_without_judging_and_closes_pool(
     assert raised.value.sandbox_usage == SandboxUsage(count=0, seconds=0.0)
 
 
+def test_cancellation_carries_completed_and_partial_wave_worker_usage(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """The public cancellation result owns all worker spend without a partial CreateResult."""
+    from wmh.harness.runtime import RuntimeCancelled, TokenUsage
+
+    seed = _pi_seed()
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    evaluate_calls = 0
+
+    def cancel_second_wave(*args: object, **kwargs: object) -> ClosedLoopReport:
+        nonlocal evaluate_calls
+        del args
+        evaluate_calls += 1
+        if evaluate_calls == 1:
+            k = kwargs.get("k", 3)
+            assert isinstance(k, int)
+            return _canned_report(0.5, k=k).model_copy(
+                update={"worker_usage": TokenUsage(input_tokens=100, output_tokens=10, calls=2)}
+            )
+        raise RuntimeCancelled(
+            "runtime episode cancelled",
+            worker_usage=TokenUsage(input_tokens=7, output_tokens=2, calls=1),
+        )
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", cancel_second_wave)
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled") as raised:
+        create_harness(
+            "winner",
+            seed,
+            _tasks(),
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            iterations=1,
+            harness_backend="e2b",
+        )
+
+    assert evaluate_calls == 2
+    assert raised.value.worker_usage == TokenUsage(input_tokens=107, output_tokens=12, calls=3)
+    assert raised.value.sandbox_usage == SandboxUsage(count=0, seconds=0.0)
+    [pool] = fake_pool_cls.instances
+    assert pool.closes == 1
+
+
 def test_e2b_pool_retires_idle_runners_once_per_proposal_batch(
     monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
 ) -> None:

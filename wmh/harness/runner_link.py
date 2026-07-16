@@ -289,23 +289,23 @@ class RunnerLink:
             max_env_actions=self._max_env_actions,
         )
         episode_id = uuid.uuid4().hex
-        self._check_cancelled()
+        usage = TokenUsage()
+        self._check_cancelled(usage)
         deadline = (
             time.monotonic() + self._episode_timeout_s
             if self._episode_timeout_s is not None
             else None
         )
-        usage = TokenUsage()
 
         def send_frame(frame: JsonObject) -> RunResult | None:
             try:
                 self._channel.send(frame)
             except Exception:
-                self._check_cancelled()
+                self._check_cancelled(usage)
                 if deadline is not None and time.monotonic() >= deadline:
                     return self._budget_result(task_id, episode, instruction, usage)
                 raise
-            self._check_cancelled()
+            self._check_cancelled(usage)
             if deadline is not None and time.monotonic() >= deadline:
                 return self._budget_result(task_id, episode, instruction, usage)
             return None
@@ -329,7 +329,7 @@ class RunnerLink:
         if stopped is not None:
             return stopped
         while True:
-            self._check_cancelled()
+            self._check_cancelled(usage)
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return self._budget_result(task_id, episode, instruction, usage)
@@ -343,18 +343,18 @@ class RunnerLink:
             try:
                 frame = self._channel.recv(timeout=recv_timeout)
             except TimeoutError:
-                self._check_cancelled()
+                self._check_cancelled(usage)
                 if deadline is not None and time.monotonic() >= deadline:
                     return self._budget_result(task_id, episode, instruction, usage)
                 if self._should_cancel is not None:
                     continue
                 raise
             except Exception:
-                self._check_cancelled()
+                self._check_cancelled(usage)
                 if deadline is not None and time.monotonic() >= deadline:
                     return self._budget_result(task_id, episode, instruction, usage)
                 raise
-            self._check_cancelled()
+            self._check_cancelled(usage)
             if deadline is not None and time.monotonic() >= deadline:
                 return self._budget_result(task_id, episode, instruction, usage)
             if frame is None:  # channel closed before the episode finished
@@ -364,7 +364,7 @@ class RunnerLink:
             kind = frame.get("type")
             if kind == "llm_request":
                 response = self._llm_response(episode_id, frame, usage)
-                self._check_cancelled()
+                self._check_cancelled(usage)
                 if deadline is not None and time.monotonic() >= deadline:
                     return self._budget_result(task_id, episode, instruction, usage)
                 # A send timeout is transport failure with an uncertain delivery state. Let it
@@ -379,7 +379,7 @@ class RunnerLink:
                     name if isinstance(name, str) else "",
                     args if isinstance(args, dict) else {},
                 )
-                self._check_cancelled()
+                self._check_cancelled(usage)
                 if deadline is not None and time.monotonic() >= deadline:
                     return self._budget_result(task_id, episode, instruction, usage)
                 stopped = send_frame(
@@ -414,9 +414,12 @@ class RunnerLink:
                 )
             # unknown frame types are ignored (forward-compatible)
 
-    def _check_cancelled(self) -> None:
+    def _check_cancelled(self, usage: TokenUsage) -> None:
         if self._should_cancel is not None and self._should_cancel():
-            raise RuntimeCancelled("runtime episode cancelled")
+            raise RuntimeCancelled(
+                "runtime episode cancelled",
+                worker_usage=(usage.model_copy() if usage.calls else None),
+            )
 
     def _budget_result(
         self,

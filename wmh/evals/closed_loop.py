@@ -156,31 +156,38 @@ def evaluate_with_env(
     per_task: dict[str, TaskOutcome] = {}
     usages: list[TokenUsage | None] = []
     if concurrency != 0 and concurrency <= 1:
-        for task in tasks:
-            verdicts: list[GoldVerdict] = []
-            attempts: list[RolloutEvidence] = []
-            for attempt in range(k):
-                _check_cancelled(should_cancel)
-                result = _run_once(task, make_env, runtime)
-                usages.append(result.worker_usage)
-                attempts.append(_rollout_evidence(result))
-                _check_cancelled(should_cancel)
-                verdict = judge.score(
-                    task.instruction, result.answer, result.transcript(), task.gold
+        try:
+            for task in tasks:
+                verdicts: list[GoldVerdict] = []
+                attempts: list[RolloutEvidence] = []
+                for attempt in range(k):
+                    _check_cancelled(should_cancel)
+                    result = _run_once(task, make_env, runtime)
+                    # Record the episode before the next cancellation boundary. If
+                    # cancellation landed during the bounded worker call, RunnerLink
+                    # raises with that episode's partial usage instead.
+                    usages.append(result.worker_usage)
+                    attempts.append(_rollout_evidence(result))
+                    _check_cancelled(should_cancel)
+                    verdict = judge.score(
+                        task.instruction, result.answer, result.transcript(), task.gold
+                    )
+                    _check_cancelled(should_cancel)
+                    verdicts.append(verdict)
+                    if on_progress is not None:
+                        on_progress(task.task_id, attempt + 1, verdict)
+                successes = [1.0 if v.passed else 0.0 for v in verdicts]
+                per_task[task.task_id] = TaskOutcome(
+                    task_id=task.task_id,
+                    success_rate=fmean(successes),
+                    mean_fraction=fmean(v.fraction for v in verdicts),
+                    passes=k,
+                    verdicts=verdicts,
+                    attempts=attempts,
                 )
-                _check_cancelled(should_cancel)
-                verdicts.append(verdict)
-                if on_progress is not None:
-                    on_progress(task.task_id, attempt + 1, verdict)
-            successes = [1.0 if v.passed else 0.0 for v in verdicts]
-            per_task[task.task_id] = TaskOutcome(
-                task_id=task.task_id,
-                success_rate=fmean(successes),
-                mean_fraction=fmean(v.fraction for v in verdicts),
-                passes=k,
-                verdicts=verdicts,
-                attempts=attempts,
-            )
+        except RuntimeCancelled as error:
+            error.worker_usage = combine_usage([*usages, error.worker_usage])
+            raise
     else:
         by_cell, usages, evidence_by_cell = _run_cells_concurrently(
             tasks,
@@ -370,9 +377,15 @@ def _run_cells_concurrently(
     ) -> tuple[GoldVerdict, TokenUsage | None, RolloutEvidence]:
         _check_cancelled(should_cancel)
         result = _run_once(task, make_env, runtime)
-        _check_cancelled(should_cancel)
-        verdict = judge.score(task.instruction, result.answer, result.transcript(), task.gold)
-        _check_cancelled(should_cancel)
+        try:
+            _check_cancelled(should_cancel)
+            verdict = judge.score(task.instruction, result.answer, result.transcript(), task.gold)
+            _check_cancelled(should_cancel)
+        except RuntimeCancelled as error:
+            # The rollout finished before cancellation, even though its verdict
+            # did not. Preserve that worker spend for the coordinator's drain.
+            error.worker_usage = combine_usage([result.worker_usage, error.worker_usage])
+            raise
         return verdict, result.worker_usage, _rollout_evidence(result)
 
     pool = ThreadPoolExecutor(max_workers=max_workers)
@@ -420,10 +433,33 @@ def _run_cells_concurrently(
                 abort_error = candidate
             else:
                 abort_error = None
+        cancelled_error: RuntimeCancelled | None = None
+        if cancelled:
+            # Every started future is done after shutdown(wait=True). Collect
+            # successful episode usage and partial usage carried by cancelled
+            # episodes exactly once, including futures the coordinator had not
+            # observed before the cancellation boundary.
+            partial_usages: list[TokenUsage | None] = []
+            for future in futures:
+                if future.cancelled():
+                    continue
+                try:
+                    _verdict, usage, _evidence = future.result()
+                except RuntimeCancelled as candidate:
+                    partial_usages.append(candidate.worker_usage)
+                except BaseException:  # noqa: BLE001 - original error remains authoritative
+                    continue
+                else:
+                    partial_usages.append(usage)
+            if isinstance(error, RuntimeCancelled):
+                cancelled_error = error
+            else:
+                cancelled_error = RuntimeCancelled("runtime evaluation cancelled")
+            cancelled_error.worker_usage = combine_usage(partial_usages)
         if abort_error is not None:
-            raise abort_error from error
-        if cancelled and not isinstance(error, RuntimeCancelled):
-            raise RuntimeCancelled("runtime evaluation cancelled") from error
+            raise abort_error from (cancelled_error or error)
+        if cancelled_error is not None and cancelled_error is not error:
+            raise cancelled_error from error
         raise
     else:
         pool.shutdown(wait=True)

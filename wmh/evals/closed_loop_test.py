@@ -22,7 +22,7 @@ from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.e2b_sandbox import SandboxCleanupError
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runtime import RunResult, RuntimeCancelled, StopReason
+from wmh.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
@@ -609,10 +609,14 @@ def test_rollout_cancellation_drains_already_started_cells() -> None:
                     task_id=task_id,
                     stop_reason=StopReason.SUBMITTED,
                     answer="pass",
+                    worker_usage=TokenUsage(input_tokens=11, output_tokens=3, calls=1),
                 )
             blocker_started.wait(timeout=30)
             cancellation_raised.set()
-            raise RuntimeCancelled("cancelled")
+            raise RuntimeCancelled(
+                "cancelled",
+                worker_usage=TokenUsage(input_tokens=7, output_tokens=2, calls=1),
+            )
 
     def evaluate() -> None:
         try:
@@ -643,6 +647,11 @@ def test_rollout_cancellation_drains_already_started_cells() -> None:
         assert late_finished.is_set()
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeCancelled)
+        usage = errors[0].worker_usage
+        assert usage is not None
+        assert usage.input_tokens == 18
+        assert usage.output_tokens == 5
+        assert usage.calls == 2
     finally:
         release.set()
         worker.join(timeout=5)

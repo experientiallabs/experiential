@@ -1256,6 +1256,10 @@ class E2BPiRuntime:
             raise RuntimeCancelled("runtime episode cancelled")
         try:
             return self._run_episode(task_id, instruction, environment)
+        except RuntimeCancelled:
+            # RunnerLink owns the episode's authoritative partial worker meter.
+            # Preserve it instead of replacing the cancellation at this wrapper.
+            raise
         except Exception as exc:
             if self._cancel_requested():
                 raise RuntimeCancelled("runtime episode cancelled") from exc

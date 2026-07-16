@@ -61,18 +61,22 @@ _NUDGE = (
 class HarnessSearchCancelled(RuntimeError):
     """The caller requested that an optimizer search stop before its next costly phase.
 
-    ``sandbox_usage`` is populated by ``create_harness`` after its evaluator
-    pool has been closed, so a caller can persist already-incurred E2B spend
-    even though cancellation intentionally produces no partial search result.
+    ``worker_usage`` aggregates every completed score wave plus the partial
+    wave interrupted by cancellation. ``sandbox_usage`` is populated by
+    ``create_harness`` after its evaluator pool has been closed. Together they
+    let a caller persist already-incurred runtime spend even though
+    cancellation intentionally produces no partial search result.
     """
 
     def __init__(
         self,
         message: str = "harness search cancelled",
         *,
+        worker_usage: TokenUsage | None = None,
         sandbox_usage: SandboxUsage | None = None,
     ) -> None:
         super().__init__(message)
+        self.worker_usage = worker_usage
         self.sandbox_usage = sandbox_usage
 
 
@@ -82,8 +86,19 @@ class RuntimeCancelled(RuntimeError):
     This is deliberately distinct from a normal ``RunResult`` stop reason: evaluation must not
     send cancelled cells to a judge, and transport owners must not retry them as infrastructure
     failures. Runtimes that cannot interrupt an active provider call raise this immediately after
-    that bounded call returns.
+    that bounded call returns. Self-metering runtimes attach the worker tokens
+    incurred before that boundary so an owning evaluator can aggregate them
+    while it drains sibling episodes.
     """
+
+    def __init__(
+        self,
+        message: str = "runtime episode cancelled",
+        *,
+        worker_usage: TokenUsage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.worker_usage = worker_usage
 
 
 @runtime_checkable
