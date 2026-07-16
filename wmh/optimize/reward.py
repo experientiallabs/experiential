@@ -73,7 +73,7 @@ class EpisodeRewardJudge:
         `steps` is the episode in order (e.g. `EpisodeResult.steps` from `run_episode`, or a served
         session's history). An empty rollout scores 0 without calling the LLM.
 
-        `rubric` — the scenario's success criteria (e.g. real tau2's gold `evaluation_criteria`) —
+        `rubric`: the scenario's success criteria (e.g. real tau2's gold `evaluation_criteria`),
         anchors the verdict: without it the judge infers success conditions from the task text
         alone, and that interpretation varies run to run (D65 source 2: the same pinned-world
         rollout judged 0.75 and 0.0 across sessions on a date-semantics reading). The rubric names

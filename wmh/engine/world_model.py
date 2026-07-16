@@ -110,7 +110,7 @@ class WorldModel:
         defaults to the offline `HashingEmbedder` so loading needs no embedding credentials.
         `reward_provider` backs `score_session` (defaults to `provider`) — pass it to judge with a
         different model than the one simulating the environment. `top_k` overrides the artifact's
-        pinned retrieval depth (0 disables retrieval demos entirely — a "no-RAG" ablation serve)
+        pinned retrieval depth (0 disables retrieval demos entirely, a "no-RAG" ablation serve)
         and beats any `max_fidelity` winner.
 
         A plain load runs pure RAG unless agentic flags were set explicitly at build

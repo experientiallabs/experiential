@@ -6,11 +6,11 @@ environment?
 
 **Setup.** One REINFORCE++ n=4 group-baseline smoke (1 epoch × the 58-scenario informative
 curriculum, same seed and scenario order, identical env substrate (the nominal temp-0
-pin is inert on Bedrock-Anthropic request paths — identical across cells either way,
+pin is inert on Bedrock-Anthropic request paths; identical across cells either way,
 so cross-cell comparability holds), reward judge pinned to
 Haiku 4.5) per training-WM backend; the resulting checkpoint (uniform rule: the last
-pre-collapse drain) is evaluated on the **real tau2 benchmark** — real gym, real LLM
-user-simulator, real grader — over the 20 pinned held-out tasks × 2 trials, paired
+pre-collapse drain) is evaluated on the **real tau2 benchmark** (real gym, real LLM
+user-simulator, real grader) over the 20 pinned held-out tasks × 2 trials, paired
 per-episode against the base model (90.0% success). X = each backend's D12 reconstruction
 fidelity (rubric judge pinned to Opus 4.8, sampled-5 turns, 1319 held-out steps).
 
@@ -33,7 +33,7 @@ fidelity (rubric judge pinned to Opus 4.8, sampled-5 turns, 1319 held-out steps)
 2. **Fidelity is not free: higher-fidelity environments destabilize training at fixed
    hyperparameters.** Both high-fidelity backends collapsed into a no-tool-call policy at
    ~episode 90 (three independent replications) under the exact settings where both
-   low-fidelity backends ran healthy full epochs — harsher grading produces denser
+   low-fidelity backends ran healthy full epochs: harsher grading produces denser
    negative advantages, shrinking the collapse step-budget below one epoch. The
    collapsed-checkpoint row (−0.793) shows the cliff is total. Practical rule: drain
    checkpoints early and select the last pre-collapse drain.

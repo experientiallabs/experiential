@@ -6,16 +6,16 @@ benchmark?
 
 **Setup.** Same base Qwen3.5-9B, two training recipes, two evaluation channels:
 
-- **WM-trained** — REINFORCE++ n=4 group-baseline against the terminal world model on the
+- **WM-trained**: REINFORCE++ n=4 group-baseline against the terminal world model on the
   D62/D65/D66 reward substrate (seeded case facts pinning the imagined world; the nominal
-  temp-0 env pin was later found inert on the Bedrock-Anthropic request path — seeding is
+  temp-0 env pin was later found inert on the Bedrock-Anthropic request path; seeding is
   the operative variance fix), 412 episodes, checkpoint = last pre-decline drain
   (`drain-0075`).
-- **Offline SFT** — LoRA on 228 recorded demonstration episodes from the terminal corpus
+- **Offline SFT**: LoRA on 228 recorded demonstration episodes from the terminal corpus
   (D26 leakage rule: any train trace whose task appears in the pinned eval set is dropped).
-- **In-WM channel** — seeded sonnet-era WM eval (Bedrock Sonnet 5 env + Opus 4.8 judge)
+- **In-WM channel**: seeded sonnet-era WM eval (Bedrock Sonnet 5 env + Opus 4.8 judge)
   over the 28 pinned eval scenarios × 2 rollouts.
-- **Real channel** — `packages/environment-capture/terminal-tasks/rl/terminal_real_eval.py`:
+- **Real channel**: `packages/environment-capture/terminal-tasks/rl/terminal_real_eval.py`:
   a real docker container per episode, Opus 4.8 judge, same pinned scenarios.
 
 Both arms are paired per-episode against the *same* base row within each channel; eras and
@@ -32,7 +32,7 @@ channels never compare in absolutes (base = 0.757 mean reward in-WM seeded, 0.86
 paired** (−0.042 vs −0.163 against the same base row, same harness). The SFT arm's
 real-env collapse (3W/30L on the paired episodes) is the demonstration-style transplant
 failing on the 9B at temperature 1.0, while the WM-trained arm stays within noise of base.
-The in-WM channel ranks the two arms the same way (+0.019 vs −0.008) — the sonnet-era
+The in-WM channel ranks the two arms the same way (+0.019 vs −0.008): the sonnet-era
 seeded WM eval predicted the real-env ordering.
 
 **Significance caveat (applies to every row of this size).** With n≈50 paired episodes and

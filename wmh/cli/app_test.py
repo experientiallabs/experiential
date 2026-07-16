@@ -438,7 +438,7 @@ def test_eval_pinned_judge_builds_its_own_provider(monkeypatch, tmp_path) -> Non
 
     monkeypatch.setattr(providers_pkg, "get_provider", recording_get_provider)
     # the serve model rides the chain seam; with no chain file it passes through to
-    # get_provider — record that construction too.
+    # get_provider, so record that construction too.
     monkeypatch.setattr(waterfall_mod, "get_provider", recording_get_provider)
     result = runner.invoke(
         app,

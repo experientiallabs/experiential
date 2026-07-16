@@ -109,7 +109,7 @@ class BedrockProvider:
             # `tcp_keepalive` guards the other stall mode: a keep-alive connection the LB
             # silently dropped during an idle gap. Without it, the next call on that socket
             # hangs until read_timeout (observed as ~10-minute stalls on the FIRST call after
-            # idle — turn-1 WM steps, sparse judge calls); with it, the OS detects the dead
+            # idle: turn-1 WM steps, sparse judge calls); with it, the OS detects the dead
             # peer and the call fails fast into the failover chain.
             client_config = Config(
                 connect_timeout=15,
