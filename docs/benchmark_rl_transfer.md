@@ -1,8 +1,16 @@
 # BENCH-B: RL transfer — training agents inside a world model (DRAFT — consolidation skeleton)
 
-> Status: DRAFT. v1 + improvement-sprint rows are final; cross-benchmark and fidelity-curve
-> rows land under the re-pinned eval env (D71) and get appended here. All WM-side rows to
-> date are "GPT-5.5-era" (see §Eval eras).
+> Status: DRAFT, post-audit (D91). The scoreboard is data-complete across all four benchmarks
+> and survived a pre-declared rigor pass that materially revised it: val-split confirmation
+> showed in-WM eval-split deltas do not replicate on uncontaminated tasks (both trained arms
+> below base); kimi's GRPO "+13.7" was withdrawn after the full pinned-set rerun (paired
+> −0.079); swe's "capability floor" was reworded to a format confound (the action-interface
+> gap's third strike). Post-audit program answer: NO real-environment improvement beyond noise
+> at 9B/smoke scale from any method; on-policy WM training is deployment-safe while offline
+> SFT can be deployment-harmful (terminal −16.3, RFT2 −77.5); frontier-demo imitation dominates
+> in-WM where demos exist (collusion caveat unresolved); and in-WM evaluation REQUIRES
+> untouched confirmation sets — protocol iteration inflates deltas (the program's own val test
+> caught it). Final tables live on PRs #73/#78 boards; this doc consolidates when they merge.
 
 ## The question (Kion, 2026-07-01)
 
