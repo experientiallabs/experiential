@@ -300,6 +300,7 @@ def test_merge_results_rejects_incomparable_results() -> None:
         val_frac: float = 0.15,
         top_k: int = 5,
         seed: int = 0,
+        embed_dim: int = 512,
         model: str = "GPT-5.5",
     ) -> GridResult:
         return GridResult(
@@ -312,6 +313,7 @@ def test_merge_results_rejects_incomparable_results() -> None:
             top_k=top_k,
             seed=seed,
             sample_turns="all",
+            embed_dim=embed_dim,
             cells=[_cell(model, "base", 0.6)],
         )
 
@@ -331,6 +333,9 @@ def test_merge_results_rejects_incomparable_results() -> None:
         merge_results([_r(), _r(seed=1)])
     with pytest.raises(ValueError, match="top_k"):
         merge_results([_r(), _r(top_k=8)])
+    # RAG phi dimensionality drift puts base_rag/gepa_rag cells on a different retrieval scale.
+    with pytest.raises(ValueError, match="embed_dim"):
+        merge_results([_r(), _r(embed_dim=256)])
     # Identical comparability fields -> merges fine.
     merged = merge_results([_r(), _r(model="Qwen")])
     assert [c.model_label for c in merged.cells] == ["GPT-5.5", "Qwen"]

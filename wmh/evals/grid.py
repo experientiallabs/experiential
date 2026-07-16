@@ -132,6 +132,12 @@ class GridResult(BaseModel):
     top_k: int
     seed: int
     sample_turns: str
+    # Retrieval phi dimensionality (`base_rag`/`gepa_rag` cells) and any dry-run holdout cap. Both
+    # change what/how cells are scored, so they are comparability fields (see `merge_results`):
+    # merging RAG cells built at different embed_dim, or a capped dry-run with a full run, would put
+    # incomparable fidelities in one chart.
+    embed_dim: int = 0
+    max_holdout_traces: int | None = None
     total_test_steps: int = 0
     total_test_traces: int = 0
     cells: list[GridCell] = Field(default_factory=list)
@@ -165,6 +171,8 @@ def merge_results(results: list[GridResult]) -> GridResult:
         "top_k",
         "seed",
         "sample_turns",
+        "embed_dim",
+        "max_holdout_traces",
     )
     for field in comparability_fields:
         values = {getattr(r, field) for r in results}
@@ -183,6 +191,8 @@ def merge_results(results: list[GridResult]) -> GridResult:
         top_k=head.top_k,
         seed=head.seed,
         sample_turns=head.sample_turns,
+        embed_dim=head.embed_dim,
+        max_holdout_traces=head.max_holdout_traces,
         total_test_steps=max(r.total_test_steps for r in results),
         total_test_traces=max(r.total_test_traces for r in results),
     )
@@ -306,6 +316,8 @@ def run_grid(
         top_k=top_k,
         seed=seed,
         sample_turns=sample_turns,
+        embed_dim=embed_dim,
+        max_holdout_traces=max_holdout_traces,
     )
     paths = [Path(f) for f in files]
 
