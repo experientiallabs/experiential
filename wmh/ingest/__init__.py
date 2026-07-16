@@ -4,7 +4,7 @@ A `TraceAdapter` turns one source's telemetry into the generic `Trace` schema. A
 themselves on import and are looked up by name (`get_adapter`) or listed (`list_adapters`). The
 span-based adapters share one normalizer (`wmh.ingest.normalize`) and the `BaseTraceAdapter`
 scaffolding, so adding a new source is transport + attribute-mapping, not a rewrite. See
-`docs/ingest.md`.
+`docs/reference/ingest.md`.
 
 Bundled adapters:
   - `otel-genai`  : OTLP-JSON spans following the OTel GenAI semantic conventions (file or pull).

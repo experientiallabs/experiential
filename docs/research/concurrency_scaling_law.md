@@ -68,9 +68,9 @@ terminal-tasks with **Claude Haiku 4.5** as the world model, across **3 seeds** 
 sign: tau-bench stays real-faster (differential ~0.14–0.28 across `W`, all seeds) and terminal-tasks
 stays world-faster (~2.7–7.8× mean differential across `W`). Magnitudes track per-call latency — Haiku's
 per-step call is not gpt-5.4-mini's — but the crossover (world model wins on expensive-standup envs,
-loses on the cheap in-process one) holds across **both world models and all seeds**. The per-seed Haiku
-reports and cross-seed aggregates are committed under
-[`.agents/docs/research/concurrency_anthropic/`](../../.agents/docs/research/concurrency_anthropic/).
+loses on the cheap in-process one) holds across **both world models and all seeds**. The per-seed differentials quoted above are the
+record; the raw Haiku reports sat in `.agents/docs/research/concurrency_anthropic/` when this
+shipped (`.agents/` is disposable: nothing here depends on it surviving).
 
 ## Machine
 
@@ -111,10 +111,9 @@ exact run is not re-runnable and its raw report JSONs were lost with it. The com
 same model over **Azure OpenAI**, which reproduces the *setup* — but only **tau-bench and
 terminal-tasks were re-checked on Azure**, endpoint latency differs, and Docker build jitter affects
 the real side, so Azure reproduces the **directions and rough magnitudes, not the exact wall-clock**.
-The three headline reports — reconstructed from the published per-benchmark tables above, since the
-original OpenAI-Responses JSONs are gone — are committed for provenance under
-[`.agents/docs/research/concurrency_anthropic/`](../../.agents/docs/research/concurrency_anthropic/)
-(`gpt54_*.json`), next to the Claude Haiku 4.5 re-run.
+The per-benchmark tables above ARE the headline record. They were reconstructed into report JSONs
+(`gpt54_*.json`, next to the Haiku re-run) under `.agents/docs/research/concurrency_anthropic/` when
+this shipped, but this report is complete without them.
 
 ```bash
 export AZURE_OPENAI_API_KEY=... AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
@@ -139,6 +138,6 @@ uv run wmh research plot-concurrency-combined \
     --out-cost docs/research/concurrency_cost.png
 ```
 
-The per-benchmark report JSONs are git-ignored (regenerate with the commands above); the committed
-speed-up and cost figures are the reproducible artifact, and the reconstructed headline reports plus
-the Haiku re-run under `.agents/docs/research/concurrency_anthropic/` are the committed provenance.
+The per-benchmark report JSONs are git-ignored (regenerate with the commands above). The committed
+speed-up and cost figures are the reproducible artifact; the tables and per-seed differentials in
+this report are the provenance record, self-contained.

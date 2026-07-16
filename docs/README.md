@@ -32,3 +32,12 @@ file here must justify its existence in the table below; a doc that can't gets d
 | `reference/eval_suites.md` | The reproducibility contract every benchmark number in this repo rests on (`examples/<task>/evals/*.toml` + `wmh eval`); commands verified against `main` at promotion. |
 | `reference/failover.md` | The `.wmh/fallback.toml` failover contract: which calls ride the chain (world-model) and which never do (the judge), plus the cross-account ladder format; verified live against both AWS accounts. |
 | `reference/eval_grid.md` | `wmh eval grid` - the model × condition fidelity grid (base/+RAG/+GEPA/+GEPA+RAG across models, one pinned judge, target-side cost); commands + judge version self-contained; fresh results land in `.wmh/evals/grid/`. |
+| `reference/closed_loop.md` | The other half of eval: `wmh eval --mode closed-loop` runs a live agent against the world model and scores task success (gold-judged) instead of per-step fidelity; the contract `wmh/evals/closed_loop.py` and `agreement.py` implement. |
+| `reference/ingest.md` | The ingestion contract behind `wmh build --source`: one pluggable `TraceAdapter` seam that turns traces from any observability stack (or plain chat logs) into the harness trace format; hub page for the per-source adapter references below. |
+| `reference/ingest.braintrust.md` | Braintrust adapter reference: span-rows grouped by `root_span_id`, re-emitted as OTel-GenAI for the shared normalizer; export shape + field mapping. |
+| `reference/ingest.langfuse.md` | Langfuse adapter reference: flat observation lists re-emitted as OTel-GenAI; export shape + field mapping. |
+| `reference/ingest.langsmith.md` | LangSmith adapter reference: run trees re-emitted as OTel-GenAI; export shape + field mapping. |
+| `reference/ingest.mastra.md` | Mastra adapter reference: AI-tracing `ExportedSpan` records mapped into OTel-GenAI; export shape + field mapping. |
+| `reference/ingest.phoenix.md` | Arize Phoenix adapter reference: OpenInference spans normalized via the shared OpenInference classifier; export shape + field mapping. |
+| `reference/ingest.posthog.md` | PostHog adapter reference: `$ai_*` analytics events mapped into OTel-GenAI; export shape + field mapping. |
+| `reference/harness_delta.md` | The `HarnessDelta` interface `wmh harness create` mutates through: the typed, precondition-guarded update representation that defines the meta-agent's search space; the contract `wmh/harness/` implements. |

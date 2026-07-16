@@ -27,9 +27,11 @@ uv run pytest -q
 
 ## Writing
 
-- No em dashes in any writing: code, comments, docstrings, docs, UI copy, commit messages, or PR
-  descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
-  restructure the sentence.
+- No em dashes in any NEW writing: code, comments, docstrings, docs, UI copy, commit messages, or
+  PR descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
+  restructure the sentence. The rule is enforced on diffs: pre-existing occurrences (including in
+  this file) are grandfathered and cleaned opportunistically when a line is edited anyway, not in
+  bulk sweeps.
 
 ## Rules
 
@@ -57,7 +59,9 @@ uv run pytest -q
    add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
    `wmh/repo_layout_test.py` enforces this. What each surface is for:
    - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
-     (completed research writeups + the one figure each renders) and `docs/reference/` (how-to
+     (completed research writeups + the figures they render: one per writeup by default, and
+     every figure beyond the first needs its own justification row in `docs/README.md`) and
+     `docs/reference/` (how-to
      references verified against main). Nothing else: raw result JSONs, vector sources, design
      notes, drafts, and proposals all live in `.agents/docs/`. `docs/README.md` indexes every
      doc with its justification — a doc that can't justify its existence gets deleted. Nothing
@@ -180,7 +184,12 @@ Rules of the road:
   their public, published APIs. Members must be installable and usable standalone. Consuming a
   member takes BOTH halves: declare it in `[project.dependencies]` (so installs outside the
   workspace resolve it) AND rely on `[tool.uv.sources]` for in-workspace source resolution —
-  the sources entry alone wires nothing.
+  the sources entry alone wires nothing. Carve-out: the no-wmh-import rule binds the member's
+  PUBLISHED source tree (what `[tool.hatch.build]`/`include` ships in the wheel). Local research
+  and capture scripts inside per-benchmark data dirs (e.g.
+  `packages/environment-capture/tau-bench/rl/`) may import `wmh`: they are workspace tooling
+  that happens to live next to the data it operates on, they never ship, and the member must
+  stay installable without them.
 - **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
   `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
   `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in
