@@ -228,3 +228,17 @@ def test_apply_patch_to_snapshot_keeps_conflicted_paths_at_their_base(tmp_path: 
 
     assert advanced.files["same.txt"] == base.files["same.txt"]
     assert advanced.files["other.txt"] != base.files["other.txt"]
+
+
+def test_sync_never_conflicts_a_path_that_converged(tmp_path: Path) -> None:
+    """Local and remote agreeing is synchronization, even for a protected path."""
+    (tmp_path / "same.txt").write_text("B", encoding="utf-8")
+    initial = snapshot_workspace(tmp_path)
+    (tmp_path / "same.txt").write_text("A", encoding="utf-8")
+    final = _archive({"same.txt": (b"A", 0o644)})
+
+    result = sync_workspace(tmp_path, initial, final, protected_paths=frozenset({"same.txt"}))
+
+    assert result.conflicts == ()
+    assert result.applied == ()
+    assert (tmp_path / "same.txt").read_text(encoding="utf-8") == "A"

@@ -39,6 +39,7 @@ from wmh.cli.session_state import (
 from wmh.cli.workspace_sync import (
     WorkspaceSnapshot,
     WorkspaceSyncError,
+    advance_snapshot_paths,
     apply_patch_to_snapshot,
     apply_workspace_patch,
     snapshot_from_archive,
@@ -152,9 +153,13 @@ class LiveWorkspace:
             paths = ", ".join(new_conflicts)
             _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
         if result.conflicts:
-            # A conflicted path was rejected by E2B, so ``current`` cannot become
-            # the synchronized base. Keep the prior base and conservatively retry
-            # accepted sibling paths until the conflict is reconciled at teardown.
+            # A conflicted path was rejected by E2B, so ``current`` cannot
+            # become the synchronized base for it; accepted sibling paths did
+            # land, so they advance individually.
+            if result.applied:
+                self.synchronized = advance_snapshot_paths(
+                    self.synchronized, current, result.applied
+                )
             return False
         self.synchronized = current
         return True

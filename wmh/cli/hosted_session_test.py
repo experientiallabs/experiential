@@ -853,3 +853,104 @@ def test_try_push_local_tolerates_a_workspace_that_is_not_ready(tmp_path: Path) 
     )
     with pytest.raises(PlatformError):
         failing.try_push_local()
+
+
+def test_contested_path_survives_push_rejection_catchup_and_finalize(tmp_path: Path) -> None:
+    """The full disputed ordering, end to end: a both-sides-edited file is never lost.
+
+    Composes the pieces the ordering debate touched: a detached checkpoint with
+    X at base content B, a local edit to U while detached, and a pending hosted
+    patch moving the same X from B to A. The send flow pushes first (rejected
+    with a content conflict), catch-up applies the patch (local conflict, file
+    kept), and the end flow's finalize preserves U locally, saves A in the
+    recovery archive, and signals the conflict with exit code 2.
+    """
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("B", encoding="utf-8")
+    base = snapshot_workspace(root)
+    store = _store_with_session(tmp_path, workspace_root=root, base_archive=base.archive)
+    patch = build_workspace_patch(base.archive, _archive({"answer.txt": b"A"}))
+    assert patch is not None
+    (root / "answer.txt").write_text("U", encoding="utf-8")
+
+    send_client = _FakeClient()
+    send_client.session_states = [_session(workspace_sync=True)]
+    send_client.upload_result = WorkspacePatchResult(applied=[], conflicts=["answer.txt"])
+    send_client.patches["patch-1"] = patch
+    send_client.pages = [
+        _page([_event(1, "workspace_patch", revision="patch-1")], 1, "running"),
+        _page([], 1, "running"),
+        _page(
+            [_event(2, "user_message", text="hi"), _event(3, "state", status="idle")],
+            3,
+            "running",
+        ),
+    ]
+
+    _command_driver(send_client, store, action="send", text="hi").run()
+
+    # The rejected push ran before the patch download (the disputed ordering).
+    assert send_client.calls.index("upload_patch") < send_client.calls.index("patch:patch-1")
+    assert send_client.patch_acks == ["patch-1"]
+    # The local edit is untouched, recorded as a conflict, and the base kept B.
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "U"
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.workspace is not None
+    assert state.workspace.conflicts == ("answer.txt",)
+    checkpoint = snapshot_from_archive(store.load_base_archive(state))
+    assert checkpoint.files["answer.txt"] == base.files["answer.txt"]
+
+    end_client = _FakeClient()
+    end_client.session_states = [
+        _session(workspace_sync=True),
+        _session("ended", workspace_sync=True),
+    ]
+    end_client.upload_result = WorkspacePatchResult(applied=[], conflicts=["answer.txt"])
+    end_client.final_archive = _archive({"answer.txt": b"A"})
+    end_client.pages = [
+        _page([], 3, "running"),
+        _page([], 3, "ended"),
+    ]
+
+    with pytest.raises(typer.Exit) as raised:
+        _command_driver(end_client, store, action="end").run()
+
+    assert raised.value.exit_code == 2
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "U"
+    recovery = root / ".wmh-conflicts" / "sess-1.tar.gz"
+    assert recovery.is_file()
+    with tarfile.open(recovery) as archive:
+        member = archive.extractfile("answer.txt")
+        assert member is not None
+        assert member.read() == b"A"
+    assert end_client.final_acked
+    assert store.load("sess-1") is None
+
+
+def test_partially_conflicted_push_advances_accepted_sibling_paths(tmp_path: Path) -> None:
+    """Accepted siblings of a rejected path advance the base; only the conflict stays.
+
+    Keeping the whole base stale would re-push the accepted paths later against
+    a base the sandbox has moved past, manufacturing conflicts if they change
+    again locally.
+    """
+    (tmp_path / "answer.txt").write_text("B", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("O", encoding="utf-8")
+    base = snapshot_workspace(tmp_path)
+    (tmp_path / "answer.txt").write_text("U", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("O2", encoding="utf-8")
+    client = _FakeClient()
+    client.upload_result = WorkspacePatchResult(applied=["other.txt"], conflicts=["answer.txt"])
+    workspace = mod.LiveWorkspace(
+        cast("mod.PlatformClient", client), "agent-1", "sess-1", tmp_path, base
+    )
+
+    changed = workspace.push_local()
+
+    assert not changed
+    assert workspace.conflicts == {"answer.txt"}
+    disk = snapshot_workspace(tmp_path)
+    assert workspace.synchronized.files["other.txt"] == disk.files["other.txt"]
+    assert workspace.synchronized.files["answer.txt"] == base.files["answer.txt"]

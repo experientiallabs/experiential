@@ -159,6 +159,26 @@ def apply_patch_to_snapshot(
     return _snapshot_from_files(files)
 
 
+def advance_snapshot_paths(
+    base: WorkspaceSnapshot, current: WorkspaceSnapshot, paths: Iterable[str]
+) -> WorkspaceSnapshot:
+    """Advance only ``paths`` of the base to their state in ``current``.
+
+    A partially-accepted upload moves the sandbox for the accepted paths only.
+    Advancing the whole base would hide the rejected paths' divergence, while
+    advancing nothing re-pushes the accepted paths against a stale base later,
+    which can manufacture conflicts if they change again locally in between.
+    """
+    files = _archive_files(base.archive)
+    replacements = _archive_files(current.archive)
+    for path in paths:
+        if path in replacements:
+            files[path] = replacements[path]
+        else:
+            files.pop(path, None)
+    return _snapshot_from_files(files)
+
+
 def _archive_files(content: bytes) -> dict[str, tuple[bytes, int]]:
     """Read a checkpoint archive's regular files as ``{path: (bytes, mode)}``."""
     if len(content) > MAX_WORKSPACE_ARCHIVE_BYTES:
@@ -252,14 +272,13 @@ def sync_workspace(
                 continue
             target = resolved / relative
             now = current.get(relative)
-            if (
-                relative in protected_paths
-                or _has_non_file_collision(target, now)
-                or (now != before and now != after)
-            ):
-                conflicts.append(relative)
-                continue
+            # Local and remote agreeing (content and mode) is synchronization,
+            # not a conflict, even for a path protected by an earlier live
+            # disagreement that has since reconverged.
             if now == after:
+                continue
+            if relative in protected_paths or _has_non_file_collision(target, now) or now != before:
+                conflicts.append(relative)
                 continue
             try:
                 if after is None:
