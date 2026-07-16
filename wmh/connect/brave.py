@@ -29,7 +29,7 @@ from wmh.connect.types import (
     transport_errors,
 )
 from wmh.core.types import JsonObject
-from wmh.engine.grounding import FetchFn, _http_get
+from wmh.engine.grounding import FetchFn, http_get
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class BraveConnector:
         transport: Injected httpx transport for the search API calls (tests pass
             `httpx.MockTransport`); None means the real network.
         fetch: The page-body fetcher; defaults to the grounding engine's SSRF-guarded
-            `_http_get` (http(s)-only, public addresses only, redirects re-checked). Tests
+            `http_get` (http(s)-only, public addresses only, redirects re-checked). Tests
             inject a plain function.
     """
 
@@ -149,7 +149,7 @@ class BraveConnector:
     def __init__(
         self,
         transport: httpx.BaseTransport | None = None,
-        fetch: FetchFn = _http_get,
+        fetch: FetchFn = http_get,
     ) -> None:
         self._transport = transport
         self._fetch = fetch

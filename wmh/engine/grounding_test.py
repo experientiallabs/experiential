@@ -260,7 +260,7 @@ def _bash(command: str) -> Action:
     return Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": command})
 
 
-def test_http_get_guard_rejects_non_http_schemes_and_private_hosts() -> None:
+def testhttp_get_guard_rejects_non_http_schemes_and_private_hosts() -> None:
     from wmh.engine.grounding import _assert_public_http_url
 
     with pytest.raises(ValueError, match="http"):

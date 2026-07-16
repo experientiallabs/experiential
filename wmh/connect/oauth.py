@@ -80,7 +80,7 @@ def pkce_challenge() -> tuple[str, str]:
     return verifier, challenge
 
 
-class _LoopbackServer(HTTPServer):
+class LoopbackServer(HTTPServer):
     """A single-use localhost server that captures the OAuth redirect."""
 
     def __init__(self) -> None:
@@ -94,7 +94,7 @@ class _LoopbackHandler(BaseHTTPRequestHandler):
     """Answers the provider redirect with a close-this-tab page; ignores stray requests."""
 
     def do_GET(self) -> None:
-        server = cast(_LoopbackServer, self.server)
+        server = cast(LoopbackServer, self.server)
         params = dict(parse_qsl(urlsplit(self.path).query))
         if not params:
             # Stray request (favicon and friends), not the callback: keep waiting.
@@ -114,7 +114,7 @@ class _LoopbackHandler(BaseHTTPRequestHandler):
         logger.debug("oauth loopback server: %s", format % args)
 
 
-def _serve_until(server: _LoopbackServer, deadline: float) -> None:
+def serve_until(server: LoopbackServer, deadline: float) -> None:
     """Handle requests until the callback arrives or the deadline passes."""
     while not server.received.is_set() and time.monotonic() < deadline:
         server.handle_request()
@@ -151,10 +151,10 @@ def run_loopback_flow(
     requested = list(scopes) if scopes is not None else list(app.scopes)
     verifier, challenge = pkce_challenge()
     state = secrets.token_urlsafe(16)
-    server = _LoopbackServer()
+    server = LoopbackServer()
     deadline = time.monotonic() + timeout
     thread = threading.Thread(
-        target=_serve_until, args=(server, deadline), name="wmh-oauth-loopback", daemon=True
+        target=serve_until, args=(server, deadline), name="wmh-oauth-loopback", daemon=True
     )
     port = int(server.server_address[1])
     redirect_uri = f"http://127.0.0.1:{port}/callback"

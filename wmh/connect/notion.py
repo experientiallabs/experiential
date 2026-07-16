@@ -35,7 +35,7 @@ from pydantic import ValidationError
 
 from wmh.connect.connector import ConnectUI, register_connector
 from wmh.connect.credentials import list_connected, save_connector_auth, token_env_var
-from wmh.connect.oauth import _LoopbackServer, _serve_until
+from wmh.connect.oauth import LoopbackServer, serve_until
 from wmh.connect.types import (
     ConnectError,
     ConnectorAuth,
@@ -280,7 +280,7 @@ async def _mcp_session(
 
 
 async def _authorize_and_identify(
-    ui: ConnectUI, server: _LoopbackServer, redirect_uri: str, timeout: float
+    ui: ConnectUI, server: LoopbackServer, redirect_uri: str, timeout: float
 ) -> str:
     """Drive the interactive MCP OAuth flow; returns the verify identity string."""
 
@@ -716,10 +716,10 @@ class NotionConnector:
 
     def _connect_mcp(self, ui: ConnectUI) -> ConnectorAuth:
         """Run the browser MCP OAuth flow against a single-use localhost redirect."""
-        server = _LoopbackServer()
+        server = LoopbackServer()
         deadline = time.monotonic() + _OAUTH_TIMEOUT_SECONDS
         thread = threading.Thread(
-            target=_serve_until, args=(server, deadline), name="wmh-notion-oauth", daemon=True
+            target=serve_until, args=(server, deadline), name="wmh-notion-oauth", daemon=True
         )
         port = int(server.server_address[1])
         redirect_uri = f"http://127.0.0.1:{port}/callback"

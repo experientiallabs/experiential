@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 
 from wmh.core.types import Action
-from wmh.engine.grounding import FetchFn, FileRead, SourceResolver, _http_get
+from wmh.engine.grounding import FetchFn, FileRead, SourceResolver, http_get
 
 # Files fetched per grep before degrading to the filename-list partial. Keeps a dir-wide grep
 # over a big repo from turning into hundreds of raw fetches.
@@ -107,7 +107,7 @@ class RepoTreeResolver:
         self,
         pins: dict[str, dict[str, str]],
         *,
-        fetch: FetchFn = _http_get,
+        fetch: FetchFn = http_get,
         grep_fetch_cap: int = _GREP_FETCH_CAP,
     ) -> None:
         self._pins = pins
