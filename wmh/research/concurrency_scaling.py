@@ -48,7 +48,7 @@ reconstruction cost (~ #steps × model latency).** Measured `--side both`, rando
   but a ~ms local DB lookup for real tau2, and there is no expensive standup to amortize, so the WM
   loses on any realistic trace. (It only "won" on the `simplest` 1-step cherry-pick.)
 
-See the cross-benchmark writeup + figure in `docs/research/concurrency_scaling_law.md`.
+See the cross-benchmark writeup + figure in `docs/research/world_model_findings.md`.
 """
 
 from __future__ import annotations

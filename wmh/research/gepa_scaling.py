@@ -24,9 +24,8 @@ Design choices specific to the GEPA axis:
 
 It is an `Ablation` like every other experiment: conditions = the (n_train, budget) grid, swept
 across seeds by `run_ablation`. Backends are factory-injected, so the unit test drives it with
-fakes and any live caller supplies real providers (the published sweeps used a workspace runner;
-`.agents/` contents are disposable - the reproduce commands in `docs/research/gepa_scaling_law.md`
-are the record).
+fakes and any live caller supplies real providers (the published sweeps used a disposable
+workspace runner; the reproduce pins in `docs/research/world_model_findings.md` are the record).
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 # Concurrency scaling law — provenance data
 
-Two things live here, both cited by `docs/research/concurrency_scaling_law.md`:
+Two things live here, both cited by `docs/research/world_model_findings.md`:
 
 1. **`gpt54_*.json`** — the three **headline** gpt-5.4-mini reports (tau/terminal/swe). The original
    run used the OpenAI Responses API; that account was deactivated and its raw JSON was lost, so these
