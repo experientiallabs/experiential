@@ -28,12 +28,14 @@ channels never compare in absolutes (base = 0.757 mean reward in-WM seeded, 0.86
 | WM-trained (R++ n=4, substrate) | +0.019 (n=47) | −0.042 (n=56) |
 | offline SFT (228 demonstrations) | −0.008 (n=53) | **−0.163** (n=56) |
 
-**Finding.** On-policy WM training beats offline SFT on the real environment by **+0.121
-paired** (−0.042 vs −0.163 against the same base row, same harness). The SFT arm's
-real-env collapse (3W/30L on the paired episodes) is the demonstration-style transplant
-failing on the 9B at temperature 1.0, while the WM-trained arm stays within noise of base.
-The in-WM channel ranks the two arms the same way (+0.019 vs −0.008): the sonnet-era
-seeded WM eval predicted the real-env ordering.
+**Finding.** On-policy WM training did not damage deployment behavior; offline SFT did.
+Both arms land at or below base on the real environment, so the honest claim is
+harm-avoidance, not a win: the WM-trained arm stays within noise of base (−0.042, 7W/9L),
+while offline SFT degrades real performance sharply (−0.163, 3W/30L: the
+demonstration-style transplant failing on the 9B at temperature 1.0). The paired gap
+between the two recipes is **+0.121** in favor of WM training. The in-WM channel ranks the
+two arms the same way (+0.019 vs −0.008): the sonnet-era seeded WM eval predicted the
+real-env ordering.
 
 **Significance caveat (applies to every row of this size).** With n≈50 paired episodes and
 most episodes tied, individual deltas of a few points are formally not significant; the
