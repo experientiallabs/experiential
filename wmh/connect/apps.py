@@ -1,10 +1,11 @@
-"""The shared OAuth app registry: embedded endpoint defaults + env-var credential overrides.
+"""The shared OAuth app registry: embedded endpoint defaults, env-var client credentials.
 
-Endpoint/scope configuration per provider is embedded here, along with the maintainer's
-registered client ids where they exist (client ids are public identifiers for native apps,
-RFC 8252; flows are secured by PKCE or the device grant, never by a shipped secret). `get_app`
-layers `WMH_<NAME>_CLIENT_ID` / `WMH_<NAME>_CLIENT_SECRET` env overrides over the embedded
-defaults, so users can always bring their own OAuth app.
+Endpoint configuration per provider is embedded here; client credentials never are. The repo
+policy is all-or-nothing: since some providers' credentials cannot ship (Google and Slack
+token exchanges demand a client secret), none do, and every OAuth connector requires its
+`WMH_<NAME>_CLIENT_ID` (plus `WMH_<NAME>_CLIENT_SECRET` where the provider demands one) when,
+and only when, that connector is used. `get_app` resolves the env credentials over the
+embedded endpoints. A planned hosted path will supply registered apps platform-side instead.
 """
 
 from __future__ import annotations
@@ -14,25 +15,23 @@ import os
 from wmh.connect.oauth import OAuthApp
 from wmh.connect.types import ConnectError
 
-# Full endpoint/scope config per provider; google/slack client ids stay empty until the
-# maintainer's registered apps are embedded (follow-up changes fill them in).
+# Full endpoint config per provider; client ids/secrets come from the env, never the repo.
 EMBEDDED_APPS: dict[str, OAuthApp] = {
     "github": OAuthApp(
         name="github",
-        # The experientiallabs "World Model Harness" GitHub App, device flow enabled.
-        # GitHub Apps carry their permissions (contents/issues/pull_requests) in the app
-        # registration, repo-scoped at install time, so no scopes are sent in the flow.
-        client_id="Iv23liPmRpghcoZECjRq",
+        # Expects a GitHub App client id ($WMH_GITHUB_CLIENT_ID): GitHub Apps carry their
+        # permissions in the app registration, repo-scoped at install time, so no scopes are
+        # sent in the flow, and the device grant needs no client secret.
+        client_id="",
         auth_url="https://github.com/login/oauth/authorize",
         token_url="https://github.com/login/oauth/access_token",
         device_url="https://github.com/login/device/code",
     ),
     "google": OAuthApp(
         name="google",
-        # Not embedded: Google's Desktop-client token exchange requires the client secret even
-        # with PKCE, and a secret never ships in the repo. The planned zero-setup path points
-        # token_url at a hosted stateless exchange holding the registered client's secret
-        # platform-side; until then Google is bring-your-own client via the env overrides.
+        # Google's Desktop-client token exchange requires the client secret even with PKCE
+        # ($WMH_GOOGLE_CLIENT_ID + $WMH_GOOGLE_CLIENT_SECRET). The planned zero-setup path
+        # points token_url at a hosted stateless exchange holding a secret platform-side.
         client_id="",
         auth_url="https://accounts.google.com/o/oauth2/v2/auth",
         token_url="https://oauth2.googleapis.com/token",

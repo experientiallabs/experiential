@@ -68,14 +68,13 @@ README into a context bundle.
 
 ### Setup
 
-None: the experientiallabs "World Model Harness" GitHub App ships embedded (device flow, no
-client secret involved), so `wmh connect github` works out of the box. Access is granted per
-repository: after connecting, pick the repositories the connection can reach at
-<https://github.com/apps/world-model-harness/installations/new>. The app's permissions are
-read and write on contents, issues, and pull requests (write powers upcoming agent features
-such as opening PRs; today's `context pull` only reads) plus read on metadata. To use your own
-GitHub App instead (Settings > Developer settings > GitHub Apps, with "Enable Device Flow"
-checked), override it:
+Bring your own GitHub App (no client credential ships in this repo; see Shared OAuth apps
+below). Register one at Settings > Developer settings > GitHub Apps: check **Enable Device
+Flow**, leave the webhook inactive, and grant the repository permissions you want the
+connector to have (read on contents/issues/pull requests/metadata covers `context pull`;
+add write to power agent features such as opening PRs). Access is repo-scoped: after
+connecting, install the app on the repositories it may reach (your app's **Install App**
+page). Then point the harness at it (a client id, no secret; the device grant needs none):
 
 ```bash
 export WMH_GITHUB_CLIENT_ID=<your GitHub App client id>
@@ -95,9 +94,9 @@ wmh connect github
 
 Runs the RFC 8628 device flow (permissions are fixed in the GitHub App, so no scopes are
 requested): open the printed URL, enter the code, and the credential lands in
-`~/.wmh/connectors.toml` with your GitHub login stamped as the account. The command then points
-at the app installation page: a token only reaches repositories where the app is installed, so
-pick those once and pulls work from then on (tokens expire after eight hours and refresh
+`~/.wmh/connectors.toml` with your GitHub login stamped as the account. The command then
+reminds you about installation: a token only reaches repositories where your app is installed,
+so pick those once and pulls work from then on (tokens expire after eight hours and refresh
 automatically).
 
 ### Pull
@@ -395,12 +394,11 @@ wmh context pull brave --query wmh --since 2026-06-01 --until 2026-07-01
 ## Shared OAuth apps
 
 OAuth endpoint and scope configuration per provider is embedded in `wmh/connect/apps.py`
-(`EMBEDDED_APPS`), together with the registered client ids where they exist: GitHub ships
-embedded today; Google (its token exchange demands a client secret, which never ships in the
-repo; a hosted exchange is planned) and Slack (app pending registration) need a
-bring-your-own client via environment overrides meanwhile. A client id is a public identifier
-for a native app (RFC 8252): flows are secured by PKCE or the device grant, and no client secret
-ever ships in the repo. Env overrides always win over whatever is embedded:
+(`EMBEDDED_APPS`); client credentials never are, ids included. The policy is all-or-nothing:
+Google's and Slack's token exchanges demand a client secret that must not be published, so no
+provider ships a credential, and each OAuth connector reads its client from the environment
+when, and only when, you use it. A planned hosted path supplies registered apps platform-side
+(the token exchange holding the secrets); until then, configure the connectors you use:
 
 ```bash
 export WMH_<NAME>_CLIENT_ID=...       # e.g. WMH_GITHUB_CLIENT_ID, WMH_GOOGLE_CLIENT_ID
@@ -412,13 +410,12 @@ treated as unset. The github/google/slack connectors resolve their app through t
 every call; Notion never needs one (MCP dynamic client registration), and Brave uses a plain
 API key, no OAuth app at all.
 
-### What the maintainer registers per provider
+### What gets registered per provider (for the hosted path, or your own)
 
 - **GitHub**: one GitHub App with **Enable Device Flow** checked, installable by **any
   account**, webhook inactive, repository permissions contents/issues/pull requests read and
   write plus metadata read (write powers the upcoming agent PR features; installation is
-  repo-scoped, so users control the blast radius). Only the client id is embedded; the device
-  flow needs no client secret, so nothing confidential ships.
+  repo-scoped, so users control the blast radius). The device flow needs no client secret.
 - **Google**: a Google Cloud project with the Calendar, Drive, and Gmail APIs enabled, plus an
   OAuth client. The consent screen must request exactly the three read-only scopes
   (`calendar.readonly`, `drive.readonly`, `gmail.readonly`). Note `gmail.readonly` and

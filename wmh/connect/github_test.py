@@ -128,7 +128,7 @@ def test_connect_runs_the_device_flow_and_stamps_the_account(
     assert auth.scopes == ["repo", "read:org"]
     assert auth.account == "octocat (The Octocat)"
     assert any("octocat" in message for message in infos)
-    assert any("installations/new" in message for message in infos)
+    assert any("Install App" in message for message in infos)
 
 
 def test_verify_returns_login_and_name() -> None:
