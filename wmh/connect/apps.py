@@ -19,12 +19,13 @@ from wmh.connect.types import ConnectError
 EMBEDDED_APPS: dict[str, OAuthApp] = {
     "github": OAuthApp(
         name="github",
-        # The experientiallabs "World Model Harness" OAuth app, device flow enabled.
-        client_id="Ov23liNGQogdOKumTflW",
+        # The experientiallabs "World Model Harness" GitHub App, device flow enabled.
+        # GitHub Apps carry their permissions (contents/issues/pull_requests) in the app
+        # registration, repo-scoped at install time, so no scopes are sent in the flow.
+        client_id="Iv23liPmRpghcoZECjRq",
         auth_url="https://github.com/login/oauth/authorize",
         token_url="https://github.com/login/oauth/access_token",
         device_url="https://github.com/login/device/code",
-        scopes=["repo", "read:org"],
     ),
     "google": OAuthApp(
         name="google",

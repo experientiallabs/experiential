@@ -24,12 +24,13 @@ def test_embedded_apps_define_endpoints_and_shippable_credentials_only() -> None
     assert EMBEDDED_APPS["slack"].client_id == ""
 
     github = EMBEDDED_APPS["github"]
-    # The registered experientiallabs OAuth app: device flow only, no secret involved.
-    assert github.client_id == "Ov23liNGQogdOKumTflW"
+    # The registered experientiallabs GitHub App: device flow only, no secret involved,
+    # permissions fixed in the app registration rather than requested as scopes.
+    assert github.client_id == "Iv23liPmRpghcoZECjRq"
     assert github.auth_url == "https://github.com/login/oauth/authorize"
     assert github.token_url == "https://github.com/login/oauth/access_token"
     assert github.device_url == "https://github.com/login/device/code"
-    assert github.scopes == ["repo", "read:org"]
+    assert github.scopes == []
 
     google = EMBEDDED_APPS["google"]
     assert google.auth_url == "https://accounts.google.com/o/oauth2/v2/auth"
@@ -50,7 +51,7 @@ def test_get_app_without_a_client_id_points_at_the_env_var() -> None:
 
 
 def test_get_app_github_resolves_from_the_embedded_registration() -> None:
-    assert get_app("github").client_id == "Ov23liNGQogdOKumTflW"
+    assert get_app("github").client_id == "Iv23liPmRpghcoZECjRq"
 
 
 def test_get_app_layers_env_overrides_over_embedded_defaults(

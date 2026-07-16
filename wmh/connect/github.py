@@ -43,6 +43,10 @@ _SOURCE = "github"
 
 _TARGET_RE = re.compile(r"^([^/\s]+)/([^/\s]+)$")
 
+# GitHub App tokens only reach repositories where the app is installed; users pick those
+# repos here after connecting (a PAT via $WMH_GITHUB_TOKEN needs no installation).
+APP_INSTALL_URL = "https://github.com/apps/world-model-harness/installations/new"
+
 
 def _parse_target(target: str | None) -> tuple[str, str]:
     """Split an "owner/repo" pull target, raising an actionable error on anything else."""
@@ -82,9 +86,10 @@ def _raise_for_response(response: httpx.Response, *, doing: str, repo: str | Non
         )
     if status == 404 and repo is not None:
         raise ConnectError(
-            f"github repository {repo!r} was not found during {doing} (HTTP 404): it either "
-            "does not exist or the connected account cannot see it; check the owner/repo "
-            "spelling, or re-run `wmh connect github` with an account that has access"
+            f"github repository {repo!r} was not found during {doing} (HTTP 404): it does not "
+            "exist, the connected account cannot see it, or the World Model Harness app is not "
+            f"installed on it; check the owner/repo spelling, install the app on the repo at "
+            f"{APP_INSTALL_URL}, or re-run `wmh connect github` with an account that has access"
         )
     raise ConnectError(
         f"github {doing} failed (HTTP {status}): {response.text[:200]}; "
@@ -196,6 +201,7 @@ class GitHubConnector:
         )
         account = self.verify(auth)
         ui.info(f"connected to GitHub as {account}")
+        ui.info(f"pick the repositories this connection can reach: {APP_INSTALL_URL}")
         return auth.model_copy(update={"account": account})
 
     def verify(self, auth: ConnectorAuth) -> str:

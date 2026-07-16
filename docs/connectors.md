@@ -68,15 +68,20 @@ README into a context bundle.
 
 ### Setup
 
-None: the experientiallabs OAuth app ships embedded (device flow, no client secret involved), so
-`wmh connect github` works out of the box. To use your own GitHub OAuth app instead (Settings >
-Developer settings > OAuth Apps, with "Enable Device Flow" checked), override it:
+None: the experientiallabs "World Model Harness" GitHub App ships embedded (device flow, no
+client secret involved), so `wmh connect github` works out of the box. Access is granted per
+repository: after connecting, pick the repositories the connection can reach at
+<https://github.com/apps/world-model-harness/installations/new>. The app's permissions are
+read and write on contents, issues, and pull requests (write powers upcoming agent features
+such as opening PRs; today's `context pull` only reads) plus read on metadata. To use your own
+GitHub App instead (Settings > Developer settings > GitHub Apps, with "Enable Device Flow"
+checked), override it:
 
 ```bash
-export WMH_GITHUB_CLIENT_ID=<your OAuth app client id>
+export WMH_GITHUB_CLIENT_ID=<your GitHub App client id>
 ```
 
-Alternatively, skip OAuth entirely with a personal access token:
+Alternatively, skip the app entirely with a personal access token:
 
 ```bash
 export WMH_GITHUB_TOKEN=ghp_...   # classic PAT with repo scope, or a fine-grained token with repo read access
@@ -88,9 +93,12 @@ export WMH_GITHUB_TOKEN=ghp_...   # classic PAT with repo scope, or a fine-grain
 wmh connect github
 ```
 
-Runs the RFC 8628 device flow (scopes `repo read:org`): open the printed URL, enter the code,
-and the credential lands in `~/.wmh/connectors.toml` with your GitHub login stamped as the
-account.
+Runs the RFC 8628 device flow (permissions are fixed in the GitHub App, so no scopes are
+requested): open the printed URL, enter the code, and the credential lands in
+`~/.wmh/connectors.toml` with your GitHub login stamped as the account. The command then points
+at the app installation page: a token only reaches repositories where the app is installed, so
+pick those once and pulls work from then on (tokens expire after eight hours and refresh
+automatically).
 
 ### Pull
 
@@ -402,8 +410,11 @@ API key, no OAuth app at all.
 
 ### What the maintainer registers per provider
 
-- **GitHub**: one OAuth App (not a GitHub App) with **Enable Device Flow** checked. Only the
-  client id is embedded; the device flow needs no client secret, so nothing confidential ships.
+- **GitHub**: one GitHub App with **Enable Device Flow** checked, installable by **any
+  account**, webhook inactive, repository permissions contents/issues/pull requests read and
+  write plus metadata read (write powers the upcoming agent PR features; installation is
+  repo-scoped, so users control the blast radius). Only the client id is embedded; the device
+  flow needs no client secret, so nothing confidential ships.
 - **Google**: a Google Cloud project with the Calendar, Drive, and Gmail APIs enabled, plus an
   OAuth client. The consent screen must request exactly the three read-only scopes
   (`calendar.readonly`, `drive.readonly`, `gmail.readonly`). Note `gmail.readonly` and
