@@ -1054,99 +1054,14 @@ def test_agent_file_tools_reject_paths_outside_the_project() -> None:
         assert "escapes project workspace" in outcome.content
 
 
-def test_project_bash_is_bounded_without_rescanning_the_whole_project() -> None:
-    """Bash stays in E2B and does not add one file-read RPC per growing context artifact."""
-    sandbox = _Sandbox()
-    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
-    project.write_text("old.txt", "remove me")
-
-    class _BashCommands(_Commands):
-        def __init__(self) -> None:
-            super().__init__()
-            self.timeouts: list[object] = []
-
-        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
-            del background
-            self.runs.append(cmd)
-            self.timeouts.append(kwargs.get("timeout"))
-            assert cmd.startswith("cd /home/user/project && bash -lc ")
-            assert "generate-output" in cmd
-            assert "timeout --kill-after=3s 50s" in cmd
-            assert "node -e" in cmd
-            sandbox.files.values.pop("/home/user/project/old.txt")
-            sandbox.files.values["/home/user/project/generated.txt"] = "generated"
-            return _Output(stdout="x" * 20_000, stderr="warning")
-
-    commands = _BashCommands()
-    sandbox.commands = commands
-    emitted: list[tuple[str, str]] = []
-
-    outcome = project._execute_tool(
-        "bash",
-        {"command": "generate-output"},
-        lambda stream, data: emitted.append((stream, data)),
-    )
-
-    assert len(commands.runs) == 1
-    assert commands.timeouts == [60.0]
-    assert outcome.is_error is False
-    assert outcome.truncated is False
-    assert "13000 characters truncated by Bash boundary" in outcome.content
-    assert emitted[0][0] == "stdout"
-    assert len(emitted[0][1]) < 7_100
-    assert emitted[1] == ("stderr", "warning")
-    # Host-mediated files remain the recovery authority. A Bash-created scratch file is readable
-    # in the live sandbox and becomes mirrored only if the agent explicitly reads it.
-    assert project._file_contents == {"old.txt": "remove me"}  # noqa: SLF001
-    assert project.read_text("generated.txt") == "generated"
-
-
-def test_project_bash_surfaces_nonzero_exit_without_a_project_rescan() -> None:
-    """E2B command exceptions retain streams and status without O(project files) reads."""
-
-    class _CommandError(RuntimeError):
-        stdout = "partial output"
-        stderr = "command failed"
-        exit_code = 7
-
-    sandbox = _Sandbox()
-    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
-
-    class _FailingCommands(_Commands):
-        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
-            del background, kwargs
-            self.runs.append(cmd)
-            sandbox.files.values["/home/user/project/partial.txt"] = "kept"
-            raise _CommandError("non-zero")
-
-    commands = _FailingCommands()
-    sandbox.commands = commands
-    emitted: list[tuple[str, str]] = []
-
-    outcome = project._execute_tool(
-        "bash", {"command": "fail"}, lambda stream, data: emitted.append((stream, data))
-    )
-
-    assert outcome.is_error is True
-    assert outcome.content == "partial outputcommand failed\n[exit 7]"
-    assert emitted == [("stdout", "partial output"), ("stderr", "command failed")]
-    assert all(not cmd.startswith("find ") for cmd in commands.runs)
-    assert project.read_text("partial.txt") == "kept"
-
-
-def test_host_guard_preserves_the_sandbox_stream_omission_count() -> None:
-    content = "a" * 3_500 + "\n... 13000 bytes truncated in sandbox ...\n" + "z" * 3_500
-
-    assert project_module._bounded_bash_stream(content) == content  # noqa: SLF001
-
-
-def test_project_rejects_agents_with_uncontained_tools() -> None:
+@pytest.mark.parametrize("tool", ["bash", "read_skill"])
+def test_project_rejects_agents_with_uncontained_tools(tool: str) -> None:
     """The project still rejects capabilities outside its isolated tool allowlist."""
     base = meta_agent()
     uncontained = HarnessDoc(
         name="uncontained",
         surfaces=[
-            surface.model_copy(update={"content": "read_skill\nsubmit"})
+            surface.model_copy(update={"content": f"{tool}\nsubmit"})
             if surface.id == TOOL_POLICY_ID
             else surface
             for surface in base.surfaces
@@ -1154,5 +1069,5 @@ def test_project_rejects_agents_with_uncontained_tools() -> None:
     )
     project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
 
-    with pytest.raises(ValueError, match="uncontained tools: read_skill"):
+    with pytest.raises(ValueError, match=f"uncontained tools: {tool}"):
         project.run(uncontained, _Provider(), "escape", timeout=1)

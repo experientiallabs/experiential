@@ -30,11 +30,8 @@ from wmh.providers.base import ToolCallingProvider
 
 PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
-_BASH_TIMEOUT_S = 60.0
-_BASH_PROCESS_TIMEOUT_S = 50
-_BASH_STREAM_CAP = 7_000
 _OUTPUT_CAP = 16_000
-_PROJECT_TOOLS = frozenset({"bash", "read_file", "write_file", "submit"})
+_PROJECT_TOOLS = frozenset({"read_file", "write_file", "submit"})
 _RECOVERABLE_SESSION_MARKERS = (
     "server disconnected",
     "connection reset",
@@ -51,40 +48,6 @@ _RECOVERABLE_SESSION_MARKERS = (
     "live session runner did not become ready",
     "channel send failed",
 )
-
-_BASH_FILTER_SCRIPT = f"""\
-const cap = {_BASH_STREAM_CAP};
-const half = Math.floor(cap / 2);
-let small = Buffer.alloc(0);
-let head = Buffer.alloc(0);
-let tail = Buffer.alloc(0);
-let total = 0;
-let truncated = false;
-process.stdin.on("data", (chunk) => {{
-  total += chunk.length;
-  if (!truncated) {{
-    small = Buffer.concat([small, chunk]);
-    if (small.length > cap) {{
-      truncated = true;
-      head = small.subarray(0, half);
-      tail = small.subarray(small.length - half);
-      small = Buffer.alloc(0);
-    }}
-  }} else {{
-    tail = Buffer.concat([tail, chunk]);
-    if (tail.length > half) tail = tail.subarray(tail.length - half);
-  }}
-}});
-process.stdin.on("end", () => {{
-  if (truncated) {{
-    process.stdout.write(head);
-    process.stdout.write(`\\n... ${{total - cap}} bytes truncated in sandbox ...\\n`);
-    process.stdout.write(tail);
-  }} else {{
-    process.stdout.write(small);
-  }}
-}});
-"""
 
 
 class ChannelFactory(Protocol):
@@ -576,59 +539,14 @@ class AgentProject:
         _handle, started_at = self._live_sandboxes.pop(id(sandbox))
         self._retired_sandbox_seconds += max(0.0, retired_at - started_at)
 
-    def _run_bash(self, command: str, emit: Callable[[str, str], None]) -> ToolOutcome:
-        """Run one bounded command in the networkless E2B project.
-
-        Durable outputs use ``write_file`` and are mirrored synchronously. Bash is for search and
-        disposable prototypes; scanning and re-reading the entire growing project after every
-        grep would turn one agent turn into hundreds of E2B control-plane requests. The rare
-        sandbox replacement replays only this bounded authoritative mirror.
-        """
-        # Bound the streams *inside* the sandbox before the E2B SDK buffers them. Keeping a
-        # second host-side bound below protects the event channel if an older template lacks the
-        # wrapper contract or an SDK exception carries its own streams.
-        # Node is guaranteed by the pi project template; do not assume Python exists there.
-        filter_command = f"node -e {shlex.quote(_BASH_FILTER_SCRIPT)}"
-        script = (
-            "set -o pipefail\n"
-            f"timeout --kill-after=3s {_BASH_PROCESS_TIMEOUT_S}s "
-            f"bash -lc {shlex.quote(command)} "
-            f"2> >({filter_command} >&2) | {filter_command}\n"
-            "status=${PIPESTATUS[0]}\n"
-            'exit "$status"'
-        )
-        wrapped = f"cd {shlex.quote(self.workspace)} && bash -lc {shlex.quote(script)}"
-        try:
-            result = self._sandbox.commands.run(
-                wrapped,
-                timeout=_BASH_TIMEOUT_S,
-            )
-            stdout = _bounded_bash_stream(str(getattr(result, "stdout", "") or ""))
-            stderr = _bounded_bash_stream(str(getattr(result, "stderr", "") or ""))
-            exit_code = int(getattr(result, "exit_code", 0) or 0)
-        except Exception as error:  # noqa: BLE001 - E2B reports non-zero exits as exceptions
-            stdout = _bounded_bash_stream(str(getattr(error, "stdout", "") or ""))
-            stderr = _bounded_bash_stream(str(getattr(error, "stderr", "") or str(error)))
-            exit_code = int(getattr(error, "exit_code", 1) or 1)
-
-        if stdout:
-            emit("stdout", stdout)
-        if stderr:
-            emit("stderr", stderr)
-        body = stdout + stderr
-        if exit_code != 0:
-            body = f"{body}\n[exit {exit_code}]"
-        return _capped(body, is_error=exit_code != 0)
-
     def _execute_tool(
         self,
         name: str,
         arguments: JsonObject,
         emit: Callable[[str, str], None],
     ) -> ToolOutcome:
+        del emit  # Project file tools return one bounded observation; they do not stream output.
         try:
-            if name == "bash":
-                return self._run_bash(str(arguments.get("command", "")), emit)
             if name == "read_file":
                 path = self._tool_path(str(arguments.get("path", "")))
                 relative = self._relative_path(path)
@@ -708,22 +626,6 @@ def _usage_delta(after: TokenUsage, before: TokenUsage) -> TokenUsage:
         input_tokens=after.input_tokens - before.input_tokens,
         output_tokens=after.output_tokens - before.output_tokens,
         calls=after.calls - before.calls,
-    )
-
-
-def _bounded_bash_stream(content: str) -> str:
-    """Keep both ends of one Bash stream within the live-session event budget."""
-    # The in-sandbox filter adds a small truthful omission marker outside its payload budget.
-    # Preserve that marker; the guard below is for unwrapped/SDK exception streams.
-    if len(content) <= _BASH_STREAM_CAP or (
-        len(content) <= _BASH_STREAM_CAP + 512 and "bytes truncated in sandbox" in content
-    ):
-        return content
-    half = _BASH_STREAM_CAP // 2
-    omitted = len(content) - _BASH_STREAM_CAP
-    return (
-        f"{content[:half]}\n... {omitted} characters truncated by Bash boundary ...\n"
-        f"{content[-half:]}"
     )
 
 

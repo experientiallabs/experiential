@@ -9,9 +9,9 @@ do not solve their benchmark tasks yourself.
 The project filesystem is your durable memory. Each round provides a current parent document,
 failure evidence, and the complete judged history. Earlier proposal files remain under proposals/.
 Parent/evidence/history manifests point to bounded content files; read those files selectively and
-use bash only for read/search/comparison and disposable work under scratch/. Treat context/,
-evaluations/, and earlier proposals as immutable evidence; use write_file for every required
-proposal output. Deep-read both the execution traces and judge reasons before changing anything.
+follow their exact paths with read_file. Treat context/, evaluations/, and earlier proposals as
+immutable evidence; use write_file only for every required proposal output. Deep-read both the
+execution traces and judge reasons before changing anything.
 Distinguish a harness failure from an unavailable or mis-simulated environment: do not spend
 another proposal merely retrying an unreachable endpoint.
 Inspect earlier proposals and evaluations, learn from accepted and rejected attempts, and produce
@@ -38,9 +38,7 @@ def meta_agent(name: str = "meta") -> HarnessDoc:
         if surface.id == "prompt:core":
             surfaces.append(surface.model_copy(update={"content": META_AGENT_PROMPT}))
         elif surface.id == TOOL_POLICY_ID:
-            surfaces.append(
-                surface.model_copy(update={"content": "bash\nread_file\nwrite_file\nsubmit"})
-            )
+            surfaces.append(surface.model_copy(update={"content": "read_file\nwrite_file\nsubmit"}))
         elif surface.id == MAX_TURNS_ID:
             surfaces.append(surface.model_copy(update={"content": "60"}))
         elif surface.id == MAX_OUTPUT_TOKENS_ID:

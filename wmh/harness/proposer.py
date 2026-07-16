@@ -558,7 +558,7 @@ Read:
 - parent manifest: {absolute_context}/parent.json
   - follow surface_index_manifest to find every independently readable surface manifest
   - each surface manifest lists ordered content_files; concatenate them to inspect exact content
-  - pathful code is also mirrored under source_root with exact source_file paths for shell search
+  - pathful code is also mirrored under source_root with exact source_file paths for direct reads
 - failure evidence manifest: {absolute_context}/evidence.json
   - read its content_files in listed order and concatenate them exactly
 - judged history manifest: {absolute_context}/history.json
