@@ -200,3 +200,22 @@ think-in-content lifts both rows ~20pts (base 68.6%→90.0%). Consequences:
 
 Lesson recorded: before running any cross-chat-comparable row, grep DECISIONS.md for the
 harness's pinned serving config — the protocol lives there, not in the harness's --help.
+
+### Real-env row OF RECORD (v2, pinned D70 config — supersedes the tables above)
+
+`b3_grpo0020_v2`: same harness/scenarios/user-sim, vLLM served per the pinned config
+(no reasoning parser, think-in-content). n=40, zero errors. Raw:
+`.agents/docs/research/real_tau_eval_results/real_tau_grpo0020_v2_b3.jsonl`.
+
+| arm | real success | airline (n=14) | retail (n=16) | telecom (n=10) |
+|---|---|---|---|---|
+| base (B2, row of record) | 0.900 | 13/14 | 13/16 | 10/10 |
+| **GRPO smoke ckpt (in-WM 0.658)** | **0.900** | 12/14 | 14/16 | 10/10 |
+
+**Real Δ = 0.000 (paired per-scenario +0.000, 2W-2L of 20).** The tau in-WM +10 does
+not transfer to the real environment — and does not hurt either. This closes tau's
+scoreboard line: **trained ✓ / in-WM +10 (gpt-5.5 era, n=79, replicated) / real Δ 0.000.**
+Consistent with the cross-env compression already documented (opus/azure eras ≈ base)
+and with B2's R++ real row (+0.025): at smoke scale, WM-trained tau checkpoints are
+real-env-neutral. The first-pass −0.300 row above stands only as provenance for the
+config lesson (D70 pinned config; ~30pts of artifact from one serving flag).
