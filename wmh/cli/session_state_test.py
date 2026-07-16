@@ -181,3 +181,37 @@ def test_symlinked_state_file_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(SessionStateError, match="symlink"):
         store.save(_state())
+
+
+def test_atomic_write_cleanup_preserves_the_original_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt racing os.replace must not be masked by the temp-file cleanup."""
+    import wmh.cli.session_state as session_state_module
+
+    real_replace = session_state_module.os.replace
+
+    def replace_then_interrupt(src: str, dst: str) -> None:
+        real_replace(src, dst)
+        raise KeyboardInterrupt
+
+    store = SessionStateStore(tmp_path)
+    monkeypatch.setattr(session_state_module.os, "replace", replace_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        store.save(_state())
+
+
+def test_state_directories_are_created_owner_only_at_every_level(tmp_path: Path) -> None:
+    """Every directory level the store creates is 0700 from the start."""
+    pre_existing = tmp_path / "home"
+    pre_existing.mkdir(mode=0o755)
+    directory = pre_existing / ".wmh" / "sessions"
+    store = SessionStateStore(directory)
+
+    store.save(_state())
+
+    assert stat.S_IMODE((pre_existing / ".wmh").stat().st_mode) == 0o700
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    # A directory the store did not create keeps its owner-chosen mode.
+    assert stat.S_IMODE(pre_existing.stat().st_mode) == 0o755

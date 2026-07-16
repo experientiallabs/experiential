@@ -17,6 +17,7 @@ intact instead of a dangling pointer.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -182,9 +183,25 @@ class SessionStateStore:
     # -- internals ---------------------------------------------------------------------------
 
     def _ensure_directory(self) -> None:
-        """Create the state directory and keep it owner-only."""
-        self._directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(self._directory, 0o700)
+        """Create every missing directory level owner-only from the start.
+
+        ``mkdir(parents=True)`` would create intermediate levels with the
+        umask default, leaving a window (and, for ``~/.wmh``, a permanent
+        0755) around checkpoint archives that contain the user's source
+        tree. A umask can only narrow 0o700, so creating each level with
+        that mode closes the race; pre-existing directories are left alone.
+        """
+        missing: list[Path] = []
+        current = self._directory
+        while not current.exists():
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        for directory in reversed(missing):
+            with contextlib.suppress(FileExistsError):
+                directory.mkdir(mode=0o700)
 
     def _state_path(self, session_id: str) -> Path:
         return self._directory / f"{session_id}.json"
@@ -219,5 +236,8 @@ class SessionStateStore:
                 handle.write(content)
             os.replace(tmp_name, path)
         except BaseException:
-            os.unlink(tmp_name)
+            # The replace may already have consumed the temp file; a missing
+            # file must not mask the original exception (e.g. an interrupt).
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
             raise
