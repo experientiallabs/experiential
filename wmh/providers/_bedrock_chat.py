@@ -13,6 +13,7 @@ def converse_request(request: ChatRequest, model: str) -> dict[str, object]:
     """Translate the provider-neutral structured contract to Bedrock Converse."""
     system: list[dict[str, str]] = []
     messages: list[dict[str, object]] = []
+    has_tool_history = False
 
     def push(role: str, content: list[dict[str, object]]) -> None:
         if messages and messages[-1]["role"] == role:
@@ -28,6 +29,7 @@ def converse_request(request: ChatRequest, model: str) -> dict[str, object]:
                 system.append({"text": text})
             continue
         if message.role == "tool":
+            has_tool_history = True
             push(
                 "user",
                 [
@@ -45,6 +47,7 @@ def converse_request(request: ChatRequest, model: str) -> dict[str, object]:
         if text:
             blocks.append({"text": text})
         for tool_call in message.tool_calls or []:
+            has_tool_history = True
             try:
                 arguments = json.loads(tool_call.function.arguments)
             except ValueError:
@@ -91,7 +94,10 @@ def converse_request(request: ChatRequest, model: str) -> dict[str, object]:
             function = choice.get("function")
             if isinstance(function, dict) and isinstance(function.get("name"), str):
                 tool_config["toolChoice"] = {"tool": {"name": function["name"]}}
-        if choice != "none":
+        if choice != "none" or has_tool_history:
+            # Converse requires toolConfig whenever replayed history contains
+            # toolUse/toolResult blocks. Bedrock has no exact "none" choice, so
+            # retain the available tools in auto mode for those follow-up turns.
             result["toolConfig"] = tool_config
     return result
 

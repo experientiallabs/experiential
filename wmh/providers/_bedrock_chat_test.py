@@ -80,6 +80,74 @@ def test_converse_round_trip_preserves_tools_results_and_usage() -> None:
     assert response.token_usage().input_tokens == 42
 
 
+def test_converse_omits_tools_for_initial_none_choice() -> None:
+    request = ChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "answer without tools"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "run a command",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            "tool_choice": "none",
+        }
+    )
+
+    wire = converse_request(request, "model-id")
+
+    assert "toolConfig" not in wire
+
+
+def test_converse_retains_tools_for_none_choice_with_tool_history() -> None:
+    request = ChatRequest.model_validate(
+        {
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "a.txt"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "run a command",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            "tool_choice": "none",
+        }
+    )
+
+    wire = converse_request(request, "model-id")
+
+    tool_config = wire["toolConfig"]
+    assert isinstance(tool_config, dict)
+    tool_config_data = cast("dict[str, object]", tool_config)
+    assert "toolChoice" not in tool_config_data
+    assert cast("list[dict[str, object]]", tool_config_data["tools"])[0]["toolSpec"] == {
+        "name": "bash",
+        "description": "run a command",
+        "inputSchema": {"json": {"type": "object"}},
+    }
+
+
 @pytest.mark.parametrize("stop_reason", ["content_filtered", "guardrail_intervened"])
 def test_converse_response_preserves_filtered_stops(stop_reason: str) -> None:
     """Blocked Bedrock turns cannot look like successful assistant stops."""
