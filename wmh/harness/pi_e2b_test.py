@@ -52,6 +52,7 @@ from wmh.harness.pi_e2b import (
     start_live_runner,
 )
 from wmh.harness.runtime import Runtime, RuntimeCancelled, StopReason
+from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY, ToolSpec
 
 _Event = tuple[str | None, str | None, str | None]
@@ -483,6 +484,8 @@ def _runtime(
     worker_fn: Callable[[ChatRequest], ChatResponse] | None = None,
     max_turns: int = 20,
     max_output_tokens: int = 4096,
+    temperature: float = 0.7,
+    skills: SkillLibrary | None = None,
     episode_timeout_s: float = 300.0,
     should_cancel: Callable[[], bool] | None = None,
 ) -> E2BPiRuntime:
@@ -496,6 +499,8 @@ def _runtime(
         worker_fn=worker_fn,
         max_turns=max_turns,
         max_output_tokens=max_output_tokens,
+        temperature=temperature,
+        skills=skills,
         episode_timeout_s=episode_timeout_s,
         should_cancel=should_cancel,
     )
@@ -1035,6 +1040,7 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
             worker_fn=worker,
             max_turns=7,
             max_output_tokens=16384,
+            temperature=0.35,
         ).run("t1", "do it", env)
 
     assert result.stop_reason is StopReason.SUBMITTED
@@ -1057,14 +1063,55 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
     assert start["files"] == {"src/agent.ts": "// a"}
     assert start["max_turns"] == 7
     assert start["max_output_tokens"] == 16384
+    assert start["temperature"] == 0.35
     assert start["episode_timeout_s"] == 300.0
     tool_names = {t["name"] for t in cast("list[JsonObject]", start["tools"])}
     assert tool_names >= {"bash", "submit"}
     llm = _of_kind(fake, "llm_response")[0]
     assert llm["req_id"] == 1 and llm["completion"] == completion.wire_payload()
     assert [request.messages[0].content for request in worker_calls] == ["hi"]
+    assert [request.temperature for request in worker_calls] == [0.35]
     tool = _of_kind(fake, "tool_response")[0]
     assert tool["req_id"] == 2 and tool["content"] == "wm says ok" and tool["is_error"] is False
+
+
+def test_skill_bodies_are_advertised_and_served_host_side_in_e2b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "read_skill",
+            "arguments": {"name": "count-words"},
+        },
+        {
+            "type": "tool_request",
+            "req_id": 2,
+            "name": "read_skill",
+            "arguments": {"name": "missing"},
+        },
+        {"type": "done", "answer": "finished"},
+    ]
+    factory, made = _factory_for([script])
+    env = _RecordingEnv()
+    skills = SkillLibrary(
+        [Skill(name="count-words", description="count words", body="wc -w <path>")]
+    )
+
+    with E2BSandboxPool(sandbox_factory=factory) as pool:
+        result = _runtime(pool=pool, skills=skills).run("t1", "do it", env)
+
+    start = _of_kind(made[0], "episode_start")[0]
+    assert "read_skill" in {tool["name"] for tool in cast("list[JsonObject]", start["tools"])}
+    responses = _of_kind(made[0], "tool_response")
+    assert responses[0]["content"] == "wc -w <path>" and responses[0]["is_error"] is False
+    assert responses[1]["content"] == "no skill named 'missing'"
+    assert responses[1]["is_error"] is True
+    assert [step.action.name for step in result.steps] == ["read_skill", "read_skill"]
+    assert env.actions == []
 
 
 def test_two_runtimes_sharing_a_pool_reuse_warm_sandboxes(

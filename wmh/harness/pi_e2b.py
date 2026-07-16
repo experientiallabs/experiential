@@ -60,6 +60,7 @@ from wmh.harness.runtime import (
     RuntimeCancelled,
     StopReason,
 )
+from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import ToolSpec
 from wmh.providers.base import ToolCallingProvider
 
@@ -1220,6 +1221,8 @@ class E2BPiRuntime:
         hello_timeout: float = HELLO_TIMEOUT_S,
         max_turns: int = DEFAULT_MAX_TURNS,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        temperature: float = 0.7,
+        skills: SkillLibrary | None = None,
         episode_timeout_s: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         should_cancel: Callable[[], bool] | None = None,
     ) -> None:
@@ -1227,6 +1230,8 @@ class E2BPiRuntime:
             raise ValueError("max_turns must be >= 1")
         if max_output_tokens < 1:
             raise ValueError("max_output_tokens must be >= 1")
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be in [0, 2]")
         if episode_timeout_s <= 0:
             raise ValueError("episode_timeout_s must be positive")
         self._provider = provider
@@ -1236,6 +1241,8 @@ class E2BPiRuntime:
         self._worker_fn = worker_fn  # test seam, exactly like RunnerLink's
         self._max_turns = max_turns
         self._max_output_tokens = max_output_tokens
+        self._temperature = temperature
+        self._skills = skills if skills is not None else SkillLibrary()
         self._episode_timeout_s = episode_timeout_s
         self._should_cancel = should_cancel
         self._aborted = threading.Event()
@@ -1277,6 +1284,8 @@ class E2BPiRuntime:
                 system_prompt=self._system_prompt,
                 max_turns=self._max_turns,
                 max_output_tokens=self._max_output_tokens,
+                temperature=self._temperature,
+                skills=self._skills,
                 episode_timeout_s=self._episode_timeout_s,
                 should_cancel=self._cancel_requested,
             )

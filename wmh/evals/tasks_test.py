@@ -38,3 +38,16 @@ def test_load_tasks_duplicate_ids_raise(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="duplicate task_id"):
         load_tasks(path)
+
+
+def test_task_text_is_canonicalized_before_evaluation_and_persistence() -> None:
+    task = TaskSpec(
+        task_id="before\x00after",
+        instruction="before\ud800after",
+        gold=["before\udcffafter", "emoji \ud83d\ude00"],
+    )
+
+    replacement = "\N{REPLACEMENT CHARACTER}"
+    assert task.task_id == f"before{replacement}after"
+    assert task.instruction == f"before{replacement}after"
+    assert task.gold == [f"before{replacement}after", "emoji 😀"]

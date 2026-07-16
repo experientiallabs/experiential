@@ -29,12 +29,13 @@ from wmh.harness.create import (
     PoolEntry,
     cluster_failures,
     create_harness,
+    select_failure_cluster,
     select_parent,
 )
-from wmh.harness.delta import GateRecord, HarnessDelta
+from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
-from wmh.harness.proposer import ProviderDeltaProposer
+from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runtime import Runtime
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
@@ -430,6 +431,90 @@ def test_cluster_failures_empty_when_everything_passes() -> None:
     assert cluster_failures(report, [TaskSpec(task_id="t1", instruction="i")]) == []
 
 
+def test_select_failure_cluster_rotates_equally_sized_failures() -> None:
+    clusters = [
+        FailureSignature(mechanism=mechanism, task_ids=[f"t-{mechanism}"])
+        for mechanism in ("a", "b", "c")
+    ]
+    counts: dict[tuple[str, str, tuple[str, ...]], int] = {}
+    selected: list[str] = []
+    for _ in range(4):
+        cluster = select_failure_cluster(clusters, counts, parent_doc_hash="parent")
+        selected.append(cluster.mechanism)
+        key = ("parent", cluster.mechanism, tuple(cluster.task_ids))
+        counts[key] = counts.get(key, 0) + 1
+
+    assert selected == ["a", "b", "c", "a"]
+
+
+def test_create_rotates_failure_evidence_after_a_screened_batch() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_useless_meta_reply(seed), judge_fn=lambda _user: False)
+    tasks = [
+        TaskSpec(task_id="t1", instruction="first failure", gold=["alpha assertion"]),
+        TaskSpec(task_id="t2", instruction="second failure", gold=["beta assertion"]),
+    ]
+
+    create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=2,
+        k=1,
+    )
+
+    assert "[TARGET] t1" in provider.meta_users[0]
+    assert "[other] t2" in provider.meta_users[0]
+    assert "[TARGET] t2" in provider.meta_users[1]
+    assert "[other] t1" in provider.meta_users[1]
+
+
+def test_create_does_not_discount_a_cluster_when_the_proposer_failed() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(judge_fn=lambda _user: False)
+    tasks = [
+        TaskSpec(task_id="t1", instruction="first failure", gold=["alpha assertion"]),
+        TaskSpec(task_id="t2", instruction="second failure", gold=["beta assertion"]),
+    ]
+
+    class FailingProposer:
+        def __init__(self) -> None:
+            self.triggers: list[FailureSignature] = []
+
+        def propose_batch(  # noqa: PLR0913 - mirrors the proposer protocol
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            del parent, evidence, history, should_cancel
+            self.triggers.append(trigger)
+            return [ProposalFailure(reason="temporary transport failure")] * count
+
+    proposer = FailingProposer()
+    create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        proposer,
+        GoldJudge(provider),
+        iterations=2,
+        k=1,
+    )
+
+    assert [trigger.task_ids for trigger in proposer.triggers] == [["t1"], ["t1"]]
+
+
 # -- parent selection --------------------------------------------------------------------------
 
 
@@ -478,6 +563,219 @@ def test_screen_rejects_delta_that_does_not_improve_its_trigger() -> None:
     # and no child progress event ever fired.
     assert len(result.reports) == 1
     assert [e[0] for e in progress] == [0]
+
+
+def test_screen_uses_assertion_fraction_to_admit_partial_improvement() -> None:
+    seed = HarnessDoc.baseline("seed")
+
+    class PartialJudgeProvider(RoleProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> Completion:
+            if "grade whether an agent completed a task" not in system:
+                return super().complete(
+                    system,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            user = messages[-1].content
+            improved = "done-verified" in user
+            assertions = _gold_assertions(user)
+            results = [
+                {
+                    "assertion": assertion,
+                    "passed": improved and index == 0,
+                    "why": "one subgoal improved" if improved and index == 0 else "still missing",
+                }
+                for index, assertion in enumerate(assertions)
+            ]
+            return Completion(text=json.dumps({"assertions": results, "passed": False}))
+
+    provider = PartialJudgeProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    tasks = [
+        TaskSpec(
+            task_id="t1",
+            instruction="complete both parts",
+            gold=["part one complete", "part two complete"],
+        )
+    ]
+
+    result = create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=1,
+        k=1,
+    )
+
+    assert result.screened == 0
+    [record] = result.iteration_records
+    assert record.outcome == "scored"
+    assert record.screen_child == record.screen_parent == 0.0
+    assert record.screen_parent_fraction == 0.0
+    assert record.screen_child_fraction == 0.5
+
+
+def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regresses() -> None:
+    """Dense screening is a prefilter; the authoritative full gate protects other tasks."""
+    delta = HarnessDelta.model_construct(
+        trigger=FailureSignature(mechanism="target", task_ids=["target"])
+    )
+    champion = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.45,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.0),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.9),
+        },
+    )
+    child = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.25,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.5),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.0),
+        },
+    )
+
+    verdict = create_module.gate_delta(
+        delta,
+        child=child,
+        champion=champion,
+        best_full=0.0,
+        suite=[],
+    )
+
+    assert verdict.accepted is False
+    assert verdict.full_delta == 0.0
+    assert verdict.full_fraction_delta == pytest.approx(-0.2)
+    assert "full-split assertion fraction regressed" in verdict.reason
+
+
+def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() -> None:
+    delta = HarnessDelta.model_construct(
+        trigger=FailureSignature(mechanism="target", task_ids=["target"])
+    )
+    champion = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.1,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.0),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.2),
+        },
+    )
+    child = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.35,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.5),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.2),
+        },
+    )
+
+    verdict = create_module.gate_delta(
+        delta,
+        child=child,
+        champion=champion,
+        best_full=0.0,
+        suite=[],
+    )
+
+    assert verdict.accepted is True
+    assert verdict.full_fraction_delta == pytest.approx(0.25)
+
+
+def test_search_records_screen_and_full_trace_feedback_for_project_proposers() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+
+    class RecordingProposer(ProviderDeltaProposer):
+        def __init__(self, wrapped: Provider) -> None:
+            super().__init__(wrapped)
+            self.evaluations: list[tuple[str, str]] = []
+
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            del delta
+            self.evaluations.append((stage, content))
+
+    proposer = RecordingProposer(provider)
+    create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        proposer,
+        GoldJudge(provider),
+        iterations=1,
+        k=1,
+    )
+
+    assert [stage for stage, _content in proposer.evaluations] == ["screen", "full"]
+    assert all("Execution transcript" in content for _stage, content in proposer.evaluations)
+    assert all("Judge feedback" in content for _stage, content in proposer.evaluations)
+
+
+def test_feedback_persistence_failure_does_not_abort_scored_search() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    notes: list[str] = []
+
+    class BrokenFeedbackProposer(ProviderDeltaProposer):
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            del delta, stage, content
+            raise RuntimeError("project filesystem disconnected")
+
+    result = create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        BrokenFeedbackProposer(provider),
+        GoldJudge(provider),
+        iterations=1,
+        k=1,
+        on_note=notes.append,
+    )
+
+    assert result.best_score == 1.0
+    assert len(result.iteration_records) == 1
+    assert any("screen feedback could not be persisted" in note for note in notes)
+    assert any("full feedback could not be persisted" in note for note in notes)
+
+
+def test_feedback_persistence_preserves_explicit_cancellation() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+
+    class CancellingFeedbackProposer(ProviderDeltaProposer):
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            del delta, stage, content
+            raise HarnessSearchCancelled("harness search cancelled")
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        create_harness(
+            "winner",
+            seed,
+            _tasks(),
+            _wm(provider),
+            provider,
+            CancellingFeedbackProposer(provider),
+            GoldJudge(provider),
+            iterations=1,
+            k=1,
+        )
 
 
 def test_rejected_history_reaches_the_next_proposal() -> None:
@@ -604,6 +902,14 @@ def test_narrow_failing_tiers_eligibility() -> None:
     # Both tiers narrowly failing -> both retried.
     both = record(full_delta=0.05, suite_delta=-0.05, holdout_delta=-0.1)
     assert narrow_failing_tiers(both, k=5, n_suite=8, n_holdout=4) == ["suite", "holdout"]
+    # Confirmation of one binary veto cannot erase a separate dense-signal veto.
+    dense_veto = record(
+        full_delta=0.05,
+        suite_delta=-0.05,
+        holdout_delta=0.0,
+        holdout_fraction_delta=-0.2,
+    )
+    assert narrow_failing_tiers(dense_veto, k=5, n_suite=8, n_holdout=4) is None
     # Accepted verdicts are never retried.
     ok = GateRecord(accepted=True, reason="r", full_delta=0.05)
     assert narrow_failing_tiers(ok, k=5, n_suite=4, n_holdout=4) is None

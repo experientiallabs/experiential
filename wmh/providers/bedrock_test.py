@@ -6,7 +6,7 @@ import io
 import json
 from typing import TYPE_CHECKING, cast
 
-from wmh.providers.base import Message, ProviderConfig, ProviderKind
+from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
 from wmh.providers.bedrock import BedrockProvider, _is_nova
 
 if TYPE_CHECKING:
@@ -25,6 +25,21 @@ class _StubClient:
         self.model_id = modelId
         self.body = json.loads(body)
         return {"body": io.BytesIO(json.dumps(self._response).encode("utf-8"))}
+
+
+class _StubConverseClient:
+    """Captures structured Converse requests and returns one text response."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def converse(self, **kwargs: object) -> dict[str, object]:
+        self.requests.append(kwargs)
+        return {
+            "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 2, "outputTokens": 1},
+        }
 
 
 def test_is_nova_matches_nova_model_ids_only() -> None:
@@ -79,3 +94,51 @@ def test_nova_complete_omits_empty_system() -> None:
     provider.complete("", [Message(role="user", content="hi")])
     assert stub.body is not None
     assert "system" not in stub.body
+
+
+def test_structured_chat_normalizes_temperature_for_unsupported_model() -> None:
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-opus-4-8",
+            model="us.anthropic.claude-opus-4-8",
+        )
+    )
+    stub = _StubConverseClient()
+    provider._client = cast("BaseClient", stub)
+    request = ChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.3,
+            "max_completion_tokens": 64,
+        }
+    )
+
+    provider.complete_chat(request)
+
+    assert request.temperature == 0.3  # normalization does not mutate the reusable request
+    assert stub.requests[0]["inferenceConfig"] == {"maxTokens": 64}
+
+
+def test_structured_chat_preserves_temperature_for_supported_model() -> None:
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-sonnet-4-6",
+            model="us.anthropic.claude-sonnet-4-6",
+        )
+    )
+    stub = _StubConverseClient()
+    provider._client = cast("BaseClient", stub)
+
+    provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.3,
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
+    assert stub.requests[0]["inferenceConfig"] == {"maxTokens": 64, "temperature": 0.3}

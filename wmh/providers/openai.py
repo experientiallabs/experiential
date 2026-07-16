@@ -20,6 +20,7 @@ from wmh.providers.base import (
     Message,
     ProviderConfig,
     VerifyResult,
+    normalize_chat_temperature,
     verify_via_ping,
 )
 
@@ -33,6 +34,7 @@ class OpenAIProvider:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
         self._client: OpenAI | None = None
+        self._forward_temperature = config.resolved_chat_forward_temperature()
 
     def _get_client(self) -> OpenAI:
         # Lazy: don't import the SDK or read the key env vars until first use.
@@ -85,6 +87,10 @@ class OpenAIProvider:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request on the configured OpenAI-compatible backend."""
+        request = normalize_chat_temperature(
+            request,
+            forward_temperature=self._forward_temperature,
+        )
         return _openai_common.complete_chat(
             self._get_client().chat.completions,
             self.config.model,

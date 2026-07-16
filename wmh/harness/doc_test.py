@@ -47,6 +47,14 @@ def test_budget_is_enforced_at_construction() -> None:
         Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="x" * 11, budget=10)
 
 
+@pytest.mark.parametrize("content", ["before\x00after", "before\ud800after"])
+def test_surface_rejects_text_that_cannot_roundtrip_through_durable_storage(
+    content: str,
+) -> None:
+    with pytest.raises(ValidationError, match="NUL|surrogate"):
+        Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content=content)
+
+
 def test_doc_hash_is_content_and_order_independent() -> None:
     a = Surface(id="prompt:a", kind=SurfaceKind.PROMPT, content="A")
     b = Surface(id="prompt:b", kind=SurfaceKind.PROMPT, content="B")
@@ -114,6 +122,9 @@ def test_runtime_reflects_document() -> None:
     skills = doc.skills()
     assert [s.name for s in skills] == ["count-words"]
     assert doc.surface_hashes()["skill:count-words"]
+    assembled = doc.assembled_prompt()
+    assert "read_skill:" in assembled
+    assert "wc -w <path>" not in assembled  # bodies remain progressive-disclosure only
 
 
 def test_json_roundtrip_preserves_identity() -> None:
@@ -228,6 +239,36 @@ def test_runtime_e2b_backend_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert shared._pool is shared_pool  # noqa: SLF001 - pins the pool passthrough
     assert shared._max_turns == 7  # noqa: SLF001 - document parameter reaches the runner
     assert shared._max_output_tokens == 16384  # noqa: SLF001 - same agent model contract
+
+
+def test_pi_e2b_runtime_inherits_temperature_and_skill_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wmh.harness.pi_e2b import E2BPiRuntime, E2BSandboxPool
+
+    base = _pi_doc()
+    doc = HarnessDoc(
+        name="pi-with-skill",
+        surfaces=[
+            *base.surfaces,
+            Surface(id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content="0.35"),
+            _skill_surface(),
+        ],
+    )
+    monkeypatch.delenv("WMH_E2B_TEMPLATE", raising=False)
+    pool = E2BSandboxPool()
+    runtime = doc.runtime(_stub_provider(), backend="e2b", e2b_pool=pool)
+
+    assert isinstance(runtime, E2BPiRuntime)
+    assert runtime._temperature == 0.35  # noqa: SLF001 - doc parameter reaches worker boundary
+    assert runtime._skills.get("count-words") is not None  # noqa: SLF001 - body stays available
+    assert {tool.name for tool in runtime._tools} >= {  # noqa: SLF001 - implicit runtime tool
+        "bash",
+        "submit",
+        "read_skill",
+    }
+    assert "read_skill:" in runtime._system_prompt  # noqa: SLF001 - visible in pi's prompt
+    pool.close()
 
 
 def test_runtime_e2b_backend_rejects_in_process_runtime_kinds() -> None:

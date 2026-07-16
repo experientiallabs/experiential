@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmh.providers.azure_openai import AzureOpenAIProvider
-from wmh.providers.base import Message, ProviderConfig, ProviderKind
+from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
 
 
 class _FakeMessage:
@@ -28,6 +28,22 @@ class _FakeChatResponse:
     def __init__(self, content: str, usage: _FakeUsage) -> None:
         self.choices = [_FakeChoice(content)]
         self.usage = usage
+
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        assert mode == "json"
+        return {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": self.choices[0].message.content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": self.usage.prompt_tokens,
+                "completion_tokens": self.usage.completion_tokens,
+            },
+        }
 
 
 class _FakeChatCompletions:
@@ -96,6 +112,33 @@ def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> 
     # On Azure the `model` arg carries the deployment name, not the base model id.
     assert chat.last_kwargs["model"] == "gpt55-deploy"
     assert chat.last_kwargs["max_completion_tokens"] == 16
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expects_temperature"),
+    [("gpt-5.5", False), ("deepseek-v4-pro", True)],
+)
+def test_structured_chat_applies_model_temperature_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    expects_temperature: bool,
+) -> None:
+    config = _config().model_copy(update={"model_type": model_type, "model": model_type})
+    provider = AzureOpenAIProvider(config)
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(1, 1)))
+    monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
+
+    provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "go"}],
+                "temperature": 0.3,
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
+    assert ("temperature" in chat.last_kwargs) is expects_temperature
 
 
 def test_missing_deployment_raises(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from wmh.core.text import validate_durable_text
 from wmh.harness.code_runtime import (
     DEFAULT_RUNTIME_CODE,
     CodeRuntime,
@@ -45,7 +46,7 @@ from wmh.harness.runtime import (
     Runtime,
 )
 from wmh.harness.skills import Skill, SkillLibrary
-from wmh.harness.tools import DEFAULT_TOOLS, render_tools, resolve_tools
+from wmh.harness.tools import DEFAULT_TOOLS, READ_SKILL, render_tools, resolve_tools
 from wmh.providers.base import Provider, ToolCallingProvider
 
 if TYPE_CHECKING:
@@ -93,6 +94,7 @@ class Surface(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> Surface:
+        validate_durable_text(self.content, field=f"surface {self.id!r} content")
         prefix, sep, slug = self.id.partition(":")
         if not sep or prefix != self.kind.value or not _SLUG_RE.match(slug):
             raise ValueError(
@@ -280,6 +282,13 @@ class HarnessDoc(BaseModel):
         if self.runtime_kind() == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
+            tool_names = self.tools()
+            # Progressive disclosure is runtime plumbing, not a burden on every persisted tool
+            # policy. Keep pi-node behavior aligned with AgentRuntime: a skill-bearing document
+            # always exposes read_skill, even when the authored policy lists only env tools.
+            if len(skills) and READ_SKILL.name not in tool_names:
+                tool_names.append(READ_SKILL.name)
+            tools = resolve_tools(tool_names)
             structured_provider = provider if isinstance(provider, ToolCallingProvider) else None
             if (
                 backend == "e2b" or os.environ.get("PI_TRANSPORT") == "link"
@@ -296,8 +305,10 @@ class HarnessDoc(BaseModel):
                 return E2BPiRuntime(
                     provider=structured_provider,
                     files=code_files,
-                    tools=resolve_tools(self.tools()),
+                    tools=tools,
                     system_prompt=self.assembled_prompt(skills),
+                    temperature=self.temperature(),
+                    skills=skills,
                     template=e2b_template,
                     pool=e2b_pool,
                     max_turns=self.max_turns(),
@@ -322,10 +333,12 @@ class HarnessDoc(BaseModel):
                 assert structured_provider is not None
                 return RunnerLink(
                     channel,
-                    tools=resolve_tools(self.tools()),
+                    tools=tools,
                     provider=structured_provider,
                     system_prompt=self.assembled_prompt(skills),
                     files=code_files,
+                    temperature=self.temperature(),
+                    skills=skills,
                     max_turns=self.max_turns(),
                     max_output_tokens=self.max_output_tokens(),
                     should_cancel=should_cancel,
@@ -335,7 +348,7 @@ class HarnessDoc(BaseModel):
             return PiRuntime(
                 provider,
                 files=code_files,
-                tools=resolve_tools(self.tools()),
+                tools=tools,
                 temperature=self.temperature(),
                 skills=skills,
                 system_prompt=self.assembled_prompt(skills),
@@ -371,7 +384,10 @@ class HarnessDoc(BaseModel):
     def assembled_prompt(self, skills: SkillLibrary | None = None) -> str:
         """Return the system prompt shared by episode and project session runtimes."""
         resolved_skills = skills if skills is not None else SkillLibrary(self.skills())
-        prompt = f"{self.system_prompt()}\n\n## Tools\n{render_tools(resolve_tools(self.tools()))}"
+        tool_names = self.tools()
+        if len(resolved_skills) and READ_SKILL.name not in tool_names:
+            tool_names.append(READ_SKILL.name)
+        prompt = f"{self.system_prompt()}\n\n## Tools\n{render_tools(resolve_tools(tool_names))}"
         index = resolved_skills.render_index()
         if index:
             prompt += f"\n\n## Your skills (read a body with read_skill)\n{index}"

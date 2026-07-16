@@ -16,6 +16,7 @@ from wmh.providers.base import (
     ProviderConfig,
     TokenUsage,
     VerifyResult,
+    normalize_chat_temperature,
     verify_via_ping,
 )
 
@@ -81,6 +82,10 @@ class BedrockProvider:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
         self._client: BaseClient | None = None
+        # Model capability lives in WMH's canonical catalog. Subclasses may
+        # override this per concrete deployment, but every Bedrock request path
+        # consumes the same provider-boundary flag.
+        self._forward_temperature = config.resolved_chat_forward_temperature()
 
     def _get_client(self) -> BaseClient:
         # Lazy: import boto3 and open the client only on first use. region falls back to
@@ -151,7 +156,11 @@ class BedrockProvider:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured agent request through Bedrock Converse."""
-        raw = self._get_client().converse(**converse_request(request, self.config.model))
+        normalized = normalize_chat_temperature(
+            request,
+            forward_temperature=self._forward_temperature,
+        )
+        raw = self._get_client().converse(**converse_request(normalized, self.config.model))
         return converse_response(raw, self.config.model)
 
     def _complete_converse(

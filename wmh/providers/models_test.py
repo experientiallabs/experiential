@@ -14,6 +14,26 @@ def test_same_model_type_resolves_to_provider_specific_ids() -> None:
     assert bedrock.model_id == "us.anthropic.claude-opus-4-8"
 
 
+def test_model_catalog_owns_temperature_compatibility() -> None:
+    """Sampling compatibility follows the canonical model across callers."""
+    opus = resolve_provider_model(ProviderKind.BEDROCK, "claude-opus-4-8")
+    opus_runtime_id = resolve_provider_model(ProviderKind.BEDROCK, "us.anthropic.claude-opus-4-8")
+    sonnet = resolve_provider_model(ProviderKind.BEDROCK, "claude-sonnet-4-6")
+
+    assert opus.forward_temperature is False
+    assert opus_runtime_id.forward_temperature is False
+    assert sonnet.forward_temperature is True
+    assert resolve_provider_model(ProviderKind.OPENAI, "gpt-5.5").forward_temperature is False
+    assert (
+        resolve_provider_model(ProviderKind.AZURE_OPENAI, "gpt-5.4-mini").forward_temperature
+        is False
+    )
+    assert (
+        resolve_provider_model(ProviderKind.AZURE_OPENAI, "deepseek-v4-pro").forward_temperature
+        is True
+    )
+
+
 def test_runtime_id_resolves_back_to_canonical_model_type() -> None:
     """Known provider ids never become a second public model identity."""
     resolved = resolve_provider_model(
@@ -58,6 +78,16 @@ def test_unknown_custom_model_round_trips() -> None:
     assert resolved.model_type == "my-fine-tune"
     assert resolved.model_id == "my-fine-tune"
     assert resolved.chat_max_tokens_field == "max_completion_tokens"
+
+
+def test_explicit_openai_compatible_endpoint_keeps_sampling_capability() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.OPENAI,
+        model="gpt-5.5",
+        endpoint="http://localhost:8001/v1",
+    )
+
+    assert config.resolved_chat_forward_temperature() is True
 
 
 def test_provider_config_resolves_model_contract_before_custom_deployment() -> None:

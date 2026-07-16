@@ -30,8 +30,11 @@ from wmh.providers.base import ToolCallingProvider
 
 PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
+_BASH_TIMEOUT_S = 60.0
+_BASH_PROCESS_TIMEOUT_S = 50
+_BASH_STREAM_CAP = 7_000
 _OUTPUT_CAP = 16_000
-_PROJECT_TOOLS = frozenset({"read_file", "write_file", "submit"})
+_PROJECT_TOOLS = frozenset({"bash", "read_file", "write_file", "submit"})
 _RECOVERABLE_SESSION_MARKERS = (
     "server disconnected",
     "connection reset",
@@ -48,6 +51,40 @@ _RECOVERABLE_SESSION_MARKERS = (
     "live session runner did not become ready",
     "channel send failed",
 )
+
+_BASH_FILTER_SCRIPT = f"""\
+const cap = {_BASH_STREAM_CAP};
+const half = Math.floor(cap / 2);
+let small = Buffer.alloc(0);
+let head = Buffer.alloc(0);
+let tail = Buffer.alloc(0);
+let total = 0;
+let truncated = false;
+process.stdin.on("data", (chunk) => {{
+  total += chunk.length;
+  if (!truncated) {{
+    small = Buffer.concat([small, chunk]);
+    if (small.length > cap) {{
+      truncated = true;
+      head = small.subarray(0, half);
+      tail = small.subarray(small.length - half);
+      small = Buffer.alloc(0);
+    }}
+  }} else {{
+    tail = Buffer.concat([tail, chunk]);
+    if (tail.length > half) tail = tail.subarray(tail.length - half);
+  }}
+}});
+process.stdin.on("end", () => {{
+  if (truncated) {{
+    process.stdout.write(head);
+    process.stdout.write(`\\n... ${{total - cap}} bytes truncated in sandbox ...\\n`);
+    process.stdout.write(tail);
+  }} else {{
+    process.stdout.write(small);
+  }}
+}});
+"""
 
 
 class ChannelFactory(Protocol):
@@ -104,14 +141,14 @@ class AgentProject:
         }
         self._closing = False
         self._finished_at: float | None = None
-        # Every supported project mutation is mediated by write_text or the contained write_file
-        # tool. Keep an in-process mirror so a dead E2B transport can be replaced without
-        # discarding the prior proposals that make this a persistent meta-agent project.
+        # Keep an in-process mirror of mediated writes so a dead E2B transport can be replaced
+        # without discarding the prior proposals that make this a persistent meta-agent project.
         self._file_contents: dict[str, str] = {}
         self._channel: Channel | None = None
         self._session: LiveSession | None = None
         self._session_agent_hash: str | None = None
         self._session_provider: ToolCallingProvider | None = None
+        self._network_locked_sandbox_id: int | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
         self._retired_worker_usage = TokenUsage()
         try:
@@ -339,20 +376,26 @@ class AgentProject:
             return self._session
         self._close_agent_session()
         channel = self._channel_factory(self._sandbox, self.workspace)
-        skills = agent.skills()
-        session = LiveSession(
-            channel,
-            tools=resolve_tools(agent.tools()),
-            execute_tool=self._execute_tool,
-            on_event=self._emit_session_event,
-            files={surface.path: surface.content for surface in agent.code_files() if surface.path},
-            system_prompt=agent.assembled_prompt(),
-            skill_bodies={skill.name: skill.body for skill in skills},
-            provider=provider,
-            turn_cap=agent.max_turns(),
-            max_output_tokens=agent.max_output_tokens(),
-        )
         try:
+            # Runner bootstrap has completed in channel_factory, but no agent-controlled source
+            # has been imported yet. Remove egress before session_start materializes that code.
+            self._lock_project_network()
+            skills = agent.skills()
+            session = LiveSession(
+                channel,
+                tools=resolve_tools(agent.tools()),
+                execute_tool=self._execute_tool,
+                on_event=self._emit_session_event,
+                files={
+                    surface.path: surface.content for surface in agent.code_files() if surface.path
+                },
+                system_prompt=agent.assembled_prompt(),
+                skill_bodies={skill.name: skill.body for skill in skills},
+                provider=provider,
+                turn_cap=agent.max_turns(),
+                max_output_tokens=agent.max_output_tokens(),
+                temperature=agent.temperature(),
+            )
             session.start()
         except Exception:
             close = getattr(channel, "close", None)
@@ -365,6 +408,16 @@ class AgentProject:
         self._session_agent_hash = agent.doc_hash
         self._session_provider = provider
         return session
+
+    def _lock_project_network(self) -> None:
+        """Remove internet egress before untrusted project evidence can drive tools."""
+        if not self._owns_sandbox or self._network_locked_sandbox_id == id(self._sandbox):
+            return
+        update_network = getattr(self._sandbox, "update_network", None)
+        if not callable(update_network):
+            raise RuntimeError("owned project sandbox cannot disable internet access")
+        update_network({"allow_internet_access": False})
+        self._network_locked_sandbox_id = id(self._sandbox)
 
     def _emit_session_event(self, event: SessionEvent) -> None:
         """Route session events to the currently active project turn."""
@@ -489,11 +542,9 @@ class AgentProject:
         factory = self._sandbox_factory
         if factory is None:
             raise RuntimeError("project sandbox replacement is unavailable")
-        # Normal project writes are mirrored synchronously. This best-effort refresh also captures
-        # files produced directly by future custom harness code before replacing a still-readable
-        # sandbox; a poisoned command API simply falls back to the mediated-write mirror.
-        with contextlib.suppress(Exception):
-            self._refresh_file_mirror()
+        # Required durable files are synchronously mirrored by write_text/write_file. Bash is
+        # explicitly scratch-only, so recovery never scans or replays an unbounded agent-created
+        # tree before honoring cancellation or replacing a poisoned transport.
         replacement = create_sandbox(factory)
         replacement_started_at = time.monotonic()
         self._sandbox_count += 1
@@ -511,6 +562,7 @@ class AgentProject:
         self._close_agent_session()
         self._active_sandbox_started_at = replacement_started_at
         self._sandbox = replacement
+        self._network_locked_sandbox_id = None
         if self._owns_sandbox:
             self._retire_sandbox(previous)
 
@@ -524,19 +576,49 @@ class AgentProject:
         _handle, started_at = self._live_sandboxes.pop(id(sandbox))
         self._retired_sandbox_seconds += max(0.0, retired_at - started_at)
 
-    def _refresh_file_mirror(self) -> None:
-        """Snapshot all text files currently visible in the project workspace."""
-        result = self._sandbox.commands.run(
-            f"find {shlex.quote(self.workspace)} -type f -print0", timeout=30
+    def _run_bash(self, command: str, emit: Callable[[str, str], None]) -> ToolOutcome:
+        """Run one bounded command in the networkless E2B project.
+
+        Durable outputs use ``write_file`` and are mirrored synchronously. Bash is for search and
+        disposable prototypes; scanning and re-reading the entire growing project after every
+        grep would turn one agent turn into hundreds of E2B control-plane requests. The rare
+        sandbox replacement replays only this bounded authoritative mirror.
+        """
+        # Bound the streams *inside* the sandbox before the E2B SDK buffers them. Keeping a
+        # second host-side bound below protects the event channel if an older template lacks the
+        # wrapper contract or an SDK exception carries its own streams.
+        # Node is guaranteed by the pi project template; do not assume Python exists there.
+        filter_command = f"node -e {shlex.quote(_BASH_FILTER_SCRIPT)}"
+        script = (
+            "set -o pipefail\n"
+            f"timeout --kill-after=3s {_BASH_PROCESS_TIMEOUT_S}s "
+            f"bash -lc {shlex.quote(command)} "
+            f"2> >({filter_command} >&2) | {filter_command}\n"
+            "status=${PIPESTATUS[0]}\n"
+            'exit "$status"'
         )
-        stdout = getattr(result, "stdout", "")
-        snapshot: dict[str, str] = {}
-        for absolute in str(stdout).split("\0"):
-            if not absolute:
-                continue
-            relative = self._relative_path(absolute)
-            snapshot[relative] = self._sandbox.files.read(absolute)
-        self._file_contents.update(snapshot)
+        wrapped = f"cd {shlex.quote(self.workspace)} && bash -lc {shlex.quote(script)}"
+        try:
+            result = self._sandbox.commands.run(
+                wrapped,
+                timeout=_BASH_TIMEOUT_S,
+            )
+            stdout = _bounded_bash_stream(str(getattr(result, "stdout", "") or ""))
+            stderr = _bounded_bash_stream(str(getattr(result, "stderr", "") or ""))
+            exit_code = int(getattr(result, "exit_code", 0) or 0)
+        except Exception as error:  # noqa: BLE001 - E2B reports non-zero exits as exceptions
+            stdout = _bounded_bash_stream(str(getattr(error, "stdout", "") or ""))
+            stderr = _bounded_bash_stream(str(getattr(error, "stderr", "") or str(error)))
+            exit_code = int(getattr(error, "exit_code", 1) or 1)
+
+        if stdout:
+            emit("stdout", stdout)
+        if stderr:
+            emit("stderr", stderr)
+        body = stdout + stderr
+        if exit_code != 0:
+            body = f"{body}\n[exit {exit_code}]"
+        return _capped(body, is_error=exit_code != 0)
 
     def _execute_tool(
         self,
@@ -544,8 +626,9 @@ class AgentProject:
         arguments: JsonObject,
         emit: Callable[[str, str], None],
     ) -> ToolOutcome:
-        del emit
         try:
+            if name == "bash":
+                return self._run_bash(str(arguments.get("command", "")), emit)
             if name == "read_file":
                 path = self._tool_path(str(arguments.get("path", "")))
                 relative = self._relative_path(path)
@@ -625,6 +708,22 @@ def _usage_delta(after: TokenUsage, before: TokenUsage) -> TokenUsage:
         input_tokens=after.input_tokens - before.input_tokens,
         output_tokens=after.output_tokens - before.output_tokens,
         calls=after.calls - before.calls,
+    )
+
+
+def _bounded_bash_stream(content: str) -> str:
+    """Keep both ends of one Bash stream within the live-session event budget."""
+    # The in-sandbox filter adds a small truthful omission marker outside its payload budget.
+    # Preserve that marker; the guard below is for unwrapped/SDK exception streams.
+    if len(content) <= _BASH_STREAM_CAP or (
+        len(content) <= _BASH_STREAM_CAP + 512 and "bytes truncated in sandbox" in content
+    ):
+        return content
+    half = _BASH_STREAM_CAP // 2
+    omitted = len(content) - _BASH_STREAM_CAP
+    return (
+        f"{content[:half]}\n... {omitted} characters truncated by Bash boundary ...\n"
+        f"{content[-half:]}"
     )
 
 

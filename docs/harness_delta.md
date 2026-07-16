@@ -95,8 +95,11 @@ class SurfaceOp(BaseModel):
 class GateRecord(BaseModel):
     """Filled at evaluation time; the delta carries its own verdict."""
     suite_delta: float           # regression suite: child − champion   (tier 1)
+    suite_fraction_delta: float  # assertion credit when suite success ties
     full_delta: float            # full split: child − best-seen        (tier 2)
+    full_fraction_delta: float   # assertion credit when full success ties
     holdout_delta: float | None  # held-out split: child − champion     (tier 3; None = no holdout)
+    holdout_fraction_delta: float | None
     accepted: bool
     reason: str                  # accept/reject reasoning, incl. the expected-effect audit
 
@@ -128,26 +131,30 @@ class HarnessDelta(BaseModel):
   written by the kit, so code cannot claim work it did not do), and crash-isolated (an exception
   fails the episode, not the eval).
 - **Verification is staged by cost**: before a full-split eval, a child is screened on its own
-  trigger cluster — the failing tasks its delta claims to fix. A delta that cannot beat its
-  parent on its own target is rejected (and archived) for a fraction of the price. Every judged
-  delta is fed back to the proposer as history, so the search iterates instead of re-proposing
-  rejected ideas.
+  trigger cluster — the failing tasks its delta claims to fix. The screen compares full-task
+  success first and assertion-level partial credit second, so a partial fix is not flattened into
+  a binary tie. A delta that improves neither signal is rejected (and archived) for a fraction of
+  the price. The authoritative full gate repeats the same lexicographic contract across the whole
+  split: binary success remains primary, and assertion credit cannot regress when success ties.
+  Every judged delta is fed back to the proposer as trace-level history, so the search iterates
+  instead of re-proposing rejected ideas.
 - **Search breadth is independent from evaluation depth**: `proposal_batch_size` asks the
   proposer for sibling deltas against one selected parent before evaluating any sibling. `k`
   remains the number of rollout passes used to score each scenario. Project-backed proposers keep
-  all prior proposal files in one persistent agent project while each round runs through a fresh
-  ordinary agent session.
+  all parent source, failure traces, proposals, and candidate evaluations in one persistent agent
+  project while every turn runs through the same ordinary agent-session runtime.
 - **Acceptance is the gate, not "applied cleanly"** (`gate_delta`): regression-suite
   non-regression vs the champion → full-split never-worse-than-best → held-out non-regression vs
-  the champion (when a holdout split is given). Ties pass every tier: with k passes per task the
-  scores are coarse, and "no worse" is the contract. On accept, newly-passing tasks promote into
-  the regression suite, so wins are locked in and later deltas cannot quietly trade them away. The
-  verdict is written onto the delta.
+  the champion (when a holdout split is given). Binary ties consult assertion-level partial credit;
+  a stepping stone may advance on dense signal but cannot hide a global dense regression. On
+  accept, newly-passing tasks promote into the regression suite, so wins are locked in and later
+  deltas cannot quietly trade them away. The verdict is written onto the delta.
 - **The trigger is machine-made** (`cluster_failures`): failing tasks group by shared unmet gold
   assertions (connected components; the most common unmet assertion labels the mechanism),
   deterministically — no LLM, no entropy — so mechanism labels are comparable across deltas and
-  runs. The proposer attacks the largest cluster. An all-pass parent gets an explicit
-  generalization/economization trigger instead of a fabricated failure.
+  runs. Selection weights cluster size but discounts rounds already spent on the same cluster and
+  parent, so one environment-limited singleton cannot absorb the whole search. An all-pass parent
+  gets an explicit generalization/economization trigger instead of a fabricated failure.
 - **The archive is a lineage of audited deltas** (`DeltaArchive`): a root snapshot plus every
   proposed delta — accepted, gate-rejected, or invalid-before-eval — with its verdict. Docs are
   reconstructable by folding accepted deltas from the seed; snapshots are caches, not the record.
@@ -175,9 +182,9 @@ that fails atomic application is a counted skip that is still archived with its 
    `add` + `replace` — the taxonomy then emerges from search instead of from us.
 2. **Merge.** Identity-keyed surfaces + content lineage make a surface-keyed three-way merge of
    two accepted lineages nearly free. Deferred to a follow-up.
-3. **Gate resolution.** With k=3 and small suites, per-task deltas are coarse (0, ⅓, ⅔, 1). Ties
-   currently pass as non-regressions; if flappy accepts show up in practice, raise k on gate evals
-   rather than adding thresholds.
+3. **Gate resolution.** With k=3 and small suites, binary per-task deltas are coarse (0, ⅓, ⅔, 1).
+   Assertion-level fractions break otherwise-flat ties; if flappy accepts show up in practice,
+   raise k on gate evals rather than adding arbitrary thresholds.
 4. **Suite demotion.** Newly-passing tasks promote into the regression suite; nothing ever leaves
    it. A permanently-flaky task could wedge the gate. Punted until observed.
 5. **Sandboxing the `CODE` surface.** The kit is an interface contract, not a security boundary:

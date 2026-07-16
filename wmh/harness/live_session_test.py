@@ -55,12 +55,14 @@ def test_start_waits_for_first_idle_state() -> None:
         execute_tool=_no_tool,
         on_event=lambda e: None,
         max_output_tokens=16384,
+        temperature=0.35,
     )
     session.start()
     assert session.status == "idle"
     assert channel.sent[0]["type"] == "session_start"
     assert channel.sent[0]["turn_cap"] == 60
     assert channel.sent[0]["max_output_tokens"] == 16384
+    assert channel.sent[0]["temperature"] == 0.35
 
 
 def test_start_surfaces_the_runner_construction_error() -> None:
@@ -222,16 +224,52 @@ def test_read_skill_answered_from_bodies() -> None:
     )
     session = LiveSession(
         channel,
-        tools=[READ_SKILL],
+        tools=[],
         execute_tool=_no_tool,
         on_event=events.append,
         skill_bodies={"deploy": "run ./deploy.sh"},
     )
     session.start()
+    raw_tools = channel.sent[0]["tools"]
+    assert isinstance(raw_tools, list)
+    advertised = {tool["name"] for tool in raw_tools if isinstance(tool, dict) and "name" in tool}
+    assert READ_SKILL.name in advertised
     _drain(session)
     results = [e for e in events if e.kind == "tool_result"]
     assert results[0].payload["content"] == "run ./deploy.sh"
+    assert results[1].payload["content"] == "no skill named 'missing'"
     assert results[1].payload["is_error"] is True
+
+
+def test_harness_temperature_overrides_live_runner_request() -> None:
+    requests: list[ChatRequest] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {
+                "type": "llm_request",
+                "req_id": 1,
+                "openai_body": {"messages": [], "temperature": 1.75},
+            },
+        ]
+    )
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        requests.append(request)
+        return _completion()
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda event: None,
+        worker_fn=worker,
+        temperature=0.35,
+    )
+    session.start()
+    _drain(session)
+
+    assert [request.temperature for request in requests] == [0.35]
 
 
 def test_worker_error_is_reported_not_raised() -> None:

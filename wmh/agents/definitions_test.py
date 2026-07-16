@@ -30,6 +30,6 @@ def test_meta_agent_has_larger_budgets_without_mutating_default() -> None:
     assert meta.surface("param:max-output-tokens") is not None
 
 
-def test_meta_agent_uses_only_project_scoped_file_tools() -> None:
-    """The optimizer agent has no shell escape from its persistent workspace."""
-    assert meta_agent().tools() == ["read_file", "write_file", "submit"]
+def test_meta_agent_uses_only_project_scoped_tools() -> None:
+    """The optimizer agent gets Bash inside its isolated E2B project, plus scoped file tools."""
+    assert meta_agent().tools() == ["bash", "read_file", "write_file", "submit"]

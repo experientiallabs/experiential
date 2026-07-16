@@ -39,7 +39,8 @@ from wmh.harness.runtime import (
     StopReason,
     TokenUsage,
 )
-from wmh.harness.tools import ToolSpec
+from wmh.harness.skills import SkillLibrary
+from wmh.harness.tools import READ_SKILL, ToolSpec
 from wmh.providers.base import ToolCallingProvider
 
 DEFAULT_MAX_ENV_ACTIONS = 40
@@ -164,6 +165,7 @@ class HostEpisode:
     instruction: str
     tools: list[ToolSpec]
     environment: AgentEnvironment
+    skills: SkillLibrary = field(default_factory=SkillLibrary)
     max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS
     steps: list[Step] = field(default_factory=list)
     answer: str = ""
@@ -176,11 +178,21 @@ class HostEpisode:
         ]
 
     def run_tool(self, name: str, arguments: JsonObject) -> JsonObject:
-        """Answer one environment tool call: enforce the budget, record the Step."""
+        """Answer one runtime/environment tool call under AgentRuntime-compatible semantics."""
         action = Action(kind=ActionKind.TOOL_CALL, name=name, arguments=arguments)
-        if self._env_calls >= self.max_env_actions:
+        if name not in {t.name for t in self.tools}:
+            obs = Observation(content=f"tool {name!r} not available", is_error=True)
+        elif name == READ_SKILL.name:
+            raw_name = arguments.get("name")
+            skill_name = raw_name if isinstance(raw_name, str) else ""
+            skill = self.skills.get(skill_name)
+            if skill is None:
+                obs = Observation(content=f"no skill named {skill_name!r}", is_error=True)
+            else:
+                obs = Observation(content=skill.body)
+        elif self._env_calls >= self.max_env_actions:
             obs = Observation(content="environment action budget exhausted", is_error=True)
-        elif name not in {t.name for t in self.tools} or not is_env_action(action):
+        elif not is_env_action(action):
             obs = Observation(content=f"tool {name!r} not available", is_error=True)
         else:
             self._env_calls += 1
@@ -216,6 +228,8 @@ class RunnerLink:
         max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS,
         max_turns: int = DEFAULT_MAX_TURNS,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        temperature: float = 0.7,
+        skills: SkillLibrary | None = None,
         episode_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
         cancel_poll_interval_s: float = DEFAULT_CANCEL_POLL_INTERVAL_S,
@@ -224,7 +238,10 @@ class RunnerLink:
         # Tools bound at construction make RunnerLink satisfy the runtime contract closed-loop eval
         # drives — `run(task_id, instruction, environment)` — while `run(..., tools=...)` still lets
         # a caller (or the conformance tests) override per episode.
-        self._tools = tools or []
+        self._tools = list(tools or [])
+        self._skills = skills if skills is not None else SkillLibrary()
+        if len(self._skills) and READ_SKILL.name not in {tool.name for tool in self._tools}:
+            self._tools.append(READ_SKILL)
         if worker_fn is None and provider is None:
             raise ValueError("RunnerLink needs a ToolCallingProvider or worker_fn")
         # worker_fn lets tests answer llm_request without a real provider.
@@ -240,12 +257,15 @@ class RunnerLink:
             raise ValueError("max_turns must be >= 1")
         if max_output_tokens < 1:
             raise ValueError("max_output_tokens must be >= 1")
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be in [0, 2]")
         if episode_timeout_s is not None and episode_timeout_s <= 0:
             raise ValueError("episode_timeout_s must be positive when set")
         if cancel_poll_interval_s <= 0:
             raise ValueError("cancel_poll_interval_s must be positive")
         self._max_turns = max_turns
         self._max_output_tokens = max_output_tokens
+        self._temperature = temperature
         self._episode_timeout_s = episode_timeout_s
         self._should_cancel = should_cancel
         self._cancel_poll_interval_s = cancel_poll_interval_s
@@ -258,10 +278,14 @@ class RunnerLink:
         *,
         tools: list[ToolSpec] | None = None,
     ) -> RunResult:
+        episode_tools = list(tools) if tools is not None else list(self._tools)
+        if len(self._skills) and READ_SKILL.name not in {tool.name for tool in episode_tools}:
+            episode_tools.append(READ_SKILL)
         episode = HostEpisode(
             instruction=instruction,
-            tools=tools if tools is not None else self._tools,
+            tools=episode_tools,
             environment=environment,
+            skills=self._skills,
             max_env_actions=self._max_env_actions,
         )
         episode_id = uuid.uuid4().hex
@@ -298,6 +322,7 @@ class RunnerLink:
                 "max_env_actions": self._max_env_actions,
                 "max_turns": self._max_turns,
                 "max_output_tokens": self._max_output_tokens,
+                "temperature": self._temperature,
                 "episode_timeout_s": self._episode_timeout_s,
             }
         )
@@ -414,7 +439,11 @@ class RunnerLink:
         req_id = frame.get("req_id")
         body = frame.get("openai_body")
         try:
-            request = ChatRequest.model_validate(body if isinstance(body, dict) else {})
+            # The runner owns message/tool serialization, while HarnessDoc owns sampling policy.
+            # Override any runner default at the final host boundary before the real model call.
+            request_body = dict(body) if isinstance(body, dict) else {}
+            request_body["temperature"] = self._temperature
+            request = ChatRequest.model_validate(request_body)
             completion = self._worker_fn(request)
             # Meter the worker leg from the provider's structured response.
             usage.calls += 1

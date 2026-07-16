@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from wmh.core.text import normalize_durable_text
 
 
 class TaskSpec(BaseModel):
@@ -19,6 +21,16 @@ class TaskSpec(BaseModel):
     task_id: str
     instruction: str
     gold: list[str] = Field(default_factory=list)  # assertions that define success
+
+    @field_validator("task_id", "instruction")
+    @classmethod
+    def _normalize_scalar_text(cls, value: str) -> str:
+        return normalize_durable_text(value)
+
+    @field_validator("gold")
+    @classmethod
+    def _normalize_gold(cls, value: list[str]) -> list[str]:
+        return [normalize_durable_text(assertion) for assertion in value]
 
 
 def load_tasks(path: str | Path) -> list[TaskSpec]:

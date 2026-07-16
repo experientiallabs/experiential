@@ -9,9 +9,10 @@ gold list: a truncated judge reply that omits assertions cannot report success.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wmh.core.parsing import extract_json_object
+from wmh.core.text import normalize_durable_text
 from wmh.providers.base import Message, Provider
 
 GOLD_JUDGE_MARKER = "grade whether an agent completed a task"
@@ -33,6 +34,11 @@ class AssertionResult(BaseModel):
     passed: bool
     why: str = ""
 
+    @field_validator("assertion", "why")
+    @classmethod
+    def _normalize_text(cls, value: str) -> str:
+        return normalize_durable_text(value)
+
 
 class GoldVerdict(BaseModel):
     """The judge's verdict on one run against its gold assertions."""
@@ -41,6 +47,11 @@ class GoldVerdict(BaseModel):
     fraction: float = 0.0  # fraction of assertions satisfied (partial-credit signal)
     assertions: list[AssertionResult] = Field(default_factory=list)
     rationale: str = ""
+
+    @field_validator("rationale")
+    @classmethod
+    def _normalize_rationale(cls, value: str) -> str:
+        return normalize_durable_text(value)
 
     @classmethod
     def trivially_passed(cls) -> GoldVerdict:

@@ -59,8 +59,7 @@ from wmh.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_local import LocalStdioChannel, start_local_live_runner
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
-from wmh.harness.skills import SkillLibrary
-from wmh.harness.tools import render_tools, resolve_tools
+from wmh.harness.tools import READ_SKILL, resolve_tools
 from wmh.harness.workspace_patch import WorkspacePatchError
 from wmh.platform.client import PlatformClient, PlatformError, RemoteAgentSession
 from wmh.platform.credentials import PlatformCredentials, load_credentials
@@ -109,12 +108,11 @@ def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str
     the resolved tool specs, the code surfaces as {path: content} (the agent's own
     code, materialized into the local runner), and skill bodies answered host-side.
     """
-    tool_specs = resolve_tools(doc.tools())
-    system = f"{doc.system_prompt()}\n\n## Tools\n{render_tools(tool_specs)}"
-    skills = SkillLibrary(doc.skills())
-    index = skills.render_index()
-    if index:
-        system += f"\n\n## Your skills (read a body with read_skill)\n{index}"
+    tool_names = doc.tools()
+    if doc.skills() and READ_SKILL.name not in tool_names:
+        tool_names.append(READ_SKILL.name)
+    tool_specs = resolve_tools(tool_names)
+    system = doc.assembled_prompt()
     files = {surface.path: surface.content for surface in doc.code_files() if surface.path}
     skill_bodies = {skill.name: skill.body for skill in doc.skills()}
     return system, tool_specs, files, skill_bodies
@@ -364,6 +362,7 @@ class LocalLiveDriver:
                 provider=self._provider,
                 worker_fn=self._worker_fn,
                 max_output_tokens=self._doc.max_output_tokens(),
+                temperature=self._doc.temperature(),
             )
             session.start()
             _console.print(

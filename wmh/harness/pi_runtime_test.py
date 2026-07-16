@@ -9,12 +9,14 @@ from wmh.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
     RUNTIME_KIND_ID,
+    TEMPERATURE_ID,
     TOOL_POLICY_ID,
     HarnessDoc,
     Surface,
     SurfaceKind,
 )
 from wmh.harness.pi_runtime import PiRuntime, _Episode, _params_schema
+from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
 
@@ -45,13 +47,17 @@ class _Provider:
         )
 
 
-def _episode(env: _Env, *, budget: int = 40) -> _Episode:
+def _episode(
+    env: _Env, *, budget: int = 40, skills: SkillLibrary | None = None, temperature: float = 0.7
+) -> _Episode:
     return _Episode(
         instruction="do it",
         system_prompt="sys",
         tools=[TOOL_REGISTRY["bash"], SUBMIT],
         provider=_Provider(),
         environment=env,
+        temperature=temperature,
+        skills=skills if skills is not None else SkillLibrary(),
         max_env_actions=budget,
         max_turns=7,
         max_output_tokens=16384,
@@ -91,6 +97,29 @@ def test_env_action_budget_is_enforced() -> None:
     assert "budget exhausted" in ep.steps[-1].observation.content
 
 
+def test_worker_request_uses_document_temperature() -> None:
+    request = _episode(_Env(), temperature=0.35).worker_request(
+        {"messages": [], "temperature": 1.75}
+    )
+    assert request.temperature == 0.35
+
+
+def test_read_skill_is_runtime_local_and_does_not_consume_environment_budget() -> None:
+    env = _Env()
+    skills = SkillLibrary(
+        [Skill(name="count-words", description="count words", body="wc -w <path>")]
+    )
+    ep = _episode(env, budget=0, skills=skills)
+    ep.tools.append(TOOL_REGISTRY["read_skill"])
+
+    found = ep.run_tool("read_skill", {"name": "count-words"})
+    missing = ep.run_tool("read_skill", {"name": "ghost"})
+
+    assert found == {"content": "wc -w <path>", "is_error": False}
+    assert missing == {"content": "no skill named 'ghost'", "is_error": True}
+    assert env.actions == []
+
+
 def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
     from wmh.providers.base import ProviderConfig, ProviderKind
 
@@ -117,6 +146,14 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
             Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
             Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
+            Surface(id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content="0.35"),
+            Surface(
+                id="skill:count-words",
+                kind=SurfaceKind.SKILL,
+                content=Skill(
+                    name="count-words", description="count words", body="wc -w <path>"
+                ).to_markdown(),
+            ),
             Surface(
                 id="code:src-agent-ts",
                 kind=SurfaceKind.CODE,
@@ -135,3 +172,9 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
     assert isinstance(runtime, PiRuntime)
     assert runtime._max_turns == 7  # noqa: SLF001 - document parameter reaches entry.ts
     assert runtime._max_output_tokens == 16384  # noqa: SLF001 - same agent model contract
+    assert runtime._temperature == 0.35  # noqa: SLF001 - same worker sampling contract
+    assert {tool.name for tool in runtime._tools} >= {  # noqa: SLF001 - runtime plumbing
+        "bash",
+        "submit",
+        "read_skill",
+    }

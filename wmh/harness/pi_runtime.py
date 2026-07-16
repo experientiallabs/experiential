@@ -38,7 +38,7 @@ from wmh.harness.environment import AgentEnvironment, is_env_action
 from wmh.harness.runner_link import params_schema
 from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TURNS, RunResult, StopReason
 from wmh.harness.skills import SkillLibrary
-from wmh.harness.tools import ToolSpec
+from wmh.harness.tools import READ_SKILL, ToolSpec
 from wmh.providers.base import Provider, ToolCallingProvider
 
 # The runner: node runs here, reached over SSH. The checkout keeps pi's node_modules; per-episode
@@ -67,6 +67,8 @@ class _Episode:
         tools: list[ToolSpec],
         provider: ToolCallingProvider,
         environment: AgentEnvironment,
+        temperature: float,
+        skills: SkillLibrary,
         max_env_actions: int,
         max_turns: int,
         max_output_tokens: int,
@@ -76,6 +78,8 @@ class _Episode:
         self.tools = tools
         self.provider = provider
         self.environment = environment
+        self.temperature = temperature
+        self.skills = skills
         self.max_env_actions = max_env_actions
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
@@ -99,9 +103,19 @@ class _Episode:
 
     def run_tool(self, name: str, arguments: JsonObject) -> JsonObject:
         action = Action(kind=ActionKind.TOOL_CALL, name=name, arguments=arguments)
-        if self._env_calls >= self.max_env_actions:
+        if name not in {t.name for t in self.tools}:
+            obs = Observation(content=f"tool {name!r} not available", is_error=True)
+        elif name == READ_SKILL.name:
+            raw_name = arguments.get("name")
+            skill_name = raw_name if isinstance(raw_name, str) else ""
+            skill = self.skills.get(skill_name)
+            if skill is None:
+                obs = Observation(content=f"no skill named {skill_name!r}", is_error=True)
+            else:
+                obs = Observation(content=skill.body)
+        elif self._env_calls >= self.max_env_actions:
             obs = Observation(content="environment action budget exhausted", is_error=True)
-        elif name not in {t.name for t in self.tools} or not is_env_action(action):
+        elif not is_env_action(action):
             obs = Observation(content=f"tool {name!r} not available", is_error=True)
         else:
             self._env_calls += 1
@@ -110,6 +124,12 @@ class _Episode:
             Step(action=action, observation=obs, state_before=EnvState(), task=self.instruction)
         )
         return {"content": obs.content, "is_error": obs.is_error}
+
+    def worker_request(self, body: JsonObject) -> ChatRequest:
+        """Apply the document sampling policy to one runner-authored structured request."""
+        request_body = dict(body)
+        request_body["temperature"] = self.temperature
+        return ChatRequest.model_validate(request_body)
 
 
 # The tool `parameters` schema builder lives in runner_link (shared with the frame transport);
@@ -185,7 +205,7 @@ class _ShimHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         try:
-            completion = self._ep.provider.complete_chat(ChatRequest.model_validate(body))
+            completion = self._ep.provider.complete_chat(self._ep.worker_request(body))
             choice = completion.choices[0]
             message = choice.message
             content = message.content if isinstance(message.content, str) else ""
@@ -235,7 +255,13 @@ class PiRuntime:
             raise TypeError("PiRuntime needs a ToolCallingProvider")
         self._provider = provider
         self._files = files
-        self._tools = tools
+        self._skills = skills if skills is not None else SkillLibrary()
+        self._tools = list(tools)
+        if len(self._skills) and READ_SKILL.name not in {tool.name for tool in self._tools}:
+            self._tools.append(READ_SKILL)
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be in [0, 2]")
+        self._temperature = temperature
         self._system_prompt = system_prompt
         self._port = port
         self._workdir = workdir or f"{PI_RUNNER_DIR}/ep-{port}"
@@ -260,6 +286,8 @@ class PiRuntime:
             tools=self._tools,
             provider=self._provider,
             environment=environment,
+            temperature=self._temperature,
+            skills=self._skills,
             max_env_actions=self._max_env_actions,
             max_turns=self._max_turns,
             max_output_tokens=self._max_output_tokens,

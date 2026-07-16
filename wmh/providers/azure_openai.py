@@ -22,6 +22,7 @@ from wmh.providers.base import (
     Message,
     ProviderConfig,
     VerifyResult,
+    normalize_chat_temperature,
     verify_via_ping,
 )
 
@@ -35,6 +36,7 @@ class AzureOpenAIProvider:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
         self._client: AzureOpenAI | None = None
+        self._forward_temperature = config.resolved_chat_forward_temperature()
 
     def _get_client(self) -> AzureOpenAI:
         # Lazy: construct on first use. api_version must be supplied by config; the endpoint and
@@ -100,6 +102,10 @@ class AzureOpenAIProvider:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request on the configured Azure deployment."""
+        request = normalize_chat_temperature(
+            request,
+            forward_temperature=self._forward_temperature,
+        )
         return _openai_common.complete_chat(
             self._get_client().chat.completions,
             self._deployment(),

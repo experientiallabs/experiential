@@ -14,8 +14,10 @@ class ProviderModel(BaseModel):
     ``model_type`` is the provider-independent identity used in product and
     configuration surfaces. ``model_id`` is the provider-specific value sent
     over the wire. ``chat_max_tokens_field`` records which output-token field
-    the model accepts on OpenAI-compatible chat requests. Keeping these
-    together prevents provider details from leaking into product catalogs.
+    the model accepts on OpenAI-compatible chat requests. ``forward_temperature``
+    records whether structured chat requests may send the sampling parameter at
+    all. Keeping these together prevents provider details from leaking into
+    product catalogs.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -24,24 +26,57 @@ class ProviderModel(BaseModel):
     model_type: str
     model_id: str
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
+    forward_temperature: bool = True
 
 
 _MODELS: tuple[ProviderModel, ...] = (
-    ProviderModel(provider=ProviderKind.OPENAI, model_type="gpt-5.5", model_id="gpt-5.5"),
-    ProviderModel(provider=ProviderKind.OPENAI, model_type="gpt-5.5-pro", model_id="gpt-5.5-pro"),
-    ProviderModel(provider=ProviderKind.OPENAI, model_type="gpt-5.4", model_id="gpt-5.4"),
-    ProviderModel(provider=ProviderKind.OPENAI, model_type="gpt-5.4-mini", model_id="gpt-5.4-mini"),
-    ProviderModel(provider=ProviderKind.OPENAI_RESPONSES, model_type="gpt-5.5", model_id="gpt-5.5"),
+    ProviderModel(
+        provider=ProviderKind.OPENAI,
+        model_type="gpt-5.5",
+        model_id="gpt-5.5",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI,
+        model_type="gpt-5.5-pro",
+        model_id="gpt-5.5-pro",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI,
+        model_type="gpt-5.4",
+        model_id="gpt-5.4",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI,
+        model_type="gpt-5.4-mini",
+        model_id="gpt-5.4-mini",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI_RESPONSES,
+        model_type="gpt-5.5",
+        model_id="gpt-5.5",
+        forward_temperature=False,
+    ),
     ProviderModel(
         provider=ProviderKind.OPENAI_RESPONSES,
         model_type="gpt-5.5-pro",
         model_id="gpt-5.5-pro",
+        forward_temperature=False,
     ),
-    ProviderModel(provider=ProviderKind.OPENAI_RESPONSES, model_type="gpt-5.4", model_id="gpt-5.4"),
+    ProviderModel(
+        provider=ProviderKind.OPENAI_RESPONSES,
+        model_type="gpt-5.4",
+        model_id="gpt-5.4",
+        forward_temperature=False,
+    ),
     ProviderModel(
         provider=ProviderKind.OPENAI_RESPONSES,
         model_type="gpt-5.4-mini",
         model_id="gpt-5.4-mini",
+        forward_temperature=False,
     ),
     ProviderModel(
         provider=ProviderKind.ANTHROPIC,
@@ -67,6 +102,9 @@ _MODELS: tuple[ProviderModel, ...] = (
         provider=ProviderKind.BEDROCK,
         model_type="claude-opus-4-8",
         model_id="us.anthropic.claude-opus-4-8",
+        # Opus 4.8 dropped sampling parameters. Bedrock rejects a forwarded
+        # temperature with a ValidationException instead of ignoring it.
+        forward_temperature=False,
     ),
     ProviderModel(
         provider=ProviderKind.BEDROCK,
@@ -97,12 +135,23 @@ _MODELS: tuple[ProviderModel, ...] = (
     # Azure uses deployment names at runtime. These defaults deliberately
     # match the canonical type; callers with custom deployment names override
     # ProviderConfig.deployment without changing model identity.
-    ProviderModel(provider=ProviderKind.AZURE_OPENAI, model_type="gpt-5.5", model_id="gpt-5.5"),
-    ProviderModel(provider=ProviderKind.AZURE_OPENAI, model_type="gpt-5.4", model_id="gpt-5.4"),
+    ProviderModel(
+        provider=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model_id="gpt-5.5",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.4",
+        model_id="gpt-5.4",
+        forward_temperature=False,
+    ),
     ProviderModel(
         provider=ProviderKind.AZURE_OPENAI,
         model_type="gpt-5.4-mini",
         model_id="gpt-5.4-mini",
+        forward_temperature=False,
     ),
     ProviderModel(
         provider=ProviderKind.AZURE_OPENAI,

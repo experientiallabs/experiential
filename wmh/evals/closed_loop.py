@@ -21,6 +21,7 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
+from wmh.core.text import normalize_durable_text
 from wmh.core.types import Action, Observation
 from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge, GoldVerdict
@@ -31,12 +32,15 @@ from wmh.harness.runtime import (
     RunResult,
     Runtime,
     RuntimeCancelled,
+    StopReason,
     TokenUsage,
     combine_usage,
 )
 from wmh.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
+_ROLLOUT_EVIDENCE_CHARS = 12_000
+_ROLLOUT_ANSWER_CHARS = 4_000
 
 # Opens a fresh environment for one task. The world-model backend and any real backend both fit
 # this shape, which is what lets the SAME scoring core measure simulation and reality.
@@ -71,6 +75,21 @@ class WorldModelEnvironment:
             self._closed = True
 
 
+class RolloutEvidence(BaseModel):
+    """The execution evidence behind one judged pass.
+
+    Aggregate scores are sufficient for ranking, but not for improving a harness: the proposer
+    needs to see what the agent actually tried, what the environment returned, and why the run
+    stopped. Keeping this alongside each verdict lets every optimizer backend expose the same
+    trace-level feedback without reaching into a platform-specific rollout store.
+    """
+
+    answer: str = ""
+    transcript: str = ""
+    stop_reason: StopReason
+    turns: int = 0
+
+
 class TaskOutcome(BaseModel):
     """One task's closed-loop result across k passes."""
 
@@ -79,6 +98,7 @@ class TaskOutcome(BaseModel):
     mean_fraction: float = 0.0  # mean fraction-of-assertions across passes (partial credit)
     passes: int = 0
     verdicts: list[GoldVerdict] = Field(default_factory=list)
+    attempts: list[RolloutEvidence] = Field(default_factory=list)
 
 
 class ClosedLoopReport(BaseModel):
@@ -138,10 +158,12 @@ def evaluate_with_env(
     if concurrency != 0 and concurrency <= 1:
         for task in tasks:
             verdicts: list[GoldVerdict] = []
+            attempts: list[RolloutEvidence] = []
             for attempt in range(k):
                 _check_cancelled(should_cancel)
                 result = _run_once(task, make_env, runtime)
                 usages.append(result.worker_usage)
+                attempts.append(_rollout_evidence(result))
                 _check_cancelled(should_cancel)
                 verdict = judge.score(
                     task.instruction, result.answer, result.transcript(), task.gold
@@ -157,9 +179,10 @@ def evaluate_with_env(
                 mean_fraction=fmean(v.fraction for v in verdicts),
                 passes=k,
                 verdicts=verdicts,
+                attempts=attempts,
             )
     else:
-        by_cell, usages = _run_cells_concurrently(
+        by_cell, usages, evidence_by_cell = _run_cells_concurrently(
             tasks,
             make_env,
             runtime,
@@ -171,6 +194,7 @@ def evaluate_with_env(
         )
         for index, task in enumerate(tasks):
             verdicts = by_cell[index * k : (index + 1) * k]  # cells are task-major, attempt-minor
+            attempts = evidence_by_cell[index * k : (index + 1) * k]
             successes = [1.0 if v.passed else 0.0 for v in verdicts]
             per_task[task.task_id] = TaskOutcome(
                 task_id=task.task_id,
@@ -178,6 +202,7 @@ def evaluate_with_env(
                 mean_fraction=fmean(v.fraction for v in verdicts),
                 passes=k,
                 verdicts=verdicts,
+                attempts=attempts,
             )
 
     task_rates = [o.success_rate for o in per_task.values()]
@@ -281,6 +306,34 @@ def _run_once(task: TaskSpec, make_env: EnvFactory, runtime: Runtime) -> RunResu
         env.close()
 
 
+def _rollout_evidence(result: RunResult) -> RolloutEvidence:
+    """Freeze the proposer-facing parts of a run before its environment is gone."""
+    return RolloutEvidence(
+        answer=_bounded_evidence_text(
+            normalize_durable_text(result.answer),
+            _ROLLOUT_ANSWER_CHARS,
+            label="answer",
+        ),
+        transcript=_bounded_evidence_text(
+            normalize_durable_text(result.transcript()),
+            _ROLLOUT_EVIDENCE_CHARS,
+            label="trace",
+        ),
+        stop_reason=result.stop_reason,
+        turns=result.turns,
+    )
+
+
+def _bounded_evidence_text(content: str, limit: int, *, label: str) -> str:
+    """Retain the beginning and terminal behavior without unbounded report memory."""
+    if len(content) <= limit:
+        return content
+    head = limit // 2
+    tail = limit - head
+    omitted = len(content) - limit
+    return f"{content[:head]}\n... ({omitted} {label} characters omitted) ...\n{content[-tail:]}"
+
+
 def _run_cells_concurrently(
     tasks: list[TaskSpec],
     make_env: EnvFactory,
@@ -291,7 +344,7 @@ def _run_cells_concurrently(
     concurrency: int,
     on_progress: Callable[[str, int, GoldVerdict], None] | None,
     should_cancel: Callable[[], bool] | None,
-) -> tuple[list[GoldVerdict], list[TokenUsage | None]]:
+) -> tuple[list[GoldVerdict], list[TokenUsage | None], list[RolloutEvidence]]:
     """Run every (task, attempt) cell on a thread pool; verdicts return in cell order.
 
     Cell order is task-major, attempt-minor — the exact order the sequential loop visits — so the
@@ -306,18 +359,21 @@ def _run_cells_concurrently(
     """
     cells = [(task, attempt) for task in tasks for attempt in range(k)]
     if not cells:
-        return [], []
+        return [], [], []
     max_workers = len(cells) if concurrency == 0 else min(concurrency, len(cells))
     slots: list[GoldVerdict | None] = [None] * len(cells)
     usage_slots: list[TokenUsage | None] = [None] * len(cells)
+    evidence_slots: list[RolloutEvidence | None] = [None] * len(cells)
 
-    def run_cell(task: TaskSpec) -> tuple[GoldVerdict, TokenUsage | None]:
+    def run_cell(
+        task: TaskSpec,
+    ) -> tuple[GoldVerdict, TokenUsage | None, RolloutEvidence]:
         _check_cancelled(should_cancel)
         result = _run_once(task, make_env, runtime)
         _check_cancelled(should_cancel)
         verdict = judge.score(task.instruction, result.answer, result.transcript(), task.gold)
         _check_cancelled(should_cancel)
-        return verdict, result.worker_usage
+        return verdict, result.worker_usage, _rollout_evidence(result)
 
     pool = ThreadPoolExecutor(max_workers=max_workers)
     try:
@@ -331,9 +387,12 @@ def _run_cells_concurrently(
             _check_cancelled(should_cancel)
             for future in sorted(done, key=futures.__getitem__):
                 index = futures[future]
-                verdict, usage = future.result()  # a rollout/judge exception propagates here
+                verdict, usage, evidence = (
+                    future.result()
+                )  # a rollout/judge exception propagates here
                 slots[index] = verdict
                 usage_slots[index] = usage
+                evidence_slots[index] = evidence
                 if on_progress is not None:
                     task, attempt = cells[index]
                     on_progress(task.task_id, attempt + 1, verdict)
@@ -369,11 +428,15 @@ def _run_cells_concurrently(
     else:
         pool.shutdown(wait=True)
     verdicts: list[GoldVerdict] = []
-    for slot in slots:
+    attempts: list[RolloutEvidence] = []
+    for slot, evidence in zip(slots, evidence_slots, strict=True):
         if slot is None:  # pragma: no cover - every future completed, or we raised above
             raise RuntimeError("a cell completed without producing a verdict")
+        if evidence is None:  # pragma: no cover - same future produced both values atomically
+            raise RuntimeError("a cell completed without preserving rollout evidence")
         verdicts.append(slot)
-    return verdicts, usage_slots
+        attempts.append(evidence)
+    return verdicts, usage_slots, attempts
 
 
 def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:

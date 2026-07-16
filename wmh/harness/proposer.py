@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -14,6 +15,8 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta
 from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import Provider, ToolCallingProvider
+
+_CONTEXT_CONTENT_CHUNK_CHARS = 12_000
 
 
 class AgentProject(Protocol):
@@ -113,6 +116,10 @@ class ProjectDeltaProposer:
         self._agent = agent
         self._provider = provider
         self._round = 0
+        self._evaluation_dirs: dict[str, str] = {}
+        self._proposal_files: dict[str, str] = {}
+        self._parent_manifests: dict[str, JsonObject] = {}
+        self._should_cancel: Callable[[], bool] | None = None
 
     def propose_batch(
         self,
@@ -127,18 +134,79 @@ class ProjectDeltaProposer:
         """Run one meta-agent turn that writes ``count`` proposal files."""
         if count < 1:
             raise ValueError(f"proposal count must be positive, got {count}")
+        self._should_cancel = should_cancel
         _check_cancelled(should_cancel)
         self._round += 1
         round_dir = f"round-{self._round:04d}"
         context_dir = f"context/{round_dir}"
         proposal_dir = f"proposals/{round_dir}"
-        self._project.write_text(
-            f"{context_dir}/parent.json", json.dumps(_parent_context(parent), indent=2)
+        parent_context = self._parent_manifests.get(parent.doc_hash)
+        if parent_context is None:
+            parent_context = _materialize_parent(
+                self._project,
+                parent,
+                context_dir=f"parents/{parent.doc_hash}",
+                should_cancel=should_cancel,
+            )
+            self._parent_manifests[parent.doc_hash] = parent_context
+        _write_project_text(
+            self._project,
+            f"{context_dir}/parent.json",
+            json.dumps(parent_context, indent=2),
+            should_cancel=should_cancel,
         )
-        self._project.write_text(f"{context_dir}/evidence.md", evidence)
-        self._project.write_text(
+        evidence_context = _materialize_context_content(
+            self._project,
+            evidence,
+            directory=f"{context_dir}/evidence",
+            extension=".md",
+            should_cancel=should_cancel,
+        )
+        _write_project_text(
+            self._project,
+            f"{context_dir}/evidence.json",
+            json.dumps(
+                {
+                    "kind": "failure-evidence",
+                    "format": "markdown",
+                    **evidence_context,
+                },
+                indent=2,
+            ),
+            should_cancel=should_cancel,
+        )
+        history_content = json.dumps(
+            [
+                _project_history_entry(
+                    delta,
+                    proposal_file=self._proposal_files.get(delta.delta_id),
+                    evaluation_dir=self._evaluation_dirs.get(delta.delta_id),
+                    workspace=self._project.workspace,
+                )
+                for delta in history
+            ],
+            indent=2,
+        )
+        history_context = _materialize_context_content(
+            self._project,
+            history_content,
+            directory=f"{context_dir}/history",
+            extension=".json.part",
+            should_cancel=should_cancel,
+        )
+        _write_project_text(
+            self._project,
             f"{context_dir}/history.json",
-            json.dumps([delta.model_dump(mode="json") for delta in history], indent=2),
+            json.dumps(
+                {
+                    "kind": "judged-history",
+                    "format": "json-array",
+                    "entry_count": len(history),
+                    **history_context,
+                },
+                indent=2,
+            ),
+            should_cancel=should_cancel,
         )
         request = _project_request(
             workspace=self._project.workspace,
@@ -146,7 +214,12 @@ class ProjectDeltaProposer:
             proposal_dir=proposal_dir,
             count=count,
         )
-        self._project.write_text(f"{context_dir}/REQUEST.md", request)
+        _write_project_text(
+            self._project,
+            f"{context_dir}/REQUEST.md",
+            request,
+            should_cancel=should_cancel,
+        )
         run_error: Exception | None = None
         try:
             self._project.run(
@@ -164,7 +237,11 @@ class ProjectDeltaProposer:
         proposals: list[HarnessDelta | ProposalFailure | None] = []
         for index in range(1, count + 1):
             try:
-                raw = self._project.read_text(f"{proposal_dir}/proposal-{index:02d}.json")
+                raw = _read_project_text(
+                    self._project,
+                    f"{proposal_dir}/proposal-{index:02d}.json",
+                    should_cancel=should_cancel,
+                )
             except Exception:  # noqa: BLE001 - a missing output is one unusable proposal
                 if run_error is None:
                     proposals.append(None)
@@ -187,8 +264,49 @@ class ProjectDeltaProposer:
                 if proposal is None and run_error is not None:
                     proposals.append(ProposalFailure(reason=str(run_error)))
                 else:
-                    proposals.append(_stamp_project_preconditions(parent, proposal))
+                    stamped = _stamp_project_preconditions(parent, proposal)
+                    proposals.append(stamped)
+                    if stamped is not None:
+                        self._proposal_files.setdefault(
+                            stamped.delta_id,
+                            f"{self._project.workspace}/{proposal_dir}/proposal-{index:02d}.json",
+                        )
+                        self._evaluation_dirs.setdefault(
+                            stamped.delta_id,
+                            f"evaluations/{round_dir}/proposal-{index:02d}",
+                        )
         return proposals
+
+    def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+        """Persist one candidate's judged evidence for later project-agent rounds."""
+        should_cancel = self._should_cancel
+        _check_cancelled(should_cancel)
+        root = self._evaluation_dirs.get(
+            delta.delta_id,
+            f"evaluations/by-delta/{delta.delta_id}",
+        )
+        context = _materialize_context_content(
+            self._project,
+            content,
+            directory=f"{root}/{stage}",
+            extension=".md",
+            should_cancel=should_cancel,
+        )
+        _write_project_text(
+            self._project,
+            f"{root}/{stage}.json",
+            json.dumps(
+                {
+                    "kind": "candidate-evaluation",
+                    "stage": stage,
+                    "delta_id": delta.delta_id,
+                    "format": "markdown",
+                    **context,
+                },
+                indent=2,
+            ),
+            should_cancel=should_cancel,
+        )
 
 
 def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
@@ -197,23 +315,213 @@ def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
         raise HarnessSearchCancelled("harness search cancelled")
 
 
-def _parent_context(parent: HarnessDoc) -> JsonObject:
-    """Serialize a parent with the computed identities a project agent must copy."""
+def _write_project_text(
+    project: AgentProject,
+    path: str,
+    content: str,
+    *,
+    should_cancel: Callable[[], bool] | None,
+) -> None:
+    """Make each E2B filesystem RPC a cancellation boundary."""
+    _check_cancelled(should_cancel)
+    project.write_text(path, content)
+    _check_cancelled(should_cancel)
+
+
+def _read_project_text(
+    project: AgentProject,
+    path: str,
+    *,
+    should_cancel: Callable[[], bool] | None,
+) -> str:
+    """Read one project output without hiding cancellation behind the next round."""
+    _check_cancelled(should_cancel)
+    content = project.read_text(path)
+    _check_cancelled(should_cancel)
+    return content
+
+
+def _materialize_parent(
+    project: AgentProject,
+    parent: HarnessDoc,
+    *,
+    context_dir: str,
+    should_cancel: Callable[[], bool] | None = None,
+) -> JsonObject:
+    """Write a bounded manifest plus individually readable parent-surface chunks.
+
+    A real pi document is hundreds of kilobytes, while one project ``read_file`` observation is
+    intentionally capped. Putting every surface inline in one parent.json therefore hid most of
+    the harness from the proposer. The manifest remains small and points to ordered chunks below
+    the read cap; concatenating a surface's chunks reconstructs its exact content.
+    """
+    surface_index: list[JsonObject] = []
+    for index, surface in enumerate(parent.surfaces, 1):
+        surface_dir = f"{context_dir}/parent-surfaces/surface-{index:03d}"
+        content_context = _materialize_context_content(
+            project,
+            surface.content,
+            directory=surface_dir,
+            extension=".txt",
+            include_contract=False,
+            should_cancel=should_cancel,
+        )
+        source_file: str | None = None
+        if surface.path is not None:
+            source_relative = f"{context_dir}/parent-source/{surface.path}"
+            _write_project_text(
+                project,
+                source_relative,
+                surface.content,
+                should_cancel=should_cancel,
+            )
+            source_file = f"{project.workspace}/{source_relative}"
+        entry: JsonObject = {
+            "id": surface.id,
+            "kind": surface.kind.value,
+            "content_hash": surface.content_hash,
+            **content_context,
+        }
+        if surface.budget is not None:
+            entry["budget"] = surface.budget
+        if surface.path is not None:
+            entry["path"] = surface.path
+            entry["source_file"] = source_file
+        surface_manifest_relative = f"{surface_dir}/manifest.json"
+        _write_project_text(
+            project,
+            surface_manifest_relative,
+            json.dumps(entry, indent=2),
+            should_cancel=should_cancel,
+        )
+        surface_index.append(
+            {
+                "id": surface.id,
+                "kind": surface.kind.value,
+                "content_hash": surface.content_hash,
+                "manifest_file": f"{project.workspace}/{surface_manifest_relative}",
+            }
+        )
+    index_content = json.dumps(surface_index, indent=2)
+    index_context = _materialize_context_content(
+        project,
+        index_content,
+        directory=f"{context_dir}/parent-surface-index",
+        extension=".json.part",
+        should_cancel=should_cancel,
+    )
+    index_manifest_relative = f"{context_dir}/parent-surfaces.json"
+    _write_project_text(
+        project,
+        index_manifest_relative,
+        json.dumps(
+            {
+                "kind": "parent-surface-index",
+                "format": "json-array",
+                "entry_count": len(surface_index),
+                **index_context,
+            },
+            indent=2,
+        ),
+        should_cancel=should_cancel,
+    )
     return {
         "name": parent.name,
         "version": parent.version,
         "doc_hash": parent.doc_hash,
-        "surfaces": [
-            {
-                "id": surface.id,
-                "kind": surface.kind.value,
-                "content": surface.content,
-                "content_hash": surface.content_hash,
-                "budget": surface.budget,
-                "path": surface.path,
-            }
-            for surface in parent.surfaces
-        ],
+        "source_root": f"{project.workspace}/{context_dir}/parent-source",
+        "surface_count": len(surface_index),
+        "surface_index_manifest": f"{project.workspace}/{index_manifest_relative}",
+        "content_contract": (
+            "Read surface_index_manifest, then concatenate its content_files and parse that JSON "
+            "array. Each index entry points to one independently readable surface manifest. "
+            "Within a surface manifest, concatenate content_files exactly to reconstruct the "
+            "surface. Pathful code is also mirrored beneath source_root at its exact path."
+        ),
+    }
+
+
+def _materialize_context_content(
+    project: AgentProject,
+    content: str,
+    *,
+    directory: str,
+    extension: str,
+    include_contract: bool = True,
+    should_cancel: Callable[[], bool] | None = None,
+) -> JsonObject:
+    """Write exact ordered chunks that each fit in one project ``read_file`` result."""
+    chunk_count = max(1, math.ceil(len(content) / _CONTEXT_CONTENT_CHUNK_CHARS))
+    width = max(3, len(str(chunk_count)))
+    content_files: list[str] = []
+    for chunk_index in range(chunk_count):
+        start = chunk_index * _CONTEXT_CONTENT_CHUNK_CHARS
+        chunk = content[start : start + _CONTEXT_CONTENT_CHUNK_CHARS]
+        relative = (
+            f"{directory}/part-{chunk_index + 1:0{width}d}-of-{chunk_count:0{width}d}{extension}"
+        )
+        _write_project_text(
+            project,
+            relative,
+            chunk,
+            should_cancel=should_cancel,
+        )
+        content_files.append(f"{project.workspace}/{relative}")
+    result: JsonObject = {
+        "content_length": len(content),
+        "content_files": content_files,
+    }
+    if include_contract:
+        result["content_contract"] = (
+            "Read content_files in listed order and concatenate them exactly. Each file is "
+            "independently readable without truncation."
+        )
+    return result
+
+
+def _project_history_entry(
+    delta: HarnessDelta,
+    *,
+    proposal_file: str | None,
+    evaluation_dir: str | None,
+    workspace: str,
+) -> JsonObject:
+    """Compact judged metadata while raw proposals retain exact replacement payloads.
+
+    Re-serializing every prior full code surface into every later round makes persistent history
+    quadratic in run length. The project already owns each raw proposal file, so history carries
+    queryable identities, rationales, sizes, and verdicts plus a direct pointer to the exact bytes.
+    """
+    ops: list[JsonObject] = []
+    for op in delta.ops:
+        item: JsonObject = {
+            "op": op.op,
+            "surface_id": op.surface_id,
+            "rationale": op.rationale[:2_000],
+            "content_length": len(op.content) if op.content is not None else 0,
+        }
+        if op.kind is not None:
+            item["kind"] = op.kind.value
+        if op.path is not None:
+            item["path"] = op.path
+        if op.budget is not None:
+            item["budget"] = op.budget
+        ops.append(item)
+    return {
+        "delta_id": delta.delta_id,
+        "parent_doc_hash": delta.parent_doc_hash,
+        "child_doc_hash": delta.child_doc_hash,
+        "trigger": delta.trigger.model_dump(mode="json"),
+        "preconditions": dict(delta.preconditions),
+        "expected_effect": delta.expected_effect[:2_000],
+        "ops": ops,
+        "verdict": delta.verdict.model_dump(mode="json") if delta.verdict is not None else None,
+        "proposal_file": proposal_file,
+        "evaluation_dir": (f"{workspace}/{evaluation_dir}" if evaluation_dir is not None else None),
+        "content_contract": (
+            "Exact op content remains in proposal_file; this entry intentionally omits it to "
+            "keep cumulative judged history linear and fast."
+        ),
     }
 
 
@@ -247,10 +555,16 @@ def _project_request(*, workspace: str, context_dir: str, proposal_dir: str, cou
     return f"""Produce exactly {count} independent harness proposals for this optimization round.
 
 Read:
-- parent document: {absolute_context}/parent.json
-- failure evidence: {absolute_context}/evidence.md
-- judged history: {absolute_context}/history.json
+- parent manifest: {absolute_context}/parent.json
+  - follow surface_index_manifest to find every independently readable surface manifest
+  - each surface manifest lists ordered content_files; concatenate them to inspect exact content
+  - pathful code is also mirrored under source_root with exact source_file paths for shell search
+- failure evidence manifest: {absolute_context}/evidence.json
+  - read its content_files in listed order and concatenate them exactly
+- judged history manifest: {absolute_context}/history.json
+  - read its content_files in listed order, concatenate them exactly, then parse the JSON array
 - earlier raw proposals, when useful: {workspace}/proposals/
+- earlier candidate evaluation manifests and traces: {workspace}/evaluations/
 
 Write exactly these files, without changing earlier rounds:
 {outputs}

@@ -18,7 +18,7 @@ from wmh.evals.closed_loop import (
     evaluate_closed_loop,
     evaluate_with_env,
 )
-from wmh.evals.gold import GoldJudge, GoldVerdict
+from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.e2b_sandbox import SandboxCleanupError
 from wmh.harness.environment import AgentEnvironment, is_env_action
@@ -80,7 +80,12 @@ def test_closed_loop_scores_success_over_k_passes() -> None:
     report = evaluate_closed_loop(tasks, _wm(provider), provider, GoldJudge(provider), k=3)
     assert report.k == 3
     assert report.success_rate == 1.0
-    assert report.per_task["q1"].passes == 3
+    outcome = report.per_task["q1"]
+    assert outcome.passes == 3
+    assert len(outcome.attempts) == 3
+    assert all(attempt.answer == "the answer is 42" for attempt in outcome.attempts)
+    assert all(attempt.stop_reason == StopReason.SUBMITTED for attempt in outcome.attempts)
+    assert all("submit" in attempt.transcript for attempt in outcome.attempts)
 
 
 def test_closed_loop_reports_failure_when_judge_rejects() -> None:
@@ -203,6 +208,87 @@ def test_concurrent_report_matches_sequential() -> None:
     assert sequential.per_task["b-fail"].success_rate == 0.0
     for concurrency in (0, 2):
         assert run(concurrency).model_dump() == sequential.model_dump()
+
+
+def test_rollout_evidence_is_bounded_without_losing_trace_tail() -> None:
+    class LongTraceRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            del environment
+            steps = [
+                Step(
+                    action=Action(
+                        kind=ActionKind.TOOL_CALL,
+                        name="bash",
+                        arguments={"command": f"step-{index}"},
+                    ),
+                    observation=Observation(content=f"obs-{index}-" + ("x" * 2_000)),
+                    state_before=EnvState(),
+                    task=instruction,
+                )
+                for index in range(30)
+            ]
+            return RunResult(
+                task_id=task_id,
+                steps=steps,
+                stop_reason=StopReason.SUBMITTED,
+                answer="pass",
+                turns=len(steps),
+            )
+
+    report = evaluate_with_env(
+        [TaskSpec(task_id="a-pass", instruction="long", gold=["g"])],
+        lambda _task: _StaticEnv(),
+        LongTraceRuntime(),
+        _AnswerJudge(),
+        k=1,
+    )
+
+    trace = report.per_task["a-pass"].attempts[0].transcript
+    assert len(trace) < 13_000
+    assert "trace characters omitted" in trace
+    assert "step-0" in trace
+    assert "step-29" in trace
+
+
+def test_rollout_and_judge_evidence_is_safe_for_utf8_project_files() -> None:
+    class InvalidTextRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            del instruction, environment
+            return RunResult(
+                task_id=task_id,
+                stop_reason=StopReason.SUBMITTED,
+                answer="before\x00after",
+                steps=[
+                    Step(
+                        action=Action(kind=ActionKind.MESSAGE, content="before\ud800after"),
+                        observation=Observation(content="before\udcffafter"),
+                    )
+                ],
+            )
+
+    report = evaluate_with_env(
+        [TaskSpec(task_id="t", instruction="i", gold=["g"])],
+        lambda _task: _StaticEnv(),
+        InvalidTextRuntime(),
+        _AnswerJudge(),
+        k=1,
+    )
+
+    replacement = "\N{REPLACEMENT CHARACTER}"
+    attempt = report.per_task["t"].attempts[0]
+    assert attempt.answer == f"before{replacement}after"
+    assert "\x00" not in attempt.transcript
+    assert not any(0xD800 <= ord(char) <= 0xDFFF for char in attempt.transcript)
+
+    assertion = AssertionResult(
+        assertion="before\x00after",
+        passed=False,
+        why="before\ud800after",
+    )
+    verdict = GoldVerdict(rationale="before\udcffafter", assertions=[assertion])
+    assert verdict.assertions[0].assertion == f"before{replacement}after"
+    assert verdict.assertions[0].why == f"before{replacement}after"
+    assert verdict.rationale == f"before{replacement}after"
 
 
 def test_concurrency_zero_overlaps_all_cells() -> None:

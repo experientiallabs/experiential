@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from wmh.providers.base import DEFAULT_MAX_TOKENS, Message, ProviderConfig, ProviderKind
+from wmh.providers.base import (
+    DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+)
 from wmh.providers.openai import OpenAIProvider
 
 
@@ -28,6 +34,22 @@ class _FakeChatResponse:
     def __init__(self, content: str, usage: _FakeUsage) -> None:
         self.choices = [_FakeChoice(content)]
         self.usage = usage
+
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        assert mode == "json"
+        return {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": self.choices[0].message.content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": self.usage.prompt_tokens,
+                "completion_tokens": self.usage.completion_tokens,
+            },
+        }
 
 
 class _FakeChatCompletions:
@@ -223,3 +245,32 @@ def test_custom_endpoint_forwards_temperature_but_openai_does_not(
         monkeypatch.setattr(provider, "_get_client", lambda fake=fake: fake)
         provider.complete("sys", [Message(role="user", content="hi")], temperature=0.3)
         assert ("temperature" in chat.last_kwargs) is expects_temperature
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expects_temperature"),
+    [(None, False), ("http://localhost:8001/v1", True)],
+)
+def test_structured_chat_applies_temperature_capability_before_wire(
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str | None,
+    expects_temperature: bool,
+) -> None:
+    provider = OpenAIProvider(
+        ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5", endpoint=endpoint)
+    )
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(1, 1)))
+    fake = _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([])))
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "go"}],
+                "temperature": 0.3,
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
+    assert ("temperature" in chat.last_kwargs) is expects_temperature

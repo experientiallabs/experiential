@@ -28,6 +28,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from wmh.core.text import validate_durable_text
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 
 
@@ -42,6 +43,15 @@ class FailureSignature(BaseModel):
     mechanism: str  # e.g. the shared unmet assertion, or "none: all tasks pass"
     task_ids: list[str] = Field(default_factory=list)  # the failing tasks exhibiting it
     unmet_assertions: list[str] = Field(default_factory=list)  # deduped, order-stable
+
+    @model_validator(mode="after")
+    def _validate_text(self) -> FailureSignature:
+        validate_durable_text(self.mechanism, field="failure mechanism")
+        for task_id in self.task_ids:
+            validate_durable_text(task_id, field="failure task id")
+        for assertion in self.unmet_assertions:
+            validate_durable_text(assertion, field="failure assertion")
+        return self
 
 
 class SurfaceOp(BaseModel):
@@ -60,6 +70,9 @@ class SurfaceOp(BaseModel):
 
     @model_validator(mode="after")
     def _validate_shape(self) -> SurfaceOp:
+        if self.content is not None:
+            validate_durable_text(self.content, field=f"{self.surface_id!r} operation content")
+        validate_durable_text(self.rationale, field=f"{self.surface_id!r} operation rationale")
         if self.op == "add" and self.kind is None:
             raise ValueError(f"add of {self.surface_id!r} must declare a kind")
         if self.op in ("add", "replace") and self.content is None:
@@ -77,10 +90,18 @@ class GateRecord(BaseModel):
     """The acceptance verdict, filled at evaluation time and persisted on the delta."""
 
     suite_delta: float = 0.0  # regression suite: child - champion (tier 1; >= 0 to pass)
+    suite_fraction_delta: float = 0.0  # assertion credit; vetoes only when suite success ties
     full_delta: float = 0.0  # full split: child - best seen (tier 2; >= 0 to pass)
+    full_fraction_delta: float = 0.0  # assertion credit; vetoes only when full success ties
     holdout_delta: float | None = None  # held-out split (tier 3; None when no holdout given)
+    holdout_fraction_delta: float | None = None  # dense held-out signal when success ties
     accepted: bool
     reason: str  # accept/reject reasoning, incl. whether `expected_effect` came true
+
+    @model_validator(mode="after")
+    def _validate_text(self) -> GateRecord:
+        validate_durable_text(self.reason, field="gate reason")
+        return self
 
 
 class HarnessDelta(BaseModel):
@@ -101,6 +122,11 @@ class HarnessDelta(BaseModel):
     expected_effect: str  # falsifiable: e.g. "the trigger cluster's tasks flip to pass"
     child_doc_hash: str | None = None  # set by apply_delta
     verdict: GateRecord | None = None  # set by the gate; None until evaluated
+
+    @model_validator(mode="after")
+    def _validate_text(self) -> HarnessDelta:
+        validate_durable_text(self.expected_effect, field="delta expected effect")
+        return self
 
 
 def compute_delta_id(parent_doc_hash: str, ops: list[SurfaceOp]) -> str:

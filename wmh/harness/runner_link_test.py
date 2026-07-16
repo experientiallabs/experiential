@@ -17,6 +17,7 @@ from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness import runner_link as runner_link_module
 from wmh.harness.runner_link import RunnerLink, SocketChannel, read_frame, write_frame
 from wmh.harness.runtime import RuntimeCancelled, StopReason
+from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
 
@@ -184,6 +185,7 @@ def test_episode_start_carries_task_tools_and_limits() -> None:
         files={"src/agent.ts": "// a"},
         max_turns=7,
         max_output_tokens=16384,
+        temperature=0.25,
         episode_timeout_s=12.5,
     ).run("t1", "do it", _Env(), tools=_tools())
     start = _sent(ch, "episode_start")
@@ -193,6 +195,7 @@ def test_episode_start_carries_task_tools_and_limits() -> None:
     assert s["files"] == {"src/agent.ts": "// a"}
     assert s["max_turns"] == 7
     assert s["max_output_tokens"] == 16384
+    assert s["temperature"] == 0.25
     assert s["episode_timeout_s"] == 12.5
     assert {t["name"] for t in s["tools"]} >= {"bash", "submit"}
 
@@ -245,6 +248,65 @@ def test_llm_request_answered_via_worker_fn() -> None:
     resp = _sent(ch, "llm_response")[0]
     assert resp["req_id"] == 7
     assert resp["completion"]["choices"][0]["message"]["content"] == "hi"
+
+
+def test_harness_temperature_overrides_the_runner_request_before_the_worker_call() -> None:
+    calls: list[ChatRequest] = []
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        calls.append(request)
+        return _completion()
+
+    ch = _FakeChannel(
+        [
+            {
+                "type": "llm_request",
+                "req_id": 1,
+                "openai_body": {"messages": [], "temperature": 1.75},
+            },
+            {"type": "done", "answer": "ok"},
+        ]
+    )
+    RunnerLink(ch, worker_fn=worker, temperature=0.35).run("t1", "x", _Env(), tools=_tools())
+
+    assert [request.temperature for request in calls] == [0.35]
+
+
+def test_skill_library_implicitly_adds_and_serves_read_skill_without_env_budget() -> None:
+    skill = Skill(name="count-words", description="count words", body="wc -w <path>")
+    script = [
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "read_skill",
+            "arguments": {"name": "count-words"},
+        },
+        {
+            "type": "tool_request",
+            "req_id": 2,
+            "name": "read_skill",
+            "arguments": {"name": "ghost"},
+        },
+        {"type": "done", "answer": "ok"},
+    ]
+    channel = _FakeChannel(script)
+    env = _Env()
+    result = RunnerLink(
+        channel,
+        tools=_tools(),
+        worker_fn=lambda request: _completion(),
+        skills=SkillLibrary([skill]),
+        max_env_actions=0,
+    ).run("t1", "x", env)
+
+    advertised = {tool["name"] for tool in _sent(channel, "episode_start")[0]["tools"]}
+    assert "read_skill" in advertised
+    responses = _sent(channel, "tool_response")
+    assert responses[0]["content"] == "wc -w <path>" and responses[0]["is_error"] is False
+    assert responses[1]["content"] == "no skill named 'ghost'"
+    assert responses[1]["is_error"] is True
+    assert [step.action.name for step in result.steps] == ["read_skill", "read_skill"]
+    assert env.actions == []
 
 
 def test_worker_fn_error_is_reported_not_crashed() -> None:

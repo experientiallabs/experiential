@@ -6,11 +6,11 @@ import pytest
 from llm_waterfall import ChatResponse
 
 from wmh.agents import project as project_module
-from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
 from wmh.harness import e2b_sandbox as e2b_sandbox_module
+from wmh.harness.doc import TOOL_POLICY_ID, HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.runtime import HarnessSearchCancelled
@@ -37,18 +37,23 @@ class _Files:
 
 
 class _Output:
-    stdout = ""
-    stderr = ""
-    exit_code = 0
+    def __init__(self, *, stdout: str = "", stderr: str = "", exit_code: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
 
 
 class _Commands:
-    def __init__(self) -> None:
+    def __init__(self, files: _Files | None = None) -> None:
         self.runs: list[str] = []
+        self.files = files
 
     def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
         del background, kwargs
         self.runs.append(cmd)
+        if cmd.startswith("find ") and self.files is not None:
+            paths = sorted(self.files.values)
+            return _Output(stdout="\0".join(paths) + ("\0" if paths else ""))
         return _Output()
 
     def send_stdin(self, pid: int, data: str, request_timeout: float | None = None) -> object:
@@ -59,11 +64,15 @@ class _Commands:
 class _Sandbox:
     def __init__(self) -> None:
         self.files = _Files()
-        self.commands = _Commands()
+        self.commands = _Commands(self.files)
         self.killed = False
+        self.network_updates: list[dict[str, object]] = []
 
     def set_timeout(self, timeout: int) -> None:
         del timeout
+
+    def update_network(self, network: dict[str, object]) -> None:
+        self.network_updates.append(network)
 
     def kill(self, request_timeout: float | None = None) -> object:
         del request_timeout
@@ -196,6 +205,34 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     ]
     project.close()
     assert channel.closed is True
+
+
+def test_owned_project_disables_internet_before_the_agent_turn() -> None:
+    order: list[str] = []
+
+    class _OrderedSandbox(_Sandbox):
+        def update_network(self, network: dict[str, object]) -> None:
+            super().update_network(network)
+            order.append("network-locked")
+
+    class _OrderedChannel(_Channel):
+        def send(self, frame: JsonObject) -> None:
+            if frame["type"] == "session_start":
+                order.append("session-start")
+            super().send(frame)
+
+    sandbox = _OrderedSandbox()
+    channel = _OrderedChannel()
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: channel,
+    )
+
+    project.run(meta_agent(), _Provider(), "produce a result", timeout=1)
+
+    assert sandbox.network_updates == [{"allow_internet_access": False}]
+    assert order[:2] == ["network-locked", "session-start"]
+    project.close()
 
 
 def test_project_retries_one_context_write_after_e2b_disconnect() -> None:
@@ -1017,17 +1054,105 @@ def test_agent_file_tools_reject_paths_outside_the_project() -> None:
         assert "escapes project workspace" in outcome.content
 
 
-def test_project_rejects_agents_with_uncontained_tools() -> None:
-    """Tool policy is enforced before a shell-enabled project session can start."""
-    project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
+def test_project_bash_is_bounded_without_rescanning_the_whole_project() -> None:
+    """Bash stays in E2B and does not add one file-read RPC per growing context artifact."""
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    project.write_text("old.txt", "remove me")
 
-    with pytest.raises(ValueError, match="uncontained tools: bash"):
-        project.run(default_agent(), _Provider(), "escape", timeout=1)
+    class _BashCommands(_Commands):
+        def __init__(self) -> None:
+            super().__init__()
+            self.timeouts: list[object] = []
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del background
+            self.runs.append(cmd)
+            self.timeouts.append(kwargs.get("timeout"))
+            assert cmd.startswith("cd /home/user/project && bash -lc ")
+            assert "generate-output" in cmd
+            assert "timeout --kill-after=3s 50s" in cmd
+            assert "node -e" in cmd
+            sandbox.files.values.pop("/home/user/project/old.txt")
+            sandbox.files.values["/home/user/project/generated.txt"] = "generated"
+            return _Output(stdout="x" * 20_000, stderr="warning")
+
+    commands = _BashCommands()
+    sandbox.commands = commands
+    emitted: list[tuple[str, str]] = []
 
     outcome = project._execute_tool(
         "bash",
-        {"command": "cat /home/user/runner.js"},
-        lambda stream, data: None,
+        {"command": "generate-output"},
+        lambda stream, data: emitted.append((stream, data)),
     )
+
+    assert len(commands.runs) == 1
+    assert commands.timeouts == [60.0]
+    assert outcome.is_error is False
+    assert outcome.truncated is False
+    assert "13000 characters truncated by Bash boundary" in outcome.content
+    assert emitted[0][0] == "stdout"
+    assert len(emitted[0][1]) < 7_100
+    assert emitted[1] == ("stderr", "warning")
+    # Host-mediated files remain the recovery authority. A Bash-created scratch file is readable
+    # in the live sandbox and becomes mirrored only if the agent explicitly reads it.
+    assert project._file_contents == {"old.txt": "remove me"}  # noqa: SLF001
+    assert project.read_text("generated.txt") == "generated"
+
+
+def test_project_bash_surfaces_nonzero_exit_without_a_project_rescan() -> None:
+    """E2B command exceptions retain streams and status without O(project files) reads."""
+
+    class _CommandError(RuntimeError):
+        stdout = "partial output"
+        stderr = "command failed"
+        exit_code = 7
+
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    class _FailingCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del background, kwargs
+            self.runs.append(cmd)
+            sandbox.files.values["/home/user/project/partial.txt"] = "kept"
+            raise _CommandError("non-zero")
+
+    commands = _FailingCommands()
+    sandbox.commands = commands
+    emitted: list[tuple[str, str]] = []
+
+    outcome = project._execute_tool(
+        "bash", {"command": "fail"}, lambda stream, data: emitted.append((stream, data))
+    )
+
     assert outcome.is_error is True
-    assert outcome.content == "tool 'bash' not available"
+    assert outcome.content == "partial outputcommand failed\n[exit 7]"
+    assert emitted == [("stdout", "partial output"), ("stderr", "command failed")]
+    assert all(not cmd.startswith("find ") for cmd in commands.runs)
+    assert project.read_text("partial.txt") == "kept"
+
+
+def test_host_guard_preserves_the_sandbox_stream_omission_count() -> None:
+    content = "a" * 3_500 + "\n... 13000 bytes truncated in sandbox ...\n" + "z" * 3_500
+
+    assert project_module._bounded_bash_stream(content) == content  # noqa: SLF001
+
+
+def test_project_rejects_agents_with_uncontained_tools() -> None:
+    """The project still rejects capabilities outside its isolated tool allowlist."""
+    base = meta_agent()
+    uncontained = HarnessDoc(
+        name="uncontained",
+        surfaces=[
+            surface.model_copy(update={"content": "read_skill\nsubmit"})
+            if surface.id == TOOL_POLICY_ID
+            else surface
+            for surface in base.surfaces
+        ],
+    )
+    project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
+
+    with pytest.raises(ValueError, match="uncontained tools: read_skill"):
+        project.run(uncontained, _Provider(), "escape", timeout=1)

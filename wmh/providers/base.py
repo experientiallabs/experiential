@@ -105,6 +105,29 @@ class ProviderConfig(BaseModel):
             fallback=self.chat_max_tokens_field,
         )
 
+    def resolved_chat_forward_temperature(self) -> bool:
+        """Return whether this configured model accepts chat temperature."""
+        # Local import avoids a module cycle: the model catalog imports ProviderKind above.
+        from wmh.providers.models import resolve_provider_model
+
+        # Explicit OpenAI-compatible endpoints are user-owned sampling servers even when their
+        # configured model label happens to match a built-in reasoning model.
+        if self.kind is ProviderKind.OPENAI and self.endpoint is not None:
+            return True
+        model = self.model_type or self.model
+        return resolve_provider_model(self.kind, model).forward_temperature
+
+
+def normalize_chat_temperature(
+    request: ChatRequest,
+    *,
+    forward_temperature: bool,
+) -> ChatRequest:
+    """Apply one model's sampling capability without mutating the provider-neutral request."""
+    if forward_temperature or request.temperature is None:
+        return request
+    return request.model_copy(update={"temperature": None})
+
 
 @runtime_checkable
 class Embedder(Protocol):

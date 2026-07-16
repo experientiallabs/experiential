@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 
-from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
+import pytest
+
+from wmh.evals.closed_loop import ClosedLoopReport, RolloutEvidence, TaskOutcome
+from wmh.evals.gold import AssertionResult, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta, render_evidence
+from wmh.harness.runtime import StopReason
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 
@@ -116,6 +120,38 @@ def test_propose_delta_returns_none_on_garbage() -> None:
     assert propose_delta(parent, trigger, "e", ScriptedProvider(no_kind)) is None
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid_text"),
+    [
+        ("content", "before\x00after"),
+        ("rationale", "before\ud800after"),
+        ("expected_effect", "before\udcffafter"),
+    ],
+)
+def test_parse_delta_rejects_nonpersistent_model_text(field: str, invalid_text: str) -> None:
+    parent = HarnessDoc.baseline("parent")
+    core = parent.surface("prompt:core")
+    assert core is not None
+    payload = {
+        "expected_effect": "t1 passes",
+        "preconditions": {"prompt:core": core.content_hash},
+        "ops": [
+            {
+                "op": "replace",
+                "surface_id": "prompt:core",
+                "content": "safe content",
+                "rationale": "safe rationale",
+            }
+        ],
+    }
+    if field == "expected_effect":
+        payload[field] = invalid_text
+    else:
+        payload["ops"][0][field] = invalid_text
+
+    assert parse_delta(parent, _trigger(), json.dumps(payload)) is None
+
+
 def test_parse_delta_expands_compact_exact_replacement_edits() -> None:
     parent = HarnessDoc.baseline("parent")
     core = parent.surface("prompt:core")
@@ -159,7 +195,61 @@ def test_render_evidence_shows_cluster_tasks_and_unmet_assertions() -> None:
     assert "the file was created" in evidence
     assert "create the file" in evidence
     assert "0.00 over 2 passes" in evidence
-    assert "easy one" not in evidence  # the passing task is not reflection fuel
+    assert "[TARGET] t1" in evidence
+    assert "[other] t2" in evidence
+    assert "easy one" in evidence  # passing behavior remains visible in the compact scorecard
+
+
+def test_render_evidence_includes_execution_trace_answer_and_judge_reason() -> None:
+    report = ClosedLoopReport(
+        label="parent",
+        per_task={
+            "t1": TaskOutcome(
+                task_id="t1",
+                success_rate=0.0,
+                mean_fraction=0.5,
+                passes=1,
+                attempts=[
+                    RolloutEvidence(
+                        answer="I could not verify it",
+                        transcript="[1] tool_call: curl endpoint\n    -> connection reset",
+                        stop_reason=StopReason.SUBMITTED,
+                        turns=2,
+                    )
+                ],
+                verdicts=[
+                    GoldVerdict(
+                        passed=False,
+                        fraction=0.5,
+                        assertions=[
+                            AssertionResult(
+                                assertion="the value was printed",
+                                passed=False,
+                                why="the final answer contained no value",
+                            )
+                        ],
+                    )
+                ],
+            )
+        },
+    )
+    trigger = FailureSignature(
+        mechanism="the value was printed",
+        task_ids=["t1"],
+        unmet_assertions=["the value was printed"],
+    )
+
+    evidence = render_evidence(
+        trigger,
+        report,
+        [TaskSpec(task_id="t1", instruction="fetch the value", gold=["the value was printed"])],
+    )
+
+    assert "assertion_fraction=0.50" in evidence
+    assert "Stop: submitted; turns=2" in evidence
+    assert "I could not verify it" in evidence
+    assert "connection reset" in evidence
+    assert "the final answer contained no value" in evidence
 
 
 def test_all_pass_evidence_asks_for_generalization() -> None:
