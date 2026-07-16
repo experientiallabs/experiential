@@ -2154,3 +2154,26 @@ def test_skipped_proposals_narrate_through_on_note() -> None:
         "iteration 3/3",
     ]
     assert all("proposal unusable" in note for note in notes)
+
+
+def test_dead_notes_precede_final_proposal_records_and_iteration_checkpoint() -> None:
+    """Eager diagnostics precede the batch's ordered records and champion checkpoint."""
+    events: list[str] = []
+
+    result = _run(
+        RoleProvider(meta_reply="truncated garbage that is not json"),
+        proposal_batch_size=2,
+        on_progress=lambda iteration, name, score, changed: events.append(f"progress:{iteration}"),
+        on_note=lambda message: events.append(f"note:{message.split(':', 1)[0]}"),
+        on_proposal=lambda record: events.append(f"proposal:{record.proposal_index}"),
+    )
+
+    assert result.skipped == 2
+    assert events == [
+        "progress:0",
+        "note:iteration 1/1 proposal 1/2",
+        "note:iteration 1/1 proposal 2/2",
+        "proposal:1",
+        "proposal:2",
+        "progress:1",
+    ]

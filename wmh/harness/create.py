@@ -418,6 +418,9 @@ def create_harness(
     selection. ``on_progress`` receives the seed plus exactly one champion point per iteration,
     including an unchanged point when no proposal wins. ``on_accept`` fires at most once per
     iteration with the selected champion, its final delta verdict, and its full-suite score.
+    ``on_note`` is an eager diagnostic stream, so dead-proposal and feedback-error notes may fire
+    while siblings are still evaluating. ``on_proposal`` waits for batch selection and then fires
+    in stable proposal order. The iteration's ``on_progress`` checkpoint follows those records.
 
     ``on_sandbox_usage`` fires after the shared E2B pool is successfully closed on every exit
     path, including failures and cancellation, so callers can persist already-incurred evaluator
