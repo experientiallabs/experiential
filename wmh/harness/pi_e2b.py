@@ -29,6 +29,7 @@ import json
 import math
 import os
 import queue
+import re
 import shlex
 import threading
 import time
@@ -129,6 +130,10 @@ MAX_EVAL_EPISODE_LIFETIME_S = 3_600.0
 DEFAULT_EVAL_EPISODE_TIMEOUT_S = 300.0
 _MAX_RETIRE_WORKERS = 16
 
+_HTTPCORE_REMOTE_STREAM_RESET = re.compile(
+    r"<StreamReset stream_id:\d+, error_code:\d+, remote_reset:True>"
+)
+
 
 class _Eof:
     """Reader-thread sentinel: the runner process's output stream ended."""
@@ -201,6 +206,12 @@ class E2BStdioChannel:
                 self._sandbox.commands.send_stdin(self._pid, line)
             except OSError as exc:
                 raise _E2BChannelSendError("failed to send a frame to the E2B runner") from exc
+            except Exception as exc:  # noqa: BLE001 - classify one optional-SDK transport shape
+                if _is_httpcore_remote_stream_reset(exc):
+                    raise _E2BChannelSendError(
+                        "failed to send a frame to the E2B runner after an HTTP/2 stream reset"
+                    ) from exc
+                raise
 
     def recv(self, timeout: float | None = None) -> JsonObject | None:
         """The next frame from the runner; blocks (up to `timeout` seconds when given).
@@ -1331,6 +1342,16 @@ def _is_retryable_transport_error(exc: Exception) -> bool:
     # TimeoutError, but any instance means the sandbox/channel state is uncertain.
     exc_type = type(exc)
     return exc_type.__module__ == "e2b.exceptions" and exc_type.__name__ == "TimeoutException"
+
+
+def _is_httpcore_remote_stream_reset(exc: Exception) -> bool:
+    """Recognize the exact HTTP/2 reset emitted by E2B's httpcore control-plane call."""
+    exc_type = type(exc)
+    return (
+        exc_type.__module__ == "httpcore"
+        and exc_type.__name__ == "RemoteProtocolError"
+        and _HTTPCORE_REMOTE_STREAM_RESET.fullmatch(str(exc)) is not None
+    )
 
 
 def session_entry_files() -> dict[str, str]:

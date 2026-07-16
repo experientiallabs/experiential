@@ -66,6 +66,13 @@ class TimeoutException(Exception):
 TimeoutException.__module__ = "e2b.exceptions"
 
 
+class RemoteProtocolError(Exception):
+    """httpcore-shaped protocol exception without depending on its implementation."""
+
+
+RemoteProtocolError.__module__ = "httpcore"
+
+
 def test_all_pi_llm_bridges_forward_opaque_reasoning_details() -> None:
     """Every runner preserves stateless Responses reasoning through Pi's SSE parser."""
     entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
@@ -1374,6 +1381,92 @@ def test_run_retries_broken_pipe_once_on_a_fresh_sandbox(
     assert result.answer == "recovered"
     assert len(made) == 2
     assert made[0].kills == 1
+    pool.close()
+
+
+def test_run_retries_http2_remote_stream_reset_once_on_a_fresh_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2B's exact HTTP/2 send reset retires the uncertain sandbox and replays once."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "done", "answer": "recovered"},
+    ]
+    factory, made = _factory_for([script, script])
+
+    def reset_first_factory() -> FakeSandbox:
+        fake = factory()
+        if len(made) == 1:
+            fake.commands.fail_sends_from = 2
+            fake.commands.send_error = RemoteProtocolError(
+                "<StreamReset stream_id:13, error_code:1, remote_reset:True>"
+            )
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=reset_first_factory)
+    result = _runtime(pool=pool).run("t1", "do it", _RecordingEnv())
+
+    assert result.answer == "recovered"
+    assert len(made) == 2
+    assert [len(_of_kind(fake, "llm_response")) for fake in made] == [1, 1]
+    assert made[0].kills == 1
+    pool.close()
+
+
+def test_arbitrary_httpcore_protocol_error_propagates_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A protocol error without the proven remote-reset shape remains ambiguous."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+    factory, made = _factory_for([script, script])
+
+    def protocol_error_factory() -> FakeSandbox:
+        fake = factory()
+        fake.commands.fail_sends_from = 2
+        fake.commands.send_error = RemoteProtocolError("Server disconnected")
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=protocol_error_factory)
+    with pytest.raises(RemoteProtocolError, match="Server disconnected"):
+        _runtime(pool=pool).run("t1", "do it", _RecordingEnv())
+
+    assert len(made) == 1
+    assert len(_of_kind(made[0], "llm_response")) == 1
+    assert made[0].kills == 1
+    pool.close()
+
+
+def test_provider_http2_remote_stream_reset_is_not_a_transport_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same exception from the worker provider is reported to pi, not replayed."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    script: list[JsonObject] = [
+        {"type": "hello"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "done", "answer": "provider error handled"},
+    ]
+    factory, made = _factory_for([script, script])
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        del request
+        raise RemoteProtocolError("<StreamReset stream_id:13, error_code:1, remote_reset:True>")
+
+    pool = E2BSandboxPool(sandbox_factory=factory)
+    result = _runtime(pool=pool, worker_fn=worker).run("t1", "do it", _RecordingEnv())
+
+    assert result.answer == "provider error handled"
+    assert len(made) == 1
+    responses = _of_kind(made[0], "llm_response")
+    assert len(responses) == 1
+    assert "StreamReset" in cast("str", responses[0]["error"])
+    assert made[0].kills == 0
     pool.close()
 
 
