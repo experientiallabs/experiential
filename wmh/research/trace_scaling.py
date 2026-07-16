@@ -25,28 +25,110 @@ and terminal-tasks / swe-bench tomorrow are just a different trace file in — n
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from wmh.core.types import JsonValue, Trace
-from wmh.research.ablation import Condition
+from wmh.engine.grounding import FetchGrounder, SourceResolver
+from wmh.engine.knowledge import seeded_knowledge_text
+from wmh.engine.replay import ReplayReport
+from wmh.engine.workspace import RepoTreeResolver
+from wmh.optimize.judge import RubricDimension
+from wmh.research.ablation import Condition, as_int
 from wmh.research.pipeline import optimize_prompt, score_prompt
 from wmh.research.scaling_split import CorpusSplit, partition_corpus, subsample_train
 from wmh.research.seed_stability import BackendFactory
+from wmh.retrieval import RetrievalKey
 
-# The two prompt sources the sweep compares. `base` = the shipped prompt + RAG only (cheap);
-# `gepa` = GEPA-optimized on the train sample (expensive). Strings (not an enum) so they read
-# straight from a CLI flag and serialize into the report's `Condition.params` unchanged.
+# The prompt/agentic configurations the sweep compares. `base` = the shipped prompt + RAG only
+# (cheap); `gepa` = GEPA-optimized on the train sample (expensive); `reason` = base + the
+# deliberate-then-answer contract; `reason+kb` = reason + a knowledge base seeded from the train
+# sample (train-only, leak-free). Strings (not an enum) so they read straight from a CLI flag and
+# serialize into the report's `Condition.params` unchanged.
 Mode = str
 BASE: Mode = "base"
 GEPA: Mode = "gepa"
+REASON: Mode = "reason"
+REASON_KB: Mode = "reason+kb"
+# reason + live prefetch of read-only curl GET URLs (FetchGrounder). NON-HERMETIC: hits the real
+# web, and the web has moved since capture — label results accordingly.
+REASON_FETCH: Mode = "reason+fetch"
+REASON_KB_FETCH: Mode = "reason+kb+fetch"  # both levers together (composability cell)
+REASON_VERIFY: Mode = "reason+verify"  # + a second self-check completion per step (2x cost)
+# reason + pinned-source grounding of first-touch file reads (SourceResolver). Needs traces
+# pinned by instance_id via `source_pins`; unpinned corpora make it a measured no-op.
+REASON_SOURCE: Mode = "reason+source"
+# reason + a per-step history-digest completion: the ICL history revised into a current-state
+# belief profile ("what is running NOW") before predicting. Extra completion per step.
+REASON_PROFILE: Mode = "reason+profile"
+# reason+source with the staleness gate relaxed to ANNOTATED base versions of edited files —
+# the low-risk face of "test-time RAG over the agent's working directory".
+REASON_SOURCE2: Mode = "reason+source2"
+# source2 + repo-tree grounding of ls/find/grep — the full "test-time RAG over the working
+# directory" composite. Needs source_pins.
+REASON_WORKSPACE: Mode = "reason+workspace"
+# reason + two zero-completion channels: live PyPI/npm registry polls for package actions
+# (NON-HERMETIC) + deterministic wc/sort/uniq answers over session-written content (hermetic).
+REASON_POLL: Mode = "reason+poll"
 MODES: tuple[Mode, ...] = (BASE, GEPA)
+# Composable confidence suffixes (WS-A6, D75): any mode above also accepts `+conf` (the
+# verbalized-confidence contract field), `+confwhy` (confidence with its one-line justification),
+# and `+gateverify@<t>` (confidence-gated verify: the second self-check completion runs only when
+# the draft states confidence < t; implies +conf). E.g. `base+conf`, `reason+confwhy`,
+# `reason+workspace+conf`, `reason+gateverify@0.7`. Split off by `split_mode` before dispatch.
+ALL_MODES: tuple[Mode, ...] = (
+    BASE,
+    GEPA,
+    REASON,
+    REASON_KB,
+    REASON_FETCH,
+    REASON_KB_FETCH,
+    REASON_VERIFY,
+    REASON_SOURCE,
+    REASON_SOURCE2,
+    REASON_WORKSPACE,
+    REASON_PROFILE,
+    REASON_POLL,
+)
 
 
-def _as_int(value: JsonValue) -> int:
-    # Condition.params is JsonValue; the keys this ablation owns are written as ints below, so this
-    # narrowing only ever sees ints — but assert to fail loudly if a malformed condition slips in.
-    assert isinstance(value, int)
-    return value
+def split_mode(mode: Mode) -> tuple[Mode, bool, bool, float | None]:
+    """Split the composable confidence suffixes off `mode`.
+
+    Returns `(base_mode, confidence, confidence_why, verify_below)`. The base mode must be one of
+    `ALL_MODES` — raising here (not deep in dispatch) keeps a typo like `reasn+conf` loud.
+    """
+    confidence = False
+    confidence_why = False
+    verify_below: float | None = None
+    kept: list[str] = []
+    for part in mode.split("+"):
+        if part == "conf":
+            confidence = True
+        elif part == "confwhy":
+            confidence = True
+            confidence_why = True
+        elif part.startswith("gateverify@"):
+            confidence = True
+            raw = part.removeprefix("gateverify@")
+            try:
+                verify_below = float(raw)
+            except ValueError:
+                raise ValueError(
+                    f"unknown mode {mode!r}: gateverify threshold {raw!r} is not a number"
+                ) from None
+            if not 0.0 < verify_below <= 1.0:  # also rejects NaN
+                raise ValueError(
+                    f"unknown mode {mode!r}: gateverify threshold must be in (0, 1] —"
+                    f" {verify_below} would mean {'never' if verify_below <= 0 else 'always'}"
+                    " verifying (use the plain mode or +verify instead)"
+                )
+        else:
+            kept.append(part)
+    base = "+".join(kept)
+    if base not in ALL_MODES:
+        raise ValueError(f"unknown mode {mode!r}: base {base!r} is not one of {ALL_MODES}")
+    return base, confidence, confidence_why, verify_below
 
 
 def _as_mode(value: JsonValue) -> Mode:
@@ -81,6 +163,11 @@ class TraceScalingAblation:
         sample_turns: str = "all",
         test_cap: int | None = None,
         concurrency: int = 1,
+        max_retrieved_observation_chars: int | None = None,
+        retrieval_key: RetrievalKey = "state_action",
+        score_dimension: RubricDimension | None = None,
+        source_pins: str | None = None,
+        results_dir: str | None = None,
     ) -> None:
         self._base_prompt = base_prompt
         self._make_backends = make_backends
@@ -88,7 +175,34 @@ class TraceScalingAblation:
         self._top_k = top_k
         self._sample_turns = sample_turns
         self._concurrency = concurrency
+        self._max_retrieved_observation_chars = max_retrieved_observation_chars
+        self._retrieval_key = retrieval_key
+        self._score_dimension = score_dimension
+        self._source_pins = source_pins
+        self._source = SourceResolver.from_file(source_pins) if source_pins else None
+        self._tree = RepoTreeResolver(self._source.pins) if self._source is not None else None
+        # Per-cell ReplayReports (per-step scores + stated confidences) land here as
+        # `<label>_seed<seed>.json` when set. Calibration analysis (WS-A6) joins per-step
+        # (confidence, judge score) pairs — the scalar fidelity the ablation returns can't carry
+        # that, and rerunning cells to get it would double the serve bill.
+        self._results_dir = results_dir
+        # Validate every mode string NOW: a typo'd mode must fail before the sweep spends hours
+        # of provider budget on the cells that precede it, not when run() finally reaches it.
+        for mode in modes:
+            split_mode(mode)
         self._modes = list(modes)
+        # GEPA optimizes under DEFAULT retrieval (optimize_prompt does not yet thread these knobs),
+        # so scoring the evolved prompt under a non-default key/cap would measure it on a retrieval
+        # distribution it never optimized for — a confounded gepa-vs-base comparison. Fail fast
+        # rather than silently bias the curve; the base arm honours these knobs.
+        if GEPA in self._modes and (
+            retrieval_key != "state_action" or max_retrieved_observation_chars is not None
+        ):
+            raise ValueError(
+                "gepa mode does not honour retrieval_key / max_retrieved_observation_chars yet; "
+                "combining them would score the evolved prompt under retrieval it never optimized "
+                "for. Use gepa with default retrieval, or restrict these knobs to base mode."
+            )
         self._split: CorpusSplit = partition_corpus(
             corpus, test_frac=test_frac, valid_frac=valid_frac
         )
@@ -101,7 +215,7 @@ class TraceScalingAblation:
         # Cap counts at the train pool and drop duplicates created by the cap, preserving order, so
         # a 1000-point sweep on a small corpus collapses cleanly to the few counts it can serve.
         pool = len(self._split.train_pool)
-        self._counts = _dedupe([min(c, pool) for c in counts if c > 0])
+        self._counts = list(dict.fromkeys(min(c, pool) for c in counts if c > 0))
 
     @property
     def split(self) -> CorpusSplit:
@@ -127,8 +241,10 @@ class TraceScalingAblation:
 
     def run(self, condition: Condition, seed: int) -> float:
         """Score one (mode, n_train) point at `seed` on the fixed test set; fidelity 0..1."""
-        mode = _as_mode(condition.params["mode"])
-        n_train = _as_int(condition.params["n_train"])
+        mode, confidence, confidence_why, verify_below = split_mode(
+            _as_mode(condition.params["mode"])
+        )
+        n_train = as_int(condition.params["n_train"])
         train = subsample_train(self._split.train_pool, n_train, seed=seed)
         provider, judge, embedder = self._make_backends()
 
@@ -147,6 +263,37 @@ class TraceScalingAblation:
         else:
             prompt = self._base_prompt
 
+        # Agentic-mode cells (roadmap f): same base prompt and RAG buffer, plus the deliberation
+        # contract; reason+kb seeds a knowledge base from THIS run's train sample only;
+        # reason+fetch adds the live curl-GET prefetch (non-hermetic by definition).
+        agentic = (
+            REASON,
+            REASON_KB,
+            REASON_FETCH,
+            REASON_KB_FETCH,
+            REASON_VERIFY,
+            REASON_SOURCE,
+            REASON_SOURCE2,
+            REASON_WORKSPACE,
+            REASON_PROFILE,
+            REASON_POLL,
+        )
+        reasoning = mode in agentic
+        with_kb = mode in (REASON_KB, REASON_KB_FETCH)
+        knowledge = seeded_knowledge_text(train, provider) if with_kb else None
+        grounder = FetchGrounder() if mode in (REASON_FETCH, REASON_KB_FETCH) else None
+        verify = mode == REASON_VERIFY
+        # Resolvers are shared across every (mode, size, seed) cell: their URL/tree memo
+        # caches are the point — per-cell reconstruction re-downloads identical pinned files.
+        source = None
+        tree = None
+        if mode in (REASON_SOURCE, REASON_SOURCE2, REASON_WORKSPACE) and self._source is not None:
+            source = self._source
+        if mode == REASON_WORKSPACE and self._tree is not None:
+            tree = self._tree
+        profile = mode == REASON_PROFILE
+        poll = mode == REASON_POLL
+
         return score_prompt(
             prompt,
             self._test,
@@ -158,7 +305,36 @@ class TraceScalingAblation:
             sample_turns=self._sample_turns,
             seed=seed,
             concurrency=self._concurrency,
+            max_retrieved_observation_chars=self._max_retrieved_observation_chars,
+            retrieval_key=self._retrieval_key,
+            score_dimension=self._score_dimension,
+            knowledge=knowledge,
+            reasoning=reasoning,
+            grounder=grounder,
+            verify=verify,
+            source=source,
+            source_annotate_stale=mode in (REASON_SOURCE2, REASON_WORKSPACE),
+            tree=tree,
+            profile=profile,
+            poll=poll,
+            confidence=confidence,
+            confidence_why=confidence_why,
+            verify_below=verify_below,
+            on_report=self._report_sink(condition.label, seed),
         )
+
+    def _report_sink(self, label: str, seed: int) -> Callable[[ReplayReport], None] | None:
+        """A writer persisting the cell's full ReplayReport under `results_dir`, or None."""
+        if self._results_dir is None:
+            return None
+        out_dir = Path(self._results_dir)
+
+        def write(report: ReplayReport) -> None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"{label.replace('/', '_')}_seed{seed}.json"
+            path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+        return write
 
 
 def _dedupe(values: list[int]) -> list[int]:

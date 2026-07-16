@@ -26,7 +26,7 @@ from llm_waterfall.types import (
 )
 from llm_waterfall.waterfall import Waterfall
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = [
     "Attempt",

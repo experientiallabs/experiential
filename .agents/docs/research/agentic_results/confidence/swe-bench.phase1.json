@@ -1,0 +1,177 @@
+{
+  "name": "trace-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "base@24",
+        "params": {
+          "mode": "base",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.7919764705882353
+        },
+        {
+          "seed": 1,
+          "score": 0.7881176470588235
+        }
+      ],
+      "mean": 0.7900470588235293,
+      "std": 0.0019294117647059017
+    },
+    {
+      "condition": {
+        "label": "base+conf@24",
+        "params": {
+          "mode": "base+conf",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.797670588235294
+        },
+        {
+          "seed": 1,
+          "score": 0.7916
+        }
+      ],
+      "mean": 0.794635294117647,
+      "std": 0.003035294117647025
+    },
+    {
+      "condition": {
+        "label": "base+confwhy@24",
+        "params": {
+          "mode": "base+confwhy",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.7998823529411764
+        },
+        {
+          "seed": 1,
+          "score": 0.7851764705882353
+        }
+      ],
+      "mean": 0.7925294117647058,
+      "std": 0.007352941176470562
+    },
+    {
+      "condition": {
+        "label": "reason@24",
+        "params": {
+          "mode": "reason",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8035529411764705
+        },
+        {
+          "seed": 1,
+          "score": 0.7910352941176471
+        }
+      ],
+      "mean": 0.7972941176470587,
+      "std": 0.006258823529411706
+    },
+    {
+      "condition": {
+        "label": "reason+conf@24",
+        "params": {
+          "mode": "reason+conf",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8062823529411766
+        },
+        {
+          "seed": 1,
+          "score": 0.7948235294117647
+        }
+      ],
+      "mean": 0.8005529411764707,
+      "std": 0.005729411764705927
+    },
+    {
+      "condition": {
+        "label": "reason+confwhy@24",
+        "params": {
+          "mode": "reason+confwhy",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8015294117647058
+        },
+        {
+          "seed": 1,
+          "score": 0.8104470588235295
+        }
+      ],
+      "mean": 0.8059882352941177,
+      "std": 0.004458823529411848
+    },
+    {
+      "condition": {
+        "label": "reason+workspace@24",
+        "params": {
+          "mode": "reason+workspace",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8419058823529412
+        },
+        {
+          "seed": 1,
+          "score": 0.8566588235294118
+        }
+      ],
+      "mean": 0.8492823529411765,
+      "std": 0.007376470588235318
+    },
+    {
+      "condition": {
+        "label": "reason+workspace+conf@24",
+        "params": {
+          "mode": "reason+workspace+conf",
+          "n_train": 24
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8400470588235294
+        },
+        {
+          "seed": 1,
+          "score": 0.8468235294117648
+        }
+      ],
+      "mean": 0.8434352941176471,
+      "std": 0.003388235294117692
+    }
+  ]
+}

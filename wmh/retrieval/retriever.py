@@ -11,15 +11,19 @@ steps (`add`).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
-from wmh.core.render import encode_state_action
+from wmh.core.render import encode_action, encode_state_action
 from wmh.core.types import Action, EnvState, Observation, Step, Trace
 from wmh.providers.base import Embedder
+
+# What text phi embeds per step: the full (state, action) summary, or the command-only action.
+RetrievalKey = Literal["state_action", "action"]
 
 # A placeholder observation for query-only encoding: topk embeds (state, action), never the result.
 _EMPTY_OBS = Observation(content="")
@@ -53,16 +57,27 @@ class EmbeddingRetriever:
     matching DreamGym Eq. 4's ``Topk(cos(phi(s_t,a_t), phi(s_i,a_i)))``.
     """
 
-    def __init__(self, provider: Embedder) -> None:
+    def __init__(self, provider: Embedder, *, key_mode: RetrievalKey = "state_action") -> None:
         self._provider = provider
+        # What text phi embeds per step: "state_action" (the full (state, action) summary, default)
+        # or "action" (command-only — no STATE/ACTION scaffolding, concentrating the signal for
+        # stateless traces). Index and query use the SAME mode, so the buffer stays self-consistent.
+        if key_mode not in ("state_action", "action"):
+            raise ValueError(f"key_mode must be 'state_action' or 'action', got {key_mode!r}")
+        self._key_mode = key_mode
         # Parallel structures: row i of `_matrix` is the embedding of `_steps[i]`.
         self._steps: list[Step] = []
         self._matrix: NDArray[np.float64] | None = None
 
+    def _key_text(self, step: Step) -> str:
+        if self._key_mode == "action":
+            return encode_action(step.action)
+        return encode_state_action(step.state_before, step.action)
+
     def _embed_steps(self, steps: list[Step]) -> NDArray[np.float64]:
-        # phi(s, a) embeds the canonical (state, action) summary from wmh.core.render — the same
-        # text the engine and GEPA render, so an embedded step and a shown demo match.
-        texts = [encode_state_action(s.state_before, s.action) for s in steps]
+        # phi embeds the canonical step text from wmh.core.render — the same text the engine and
+        # GEPA render, so an embedded step and a shown demo match. `key_mode` selects which text.
+        texts = [self._key_text(s) for s in steps]
         vectors = self._provider.embed(texts)
         return np.asarray(vectors, dtype=np.float64)
 
@@ -118,6 +133,10 @@ class EmbeddingRetriever:
         with (path / _STEPS_FILE).open("w", encoding="utf-8") as fh:
             for step in self._steps:
                 fh.write(step.model_dump_json() + "\n")
+        # Persist key_mode: the matrix was embedded from this mode's key text, so a reload MUST
+        # query in the same mode or it cosine-compares mismatched embedding spaces (no dim error,
+        # just near-random neighbours). Without this, a reloaded index reverts to state_action.
+        (path / _META_FILE).write_text(json.dumps({"key_mode": self._key_mode}), encoding="utf-8")
 
     def load(self, index_dir: str | Path) -> None:
         """Reload a buffer previously written by `save`, replacing any current contents."""
@@ -130,10 +149,18 @@ class EmbeddingRetriever:
         ]
         self._steps = steps
         self._matrix = matrix if matrix.size and steps else None
+        # Restore the mode the matrix was built with (older indexes predate meta.json -> default).
+        meta_path = path / _META_FILE
+        if meta_path.exists():
+            mode = json.loads(meta_path.read_text(encoding="utf-8")).get("key_mode", "state_action")
+            if mode not in ("state_action", "action"):
+                raise ValueError(f"index meta has invalid key_mode {mode!r}")
+            self._key_mode = mode
 
 
 _MATRIX_FILE = "embeddings.npy"
 _STEPS_FILE = "steps.jsonl"
+_META_FILE = "meta.json"
 
 
 def _cosine(query: NDArray[np.float64], matrix: NDArray[np.float64]) -> NDArray[np.float64]:

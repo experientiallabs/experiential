@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from wmh.cli import app
@@ -131,8 +132,8 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
             str(root),
             "--provider",
             "bedrock",
-            "--gepa-budget",
-            "4",
+            "--fidelity",
+            "low",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -165,9 +166,37 @@ def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_pa
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    core = {"build", "list", "serve", "demo", "eval", "play", "download"}
+    core = {"build", "list", "serve", "demo", "eval", "play", "download", "knowledge"}
     platform = {"login", "logout", "status", "push", "pull", "run"}
     assert names == core | platform
+
+
+def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture
+    from wmh.config import save_config
+    from wmh.config.config import HarnessConfig
+    from wmh.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmh"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(), root=model_dir)
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "knowledge" in result.output  # the folder path (the real editing surface)
+    assert "rules.md" in result.output
+    assert "gate: auth required" in result.output
+
+
+def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # noqa: ANN001
+    from wmh.config import save_config
+    from wmh.config.config import HarnessConfig
+
+    root = tmp_path / ".wmh"
+    save_config(HarnessConfig(), root=root / "models" / "airline")
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "empty" in result.output.lower()
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -546,7 +575,7 @@ def test_build_interactive_wizard_creates_model(
             "1",  # model: us.anthropic.claude-opus-4-8
             "us-east-1",
             "",  # judge model: accept the bedrock default (dated haiku)
-            "4",  # gepa budget
+            "1",  # fidelity: low (RAG only)
             "1",  # embedder: hashing
         ]
     )
@@ -804,3 +833,39 @@ def test_download_picker_lists_published_and_fetches_choice(
     assert result.exit_code == 0, result.output
     assert fetched == ["gaia2"]
     assert "not downloaded" in result.output  # picker showed local status
+
+
+def test_grid_output_paths_never_collide() -> None:
+    # Regression: `--out foo.json` must NOT make the chart PNG overwrite the just-written result
+    # JSON. The JSON and PNG always get distinct suffixes off the same stem.
+    from wmh.cli.app import _grid_output_paths
+
+    default = Path("/tmp/grid/suite-run.json")
+    for out in ("foo.json", "foo.png", "foo", "dir/bar.json"):
+        json_path, png_path = _grid_output_paths(out, default)
+        assert json_path.suffix == ".json"
+        assert png_path.suffix == ".png"
+        assert json_path != png_path  # the bug: these were equal for `--out foo.json`
+        assert json_path.stem == png_path.stem == Path(out).stem
+    # No --out: fall back to the default JSON dest + its .png sibling.
+    json_path, png_path = _grid_output_paths(None, default)
+    assert json_path == default
+    assert png_path == default.with_suffix(".png")
+
+
+def test_parse_model_specs_validates_provider_and_resolves_model() -> None:
+    from wmh.cli.app import _parse_model_specs
+
+    specs = _parse_model_specs(
+        "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,Qwen:openai:qwen-agentworld-35b-a3b"
+    )
+    assert [(s.label, s.provider, s.model) for s in specs] == [
+        ("Opus 4.8", "bedrock", "us.anthropic.claude-opus-4-8"),  # exact wire id preserved
+        ("Qwen", "openai", "qwen-agentworld-35b-a3b"),  # self-hosted id passes through unchanged
+    ]
+    # A bad provider fails at parse time with a clear message, not deep inside run_grid.
+    with pytest.raises(typer.BadParameter, match="unknown provider"):
+        _parse_model_specs("X:notaprovider:m")
+    # Malformed entry (wrong arity) still rejected.
+    with pytest.raises(typer.BadParameter, match="bad --models entry"):
+        _parse_model_specs("Opus:bedrock")

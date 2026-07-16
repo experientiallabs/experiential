@@ -14,6 +14,8 @@ matplotlib is not a project dependency (this is a one-off research figure), so r
 
 Each --report is `label=path`. A report's conditions are the sweep points (label `base@N` or
 `gepa@N`); by default only `base` (RAG-only) points are plotted — pass --mode gepa for that curve.
+A `base@0` condition (the no-RAG baseline, run with `run_trace_scaling.py --no-rag`) is drawn in a
+fixed "0" slot left of 10^0 with a dotted connector to the first RAG point (log(0) is undefined).
 """
 
 from __future__ import annotations
@@ -23,11 +25,16 @@ import json
 import re
 from pathlib import Path
 
+import numpy as np
+
 # Vercel/Notion-ish palette: near-black text, restrained accent lines, generous whitespace.
 _INK = "#0a0a0a"
 _MUTED = "#8a8a8a"
 _GRID = "#ececec"
 _COLORS = ["#0070f3", "#7928ca", "#f5a623", "#e00", "#50e3c2"]  # blue, purple, amber, red, teal
+
+# Fixed log-axis slot for the n=0 (no-RAG) baseline, sitting just left of 10^0.
+_ZERO_X = 0.4
 
 _POINT_RE = re.compile(r"^(?P<mode>base|gepa)@(?P<n>\d+)$")
 
@@ -62,6 +69,8 @@ def main() -> None:
     parser.add_argument("--mode", default="base", help="Which curve to plot: base | gepa.")
     parser.add_argument("--out", default="trace_scaling", help="Output path stem (.png + .svg).")
     parser.add_argument("--title", default="Trace scaling law", help="Figure title.")
+    parser.add_argument("--ymin", type=float, default=0.6, help="Y-axis floor (fidelity is 0..1).")
+    parser.add_argument("--ymax", type=float, default=1.0, help="Y-axis ceiling.")
     args = parser.parse_args()
 
     import matplotlib
@@ -74,6 +83,8 @@ def main() -> None:
     ax.set_facecolor("white")
 
     plotted = 0
+    any_zero = False
+    max_count = 1
     for i, spec in enumerate(args.report):
         if "=" not in spec:
             raise SystemExit(f"--report must be label=path, got {spec!r}")
@@ -83,33 +94,47 @@ def main() -> None:
             print(f"warning: no {args.mode} points in {path} ({label})")
             continue
         color = _COLORS[i % len(_COLORS)]
-        ax.plot(
-            counts,
-            means,
-            "-o",
-            color=color,
-            label=label,
-            linewidth=2.2,
-            markersize=5,
-            markerfacecolor="white",
-            markeredgecolor=color,
-            markeredgewidth=1.6,
-            zorder=3,
-        )
-        lo = [m - s for m, s in zip(means, stds, strict=True)]
-        hi = [m + s for m, s in zip(means, stds, strict=True)]
-        ax.fill_between(counts, lo, hi, color=color, alpha=0.10, linewidth=0, zorder=2)
+        # n=0 is the no-RAG baseline (log(0) is undefined), so pin it at a fixed slot left of 10^0
+        # and connect it to the first RAG point with a dotted line to mark the retrieval "jump".
+        pts = list(zip(counts, means, stds, strict=True))
+        zero = next((p for p in pts if p[0] == 0), None)
+        rest = [p for p in pts if p[0] >= 1]
+        if rest:
+            rc, rm, rs = zip(*rest, strict=True)
+            ax.plot(rc, rm, "-o", color=color, label=label, linewidth=2.2, markersize=5,
+                    markerfacecolor="white", markeredgecolor=color, markeredgewidth=1.6, zorder=3)
+            lo = [m - s for m, s in zip(rm, rs, strict=True)]
+            hi = [m + s for m, s in zip(rm, rs, strict=True)]
+            ax.fill_between(rc, lo, hi, color=color, alpha=0.10, linewidth=0, zorder=2)
+            max_count = max(max_count, max(rc))
+        if zero is not None:
+            any_zero = True
+            zlabel = label if not rest else None  # keep one legend entry per series
+            ax.plot([_ZERO_X], [zero[1]], "o", color=color, label=zlabel, markersize=5,
+                    markerfacecolor="white", markeredgecolor=color, markeredgewidth=1.6, zorder=3)
+            if rest:
+                ax.plot([_ZERO_X, rest[0][0]], [zero[1], rest[0][1]], ":", color=color,
+                        linewidth=1.4, alpha=0.7, zorder=2)
         plotted += 1
 
     if not plotted:
         raise SystemExit("no series plotted — check --report paths and --mode")
 
     ax.set_xscale("log")
+    if any_zero:
+        # Explicit ticks: a "0" slot for the no-RAG baseline, then decade ticks for the RAG sweep.
+        from matplotlib.ticker import FixedFormatter, FixedLocator
+
+        decades = [10**k for k in range(0, int(np.floor(np.log10(max_count))) + 1)]
+        ax.xaxis.set_major_locator(FixedLocator([_ZERO_X, *decades]))
+        ax.xaxis.set_major_formatter(FixedFormatter(["0", *[str(d) for d in decades]]))
+        ax.xaxis.set_minor_locator(FixedLocator([]))
+        ax.set_xlim(_ZERO_X * 0.75, max_count * 1.4)
     ax.set_xlabel("training traces", fontsize=11, color=_INK)
     ylabel = "reconstruction fidelity" + ("" if args.mode == "base" else f" ({args.mode})")
     ax.set_ylabel(ylabel, fontsize=11, color=_INK)
     ax.set_title(args.title, fontsize=15, color=_INK, fontweight="bold", loc="left", pad=14)
-    ax.set_ylim(0, 1)
+    ax.set_ylim(args.ymin, args.ymax)
 
     # Minimal chrome: no top/right spine, soft horizontal grid only, muted ticks.
     for side in ("top", "right"):

@@ -1,0 +1,76 @@
+{
+  "name": "gepa-scaling-law",
+  "seeds": [
+    0
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "t1_b8",
+        "params": {
+          "n_train": 1,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8598658536585366
+        }
+      ],
+      "mean": 0.8598658536585366,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t4_b8",
+        "params": {
+          "n_train": 4,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8766463414634147
+        }
+      ],
+      "mean": 0.8766463414634147,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t16_b8",
+        "params": {
+          "n_train": 16,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8760365853658536
+        }
+      ],
+      "mean": 0.8760365853658536,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t648_b8",
+        "params": {
+          "n_train": 648,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.9057317073170731
+        }
+      ],
+      "mean": 0.9057317073170731,
+      "std": 0.0
+    }
+  ]
+}

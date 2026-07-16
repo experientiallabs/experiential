@@ -1,0 +1,15 @@
+{
+  "low": {
+    "fidelity": 0.8403838383838383,
+    "error_flag_accuracy": 0.9595959595959596,
+    "n_steps": 99,
+    "winner": "base",
+    "considered": [
+      "base"
+    ],
+    "embeddings": "hashing",
+    "gepa_budget": 0,
+    "serve_calls": 99,
+    "serve_cost_usd": 2.513
+  }
+}

@@ -1,0 +1,1022 @@
+{
+ "astropy__astropy-12907": {
+  "base_commit": "d16bfe05a744909de4b27f5875fe0d4ed41ce607",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-13033": {
+  "base_commit": "298ccb478e6bf092953bca67a3d29dc6c35f6752",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-13236": {
+  "base_commit": "6ed769d58d89380ebaa1ef52b300691eefda8928",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-13398": {
+  "base_commit": "6500928dc0e57be8f06d1162eacc3ba5e2eff692",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-13453": {
+  "base_commit": "19cc80471739bcb67b7e8099246b391c355023ee",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-13579": {
+  "base_commit": "0df94ff7097961e92fd7812036a24b145bc13ca8",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-13977": {
+  "base_commit": "5250b2442501e6c671c6b380536f1edb352602d1",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14096": {
+  "base_commit": "1a4462d72eb03f30dc83a879b1dd57aac8b2c18b",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14182": {
+  "base_commit": "a5917978be39d13cd90b517e1de4e7a539ffaa48",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14309": {
+  "base_commit": "cdb66059a2feb44ee49021874605ba90801f9986",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14365": {
+  "base_commit": "7269fa3e33e8d02485a647da91a5a2a60a06af61",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14369": {
+  "base_commit": "fa4e8d1cd279acf9b24560813c8652494ccd5922",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14508": {
+  "base_commit": "a3f4ae6cd24d5ecdf49f213d77b3513dd509a06c",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14539": {
+  "base_commit": "c0a24c1dc957a3b565294213f435fefb2ec99714",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14598": {
+  "base_commit": "80c3854a5f4f4a6ab86c03d9db7854767fcd83c1",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-14995": {
+  "base_commit": "b16c7d12ccbc7b2d20364b89fb44285bcbfede54",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-7166": {
+  "base_commit": "26d147868f8a891a6009a25cd6a8576d2e1bd747",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-7336": {
+  "base_commit": "732d89c2940156bdc0e200bb36dc38b5e424bcba",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-7606": {
+  "base_commit": "3cedd79e6c121910220f8e6df77c54a0b344ea94",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-7671": {
+  "base_commit": "a7141cd90019b62688d507ae056298507678c058",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-8707": {
+  "base_commit": "a85a0747c54bac75e9c3b2fe436b105ea029d6cf",
+  "repo": "astropy/astropy"
+ },
+ "astropy__astropy-8872": {
+  "base_commit": "b750a0e6ee76fb6b8a099a4d16ec51977be46bf6",
+  "repo": "astropy/astropy"
+ },
+ "django__django-10097": {
+  "base_commit": "b9cf764be62e77b4777b3a75ec256f6209a57671",
+  "repo": "django/django"
+ },
+ "django__django-10554": {
+  "base_commit": "14d026cccb144c6877294ba4cd4e03ebf0842498",
+  "repo": "django/django"
+ },
+ "django__django-10880": {
+  "base_commit": "838e432e3e5519c5383d12018e6c78f8ec7833c1",
+  "repo": "django/django"
+ },
+ "django__django-10914": {
+  "base_commit": "e7fd69d051eaa67cb17f172a39b57253e9cb831a",
+  "repo": "django/django"
+ },
+ "django__django-10973": {
+  "base_commit": "ddb293685235fd09e932805771ae97f72e817181",
+  "repo": "django/django"
+ },
+ "django__django-10999": {
+  "base_commit": "36300ef336e3f130a0dadc1143163ff3d23dc843",
+  "repo": "django/django"
+ },
+ "django__django-11066": {
+  "base_commit": "4b45b6c8e4d7c9701a332e80d3b1c84209dc36e2",
+  "repo": "django/django"
+ },
+ "django__django-11087": {
+  "base_commit": "8180ffba21bf10f4be905cb0d4890dc2bcff2788",
+  "repo": "django/django"
+ },
+ "django__django-11095": {
+  "base_commit": "7d49ad76562e8c0597a0eb66046ab423b12888d8",
+  "repo": "django/django"
+ },
+ "django__django-11099": {
+  "base_commit": "d26b2424437dabeeca94d7900b37d2df4410da0c",
+  "repo": "django/django"
+ },
+ "django__django-11119": {
+  "base_commit": "d4df5e1b0b1c643fe0fc521add0236764ec8e92a",
+  "repo": "django/django"
+ },
+ "django__django-11133": {
+  "base_commit": "879cc3da6249e920b8d54518a0ae06de835d7373",
+  "repo": "django/django"
+ },
+ "django__django-11138": {
+  "base_commit": "c84b91b7603e488f7171fdff8f08368ef3d6b856",
+  "repo": "django/django"
+ },
+ "django__django-11141": {
+  "base_commit": "5d9cf79baf07fc4aed7ad1b06990532a65378155",
+  "repo": "django/django"
+ },
+ "django__django-11149": {
+  "base_commit": "e245046bb6e8b32360aa48b8a41fb7050f0fc730",
+  "repo": "django/django"
+ },
+ "django__django-11163": {
+  "base_commit": "e6588aa4e793b7f56f4cadbfa155b581e0efc59a",
+  "repo": "django/django"
+ },
+ "django__django-11179": {
+  "base_commit": "19fc6376ce67d01ca37a91ef2f55ef769f50513a",
+  "repo": "django/django"
+ },
+ "django__django-11206": {
+  "base_commit": "571ab44e8a8936014c22e7eebe4948d9611fd7ce",
+  "repo": "django/django"
+ },
+ "django__django-11211": {
+  "base_commit": "ba726067604ce5a8ca3919edf653496722b433ab",
+  "repo": "django/django"
+ },
+ "django__django-11239": {
+  "base_commit": "d87bd29c4f8dfcdf3f4a4eb8340e6770a2416fe3",
+  "repo": "django/django"
+ },
+ "django__django-11265": {
+  "base_commit": "21aa2a5e785eef1f47beb1c3760fdd7d8915ae09",
+  "repo": "django/django"
+ },
+ "django__django-11276": {
+  "base_commit": "28d5262fa3315690395f04e3619ed554dbaf725b",
+  "repo": "django/django"
+ },
+ "django__django-11292": {
+  "base_commit": "eb16c7260e573ec513d84cb586d96bdf508f3173",
+  "repo": "django/django"
+ },
+ "django__django-11299": {
+  "base_commit": "6866c91b638de5368c18713fa851bfe56253ea55",
+  "repo": "django/django"
+ },
+ "django__django-11333": {
+  "base_commit": "55b68de643b5c2d5f0a8ea7587ab3b2966021ccc",
+  "repo": "django/django"
+ },
+ "django__django-11400": {
+  "base_commit": "1f8382d34d54061eddc41df6994e20ee38c60907",
+  "repo": "django/django"
+ },
+ "django__django-11433": {
+  "base_commit": "21b1d239125f1228e579b1ce8d94d4d5feadd2a6",
+  "repo": "django/django"
+ },
+ "django__django-11451": {
+  "base_commit": "e065b293878b1e3ea56655aa9d33e87576cd77ff",
+  "repo": "django/django"
+ },
+ "django__django-11477": {
+  "base_commit": "e28671187903e6aca2428374fdd504fca3032aee",
+  "repo": "django/django"
+ },
+ "django__django-11490": {
+  "base_commit": "a7038adbd02c916315b16939b835f021c2ee8880",
+  "repo": "django/django"
+ },
+ "django__django-11532": {
+  "base_commit": "a5308514fb4bc5086c9a16a8a24a945eeebb073c",
+  "repo": "django/django"
+ },
+ "django__django-11551": {
+  "base_commit": "7991111af12056ec9a856f35935d273526338c1f",
+  "repo": "django/django"
+ },
+ "django__django-11555": {
+  "base_commit": "8dd5877f58f84f2b11126afbd0813e24545919ed",
+  "repo": "django/django"
+ },
+ "django__django-11603": {
+  "base_commit": "f618e033acd37d59b536d6e6126e6c5be18037f6",
+  "repo": "django/django"
+ },
+ "django__django-11728": {
+  "base_commit": "05457817647368be4b019314fcc655445a5b4c0c",
+  "repo": "django/django"
+ },
+ "django__django-11734": {
+  "base_commit": "999891bd80b3d02dd916731a7a239e1036174885",
+  "repo": "django/django"
+ },
+ "django__django-11740": {
+  "base_commit": "003bb34b218adb23d1a7e67932a6ba9b3c4dcc81",
+  "repo": "django/django"
+ },
+ "django__django-11749": {
+  "base_commit": "350123f38c2b6217c38d70bfbd924a9ba3df1289",
+  "repo": "django/django"
+ },
+ "django__django-11790": {
+  "base_commit": "b1d6b35e146aea83b171c1b921178bbaae2795ed",
+  "repo": "django/django"
+ },
+ "django__django-11815": {
+  "base_commit": "e02f67ef2d03d48128e7a118bf75f0418e24e8ac",
+  "repo": "django/django"
+ },
+ "django__django-11820": {
+  "base_commit": "c2678e49759e5c4c329bff0eeca2886267005d21",
+  "repo": "django/django"
+ },
+ "django__django-11848": {
+  "base_commit": "f0adf3b9b7a19cdee05368ff0c0c2d087f011180",
+  "repo": "django/django"
+ },
+ "django__django-11880": {
+  "base_commit": "06909fe084f87a65459a83bd69d7cdbe4fce9a7c",
+  "repo": "django/django"
+ },
+ "django__django-11885": {
+  "base_commit": "04ac9b45a34440fa447feb6ae934687aacbfc5f4",
+  "repo": "django/django"
+ },
+ "django__django-11951": {
+  "base_commit": "312049091288dbba2299de8d07ea3e3311ed7238",
+  "repo": "django/django"
+ },
+ "django__django-11964": {
+  "base_commit": "fc2b1cc926e34041953738e58fa6ad3053059b22",
+  "repo": "django/django"
+ },
+ "django__django-11999": {
+  "base_commit": "84633905273fc916e3d17883810d9969c03f73c2",
+  "repo": "django/django"
+ },
+ "django__django-12039": {
+  "base_commit": "58c1acb1d6054dfec29d0f30b1033bae6ef62aec",
+  "repo": "django/django"
+ },
+ "django__django-12050": {
+  "base_commit": "b93a0e34d9b9b99d41103782b7e7aeabf47517e3",
+  "repo": "django/django"
+ },
+ "django__django-12125": {
+  "base_commit": "89d41cba392b759732ba9f1db4ff29ed47da6a56",
+  "repo": "django/django"
+ },
+ "django__django-12143": {
+  "base_commit": "5573a54d409bb98b5c5acdb308310bed02d392c2",
+  "repo": "django/django"
+ },
+ "django__django-12155": {
+  "base_commit": "e8fcdaad5c428878d0a5d6ba820d957013f75595",
+  "repo": "django/django"
+ },
+ "django__django-12193": {
+  "base_commit": "3fb7c12158a2402f0f80824f6778112071235803",
+  "repo": "django/django"
+ },
+ "django__django-12209": {
+  "base_commit": "5a68f024987e6d16c2626a31bf653a2edddea579",
+  "repo": "django/django"
+ },
+ "django__django-12262": {
+  "base_commit": "69331bb851c34f05bc77e9fc24020fe6908b9cd5",
+  "repo": "django/django"
+ },
+ "django__django-12273": {
+  "base_commit": "927c903f3cd25c817c21738328b53991c035b415",
+  "repo": "django/django"
+ },
+ "django__django-12276": {
+  "base_commit": "53d8646f799de7f92ab9defe9dc56c6125448102",
+  "repo": "django/django"
+ },
+ "django__django-12304": {
+  "base_commit": "4c1b401e8250f9f520b3c7dc369554477ce8b15a",
+  "repo": "django/django"
+ },
+ "django__django-12308": {
+  "base_commit": "2e0f04507b17362239ba49830d26fec504d46978",
+  "repo": "django/django"
+ },
+ "django__django-12325": {
+  "base_commit": "29c126bb349526b5f1cd78facbe9f25906f18563",
+  "repo": "django/django"
+ },
+ "django__django-12406": {
+  "base_commit": "335c9c94acf263901fb023404408880245b0c4b4",
+  "repo": "django/django"
+ },
+ "django__django-12419": {
+  "base_commit": "7fa1a93c6c8109010a6ff3f604fda83b604e0e97",
+  "repo": "django/django"
+ },
+ "django__django-12663": {
+  "base_commit": "fa5e7e46d875d4143510944f19d79df7b1739bab",
+  "repo": "django/django"
+ },
+ "django__django-12708": {
+  "base_commit": "447980e72ac01da1594dd3373a03ba40b7ee6f80",
+  "repo": "django/django"
+ },
+ "django__django-12713": {
+  "base_commit": "5b884d45ac5b76234eca614d90c83b347294c332",
+  "repo": "django/django"
+ },
+ "django__django-12741": {
+  "base_commit": "537d422942b53bc0a2b6a51968f379c0de07793c",
+  "repo": "django/django"
+ },
+ "django__django-12754": {
+  "base_commit": "18759b2209ff556aed7f20d83cbf23e3d234e41c",
+  "repo": "django/django"
+ },
+ "django__django-12774": {
+  "base_commit": "67f9d076cfc1858b94f9ed6d1a5ce2327dcc8d0d",
+  "repo": "django/django"
+ },
+ "django__django-12858": {
+  "base_commit": "f2051eb8a7febdaaa43bd33bf5a6108c5f428e59",
+  "repo": "django/django"
+ },
+ "django__django-12965": {
+  "base_commit": "437196da9a386bd4cc62b0ce3f2de4aba468613d",
+  "repo": "django/django"
+ },
+ "django__django-13012": {
+  "base_commit": "22a59c01c00cf9fbefaee0e8e67fab82bbaf1fd2",
+  "repo": "django/django"
+ },
+ "django__django-13023": {
+  "base_commit": "f83b44075dafa429d59e8755aa47e15577cc49f9",
+  "repo": "django/django"
+ },
+ "django__django-13028": {
+  "base_commit": "78ad4b4b0201003792bfdbf1a7781cbc9ee03539",
+  "repo": "django/django"
+ },
+ "django__django-13033": {
+  "base_commit": "a59de6e89e8dc1f3e71c9a5a5bbceb373ea5247e",
+  "repo": "django/django"
+ },
+ "django__django-13089": {
+  "base_commit": "27c09043da52ca1f02605bf28600bfd5ace95ae4",
+  "repo": "django/django"
+ },
+ "django__django-13109": {
+  "base_commit": "fbe82f82555bc25dccb476c749ca062f0b522be3",
+  "repo": "django/django"
+ },
+ "django__django-13112": {
+  "base_commit": "09914ccf688974e068941f55412b930729bafa06",
+  "repo": "django/django"
+ },
+ "django__django-13121": {
+  "base_commit": "ec5aa2161d8015a3fe57dcbbfe14200cd18f0a16",
+  "repo": "django/django"
+ },
+ "django__django-13128": {
+  "base_commit": "2d67222472f80f251607ae1b720527afceba06ad",
+  "repo": "django/django"
+ },
+ "django__django-13158": {
+  "base_commit": "7af8f4127397279d19ef7c7899e93018274e2f9b",
+  "repo": "django/django"
+ },
+ "django__django-13195": {
+  "base_commit": "156a2138db20abc89933121e4ff2ee2ce56a173a",
+  "repo": "django/django"
+ },
+ "django__django-13212": {
+  "base_commit": "f4e93919e4608cfc50849a1f764fd856e0917401",
+  "repo": "django/django"
+ },
+ "django__django-13279": {
+  "base_commit": "6e9c5ee88fc948e05b4a7d9f82a8861ed2b0343d",
+  "repo": "django/django"
+ },
+ "django__django-13297": {
+  "base_commit": "8954f255bbf5f4ee997fd6de62cb50fc9b5dd697",
+  "repo": "django/django"
+ },
+ "django__django-13315": {
+  "base_commit": "36bc47069ce071e80c8129500de3b8664d2058a7",
+  "repo": "django/django"
+ },
+ "django__django-13343": {
+  "base_commit": "ece18207cbb64dd89014e279ac636a6c9829828e",
+  "repo": "django/django"
+ },
+ "django__django-13344": {
+  "base_commit": "e39e727ded673e74016b5d3658d23cbe20234d11",
+  "repo": "django/django"
+ },
+ "django__django-13346": {
+  "base_commit": "9c92924cd5d164701e2514e1c2d6574126bd7cc2",
+  "repo": "django/django"
+ },
+ "django__django-13363": {
+  "base_commit": "76e0151ea0e0f56dca66cee846a78b89346d2c4c",
+  "repo": "django/django"
+ },
+ "django__django-13401": {
+  "base_commit": "453967477e3ddae704cd739eac2449c0e13d464c",
+  "repo": "django/django"
+ },
+ "django__django-13406": {
+  "base_commit": "84609b3205905097d7d3038d32e6101f012c0619",
+  "repo": "django/django"
+ },
+ "django__django-13410": {
+  "base_commit": "580a4341cb0b4cbfc215a70afc004875a7e815f4",
+  "repo": "django/django"
+ },
+ "django__django-13417": {
+  "base_commit": "71ae1ab0123582cc5bfe0f7d5f4cc19a9412f396",
+  "repo": "django/django"
+ },
+ "django__django-13449": {
+  "base_commit": "2a55431a5678af52f669ffe7dff3dd0bd21727f8",
+  "repo": "django/django"
+ },
+ "django__django-13512": {
+  "base_commit": "b79088306513d5ed76d31ac40ab3c15f858946ea",
+  "repo": "django/django"
+ },
+ "django__django-13513": {
+  "base_commit": "6599608c4d0befdcb820ddccce55f183f247ae4f",
+  "repo": "django/django"
+ },
+ "django__django-13516": {
+  "base_commit": "b7da588e883e12b8ac3bb8a486e654e30fc1c6c8",
+  "repo": "django/django"
+ },
+ "django__django-13551": {
+  "base_commit": "7f9e4524d6b23424cf44fbe1bf1f4e70f6bb066e",
+  "repo": "django/django"
+ },
+ "django__django-13568": {
+  "base_commit": "ede9fac75807fe5810df66280a60e7068cc97e4a",
+  "repo": "django/django"
+ },
+ "django__django-13569": {
+  "base_commit": "257f8495d6c93e30ab0f52af4c488d7344bcf112",
+  "repo": "django/django"
+ },
+ "django__django-13590": {
+  "base_commit": "755dbf39fcdc491fe9b588358303e259c7750be4",
+  "repo": "django/django"
+ },
+ "django__django-13658": {
+  "base_commit": "0773837e15bb632afffb6848a58c59a791008fa1",
+  "repo": "django/django"
+ },
+ "django__django-13670": {
+  "base_commit": "c448e614c60cc97c6194c62052363f4f501e0953",
+  "repo": "django/django"
+ },
+ "django__django-13741": {
+  "base_commit": "d746f28949c009251a8741ba03d156964050717f",
+  "repo": "django/django"
+ },
+ "django__django-13786": {
+  "base_commit": "bb64b99b78a579cb2f6178011a4cf9366e634438",
+  "repo": "django/django"
+ },
+ "django__django-13794": {
+  "base_commit": "fe886eee36be8022f34cfe59aa61ff1c21fe01d9",
+  "repo": "django/django"
+ },
+ "django__django-13807": {
+  "base_commit": "89fc144dedc737a79929231438f035b1d4a993c9",
+  "repo": "django/django"
+ },
+ "django__django-13809": {
+  "base_commit": "bef6f7584280f1cc80e5e2d80b7ad073a93d26ec",
+  "repo": "django/django"
+ },
+ "django__django-13810": {
+  "base_commit": "429d089d0a8fbd400e0c010708df4f0d16218970",
+  "repo": "django/django"
+ },
+ "django__django-13820": {
+  "base_commit": "98ad327864aed8df245fd19ea9d2743279e11643",
+  "repo": "django/django"
+ },
+ "django__django-13821": {
+  "base_commit": "e64c1d8055a3e476122633da141f16b50f0c4a2d",
+  "repo": "django/django"
+ },
+ "django__django-13837": {
+  "base_commit": "415f50298f97fb17f841a9df38d995ccf347dfcc",
+  "repo": "django/django"
+ },
+ "django__django-13925": {
+  "base_commit": "0c42cdf0d2422f4c080e93594d5d15381d6e955e",
+  "repo": "django/django"
+ },
+ "django__django-13933": {
+  "base_commit": "42e8cf47c7ee2db238bf91197ea398126c546741",
+  "repo": "django/django"
+ },
+ "django__django-13964": {
+  "base_commit": "f39634ff229887bf7790c069d0c411b38494ca38",
+  "repo": "django/django"
+ },
+ "django__django-14007": {
+  "base_commit": "619f26d2895d121854b1bed1b535d42b722e2eba",
+  "repo": "django/django"
+ },
+ "django__django-14011": {
+  "base_commit": "e4430f22c8e3d29ce5d9d0263fba57121938d06d",
+  "repo": "django/django"
+ },
+ "django__django-14017": {
+  "base_commit": "466920f6d726eee90d5566e0a9948e92b33a122e",
+  "repo": "django/django"
+ },
+ "django__django-14034": {
+  "base_commit": "db1fc5cd3c5d36cdb5d0fe4404efd6623dd3e8fb",
+  "repo": "django/django"
+ },
+ "django__django-14053": {
+  "base_commit": "179ee13eb37348cd87169a198aec18fedccc8668",
+  "repo": "django/django"
+ },
+ "django__django-14089": {
+  "base_commit": "d01709aae21de9cd2565b9c52f32732ea28a2d98",
+  "repo": "django/django"
+ },
+ "django__django-14122": {
+  "base_commit": "bc04941bf811d1ea2c79fb7fc20457ed2c7e3410",
+  "repo": "django/django"
+ },
+ "django__django-14140": {
+  "base_commit": "45814af6197cfd8f4dc72ee43b90ecde305a1d5a",
+  "repo": "django/django"
+ },
+ "django__django-14155": {
+  "base_commit": "2f13c476abe4ba787b6cb71131818341911f43cc",
+  "repo": "django/django"
+ },
+ "django__django-14170": {
+  "base_commit": "6efc35b4fe3009666e56a60af0675d7d532bf4ff",
+  "repo": "django/django"
+ },
+ "django__django-14238": {
+  "base_commit": "30e123ed351317b7527f632b3b7dc4e81e850449",
+  "repo": "django/django"
+ },
+ "django__django-14311": {
+  "base_commit": "5a8e8f80bb82a867eab7e4d9d099f21d0a976d22",
+  "repo": "django/django"
+ },
+ "django__django-14315": {
+  "base_commit": "187118203197801c6cb72dc8b06b714b23b6dd3d",
+  "repo": "django/django"
+ },
+ "django__django-14349": {
+  "base_commit": "a708f39ce67af174df90c5b5e50ad1976cec7cb8",
+  "repo": "django/django"
+ },
+ "django__django-14351": {
+  "base_commit": "06fd4df41afb5aa1d681b853c3c08d8c688ca3a5",
+  "repo": "django/django"
+ },
+ "django__django-14373": {
+  "base_commit": "b1a4b1f0bdf05adbd3dc4dde14228e68da54c1a3",
+  "repo": "django/django"
+ },
+ "django__django-14376": {
+  "base_commit": "d06c5b358149c02a62da8a5469264d05f29ac659",
+  "repo": "django/django"
+ },
+ "django__django-14404": {
+  "base_commit": "de32fe83a2e4a20887972c69a0693b94eb25a88b",
+  "repo": "django/django"
+ },
+ "django__django-14434": {
+  "base_commit": "5e04e84d67da8163f365e9f5fcd169e2630e2873",
+  "repo": "django/django"
+ },
+ "django__django-14493": {
+  "base_commit": "7272e1963ffdf39c1d4fe225d5425a45dd095d11",
+  "repo": "django/django"
+ },
+ "django__django-14500": {
+  "base_commit": "8c3bd0b708b488a1f6e8bd8cc6b96569904605be",
+  "repo": "django/django"
+ },
+ "django__django-14534": {
+  "base_commit": "910ecd1b8df7678f45c3d507dde6bcb1faafa243",
+  "repo": "django/django"
+ },
+ "django__django-14539": {
+  "base_commit": "6a5ef557f80a8eb6a758ebe99c8bb477ca47459e",
+  "repo": "django/django"
+ },
+ "django__django-14559": {
+  "base_commit": "d79be3ed39b76d3e34431873eec16f6dd354ab17",
+  "repo": "django/django"
+ },
+ "django__django-14580": {
+  "base_commit": "36fa071d6ebd18a61c4d7f1b5c9d17106134bd44",
+  "repo": "django/django"
+ },
+ "django__django-14608": {
+  "base_commit": "7f33c1e22dbc34a7afae7967783725b10f1f13b1",
+  "repo": "django/django"
+ },
+ "django__django-14631": {
+  "base_commit": "84400d2e9db7c51fee4e9bb04c028f665b8e7624",
+  "repo": "django/django"
+ },
+ "django__django-14672": {
+  "base_commit": "00ea883ef56fb5e092cbe4a6f7ff2e7470886ac4",
+  "repo": "django/django"
+ },
+ "django__django-14725": {
+  "base_commit": "0af9a5fc7d765aa05ea784e2c3237675f3bb4b49",
+  "repo": "django/django"
+ },
+ "django__django-14752": {
+  "base_commit": "b64db05b9cedd96905d637a2d824cbbf428e40e7",
+  "repo": "django/django"
+ },
+ "django__django-14765": {
+  "base_commit": "4e8121e8e42a24acc3565851c9ef50ca8322b15c",
+  "repo": "django/django"
+ },
+ "django__django-14771": {
+  "base_commit": "4884a87e022056eda10534c13d74e49b8cdda632",
+  "repo": "django/django"
+ },
+ "django__django-14787": {
+  "base_commit": "004b4620f6f4ad87261e149898940f2dcd5757ef",
+  "repo": "django/django"
+ },
+ "django__django-14792": {
+  "base_commit": "d89f976bddb49fb168334960acc8979c3de991fa",
+  "repo": "django/django"
+ },
+ "django__django-14855": {
+  "base_commit": "475cffd1d64c690cdad16ede4d5e81985738ceb4",
+  "repo": "django/django"
+ },
+ "django__django-14915": {
+  "base_commit": "903aaa35e5ceaa33bfc9b19b7f6da65ce5a91dd4",
+  "repo": "django/django"
+ },
+ "django__django-14999": {
+  "base_commit": "a754b82dac511475b6276039471ccd17cc64aeb8",
+  "repo": "django/django"
+ },
+ "django__django-15022": {
+  "base_commit": "e1d673c373a7d032060872b690a92fc95496612e",
+  "repo": "django/django"
+ },
+ "django__django-15037": {
+  "base_commit": "dab48b7482295956973879d15bfd4d3bb0718772",
+  "repo": "django/django"
+ },
+ "django__django-15098": {
+  "base_commit": "2c7846d992ca512d36a73f518205015c88ed088c",
+  "repo": "django/django"
+ },
+ "django__django-15103": {
+  "base_commit": "dd528cb2cefc0db8b91a7ff0a2bc87305b976597",
+  "repo": "django/django"
+ },
+ "django__django-15104": {
+  "base_commit": "a7e7043c8746933dafce652507d3b821801cdc7d",
+  "repo": "django/django"
+ },
+ "django__django-15127": {
+  "base_commit": "9a6e2df3a8f01ea761529bec48e5a8dc0ea9575b",
+  "repo": "django/django"
+ },
+ "django__django-15128": {
+  "base_commit": "cb383753c0e0eb52306e1024d32a782549c27e61",
+  "repo": "django/django"
+ },
+ "django__django-15161": {
+  "base_commit": "96e7ff5e9ff6362d9a886545869ce4496ca4b0fb",
+  "repo": "django/django"
+ },
+ "django__django-15252": {
+  "base_commit": "361bb8f786f112ee275be136795c0b1ecefff928",
+  "repo": "django/django"
+ },
+ "django__django-15268": {
+  "base_commit": "0ab58c120939093fea90822f376e1866fc714d1f",
+  "repo": "django/django"
+ },
+ "django__django-15277": {
+  "base_commit": "30613d6a748fce18919ff8b0da166d9fda2ed9bc",
+  "repo": "django/django"
+ },
+ "django__django-15278": {
+  "base_commit": "0ab58c120939093fea90822f376e1866fc714d1f",
+  "repo": "django/django"
+ },
+ "django__django-15280": {
+  "base_commit": "973fa566521037ac140dcece73fceae50ee522f1",
+  "repo": "django/django"
+ },
+ "django__django-15315": {
+  "base_commit": "652c68ffeebd510a6f59e1b56b3e007d07683ad8",
+  "repo": "django/django"
+ },
+ "django__django-15368": {
+  "base_commit": "e972620ada4f9ed7bc57f28e133e85c85b0a7b20",
+  "repo": "django/django"
+ },
+ "django__django-15375": {
+  "base_commit": "beb7ddbcee03270e833b2f74927ccfc8027aa693",
+  "repo": "django/django"
+ },
+ "django__django-15380": {
+  "base_commit": "71e7c8e73712419626f1c2b6ec036e8559a2d667",
+  "repo": "django/django"
+ },
+ "django__django-15382": {
+  "base_commit": "770d3e6a4ce8e0a91a9e27156036c1985e74d4a3",
+  "repo": "django/django"
+ },
+ "django__django-15467": {
+  "base_commit": "e0442a628eb480eac6a7888aed5a86f83499e299",
+  "repo": "django/django"
+ },
+ "django__django-15499": {
+  "base_commit": "d90e34c61b27fba2527834806639eebbcfab9631",
+  "repo": "django/django"
+ },
+ "django__django-15503": {
+  "base_commit": "859a87d873ce7152af73ab851653b4e1c3ffea4c",
+  "repo": "django/django"
+ },
+ "django__django-15525": {
+  "base_commit": "fbacaa58ffc5a62456ee68b90efa13957f761ce4",
+  "repo": "django/django"
+ },
+ "django__django-15554": {
+  "base_commit": "59ab3fd0e9e606d7f0f7ca26609c06ee679ece97",
+  "repo": "django/django"
+ },
+ "django__django-15561": {
+  "base_commit": "6991880109e35c879b71b7d9d9c154baeec12b89",
+  "repo": "django/django"
+ },
+ "django__django-15563": {
+  "base_commit": "9ffd4eae2ce7a7100c98f681e2b6ab818df384a4",
+  "repo": "django/django"
+ },
+ "django__django-15569": {
+  "base_commit": "884b4c27f506b3c29d58509fc83a35c30ea10d94",
+  "repo": "django/django"
+ },
+ "django__django-15572": {
+  "base_commit": "0b31e024873681e187b574fe1c4afe5e48aeeecf",
+  "repo": "django/django"
+ },
+ "django__django-15629": {
+  "base_commit": "694cf458f16b8d340a3195244196980b2dec34fd",
+  "repo": "django/django"
+ },
+ "django__django-15695": {
+  "base_commit": "647480166bfe7532e8c471fef0146e3a17e6c0c9",
+  "repo": "django/django"
+ },
+ "django__django-15731": {
+  "base_commit": "93cedc82f29076c824d476354527af1150888e4f",
+  "repo": "django/django"
+ },
+ "django__django-15732": {
+  "base_commit": "ce69e34bd646558bb44ea92cecfd98b345a0b3e0",
+  "repo": "django/django"
+ },
+ "django__django-15741": {
+  "base_commit": "8c0886b068ba4e224dd78104b93c9638b860b398",
+  "repo": "django/django"
+ },
+ "django__django-15814": {
+  "base_commit": "5eb6a2b33d70b9889e1cafa12594ad6f80773d3a",
+  "repo": "django/django"
+ },
+ "django__django-15851": {
+  "base_commit": "b4817d20b9e55df30be0b1b2ca8c8bb6d61aab07",
+  "repo": "django/django"
+ },
+ "django__django-15863": {
+  "base_commit": "37c5b8c07be104fd5288cd87f101e48cb7a40298",
+  "repo": "django/django"
+ },
+ "django__django-15916": {
+  "base_commit": "88e67a54b7ed0210c11523a337b498aadb2f5187",
+  "repo": "django/django"
+ },
+ "django__django-15930": {
+  "base_commit": "63884829acd207404f2a5c3cc1d6b4cd0a822b70",
+  "repo": "django/django"
+ },
+ "django__django-15957": {
+  "base_commit": "f387d024fc75569d2a4a338bfda76cc2f328f627",
+  "repo": "django/django"
+ },
+ "django__django-15973": {
+  "base_commit": "2480554dc4ada4ecf3f6a08e318735a2e50783f3",
+  "repo": "django/django"
+ },
+ "django__django-15987": {
+  "base_commit": "7e6b537f5b92be152779fc492bb908d27fe7c52a",
+  "repo": "django/django"
+ },
+ "django__django-16032": {
+  "base_commit": "0c3981eb5094419fe200eb46c71b5376a2266166",
+  "repo": "django/django"
+ },
+ "django__django-16082": {
+  "base_commit": "bf47c719719d0e190a99fa2e7f959d5bbb7caf8a",
+  "repo": "django/django"
+ },
+ "django__django-16100": {
+  "base_commit": "c6350d594c359151ee17b0c4f354bb44f28ff69e",
+  "repo": "django/django"
+ },
+ "django__django-16116": {
+  "base_commit": "5d36a8266c7d5d1994d7a7eeb4016f80d9cb0401",
+  "repo": "django/django"
+ },
+ "django__django-16136": {
+  "base_commit": "19e6efa50b603af325e7f62058364f278596758f",
+  "repo": "django/django"
+ },
+ "django__django-16139": {
+  "base_commit": "d559cb02da30f74debbb1fc3a46de0df134d2d80",
+  "repo": "django/django"
+ },
+ "django__django-16145": {
+  "base_commit": "93d4c9ea1de24eb391cb2b3561b6703fd46374df",
+  "repo": "django/django"
+ },
+ "django__django-16255": {
+  "base_commit": "444b6da7cc229a58a2c476a52e45233001dc7073",
+  "repo": "django/django"
+ },
+ "django__django-16256": {
+  "base_commit": "76e37513e22f4d9a01c7f15eee36fe44388e6670",
+  "repo": "django/django"
+ },
+ "django__django-16263": {
+  "base_commit": "321ecb40f4da842926e1bc07e11df4aabe53ca4b",
+  "repo": "django/django"
+ },
+ "django__django-16315": {
+  "base_commit": "7d5329852f19c6ae78c6f6f3d3e41835377bf295",
+  "repo": "django/django"
+ },
+ "django__django-16333": {
+  "base_commit": "60a7bd89860e504c0c33b02c78edcac87f6d1b5a",
+  "repo": "django/django"
+ },
+ "django__django-16429": {
+  "base_commit": "6c86495bcee22eac19d7fb040b2988b830707cbd",
+  "repo": "django/django"
+ },
+ "django__django-16454": {
+  "base_commit": "1250483ebf73f7a82ff820b94092c63ce4238264",
+  "repo": "django/django"
+ },
+ "django__django-16485": {
+  "base_commit": "39f83765e12b0e5d260b7939fc3fe281d879b279",
+  "repo": "django/django"
+ },
+ "django__django-16493": {
+  "base_commit": "e3a4cee081cf60650b8824f0646383b79cb110e7",
+  "repo": "django/django"
+ },
+ "django__django-16502": {
+  "base_commit": "246eb4836a6fb967880f838aa0d22ecfdca8b6f1",
+  "repo": "django/django"
+ },
+ "django__django-16527": {
+  "base_commit": "bd366ca2aeffa869b7dbc0b0aa01caea75e6dc31",
+  "repo": "django/django"
+ },
+ "django__django-16560": {
+  "base_commit": "51c9bb7cd16081133af4f0ab6d06572660309730",
+  "repo": "django/django"
+ },
+ "django__django-16569": {
+  "base_commit": "278881e37619278789942513916acafaa88d26f3",
+  "repo": "django/django"
+ },
+ "django__django-16595": {
+  "base_commit": "f9fe062de5fc0896d6bbbf3f260b5c44473b3c77",
+  "repo": "django/django"
+ },
+ "django__django-16612": {
+  "base_commit": "55bcbd8d172b689811fae17cde2f09218dd74e9c",
+  "repo": "django/django"
+ },
+ "django__django-16631": {
+  "base_commit": "9b224579875e30203d079cc2fee83b116d98eb78",
+  "repo": "django/django"
+ },
+ "django__django-16642": {
+  "base_commit": "fbe850106b2e4b85f838219cb9e1df95fba6c164",
+  "repo": "django/django"
+ },
+ "django__django-16661": {
+  "base_commit": "d687febce5868545f99974d2499a91f81a32fef5",
+  "repo": "django/django"
+ },
+ "django__django-16662": {
+  "base_commit": "0eb3e9bd754e4c9fac8b616b705178727fc8031e",
+  "repo": "django/django"
+ },
+ "django__django-16667": {
+  "base_commit": "02c356f2f3945b8075735d485c3cf48cad991011",
+  "repo": "django/django"
+ },
+ "django__django-16801": {
+  "base_commit": "3b62d8c83e3e48d2ed61cfa32a61c56d9e030293",
+  "repo": "django/django"
+ },
+ "django__django-16819": {
+  "base_commit": "0b0998dc151feb77068e2387c34cc50ef6b356ae",
+  "repo": "django/django"
+ },
+ "django__django-16877": {
+  "base_commit": "98f6ada0e2058d67d91fb6c16482411ec2ca0967",
+  "repo": "django/django"
+ },
+ "django__django-16899": {
+  "base_commit": "d3d173425fc0a1107836da5b4567f1c88253191b",
+  "repo": "django/django"
+ },
+ "django__django-16901": {
+  "base_commit": "ee36e101e8f8c0acde4bb148b738ab7034e902a0",
+  "repo": "django/django"
+ },
+ "django__django-16938": {
+  "base_commit": "1136aa5005f0ae70fea12796b7e37d6f027b9263",
+  "repo": "django/django"
+ },
+ "django__django-16950": {
+  "base_commit": "f64fd47a7627ed6ffe2df2a32ded6ee528a784eb",
+  "repo": "django/django"
+ },
+ "django__django-17029": {
+  "base_commit": "953f29f700a60fc09b08b2c2270c12c447490c6a",
+  "repo": "django/django"
+ },
+ "django__django-17084": {
+  "base_commit": "f8c43aca467b7b0c4bb0a7fa41362f90b610b8df",
+  "repo": "django/django"
+ },
+ "django__django-17087": {
+  "base_commit": "4a72da71001f154ea60906a2f74898d32b7322a7",
+  "repo": "django/django"
+ },
+ "django__django-7530": {
+  "base_commit": "f8fab6f90233c7114d642dfe01a4e6d4cb14ee7d",
+  "repo": "django/django"
+ },
+ "django__django-9296": {
+  "base_commit": "84322a29ce9b0940335f8ab3d60e55192bef1e50",
+  "repo": "django/django"
+ },
+ "matplotlib__matplotlib-13989": {
+  "base_commit": "a3e2897bfaf9eaac1d6649da535c4e721c89fa69",
+  "repo": "matplotlib/matplotlib"
+ },
+ "matplotlib__matplotlib-14623": {
+  "base_commit": "d65c9ca20ddf81ef91199e6d819f9d3506ef477c",
+  "repo": "matplotlib/matplotlib"
+ }
+}

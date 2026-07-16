@@ -1,0 +1,30 @@
+{
+  "name": "trace-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "reason+verify@160",
+        "params": {
+          "mode": "reason+verify",
+          "n_train": 160
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8813333333333333
+        },
+        {
+          "seed": 1,
+          "score": 0.895979797979798
+        }
+      ],
+      "mean": 0.8886565656565657,
+      "std": 0.007323232323232343
+    }
+  ]
+}

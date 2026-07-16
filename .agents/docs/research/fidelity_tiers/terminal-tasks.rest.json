@@ -1,0 +1,48 @@
+{
+  "medium": {
+    "fidelity": 0.848020202020202,
+    "error_flag_accuracy": 0.9595959595959596,
+    "n_steps": 99,
+    "winner": "base",
+    "considered": [
+      "base"
+    ],
+    "embeddings": "hashing",
+    "gepa_budget": 4,
+    "serve_calls": 223,
+    "serve_cost_usd": 7.115
+  },
+  "high": {
+    "fidelity": 0.8954949494949495,
+    "error_flag_accuracy": 0.9797979797979798,
+    "n_steps": 99,
+    "winner": "reason+fetch",
+    "considered": [
+      "base",
+      "reason",
+      "reason+kb",
+      "reason+fetch"
+    ],
+    "embeddings": "semantic",
+    "gepa_budget": 8,
+    "serve_calls": 464,
+    "serve_cost_usd": 16.742
+  },
+  "max": {
+    "fidelity": 0.8968484848484848,
+    "error_flag_accuracy": 0.9797979797979798,
+    "n_steps": 99,
+    "winner": "reason+fetch",
+    "considered": [
+      "base",
+      "reason",
+      "reason+kb",
+      "reason+verify",
+      "reason+fetch"
+    ],
+    "embeddings": "semantic",
+    "gepa_budget": 16,
+    "serve_calls": 961,
+    "serve_cost_usd": 39.746
+  }
+}

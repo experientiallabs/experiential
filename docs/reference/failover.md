@@ -23,6 +23,12 @@ model = "us.anthropic.claude-opus-4-8"   # no profile = default AWS credentials
 [[backend]]
 kind = "openai"
 model = "gpt-5.5"           # reads OPENAI_API_KEY (or set api_key = "..." here)
+
+[[backend]]
+kind = "anthropic"
+model = "claude-opus-4-7"   # Anthropic direct (ANTHROPIC_API_KEY): a different capacity pool
+                            # AND network path than Bedrock — rides out regional quota
+                            # contention and AWS connectivity flaps (both killed live runs)
 ```
 
 The requested `(kind, model)` always leads as the primary; the file's rungs back it up.

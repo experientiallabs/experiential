@@ -166,6 +166,16 @@ _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 # two regardless, so the headroom costs nothing there.
 PING_MAX_TOKENS = 2048
 
+# Belt-and-suspenders for the above: if a reasoning model spends even the larger ping budget on
+# reasoning before emitting output, the resulting error still PROVES the model is reachable (auth
+# ok, model exists). Treat these markers as reachable so `verify` passes instead of reporting fail.
+_REACHABLE_ERROR_MARKERS = (
+    "max_tokens",
+    "max_output_tokens",
+    "output limit was reached",
+    "finish the message because",
+)
+
 
 def verify_via_ping(provider: Provider) -> VerifyResult:
     """Shared `verify()`: one cheap short completion, reporting failure as ok=False.
@@ -177,5 +187,12 @@ def verify_via_ping(provider: Provider) -> VerifyResult:
     try:
         provider.complete("", _PING_MESSAGES, max_tokens=PING_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001 - verify reports failure, never raises
+        # A max-tokens/output-limit error confirms reachability: the request reached the model
+        # (auth + model id are valid) and only failed because a reasoning model consumed the 1-token
+        # ping budget before producing output. Anything else (auth, missing model, network) is a
+        # real failure.
+        msg = str(exc).lower()
+        if any(marker in msg for marker in _REACHABLE_ERROR_MARKERS):
+            return VerifyResult(ok=True, kind=cfg.kind, model=cfg.model)
         return VerifyResult(ok=False, kind=cfg.kind, model=cfg.model, detail=str(exc))
     return VerifyResult(ok=True, kind=cfg.kind, model=cfg.model)

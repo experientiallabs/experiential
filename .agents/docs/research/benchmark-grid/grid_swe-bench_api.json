@@ -1,0 +1,190 @@
+{
+  "suite": "swe-bench/default",
+  "judge_model": "us.anthropic.claude-opus-4-8",
+  "judge_provider": "bedrock",
+  "judge_version": "rubric-v1",
+  "train_split": 0.85,
+  "top_k": 5,
+  "seed": 0,
+  "sample_turns": "sampled",
+  "total_test_steps": 12,
+  "total_test_traces": 8,
+  "cells": [
+    {
+      "model_label": "Opus 4.8",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-opus-4-8",
+      "condition": "base",
+      "condition_label": "base",
+      "fidelity": 0.5963333333333334,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.7714049999999999
+    },
+    {
+      "model_label": "Opus 4.8",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-opus-4-8",
+      "condition": "base_rag",
+      "condition_label": "wmh/rag",
+      "fidelity": 0.5943333333333334,
+      "error_flag_acc": 0.9166666666666666,
+      "n_steps": 12,
+      "cost_usd": 0.903175
+    },
+    {
+      "model_label": "Opus 4.8",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-opus-4-8",
+      "condition": "gepa",
+      "condition_label": "wmh/gepa",
+      "fidelity": 0.5945,
+      "error_flag_acc": 0.9166666666666666,
+      "n_steps": 12,
+      "cost_usd": 0.8921699999999999
+    },
+    {
+      "model_label": "Opus 4.8",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-opus-4-8",
+      "condition": "gepa_rag",
+      "condition_label": "wmh/gepa/rag",
+      "fidelity": 0.5871666666666667,
+      "error_flag_acc": 0.9166666666666666,
+      "n_steps": 12,
+      "cost_usd": 0.9916649999999999
+    },
+    {
+      "model_label": "Haiku 4.5",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "condition": "base",
+      "condition_label": "base",
+      "fidelity": 0.40833333333333327,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.114992
+    },
+    {
+      "model_label": "Haiku 4.5",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "condition": "base_rag",
+      "condition_label": "wmh/rag",
+      "fidelity": 0.24750000000000003,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.154681
+    },
+    {
+      "model_label": "Haiku 4.5",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "condition": "gepa",
+      "condition_label": "wmh/gepa",
+      "fidelity": 0.28583333333333333,
+      "error_flag_acc": 0.6666666666666666,
+      "n_steps": 12,
+      "cost_usd": 0.126363
+    },
+    {
+      "model_label": "Haiku 4.5",
+      "provider": "bedrock",
+      "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "condition": "gepa_rag",
+      "condition_label": "wmh/gepa/rag",
+      "fidelity": 0.33,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.142312
+    },
+    {
+      "model_label": "GPT-5.5",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "condition": "base",
+      "condition_label": "base",
+      "fidelity": 0.6395000000000001,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.742335
+    },
+    {
+      "model_label": "GPT-5.5",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "condition": "base_rag",
+      "condition_label": "wmh/rag",
+      "fidelity": 0.6573333333333333,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.76471
+    },
+    {
+      "model_label": "GPT-5.5",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "condition": "gepa",
+      "condition_label": "wmh/gepa",
+      "fidelity": 0.7141666666666667,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.8573849999999998
+    },
+    {
+      "model_label": "GPT-5.5",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "condition": "gepa_rag",
+      "condition_label": "wmh/gepa/rag",
+      "fidelity": 0.6523333333333333,
+      "error_flag_acc": 1.0,
+      "n_steps": 12,
+      "cost_usd": 0.8896900000000001
+    },
+    {
+      "model_label": "GPT-5.4 Mini",
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "condition": "base",
+      "condition_label": "base",
+      "fidelity": 0.5313333333333333,
+      "error_flag_acc": 0.75,
+      "n_steps": 12,
+      "cost_usd": 0.06626475
+    },
+    {
+      "model_label": "GPT-5.4 Mini",
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "condition": "base_rag",
+      "condition_label": "wmh/rag",
+      "fidelity": 0.5991666666666667,
+      "error_flag_acc": 0.9166666666666666,
+      "n_steps": 12,
+      "cost_usd": 0.076659
+    },
+    {
+      "model_label": "GPT-5.4 Mini",
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "condition": "gepa",
+      "condition_label": "wmh/gepa",
+      "fidelity": 0.6786666666666666,
+      "error_flag_acc": 0.8333333333333334,
+      "n_steps": 12,
+      "cost_usd": 0.06665625
+    },
+    {
+      "model_label": "GPT-5.4 Mini",
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "condition": "gepa_rag",
+      "condition_label": "wmh/gepa/rag",
+      "fidelity": 0.5878333333333333,
+      "error_flag_acc": 0.9166666666666666,
+      "n_steps": 12,
+      "cost_usd": 0.0783825
+    }
+  ]
+}

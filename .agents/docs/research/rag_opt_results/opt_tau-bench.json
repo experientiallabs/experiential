@@ -1,0 +1,93 @@
+{
+  "name": "trace-scaling-law",
+  "seeds": [
+    0,
+    1
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "base@0",
+        "params": {
+          "mode": "base",
+          "n_train": 0
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.5357894736842105
+        },
+        {
+          "seed": 1,
+          "score": 0.529298245614035
+        }
+      ],
+      "mean": 0.5325438596491228,
+      "std": 0.0032456140350877183
+    },
+    {
+      "condition": {
+        "label": "base@1",
+        "params": {
+          "mode": "base",
+          "n_train": 1
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8312280701754386
+        },
+        {
+          "seed": 1,
+          "score": 0.7884210526315789
+        }
+      ],
+      "mean": 0.8098245614035088,
+      "std": 0.02140350877192987
+    },
+    {
+      "condition": {
+        "label": "base@16",
+        "params": {
+          "mode": "base",
+          "n_train": 16
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8850877192982457
+        },
+        {
+          "seed": 1,
+          "score": 0.8417543859649123
+        }
+      ],
+      "mean": 0.863421052631579,
+      "std": 0.021666666666666723
+    },
+    {
+      "condition": {
+        "label": "base@648",
+        "params": {
+          "mode": "base",
+          "n_train": 648
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.8743859649122806
+        },
+        {
+          "seed": 1,
+          "score": 0.880701754385965
+        }
+      ],
+      "mean": 0.8775438596491227,
+      "std": 0.003157894736842193
+    }
+  ]
+}

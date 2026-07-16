@@ -126,6 +126,10 @@ def test_status_code_from_foreign_module_is_ignored() -> None:
         "model not ready yet",
         # botocore EndpointConnectionError — found live: an unreachable endpoint must spill.
         'Could not connect to the endpoint URL: "https://bedrock-runtime.x.amazonaws.com/"',
+        # botocore ConnectionClosedError - found live (killed a GEPA sweep mid-scoring): a
+        # connection that was ESTABLISHED and then dropped mid-response is transient by
+        # construction, unlike a bad request which never gets that far.
+        "Connection was closed before we received a valid response from endpoint URL",
     ],
 )
 def test_transport_messages_are_capacity(message: str) -> None:
@@ -177,3 +181,33 @@ def test_waterfall_exhausted_is_capacity() -> None:
     from llm_waterfall.types import WaterfallExhausted
 
     assert is_capacity_error(WaterfallExhausted("all rungs throttled", []))
+
+
+def test_internal_failure_code_is_capacity() -> None:
+    # botocore's generic 5xx code — a live run died on it before this classified.
+    exc = _BotocoreShaped("InternalFailure", "An error occurred (InternalFailure)")
+    assert outcome_for(exc) == "capacity_error"
+
+
+def test_botocore_connection_family_matches_by_mro_without_imports() -> None:
+    # Any member of botocore's ConnectionError/HTTPClientError family classifies by MRO
+    # (module, name), so never-seen subclasses with novel messages still fail over. Message
+    # matching alone lost this twice (ConnectionClosedError, EndpointConnectionError).
+    class ConnectionError(Exception):  # noqa: A001 - mirrors botocore's own name
+        pass
+
+    ConnectionError.__module__ = "botocore.exceptions"
+
+    class NewlyInventedSubclass(ConnectionError):
+        pass
+
+    NewlyInventedSubclass.__module__ = "botocore.exceptions"
+    assert outcome_for(NewlyInventedSubclass("some phrasing we have never seen")) == (
+        "capacity_error"
+    )
+
+    # An identically named class from application code proves nothing.
+    class AppConnectionError(Exception):
+        pass
+
+    assert outcome_for(AppConnectionError("connection something")) == "client_error"

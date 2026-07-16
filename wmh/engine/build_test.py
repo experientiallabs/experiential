@@ -38,6 +38,11 @@ class FakeProvider:
                     '"realism": 0.5, "quality": 0.5, "critique": "be more specific"}'
                 )
             )
+        if "KNOWLEDGE BASE" in system:  # the knowledge-seeding extraction pass
+            return Completion(
+                text='{"rules": "- gate: lookups need a valid id", '
+                '"entities": "- user u1", "schemas": "- get_user -> text"}'
+            )
         return Completion(text='{"output": "ok", "is_error": false}')
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -111,6 +116,86 @@ def test_cap_gepa_valset_bounds_steps_and_keeps_at_least_one_trace() -> None:
     # A single over-cap trace still passes through: never starve GEPA of a valset entirely.
     huge = trace_with_steps("huge", _GEPA_VAL_STEP_CAP + 10)
     assert _cap_gepa_valset([huge]) == [huge]
+
+
+def _multi_trace_file(tmp_path, n: int) -> str:  # noqa: ANN001 - pytest fixture
+    """Write `n` one-step OTel traces with distinct 32-char trace ids."""
+    lines: list[str] = []
+    for i in range(n):
+        tid = f"{i:032d}"
+        lines.append(
+            json.dumps(
+                {
+                    "traceId": tid,
+                    "spanId": "s1",
+                    "name": "chat",
+                    "startTimeUnixNano": 1,
+                    "attributes": [
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                        {"key": "gen_ai.tool.name", "value": {"stringValue": "get_user"}},
+                        {
+                            "key": "gen_ai.tool.call.arguments",
+                            "value": {"stringValue": '{"id": "u"}'},
+                        },
+                        {"key": "gen_ai.prompt", "value": {"stringValue": "look up u"}},
+                    ],
+                }
+            )
+        )
+        lines.append(
+            json.dumps(
+                {
+                    "traceId": tid,
+                    "spanId": "s2",
+                    "name": "execute_tool",
+                    "startTimeUnixNano": 2,
+                    "attributes": [
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                        {"key": "gen_ai.tool.message", "value": {"stringValue": "found u"}},
+                    ],
+                }
+            )
+        )
+    p = tmp_path / "traces.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(p)
+
+
+def test_build_falls_back_to_base_when_gepa_prompt_is_empty(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """An empty GEPA winner (weak reflection LM) must not be persisted; base is written instead."""
+    import sys
+
+    from wmh.engine.prompts import BASE_ENV_PROMPT
+    from wmh.optimize import OptimizeResult
+
+    build_mod = sys.modules["wmh.engine.build"]
+    traces_file = _multi_trace_file(tmp_path, 12)
+
+    class _EmptyOptimizer:
+        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def optimize(self, *a, **k) -> OptimizeResult:  # noqa: ANN002, ANN003
+            return OptimizeResult(prompt="   \n", frontier=[])  # blank winner
+
+    monkeypatch.setattr(build_mod, "GEPAOptimizer", _EmptyOptimizer)
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=2,
+        train_split=0.7,
+    )
+    result = build(
+        config,
+        file=traces_file,
+        root=str(tmp_path / ".wmh"),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    assert result.prompt == BASE_ENV_PROMPT
+    paths = ArtifactPaths(tmp_path / ".wmh")
+    assert paths.optimized_prompt.read_text(encoding="utf-8").strip()  # never empty
 
 
 def test_build_writes_a_loadable_artifact(tmp_path) -> None:  # noqa: ANN001 - pytest fixture
@@ -223,3 +308,171 @@ def test_build_judge_stays_on_the_judge_provider(tmp_path) -> None:  # noqa: ANN
     assert all("grade a world model" not in s for s in serve.systems)
     assert any("grade a world model" in s for s in judge.systems)
     assert all("grade a world model" in s for s in judge.systems)  # judge does ONLY judging
+
+
+def _tiny_trace_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture
+    span_llm = {
+        "traceId": "e" * 32,
+        "spanId": "s1",
+        "name": "chat",
+        "startTimeUnixNano": 1,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.tool.name", "value": {"stringValue": "get_user"}},
+            {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": '{"id": "u1"}'}},
+            {"key": "gen_ai.prompt", "value": {"stringValue": "look up u1"}},
+        ],
+    }
+    span_tool = {
+        "traceId": "e" * 32,
+        "spanId": "s2",
+        "name": "execute_tool",
+        "startTimeUnixNano": 2,
+        "attributes": [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+            {"key": "gen_ai.tool.message", "value": {"stringValue": "found u1"}},
+        ],
+    }
+    traces_file = tmp_path / "traces.jsonl"
+    traces_file.write_text(
+        json.dumps(span_llm) + "\n" + json.dumps(span_tool) + "\n", encoding="utf-8"
+    )
+    return str(traces_file)
+
+
+def test_build_with_knowledge_seeds_the_kb_from_train(tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=4,
+        train_split=0.5,
+        knowledge=True,
+    )
+    build(
+        config,
+        file=_tiny_trace_file(tmp_path),
+        root=str(root),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    paths = ArtifactPaths(root)
+    rules = (paths.knowledge / "rules.md").read_text(encoding="utf-8")
+    assert "gate: lookups need a valid id" in rules
+
+
+class _AutoFidelityProvider(FakeProvider):
+    """Reason-mode predictions are distinguishable so the judge can prefer them."""
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        user = messages[0].content
+        if "improve the system prompt" in system:
+            return Completion(text="IMPROVED ENV PROMPT")
+        if "grade a world model" in system:  # rubric judge: reward the reason-mode prediction
+            score = 0.9 if "ok-reason" in user else 0.4
+            dims = ", ".join(
+                f'"{d}": {score}'
+                for d in ("format", "factuality", "consistency", "realism", "quality")
+            )
+            return Completion(text="{" + dims + ', "critique": "ok"}')
+        if "KNOWLEDGE BASE" in system:
+            return Completion(text='{"rules": "- gate: x", "entities": "", "schemas": ""}')
+        if '"reasoning"' in user:  # reason-mode contract requested
+            return Completion(text='{"reasoning": "r", "output": "ok-reason", "is_error": false}')
+        return Completion(text='{"output": "ok", "is_error": false}')
+
+
+def test_build_max_fidelity_finds_the_winner_but_leaves_defaults_plain(tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=4,
+        train_split=0.5,
+    )
+    build(
+        config,
+        file=_tiny_trace_file(tmp_path),
+        root=str(root),
+        serve_provider=_AutoFidelityProvider(),
+        embedder=HashingEmbedder(dim=64),
+        max_fidelity=True,
+        fidelity_budget=2,
+        full_search=True,
+    )
+    from wmh.config import load_config
+
+    # The search NEVER changes the serve defaults — a plain run stays pure RAG...
+    persisted = load_config(str(root))
+    assert persisted.reasoning is False
+    assert persisted.verify is False
+    assert persisted.knowledge is False
+    # ...the measured winner lives in the artifact as a runtime menu (--max-fidelity).
+    report = json.loads((root / "auto_fidelity.json").read_text(encoding="utf-8"))
+    assert report["winner_label"] == "reason"  # judge preferred reason; ties -> cheapest
+    assert report["scores"]["base"] == pytest.approx(0.4)  # five-dim rubric mean
+    # And loading with max_fidelity activates exactly the winner.
+    from wmh.engine.world_model import WorldModel
+
+    wm = WorldModel.load(str(root), _AutoFidelityProvider(), max_fidelity=True)
+    session = wm.new_session(task="t")
+    obs = wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="get_user", arguments={}))
+    assert obs.content == "ok-reason"
+
+
+def test_build_low_tier_skips_gepa(tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=0,  # the low fidelity tier: RAG only
+        train_split=0.5,
+    )
+
+    class _NoGepaProvider(FakeProvider):
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
+            assert "improve the system prompt" not in system, "low tier must not run GEPA"
+            return super().complete(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+
+    result = build(
+        config,
+        file=_tiny_trace_file(tmp_path),
+        root=str(root),
+        serve_provider=_NoGepaProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    from wmh.engine.prompts import BASE_ENV_PROMPT
+
+    assert result.prompt == BASE_ENV_PROMPT
+    assert ArtifactPaths(root).optimized_prompt.read_text(encoding="utf-8") == BASE_ENV_PROMPT
+
+
+def test_build_default_runs_no_search(tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=4,
+        train_split=0.5,
+    )
+    build(
+        config,
+        file=_tiny_trace_file(tmp_path),
+        root=str(root),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    assert not (root / "auto_fidelity.json").exists()  # default stays plain RAG, no search

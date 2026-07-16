@@ -55,8 +55,10 @@ from wmh.cli.ui import (
 from wmh.config import (
     ARTIFACT_DIR,
     DEFAULT_MODEL_NAME,
+    FIDELITY_TIERS,
     PROVIDER_ENV_VARS,
     ArtifactPaths,
+    FidelityTier,
     HarnessConfig,
     WorldModelStore,
     load_config,
@@ -78,9 +80,13 @@ from wmh.engine.eval_suites import (
     resolve_eval_suite,
     result_path,
 )
+from wmh.engine.grounding import GROUNDER_KINDS
+from wmh.engine.knowledge import KnowledgeBase
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
 from wmh.env.llm_agent import LLMAgent
+from wmh.evals.grid import GridResult, ModelSpec, merge_results, run_grid
+from wmh.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import JUDGE_VERSION, RubricJudge
@@ -183,6 +189,8 @@ class _EvalOptions:
     sample_turns: str
     seed: int
     top_k: int
+    knowledge: bool
+    reasoning: bool
 
 
 @config_app.command("telemetry")
@@ -313,10 +321,14 @@ def build(
         None, "--judge-model", help="Canonical GEPA judge model type (default: cheap per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
+    fidelity: str = typer.Option(
+        "medium",
+        help="Build effort: low (RAG only) | medium (+light GEPA + cheap-lever search) | "
+        "high (+GEPA + config search) | max (deep GEPA + full config search).",
+    ),
     chain: str = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
     ),
-    gepa_budget: int = typer.Option(10, help="GEPA iterations (each ~one capped valset pass)."),
     train_split: float = typer.Option(
         0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
     ),
@@ -325,6 +337,20 @@ def build(
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure embedding deployment."),
     embed_dim: int = typer.Option(512, help="phi dimensionality (index + query must agree)."),
+    knowledge: bool = typer.Option(
+        False,
+        "--knowledge/--no-knowledge",
+        help="Seed a knowledge base (rules/entities/schemas markdown) from the train traces.",
+    ),
+    reasoning: bool = typer.Option(
+        False,
+        "--reasoning/--no-reasoning",
+        help="Serve with the deliberate-then-answer output contract.",
+    ),
+    grounder: str = typer.Option(
+        "none",
+        help="Web grounding for unknown entities: none | brave (needs BRAVE_SEARCH_API_KEY).",
+    ),
     interactive: bool = typer.Option(
         None,
         "--interactive/--no-interactive",
@@ -362,7 +388,7 @@ def build(
         provider=provider,
         model=model,
         region=region,
-        gepa_budget=gepa_budget,
+        fidelity=fidelity,
         train_split=train_split,
         judge_model=judge_model,
         embed_provider=embed_provider,
@@ -390,6 +416,14 @@ def build(
         validate_name(params.name)
     except ValueError as err:
         raise typer.BadParameter(str(err)) from None
+    try:
+        tier = FidelityTier(params.fidelity)
+    except ValueError:
+        tiers = ", ".join(t.value for t in FidelityTier)
+        raise typer.BadParameter(
+            f"unknown fidelity {params.fidelity!r}; choose one of: {tiers}"
+        ) from None
+    spec = FIDELITY_TIERS[tier]
     try:
         serve_provider = ProviderKind(params.provider)
     except ValueError:
@@ -421,11 +455,20 @@ def build(
         embed_provider=embed_kind,
         embed_model=params.embed_model,
         embed_dim=params.embed_dim,
-        gepa_budget=params.gepa_budget,
+        gepa_budget=spec.gepa_budget,
         train_split=params.train_split,
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
         trace_adapter=params.source,
     )
+    if grounder not in GROUNDER_KINDS:
+        raise typer.BadParameter(
+            f"unknown grounder {grounder!r}; choose one of: {', '.join(GROUNDER_KINDS)}"
+        )
+    # Agentic-mode flags (CLI-only, not in the wizard): persisted to config.toml so serve/load
+    # pick them up; knowledge additionally seeds knowledge/ during this build.
+    config.knowledge = knowledge
+    config.reasoning = reasoning
+    config.grounder = grounder
     # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
     # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
     # silently swallows it and "succeeds" with a useless held-out-0.0 model.
@@ -470,6 +513,11 @@ def build(
             judge_provider=metered_judge,
             embedder=get_embedder(config),
             reporter=TelemetryBuildReporter(reporter, build_stats),
+            max_fidelity=spec.config_search,
+            fidelity_budget=spec.search_budget,
+            full_search=spec.full_ladder,
+            cheap_search=spec.cheap_frontier_only,
+            gepa_val_cap=spec.gepa_val_cap or None,
         )
     record = tracker.record_summary()
     save_run(record, ArtifactPaths(model_dir).runs)
@@ -492,7 +540,7 @@ def build(
         _console.print(f"[yellow]warning[/yellow]: could not write card.json: {err}")
     capture_build_completed(
         stats=build_stats,
-        gepa_budget=params.gepa_budget,
+        gepa_budget=spec.gepa_budget,
         rollouts_used=result.metrics.rollouts_used,
         frontier_size=len(result.frontier),
         record=record,
@@ -500,6 +548,15 @@ def build(
     )
 
     _console.print(build_summary_panel(store.info(params.name), model_dir))
+    auto_report = Path(model_dir) / "auto_fidelity.json"
+    if auto_report.exists():
+        auto = json.loads(auto_report.read_text(encoding="utf-8"))
+        scores = ", ".join(f"{k}={v:.3f}" for k, v in auto["scores"].items())
+        _console.print(
+            f"[bold]max-fidelity config[/bold]: [bold]{auto['winner_label']}[/bold] "
+            f"({scores}; {auto['val_traces']} held-out traces) — activate with "
+            f"`wmh serve --max-fidelity` / `wmh play --max-fidelity`"
+        )
     _console.print(
         f"[bold]run[/bold] {record.run_id[:8]}: {record.duration_seconds:.1f}s, "
         f"{record.total.total_tokens} tokens, ${record.total.cost_usd:.4f} "
@@ -655,6 +712,12 @@ def serve(
         "--root",
         help="Project dir(s) to serve from. Repeatable; server-side builds land in the first.",
     ),
+    max_fidelity: bool = typer.Option(
+        False,
+        "--max-fidelity",
+        help="Serve with the online extras on: the build-measured winning config when the "
+        "artifact has one, otherwise every extra it supports. Default: pure RAG.",
+    ),
 ) -> None:
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
@@ -666,7 +729,7 @@ def serve(
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
     # not a traceback; load the models before uvicorn takes over the process.
     try:
-        server_app = create_app(list(root), names=names)
+        server_app = create_app(list(root), names=names, max_fidelity=max_fidelity)
     except (ValueError, FileNotFoundError) as err:
         raise typer.BadParameter(str(err)) from None
     uvicorn.run(server_app, host="127.0.0.1", port=port)
@@ -693,6 +756,12 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     train_split: float | None = typer.Option(
         None, help="Train/holdout ratio per file (default: 0.7, or suite config)."
     ),
+    val_frac: float | None = typer.Option(
+        None,
+        "--val-frac",
+        help="`wmh eval grid`: validation fraction reserved for GEPA in a 3-way split so cells "
+        "score only the leak-free test band (default: (1 - train_split)/2, matching build).",
+    ),
     embed_dim: int | None = typer.Option(
         None, help="phi dimensionality for the offline embedder (default: 512, or suite config)."
     ),
@@ -707,7 +776,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         "--judge-model",
         help="Pin the fidelity judge to its own model instead of the serve model. Comparing "
         "fidelity across serve backends REQUIRES a pinned judge, or the grader changes "
-        "with the cell.",
+        "with the cell. `wmh eval grid` pins to us.anthropic.claude-opus-4-8 when unset.",
     ),
     judge_provider: str = typer.Option(
         "bedrock", "--judge-provider", help="Provider for --judge-model."
@@ -722,6 +791,16 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     top_k: int | None = typer.Option(
         None, help="Retrieved demos per step (default: 5, or suite config)."
     ),
+    knowledge: bool | None = typer.Option(
+        None,
+        "--knowledge/--no-knowledge",
+        help="Seed a knowledge base from the train split and render it into every prediction.",
+    ),
+    reasoning: bool | None = typer.Option(
+        None,
+        "--reasoning/--no-reasoning",
+        help="Deliberate-then-answer output contract (explicit reasoning pass).",
+    ),
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
     examples_root: str | None = typer.Option(
         None, help="Directory containing example eval suites. Default: repo-local examples/."
@@ -730,6 +809,20 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
     ),
     limit: int = typer.Option(20, help="Rows to show for `wmh eval results`."),
+    models: str | None = typer.Option(
+        None,
+        help="`wmh eval grid`: comma-separated Label:provider:model cells "
+        "(e.g. 'Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,GPT-5.5:openai:gpt-5.5').",
+    ),
+    gepa_prompts: str | None = typer.Option(
+        None, help="`wmh eval grid`: dir of <label>.txt evolved prompts (enables +GEPA cells)."
+    ),
+    dataset_label: str | None = typer.Option(
+        None, help="`wmh eval grid`: dataset name for the chart subtitle (default: suite id)."
+    ),
+    limit_traces: int | None = typer.Option(
+        None, help="`wmh eval grid`: cap test traces (dry-run). Default: all."
+    ),
     name: str | None = typer.Option(
         None, "--name", help="World model for --mode closed-loop (default: the only built one)."
     ),
@@ -825,6 +918,42 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         suite_filter = args[1] if len(args) == 2 else None
         _eval_results(results_root, suite_roots, suite_filter, limit=limit)
         return
+    if args and args[0] == "grid":
+        if len(args) != 2:
+            raise typer.BadParameter("usage: wmh eval grid <suite>")
+        _eval_run_grid(
+            args[1],
+            examples_roots=suite_roots,
+            results_root=results_root,
+            models=models,
+            gepa_prompts=gepa_prompts,
+            dataset_label=dataset_label,
+            limit_traces=limit_traces,
+            # the grid is a cross-backend comparison, so its judge is always pinned:
+            # default to the canonical Opus judge when --judge-model is not given.
+            judge_model=judge_model or "us.anthropic.claude-opus-4-8",
+            region=region,
+            train_split=train_split,
+            seed=seed,
+            top_k=top_k,
+            embed_dim=embed_dim,
+            sample_turns=sample_turns,
+            val_frac=val_frac,
+            out=out,
+        )
+        return
+    if args and args[0] == "grid-plot":
+        if len(args) < 2:
+            raise typer.BadParameter("usage: wmh eval grid-plot <result.json> [<result.json>...]")
+        _eval_grid_plot(args[1:], out=out, dataset_label=dataset_label)
+        return
+    if args and args[0] == "grid-heatmap":
+        if len(args) < 2:
+            raise typer.BadParameter(
+                "usage: wmh eval grid-heatmap <result.json> [<result.json>...]"
+            )
+        _eval_grid_heatmap(args[1:], out=out)
+        return
     if args and args[0] == "run":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval run <suite>")
@@ -845,6 +974,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             judge_region=judge_region,
             seed=seed,
             top_k=top_k,
+            knowledge=knowledge,
+            reasoning=reasoning,
             out=out,
         )
         return
@@ -862,6 +993,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         sample_turns=sample_turns,
         seed=seed,
         top_k=top_k,
+        knowledge=knowledge,
+        reasoning=reasoning,
     )
     report = _run_eval_files(
         [Path(f) for f in args],
@@ -950,6 +1083,170 @@ def _eval_results(
     _console.print(table)
 
 
+# Default grid: one bar family per serving model. Qwen-AgentWorld is self-hosted (openai-compatible
+# vLLM via OPENAI_BASE_URL); the rest are frontier models the registry builds directly.
+_DEFAULT_GRID_MODELS = (
+    "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8",
+    "Haiku 4.5:bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "GPT-5.5:openai:gpt-5.5",
+    "GPT-5.4 Mini:openai:gpt-5.4-mini",
+    "Qwen-AgentWorld:openai:Qwen/Qwen-AgentWorld-35B-A3B",
+)
+
+
+def _parse_model_specs(models: str | None) -> list[ModelSpec]:
+    """Parse "Label:provider:model[,...]" into ModelSpecs (default set when None).
+
+    The provider is validated and the model resolved through the shared catalog
+    (`resolve_provider_model`), so a friendly model type resolves to its canonical wire id while an
+    unknown (self-hosted) id passes through unchanged, and a bad provider fails at parse time.
+    """
+    raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
+    specs: list[ModelSpec] = []
+    for entry in raw:
+        parts = entry.split(":", 2)
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            raise typer.BadParameter(f"bad --models entry {entry!r}; want 'Label:provider:model'")
+        label, provider_str, model_str = (p.strip() for p in parts)
+        try:
+            kind = ProviderKind(provider_str)
+        except ValueError:
+            kinds = ", ".join(k.value for k in ProviderKind)
+            raise typer.BadParameter(
+                f"unknown provider {provider_str!r} in --models {entry!r}; want one of {kinds}"
+            ) from None
+        specs.append(ModelSpec(label, kind.value, resolve_provider_model(kind, model_str).model_id))
+    return specs
+
+
+def _grid_output_paths(out: str | None, default_json: Path) -> tuple[Path, Path]:
+    """Result-JSON and chart-PNG destinations for a grid run.
+
+    With `--out`, the JSON and PNG share the stem but ALWAYS take distinct suffixes, so passing
+    `--out foo.json` can never make the PNG write clobber the result JSON at the same path (and
+    `--out foo.png` still lands the JSON next to it). Without `--out`, use the default JSON dest and
+    its `.png` sibling.
+    """
+    if out is None:
+        return default_json, default_json.with_suffix(".png")
+    base = Path(out)
+    return base.with_suffix(".json"), base.with_suffix(".png")
+
+
+def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each maps to one flag
+    selector: str,
+    *,
+    examples_roots: list[str],
+    results_root: str,
+    models: str | None,
+    gepa_prompts: str | None,
+    dataset_label: str | None,
+    limit_traces: int | None,
+    judge_model: str,
+    region: str | None,
+    train_split: float | None,
+    seed: int | None,
+    top_k: int | None,
+    embed_dim: int | None,
+    sample_turns: str | None,
+    val_frac: float | None,
+    out: str | None,
+) -> None:
+    """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
+    suite = resolve_eval_suite(selector, examples_roots)
+    specs = _parse_model_specs(models)
+    prompt_dir = Path(gepa_prompts) if gepa_prompts else None
+    prompt_map: dict[str, str] | None = None
+    if prompt_dir is not None:
+        prompt_map = {
+            s.label: str(prompt_dir / f"{s.label}.txt")
+            for s in specs
+            if (prompt_dir / f"{s.label}.txt").exists()
+        }
+    cfg = suite.config
+    result = run_grid(
+        suite_name=suite.id,
+        files=[str(p) for p in suite.resolve_files()],
+        models=specs,
+        gepa_prompts=prompt_map,
+        base_prompt=BASE_ENV_PROMPT,
+        judge_provider="bedrock",
+        judge_model=judge_model,
+        judge_region=region,
+        train_split=train_split if train_split is not None else cfg.train_split,
+        val_frac=val_frac,
+        top_k=top_k if top_k is not None else cfg.top_k,
+        seed=seed if seed is not None else cfg.seed,
+        sample_turns=sample_turns or cfg.sample_turns,
+        embed_dim=embed_dim if embed_dim is not None else cfg.embed_dim,
+        max_holdout_traces=limit_traces,
+    )
+    for cell in result.cells:
+        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
+        _console.print(
+            f"  {cell.model_label:16} {cell.condition_label:14} "
+            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
+            f"n={cell.n_steps}{cost}"
+        )
+    run_id = uuid4().hex
+    default_dest = Path(results_root) / "grid" / f"{suite.name}-{run_id}.json"
+    dest, png = _grid_output_paths(out, default_dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    _console.print(f"wrote grid result -> {dest}")
+    png.parent.mkdir(parents=True, exist_ok=True)
+    plot_grid(
+        result,
+        png,
+        dataset_label=dataset_label or suite.id,
+        n_test_traces=result.total_test_traces,
+    )
+    _console.print(f"wrote grid chart  -> {png}")
+
+
+def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | None) -> None:
+    """Merge one or more grid result JSONs and render a single combined fidelity chart.
+
+    Lets a self-hosted model's grid (run in its own process, since its OpenAI base URL is
+    process-global) be combined with the API-model grid into one chart - and re-plots any saved
+    result without re-running the eval.
+    """
+    results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
+    merged = merge_results(results)
+    for cell in merged.cells:
+        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
+        _console.print(
+            f"  {cell.model_label:16} {cell.condition_label:14} "
+            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
+            f"n={cell.n_steps}{cost}"
+        )
+    # Force a .png suffix so `--out foo.json` writes a real PNG file, never a PNG mislabeled .json.
+    png = Path(out).with_suffix(".png") if out else Path(paths[0]).with_suffix(".merged.png")
+    plot_grid(
+        merged,
+        png,
+        dataset_label=dataset_label or merged.suite,
+        n_test_traces=merged.total_test_traces,
+    )
+    _console.print(f"wrote merged grid chart -> {png}")
+
+
+def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
+    """Render the whole grid as one heatmap from result JSONs (merged per suite).
+
+    Accepts any mix of API/Qwen result JSONs; same-suite results are merged into one 5-model row
+    set, then all suites become the heatmap's columns (rows = model x condition).
+    """
+    by_suite: dict[str, list[GridResult]] = {}
+    for p in paths:
+        res = GridResult.model_validate_json(Path(p).read_text(encoding="utf-8"))
+        by_suite.setdefault(res.suite, []).append(res)
+    merged = {suite: merge_results(rs) for suite, rs in by_suite.items()}
+    png = Path(out).with_suffix(".png") if out else Path("grid-heatmap.png")
+    plot_grid_heatmap(merged, png)
+    _console.print(f"wrote grid heatmap -> {png} ({len(merged)} benchmarks)")
+
+
 def _eval_run_suite(
     selector: str,
     *,
@@ -968,6 +1265,8 @@ def _eval_run_suite(
     judge_region: str | None,
     seed: int | None,
     top_k: int | None,
+    knowledge: bool | None,
+    reasoning: bool | None,
     out: str | None,
 ) -> None:
     suite = resolve_eval_suite(selector, examples_roots)
@@ -980,6 +1279,8 @@ def _eval_run_suite(
         sample_turns=sample_turns or suite.config.sample_turns,
         seed=seed if seed is not None else suite.config.seed,
         top_k=top_k if top_k is not None else suite.config.top_k,
+        knowledge=knowledge if knowledge is not None else suite.config.knowledge,
+        reasoning=reasoning if reasoning is not None else suite.config.reasoning,
     )
     files = suite.resolve_files()
     report = _run_eval_files(
@@ -1016,6 +1317,8 @@ def _eval_run_suite(
             "seed": options.seed,
             "rag": options.use_rag,
             "embed_dim": options.embed_dim,
+            "knowledge": options.knowledge,
+            "reasoning": options.reasoning,
         },
         "report": _eval_report_payload(report),
     }
@@ -1042,6 +1345,8 @@ def _eval_options(
     sample_turns: str | None,
     seed: int | None,
     top_k: int | None,
+    knowledge: bool | None = None,
+    reasoning: bool | None = None,
 ) -> _EvalOptions:
     split = 0.7 if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
@@ -1065,6 +1370,8 @@ def _eval_options(
         sample_turns=turns,
         seed=rng_seed,
         top_k=demos,
+        knowledge=bool(knowledge),
+        reasoning=bool(reasoning),
     )
 
 
@@ -1122,6 +1429,8 @@ def _run_eval_files(
         top_k=options.top_k,
         sample_turns=options.sample_turns,
         seed=options.seed,
+        knowledge=options.knowledge,
+        reasoning=options.reasoning,
     )
     return evaluation.run()
 
@@ -1153,6 +1462,32 @@ def _eval_report_payload(report: EvalReport) -> JsonObject:
         "total_invalid": report.total_invalid,
         "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
     }
+
+
+@app.command("knowledge")
+def knowledge_(
+    name: str = typer.Option(None, "--name", help="World model (default: the only one)."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+) -> None:
+    """Show a model's knowledge base: the env's canonical facts, a folder of editable markdown.
+
+    The printed directory IS the editing interface — open it in any editor. `rules.md`/
+    `entities.md`/`schemas.md` are seeded at build (with knowledge enabled); `learned.md` collects
+    the env's own cross-session notes; `grounded.md` caches web-search groundings.
+    """
+    store = WorldModelStore(root)
+    resolved = _resolve_name(store, name)
+    kb = KnowledgeBase(ArtifactPaths(store.resolve(resolved)).knowledge)
+    _console.print(f"[bold]{kb.directory}[/bold]")
+    if kb.is_empty:
+        _console.print(
+            "(empty — enable knowledge at build, drop *.md files in this folder, "
+            "or PUT files via the serving API)"
+        )
+        return
+    for file_name, content in kb.files().items():
+        _console.print(f"\n[bold]## {file_name}[/bold]")
+        _console.print(content.strip())
 
 
 @scenarios_app.command("build")
@@ -1401,9 +1736,14 @@ def demo(
         "--show-prompt/--no-prompt",
         help="Print the exact env prompt the world model sees for the first step.",
     ),
+    max_fidelity: bool = typer.Option(
+        False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
+    ),
 ) -> None:
     """Replay a randomly sampled recorded scenario against the world model, open loop."""
-    wm, resolved_name, _provider, model_root = _load_model_any(name, root)
+    wm, resolved_name, _provider, model_root = _load_model_any(
+        name, root, max_fidelity=max_fidelity
+    )
     traces_file = Path(traces) if traces else _traces_for_root(model_root)
     if traces_file is None or not traces_file.exists():
         raise typer.BadParameter(
@@ -1520,9 +1860,14 @@ def play(
     name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    max_fidelity: bool = typer.Option(
+        False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
+    ),
 ) -> None:
     """Step into the environment yourself: type actions, the world model returns observations."""
-    wm, resolved_name, _provider, _model_root = _load_model_any(name, root)
+    wm, resolved_name, _provider, _model_root = _load_model_any(
+        name, root, max_fidelity=max_fidelity
+    )
     suggestions = _action_suggestions(wm)
     run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
 
@@ -1552,14 +1897,14 @@ def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
     return suggestions
 
 
-def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider, Path)
+def _load_model_any(name: str | None, root: str, *, max_fidelity: bool = False):  # noqa: ANN202
     """Resolve a model across the project dir AND shipped examples, then load it.
 
     An explicit non-default `--root` keeps the old single-root behavior. Otherwise the picker
     spans `<root>/models/*` plus `examples/*/models/*`, labeling each with its source.
     """
     if root != ARTIFACT_DIR:
-        wm, resolved, provider = _load_model(name, root)
+        wm, resolved, provider = _load_model(name, root, max_fidelity=max_fidelity)
         return wm, resolved, provider, Path(root)
 
     candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
@@ -1593,7 +1938,7 @@ def _load_model_any(name: str | None, root: str):  # noqa: ANN202 - (WorldModel,
         have = ", ".join(c[2] for c in candidates)
         raise typer.BadParameter(f"multiple world models ({have}); pass --name")
 
-    wm, resolved, provider = _load_model(resolved, str(store_root))
+    wm, resolved, provider = _load_model(resolved, str(store_root), max_fidelity=max_fidelity)
     return wm, resolved, provider, store_root
 
 
@@ -1990,12 +2335,13 @@ class _RetryNarrator:
 _NARRATOR = _RetryNarrator(_console)
 
 
-def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, name, Provider)
+def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # noqa: ANN202
     """Resolve + load a named world model (or the single built one) with its serve provider.
 
     The serve provider comes from the MODEL'S OWN config (the one it was built to serve on),
     wrapped so transient capacity errors retry with narrated exponential backoff instead of
-    dying. Returns `(world_model, resolved_name, provider)`.
+    dying. `max_fidelity` = the online extras (see `WorldModel.load`); default is pure RAG.
+    Returns `(world_model, resolved_name, provider)`.
     """
     store = WorldModelStore(root)
     resolved_name = _resolve_name(store, name)
@@ -2006,7 +2352,9 @@ def _load_model(name: str | None, root: str):  # noqa: ANN202 - (WorldModel, nam
         on_retry=_NARRATOR.on_retry,
         sleep=_NARRATOR.sleep,
     )
-    world_model = WorldModel.load(str(model_dir), provider, telemetry_root=store.root)
+    world_model = WorldModel.load(
+        str(model_dir), provider, telemetry_root=store.root, max_fidelity=max_fidelity
+    )
     return world_model, resolved_name, provider
 
 

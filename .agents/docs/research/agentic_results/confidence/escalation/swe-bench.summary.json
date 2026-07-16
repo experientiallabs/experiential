@@ -1,0 +1,42 @@
+[
+  {
+    "suite": "swe-bench",
+    "tau": 0.9,
+    "seed": 0,
+    "fidelity": 0.7511,
+    "escalation_rate": 0.4353,
+    "serve_cost_usd": 3.499,
+    "calls": 122,
+    "n_steps": 85
+  },
+  {
+    "suite": "swe-bench",
+    "tau": 1.0,
+    "seed": 0,
+    "fidelity": 0.8003,
+    "escalation_rate": 1.0,
+    "serve_cost_usd": 6.814,
+    "calls": 170,
+    "n_steps": 85
+  },
+  {
+    "suite": "swe-bench",
+    "tau": 0.9,
+    "seed": 1,
+    "fidelity": 0.7473,
+    "escalation_rate": 0.3647,
+    "serve_cost_usd": 3.217,
+    "calls": 116,
+    "n_steps": 85
+  },
+  {
+    "suite": "swe-bench",
+    "tau": 1.0,
+    "seed": 1,
+    "fidelity": 0.7875,
+    "escalation_rate": 1.0,
+    "serve_cost_usd": 7.05,
+    "calls": 170,
+    "n_steps": 85
+  }
+]

@@ -1,0 +1,178 @@
+{
+  "name": "gepa-scaling-law",
+  "seeds": [
+    0
+  ],
+  "conditions": [
+    {
+      "condition": {
+        "label": "t1_b8",
+        "params": {
+          "n_train": 1,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.776
+        }
+      ],
+      "mean": 0.776,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t2_b8",
+        "params": {
+          "n_train": 2,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.794
+        }
+      ],
+      "mean": 0.794,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t4_b8",
+        "params": {
+          "n_train": 4,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.809
+        }
+      ],
+      "mean": 0.809,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t8_b8",
+        "params": {
+          "n_train": 8,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.851
+        }
+      ],
+      "mean": 0.851,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t16_b8",
+        "params": {
+          "n_train": 16,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.846
+        }
+      ],
+      "mean": 0.846,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t32_b8",
+        "params": {
+          "n_train": 32,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.858
+        }
+      ],
+      "mean": 0.858,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t64_b8",
+        "params": {
+          "n_train": 64,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.865
+        }
+      ],
+      "mean": 0.865,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t128_b8",
+        "params": {
+          "n_train": 128,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.864
+        }
+      ],
+      "mean": 0.864,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t256_b8",
+        "params": {
+          "n_train": 256,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.889
+        }
+      ],
+      "mean": 0.889,
+      "std": 0.0
+    },
+    {
+      "condition": {
+        "label": "t648_b8",
+        "params": {
+          "n_train": 648,
+          "budget": 8
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "score": 0.912
+        }
+      ],
+      "mean": 0.912,
+      "std": 0.0
+    }
+  ]
+}

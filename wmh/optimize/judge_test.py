@@ -141,6 +141,26 @@ def test_headline_score_is_weighted_mean_of_dimensions() -> None:
     assert result.valid is True
 
 
+def test_judge_prompt_never_sees_stated_confidence() -> None:
+    # WS-A6 guard (D75): the model's verbalized confidence is analysis-only. If it reached the
+    # judge, a prompt (or an RL policy) could learn to game fidelity by talking the judge up —
+    # same rule as `reasoning`, pinned here because calibration research depends on it.
+    predicted = Observation(
+        content="cart has 1 item",
+        is_error=False,
+        metadata={
+            "confidence": 0.95,
+            "confidence_why": "the demo shows this exact lookup",
+            "reasoning": "auth gate passed",
+        },
+    )
+    prompt = _build_judge_prompt(predicted, Observation(content="cart has 1 item"), _ctx())
+    assert "confidence" not in prompt
+    assert "0.95" not in prompt
+    assert "the demo shows this exact lookup" not in prompt
+    assert "auth gate passed" not in prompt
+
+
 def test_equal_dimensions_score_the_same_as_the_old_unweighted_mean() -> None:
     # Comparability guard: any reply with all dimensions equal is unaffected by the reweighting,
     # so uniformly-judged steps keep their pre-overhaul scores.

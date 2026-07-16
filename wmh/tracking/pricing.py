@@ -52,6 +52,9 @@ _PRICES: dict[str, ModelPrice] = {
     "gpt-5.4": ModelPrice(input_per_mtok=2.5, output_per_mtok=15.0),
     "gpt-5.4-mini": ModelPrice(input_per_mtok=0.75, output_per_mtok=4.5),
     "gpt-5.4-nano": ModelPrice(input_per_mtok=0.2, output_per_mtok=1.25),
+    # Self-hosted models (vLLM on our own GPUs) intentionally have NO row: their cost is amortized
+    # GPU time, not a per-token API price. `price_for` returns None for them, which the eval grid
+    # renders as "no cost"; a 0.0 ModelPrice would instead report a misleading $0.00.
     # --- Embeddings (output tokens are always 0 for embed calls) ---
     "text-embedding-3-small": ModelPrice(input_per_mtok=0.02, output_per_mtok=0.0),
     "text-embedding-3-large": ModelPrice(input_per_mtok=0.13, output_per_mtok=0.0),

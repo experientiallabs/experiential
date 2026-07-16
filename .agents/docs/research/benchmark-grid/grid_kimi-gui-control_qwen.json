@@ -1,0 +1,58 @@
+{
+  "suite": "kimi-gui-control/default",
+  "judge_model": "us.anthropic.claude-opus-4-8",
+  "judge_provider": "bedrock",
+  "judge_version": "rubric-v1",
+  "train_split": 0.85,
+  "top_k": 5,
+  "seed": 0,
+  "sample_turns": "sampled",
+  "total_test_steps": 15,
+  "total_test_traces": 3,
+  "cells": [
+    {
+      "model_label": "Qwen-AgentWorld",
+      "provider": "openai",
+      "model": "Qwen/Qwen-AgentWorld-35B-A3B",
+      "condition": "base",
+      "condition_label": "base",
+      "fidelity": 0.4026666666666667,
+      "error_flag_acc": 0.9333333333333333,
+      "n_steps": 15,
+      "cost_usd": 0.0
+    },
+    {
+      "model_label": "Qwen-AgentWorld",
+      "provider": "openai",
+      "model": "Qwen/Qwen-AgentWorld-35B-A3B",
+      "condition": "base_rag",
+      "condition_label": "wmh/rag",
+      "fidelity": 0.39333333333333337,
+      "error_flag_acc": 0.9333333333333333,
+      "n_steps": 15,
+      "cost_usd": 0.0
+    },
+    {
+      "model_label": "Qwen-AgentWorld",
+      "provider": "openai",
+      "model": "Qwen/Qwen-AgentWorld-35B-A3B",
+      "condition": "gepa",
+      "condition_label": "wmh/gepa",
+      "fidelity": 0.39066666666666666,
+      "error_flag_acc": 0.9333333333333333,
+      "n_steps": 15,
+      "cost_usd": 0.0
+    },
+    {
+      "model_label": "Qwen-AgentWorld",
+      "provider": "openai",
+      "model": "Qwen/Qwen-AgentWorld-35B-A3B",
+      "condition": "gepa_rag",
+      "condition_label": "wmh/gepa/rag",
+      "fidelity": 0.44666666666666666,
+      "error_flag_acc": 1.0,
+      "n_steps": 15,
+      "cost_usd": 0.0
+    }
+  ]
+}

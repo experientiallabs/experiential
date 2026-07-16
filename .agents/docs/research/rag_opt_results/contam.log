@@ -1,0 +1,4 @@
+tau-bench       zero-shot(no ctx): exact=0%  near(>0.95)=0%  factuality=0.12  (n=30)
+terminal-tasks  zero-shot(no ctx): exact=17%  near(>0.95)=27%  factuality=0.27  (n=30)
+swe-bench       zero-shot(no ctx): exact=3%  near(>0.95)=13%  factuality=0.11  (n=30)
+CONTAM DONE
