@@ -154,8 +154,9 @@ def main() -> int:
     # The policy must never train on an eval task, so any train scenario whose task also appears in
     # the eval set is dropped — from TRAIN, keeping the eval set at full size.
     eval_tasks = {s.task for s in eval_scenarios}
-    train_pool = [s for s in scenarios_from_traces(train) if s.task not in eval_tasks]
-    n_leak = len(scenarios_from_traces(train)) - len(train_pool)
+    train_all = scenarios_from_traces(train)
+    train_pool = [s for s in train_all if s.task not in eval_tasks]
+    n_leak = len(train_all) - len(train_pool)
     train_scenarios = _stratified_cap(train_pool, by_trace)
 
     # Join every pinned scenario to gold on instance_id; abort on any miss (never a silent null).

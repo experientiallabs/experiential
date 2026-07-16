@@ -155,15 +155,13 @@ class WorldModel:
                 reasoning, verify = True, True
                 knowledge_on = paths.knowledge.is_dir()
                 grounder_kind = "fetch" if grounder_kind == "none" else grounder_kind
+        if top_k is not None:
+            top_k_override = top_k  # the caller's explicit depth beats the max_fidelity winner
         return cls(
             provider,
             retriever,
             env_prompt=env_prompt,
-            top_k=(
-                top_k
-                if top_k is not None
-                else (top_k_override if top_k_override is not None else config.top_k)
-            ),
+            top_k=top_k_override if top_k_override is not None else config.top_k,
             telemetry_root=telemetry_root or _default_telemetry_root(artifact_dir),
             reward_provider=reward_provider,
             knowledge=(

@@ -145,6 +145,10 @@ register_platform_commands(app)
 register_agent_session_commands(app)
 _console = Console()
 _CHECK = "[green]✓[/green]"
+# `wmh eval grid` compares serve backends, so its judge is always pinned; this is the
+# canonical grader used when --judge-model is not given (one constant: the default and
+# the --judge-model help text must never advertise different judges).
+_GRID_JUDGE_DEFAULT = "us.anthropic.claude-opus-4-8"
 
 # Module-level singleton: a typer.Argument call can't be a default inline (ruff B008).
 _EVAL_TOKENS = typer.Argument(
@@ -776,7 +780,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         "--judge-model",
         help="Pin the fidelity judge to its own model instead of the serve model. Comparing "
         "fidelity across serve backends REQUIRES a pinned judge, or the grader changes "
-        "with the cell. `wmh eval grid` pins to us.anthropic.claude-opus-4-8 when unset.",
+        f"with the cell. `wmh eval grid` pins to {_GRID_JUDGE_DEFAULT} when unset.",
     ),
     judge_provider: str = typer.Option(
         "bedrock", "--judge-provider", help="Provider for --judge-model."
@@ -929,9 +933,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             gepa_prompts=gepa_prompts,
             dataset_label=dataset_label,
             limit_traces=limit_traces,
-            # the grid is a cross-backend comparison, so its judge is always pinned:
-            # default to the canonical Opus judge when --judge-model is not given.
-            judge_model=judge_model or "us.anthropic.claude-opus-4-8",
+            judge_model=judge_model,
+            judge_provider=judge_provider,
+            judge_region=judge_region,
             region=region,
             train_split=train_split,
             seed=seed,
@@ -1142,7 +1146,9 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     gepa_prompts: str | None,
     dataset_label: str | None,
     limit_traces: int | None,
-    judge_model: str,
+    judge_model: str | None,
+    judge_provider: str,
+    judge_region: str | None,
     region: str | None,
     train_split: float | None,
     seed: int | None,
@@ -1170,9 +1176,9 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
         models=specs,
         gepa_prompts=prompt_map,
         base_prompt=BASE_ENV_PROMPT,
-        judge_provider="bedrock",
-        judge_model=judge_model,
-        judge_region=region,
+        judge_provider=judge_provider,
+        judge_model=judge_model or _GRID_JUDGE_DEFAULT,
+        judge_region=judge_region or region,
         train_split=train_split if train_split is not None else cfg.train_split,
         val_frac=val_frac,
         top_k=top_k if top_k is not None else cfg.top_k,
@@ -1404,20 +1410,13 @@ def _run_eval_files(
     # the failover chain — a judge that silently switches models mid-run makes fidelity numbers
     # incomparable across steps. World-model prediction calls (above) may fail over freely.
     # --judge-model additionally pins the judge to its OWN model/region: comparing
-    # fidelity across serve backends requires a constant grader.
-    if judge_model:
-        try:
-            judge_kind = ProviderKind(judge_provider)
-        except ValueError:
-            kinds = ", ".join(k.value for k in ProviderKind)
-            raise typer.BadParameter(
-                f"unknown --judge-provider {judge_provider!r}; choose one of: {kinds}"
-            ) from None
-        judge_config = ProviderConfig(
-            kind=judge_kind, model=judge_model, region=judge_region or region
-        )
-    else:
-        judge_config = provider_config
+    # fidelity across serve backends requires a constant grader. Built through
+    # _provider_config so judge model aliases resolve exactly like serve models.
+    judge_config = (
+        _provider_config(judge_provider, judge_model, judge_region or region)
+        if judge_model
+        else provider_config
+    )
     scorer = RubricJudge(providers.get_provider(judge_config))
     evaluation = OpenLoopEval(
         files,

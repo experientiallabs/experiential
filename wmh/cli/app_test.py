@@ -459,6 +459,82 @@ def test_eval_pinned_judge_builds_its_own_provider(monkeypatch, tmp_path) -> Non
     assert ("bedrock", "pinned-judge") in requested
 
 
+def test_eval_grid_threads_judge_flags_into_run_grid(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    """`wmh eval grid` honors --judge-model/--judge-provider/--judge-region (not just file mode)."""
+    from wmh.evals.grid import GridResult
+
+    examples_root = tmp_path / "examples"
+    evals_dir = examples_root / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (examples_root / "tiny-task" / "traces.otel.jsonl").write_text(
+        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (evals_dir / "default.toml").write_text(
+        'description = "Tiny suite"\nfiles = ["../traces.otel.jsonl"]\ntrain_split = 0.5\n',
+        encoding="utf-8",
+    )
+
+    captured: dict[str, str | None] = {}
+
+    def fake_run_grid(**kwargs):  # noqa: ANN003, ANN202
+        captured.update(
+            {k: kwargs[k] for k in ("judge_model", "judge_provider", "judge_region")}
+        )
+        return GridResult(
+            suite="tiny-task/default",
+            judge_model=kwargs["judge_model"],
+            judge_provider=kwargs["judge_provider"],
+            train_split=0.5,
+            top_k=5,
+            seed=0,
+            sample_turns="all",
+        )
+
+    monkeypatch.setattr(cli_app_module, "run_grid", fake_run_grid)
+    monkeypatch.setattr(cli_app_module, "plot_grid", lambda *a, **kw: None)
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "grid",
+            "tiny-task",
+            "--examples-root",
+            str(examples_root),
+            "--results-root",
+            str(tmp_path / ".wmh" / "evals"),
+            "--judge-model",
+            "pinned-grid-judge",
+            "--judge-provider",
+            "openai",
+            "--judge-region",
+            "eu-west-1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "judge_model": "pinned-grid-judge",
+        "judge_provider": "openai",
+        "judge_region": "eu-west-1",
+    }
+
+    # unset -> the canonical pinned default, not the serve model
+    captured.clear()
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "grid",
+            "tiny-task",
+            "--examples-root",
+            str(examples_root),
+            "--results-root",
+            str(tmp_path / ".wmh" / "evals"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["judge_model"] == cli_app_module._GRID_JUDGE_DEFAULT
+
+
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
     examples_root = tmp_path / "examples"
     task_dir = examples_root / "tiny-task"
