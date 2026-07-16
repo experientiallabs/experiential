@@ -219,3 +219,30 @@ Consistent with the cross-env compression already documented (opus/azure eras �
 and with B2's R++ real row (+0.025): at smoke scale, WM-trained tau checkpoints are
 real-env-neutral. The first-pass −0.300 row above stands only as provenance for the
 config lesson (D70 pinned config; ~30pts of artifact from one serving flag).
+
+## Cross-era compression is the central caveat on every in-WM delta (D90.7)
+
+The tau headline arms, measured on every eval environment the program had:
+
+| eval environment | base | GRPO smoke | SDPO-n8 | GRPO delta |
+|---|---|---|---|---|
+| GPT-5.5-era WM (results of record, n=79 pooled) | 0.550 | **0.658** | 0.650 | **+10.8** |
+| Opus-era WM (interim, references re-evaled) | 0.600 | 0.600 | 0.555 | **0.0** |
+| Azure GPT-5.5-era WM (third era, same base model, new serving stack) | 0.675 | ≤ base | ≤ base | **≤ 0** |
+| **Real tau2 gym** (pinned D70 config, n=40) | 0.900 | 0.900 | — | **0.0** |
+
+The +10.8 exists on exactly one eval environment and compresses to ≤0 on every other,
+including reality. **Open hypothesis, stated plainly and not resolved here: the in-WM
+gain may partly be judge/env-pleasing rather than task competence.** The mechanism is
+available: training rewards and the GPT-5.5-era eval rows share reward machinery from
+the same model-family lineage, so GRPO can ascend idiosyncrasies of that grader — and
+every grader that differs from the training-reward stack (Opus env, Azure serving
+stack, tau2's real rule-based grader) shows no lift. Points against it: the training
+WM was haiku (different family from the GPT-5.5 eval env, the strongest circularity
+blunting we had), reward-integrity audits found no gaming pattern in episode text, and
+the real-env row shows no *harm* either (a pure grader-hack usually costs real
+performance — cf. terminal offline-SFT at −0.163). n=40–79 also leaves room for plain
+noise. **This is the primary open question the program's in-WM deltas carry**; the
+pre-registered discriminator is B2's D90.1 confirmatory pass on the untouched tau
+val-split (one pre-declared pass, no reruns), and the queued substrate fix (D86.5:
+WM action-parser strictness = deployment strictness) closes the adjacent loophole.
