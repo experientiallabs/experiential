@@ -311,6 +311,11 @@ class AttachedCommandReader(threading.Thread):
                         )
                 elif line == ":stop":
                     self._post("interrupt")
+                elif line.startswith(":"):
+                    # An unknown command must never reach the agent as chat.
+                    _console.print(
+                        f"[yellow]unknown command {line}; use :stop, :detach, or :end[/yellow]"
+                    )
                 elif line:
                     self._post("user_message", text=line)
         except (OSError, PlatformError):

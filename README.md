@@ -88,6 +88,10 @@ wmh run --end                            # end it explicitly, with the final wor
 wmh run --session <session-id> --send "Do this task"   # address a specific session
 ```
 
+An interactive `wmh run <agent-id>` can also be promoted mid-session: type `:detach` to leave
+the hosted session running as the current detached session (with `-u`, the sync checkpoint is
+carried over), then continue with `-s`/`-a`/`--end` as above.
+
 The current-session reference (and, with `-u`, a synchronization checkpoint) lives in WMH user
 state under `~/.wmh/sessions/`, not in your repository. Every send/attach/end first catches up:
 workspace changes the agent made while nothing was attached are applied locally, and local edits
