@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
@@ -113,6 +113,10 @@ class AgentProject:
         self._session_provider: ToolCallingProvider | None = None
         self._network_locked_sandbox_id: int | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
+        # ``None`` preserves the historical unrestricted project-tool behavior. A concrete set is
+        # one logical run's exact, project-relative write grant; it is cleared even when the turn
+        # fails so a reused live session cannot inherit the preceding turn's authority.
+        self._active_writable_files: frozenset[str] | None = None
         self._retired_worker_usage = TokenUsage()
         try:
             self._initialize_sandbox(self._sandbox)
@@ -189,13 +193,18 @@ class AgentProject:
         timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
         on_event: Callable[[SessionEvent], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        writable_files: Collection[str] | None = None,
     ) -> AgentProjectRun:
         """Run one turn of an ordinary agent against this persistent project.
 
         A transient runner-channel disconnect retries the turn once. Owned E2B
         projects replace a transport-poisoned sandbox and replay their mirrored
         filesystem first; injected test projects keep the sandbox and replace
-        only the ordinary live session.
+        only the ordinary live session. ``writable_files`` optionally grants the
+        agent's ``write_file`` tool access to exact project-relative files for
+        this logical run. Omitting it preserves unrestricted project writes;
+        an empty collection denies every agent write. Host ``write_text`` calls
+        are not constrained by an agent turn's grant.
         """
         if self._closing:
             raise RuntimeError("cannot run an agent in a closed project")
@@ -206,38 +215,43 @@ class AgentProject:
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"project agents cannot use uncontained tools: {names}")
+        write_grant = self._normalize_writable_files(writable_files)
         usage_before = self._total_worker_usage()
-        for attempt in range(2):
-            try:
-                result = self._run_turn(
-                    agent,
-                    provider,
-                    instruction,
-                    timeout=timeout,
-                    on_event=on_event,
-                    should_cancel=should_cancel,
-                )
-                usage_after = self._total_worker_usage()
-                return AgentProjectRun(
-                    answer=result.answer,
-                    events=result.events,
-                    worker_usage=_usage_delta(usage_after, usage_before),
-                )
-            except HarnessSearchCancelled:
-                raise
-            except Exception as error:
-                if attempt > 0 or not _is_recoverable_session_error(error):
-                    raise
-                if self._sandbox_factory is None:
-                    self._close_agent_session()
-                    continue
+        self._active_writable_files = write_grant
+        try:
+            for attempt in range(2):
                 try:
-                    self._replace_sandbox()
-                except Exception as recovery_error:
-                    raise RuntimeError(
-                        f"{error}; fresh project sandbox recovery failed: {recovery_error}"
-                    ) from recovery_error
-        raise AssertionError("unreachable")
+                    result = self._run_turn(
+                        agent,
+                        provider,
+                        instruction,
+                        timeout=timeout,
+                        on_event=on_event,
+                        should_cancel=should_cancel,
+                    )
+                    usage_after = self._total_worker_usage()
+                    return AgentProjectRun(
+                        answer=result.answer,
+                        events=result.events,
+                        worker_usage=_usage_delta(usage_after, usage_before),
+                    )
+                except HarnessSearchCancelled:
+                    raise
+                except Exception as error:
+                    if attempt > 0 or not _is_recoverable_session_error(error):
+                        raise
+                    if self._sandbox_factory is None:
+                        self._close_agent_session()
+                        continue
+                    try:
+                        self._replace_sandbox()
+                    except Exception as recovery_error:
+                        raise RuntimeError(
+                            f"{error}; fresh project sandbox recovery failed: {recovery_error}"
+                        ) from recovery_error
+            raise AssertionError("unreachable")
+        finally:
+            self._active_writable_files = None
 
     def _run_turn(
         self,
@@ -561,9 +575,17 @@ class AgentProject:
                 return _capped(content)
             if name == "write_file":
                 path = self._tool_path(str(arguments.get("path", "")))
+                relative = self._relative_path(path)
+                if (
+                    self._active_writable_files is not None
+                    and relative not in self._active_writable_files
+                ):
+                    raise PermissionError(
+                        f"path is not writable in this project turn: {relative!r}"
+                    )
                 content = str(arguments.get("content", ""))
                 self._write_sandbox_file(self._sandbox, path, content)
-                self._file_contents[self._relative_path(path)] = content
+                self._file_contents[relative] = content
                 return ToolOutcome(content=f"wrote {path}")
         except Exception as error:  # noqa: BLE001 - tool errors are agent observations
             return ToolOutcome(content=f"{name} failed: {error}", is_error=True)
@@ -581,6 +603,14 @@ class AgentProject:
         if not candidate.parts or ".." in candidate.parts:
             raise ValueError(f"path escapes project workspace: {path!r}")
         return str(workspace / candidate)
+
+    def _normalize_writable_files(
+        self, writable_files: Collection[str] | None
+    ) -> frozenset[str] | None:
+        """Normalize one optional exact-file grant to project-relative paths."""
+        if writable_files is None:
+            return None
+        return frozenset(self._relative_path(self._absolute_path(path)) for path in writable_files)
 
 
 def _start_channel(sandbox: SandboxHandle, workspace: str) -> Channel:

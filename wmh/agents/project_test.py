@@ -207,6 +207,126 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     assert channel.closed is True
 
 
+def test_project_grants_agent_writes_to_exact_files_only() -> None:
+    """A turn grant contains agent writes without constraining trusted host writes."""
+    sandbox = _Sandbox()
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "write_file",
+            "arguments": {
+                "path": "/home/user/project/context/round-1/parent.json",
+                "content": "poisoned",
+            },
+        },
+        {
+            "type": "tool_request",
+            "req_id": 2,
+            "name": "write_file",
+            "arguments": {
+                "path": "/home/user/project/proposals/round-1/proposal-01.json",
+                "content": "candidate",
+            },
+        },
+        {
+            "type": "tool_request",
+            "req_id": 3,
+            "name": "submit",
+            "arguments": {"answer": "done"},
+        },
+        {"type": "state", "status": "idle", "reason": "completed"},
+    ]
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+    project.write_text("context/round-1/parent.json", "trusted")
+    host_write_pending = [True]
+
+    def on_event(event: SessionEvent) -> None:
+        if event.kind != "tool_call" or not host_write_pending:
+            return
+        host_write_pending.clear()
+        project.write_text("context/round-1/host-note.txt", "host-authored")
+
+    result = project.run(
+        meta_agent(),
+        _Provider(),
+        "produce one proposal",
+        timeout=1,
+        on_event=on_event,
+        writable_files=["proposals/round-1/proposal-01.json"],
+    )
+
+    assert result.answer == "done"
+    assert project.read_text("context/round-1/parent.json") == "trusted"
+    assert project.read_text("context/round-1/host-note.txt") == "host-authored"
+    assert project.read_text("proposals/round-1/proposal-01.json") == "candidate"
+    tool_results = [event for event in result.events if event.kind == "tool_result"]
+    assert [event.payload["is_error"] for event in tool_results] == [True, False]
+    assert "not writable in this project turn" in str(tool_results[0].payload["content"])
+
+
+def test_project_write_grant_resets_between_turns_on_one_session() -> None:
+    """A restricted turn cannot narrow a later backward-compatible unrestricted turn."""
+    sandbox = _Sandbox()
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "write_file",
+            "arguments": {"path": "memory.txt", "content": "blocked"},
+        },
+        {
+            "type": "tool_request",
+            "req_id": 2,
+            "name": "submit",
+            "arguments": {"answer": "restricted"},
+        },
+        {"type": "state", "status": "idle", "reason": "completed"},
+        {"type": "state", "status": "running"},
+        {
+            "type": "tool_request",
+            "req_id": 3,
+            "name": "write_file",
+            "arguments": {"path": "memory.txt", "content": "unrestricted"},
+        },
+        {
+            "type": "tool_request",
+            "req_id": 4,
+            "name": "submit",
+            "arguments": {"answer": "second"},
+        },
+        {"type": "state", "status": "idle", "reason": "completed"},
+    ]
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+    project.write_text("memory.txt", "original")
+    agent = meta_agent()
+    provider = _Provider()
+
+    first = project.run(agent, provider, "restricted", timeout=1, writable_files=[])
+    assert first.answer == "restricted"
+    assert project.read_text("memory.txt") == "original"
+
+    second = project.run(agent, provider, "unrestricted", timeout=1)
+
+    assert second.answer == "second"
+    assert project.read_text("memory.txt") == "unrestricted"
+    assert [frame["type"] for frame in channel.sent].count("session_start") == 1
+
+
 def test_owned_project_disables_internet_before_the_agent_turn() -> None:
     order: list[str] = []
 
@@ -805,6 +925,58 @@ def test_project_replaces_owned_sandbox_after_durable_outbox_failure() -> None:
     assert original.killed is True
     assert replacement.killed is False
     assert project.usage().count == 2
+
+
+def test_denied_agent_write_never_enters_the_replayed_project_mirror() -> None:
+    """A sandbox replacement replays trusted bytes, not a rejected agent overwrite."""
+
+    class _DisconnectedAfterDeniedWrite(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+                {
+                    "type": "tool_request",
+                    "req_id": 1,
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "context/round-1/parent.json",
+                        "content": "poisoned",
+                    },
+                },
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise RuntimeError("Server disconnected")
+
+    original = _Sandbox()
+    replacement = _Sandbox()
+    failed = _DisconnectedAfterDeniedWrite()
+    recovered = _Channel()
+    project = AgentProject(
+        original,
+        channel_factory=lambda sandbox, workspace: recovered if sandbox is replacement else failed,
+        sandbox_factory=lambda: replacement,
+    )
+    parent_path = "context/round-1/parent.json"
+    project.write_text(parent_path, "trusted")
+
+    result = project.run(
+        meta_agent(),
+        _Provider(),
+        "produce a result",
+        timeout=1,
+        writable_files=["result.txt"],
+    )
+
+    assert result.answer == "finished"
+    assert original.killed is True
+    assert replacement.files.values[f"/home/user/project/{parent_path}"] == "trusted"
+    assert project.read_text(parent_path) == "trusted"
+    assert project.read_text("result.txt") == "done"
 
 
 def test_project_counts_worker_usage_from_failed_and_recovered_attempts() -> None:

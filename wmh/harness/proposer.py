@@ -4,19 +4,31 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Protocol
 
 from wmh.agents.project import AgentProjectRun
 from wmh.core.types import JsonObject
-from wmh.harness.delta import FailureSignature, HarnessDelta
+from wmh.harness.delta import FailureSignature, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta
 from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import Provider, ToolCallingProvider
 
 _CONTEXT_CONTENT_CHUNK_CHARS = 12_000
+_MAX_PROJECT_REPAIR_TURNS = 2
+_SUPPORTED_RUNTIME_KINDS = frozenset({"kit-python", "pi-node"})
+
+
+@dataclass(frozen=True)
+class _ProposalValidation:
+    """Host-validated proposal slots plus the raw files needed to protect valid siblings."""
+
+    proposals: dict[int, HarnessDelta]
+    raw_files: dict[int, str]
+    child_hashes: dict[int, str]
+    errors: dict[int, str]
 
 
 class AgentProject(Protocol):
@@ -35,6 +47,7 @@ class AgentProject(Protocol):
         instruction: str,
         *,
         should_cancel: Callable[[], bool] | None = None,
+        writable_files: Collection[str] | None = None,
     ) -> AgentProjectRun: ...
 
 
@@ -111,6 +124,8 @@ class ProjectDeltaProposer:
         project: AgentProject,
         agent: HarnessDoc,
         provider: ToolCallingProvider,
+        *,
+        preserve_runtime_kind: bool = False,
     ) -> None:
         self._project = project
         self._agent = agent
@@ -120,6 +135,7 @@ class ProjectDeltaProposer:
         self._proposal_files: dict[str, str] = {}
         self._parent_manifests: dict[str, JsonObject] = {}
         self._should_cancel: Callable[[], bool] | None = None
+        self._preserve_runtime_kind = preserve_runtime_kind
 
     def propose_batch(
         self,
@@ -213,6 +229,8 @@ class ProjectDeltaProposer:
             context_dir=context_dir,
             proposal_dir=proposal_dir,
             count=count,
+            runtime_kind=parent.runtime_kind(),
+            preserve_runtime_kind=self._preserve_runtime_kind,
         )
         _write_project_text(
             self._project,
@@ -227,6 +245,9 @@ class ProjectDeltaProposer:
                 self._provider,
                 request,
                 should_cancel=should_cancel,
+                writable_files=[
+                    f"{proposal_dir}/proposal-{index:02d}.json" for index in range(1, count + 1)
+                ],
             )
         except HarnessSearchCancelled:
             raise
@@ -234,47 +255,172 @@ class ProjectDeltaProposer:
             run_error = error
         _check_cancelled(should_cancel)
 
-        proposals: list[HarnessDelta | ProposalFailure | None] = []
-        for index in range(1, count + 1):
+        slots = list(range(1, count + 1))
+        validation = _validate_project_proposals(
+            self._project,
+            parent,
+            trigger,
+            proposal_dir=proposal_dir,
+            slots=slots,
+            history=history,
+            preserve_runtime_kind=self._preserve_runtime_kind,
+            should_cancel=should_cancel,
+        )
+        # A lost terminal frame does not invalidate durable files. Host-preflight whatever was
+        # written, then repair only the bad/missing slots in an ordinary follow-up project turn.
+        # The last project-channel error matters only while a slot remains unresolved.
+        terminal_error = run_error
+        if validation.errors:
+            validation_report_ready = True
             try:
-                raw = _read_project_text(
+                _write_project_text(
                     self._project,
-                    f"{proposal_dir}/proposal-{index:02d}.json",
+                    f"{context_dir}/proposal-validation-attempt-01.json",
+                    _proposal_validation_report(
+                        parent=parent,
+                        proposal_dir=proposal_dir,
+                        attempt=1,
+                        valid_slots=validation.proposals,
+                        errors=validation.errors,
+                    ),
                     should_cancel=should_cancel,
                 )
-            except Exception:  # noqa: BLE001 - a missing output is one unusable proposal
-                if run_error is None:
-                    proposals.append(None)
-                else:
-                    proposals.append(ProposalFailure(reason=str(run_error)))
-                continue
-            try:
-                proposal = parse_delta(parent, trigger, raw)
-            except Exception as error:  # noqa: BLE001 - isolate one malformed sibling output
-                proposals.append(
-                    ProposalFailure(
-                        reason=(
-                            str(run_error)
-                            if run_error is not None
-                            else f"invalid proposal output: {error}"
-                        )
-                    )
+            except HarnessSearchCancelled:
+                raise
+            except Exception as error:  # noqa: BLE001 - no report means no safe repair prompt
+                terminal_error = error
+                validation_report_ready = False
+
+            for repair_turn in range(1, _MAX_PROJECT_REPAIR_TURNS + 1):
+                if not validation.errors or not validation_report_ready:
+                    break
+                validation_report_ready = False
+                validation_path = (
+                    f"{context_dir}/proposal-validation-attempt-{repair_turn:02d}.json"
                 )
+                repair_request = _project_repair_request(
+                    workspace=self._project.workspace,
+                    validation_path=validation_path,
+                    request_path=f"{context_dir}/REQUEST.md",
+                    proposal_dir=proposal_dir,
+                    errors=validation.errors,
+                    valid_slots=validation.proposals,
+                    runtime_kind=parent.runtime_kind(),
+                    preserve_runtime_kind=self._preserve_runtime_kind,
+                    repair_turn=repair_turn,
+                )
+                invalid_slots = sorted(validation.errors)
+                protected_restore_error: Exception | None = None
+                turn_error: Exception | None = None
+                try:
+                    _write_project_text(
+                        self._project,
+                        f"{context_dir}/REPAIR-{repair_turn:02d}.md",
+                        repair_request,
+                        should_cancel=should_cancel,
+                    )
+                    try:
+                        self._project.run(
+                            self._agent,
+                            self._provider,
+                            repair_request,
+                            should_cancel=should_cancel,
+                            writable_files=[
+                                f"{proposal_dir}/proposal-{index:02d}.json"
+                                for index in invalid_slots
+                            ],
+                        )
+                    except HarnessSearchCancelled:
+                        raise
+                    except Exception as error:  # noqa: BLE001 - salvage durable repaired files
+                        turn_error = error
+                    finally:
+                        # The agent is asked to rewrite only invalid slots. Restore every
+                        # byte-exact valid sibling after each turn as an enforcement boundary.
+                        for index in sorted(validation.proposals):
+                            try:
+                                _write_project_text(
+                                    self._project,
+                                    f"{proposal_dir}/proposal-{index:02d}.json",
+                                    validation.raw_files[index],
+                                    should_cancel=should_cancel,
+                                )
+                            except HarnessSearchCancelled:
+                                raise
+                            except Exception as error:  # noqa: BLE001 - attempt every restore
+                                if protected_restore_error is None:
+                                    protected_restore_error = error
+                except HarnessSearchCancelled:
+                    raise
+                except Exception as error:  # noqa: BLE001 - preserve good siblings, fail bad ones
+                    turn_error = error
+                if protected_restore_error is not None:
+                    # The in-memory delta and its durable proposal_file must always name the
+                    # same bytes. If protection cannot be proven, abort this batch instead of
+                    # returning a valid object whose persistent provenance may have been changed.
+                    raise protected_restore_error
+                terminal_error = turn_error
+
+                repaired = _validate_project_proposals(
+                    self._project,
+                    parent,
+                    trigger,
+                    proposal_dir=proposal_dir,
+                    slots=invalid_slots,
+                    history=history,
+                    valid_proposals=validation.proposals,
+                    preserve_runtime_kind=self._preserve_runtime_kind,
+                    should_cancel=should_cancel,
+                )
+                validation = _ProposalValidation(
+                    proposals=repaired.proposals,
+                    raw_files={**validation.raw_files, **repaired.raw_files},
+                    child_hashes={**validation.child_hashes, **repaired.child_hashes},
+                    errors=repaired.errors,
+                )
+                # Each host result becomes the next turn's nested input and the durable final
+                # audit. These turns happen wholly inside proposal generation, before search.
+                try:
+                    _write_project_text(
+                        self._project,
+                        f"{context_dir}/proposal-validation-attempt-{repair_turn + 1:02d}.json",
+                        _proposal_validation_report(
+                            parent=parent,
+                            proposal_dir=proposal_dir,
+                            attempt=repair_turn + 1,
+                            valid_slots=validation.proposals,
+                            errors=validation.errors,
+                        ),
+                        should_cancel=should_cancel,
+                    )
+                    validation_report_ready = True
+                except HarnessSearchCancelled:
+                    raise
+                except Exception as error:  # noqa: BLE001 - preserve validated in-memory output
+                    if terminal_error is None:
+                        terminal_error = error
+                if not validation.errors:
+                    # A prior turn can lose its terminal control frame after durable repaired
+                    # files were written. Successful preflight is authoritative salvage.
+                    terminal_error = None
+
+        proposals: list[HarnessDelta | ProposalFailure | None] = []
+        for index in slots:
+            stamped = validation.proposals.get(index)
+            if stamped is not None:
+                proposals.append(stamped)
+                self._proposal_files.setdefault(
+                    stamped.delta_id,
+                    f"{self._project.workspace}/{proposal_dir}/proposal-{index:02d}.json",
+                )
+                self._evaluation_dirs.setdefault(
+                    stamped.delta_id,
+                    f"evaluations/{round_dir}/proposal-{index:02d}",
+                )
+            elif terminal_error is not None:
+                proposals.append(ProposalFailure(reason=str(terminal_error)))
             else:
-                if proposal is None and run_error is not None:
-                    proposals.append(ProposalFailure(reason=str(run_error)))
-                else:
-                    stamped = _stamp_project_preconditions(parent, proposal)
-                    proposals.append(stamped)
-                    if stamped is not None:
-                        self._proposal_files.setdefault(
-                            stamped.delta_id,
-                            f"{self._project.workspace}/{proposal_dir}/proposal-{index:02d}.json",
-                        )
-                        self._evaluation_dirs.setdefault(
-                            stamped.delta_id,
-                            f"evaluations/{round_dir}/proposal-{index:02d}",
-                        )
+                proposals.append(None)
         return proposals
 
     def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
@@ -545,12 +691,219 @@ def _stamp_project_preconditions(
     return proposal
 
 
-def _project_request(*, workspace: str, context_dir: str, proposal_dir: str, count: int) -> str:
+def _validate_project_proposals(
+    project: AgentProject,
+    parent: HarnessDoc,
+    trigger: FailureSignature,
+    *,
+    proposal_dir: str,
+    slots: list[int],
+    history: list[HarnessDelta],
+    valid_proposals: dict[int, HarnessDelta] | None = None,
+    preserve_runtime_kind: bool,
+    should_cancel: Callable[[], bool] | None,
+) -> _ProposalValidation:
+    """Parse, stamp, apply, and de-duplicate selected project proposal slots.
+
+    Applying a deep copy exercises the complete typed ``HarnessDoc`` boundary without stamping
+    ``child_doc_hash`` onto the delta the search will later apply and archive. Previously the
+    project proposer returned syntactically parsed deltas and left this check to the search loop,
+    where a missing skill frontmatter block consumed an iteration as ``invalid before eval``.
+    """
+    accepted = dict(valid_proposals or {})
+    raw_files: dict[int, str] = {}
+    child_hashes: dict[int, str] = {}
+    errors: dict[int, str] = {}
+    history_ids = {delta.delta_id for delta in history}
+    history_child_hashes = {
+        delta.child_doc_hash for delta in history if delta.child_doc_hash is not None
+    }
+    sibling_ids = {delta.delta_id: index for index, delta in accepted.items()}
+    for accepted_index, accepted_delta in accepted.items():
+        accepted_child = apply_delta(
+            parent,
+            accepted_delta.model_copy(deep=True),
+            f"{parent.name}-accepted-preflight-{accepted_index:02d}",
+        )
+        child_hashes[accepted_index] = accepted_child.doc_hash
+    sibling_child_hashes = {child_hash: index for index, child_hash in child_hashes.items()}
+    parent_runtime_kind = parent.runtime_kind()
+    for index in slots:
+        _check_cancelled(should_cancel)
+        relative = f"{proposal_dir}/proposal-{index:02d}.json"
+        try:
+            raw = _read_project_text(project, relative, should_cancel=should_cancel)
+        except HarnessSearchCancelled:
+            raise
+        except Exception as error:  # noqa: BLE001 - one missing file is one repairable slot
+            errors[index] = f"proposal file is missing or unreadable: {error}"
+            continue
+        raw_files[index] = raw
+        proposal = parse_delta(parent, trigger, raw)
+        if proposal is None:
+            errors[index] = "proposal is not a parseable typed delta JSON object"
+            continue
+        stamped = _stamp_project_preconditions(parent, proposal)
+        assert stamped is not None
+        try:
+            child = apply_delta(
+                parent,
+                stamped.model_copy(deep=True),
+                f"{parent.name}-proposal-preflight-{index:02d}",
+            )
+            child_runtime_kind = child.runtime_kind()
+            if child_runtime_kind not in _SUPPORTED_RUNTIME_KINDS:
+                supported = ", ".join(sorted(_SUPPORTED_RUNTIME_KINDS))
+                raise ValueError(
+                    f"project proposal resolves to unsupported runtime kind "
+                    f"{child_runtime_kind!r}; choose one of: {supported}"
+                )
+            if preserve_runtime_kind and child_runtime_kind != parent_runtime_kind:
+                raise ValueError(
+                    "project proposals must preserve the parent's runtime kind "
+                    f"{parent_runtime_kind!r}; this proposal resolves to {child_runtime_kind!r}"
+                )
+        except ValueError as error:
+            errors[index] = f"delta does not apply to the supplied parent: {error}"
+            continue
+        child_hash = child.doc_hash
+        if child_hash == parent.doc_hash:
+            errors[index] = "delta is a semantic no-op: its child document equals the parent"
+            continue
+        if stamped.delta_id in history_ids:
+            errors[index] = (
+                f"delta {stamped.delta_id} duplicates a proposal already present in judged history"
+            )
+            continue
+        if child_hash in history_child_hashes:
+            errors[index] = (
+                f"child document {child_hash} duplicates a proposal already present in "
+                "judged history"
+            )
+            continue
+        duplicate_slot = sibling_ids.get(stamped.delta_id)
+        if duplicate_slot is not None:
+            errors[index] = (
+                f"delta {stamped.delta_id} duplicates valid sibling proposal-{duplicate_slot:02d}"
+            )
+            continue
+        duplicate_child_slot = sibling_child_hashes.get(child_hash)
+        if duplicate_child_slot is not None:
+            errors[index] = (
+                f"child document {child_hash} duplicates valid sibling "
+                f"proposal-{duplicate_child_slot:02d}"
+            )
+            continue
+        accepted[index] = stamped
+        sibling_ids[stamped.delta_id] = index
+        child_hashes[index] = child_hash
+        sibling_child_hashes[child_hash] = index
+    _check_cancelled(should_cancel)
+    return _ProposalValidation(
+        proposals=accepted,
+        raw_files=raw_files,
+        child_hashes=child_hashes,
+        errors=errors,
+    )
+
+
+def _proposal_validation_report(
+    *,
+    parent: HarnessDoc,
+    proposal_dir: str,
+    attempt: int,
+    valid_slots: dict[int, HarnessDelta],
+    errors: dict[int, str],
+) -> str:
+    """Serialize actionable per-slot host validation for the project and run audit."""
+    return json.dumps(
+        {
+            "kind": "proposal-validation",
+            "attempt": attempt,
+            "parent_doc_hash": parent.doc_hash,
+            "parent_runtime_kind": parent.runtime_kind(),
+            "valid_slots": sorted(valid_slots),
+            "errors": [
+                {
+                    "slot": index,
+                    "proposal_file": f"{proposal_dir}/proposal-{index:02d}.json",
+                    "reason": errors[index],
+                }
+                for index in sorted(errors)
+            ],
+        },
+        indent=2,
+    )
+
+
+def _project_repair_request(
+    *,
+    workspace: str,
+    validation_path: str,
+    request_path: str,
+    proposal_dir: str,
+    errors: dict[int, str],
+    valid_slots: dict[int, HarnessDelta],
+    runtime_kind: str,
+    preserve_runtime_kind: bool,
+    repair_turn: int,
+) -> str:
+    """Render one of the bounded repair turns for only invalid batch slots."""
+    invalid_outputs = "\n".join(
+        f"- {workspace}/{proposal_dir}/proposal-{index:02d}.json" for index in sorted(errors)
+    )
+    protected_outputs = "\n".join(
+        f"- {workspace}/{proposal_dir}/proposal-{index:02d}.json" for index in sorted(valid_slots)
+    )
+    if not protected_outputs:
+        protected_outputs = "- (none)"
+    runtime_constraint = (
+        f"preserve its resolved runtime kind {runtime_kind!r}"
+        if preserve_runtime_kind
+        else "produce a valid resolved runtime kind"
+    )
+    return f"""Repair exactly {len(errors)} invalid proposal slot(s) from this round.
+This is repair turn {repair_turn} of {_MAX_PROJECT_REPAIR_TURNS}.
+
+Read the host validation report: {workspace}/{validation_path}
+It contains the exact error for each invalid slot. Re-read the original round request at
+{workspace}/{request_path} and its supplied parent manifests as needed, then rewrite ONLY these
+invalid files:
+{invalid_outputs}
+
+These siblings already passed host preflight. Do not rewrite them:
+{protected_outputs}
+
+Every repaired file must follow the original typed delta JSON schema, apply cleanly to that same
+parent, {runtime_constraint}, produce a child document different from the parent, differ from
+judged history, and differ from every sibling. A skill's content must include the complete
+four-line frontmatter shown in the original request. Validate every rewritten file before calling
+submit with a short summary."""
+
+
+def _project_request(
+    *,
+    workspace: str,
+    context_dir: str,
+    proposal_dir: str,
+    count: int,
+    runtime_kind: str,
+    preserve_runtime_kind: bool,
+) -> str:
     """Render one filesystem-first proposal task for the ordinary meta agent."""
     absolute_context = f"{workspace}/{context_dir}"
     absolute_proposals = f"{workspace}/{proposal_dir}"
     outputs = "\n".join(
         f"- {absolute_proposals}/proposal-{index:02d}.json" for index in range(1, count + 1)
+    )
+    runtime_constraint = (
+        f"This project must preserve the parent's resolved runtime kind {runtime_kind!r}; do not "
+        "add, replace, or remove runtime-kind in a way that changes it."
+        if preserve_runtime_kind
+        else (
+            "A runtime-kind edit is allowed only when the resulting child remains a valid harness; "
+            "the search backend makes the final executability decision."
+        )
     )
     return f"""Produce exactly {count} independent harness proposals for this optimization round.
 
@@ -578,6 +931,34 @@ Each file must be one JSON object:
 
 For a replacement, you may omit content and use compact exact edits instead:
 "edits":[{{"old":"<nonempty text occurring exactly once>","new":"<replacement>"}}].
-The optimizer expands those edits against the parent before validation. Every proposal must be
-focused, valid against the same supplied parent, and meaningfully different from its siblings.
+The optimizer expands those edits against the parent before validation.
+
+Typed surface constraints (host preflight enforces all of these before evaluation):
+- Every surface id is `<kind>:<kebab-slug>` and its prefix must exactly match `kind`.
+- `add` needs a fresh id, `kind`, full `content`, and a nonempty `rationale`. `replace` needs an
+  existing id, full `content` or exact `edits`, and a nonempty `rationale`; if it declares `kind`,
+  that kind must match the parent. `remove` needs an existing id and rationale and must omit
+  content. Every replace/remove target must have its exact parent hash in `preconditions`.
+- A `skill:<slug>` add/replace has kind `skill`; its content is the complete markdown below,
+  beginning at the first character, with kebab-case `name` exactly equal to `<slug>`:
+  ---
+  name: <slug>
+  description: <one-line description of when the agent should use this skill>
+  ---
+  <nonempty reusable technique body>
+- Prompt content is plain text, and the child must retain at least one prompt surface.
+- `tool_policy:main` is one registered tool name per line and must retain `submit`.
+- Supported scalar params are `param:max-turns` and `param:max-output-tokens` (integers >= 1),
+  `param:temperature` (number in [0, 2]), and `param:runtime-kind` (`kit-python` or `pi-node`).
+  {runtime_constraint}
+- A path-less code surface can only be `code:runtime` and must remain valid Python defining
+  `run(kit)`. Pathful code surfaces use safe relative paths without `..`; replacements inherit the
+  parent's path unless explicitly supplied, and paths must stay unique.
+- Respect each surface's character budget. Do not remove required singleton surfaces or create
+  duplicate ids/paths. Do not emit a semantic no-op or repeat any child document from judged
+  history or another sibling, even through differently ordered operations.
+
+Every proposal must be focused, valid against the same supplied parent, and meaningfully different
+from its siblings. The host will parse, stamp mechanical missing preconditions, deep-copy apply,
+and de-duplicate every file. Invalid slots receive at most two repair turns and are never evaluated.
 After all files exist, call submit with a short summary."""
