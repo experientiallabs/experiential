@@ -58,13 +58,13 @@ def test_connect_error_is_a_raisable_exception() -> None:
 
 def test_transport_errors_maps_httpx_failures_to_actionable_connect_errors() -> None:
     request = httpx.Request("GET", "https://api.example.com/things")
-    with pytest.raises(ConnectError) as excinfo:
+    with pytest.raises(
+        ConnectError,
+        match=r"could not reach api\.example\.com \(connection timed out\); "
+        r"check your network connection and retry",
+    ):
         with transport_errors("api.example.com"):
             raise httpx.ConnectTimeout("connection timed out", request=request)
-    message = str(excinfo.value)
-    assert "api.example.com" in message
-    assert "connection timed out" in message
-    assert "network" in message and "retry" in message
 
 
 def test_transport_errors_passes_non_httpx_exceptions_through() -> None:

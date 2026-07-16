@@ -92,11 +92,10 @@ def test_verify_rejected_key_points_at_the_dashboard(status: int) -> None:
         return httpx.Response(status, json={"message": "invalid key"})
 
     connector = BraveConnector(transport=httpx.MockTransport(handler))
-    with pytest.raises(ConnectError) as excinfo:
+    with pytest.raises(
+        ConnectError, match=r"BRAVE_SEARCH_API_KEY.*api-dashboard\.search\.brave\.com"
+    ):
         connector.verify(_auth())
-    message = str(excinfo.value)
-    assert "BRAVE_SEARCH_API_KEY" in message
-    assert "api-dashboard.search.brave.com" in message
 
 
 def test_transport_failures_become_actionable_connect_errors() -> None:
