@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from wmh.cli import app
@@ -816,3 +817,21 @@ def test_grid_output_paths_never_collide() -> None:
     json_path, png_path = _grid_output_paths(None, default)
     assert json_path == default
     assert png_path == default.with_suffix(".png")
+
+
+def test_parse_model_specs_validates_provider_and_resolves_model() -> None:
+    from wmh.cli.app import _parse_model_specs
+
+    specs = _parse_model_specs(
+        "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,Qwen:openai:qwen-agentworld-35b-a3b"
+    )
+    assert [(s.label, s.provider, s.model) for s in specs] == [
+        ("Opus 4.8", "bedrock", "us.anthropic.claude-opus-4-8"),  # exact wire id preserved
+        ("Qwen", "openai", "qwen-agentworld-35b-a3b"),  # self-hosted id passes through unchanged
+    ]
+    # A bad provider fails at parse time with a clear message, not deep inside run_grid.
+    with pytest.raises(typer.BadParameter, match="unknown provider"):
+        _parse_model_specs("X:notaprovider:m")
+    # Malformed entry (wrong arity) still rejected.
+    with pytest.raises(typer.BadParameter, match="bad --models entry"):
+        _parse_model_specs("Opus:bedrock")

@@ -1074,14 +1074,27 @@ _DEFAULT_GRID_MODELS = (
 
 
 def _parse_model_specs(models: str | None) -> list[ModelSpec]:
-    """Parse "Label:provider:model[,...]" into ModelSpecs (default set when None)."""
+    """Parse "Label:provider:model[,...]" into ModelSpecs (default set when None).
+
+    The provider is validated and the model resolved through the shared catalog
+    (`resolve_provider_model`), so a friendly model type resolves to its canonical wire id while an
+    unknown (self-hosted) id passes through unchanged, and a bad provider fails at parse time.
+    """
     raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
     specs: list[ModelSpec] = []
     for entry in raw:
         parts = entry.split(":", 2)
         if len(parts) != 3 or not all(p.strip() for p in parts):
             raise typer.BadParameter(f"bad --models entry {entry!r}; want 'Label:provider:model'")
-        specs.append(ModelSpec(parts[0].strip(), parts[1].strip(), parts[2].strip()))
+        label, provider_str, model_str = (p.strip() for p in parts)
+        try:
+            kind = ProviderKind(provider_str)
+        except ValueError:
+            kinds = ", ".join(k.value for k in ProviderKind)
+            raise typer.BadParameter(
+                f"unknown provider {provider_str!r} in --models {entry!r}; want one of {kinds}"
+            ) from None
+        specs.append(ModelSpec(label, kind.value, resolve_provider_model(kind, model_str).model_id))
     return specs
 
 
