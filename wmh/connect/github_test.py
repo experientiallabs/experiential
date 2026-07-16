@@ -120,13 +120,15 @@ def test_connect_runs_the_device_flow_and_stamps_the_account(
 
     auth = _connector(handler).connect(ui)
 
-    assert device_requests == [{"client_id": "cid_test", "scope": "repo read:org"}]
+    # GitHub Apps carry permissions in the registration: the device request sends no scope.
+    assert device_requests == [{"client_id": "cid_test"}]
     assert presented == [("https://github.com/login/device", "WDJB-MJHT")]
     assert auth.kind == "oauth"
     assert auth.access_token == "gho_new"
     assert auth.scopes == ["repo", "read:org"]
     assert auth.account == "octocat (The Octocat)"
     assert any("octocat" in message for message in infos)
+    assert any("installations/new" in message for message in infos)
 
 
 def test_verify_returns_login_and_name() -> None:
