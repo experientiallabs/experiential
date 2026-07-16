@@ -19,7 +19,7 @@ matters for reading small effects below.
 > where v1 scored ≈0.70). Re-running the quoted commands on `main` will therefore produce lower
 > absolute fidelities; the *comparisons* (which config beats which) are what this study reads.
 
-![RAG optimization: optimized vs. unoptimized trace scaling](rag_optimization.png)
+![RAG optimization: optimized vs. unoptimized trace scaling](figures/rag_optimization.png)
 
 ## The robust wins: retrieval depth + an observation cap
 
@@ -84,24 +84,21 @@ crowding-failure fix; it is not what unlocks these benchmarks.
 
 ## Reproduce
 
-`run_trace_scaling.py` (a workspace script, quoted here as the record; `.agents/` is disposable) is
-the sidecar for `wmh/research/trace_scaling.py`. Optimized arm, one benchmark:
+Every arm is a `wmh.research.TraceScalingAblation` sweep (driven by `run_ablation`); the levers
+under test are its constructor knobs. The parameters below are the record.
 
-```bash
-AWS_PROFILE=default AWS_REGION=us-west-2 uv run python .agents/scripts/run_trace_scaling.py \
-  terminal-tasks --counts 1,16,164 --modes base --seeds 0,1 \
-  --top-k 20 --max-retrieved-observation-chars 2000 --retrieval-key state_action \
-  --sample-turns sampled --test-cap 15 --concurrency 8 \
-  --opt-model us.anthropic.claude-sonnet-4-6 --judge-model us.anthropic.claude-sonnet-4-6 --out opt.json
-# unoptimized: --top-k 5 (drop the cap); n=0 anchor: --no-rag; semantic: --embedder azure
-#   (Azure ada-002 via AZURE_OPENAI_API_KEY + endpoint; command-only key: --retrieval-key action)
-
-uv run --with matplotlib python .agents/scripts/plot_rag_compare.py \
-  --panel tau-bench=unopt_tau.json,opt_tau.json \
-  --panel terminal-tasks=unopt_term.json,opt_term.json \
-  --panel swe-bench=unopt_swe.json,opt_swe.json --out docs/research/rag_optimization --ymin 0.5
+```text
+API          wmh.research.TraceScalingAblation + wmh.research.run_ablation
+corpus       packages/environment-capture/<suite>/traces.otel.jsonl (wmh.ingest)
+sweep        counts=1,16,<pool>, modes=base (RAG-only), seeds=0,1
+sampling     sample_turns=sampled, test_cap=15, concurrency=8
+backends     serve + judge = us.anthropic.claude-sonnet-4-6 on Bedrock
+             (AWS_PROFILE=default, AWS_REGION=us-west-2)
+optimized    top_k=20, max_retrieved_observation_chars=2000, retrieval_key="state_action"
+unoptimized  top_k=5, no observation cap
+n=0 anchor   retrieval disabled
+semantic arm Azure ada-002 embedder (AZURE_OPENAI_API_KEY + endpoint) instead of
+             HashingEmbedder; command-only key arm: retrieval_key="action"
+figure       matplotlib, one panel per benchmark (unoptimized vs optimized curves, ymin 0.5),
+             brand palette (AGENTS.md rule 15)
 ```
-
-Full methodology, the offline retrieval-quality diagnostics, and every raw `AblationReport` are
-recorded in the workspace (`.agents/docs/reference/rag-scaling-methodology.md` and
-`.agents/docs/research/`) as of publication.

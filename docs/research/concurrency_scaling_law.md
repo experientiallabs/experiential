@@ -9,9 +9,9 @@ is the differential `T_real(W) / T_world(W)` — >1 means the world model is fas
 `wmh/research/concurrency_scaling.py` implements the sweep; run it with
 `wmh research concurrency <suite> --side both`.
 
-![How many times faster the world model is than the real environment, per benchmark and concurrency level](concurrency_speedup.png)
+![How many times faster the world model is than the real environment, per benchmark and concurrency level](figures/concurrency_speedup.png)
 
-![Why: world-model reconstruction cost vs. real-environment setup cost at W=1, per benchmark](concurrency_cost.png)
+![Why: world-model reconstruction cost vs. real-environment setup cost at W=1, per benchmark](figures/concurrency_cost.png)
 
 ## The finding: a world model saves time only when real standup is expensive
 
@@ -69,8 +69,7 @@ sign: tau-bench stays real-faster (differential ~0.14–0.28 across `W`, all see
 stays world-faster (~2.7–7.8× mean differential across `W`). Magnitudes track per-call latency — Haiku's
 per-step call is not gpt-5.4-mini's — but the crossover (world model wins on expensive-standup envs,
 loses on the cheap in-process one) holds across **both world models and all seeds**. The per-seed differentials quoted above are the
-record; the raw Haiku reports sat in `.agents/docs/research/concurrency_anthropic/` when this
-shipped (`.agents/` is disposable: nothing here depends on it surviving).
+record.
 
 ## Machine
 
@@ -111,9 +110,7 @@ exact run is not re-runnable and its raw report JSONs were lost with it. The com
 same model over **Azure OpenAI**, which reproduces the *setup* — but only **tau-bench and
 terminal-tasks were re-checked on Azure**, endpoint latency differs, and Docker build jitter affects
 the real side, so Azure reproduces the **directions and rough magnitudes, not the exact wall-clock**.
-The per-benchmark tables above ARE the headline record. They were reconstructed into report JSONs
-(`gpt54_*.json`, next to the Haiku re-run) under `.agents/docs/research/concurrency_anthropic/` when
-this shipped, but this report is complete without them.
+The per-benchmark tables above ARE the headline record; this report is complete on its own.
 
 ```bash
 export AZURE_OPENAI_API_KEY=... AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/

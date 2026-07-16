@@ -8,8 +8,8 @@ and the biggest per-step deltas so shifts can be verified to concentrate on low-
 
 Usage:
     uv run python .agents/scripts/run_judge_regression.py \
-        --cache .agents/docs/research/raw/judge-regression-preds.json \
-        --out .agents/docs/research/raw/judge-regression.json
+        --cache .agents/docs/research/judge-overhaul/raw/judge-regression-preds.json \
+        --out .agents/docs/research/judge-overhaul/raw/judge-regression.json
 """
 
 from __future__ import annotations

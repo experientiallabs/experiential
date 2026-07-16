@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Render the judge-overhaul figure (.agents/docs/research/judge_overhaul.png), brand system per AGENTS.md.
+"""Render the judge-overhaul figure (.agents/docs/research/judge-overhaul/judge_overhaul.png), brand system per AGENTS.md.
 
-Three panels. Panel A/C read the committed meta-eval runs in .agents/docs/research/raw/;
+Three panels. Panel A/C read the committed meta-eval runs in .agents/docs/research/judge-overhaul/raw/;
 panel B (and the "fixed" run) read bulky outputs that are NOT committed — regenerate them first:
-    uv run python .agents/scripts/run_judge_quality.py --out .agents/docs/research/raw/judge-quality-fixed.json
+    uv run python .agents/scripts/run_judge_quality.py --out .agents/docs/research/judge-overhaul/raw/judge-quality-fixed.json
     uv run python .agents/scripts/run_judge_regression.py \
-        --cache .wmh/judge-regression-preds.json --out .agents/docs/research/raw/judge-regression.json
+        --cache .wmh/judge-regression-preds.json --out .agents/docs/research/judge-overhaul/raw/judge-regression.json
 Panels:
   A. Judge-quality meta-eval per case: expected band, baseline score, overhauled score.
   B. Old vs new judge on 47 identical real predictions, colored by new-judge factuality band.
@@ -33,8 +33,8 @@ PURPLE = "#7928ca"
 AMBER = "#f5a623"
 RED = "#ee0000"
 
-RAW = Path(".agents/docs/research/raw")
-OUT = Path(".agents/docs/research/judge_overhaul.png")
+RAW = Path(".agents/docs/research/judge-overhaul/raw")
+OUT = Path(".agents/docs/research/judge-overhaul/judge_overhaul.png")
 
 
 def _style(ax: plt.Axes) -> None:

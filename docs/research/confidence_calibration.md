@@ -19,13 +19,14 @@ of this).
 
 The measurement contract is entirely in `wmh.research` and this section: any runner that feeds
 `TraceScalingAblation` the composable modes below under the protocol above yields comparable
-cells. One such runner existed at `.agents/scripts/run_trace_scaling.py` when this was measured
-(`.agents/` is disposable; git history at this report's commit preserves it):
+cells.
 
-```
-AWS_REGION=us-east-1 uv run python .agents/scripts/run_trace_scaling.py tau-bench \
-  --counts 200 --modes base+conf,reason+conf,reason+confwhy,reason+gateverify@0.6 \
-  --seeds 0,1 --test-cap 40 --results-dir <dir> --out <report.json>
+```text
+API      wmh.research.TraceScalingAblation + wmh.research.run_ablation (AWS_REGION=us-east-1)
+sweep    e.g. tau-bench: counts=200, seeds 0,1, test_cap=40
+modes    base+conf, reason+conf, reason+confwhy, reason+gateverify@0.6
+joins    results_dir=<dir> persists each cell's ReplayReport, the per-step
+         (confidence, judge-score) joins the calibration analysis needs
 ```
 
 ## Finding 1 — the confidence is real, and it is UNDERconfident
@@ -128,7 +129,7 @@ confidence < τ; missing = low) dominates blanket verification on all three suit
 ($ = serve-side per cell, judge excluded; verified% = fraction of steps that took the second
 completion.)
 
-![gated frontier](confidence_gated_frontier.png)
+![gated frontier](figures/confidence_gated_frontier.png)
 
 The headline is swe: **gated@0.7 reaches .826 — above always-verify's .812 — at 79% of its
 cost**, and gated@0.5 still beats it at 66%. Gating doesn't merely recover the cost of the
@@ -215,9 +216,6 @@ model's AUROC; ≥ .8 → gate pays; ≤ .6 → pay for the strong model.*
   scores the same predictions ~0.12 lower by design — never compare these absolute fidelities
   against rubric-v2 results, or across judges generally.
 
-Raw per-step results (the (confidence, judge-score) joins), calibration summaries, usage/cost
-records, SVG sources, and the analysis/figure scripts lived under
-`.agents/docs/research/agentic_results/confidence/` and `.agents/scripts/` when this shipped.
-`.agents/` is disposable scratch — nothing in this report depends on it surviving; the numbers,
-protocol, and figures above are self-contained, and git history at this report's commit
-preserves the raw evidence for re-audit.
+The numbers, protocol, and figure above are self-contained. Git history at this report's commit
+preserves the raw evidence (per-step (confidence, judge-score) joins and calibration summaries)
+for re-audit.

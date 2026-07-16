@@ -2,9 +2,8 @@
 
 *WS-A3, 2026-07-02 (updated 2026-07-10). How the `--fidelity low|medium|high|max` build
 tiers and the runtime `--max-fidelity` switch were designed, what was measured, and the traps
-hit on the way. Raw per-suite ladder JSONs live in the workspace layer
-(`.agents/docs/research/fidelity_tiers/`, PR #55); the numbers below are complete without
-them.*
+hit on the way. The numbers below are the complete record (raw per-suite ladder JSONs are
+preserved in git history at PR #55).*
 
 ## The design (D30)
 
@@ -85,7 +84,7 @@ configs.
 
 ## Tier ladder results (final)
 
-![fidelity tiers](./fidelity_tiers.png)
+![fidelity tiers](figures/fidelity_tiers.png)
 
 | tier | tau-bench | terminal-tasks | swe-bench (healthy) |
 |---|---|---|---|

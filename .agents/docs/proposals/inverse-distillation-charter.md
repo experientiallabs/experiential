@@ -1,8 +1,8 @@
 # Charter: inverse distillation — train an agent from mined scenarios + the world model
 
 > Proposal for the 48-hour autonomous run. Companion research:
-> `../research/scenario-set-construction-sota.md`, `../research/scenario-composition-interpolation-sota.md`,
-> and the correction analysis in `../research/scenario-set-e2e-tau-bench.md`.
+> `../research/scenarios/scenario-set-construction-sota.md`, `../research/scenarios/scenario-composition-interpolation-sota.md`,
+> and the correction analysis in `../research/scenarios/scenario-set-e2e-tau-bench.md`.
 > Key external reference: World Model Self-Distillation (arXiv 2606.12072) — privileged
 > Demonstrator → task-only Executor distillation + RL with verifier feedback.
 

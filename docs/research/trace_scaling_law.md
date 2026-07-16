@@ -11,7 +11,7 @@ never changes as the corpus grows), a fixed `valid` band, and a train *pool*; ea
 `n` traces from the pool, shuffled per seed and nested as `n` grows, so the only thing varying along
 x is how much training data the model sees. `wmh/research/trace_scaling.py` implements the ablation.
 
-![Trace scaling law](trace_scaling_law.png)
+![Trace scaling law](figures/trace_scaling_law.png)
 
 ## The finding: for two of three benchmarks, trace data barely contributes
 
@@ -41,7 +41,7 @@ the observation is a function of environment state the trace never captures (liv
 repo's file contents) and is near-unique per step; retrieval finds a lexically similar *command* but
 its *output* is unrelated, so no number of traces makes it predictive. (Empirically: the retrieved
 demo's observation resembles the actual one with a large lift over random for tau at high `n`, but
-~zero lift for terminal/swe. See `.agents/docs/research/` for the diagnostic.)
+~zero lift for terminal/swe.)
 
 **Takeaway:** more traces of the same kind only buy fidelity when the observation is a retrievable
 function of the recorded `(state, action)` — true for structured tool lookups (tau), false for
@@ -55,43 +55,35 @@ reproduces almost nothing (swe-bench, the most public via GitHub repos, is *lowe
 3% exact match; tau-bench, synthetic and un-memorizable, is the 0%/0.12 control). Verbatim
 memorization would show near-1.0 factuality. Adding the recorded trajectory history roughly *doubles*
 factuality (swe 0.11→0.40, terminal 0.27→0.63) — the model reconstructs from in-context signal, which
-is exactly why the n=0→RAG gap above measures a real contribution rather than recall. Probe script
-and raw numbers: `.agents/docs/research/rag_opt_results/` (`contamination_probe.py`, `contam.log`).
+is exactly why the n=0→RAG gap above measures a real contribution rather than recall. (The probe is
+`predict_observation` with no retrieved demos and no trajectory history, scored on the same test
+split with the same judge.)
 
 ## Reproduce
 
-The curves come from `run_trace_scaling.py` (RAG-only, `--modes base`) — a workspace script,
-snapshotted below as of publication (`.agents/` contents are disposable; the commands quoted
-here are the record) — scored with the
-canonical `RubricJudge` on a fixed test split, parallelized (`--concurrency`) and cost-bounded
-(`--test-cap`). Raw `AblationReport` JSONs were archived to the workspace
-(`.agents/docs/research/trace_scaling_results/` as of publication).
+The sweep is the public `wmh.research` API (`TraceScalingAblation` driven by `run_ablation`),
+scored with the canonical `RubricJudge` on a fixed test split. Any thin driver over that API
+reproduces the curves; the parameters below are the record.
 
 > **Judge provenance.** These numbers predate #83 and use **rubric-v1** (unweighted mean of five
 > dimensions). Main's **rubric-v2** (factuality-weighted headline + validity flag + middle
 > truncation) scores strictly lower on identical predictions — ≈0.58 where v1 scored ≈0.70 — so
-> re-running the commands below on `main` will produce lower absolute fidelities. The *shape* of each
+> re-running this on `main` will produce lower absolute fidelities. The *shape* of each
 > curve and the n=0→RAG gaps (what this doc claims) are unchanged in kind.
 
-```bash
-# one benchmark's curve — the same --counts for all three; the ablation auto-caps at the train pool
-# (tau-bench -> 648, terminal-tasks -> 164, swe-bench -> 173), so the top point is the whole pool.
-AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_trace_scaling.py \
-  terminal-tasks --counts 1,4,16,64,256,648 --modes base --seeds 0,1 \
-  --sample-turns sampled --test-cap 40 --concurrency 8 \
-  --opt-model us.anthropic.claude-opus-4-8 --out term.json
-
-# the n=0 anchor: the same scoring with retrieval OFF (--no-rag); merged into the report as base@0.
-AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_trace_scaling.py \
-  terminal-tasks --counts 1 --modes base --seeds 0,1 --no-rag \
-  --sample-turns sampled --test-cap 40 --concurrency 8 \
-  --opt-model us.anthropic.claude-opus-4-8 --out term_norag.json
-
-# render all three into the figure (matplotlib is ephemeral, not a project dep); base@0 is drawn
-# in the "0" slot left of 10^0 with a dotted connector to the first RAG point.
-uv run --with matplotlib python .agents/scripts/plot_trace_scaling.py \
-  --report tau-bench=tau.json --report terminal-tasks=term.json --report swe-bench=swe.json \
-  --out docs/research/trace_scaling_law --title "Trace scaling law (RAG-only)"
+```text
+API        wmh.research.TraceScalingAblation + wmh.research.run_ablation
+corpus     packages/environment-capture/<suite>/traces.otel.jsonl (wmh.ingest, degenerate
+           traces dropped), suites: tau-bench, terminal-tasks, swe-bench
+counts     1,4,16,64,256,648; the ablation auto-caps at each train pool
+           (tau-bench 648, terminal-tasks 164, swe-bench 173), so the top point is the whole pool
+modes      base (RAG-only; budget=0)          seeds     0,1
+sampling   sample_turns=sampled, test_cap=40, concurrency=8
+backends   serve + judge = us.anthropic.claude-opus-4-8 on Bedrock
+           (AWS_PROFILE=default, AWS_REGION=us-east-1), HashingEmbedder(dim=512), top_k=5
+n=0 anchor the same scoring with retrieval disabled, merged into the report as base@0
+figure     matplotlib over the three AblationReport JSONs, brand palette (AGENTS.md rule 15);
+           base@0 drawn in the "0" slot left of 10^0 with a dotted connector to the first RAG point
 ```
 
 Each corpus was captured live from its real benchmark; see the capture tooling and READMEs under

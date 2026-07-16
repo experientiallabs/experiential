@@ -59,14 +59,16 @@ uv run pytest -q
    add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
    `wmh/repo_layout_test.py` enforces this. What each surface is for:
    - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
-     (completed research writeups + the figures they render: one per writeup by default, and
-     every figure beyond the first needs its own justification row in `docs/README.md`) and
-     `docs/reference/` (how-to
+     (completed research writeups, their rendered figures under `docs/research/figures/`: one
+     figure per writeup by default, and every figure beyond the first needs its own
+     justification row in `docs/README.md`) and `docs/reference/` (how-to
      references verified against main). Nothing else: raw result JSONs, vector sources, design
      notes, drafts, and proposals all live in `.agents/docs/`. `docs/README.md` indexes every
-     doc with its justification — a doc that can't justify its existence gets deleted. Nothing
-     in `docs/` may depend on `.agents/` staying around — quote reproduction commands in the
-     report itself.
+     doc with its justification; a doc that can't justify its existence gets deleted. `docs/`
+     never mentions `.agents/` at all, not even as a disclaimed pointer (enforced by
+     `wmh/repo_layout_test.py`): a reader of docs/ should never learn the workspace exists.
+     Reproduction lives in the report itself, quoted as public `wmh` API/CLI plus the exact
+     parameter pins.
      Everything else that is "generated" stays out of git: eval results under the local
      `.wmh/evals/` artifact root, built models under `.wmh/models/` (intentional prebuilt
      example artifacts under `examples/<task>/models/`), eval suite definitions under
@@ -165,7 +167,7 @@ uv run pytest -q
     - Ink (text/titles): `#0a0a0a` · Grid/hairlines: `#ececec` · Background: white
     - Accents, in order of use: `#0070f3` (primary blue), `#7928ca` purple, `#f5a623` amber,
       `#ee0000` red, `#50e3c2` teal
-    The published figures under `docs/` (e.g. `docs/research/trace_scaling_law.png`) are the visual
+    The published figures under `docs/` (e.g. `docs/research/figures/trace_scaling_law.png`) are the visual
     reference. (`.agents/scripts/plot_trace_scaling.py` shows one way to produce them, but
     `.agents/` contents are disposable — the palette above is the contract, not that script.)
 

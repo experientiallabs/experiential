@@ -5,8 +5,8 @@ automated component — a judge, a retriever, a reward model, an optimizer promp
 method instead of rediscovering it. The concrete artifacts referenced live in
 `wmh/optimize/judge_quality.py` (the suite), `.agents/scripts/run_judge_quality.py` /
 `run_judge_regression.py` / `plot_judge_overhaul.py` (drivers), and
-`.agents/docs/research/raw/judge-*.json` (every run). Finished narrative:
-`.agents/docs/research/judge-overhaul-writeup.md`.
+`.agents/docs/research/judge-overhaul/raw/judge-*.json` (every run). Finished narrative:
+`.agents/docs/research/judge-overhaul/judge-overhaul-writeup.md`.
 
 ## The loop in one line
 
@@ -132,7 +132,7 @@ see `docs/reference/failover.md` once PR #51 lands) while world-model calls fail
   concurrency 3–4; the 47-step regression (predictions + 2×judging) is the expensive part —
   which is exactly why predictions are cached and reused.
 - **Figure regeneration**: `uv run python .agents/scripts/plot_judge_overhaul.py` re-renders
-  `.agents/docs/research/judge_overhaul.png` from the raw JSONs (brand palette per AGENTS rule 15).
+  `.agents/docs/research/judge-overhaul/judge_overhaul.png` from the raw JSONs (brand palette per AGENTS rule 15).
 
 ## 8. Extending the suite
 

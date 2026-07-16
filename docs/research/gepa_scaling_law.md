@@ -19,7 +19,7 @@ improved optimizer to locate each benchmark's optimal n.
 `wmh/research/gepa_scaling.py` implements the ablation; `budget=0` (GEPA off) reproduces the trace
 scaling law's RAG-only point - a built-in consistency anchor between the two experiments.
 
-![GEPA scaling law](gepa_scaling_law.png)
+![GEPA scaling law](figures/gepa_scaling_law.png)
 
 ## Finding 1: GEPA does not lift open-loop fidelity above the RAG plateau
 
@@ -262,61 +262,34 @@ configurations and swe's across three, so the pattern is consistent, but error b
 
 ## Reproduce
 
-The experiment is fully specified by the public `wmh` API - the commands below name a workspace
-runner for convenience, but nothing here depends on it surviving (`.agents/` contents are
-disposable). The procedure each command drives, in API terms: ingest the suite's OTel traces
-(`wmh.ingest`, adapter `otel-genai`), split with `wmh.research.partition_corpus(test_frac=0.2,
-valid_frac=0.15)`, and run `wmh.research.GepaScalingAblation` over the given `(n_train, budget)`
-grid via `run_ablation` with the flags mapping 1:1 onto its constructor: `--gepa-val-steps` →
-`gepa_val_steps` (GEPA's selection valset step cap), `--val-fill` → `val_fill`
-(greedy|inclusive fill), `--minibatch` → `minibatch_size`, `--recheck-steps` → `recheck_steps`
-(guard-v2 disjoint re-check), `--hard-threshold` → `hard_threshold`, `--test-cap` → `test_cap`
-(fixed seeded test subsample), `--sample-turns sampled` → Qwen-AgentWorld 5-turn scoring.
-Backends: serving/optimize on Bedrock Opus 4.7 behind a capacity-only failover ladder, judge =
-`RubricJudge` on Opus 4.8 (**rubric-v1 at publication** - on current `main` the same commands
-score with rubric-v2 and will not match these tables), embedder = offline
-`HashingEmbedder(dim=512)`. Raw `AblationReport`s, judge-ablation JSONs (including the evolved
-prompts), and the RAG baselines are archived under
-`.agents/docs/research/gepa_scaling_results/`.
+The experiment is fully specified by the public `wmh` API; any thin driver over it reproduces the
+grid. The procedure, in API terms: ingest the suite's OTel traces (`wmh.ingest`, adapter
+`otel-genai`), split with `wmh.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`, and run
+`wmh.research.GepaScalingAblation` over the given `(n_train, budget)` grid via `run_ablation`. The
+knobs named below are its constructor arguments: `gepa_val_steps` (GEPA's selection valset step
+cap), `val_fill` (greedy|inclusive fill), `minibatch_size`, `recheck_steps` (guard-v2 disjoint
+re-check), `hard_threshold`, `test_cap` (fixed seeded test subsample), `sample_turns="sampled"`
+(Qwen-AgentWorld 5-turn scoring). Backends: serving/optimize on Bedrock Opus 4.7 behind a
+capacity-only failover ladder, judge = `RubricJudge` on Opus 4.8 (**rubric-v1 at publication** - on
+current `main` the same procedure scores with rubric-v2 and will not match these tables), embedder
+= offline `HashingEmbedder(dim=512)`.
 
-```bash
-# budget axis (per benchmark): b in {0,1,2,4,8,16} at n=64, seeds 0,1
-AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_gepa_scaling.py \
-  tau-bench --counts 64 --budgets 0,1,2,4,8,16 --seeds 0,1 --sample-turns sampled \
-  --test-cap 40 --gepa-val-steps 30 --concurrency 8 --out tau_budget.json
+```text
+env          AWS_PROFILE=default AWS_REGION=us-east-1 (Bedrock); shared by every arm below
+common       sample_turns=sampled, test_cap=40, concurrency=8, gepa_val_steps=30
 
-# trace axis (per benchmark): n in {1,4,16,pool} at b=8, seed 0
-AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_gepa_scaling.py \
-  tau-bench --counts 1,4,16,648 --budgets 8 --seeds 0 --sample-turns sampled \
-  --test-cap 40 --gepa-val-steps 30 --concurrency 8 --out tau_traces.json
-
-# dense optimal-n sweep (improved GEPA: acceptance re-check + anti-flip template are default;
-# --recheck-steps 30 additionally re-checks on a valset-disjoint slice - guard v2)
-AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_gepa_scaling.py \
-  tau-bench --counts 1,2,4,8,16,32,64,128,256,648 --budgets 8 --seeds 0 --sample-turns sampled \
-  --test-cap 40 --gepa-val-steps 30 --concurrency 8 --out tau_dense.json
-
-# data-configuration grid (Finding 5; template v2 ships as the default reflection template) -
-# the winning configuration:
-AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_gepa_scaling.py \
-  tau-bench --counts 64 --budgets 8 --seeds 0 --minibatch 8 --gepa-val-steps 90 \
-  --val-fill inclusive --sample-turns sampled --test-cap 40 --concurrency 8 --out tau_mb8v90.json
-
-# hard-step arm: same t64_b8 point with reflection/selection concentrated on failures
-AWS_PROFILE=default AWS_REGION=us-east-1 uv run python .agents/scripts/run_gepa_scaling.py \
-  tau-bench --counts 64 --budgets 8 --seeds 0 --hard-threshold 0.9 ... --out tau_hard.json
-
-# judge-sensitivity ablation (per benchmark; needs OPENAI_API_KEY for the two GPT judges)
-AWS_PROFILE=default AWS_REGION=us-east-1 OPENAI_API_KEY=... uv run python \
-  .agents/scripts/run_judge_ablation.py tau-bench --out judge_ablation/tau-bench.json
-
-# the figure (matplotlib is ephemeral, not a project dep)
-uv run --with matplotlib python .agents/scripts/plot_gepa_scaling.py \
-  --budget-report tau-bench=tau_budget.json ... --trace-report tau-bench=tau_traces.json ... \
-  --rag-report tau-bench=rag_baseline/tau-bench.json ... \
-  --judge-report tau-bench=judge_ablation/tau-bench.json ... \
-  --dense-report tau-bench=tau_dense.json ... \
-  --ymin 0.55 --out docs/research/gepa_scaling_law --title "GEPA scaling law"
+budget axis  per benchmark: budgets {0,1,2,4,8,16} at counts=64, seeds 0,1
+trace axis   per benchmark: counts {1,4,16,pool} at budgets=8, seed 0
+dense sweep  counts {1,2,4,8,16,32,64,128,256,pool} at budgets=8, seed 0 (improved GEPA:
+             acceptance re-check + anti-flip template are default; recheck_steps=30 additionally
+             re-checks on a valset-disjoint slice - guard v2)
+data grid    Finding 5's winning configuration: counts=64, budgets=8, seed 0, minibatch_size=8,
+             gepa_val_steps=90, val_fill=inclusive (template v2 is the default reflection template)
+hard arm     the same t64_b8 point with hard_threshold=0.9 (reflection/selection on failures)
+judge arm    the same evolved prompts re-scored by each judge in the panel; the two GPT judges
+             need OPENAI_API_KEY
+figure       matplotlib over the AblationReport JSONs (budget/trace/dense/RAG-baseline/judge
+             panels, ymin 0.55), brand palette (AGENTS.md rule 15)
 ```
 
 Serving/optimize model `us.anthropic.claude-opus-4-7`, judge `us.anthropic.claude-opus-4-8`, both
