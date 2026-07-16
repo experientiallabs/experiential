@@ -1,9 +1,10 @@
 """The shared OAuth app registry: embedded endpoint defaults + env-var credential overrides.
 
-Endpoint/scope configuration per provider is embedded here; client credentials are not (the
-embedded ids are placeholders until the maintainer's registered apps land). `get_app` layers
-`WMH_<NAME>_CLIENT_ID` / `WMH_<NAME>_CLIENT_SECRET` env overrides over the embedded defaults, so
-users can always bring their own OAuth app.
+Endpoint/scope configuration per provider is embedded here, along with the maintainer's
+registered client ids where they exist (client ids are public identifiers for native apps,
+RFC 8252; flows are secured by PKCE or the device grant, never by a shipped secret). `get_app`
+layers `WMH_<NAME>_CLIENT_ID` / `WMH_<NAME>_CLIENT_SECRET` env overrides over the embedded
+defaults, so users can always bring their own OAuth app.
 """
 
 from __future__ import annotations
@@ -13,12 +14,13 @@ import os
 from wmh.connect.oauth import OAuthApp
 from wmh.connect.types import ConnectError
 
-# Full endpoint/scope config per provider; client ids stay empty until the maintainer's
-# registered apps are embedded (a follow-up change fills them in).
+# Full endpoint/scope config per provider; google/slack client ids stay empty until the
+# maintainer's registered apps are embedded (follow-up changes fill them in).
 EMBEDDED_APPS: dict[str, OAuthApp] = {
     "github": OAuthApp(
         name="github",
-        client_id="",
+        # The experientiallabs "World Model Harness" OAuth app, device flow enabled.
+        client_id="Ov23liNGQogdOKumTflW",
         auth_url="https://github.com/login/oauth/authorize",
         token_url="https://github.com/login/oauth/access_token",
         device_url="https://github.com/login/device/code",

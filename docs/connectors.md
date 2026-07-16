@@ -68,9 +68,9 @@ README into a context bundle.
 
 ### Setup
 
-The embedded OAuth app ships without a client id for now, so bring your own GitHub OAuth app
-(Settings > Developer settings > OAuth Apps, with "Enable Device Flow" checked; no client secret
-needed):
+None: the experientiallabs OAuth app ships embedded (device flow, no client secret involved), so
+`wmh connect github` works out of the box. To use your own GitHub OAuth app instead (Settings >
+Developer settings > OAuth Apps, with "Enable Device Flow" checked), override it:
 
 ```bash
 export WMH_GITHUB_CLIENT_ID=<your OAuth app client id>
@@ -384,9 +384,11 @@ wmh context pull brave --query wmh --since 2026-06-01 --until 2026-07-01
 ## Shared OAuth apps
 
 OAuth endpoint and scope configuration per provider is embedded in `wmh/connect/apps.py`
-(`EMBEDDED_APPS`); client credentials are not, yet. Until the maintainer's registered apps land,
-every OAuth path needs a bring-your-own client via environment overrides, which always win over
-whatever is embedded:
+(`EMBEDDED_APPS`), together with the registered client ids where they exist: GitHub ships
+embedded today; Google and Slack are pending registration, so those OAuth paths need a
+bring-your-own client via environment overrides meanwhile. A client id is a public identifier
+for a native app (RFC 8252): flows are secured by PKCE or the device grant, and no client secret
+ever ships in the repo. Env overrides always win over whatever is embedded:
 
 ```bash
 export WMH_<NAME>_CLIENT_ID=...       # e.g. WMH_GITHUB_CLIENT_ID, WMH_GOOGLE_CLIENT_ID

@@ -15,11 +15,17 @@ def _no_client_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(f"WMH_{provider}_CLIENT_SECRET", raising=False)
 
 
-def test_embedded_apps_define_endpoints_but_no_client_ids() -> None:
+def test_embedded_apps_define_endpoints_and_shippable_credentials_only() -> None:
     assert set(EMBEDDED_APPS) == {"github", "google", "slack"}
-    assert all(app.client_id == "" for app in EMBEDDED_APPS.values())
+    # Embedded client ids are public identifiers; a client SECRET must never ship.
+    assert all(app.client_secret is None for app in EMBEDDED_APPS.values())
+    # Google and Slack apps are not registered yet (env overrides required meanwhile).
+    assert EMBEDDED_APPS["google"].client_id == ""
+    assert EMBEDDED_APPS["slack"].client_id == ""
 
     github = EMBEDDED_APPS["github"]
+    # The registered experientiallabs OAuth app: device flow only, no secret involved.
+    assert github.client_id == "Ov23liNGQogdOKumTflW"
     assert github.auth_url == "https://github.com/login/oauth/authorize"
     assert github.token_url == "https://github.com/login/oauth/access_token"
     assert github.device_url == "https://github.com/login/device/code"
@@ -37,10 +43,14 @@ def test_embedded_apps_define_endpoints_but_no_client_ids() -> None:
 
 def test_get_app_without_a_client_id_points_at_the_env_var() -> None:
     with pytest.raises(ConnectError) as excinfo:
-        get_app("github")
+        get_app("google")
     message = str(excinfo.value)
-    assert "WMH_GITHUB_CLIENT_ID" in message
+    assert "WMH_GOOGLE_CLIENT_ID" in message
     assert "docs/connectors.md" in message
+
+
+def test_get_app_github_resolves_from_the_embedded_registration() -> None:
+    assert get_app("github").client_id == "Ov23liNGQogdOKumTflW"
 
 
 def test_get_app_layers_env_overrides_over_embedded_defaults(
