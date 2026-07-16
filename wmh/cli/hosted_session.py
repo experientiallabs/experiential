@@ -837,6 +837,11 @@ class DetachedCommandDriver:
                 _console.print(f"[dim]({detail})[/dim]")
             return
         if event.kind == "user_message" and stream.pending_text is not None:
+            # Turn attribution matches the echoed text among events after the
+            # send-time cursor. The command API cannot correlate a command id
+            # to its transcript echo, so an identical message posted by
+            # another actor in the same window can end the stream one turn
+            # early; the session itself is unaffected (a known approximation).
             if event.payload.get("text") == stream.pending_text:
                 stream.message_seen = True
         if event.kind == "state" and stream.message_seen and event.payload.get("status") == "idle":

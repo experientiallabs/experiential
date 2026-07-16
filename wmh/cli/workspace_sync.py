@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import os
@@ -330,11 +331,26 @@ def apply_workspace_patch(root: Path, content: bytes) -> SyncResult:
 
 
 def write_conflict_archive(root: Path, session_id: str, content: bytes) -> Path:
-    """Preserve a downloaded result archive when automatic reconciliation conflicts."""
+    """Preserve a downloaded result archive when automatic reconciliation conflicts.
+
+    The archive is the only remaining copy of the agent's work once the
+    handoff is acknowledged, so it lands atomically: a crash mid-write leaves
+    the previous file (or nothing), never a truncated archive.
+    """
     directory = root.resolve() / ".wmh-conflicts"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{session_id}.tar.gz"
-    path.write_bytes(content)
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f"{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+        os.replace(tmp_name, path)
+    except BaseException:
+        # The replace may already have consumed the temp file; a missing file
+        # must not mask the original exception.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     return path
 
 

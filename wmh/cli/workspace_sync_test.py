@@ -256,3 +256,21 @@ def test_sync_conflicts_when_remote_deletion_meets_a_local_directory(tmp_path: P
 
     assert result.conflicts == ("same.txt",)
     assert (tmp_path / "same.txt").is_dir()
+
+
+def test_conflict_archive_write_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A crash mid-write must not leave a truncated recovery archive behind."""
+    import wmh.cli.workspace_sync as workspace_sync_module
+
+    def failing_replace(_src: str, _dst: str) -> None:
+        raise OSError("simulated crash at the swap")
+
+    monkeypatch.setattr(workspace_sync_module.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="simulated"):
+        write_conflict_archive(tmp_path, "sess-1", b"archive-bytes")
+
+    directory = tmp_path / ".wmh-conflicts"
+    # Neither a partial target nor a stray temporary file survives the crash.
+    assert not (directory / "sess-1.tar.gz").exists()
+    assert [p for p in directory.iterdir()] == []
