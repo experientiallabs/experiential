@@ -571,6 +571,10 @@ class RemoteAgentDriver:
         finally:
             self._client.close()
 
+    def _advance_cursor(self, seq: int) -> None:
+        """Mark one transcript event as processed."""
+        self._cursor = seq
+
     def _promote(self, session_id: str, workspace: LiveWorkspace | None) -> None:
         """Persist the live session as the current detached session and exit.
 
@@ -628,7 +632,6 @@ class RemoteAgentDriver:
         Returns:
             The terminal session record, or ``None`` when the user detached.
         """
-        cursor = 0
         last_workspace_push = time.monotonic()
         sink = TerminalEventSink(recorder=None, on_running=lambda _running: None)
         saw_running = False
@@ -636,7 +639,7 @@ class RemoteAgentDriver:
         while True:
             try:
                 page = self._client.list_agent_session_events(
-                    self._target_id, session_id, after=cursor
+                    self._target_id, session_id, after=self._cursor
                 )
                 for event in page.events:
                     if event.kind == "workspace_patch":
@@ -644,7 +647,13 @@ class RemoteAgentDriver:
                             raise WorkspaceSyncError(
                                 "received a workspace patch without --upload-dir"
                             )
-                        workspace.apply_remote_patch(patch_revision(event))
+                        # Advance before the ack posts: once the object is
+                        # acknowledged (hence deleted), neither an interrupt
+                        # resume nor a :detach promotion may re-request it.
+                        workspace.apply_remote_patch(
+                            patch_revision(event),
+                            before_ack=lambda seq=event.seq: self._advance_cursor(seq),
+                        )
                     elif event.kind == "status":
                         detail = event.payload.get("message") or event.payload.get("status")
                         if detail:
@@ -664,8 +673,10 @@ class RemoteAgentDriver:
                                     self._target_id, session_id, "end"
                                 )
                                 end_sent = True
-                cursor = page.last_seq
-                self._cursor = cursor
+                    # Per event, not per page: a Ctrl-C mid-page must resume
+                    # (and promote) after the events already processed.
+                    self._cursor = event.seq
+                self._cursor = page.last_seq
                 if page.status in {"ended", "failed"}:
                     return self._client.get_agent_session(self._target_id, session_id)
                 if detach.is_set():

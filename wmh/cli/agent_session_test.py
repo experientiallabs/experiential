@@ -718,7 +718,7 @@ def test_remote_agent_driver_applies_live_workspace_patch(
             event = type(
                 "Event",
                 (),
-                {"kind": "workspace_patch", "payload": {"revision": "patch-1"}},
+                {"seq": 1, "kind": "workspace_patch", "payload": {"revision": "patch-1"}},
             )()
             return type("Page", (), {"events": [event], "last_seq": 1, "status": "ended"})()
 
@@ -1186,3 +1186,92 @@ def test_second_interrupt_during_the_plain_handler_still_ends(tmp_path: Path) ->
 
     assert client.commands == ["interrupt", "end"]
     assert client.closed
+
+
+def test_plain_run_interrupt_around_a_patch_ack_promotes_a_fresh_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Ctrl-C during the patch ack must not leave a cursor that re-fetches it.
+
+    The resumed loop (and a later :detach promotion) must poll past the
+    processed patch event: its object is acknowledged, so re-requesting it
+    would 404 and abort the next detached command.
+    """
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = mod.snapshot_workspace(root)
+    remote = io.BytesIO()
+    with tarfile.open(fileobj=remote, mode="w:gz") as archive:
+        body = b"during"
+        info = tarfile.TarInfo("answer.txt")
+        info.size = len(body)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(body))
+    patch = build_workspace_patch(base.archive, remote.getvalue())
+    assert patch is not None
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.acks = 0
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "sess-1"})()
+
+        def list_agent_session_events(
+            self, _agent_id: str, _session_id: str, *, after: int
+        ) -> object:
+            self.calls.append(f"events after={after}")
+            if after == 0:
+                event = type(
+                    "Event",
+                    (),
+                    {"seq": 1, "kind": "workspace_patch", "payload": {"revision": "p1"}},
+                )()
+                return type("Page", (), {"events": [event], "last_seq": 1, "status": "running"})()
+            return type("Page", (), {"events": [], "last_seq": after, "status": "running"})()
+
+        def download_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: str
+        ) -> bytes:
+            self.calls.append(f"patch:{revision}")
+            if revision != "p1" or self.acks:
+                pytest.fail("an acknowledged patch must never be re-requested")
+            return patch
+
+        def acknowledge_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: str
+        ) -> None:
+            _ = revision
+            self.acks += 1
+            raise KeyboardInterrupt
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            _ = kind, text
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _DetachAfterResume:
+        def __init__(self, *_args: object) -> None:
+            self.eof = threading.Event()
+            self.detach = threading.Event()
+            self.detach.set()
+
+        def start(self) -> None:
+            pass
+
+    client = _Client()
+    driver, store = _plain_driver(client, tmp_path, jail_root=root)
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _DetachAfterResume)
+    driver.run()
+
+    assert client.calls.count("patch:p1") == 1
+    assert "events after=1" in client.calls
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.cursor == 1
