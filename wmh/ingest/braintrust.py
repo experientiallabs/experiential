@@ -64,10 +64,6 @@ _LLM_TYPES = frozenset({"llm", "task", "function", "chain", "agent"})
 _TOOL_TYPES = frozenset({"tool"})
 
 
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
-
-
 def _looks_like_uuid(value: str) -> bool:
     """True if `value` is a canonical UUID (Braintrust project ids), so we skip the name lookup."""
     import uuid

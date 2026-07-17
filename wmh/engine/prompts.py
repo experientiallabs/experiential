@@ -1,4 +1,4 @@
-"""Prompt assembly for the world model and the demo agent.
+"""Prompt assembly for the world model.
 
 The env prompt is the heart of the system. It composes:
   - the optimized base prompt (layer a / GEPA winner, layer b)
@@ -16,7 +16,6 @@ serves. This module is the engine-facing entry point: it adapts a live `Session`
 from __future__ import annotations
 
 from wmh.core.render import build_env_prompt as _build_env_prompt
-from wmh.core.render import render_demo
 from wmh.core.types import Action, Session, Step
 
 # Layer (a): the env-agnostic base prompt. GEPA (layer b) evolves a specialized version of this.
@@ -97,17 +96,4 @@ def build_env_prompt(
         confidence=confidence,
         confidence_why=confidence_why,
         max_retrieved_observation_chars=max_retrieved_observation_chars,
-    )
-
-
-def build_demo_agent_prompt(task: str, examples: list[Step]) -> str:
-    """Prompt for the throwaway LLM-as-agent used by `wmh demo` (no GEPA, just examples)."""
-    example_block = "\n\n".join(render_demo(e) for e in examples) if examples else "(no examples)"
-    return (
-        "You are role-playing the agent in a traced environment. Based on the task and the example "
-        "interactions below, emit a SINGLE next tool call as a JSON object and nothing else:\n"
-        '{"name": "<tool name>", "arguments": {<json args>}}\n\n'
-        f"TASK:\n{task}\n\n"
-        f"EXAMPLE INTERACTIONS:\n{example_block}\n\n"
-        "Your single tool call (JSON only):"
     )
