@@ -44,7 +44,7 @@ from typing import Callable
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.engine.loader import load_world_model
 from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.optimize.gepa import predict_observation
+from wmh.optimize.gepa import predict_observation, verify_observation
 from wmh.providers import get_provider
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
 from wmh.tracking.metered import MeteredProvider
@@ -90,7 +90,9 @@ def with_retry(fn: Callable[[], Observation]) -> Observation:
     raise AssertionError("unreachable")
 
 
-def predict_row_wm(world_model, serve_model: str, model_dir: str, row: JsonObject) -> None:
+def predict_row_wm(
+    world_model, serve_model: str, model_dir: str, row: JsonObject, *, max_fidelity: bool = False
+) -> None:
     """One row through the serving session path (retrieval included), per-session metering."""
 
     def attempt() -> Observation:
@@ -103,6 +105,7 @@ def predict_row_wm(world_model, serve_model: str, model_dir: str, row: JsonObjec
             row["wmh_infer"] = {
                 "mode": "wm",
                 "model_dir": model_dir,
+                "max_fidelity": max_fidelity,
                 "serve_model": serve_model,
                 "input_tokens": usage.total.input_tokens,
                 "output_tokens": usage.total.output_tokens,
@@ -112,21 +115,47 @@ def predict_row_wm(world_model, serve_model: str, model_dir: str, row: JsonObjec
     row["gen"] = wrap_gen(with_retry(attempt))
 
 
-def predict_row_base(provider: Provider, serve_model: str, row: JsonObject) -> None:
-    """One row with BASE_ENV_PROMPT and no retrieval; per-row tracker for clean attribution."""
+def predict_row_base(
+    provider: Provider,
+    serve_model: str,
+    row: JsonObject,
+    *,
+    reasoning: bool = False,
+    verify: bool = False,
+) -> None:
+    """One row with BASE_ENV_PROMPT and no retrieval; per-row tracker for clean attribution.
+
+    `reasoning`/`verify` are the corpus-free max levers (verify = one extra completion that
+    audits the draft — doubles per-row provider cost).
+    """
     tracker = RunTracker(run_id=f"awb-base-{row['id']}-{row['turn_idx']}", kind="eval")
     tracker.start()
     metered = MeteredProvider(provider, tracker, base_phase=Phase.SERVE)
 
     def attempt() -> Observation:
-        return predict_observation(
+        history = history_steps(row)
+        draft = predict_observation(
             metered,
             BASE_ENV_PROMPT,
             None,
             EnvState(),
             current_action(row),
             demos=[],
-            history=history_steps(row),
+            history=history,
+            reasoning=reasoning,
+        )
+        if not verify:
+            return draft
+        return verify_observation(
+            metered,
+            BASE_ENV_PROMPT,
+            None,
+            EnvState(),
+            current_action(row),
+            draft,
+            demos=[],
+            history=history,
+            reasoning=reasoning,
         )
 
     try:
@@ -136,6 +165,8 @@ def predict_row_base(provider: Provider, serve_model: str, row: JsonObject) -> N
         row["wmh_infer"] = {
             "mode": "base",
             "serve_model": serve_model,
+            "reasoning": reasoning,
+            "verify": verify,
             "input_tokens": total.input_tokens,
             "output_tokens": total.output_tokens,
             "cost_usd": total.cost_usd,
@@ -173,6 +204,15 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--resume", action="store_true", help="skip rows already in --output")
     parser.add_argument("--output", required=True, help="predictions.jsonl path")
+    parser.add_argument(
+        "--max-fidelity",
+        action="store_true",
+        help="wm mode: apply the model's auto_fidelity.json winner (plain load = pure RAG)",
+    )
+    parser.add_argument("--reasoning", action="store_true", help="base mode: reasoning lever")
+    parser.add_argument(
+        "--verify", action="store_true", help="base mode: verify second pass (2x provider cost)"
+    )
     args = parser.parse_args()
     if args.mode == "wm" and not args.model_dir:
         parser.error("--mode wm requires --model-dir")
@@ -196,14 +236,24 @@ def main() -> None:
     )
 
     if args.mode == "wm":
-        world_model, provider = load_world_model(args.model_dir)
+        world_model, provider = load_world_model(args.model_dir, max_fidelity=args.max_fidelity)
         serve_model = provider.config.model
-        predict = lambda row: predict_row_wm(world_model, serve_model, args.model_dir, row)  # noqa: E731
+        winner_path = Path(args.model_dir) / "auto_fidelity.json"
+        if args.max_fidelity and not winner_path.exists():
+            parser.error(f"--max-fidelity: no auto_fidelity.json in {args.model_dir}")
+        winner = json.loads(winner_path.read_text()) if winner_path.exists() else None
+        if args.max_fidelity:
+            print(f"max-fidelity winner: {winner}")
+        predict = lambda row: predict_row_wm(  # noqa: E731
+            world_model, serve_model, args.model_dir, row, max_fidelity=args.max_fidelity
+        )
     else:
         provider = get_provider(
             ProviderConfig(kind=ProviderKind.BEDROCK, model=args.provider_model, region=args.region)
         )
-        predict = lambda row: predict_row_base(provider, args.provider_model, row)  # noqa: E731
+        predict = lambda row: predict_row_base(  # noqa: E731
+            provider, args.provider_model, row, reasoning=args.reasoning, verify=args.verify
+        )
 
     write_lock = threading.Lock()
     counter = {"done": 0, "failed": 0}
