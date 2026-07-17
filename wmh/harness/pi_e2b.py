@@ -438,6 +438,7 @@ class E2BDurableChannel:
         self._next_pid_check_at = time.monotonic() + pid_probe_interval_s
         self._pid_dead_at: float | None = None
         self._last_outbox_error: str | None = None
+        self._stream_generation = 0
         self._file_request_timeout_s = file_request_timeout_s
         self._frame_request_timeout_s = frame_request_timeout_s
         self._poll_interval_s = poll_interval_s
@@ -449,10 +450,56 @@ class E2BDurableChannel:
         self._send_ack_timeout_s = send_ack_timeout_s
         self._close_request_timeout_s = close_request_timeout_s
         self._stdout_silence_grace_s = stdout_silence_grace_s
-        self._reader = threading.Thread(
-            target=self._read_events, name="e2b-durable-reader", daemon=True
-        )
+        self._reader = self._new_reader(handle, generation=self._stream_generation)
         self._reader.start()
+
+    def resume(self, sandbox: SandboxHandle, *, timeout: float | None = 0) -> None:
+        """Reconnect this channel to its preserved runner after an E2B sandbox resume.
+
+        E2B keeps the runner process and filesystem outbox in a memory-preserving pause, but the
+        old command output stream is gone. Reusing this channel preserves both transport sequence
+        cursors while replacing only that notification stream. The durable outbox remains the
+        source of truth for frames produced while the stream was detached.
+
+        Args:
+            sandbox: The reconnected handle for the same memory-preserved sandbox.
+            timeout: E2B command-stream timeout. Zero keeps the live stream attached indefinitely.
+        """
+        with self._send_lock, self._close_lock:
+            if self._closed.is_set():
+                raise RuntimeError("a closed durable runner channel cannot be resumed")
+            with self._state_lock:
+                if self._fatal_error is not None:
+                    raise RuntimeError(
+                        f"a failed durable runner channel cannot be resumed: {self._fatal_error}"
+                    )
+
+            handle = sandbox.commands.connect(self._pid, timeout=timeout)
+            previous_handle = self._handle
+            self._sandbox = sandbox
+            self._handle = handle
+            now = time.monotonic()
+            with self._state_lock:
+                self._stream_generation += 1
+                generation = self._stream_generation
+                self._stream_dead_at = None
+                self._stream_death_probe_done = False
+                self._stream_error = None
+                self._last_stdout_at = now
+                self._head_failure_since = None
+                self._last_head_failure_at = None
+                self._next_pid_check_at = now + self._pid_probe_interval_s
+                self._pid_dead_at = None
+                self._last_outbox_error = None
+                self._missing_since.clear()
+            reader = self._new_reader(handle, generation=generation)
+            self._reader = reader
+
+            disconnect = getattr(previous_handle, "disconnect", None)
+            if callable(disconnect):
+                with contextlib.suppress(Exception):
+                    disconnect()
+            reader.start()
 
     def send(self, frame: JsonObject) -> None:
         """Deliver one host frame once, retrying the same sequence until its durable ack."""
@@ -681,12 +728,23 @@ class E2BDurableChannel:
         message = self._fatal_error or "pi live runner process exited"
         raise RuntimeError(f"{message}{self._stderr_suffix()}")
 
-    def _read_events(self) -> None:
+    def _new_reader(self, handle: CommandHandle, *, generation: int) -> threading.Thread:
+        return threading.Thread(
+            target=self._read_events,
+            args=(handle, generation),
+            name="e2b-durable-reader",
+            daemon=True,
+        )
+
+    def _read_events(self, handle: CommandHandle, generation: int) -> None:
         pending = ""
         try:
-            for stdout, stderr, _pty in self._handle:
+            for stdout, stderr, _pty in handle:
                 if self._closed.is_set():
                     return
+                with self._state_lock:
+                    if generation != self._stream_generation:
+                        return
                 if stderr:
                     for line in stderr.splitlines():
                         if line.strip():
@@ -697,17 +755,22 @@ class E2BDurableChannel:
                 pending += stdout
                 while "\n" in pending:
                     line, pending = pending.split("\n", 1)
-                    self._decode_stdout_line(line)
+                    self._decode_stdout_line(line, generation=generation)
         except Exception as exc:  # noqa: BLE001 - stdout is only a fallible notification path
-            self._stream_error = f"[channel] output stream failed: {exc}"
-            self._stderr.append(self._stream_error)
+            with self._state_lock:
+                if generation == self._stream_generation and not self._closed.is_set():
+                    self._stream_error = f"[channel] output stream failed: {exc}"
+                    self._stderr.append(self._stream_error)
         else:
-            self._stream_error = "[channel] output stream ended"
+            with self._state_lock:
+                if generation == self._stream_generation and not self._closed.is_set():
+                    self._stream_error = "[channel] output stream ended"
         finally:
-            if not self._closed.is_set():
-                self._stream_dead_at = time.monotonic()
+            with self._state_lock:
+                if generation == self._stream_generation and not self._closed.is_set():
+                    self._stream_dead_at = time.monotonic()
 
-    def _decode_stdout_line(self, line: str) -> None:
+    def _decode_stdout_line(self, line: str, *, generation: int) -> None:
         text = line.strip()
         if not text:
             return
@@ -722,6 +785,8 @@ class E2BDurableChannel:
         if envelope is None:
             if isinstance(value, dict):
                 with self._state_lock:
+                    if generation != self._stream_generation:
+                        return
                     self._mark_fatal_locked(
                         "durable runner emitted an unsequenced or malformed semantic frame"
                     )
@@ -730,6 +795,8 @@ class E2BDurableChannel:
             return
         seq, frame = envelope
         with self._state_lock:
+            if generation != self._stream_generation:
+                return
             if seq <= self._last_seq:
                 return
             self._pending.setdefault(seq, frame)

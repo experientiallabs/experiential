@@ -1599,6 +1599,42 @@ def test_durable_channel_recovers_after_stdout_drops() -> None:
     assert "Server disconnected" in channel.stderr_tail()
 
 
+def test_durable_channel_resume_preserves_both_sequence_cursors() -> None:
+    """A memory-preserving sandbox resume reattaches without replaying either direction."""
+    hello: JsonObject = {"type": "hello"}
+    idle: JsonObject = {"type": "state", "status": "idle"}
+    running: JsonObject = {"type": "state", "status": "running"}
+    handle = _ScriptedHandle(
+        _stdout_events([_envelope(1, hello), _envelope(2, idle)]),
+        hold_open=True,
+    )
+    resumed = _ScriptedHandle(_stdout_events([_envelope(4, running)]), hold_open=True)
+    fake = FakeSandbox(handle, reconnect_handles=[resumed])
+    _store_outbox(fake, [hello, idle])
+    channel = _durable_channel(fake, handle)
+
+    assert channel.recv(timeout=0.5) == hello
+    assert channel.recv(timeout=0.5) == idle
+    first: JsonObject = {"type": "user_message", "text": "first"}
+    channel.send(first)
+
+    fake.files.store[_frame_path(4)] = json.dumps(_envelope(4, running))
+    fake.files.store[f"{_OUTBOX}/head"] = "4"
+    channel.resume(fake)
+
+    assert fake.commands.connects == [(_PID, 0)]
+    assert channel.recv(timeout=0.5) == running
+    second: JsonObject = {"type": "user_message", "text": "second"}
+    channel.send(second)
+
+    wires = [
+        cast("JsonObject", json.loads(base64.b64decode(data.strip())))
+        for _pid, data in fake.commands.stdin
+    ]
+    assert [wire["transport_in_seq"] for wire in wires] == [1, 2]
+    assert fake.durable_dispatches == [first, second]
+
+
 def test_durable_channel_retries_a_transiently_missing_committed_frame() -> None:
     hello: JsonObject = {"type": "hello"}
     ready: JsonObject = {"type": "state", "status": "ready"}
