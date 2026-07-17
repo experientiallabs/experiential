@@ -52,7 +52,7 @@ from pydantic import JsonValue
 from wmh.core.types import JsonObject
 from wmh.ingest.adapter import VendorPull, register_adapter
 from wmh.ingest.base import BaseTraceAdapter
-from wmh.ingest.normalize import SpanRecord, as_text, iso_to_ordinal
+from wmh.ingest.normalize import SpanRecord, as_str, as_text, iso_to_ordinal
 
 # Mastra self-hosts, so the "vendor" is a server base URL (dev default http://localhost:4111).
 _MASTRA_URL_ENV = "MASTRA_URL"
@@ -63,10 +63,6 @@ _MASTRA_URL_ENV = "MASTRA_URL"
 # still accept. `model_chunk`/`model_step`/`agent_run`/`workflow_*`/`generic` are not steps.
 _LLM_TYPES = frozenset({"model_generation", "llm_generation"})
 _TOOL_TYPES = frozenset({"tool_call", "mcp_tool_call"})
-
-
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
 
 
 def _span_type(span: JsonObject) -> str:
@@ -158,7 +154,7 @@ def _first_user_text(value: JsonValue) -> str | None:
     """First user message text from a span `input` (a messages list), else the input as text."""
     if isinstance(value, list):
         for message in value:
-            if isinstance(message, dict) and _as_str(message.get("role")).lower() in {
+            if isinstance(message, dict) and as_str(message.get("role")).lower() in {
                 "user",
                 "human",
             }:

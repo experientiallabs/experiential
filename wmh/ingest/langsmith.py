@@ -62,11 +62,7 @@ from pydantic import JsonValue
 from wmh.core.types import JsonObject
 from wmh.ingest.adapter import register_adapter
 from wmh.ingest.base import BaseTraceAdapter
-from wmh.ingest.normalize import SpanRecord, as_text, iso_to_ordinal
-
-
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
+from wmh.ingest.normalize import SpanRecord, as_str, as_text, iso_to_ordinal
 
 
 def _is_error(run: JsonObject) -> bool:
@@ -327,7 +323,7 @@ class LangSmithAdapter(BaseTraceAdapter):
             ordinal += 1
 
         for _, run in indexed:
-            run_type = _as_str(run.get("run_type")).lower()
+            run_type = as_str(run.get("run_type")).lower()
             error = _is_error(run)
             outputs = run.get("outputs")
             out_obj: JsonObject = outputs if isinstance(outputs, dict) else {}

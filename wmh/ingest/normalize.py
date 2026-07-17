@@ -150,8 +150,46 @@ def as_text(value: JsonValue) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _as_str(value: JsonValue) -> str:
+def as_str(value: JsonValue) -> str:
+    """The value if it is a string, else the empty string (no rendering; shared by adapters)."""
     return value if isinstance(value, str) else ""
+
+
+# --- OpenAI chat tool-call wire shape (shared by row/message adapters) ------------------------
+# Row/message providers (Braintrust, Langfuse, PostHog, raw message logs) carry an agent turn's
+# tool calls as an OpenAI-style `tool_calls` array on the assistant message. These two helpers
+# parse that wire shape before an adapter re-emits it in the OTel-GenAI vocabulary.
+
+
+def openai_tool_calls(output: JsonValue) -> list[JsonObject]:
+    """Extract OpenAI-style tool calls from an `output` (a message object or a message list)."""
+    if isinstance(output, dict):
+        raw = output.get("tool_calls")
+        if isinstance(raw, list):
+            return [tc for tc in raw if isinstance(tc, dict)]
+    if isinstance(output, list):
+        calls: list[JsonObject] = []
+        for message in output:
+            if isinstance(message, dict):
+                raw = message.get("tool_calls")
+                if isinstance(raw, list):
+                    calls.extend(tc for tc in raw if isinstance(tc, dict))
+        return calls
+    return []
+
+
+def openai_tool_call_name_args(tool_call: JsonObject) -> tuple[str, str]:
+    """(name, raw-arguments-json) from a tool call in OpenAI-nested or flattened shape."""
+    fn = tool_call.get("function")
+    if isinstance(fn, dict):
+        name = fn.get("name")
+        args = fn.get("arguments")
+    else:
+        name = tool_call.get("name")
+        args = tool_call.get("arguments")
+    name_s = name if isinstance(name, str) else ""
+    args_s = args if isinstance(args, str) else as_text(args)
+    return name_s, args_s
 
 
 # --- OTLP / OpenInference AnyValue decoding ---------------------------------------------------
@@ -216,9 +254,9 @@ def parse_span(raw: JsonValue) -> SpanRecord | None:
         status_error = code in (2, "STATUS_CODE_ERROR")
     return SpanRecord(
         trace_id=trace_id,
-        span_id=_as_str(raw.get("spanId")),
-        parent_span_id=_as_str(raw.get("parentSpanId")),
-        name=_as_str(raw.get("name")),
+        span_id=as_str(raw.get("spanId")),
+        parent_span_id=as_str(raw.get("parentSpanId")),
+        name=as_str(raw.get("name")),
         start_nano=to_int(raw.get("startTimeUnixNano")),
         end_nano=to_int(raw.get("endTimeUnixNano")),
         attributes=attrs_to_dict(raw.get("attributes")),
