@@ -416,6 +416,7 @@ class E2BDurableChannel:
         self._durable_stderr = ""
         self._frames: queue.Queue[JsonObject | _Eof] = queue.Queue()
         self._state_lock = threading.Lock()
+        self._resume_condition = threading.Condition(self._state_lock)
         self._send_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._ack_condition = threading.Condition()
@@ -439,6 +440,7 @@ class E2BDurableChannel:
         self._pid_dead_at: float | None = None
         self._last_outbox_error: str | None = None
         self._stream_generation = 0
+        self._resuming = False
         self._file_request_timeout_s = file_request_timeout_s
         self._frame_request_timeout_s = frame_request_timeout_s
         self._poll_interval_s = poll_interval_s
@@ -468,20 +470,26 @@ class E2BDurableChannel:
         with self._send_lock, self._close_lock:
             if self._closed.is_set():
                 raise RuntimeError("a closed durable runner channel cannot be resumed")
-            with self._state_lock:
+            with self._resume_condition:
                 if self._fatal_error is not None:
                     raise RuntimeError(
                         f"a failed durable runner channel cannot be resumed: {self._fatal_error}"
                     )
-
-            handle = sandbox.commands.connect(self._pid, timeout=timeout)
-            previous_handle = self._handle
-            self._sandbox = sandbox
-            self._handle = handle
-            now = time.monotonic()
-            with self._state_lock:
+                self._resuming = True
                 self._stream_generation += 1
                 generation = self._stream_generation
+                previous_handle = self._handle
+            try:
+                handle = sandbox.commands.connect(self._pid, timeout=timeout)
+            except BaseException:
+                with self._resume_condition:
+                    self._resuming = False
+                    self._resume_condition.notify_all()
+                raise
+            now = time.monotonic()
+            with self._resume_condition:
+                self._sandbox = sandbox
+                self._handle = handle
                 self._stream_dead_at = None
                 self._stream_death_probe_done = False
                 self._stream_error = None
@@ -492,6 +500,8 @@ class E2BDurableChannel:
                 self._pid_dead_at = None
                 self._last_outbox_error = None
                 self._missing_since.clear()
+                self._resuming = False
+                self._resume_condition.notify_all()
             reader = self._new_reader(handle, generation=generation)
             self._reader = reader
 
@@ -580,6 +590,11 @@ class E2BDurableChannel:
             return None
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
+            if not self._wait_for_resume(deadline):
+                raise TimeoutError(
+                    f"no frame from the pi runner within {timeout}s"
+                    f"{self._stderr_suffix(include_durable=False)}"
+                )
             item = self._get_queued_nowait()
             if item is not None:
                 return self._unwrap_item(item)
@@ -642,6 +657,19 @@ class E2BDurableChannel:
             except queue.Empty:
                 continue
             return self._unwrap_item(item)
+
+    def _wait_for_resume(self, deadline: float | None) -> bool:
+        """Block unary reads while a new sandbox attachment is being established."""
+        with self._resume_condition:
+            while self._resuming and not self._closed.is_set():
+                if deadline is None:
+                    self._resume_condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._resume_condition.wait(timeout=remaining)
+            return not self._resuming
 
     def close(self) -> None:
         """Logically close immediately and retire the runner in bounded background cleanup."""
@@ -745,13 +773,14 @@ class E2BDurableChannel:
                 with self._state_lock:
                     if generation != self._stream_generation:
                         return
-                if stderr:
-                    for line in stderr.splitlines():
-                        if line.strip():
-                            self._stderr.append(line)
+                    if stderr:
+                        for stderr_line in stderr.splitlines():
+                            if stderr_line.strip():
+                                self._stderr.append(stderr_line)
+                    if stdout:
+                        self._last_stdout_at = time.monotonic()
                 if not stdout:
                     continue
-                self._last_stdout_at = time.monotonic()
                 pending += stdout
                 while "\n" in pending:
                     line, pending = pending.split("\n", 1)
@@ -777,7 +806,9 @@ class E2BDurableChannel:
         try:
             value = json.loads(base64.b64decode(text, validate=True))
         except ValueError:
-            self._stderr.append(f"[stdout] {text}")
+            with self._state_lock:
+                if generation == self._stream_generation:
+                    self._stderr.append(f"[stdout] {text}")
             return
         if isinstance(value, dict) and value.get("type") == TRANSPORT_KEEPALIVE_TYPE:
             return  # deliberately unsequenced and never persisted by the durable runner
@@ -791,7 +822,9 @@ class E2BDurableChannel:
                         "durable runner emitted an unsequenced or malformed semantic frame"
                     )
                 return
-            self._stderr.append(f"[stdout] invalid durable envelope: {text}")
+            with self._state_lock:
+                if generation == self._stream_generation:
+                    self._stderr.append(f"[stdout] invalid durable envelope: {text}")
             return
         seq, frame = envelope
         with self._state_lock:
@@ -818,42 +851,51 @@ class E2BDurableChannel:
     ) -> None:
         if self._closed.is_set():
             return
+        with self._state_lock:
+            if self._resuming:
+                return
+            generation = self._stream_generation
+            sandbox = self._sandbox
         # Head is tiny and latency-sensitive. Exact frames use a separate, gzip-enabled budget:
         # an LLM request can carry the agent's entire context and must not be misclassified as
         # unavailable merely because it cannot fit inside this short polling interval.
         unary_timeout = max(0.001, request_timeout)
         try:
-            raw_head = self._sandbox.files.read(
+            raw_head = sandbox.files.read(
                 f"{self._outbox_root}/head", request_timeout=unary_timeout
             )
             head = int(raw_head.strip())
             if head < 0:
                 raise ValueError("negative sequence")
         except Exception as exc:  # noqa: BLE001 - startup/momentary unary read misses are normal
-            self._last_outbox_error = f"head read failed: {exc}"
-            now = time.monotonic()
-            # Treat only uninterrupted failures as one outage. AgentProject does not pump this
-            # channel while it is idle between proposal iterations, so a long idle gap must not make
-            # the next isolated read failure look ancient.
-            if self._last_head_failure_at is None or now - self._last_head_failure_at > max(
-                1.0, self._poll_interval_s * 4
-            ):
-                self._head_failure_since = now
-            self._last_head_failure_at = now
-            head_failure_since = self._head_failure_since or now
-            output_unavailable = self._stream_dead_at is not None or (
-                now - self._last_stdout_at >= self._stdout_silence_grace_s
-            )
-            if output_unavailable and now - head_failure_since >= self._frame_read_grace_s:
-                with self._state_lock:
+            with self._state_lock:
+                if generation != self._stream_generation or self._resuming:
+                    return
+                self._last_outbox_error = f"head read failed: {exc}"
+                now = time.monotonic()
+                # Treat only uninterrupted failures as one outage. AgentProject does not pump this
+                # channel while it is idle between proposal iterations, so a long idle gap must not
+                # make the next isolated read failure look ancient.
+                if self._last_head_failure_at is None or now - self._last_head_failure_at > max(
+                    1.0, self._poll_interval_s * 4
+                ):
+                    self._head_failure_since = now
+                self._last_head_failure_at = now
+                head_failure_since = self._head_failure_since or now
+                output_unavailable = self._stream_dead_at is not None or (
+                    now - self._last_stdout_at >= self._stdout_silence_grace_s
+                )
+                if output_unavailable and now - head_failure_since >= self._frame_read_grace_s:
                     self._mark_fatal_locked(
                         "durable outbox head unavailable after "
                         f"{self._frame_read_grace_s:g}s: {self._last_outbox_error}"
                     )
             return
-        self._head_failure_since = None
-        self._last_head_failure_at = None
         with self._state_lock:
+            if generation != self._stream_generation or self._resuming:
+                return
+            self._head_failure_since = None
+            self._last_head_failure_at = None
             self._known_head = max(self._known_head, head)
             self._drain_committed_locked(
                 request_timeout=(
@@ -962,48 +1004,78 @@ class E2BDurableChannel:
             return None
 
     def _classify_runner_liveness(self, *, request_timeout: float) -> None:
-        dead_at = self._stream_dead_at
-        if self._closed.is_set():
-            return
-        now = time.monotonic()
-        stream_failure_is_due = (
-            dead_at is not None
-            and not self._stream_death_probe_done
-            and now - dead_at >= self._stream_death_grace_s
-        )
-        if not stream_failure_is_due and now < self._next_pid_check_at:
-            return
-        if stream_failure_is_due:
-            self._stream_death_probe_done = True
-        self._next_pid_check_at = now + self._pid_probe_interval_s
+        with self._state_lock:
+            if self._closed.is_set() or self._resuming:
+                return
+            generation = self._stream_generation
+            sandbox = self._sandbox
+            dead_at = self._stream_dead_at
+            now = time.monotonic()
+            stream_failure_is_due = (
+                dead_at is not None
+                and not self._stream_death_probe_done
+                and now - dead_at >= self._stream_death_grace_s
+            )
+            if not stream_failure_is_due and now < self._next_pid_check_at:
+                return
+            if stream_failure_is_due:
+                self._stream_death_probe_done = True
+            self._next_pid_check_at = now + self._pid_probe_interval_s
         try:
-            processes = self._sandbox.commands.list(request_timeout=request_timeout)
+            processes = sandbox.commands.list(request_timeout=request_timeout)
         except Exception as exc:  # noqa: BLE001 - a failed probe is not proof of process death
             message = f"[channel] runner liveness probe failed: {exc}"
-            if not self._stderr or self._stderr[-1] != message:
-                self._stderr.append(message)
+            with self._state_lock:
+                if generation != self._stream_generation or self._resuming:
+                    return
+                if not self._stderr or self._stderr[-1] != message:
+                    self._stderr.append(message)
             return
-        if any(process.pid == self._pid for process in processes):
-            self._pid_dead_at = None
-            return
-        # `recv` polls disk before every liveness probe. Keep doing so for a bounded grace after the
-        # PID disappears, allowing a final frame and head update to become visible before EOF.
-        if self._pid_dead_at is None:
-            self._pid_dead_at = now
-            return
-        if now - self._pid_dead_at < self._frame_read_grace_s:
-            return
-        self._refresh_durable_stderr(request_timeout)
         with self._state_lock:
+            if generation != self._stream_generation or self._resuming:
+                return
+            if any(process.pid == self._pid for process in processes):
+                self._pid_dead_at = None
+                return
+            # `recv` polls disk before every liveness probe. Keep doing so for a bounded grace after
+            # the PID disappears, allowing a final frame and head update to become visible before
+            # EOF.
+            if self._pid_dead_at is None:
+                self._pid_dead_at = now
+                return
+            if now - self._pid_dead_at < self._frame_read_grace_s:
+                return
+        self._refresh_durable_stderr(
+            request_timeout,
+            generation=generation,
+            sandbox=sandbox,
+        )
+        with self._state_lock:
+            if generation != self._stream_generation or self._resuming:
+                return
             detail = f" after {self._stream_error}" if self._stream_error else ""
             self._mark_fatal_locked(f"pi live runner process exited{detail}")
 
-    def _refresh_durable_stderr(self, request_timeout: float) -> None:
+    def _refresh_durable_stderr(
+        self,
+        request_timeout: float,
+        *,
+        generation: int | None = None,
+        sandbox: SandboxHandle | None = None,
+    ) -> None:
+        if generation is None or sandbox is None:
+            with self._state_lock:
+                if self._resuming:
+                    return
+                generation = self._stream_generation
+                sandbox = self._sandbox
         try:
-            stderr = self._sandbox.files.read(self._stderr_path, request_timeout=request_timeout)
-            self._durable_stderr = "\n".join(stderr.splitlines()[-self._stderr_lines :])
+            stderr = sandbox.files.read(self._stderr_path, request_timeout=request_timeout)
         except Exception:  # noqa: BLE001 - diagnostics must never mask the transport error
-            pass
+            return
+        with self._state_lock:
+            if generation == self._stream_generation and not self._resuming:
+                self._durable_stderr = "\n".join(stderr.splitlines()[-self._stderr_lines :])
 
     @staticmethod
     def _parse_envelope(value: object) -> tuple[int, JsonObject] | None:

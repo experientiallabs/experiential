@@ -188,6 +188,8 @@ class _FakeCommands:
     ) -> None:
         self._handle = handle
         self._reconnect_handles = list(reconnect_handles or [])
+        self.connect_started = threading.Event()
+        self.connect_gate: threading.Event | None = None
         self.calls: list[str] = []  # foreground commands, in order (installs, ...)
         self.background_cmds: list[str] = []
         self.background_envs: list[dict[str, str] | None] = []
@@ -221,6 +223,9 @@ class _FakeCommands:
 
     def connect(self, pid: int, *, timeout: float | None = None) -> object:
         self.connects.append((pid, timeout))
+        self.connect_started.set()
+        if self.connect_gate is not None:
+            self.connect_gate.wait(2.0)
         if not self._reconnect_handles:
             raise RuntimeError("process connection unavailable")
         return self._reconnect_handles.pop(0)
@@ -1637,6 +1642,57 @@ def test_durable_channel_resume_preserves_both_sequence_cursors() -> None:
     ]
     assert [wire["transport_in_seq"] for wire in wires] == [1, 2]
     assert fake.durable_dispatches == [first, second]
+
+
+def test_durable_channel_resume_fences_a_concurrent_old_liveness_probe() -> None:
+    """A recv racing reconnect cannot poison the resumed channel with the old PID state."""
+    hello: JsonObject = {"type": "hello"}
+    handle = _DisconnectingHandle(_stdout_events([_envelope(1, hello)]))
+    resumed = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle, reconnect_handles=[resumed])
+    _store_outbox(fake, [hello])
+    channel = _durable_channel(fake, handle, frame_read_grace_s=0.01)
+    assert channel.recv(timeout=0.5) == hello
+    deadline = time.monotonic() + 0.5
+    while channel._stream_dead_at is None and time.monotonic() < deadline:  # noqa: SLF001
+        time.sleep(0.001)
+    assert channel._stream_dead_at is not None  # noqa: SLF001
+
+    release_connect = threading.Event()
+    fake.commands.connect_gate = release_connect
+    fake.commands.running_pids.clear()
+    resume_errors: list[Exception] = []
+    recv_errors: list[Exception] = []
+
+    def resume() -> None:
+        try:
+            channel.resume(fake)
+        except Exception as error:  # noqa: BLE001 - asserted below
+            resume_errors.append(error)
+
+    def recv() -> None:
+        try:
+            channel.recv(timeout=0.1)
+        except Exception as error:  # noqa: BLE001 - asserted below
+            recv_errors.append(error)
+
+    resume_thread = threading.Thread(target=resume)
+    resume_thread.start()
+    assert fake.commands.connect_started.wait(0.5)
+    recv_thread = threading.Thread(target=recv)
+    recv_thread.start()
+    time.sleep(0.04)
+    fake.commands.running_pids.add(_PID)
+    release_connect.set()
+    resume_thread.join(timeout=0.5)
+    recv_thread.join(timeout=0.5)
+
+    assert not resume_thread.is_alive()
+    assert not recv_thread.is_alive()
+    assert resume_errors == []
+    assert len(recv_errors) == 1
+    assert isinstance(recv_errors[0], TimeoutError)
+    assert channel._fatal_error is None  # noqa: SLF001
 
 
 def test_durable_channel_retries_a_transiently_missing_committed_frame() -> None:
