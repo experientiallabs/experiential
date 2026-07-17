@@ -79,15 +79,61 @@ def test_no_bytecode_or_caches_are_tracked() -> None:
     )
 
 
-def test_docs_holds_no_data_files() -> None:
-    """docs/ is writeups + rendered figures only; raw results/data live in .agents/docs/."""
-    allowed_suffixes = (".md", ".png")
+def test_docs_layout_is_exactly_readme_research_reference() -> None:
+    """docs/ is the manifest, writeups with their rendered figures, and how-to references.
+
+    Anything else (top-level pages, stray dirs, figures outside figures/) is clutter that rule 5
+    says gets relocated or deleted.
+    """
+    allowed = re.compile(
+        r"^docs/(README\.md"
+        r"|research/[^/]+\.md"
+        r"|research/figures/[^/]+\.png"
+        r"|reference/[^/]+\.md)$"
+    )
+    offenders = [p for p in _tracked_files() if p.startswith("docs/") and not allowed.match(p)]
+    assert not offenders, (
+        f"files outside the docs/ layout: {offenders}; writeups go in docs/research/*.md with "
+        "figures in docs/research/figures/, references in docs/reference/*.md (AGENTS.md rule 5)"
+    )
+
+
+def test_docs_never_mention_the_agents_workspace() -> None:
+    """docs/ are finished products: the agents' workspace must be invisible from them.
+
+    Not even disclaimed pointers: a reader of docs/ should never learn the workspace exists.
+    Reproduction lives in the report itself (public wmh API or CLI), never behind a workspace
+    path.
+    """
     offenders = [
-        p for p in _tracked_files() if p.startswith("docs/") and not p.endswith(allowed_suffixes)
+        p
+        for p in _tracked_files()
+        if p.startswith("docs/")
+        and p.endswith(".md")
+        and (REPO_ROOT / p).is_file()  # tolerate uncommitted deletes/renames mid-edit
+        and ".agents" in (REPO_ROOT / p).read_text(encoding="utf-8")
     ]
     assert not offenders, (
-        f"non-writeup files under docs/: {offenders}; move raw results/vector sources to "
-        ".agents/docs/research/ (AGENTS.md rule 5 keeps docs/ deliberately small)"
+        f"docs mentioning the agents workspace: {offenders}; quote reproduction as public "
+        "wmh API/CLI in the report itself and drop every workspace path (AGENTS.md rule 5)"
+    )
+
+
+def test_docs_readme_indexes_every_doc() -> None:
+    """docs/README.md's justification table must name every tracked docs/ file (rule 5).
+
+    The manifest is what makes the justification rule enforceable; a doc or figure absent from
+    it is either unjustified or the table has drifted.
+    """
+    readme = (REPO_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    missing = [
+        p
+        for p in _tracked_files()
+        if p.startswith("docs/") and p != "docs/README.md" and p.removeprefix("docs/") not in readme
+    ]
+    assert not missing, (
+        f"docs files absent from docs/README.md's justification table: {missing}; every doc "
+        "and figure gets a row or gets deleted (AGENTS.md rule 5)"
     )
 
 

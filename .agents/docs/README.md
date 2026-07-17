@@ -15,10 +15,14 @@ here 2026-07-02; files keep their Notion `area`/`status` in frontmatter.
 - **`design-decisions/`** — the why behind load-bearing mechanisms: `rag-aware-gepa.md`
   (verified accurate 2026-07-02; lives here, not in public docs — design rationale is internal
   material, per user direction).
-- **`research/`** — experiment logs, snapshots, and raw results: `gepa-optimization-research.md`,
-  `base-env-prompt-iteration.md`, `benchmark-results-reproducibility.md`, plus
-  `trace_scaling_law.svg` and `trace_scaling_results/` (the raw JSONs and vector source behind
-  the published `docs/research/trace_scaling_law.md` writeup).
+- **`research/`** — experiment logs, snapshots, and raw results, one directory per study
+  holding its result JSONs and the vector source (`.svg`) behind the published figure:
+  `trace_scaling_results/`, `rag_opt_results/`, `gepa_scaling_results/`,
+  `concurrency_anthropic/`, `fidelity_tiers/`, `agentic_results/` (incl. `confidence/`),
+  `benchmark-grid/`, `judge-overhaul/` (writeup, figure, decision record, `raw/` meta-eval
+  runs), `scenarios/` (the scenario-set SOTA notes). Loose `.md` files are standalone
+  analysis notes: `gepa-optimization-research.md`, `base-env-prompt-iteration.md`,
+  `benchmark-results-reproducibility.md`, `fidelity-tiers.md`.
 - **`proposals/`** — specced-but-not-built directions: `research-directions.md`,
   `closed-loop-eval-spec.md`, `sim-real-policy-rank-agreement.md`.
 

@@ -27,9 +27,12 @@ uv run pytest -q
 
 ## Writing
 
-- No em dashes in any writing: code, comments, docstrings, docs, UI copy, commit messages, or PR
-  descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
-  restructure the sentence.
+- No em dashes in any NEW writing: code, comments, docstrings, docs, UI copy, commit messages, or
+  PR descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
+  restructure the sentence. The rule applies to a diff's added lines and is checked in review
+  (the /ready-for-merge audit); pre-existing occurrences (including in this file) are
+  grandfathered and cleaned opportunistically when a line is edited anyway, not in bulk sweeps.
+  Verbatim data quoted inside code fences keeps its original punctuation.
 
 ## Rules
 
@@ -57,12 +60,16 @@ uv run pytest -q
    add others (no `benchmarks/`, `scripts/`, `tools/`, `world-models/`, ...).
    `wmh/repo_layout_test.py` enforces this. What each surface is for:
    - `docs/` — **finished products only, kept deliberately small**: `docs/research/`
-     (completed research writeups + the one figure each renders) and `docs/reference/` (how-to
+     (completed research writeups, their rendered figures under `docs/research/figures/`: one
+     figure per writeup by default, and every figure beyond the first needs its own
+     justification row in `docs/README.md`) and `docs/reference/` (how-to
      references verified against main). Nothing else: raw result JSONs, vector sources, design
      notes, drafts, and proposals all live in `.agents/docs/`. `docs/README.md` indexes every
-     doc with its justification — a doc that can't justify its existence gets deleted. Nothing
-     in `docs/` may depend on `.agents/` staying around — quote reproduction commands in the
-     report itself.
+     doc with its justification; a doc that can't justify its existence gets deleted. `docs/`
+     never mentions `.agents/` at all, not even as a disclaimed pointer (enforced by
+     `wmh/repo_layout_test.py`): a reader of docs/ should never learn the workspace exists.
+     Reproduction lives in the report itself, quoted as public `wmh` API/CLI plus the exact
+     parameter pins.
      Everything else that is "generated" stays out of git: eval results under the local
      `.wmh/evals/` artifact root, built models under `.wmh/models/` (intentional prebuilt
      example artifacts under `examples/<task>/models/`), eval suite definitions under
@@ -161,7 +168,7 @@ uv run pytest -q
     - Ink (text/titles): `#0a0a0a` · Grid/hairlines: `#ececec` · Background: white
     - Accents, in order of use: `#0070f3` (primary blue), `#7928ca` purple, `#f5a623` amber,
       `#ee0000` red, `#50e3c2` teal
-    The published figures under `docs/` (e.g. `docs/research/trace_scaling_law.png`) are the visual
+    The published figures under `docs/` (e.g. `docs/research/figures/trace_scaling_law.png`) are the visual
     reference. (`.agents/scripts/plot_trace_scaling.py` shows one way to produce them, but
     `.agents/` contents are disposable — the palette above is the contract, not that script.)
 
@@ -180,7 +187,12 @@ Rules of the road:
   their public, published APIs. Members must be installable and usable standalone. Consuming a
   member takes BOTH halves: declare it in `[project.dependencies]` (so installs outside the
   workspace resolve it) AND rely on `[tool.uv.sources]` for in-workspace source resolution —
-  the sources entry alone wires nothing.
+  the sources entry alone wires nothing. Carve-out: the no-wmh-import rule binds the member's
+  PUBLISHED source tree (what `[tool.hatch.build]`/`include` ships in the wheel). Local research
+  and capture scripts inside per-benchmark data dirs (e.g.
+  `packages/environment-capture/tau-bench/rl/`) may import `wmh`: they are workspace tooling
+  that happens to live next to the data it operates on, they never ship, and the member must
+  stay installable without them.
 - **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
   `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
   `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in

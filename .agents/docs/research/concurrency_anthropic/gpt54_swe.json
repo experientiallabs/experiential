@@ -10,7 +10,7 @@
     8,
     16
   ],
-  "_provenance": "Reconstructed from the published per-benchmark table in docs/research/concurrency_scaling_law.md. The original gpt-5.4-mini run used the OpenAI Responses API; that account was deactivated and its raw report JSON was lost, so these are the exact published means/stds/differentials re-materialized as machine-readable data. Fields not determined by the published table (tokens/cost/fidelity) are omitted.",
+  "_provenance": "Reconstructed from the published per-benchmark table in docs/research/world_model_findings.md (layer 6). The original gpt-5.4-mini run used the OpenAI Responses API; that account was deactivated and its raw report JSON was lost, so these are the exact published means/stds/differentials re-materialized as machine-readable data. Fields not determined by the published table (tokens/cost/fidelity) are omitted.",
   "points": [
     {
       "level": 1,

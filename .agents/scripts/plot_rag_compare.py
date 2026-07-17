@@ -11,7 +11,7 @@ near-black ink, hairline grid, left-aligned titles. Writes PNG + SVG. matplotlib
         --panel tau-bench=base_tau.json,opt_tau.json \
         --panel terminal-tasks=base_term.json,opt_term.json \
         --panel swe-bench=base_swe.json,opt_swe.json \
-        --out docs/research/rag_optimization --ymin 0.6
+        --out docs/research/figures/rag_optimization --ymin 0.6
 
 Each --panel is `label=base_path,opt_path`.
 """

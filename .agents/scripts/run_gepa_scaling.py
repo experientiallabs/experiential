@@ -91,7 +91,7 @@ def _chain(primary: str, region: str | None, ladder: bool) -> Provider:
     Failover happens on capacity errors only. `retry` wraps the whole chain in bounded
     backoff rounds so a simultaneous brownout across every Bedrock rung (the cascade that killed
     the first tau budget sweep) rides out the window instead of raising WaterfallExhausted on the
-    first pass — same policy as `.agents/scripts/eval_with_fallback.py`. Ladder entries equal to
+    first pass. Ladder entries equal to
     the primary spec are dropped (no point retrying the same account+model immediately); OpenAI
     rungs without a key are skipped. A single rung with an @profile still goes through
     WaterfallProvider — wmh's bare BedrockProvider has no profile support and would silently run

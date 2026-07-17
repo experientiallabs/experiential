@@ -1,0 +1,15 @@
+# Regenerable experiment scratch never gets committed (AGENTS.md rule 5: bulky or churning
+# data goes to the Notion experiments area with a SHA-256 manifest, not git). Patterns cover
+# every study dir under research/: TraceScalingAblation._report_sink writes *_seed<N>.json,
+# every runner writes .usage.json next to its --out, inspection dumps are per-step
+# prediction/critique blobs, and figs/ pngs are rendered from the tracked SVG sources.
+**/*_seed*.json
+**/*.usage.json
+**/*.inspection.json
+**/*.log
+**/figs/*.png
+
+# The contamination probe's sole surviving raw evidence (the zero-shot table in
+# docs/research/world_model_findings.md layer 1; methodology in
+# ../reference/rag-scaling-methodology.md).
+!rag_opt_results/contam.log

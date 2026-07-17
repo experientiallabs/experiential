@@ -3,7 +3,8 @@
 
 Sim2real leg of the distillation verification: the same scenarios the world-model eval uses, but
 tool calls execute against Sierra's real domain environments (real JSON DB). Transcripts are
-dumped as JSONL; judging happens wmh-side (judge_real_transcripts step) so this venv stays
+dumped as JSONL; judging happens wmh-side (score the transcripts with the pinned RubricJudge
+from a wmh checkout) so this venv stays
 tau2+openai only — no wmh import (see README: wmh never imports tau2 and vice versa).
 
 Usage (from examples/tau-bench, in the tau2 venv):

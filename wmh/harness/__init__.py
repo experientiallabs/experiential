@@ -6,8 +6,8 @@ it to the world model, and a real execution backend can bind the same loop to re
 loop runs with is a `HarnessDoc` — a typed document of identity-keyed surfaces (prompt sections,
 tool policy, loop params, skills) stored as immutable versions with movable aliases
 (`wmh.harness.store`) and updated through audited `HarnessDelta`s (`wmh.harness.delta`,
-docs/harness_delta.md) proposed by a meta-agent and gated on non-regression (`wmh.harness.create`,
-the `wmh harness create` search).
+docs/reference/harness_delta.md) proposed by a meta-agent and gated on non-regression
+(`wmh.harness.create`, the `wmh harness create` search).
 
 `create` and `mutate` are imported directly (not re-exported here): they depend on
 `wmh.evals.closed_loop`, which itself binds to this package's runtime — re-exporting them would

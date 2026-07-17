@@ -20,7 +20,7 @@ matplotlib is not a project dependency (this is a one-off research figure), so r
 
     uv run --with matplotlib python .agents/scripts/plot_gepa_scaling.py \
         --budget-report tau-bench=tau_budget.json --trace-report tau-bench=tau_traces.json \
-        --rag-report tau-bench=tau_rag.json ... --out docs/research/gepa_scaling_law
+        --rag-report tau-bench=tau_rag.json ... --out docs/research/figures/gepa_scaling_law
 
 Each --*-report is `label=path` (repeatable; repeats with the same label merge, so the shared
 t64_b8 point can come from either sweep). Writes both PNG and SVG.

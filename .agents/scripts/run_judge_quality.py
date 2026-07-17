@@ -1,7 +1,7 @@
 """Run the judge-quality meta-eval (wmh.optimize.judge_quality) against a real Bedrock judge.
 
 Usage:
-    uv run python .agents/scripts/run_judge_quality.py --out .agents/docs/research/raw/jq.json
+    uv run python .agents/scripts/run_judge_quality.py --out .agents/docs/research/judge-overhaul/raw/jq.json
     uv run python .agents/scripts/run_judge_quality.py --defect outcome-flip -v
 """
 

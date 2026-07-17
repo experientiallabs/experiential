@@ -37,7 +37,7 @@ uv run wmh play --root packages/environment-capture/tau-bench --name tau-telecom
 This corpus is one benchmark in the world-model-vs-real-sandbox concurrency study — does
 reconstructing observations with a world model beat standing up the real environment? Method,
 per-benchmark numbers, and the figure live in
-[`docs/research/concurrency_scaling_law.md`](../../docs/research/concurrency_scaling_law.md).
+[`docs/research/world_model_findings.md`](../../docs/research/world_model_findings.md).
 
 ## Why capture from the REAL benchmark
 

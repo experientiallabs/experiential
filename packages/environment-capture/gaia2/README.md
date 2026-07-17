@@ -103,9 +103,10 @@ enters the world model).
     durably (a hang never discards completed work) and re-runs with `--append`/`--run-start` grow it.
 - **Open-loop fidelity** (Opus 4.8 target + rubric judge, seed 0; final 37-trace corpus):
   mean fidelity **0.773**, error-flag accuracy **0.939**, n=196 held-out steps (the earlier
-  0.652 @10 traces was a noisy small-n measurement). Measured via the cross-provider failover
-  runner (`.agents/scripts/eval_with_fallback.py`: bedrock-4.8 → anthropic-direct-4.8 →
-  bedrock-4.7 — same Opus 4.8 weights on the first two links, so the judge stays comparable).
+  0.652 @10 traces was a noisy small-n measurement). Measured via a cross-provider failover
+  chain (bedrock-4.8 → anthropic-direct-4.8 → bedrock-4.7; same Opus 4.8 weights on the first
+  two links, so the judge stays comparable; today the supported route is a `.wmh/fallback.toml`
+  chain, see `docs/reference/failover.md`).
   Sits mid-family: above financebench's document excerpts (0.586), below
   appworld's structured API observations (0.793); the residual is opaque per-universe identifiers
   (contact/message ids) the model cannot infer from the request alone.
