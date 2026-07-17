@@ -1620,9 +1620,13 @@ def test_durable_channel_resume_preserves_both_sequence_cursors() -> None:
 
     fake.files.store[_frame_path(4)] = json.dumps(_envelope(4, running))
     fake.files.store[f"{_OUTBOX}/head"] = "4"
+    previous_reader = channel._reader  # noqa: SLF001
     channel.resume(fake)
 
     assert fake.commands.connects == [(_PID, 0)]
+    previous_reader.join(timeout=0.5)
+    assert not previous_reader.is_alive()
+    assert channel._stream_dead_at is None  # noqa: SLF001
     assert channel.recv(timeout=0.5) == running
     second: JsonObject = {"type": "user_message", "text": "second"}
     channel.send(second)
