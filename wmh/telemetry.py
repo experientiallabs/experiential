@@ -29,6 +29,8 @@ _CLIENTS: dict[tuple[str, str], Posthog] = {}
 
 @dataclass
 class BuildTelemetryStats:
+    """Trace/step counts a build accumulates, captured with the "build completed" event."""
+
     input_trace_count: int = 0
     input_step_count: int = 0
     train_trace_count: int = 0
@@ -38,6 +40,8 @@ class BuildTelemetryStats:
 
 
 class TelemetryBuildReporter:
+    """A `BuildReporter` that records pipeline counts into `BuildTelemetryStats`, then delegates."""
+
     def __init__(self, inner: BuildReporter, stats: BuildTelemetryStats) -> None:
         self._inner = inner
         self._stats = stats
@@ -111,6 +115,7 @@ def capture_build_completed(
     record: RunRecord,
     root: str | Path,
 ) -> None:
+    """Capture the anonymous "build completed" event (counts, budget, duration, token/cost)."""
     capture(
         "wmh build completed",
         {
@@ -145,6 +150,7 @@ def capture_eval_completed(
     top_k: int,
     root: str | Path,
 ) -> None:
+    """Capture the anonymous "eval completed" event (mode, counts, and eval configuration)."""
     capture(
         "wmh eval completed",
         {
@@ -162,6 +168,7 @@ def capture_eval_completed(
 
 
 def settings_root_from_results_root(results_root: str) -> Path:
+    """The settings root for a results root: its parent for an `evals/` dir, else the default."""
     path = Path(results_root)
     return path.parent if path.name == "evals" else Path(ARTIFACT_DIR)
 

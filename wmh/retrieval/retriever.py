@@ -31,6 +31,8 @@ _EMPTY_OBS = Observation(content="")
 
 @runtime_checkable
 class Retriever(Protocol):
+    """The retrieval interface: fetch the top-k prior steps most similar to a (state, action)."""
+
     def index(self, traces: list[Trace]) -> None:
         """Build phase: embed every step's (state, action) and store it in the buffer."""
         ...
