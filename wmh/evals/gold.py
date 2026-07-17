@@ -104,11 +104,16 @@ def _parse(text: str, gold: list[str]) -> GoldVerdict:
         if parsed is not None and parsed.assertions:
             # Score against ALL required gold assertions, matched BY TEXT to what the judge echoed
             # back (the prompt demands verbatim echoes). A truncated reply that omits an assertion,
-            # or one that duplicates a passing assertion to pad the count, cannot report success:
-            # every unmatched gold assertion counts as failed. Fail-closed by construction.
+            # one that duplicates a passing assertion to pad the count, or one that echoes the same
+            # assertion as both failed and passed (a failing verdict is never discarded) cannot
+            # report success: every unmatched gold assertion counts as failed. Fail-closed by
+            # construction.
             passed_texts = {a.assertion.strip() for a in parsed.assertions if a.passed}
+            failed_texts = {a.assertion.strip() for a in parsed.assertions if not a.passed}
             total = len(gold)
-            n_pass = sum(1 for g in gold if g.strip() in passed_texts)
+            n_pass = sum(
+                1 for g in gold if g.strip() in passed_texts and g.strip() not in failed_texts
+            )
             return GoldVerdict(
                 passed=parsed.passed and n_pass == total,
                 fraction=n_pass / total if total else 1.0,

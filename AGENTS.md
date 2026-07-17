@@ -29,9 +29,10 @@ uv run pytest -q
 
 - No em dashes in any NEW writing: code, comments, docstrings, docs, UI copy, commit messages, or
   PR descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
-  restructure the sentence. The rule is enforced on diffs: pre-existing occurrences (including in
-  this file) are grandfathered and cleaned opportunistically when a line is edited anyway, not in
-  bulk sweeps.
+  restructure the sentence. The rule applies to a diff's added lines and is checked in review
+  (the /ready-for-merge audit); pre-existing occurrences (including in this file) are
+  grandfathered and cleaned opportunistically when a line is edited anyway, not in bulk sweeps.
+  Verbatim data quoted inside code fences keeps its original punctuation.
 
 ## Rules
 

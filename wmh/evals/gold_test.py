@@ -8,6 +8,8 @@ reply must all be unable to report success.
 
 from __future__ import annotations
 
+import json
+
 from wmh.evals.gold import GOLD_JUDGE_SYSTEM, GoldJudge, _parse
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
@@ -43,11 +45,14 @@ class ScriptedJudgeProvider:
 
 
 def _reply(assertions: list[tuple[str, bool]], *, passed: bool) -> str:
-    items = ",".join(
-        f'{{"assertion": "{text}", "passed": {str(ok).lower()}, "why": "w"}}'
-        for text, ok in assertions
+    return json.dumps(
+        {
+            "assertions": [
+                {"assertion": text, "passed": ok, "why": "w"} for text, ok in assertions
+            ],
+            "passed": passed,
+        }
     )
-    return f'{{"assertions": [{items}], "passed": {str(passed).lower()}}}'
 
 
 def test_full_pass_scores_every_assertion() -> None:
@@ -67,6 +72,16 @@ def test_truncated_reply_omitting_an_assertion_cannot_pass() -> None:
 def test_duplicated_assertion_cannot_pad_the_count() -> None:
     # Same passing assertion twice; the other gold assertion never appears.
     verdict = _parse(_reply([(_GOLD[0], True), (_GOLD[0], True)], passed=True), _GOLD)
+    assert not verdict.passed
+    assert verdict.fraction == 0.5
+
+
+def test_contradictory_duplicate_echo_cannot_pass() -> None:
+    # The judge echoes the same assertion as failed AND passed (self-correction or a
+    # hallucinated duplicate row); its own failing verdict must not be discarded.
+    verdict = _parse(
+        _reply([(_GOLD[0], False), (_GOLD[0], True), (_GOLD[1], True)], passed=True), _GOLD
+    )
     assert not verdict.passed
     assert verdict.fraction == 0.5
 

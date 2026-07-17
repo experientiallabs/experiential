@@ -9,5 +9,7 @@
 **/*.log
 **/figs/*.png
 
-# The contamination probe's sole surviving evidence, cited by docs/research/trace_scaling_law.md.
+# The contamination probe's sole surviving raw evidence (the zero-shot table in
+# docs/research/world_model_findings.md layer 1; methodology in
+# ../reference/rag-scaling-methodology.md).
 !rag_opt_results/contam.log

@@ -91,8 +91,8 @@ venv, driven by a thin client in the adapter; add `backend/*.py` to the root ty 
 6. **Fidelity row**: `evals/default.toml` (copy a sibling's), run
    `uv run wmh eval run <name>/default --examples-root packages/environment-capture`, put mean fidelity +
    error-flag accuracy + n into your README Results with the corpus size at eval time. If
-   Bedrock flaps kill the eval, use `.agents/scripts/eval_with_fallback.py` (same-weights
-   cross-provider chain keeps the judge comparable).
+   Bedrock flaps kill the eval, configure a same-weights cross-provider chain in
+   `.wmh/fallback.toml` (`docs/reference/failover.md`) so the judge stays comparable.
 7. **README**: what the env is, contents, Results, provenance (upstream, models, dates, how the
    corpus was made), License section. Then whole gate → commit(s) → push your branch → DRAFT PR
    into the integration branch with corpus stats, license finding, mean reward, fidelity, and

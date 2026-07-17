@@ -1,8 +1,8 @@
 # Ingesting traces from anywhere
 
 The harness builds a world model from **recorded agent traces**. Ingestion is part of `wmh build`,
-not a separate step: you pick a **source** and `build` turns traces from whatever you already have —
-an observability provider, an OTLP export, or a plain chat/tool-call log — into the normalized
+not a separate step: you pick a **source** and `build` turns traces from whatever you already have -
+an observability provider, an OTLP export, or a plain chat/tool-call log - into the normalized
 `wmh.core.types.Trace` shape and runs the pipeline.
 
 Everything plugs into **one interface** (`TraceAdapter`) and **one normalizer**
@@ -22,15 +22,15 @@ wmh build                                                   # or pick the source
 sources that support it. On an interactive terminal, `wmh build` with no source launches a wizard
 that lists the sources and prompts for file-or-pull.
 
-Under the hood the chosen adapter normalizes to OTel-GenAI span JSONL — the same format the bundled
-`examples/*.otel.jsonl` use — so a source is interchangeable with any other corpus the harness reads.
+Under the hood the chosen adapter normalizes to OTel-GenAI span JSONL - the same format the bundled
+`examples/*.otel.jsonl` use - so a source is interchangeable with any other corpus the harness reads.
 
 ## Sources
 
 | `--source` | What it reads | File | Live pull |
 |---|---|---|---|
 | `otel-genai` | OTLP-JSON spans (OTel GenAI semconv) | ✅ | ✅ (generic OTLP query backend) |
-| `chat-json` | recorded OpenAI/LangChain-style chat + tool-call conversations | ✅ | — |
+| `chat-json` | recorded OpenAI/LangChain-style chat + tool-call conversations | ✅ | - |
 | `phoenix` | Arize Phoenix / OpenInference spans | ✅ | provider-dependent |
 | `langfuse` | Langfuse trace + observation tree | ✅ | provider-dependent |
 | `langsmith` | LangSmith run tree | ✅ | provider-dependent |
@@ -48,34 +48,34 @@ live in [`examples/ingest/`](../../examples/ingest/).
 
 A dedicated adapter only exists where a provider emits its OWN non-OTLP shape (Langfuse's
 observation tree, LangSmith's run tree, Braintrust/PostHog rows, Phoenix's OpenInference dataframe,
-Mastra's AI-tracing spans). Platforms that already export **OTel GenAI spans** need no adapter — point
+Mastra's AI-tracing spans). Platforms that already export **OTel GenAI spans** need no adapter - point
 them at a file or an OTLP query backend and use `--source otel-genai`:
 
 - **Traceloop / OpenLLMetry**, **Opik** (Comet), **Logfire** (Pydantic), **Laminar**, **Datadog LLM
-  Observability**, **MLflow Tracing**, **Honeycomb**, **New Relic**, **Grafana/Tempo**, **SigNoz** —
+  Observability**, **MLflow Tracing**, **Honeycomb**, **New Relic**, **Grafana/Tempo**, **SigNoz** -
   all speak OTLP GenAI natively.
 - **Helicone** (LLM gateway/proxy) can forward its logged traffic as OTLP; use `otel-genai` against
   that export. If you only have Helicone's native request/response logs (not OTLP), that's a small
-  dedicated adapter — open an issue.
+  dedicated adapter - open an issue.
 - **Langfuse** and **Mastra** ALSO expose OTLP endpoints; for framework traces where tool calls are
   separate child spans, `otel-genai` against their OTLP export is often cleaner than the native
   adapter (which reads the provider's own tree/span shape).
 
-If a provider isn't listed and doesn't emit OTLP, it's a ~30-line adapter (see below) — open an issue
+If a provider isn't listed and doesn't emit OTLP, it's a ~30-line adapter (see below) - open an issue
 or add one.
 
 ### Databases and other stores
 
-There is no bespoke database adapter — instead, **point your store at OpenTelemetry** and ingest with
+There is no bespoke database adapter - instead, **point your store at OpenTelemetry** and ingest with
 `--source otel-genai`. If your agent runs are in a SQL table, a warehouse, or a custom log, the clean
 hook-up is to emit OTel GenAI spans (most agent frameworks and the OTel GenAI instrumentations do
 this out of the box) and either export them to a file (`--file spans.otlp.json`) or serve them from
-an OTLP-compatible query backend and `--pull`. One OTel format, any store behind it — no per-database
+an OTLP-compatible query backend and `--pull`. One OTel format, any store behind it - no per-database
 code to maintain.
 
 **File vs. pull.** Every adapter supports `--file` (an export you already have); `--pull` (live from
 the vendor API) is opt-in per adapter and errors with a clear "export to a file" message when a
-source hasn't implemented it. File ingestion needs **no** vendor SDK — the provider adapters parse
+source hasn't implemented it. File ingestion needs **no** vendor SDK - the provider adapters parse
 the export as JSON. The optional `pip install 'world-model-harness[phoenix]'` (etc.) extras install a
 provider's own SDK only if you want to drive its export tooling yourself; nothing in `wmh` imports
 them.
@@ -83,7 +83,7 @@ them.
 ## The chat / tool-call converter (`chat-json`)
 
 If you don't use an observability vendor, the most universal trace is a list of chat messages with
-tool calls — the OpenAI Chat Completions shape (which LangChain, the Anthropic SDK, and most agent
+tool calls - the OpenAI Chat Completions shape (which LangChain, the Anthropic SDK, and most agent
 frameworks can emit). Drop it in a file and ingest it:
 
 ```json
@@ -109,11 +109,11 @@ array of them, JSONL (one per line), or a bare message list. See `wmh/ingest/mes
 A `Trace` is `{trace_id, steps, source, metadata}`. Each `Step` is one
 `(state_before, action) → observation`:
 
-- `action` — a tool call (`name` + `arguments`) or a free-text message.
-- `observation` — what the environment returned (`content`, `is_error`).
-- `state_before` — optional env-state snapshot (most provider traces leave it empty; open-loop
+- `action` - a tool call (`name` + `arguments`) or a free-text message.
+- `observation` - what the environment returned (`content`, `is_error`).
+- `state_before` - optional env-state snapshot (most provider traces leave it empty; open-loop
   replay reconstructs state from action + history).
-- `task` — the originating instruction.
+- `task` - the originating instruction.
 
 `metadata` carries provenance and anything a source wants to thread through. Open-loop replay scores
 a predicted observation for `(state_before, action)` against the recorded one, so faithful `action`
@@ -127,15 +127,15 @@ and `observation` are what matter most.
                                   └─ from_vendor(pull) ─┘        (wmh.ingest.normalize: the ONE normalizer)
 ```
 
-- `wmh/ingest/adapter.py` — the `TraceAdapter` protocol + the registry (`register_adapter`,
+- `wmh/ingest/adapter.py` - the `TraceAdapter` protocol + the registry (`register_adapter`,
   `get_adapter`, `list_adapters`).
-- `wmh/ingest/base.py` — `BaseTraceAdapter`: file/JSONL loading + vendor plumbing, so a concrete
+- `wmh/ingest/base.py` - `BaseTraceAdapter`: file/JSONL loading + vendor plumbing, so a concrete
   adapter only implements `spans_from_payload` (and optionally `_pull_payloads`).
-- `wmh/ingest/normalize.py` — the shared span→Trace core. Understands **both** the OTel GenAI
+- `wmh/ingest/normalize.py` - the shared span→Trace core. Understands **both** the OTel GenAI
   (`gen_ai.*`) and **OpenInference** (`openinference.span.kind`, `tool.name`, `input.value` /
   `output.value`, `llm.*`) vocabularies, pairs each action span with its following tool span, and
   honors optional `wmh.*` enrichments.
-- `wmh/ingest/otel_writer.py` — the inverse: `Trace` → OTel-GenAI span JSONL (used to persist a
+- `wmh/ingest/otel_writer.py` - the inverse: `Trace` → OTel-GenAI span JSONL (used to persist a
   corpus; round-trips losslessly through `otel-genai`).
 
 ## Add a new source in ~30 lines
@@ -155,7 +155,7 @@ class MyProviderAdapter(BaseTraceAdapter):
     name = "myprovider"
 
     def spans_from_payload(self, payload):  # one decoded JSON payload -> SpanRecords
-        # If the export is OTLP/OpenInference JSON, the BaseTraceAdapter default already works —
+        # If the export is OTLP/OpenInference JSON, the BaseTraceAdapter default already works -
         # you don't even need this method. Override it only when the export is a custom shape:
         spans: list[SpanRecord] = []
         for row in payload.get("events", []):
@@ -189,7 +189,7 @@ adapters for reference.
 ## Conventions
 
 Adapters live in `wmh/ingest/`, are typed (no `Any`/bare `dict`; use `wmh.core.types`
-`JsonValue`/`JsonObject`), and are tested inline with fixtures — never the network. Vendor SDKs are
+`JsonValue`/`JsonObject`), and are tested inline with fixtures - never the network. Vendor SDKs are
 optional extras, imported lazily; file ingestion works with none installed.
 
 ## Ingesting Arize Phoenix traces
@@ -214,7 +214,7 @@ The Phoenix UI's per-trace **Export** also produces a JSON array of span objects
 
 ### Shapes the adapter accepts
 
-1. **Phoenix native span dicts** — flat objects where ids live under `context` and timestamps are
+1. **Phoenix native span dicts** - flat objects where ids live under `context` and timestamps are
    ISO strings:
 
    ```json
@@ -230,7 +230,7 @@ The Phoenix UI's per-trace **Export** also produces a JSON array of span objects
 
    A single object, a JSON array, or one object per line (JSONL) are all accepted.
 
-2. **OTLP envelope** — standard `{"resourceSpans": [...]}` OTLP-JSON (or bare OTLP spans with
+2. **OTLP envelope** - standard `{"resourceSpans": [...]}` OTLP-JSON (or bare OTLP spans with
    `traceId`). These delegate to the shared OTLP collector.
 
 The adapter maps Phoenix's field names (`context.trace_id`, `context.span_id`, `parent_id`,
@@ -258,8 +258,8 @@ See `examples/ingest/phoenix_to_wmh.sh` for a runnable script.
 ## Ingesting Langfuse traces
 
 The `langfuse` adapter turns a [Langfuse](https://langfuse.com) trace export into the normalized
-`Trace` shape the harness builds world models from. Langfuse does **not** emit OTLP spans — it models
-a *trace* with a flat list of nested *observations* — so this adapter overrides `spans_from_payload`
+`Trace` shape the harness builds world models from. Langfuse does **not** emit OTLP spans - it models
+a *trace* with a flat list of nested *observations* - so this adapter overrides `spans_from_payload`
 and re-emits the observations in OTel-GenAI vocabulary for the shared normalizer
 (`wmh/ingest/normalize.py`).
 
@@ -292,8 +292,8 @@ Each observation has a `type` of `SPAN | GENERATION | EVENT | TOOL`. The adapter
 - A **GENERATION** with no tool call becomes a plain `chat` message action with no observation.
 - **EVENT** (and non-actionable) observations are ignored.
 - `level == "ERROR"` marks the observation's step as an error (`ObservationLevel` is
-  DEBUG | DEFAULT | WARNING | ERROR). `statusMessage` is NOT an error signal — Langfuse sets it on
-  any level — so its presence alone does not flag an error.
+  DEBUG | DEFAULT | WARNING | ERROR). `statusMessage` is NOT an error signal - Langfuse sets it on
+  any level - so its presence alone does not flag an error.
 
 Observations are ordered by `startTime` (ISO-8601 -> a monotonic ordinal; list index when absent).
 The trace `input` becomes the step `task` (`gen_ai.prompt`), and trace `metadata` round-trips via
@@ -306,8 +306,8 @@ The trace `input` becomes the step `task` (`gen_ai.prompt`), and trace `metadata
 curl -s -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
   "$LANGFUSE_HOST/api/public/traces/$TRACE_ID" > langfuse_export.json
 
-# A page of recent traces ({"data": [...]} — the adapter accepts this directly). NOTE: the LIST
-# endpoint returns each trace's `observations` as ID *strings* only, so a list page yields no steps —
+# A page of recent traces ({"data": [...]} - the adapter accepts this directly). NOTE: the LIST
+# endpoint returns each trace's `observations` as ID *strings* only, so a list page yields no steps -
 # fetch each trace by id (loop the ids from this page) to get full observation objects:
 curl -s -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
   "$LANGFUSE_HOST/api/public/traces?limit=50" > langfuse_traces_page.json
@@ -340,12 +340,12 @@ See `examples/ingest/langfuse_to_wmh.sh` for the end-to-end script.
 
 The `langsmith` adapter turns a [LangSmith](https://smith.langchain.com) (LangChain) run export into
 the normalized `Trace` shape the harness builds world models from. LangSmith does **not** emit OTLP
-spans — it models a trace as a tree of *runs* — so this adapter overrides `spans_from_payload` and
+spans - it models a trace as a tree of *runs* - so this adapter overrides `spans_from_payload` and
 re-emits the runs in OTel-GenAI vocabulary for the shared normalizer (`wmh/ingest/normalize.py`).
 
 ### The shape
 
-`Client.list_runs` (or `POST /api/v1/runs/query` — the list endpoint is a POST with a JSON filter
+`Client.list_runs` (or `POST /api/v1/runs/query` - the list endpoint is a POST with a JSON filter
 body, not a GET) returns runs that look roughly like:
 
 ```json
@@ -387,7 +387,7 @@ input (dug from a run's `inputs`) becomes the step `task` (`gen_ai.prompt`).
 ### Export from LangSmith
 
 ```bash
-# REST API — runs in a project (filter to one trace by id):
+# REST API - runs in a project (filter to one trace by id):
 curl -s -X POST "${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}/api/v1/runs/query" \
   -H "x-api-key: $LANGCHAIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"session": ["<project-uuid>"], "limit": 100}' \
@@ -428,8 +428,8 @@ See `examples/ingest/langsmith_to_wmh.sh` for the end-to-end script.
 
 The `braintrust` adapter turns a [Braintrust](https://www.braintrust.dev) span-row export into the
 normalized `Trace` shape the harness builds world models from. Braintrust does **not** emit OTLP
-spans — it logs **spans as rows** in an experiment or project log, where a *trace* is the set of rows
-that share a `root_span_id` — so this adapter overrides `spans_from_payload` and re-emits each row in
+spans - it logs **spans as rows** in an experiment or project log, where a *trace* is the set of rows
+that share a `root_span_id` - so this adapter overrides `spans_from_payload` and re-emits each row in
 OTel-GenAI vocabulary for the shared normalizer (`wmh/ingest/normalize.py`).
 
 ### The shape
@@ -474,7 +474,7 @@ in `input` becomes the step `task` (`gen_ai.prompt`), and the row `metadata` rou
 ### Export from Braintrust
 
 ```bash
-# Project logs ({"events": [...]} — the adapter accepts this directly):
+# Project logs ({"events": [...]} - the adapter accepts this directly):
 curl -s -H "Authorization: Bearer $BRAINTRUST_API_KEY" \
   "https://api.braintrust.dev/v1/project_logs/$PROJECT_ID/fetch" > braintrust_export.json
 
@@ -517,15 +517,15 @@ vocabulary for the shared normalizer (`wmh/ingest/normalize.py`).
 
 Per agent run, PostHog emits events sharing `properties.$ai_trace_id`:
 
-- **`$ai_generation`** — one LLM call. Prompt in `properties.$ai_input` (a messages list), completion
+- **`$ai_generation`** - one LLM call. Prompt in `properties.$ai_input` (a messages list), completion
   in `properties.$ai_output_choices`. In PostHog's NORMALIZED shape a tool call is a `content` part
   (`{"type": "function", "function": {"name", "arguments"}}`, with `arguments` a JSON object) and
   assistant text is a `[{"type": "text", "text"}]` parts list; the adapter also accepts a raw-OpenAI
   top-level `tool_calls` array (string `arguments`) for setups that forward the provider payload
   unnormalized.
-- **`$ai_span`** — a non-LLM step (often a tool execution): `properties.$ai_span_name` (tool name),
+- **`$ai_span`** - a non-LLM step (often a tool execution): `properties.$ai_span_name` (tool name),
   `properties.$ai_input_state` (args), `properties.$ai_output_state` (result).
-- **`$ai_trace`** — a trace-root summary; no standalone step.
+- **`$ai_trace`** - a trace-root summary; no standalone step.
 - **`$ai_is_error`** (bool) on any event marks that step errored.
 
 The adapter maps each `$ai_generation` tool call to an Action, pairs it with the sibling `$ai_span`
@@ -561,20 +561,20 @@ The `mastra` adapter turns a [Mastra](https://mastra.ai) AI-tracing export into 
 agent runs as **AI-tracing spans** (`ExportedSpan`) typed by `type`, which this adapter maps into the
 OTel-GenAI vocabulary for the shared normalizer (`wmh/ingest/normalize.py`). The span id field is
 `id`, and spans order by `startTime`. (Mastra renamed its LLM spans to "model" spans in the 2025-11
-release; the adapter still accepts the pre-rename aliases — `spanType`, `llm_generation`, `spanId`,
-`startedAt` — so older exports keep working.)
+release; the adapter still accepts the pre-rename aliases - `spanType`, `llm_generation`, `spanId`,
+`startedAt` - so older exports keep working.)
 
 ### The shape
 
 Spans sharing a `traceId`, each with a `type`:
 
-- **`model_generation`** (pre-rename: `llm_generation`) — an LLM call. `input` is the messages,
+- **`model_generation`** (pre-rename: `llm_generation`) - an LLM call. `input` is the messages,
   `output` the completion. A completion that issues a tool call carries it as the AI-SDK `toolCalls`
   (`{toolCallId, toolName, input}` on AI SDK v5; `args` on v4) or the OpenAI `tool_calls`
   (`{id, function:{name, arguments}}`) shape.
-- **`tool_call`** / **`mcp_tool_call`** — a tool execution: `name` (tool), `input` (args),
+- **`tool_call`** / **`mcp_tool_call`** - a tool execution: `name` (tool), `input` (args),
   `output` (result).
-- **`agent_run`** / **`workflow_*`** / **`model_chunk`** / **`model_step`** / **`generic`** —
+- **`agent_run`** / **`workflow_*`** / **`model_chunk`** / **`model_step`** / **`generic`** -
   container/streaming spans; no standalone step. An `agent_run`/`model_generation` `input` supplies
   the trace task.
 - An `errorInfo`/`error` (or error status) marks the step errored.

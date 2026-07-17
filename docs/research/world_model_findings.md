@@ -14,8 +14,9 @@ holding the rest fixed, each layer's result motivating the next:
 | 6 | economics | concurrency scaling law (#41) | a world model saves wall-clock iff real standup cost exceeds reconstruction cost |
 
 Cross-cutting instruments: the judge overhaul (#83) and the cross-model benchmark grid (#98,
-how-to in [`../reference/eval_grid.md`](../reference/eval_grid.md)). The six studies merged to
-`main` as one train (#41, #72, #97, #55, #120, #98).
+how-to in [`../reference/eval_grid.md`](../reference/eval_grid.md)). The work merged to `main`
+as one six-PR train (#41, #72, #97, #55, #120, #98); the six layers map to five study PRs, with
+#72 carrying layers 1 and 2 and #98 serving as instrumentation.
 
 ## Shared protocol (every layer, stated once)
 
