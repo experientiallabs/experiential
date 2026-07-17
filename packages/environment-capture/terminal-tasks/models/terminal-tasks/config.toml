@@ -1,10 +1,20 @@
-providers = [
-    { kind = "bedrock", model = "us.anthropic.claude-opus-4-8", region = "us-east-1" },
-]
 serve_provider = "bedrock"
 embed_provider = "hashing"
 embed_dim = 512
 top_k = 5
 train_split = 0.8
-gepa_budget = 50
+gepa_budget = 4
+judge_model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 trace_adapter = "otel-genai"
+knowledge = false
+reasoning = false
+grounder = "none"
+verify = false
+confidence = false
+confidence_why = false
+
+[[providers]]
+kind = "bedrock"
+model_type = "claude-opus-4-7"
+model = "us.anthropic.claude-opus-4-7"
+chat_max_tokens_field = "max_completion_tokens"

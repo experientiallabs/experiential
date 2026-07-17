@@ -1,0 +1,26 @@
+{
+  "winner_label": "rag-deep",
+  "scores": {
+    "base": 0.5035714285714287,
+    "reason": 0.46642857142857147,
+    "rag-deep": 0.5182142857142857,
+    "reason+kb": 0.48392857142857143
+  },
+  "val_traces": 8,
+  "considered": [
+    "base",
+    "reason",
+    "rag-deep",
+    "reason+kb"
+  ],
+  "winner_spec": {
+    "label": "rag-deep",
+    "reasoning": false,
+    "knowledge": false,
+    "verify": false,
+    "grounder": "none",
+    "workspace": false,
+    "top_k": 20,
+    "demo_obs_cap": 2000
+  }
+}

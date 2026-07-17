@@ -1,0 +1,30 @@
+# Entities
+
+Three parallel product "groups" (g1, g2, g3), each with items + feedback (+ optional taxonomy/attrs). Each `items_gN` has exactly 20,000 rows. Groups appear to correspond to product domains:
+
+- **Group 1 (g1)** — dominated by `Office Products` (13,933 items by `main_cat`; 17,825 by `taxn_g1` lvl-0). Other main_cats: Amazon Home (1,355), All Electronics (1,308), NULL (741), Tools & Home Improvement (532), Industrial & Scientific (529), Computers (340), Books (248), AMAZON FASHION (224), Toys & Games (201), Arts/Crafts/Sewing (174), Health & Personal Care (128), Sports & Outdoors (69), Cell Phones & Accessories (57), All Beauty (25), Camera & Photo (21), Home Audio & Theater (12), Portable Audio & Accessories (4), Car Electronics (1). Has `taxn_g1`, `attrs_g1`, `fdbk_stats_g1`.
+  - g1 feedback rows: 377,472. Ratings distribution: 1★=40,062, 2★=17,776, 3★=24,363, 4★=42,697, 5★=252,574. vrf: 1=351,745, 0=25,727.
+  - g1 taxonomy lvl-0 distinct values include 'Office Products' (17,825) and 'Office Electronics' (29). Lvl-0 is essentially always 'Office Products'-ish; deeper levels branch.
+  - 9,999 distinct ref_ids appear in `fdbk_stats_g1` (of 20,000 items); per-item review_ct 1..6130; per-item avg_rtg 1.0..5.0.
+- **Group 2 (g2)** — Electronics/Computers domain. 32 distinct main_cats. Main_cats: Computers (5,247), All Electronics (4,562), Camera & Photo (2,789), Cell Phones & Accessories (1,775), NULL (1,304), Home Audio & Theater (1,248), Industrial & Scientific (643), Car Electronics (346), Tools & Home Improvement (302), Office Products (284), Amazon Home (247), AMAZON FASHION (232), Sports & Outdoors (203), Automotive (195), GPS & Navigation (132), Portable Audio & Accessories (109), Amazon Devices (106), Musical Instruments (85), Toys & Games (53), Health & Personal Care (39). Has `taxn_g2` but no `attrs_g2`. `taxn_g2` lvl-0 is 'Electronics' uniformly (18,396 refs). Common lvl-1 nodes: 'Computers & Accessories' (8,089), 'Headphones, Earbuds & Accessories' (1,219), 'Accessories & Supplies' (473), 'Power Accessories' (310), 'GPS, Finders & Accessories' (269).
+  - fdbk_g2 rows: 77,022. vrf: 'true'=71,517, 'false'=5,505.
+  - 8,655 distinct ref_ids appear in `fdbk_g2` (of 20,000); per-item review count 1..5,891; per-item avg_rtg 1.0..5.0.
+- **Group 3 (g3)** — dominated by `Musical Instruments` (17,162 items). Also All Electronics (534), Industrial & Scientific (372), NULL (321), Tools & Home Improvement (293), Amazon Home (253), Home Audio & Theater (196), AMAZON FASHION (177), Sports & Outdoors (122), Toys & Games (92), Cell Phones & Accessories (72), Computers (69), Camera & Photo (52), Car Electronics (8), Portable Audio & Accessories (7). Has `attrs_g3` but no `taxn_g3` table (queries return empty).
+  - fdbk_g3 rows: 286,626. vrf: 1=264,096, 0=22,530.
+  - 19,998 distinct ref_ids appear in `fdbk_g3` (nearly all 20,000 items); per-item review count 1..4,461; per-item avg_rtg 1.0..5.0.
+  - `attrs_g3` total rows: 202,543. Brand-like keys: 'Brand' (11,643), 'Manufacturer' (2,481), 'Brand Name' (144), 'Manufacturer Part Number' (82). Sample brands: Pyle, Rockville, Avedis Zildjian Company, Yamaha, Fender, Ibanez, Taylor, Pearl, Vic Firth, Ernie Ball, Seymour Duncan, Paiste, Sabian, JIM DUNLOP, Shure, Casio, Gibraltar, Schecter, Latin Percussion, Remo, M-Audio, Samson, Hofner, Aquila, DR Strings.
+
+Relations:
+- `items_gN.ref_id` (TEXT, PK) — Amazon-style ASIN / ISBN (e.g. `B001DZWCDO`, `1604189495`, `0740325884`).
+- `fdbk_gN.ref_id` → `items_gN.ref_id` (FK, declared in schema).
+- `taxn_gN.ref_id`, `attrs_gN.ref_id`, `fdbk_stats_g1.ref_id` → `items_gN.ref_id` (FK).
+- `fdbk_gN.item_id` also present (g1, g2) alongside `ref_id`; item_id and ref_id are not always equal. In `fdbk_g1` for rtg≤2.0: 10,059 distinct item_id vs 8,227 distinct ref_id across 57,838 rows. `fdbk_g3` has NO `item_id` column.
+- `fdbk_gN.uid` is the reviewer id (TEXT, Amazon-style, e.g. 'AFKZENTNBQ7A7V7UXW5JJI6UGRYQ'); can be NULL.
+
+Taxonomy sample (`taxn_g1.cat_nm`): Office Products, Office & School Supplies, Office Electronics, Paper, Printers & Accessories, Writing & Correction Supplies, Desk Accessories & Workspace Organizers, Labels/Indexes/Stamps, Printer Parts & Accessories, Printer Ink & Toner, Calendars/Planners, Pens & Refills, Cards & Card Stock, Office Furniture & Lighting, Inkjet Ink Cartridges.
+
+Taxonomy sample (`taxn_g2.cat_nm` top by count): Electronics (18,396), Computers & Accessories (8,089), Camera & Photo (3,164), Accessories (2,467), Computer Accessories & Peripherals (2,088), Bags/Cases & Sleeves (1,840), Tablet Accessories (1,647), Laptop Accessories (1,629), Cases (1,599), Television & Video (1,397), Headphones/Earbuds & Accessories (1,219), Computer Components (1,176), Car & Vehicle Electronics (944), Internal Components (838), Home Audio (785).
+
+Attribute keys (top values):
+- `attrs_g1` top: Date First Available (18,198), Brand (17,121), Manufacturer (16,717), Item Weight (16,635), Manufacturer Part Number (12,894), Color (10,916), Product Dimensions (10,568), Best Sellers Rank (10,306), Item model number (10,304), Is Discontinued By Manufacturer (8,121), Material Type (7,891), Material (7,331), Package Dimensions (6,365), Number of Items (6,070), Size (5,793), Special Feature, Shape, Item Dimensions LxWxH, Ink Color, Closure.
+- `attrs_g3` top: Date First Available (18,934), Item Weight (16,476), Item model number (13,396), Brand (11,643), Product Dimensions (10,381), Best Sellers Rank (9,777), Is Discontinued By Manufacturer (9,486), Color Name (8,308), Color (7,054), Package Dimensions (5,728), Material Type (5,240), Size (3,737), Material (3,711), Item Dimensions LxWxH (3,553), Number of Strings (3,055), Body Material (2,836), Power Source (2,661), Compatible Devices (2,587), Manufacturer (2,481), Style (2,442), Back Material, Top Material, Connector Type, Country of Origin, Neck Material Type, Fretboard Material, Instrument, Hand Orientation, Model Name, Guitar Bridge System, String Material, Finish Type, Guitar Pickup Configuration, Scale Length, Polar Pattern, Batteries, Instrument Key, Voltage.

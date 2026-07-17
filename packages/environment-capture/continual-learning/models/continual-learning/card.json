@@ -1,25 +1,21 @@
 {
   "schema_version": 1,
   "name": "continual-learning",
-  "title": "Continual-learning DB QA",
-  "description": "Database-exploration QA over a large, deliberately obfuscated SQLite product database: the agent maps cryptic tables to answer catalog questions.",
-  "task": "continual-learning",
+  "title": "continual-learning",
+  "description": "",
+  "task": null,
   "corpus": {
-    "traces": 40,
-    "steps": 202,
-    "source": "continual-learning.capped.jsonl"
+    "traces": 286,
+    "steps": 2071,
+    "source": "traces.otel.jsonl"
   },
   "provider": "bedrock",
-  "model_id": "us.anthropic.claude-opus-4-8",
+  "model_id": "us.anthropic.claude-opus-4-7",
   "fidelity": null,
   "cost_per_step_usd": null,
   "latency_per_step_s": null,
-  "built_at": "2026-07-08T07:51:58.723320+00:00",
-  "license": "CC BY 4.0",
-  "tags": [
-    "sql",
-    "database",
-    "qa"
-  ],
+  "built_at": "2026-07-16T20:07:49.258430+00:00",
+  "license": null,
+  "tags": [],
   "traces_hf": null
 }

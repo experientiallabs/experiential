@@ -1,5 +1,6 @@
 {
-  "held_out_accuracy": 0.37214285714285705,
-  "rollouts_used": 90,
+  "held_out_accuracy": 0.7440952380952381,
+  "rollouts_used": 168,
+  "reverted_to_base": true,
   "judge_agreement": null
 }

@@ -1,25 +1,21 @@
 {
   "schema_version": 1,
   "name": "gaia2",
-  "title": "GAIA2 multi-app world",
-  "description": "A stateful multi-app simulated world (Contacts, Email, Calendar, Shopping, ...): the agent drives app tools with Python against live scenario state.",
-  "task": "gaia2",
+  "title": "gaia2",
+  "description": "",
+  "task": null,
   "corpus": {
     "traces": 37,
     "steps": 563,
-    "source": "gaia2.capped.jsonl"
+    "source": "traces.otel.jsonl"
   },
   "provider": "bedrock",
-  "model_id": "us.anthropic.claude-opus-4-8",
+  "model_id": "us.anthropic.claude-opus-4-7",
   "fidelity": null,
   "cost_per_step_usd": null,
   "latency_per_step_s": null,
-  "built_at": "2026-07-08T07:52:18.099549+00:00",
-  "license": "CC BY 4.0",
-  "tags": [
-    "tool-use",
-    "multi-app",
-    "python"
-  ],
+  "built_at": "2026-07-16T22:05:13.604839+00:00",
+  "license": null,
+  "tags": [],
   "traces_hf": null
 }

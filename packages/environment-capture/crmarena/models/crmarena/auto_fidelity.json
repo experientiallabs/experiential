@@ -1,0 +1,28 @@
+{
+  "winner_label": "reason+kb",
+  "scores": {
+    "base": 0.5728,
+    "reason": 0.5424,
+    "rag-deep": 0.527,
+    "reason+kb": 0.6474,
+    "reason+verify": 0.607
+  },
+  "val_traces": 5,
+  "considered": [
+    "base",
+    "reason",
+    "rag-deep",
+    "reason+kb",
+    "reason+verify"
+  ],
+  "winner_spec": {
+    "label": "reason+kb",
+    "reasoning": true,
+    "knowledge": true,
+    "verify": false,
+    "grounder": "none",
+    "workspace": false,
+    "top_k": null,
+    "demo_obs_cap": null
+  }
+}

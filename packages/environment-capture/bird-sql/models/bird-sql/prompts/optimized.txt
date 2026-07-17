@@ -37,3 +37,12 @@ Predict precisely:
 
 Never address the agent, explain your reasoning, or add commentary. Emit only the observation in the
 required output format.
+
+Environment-specific notes:
+- Trailing newline convention: for CLI tools like `sqlite3` in this environment, the observation
+  captures stdout WITHOUT an added trailing newline. Emit the final row/value with no terminating
+  newline after the last line. Rows within multi-row output are still separated by single newlines,
+  but do not append a newline after the last row.
+- `sqlite3` default output format: pipe-delimited columns, one row per line, no header, no trailing
+  newline. A single scalar result (e.g. COUNT) is just the bare value. An empty result set is an
+  entirely empty observation.

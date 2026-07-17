@@ -24,7 +24,7 @@ from wmh.engine.autoconfig import (
 from wmh.engine.knowledge import KnowledgeBase, seed_knowledge
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.reporting import BuildReporter, NullReporter
-from wmh.ingest import VendorPull, get_adapter
+from wmh.ingest import VendorPull, drop_degenerate_traces, get_adapter
 from wmh.optimize import GEPAOptimizer, OptimizeResult, RubricJudge
 from wmh.providers import get_provider
 from wmh.providers.base import Embedder, Provider
@@ -116,6 +116,7 @@ def build(
     full_search: bool = False,
     cheap_search: bool = False,
     estimate_only: bool = False,
+    drop_degenerate: bool = False,
     gepa_val_cap: int | None = None,
 ) -> OptimizeResult:
     """Ingest traces and run the full build, creating + persisting the artifact under `root`.
@@ -139,6 +140,12 @@ def build(
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)
     traces = ingest(config, file=file, vendor=vendor)
+    if drop_degenerate:
+        # Some captures are polluted with all-empty-observation traces (swe-bench is 66% such
+        # junk, D24); building on them trains and measures the model on capture damage. Same
+        # filter `wmh eval --drop-degenerate` and the research runners use.
+        traces, dropped = drop_degenerate_traces(traces)
+        report.activity(f"dropped {dropped} degenerate (all-empty-observation) traces")
     if not traces:
         raise ValueError("no traces ingested; nothing to build")
     report.ingest_done(len(traces), _count_steps(traces))

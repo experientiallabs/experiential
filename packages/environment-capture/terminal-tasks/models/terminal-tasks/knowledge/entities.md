@@ -1,0 +1,74 @@
+# Entities
+
+## npm packages (latest version observed)
+- lodash — latest maintainer `jdalton`; `main=lodash.js`; unpackedSize 1413741; description "Lodash modular utilities."
+- react — 2849 published versions
+- express — latest 5.2.1; 27 runtime deps (accepts, body-parser, content-disposition, content-type, cookie, cookie-signature, debug, depd, encodeurl, escape-html, etag, finalhandler, fresh, http-errors, merge-descriptors, mime-types, on-finished, once, parseurl, proxy-addr, qs, range-parser, router, send, serve-static, statuses, type-is, vary); tarball `https://registry.npmjs.org/express/-/express-5.2.1.tgz`; earliest time entries dated 2010-12-29
+- axios — license MIT; types `index.d.ts`
+- vue — repository `git+https://github.com/vuejs/core.git`
+- next — latest 16.2.9
+- moment — created 2011-10-17T20:04:22.876Z
+- typescript — dist-tags: latest 6.0.3, next 6.0.0-dev.20260416, beta 6.0.0-beta, rc 7.0.1-rc, dev 3.9.4, insiders 4.6.2-insiders.20220225, tag-for-publishing-older-releases 4.1.6; fileCount 140
+- jquery — latest 4.0.0; fileCount 163; unpackedSize 2889460
+- eslint — latest 10.6.0; keywords [ast, lint, javascript, ecmascript, espree]; engines.node `^20.19.0 || ^22.13.0 || >=24`; bin `{eslint: bin/eslint.js}`
+- webpack — latest 5.108.3; 22 runtime deps; keywords null across all versions
+- @angular/core — latest 22.0.4
+- react-dom — peerDependencies `{react: ^19.2.7}`
+- debug — bugs.url `https://github.com/debug-js/debug/issues`
+- mocha — latest 11.7.6; 62 devDependencies
+- ember-cli — latest 7.0.1
+- underscore — created 2011-01-09T19:04:10.529Z
+- node-fetch — dist-tags: latest 3.3.2, next 3.0.0-beta.10, cjs 2.6.7, beta 4.0.0-beta.4, release-2.x 2.7.0
+- chalk — 1 maintainer
+- esbuild — latest 0.28.1
+- npm — latest 11.18.0; optionalDependencies null
+- zod — latest 4.4.3
+- rxjs — time.modified 2025-02-22T03:00:42.995Z
+- fastify — latest 5.9.0
+- yarn — latest 1.22.22
+- prisma — latest 7.8.0
+- tailwindcss — latest 4.3.2
+- koa — latest 3.2.1
+- vite — latest 8.1.2
+- helmet — latest 8.2.0
+- svelte — latest 5.56.4
+- prettier — latest 3.9.4
+- graphql — latest 17.0.1
+- three — latest 0.185.0; homepage `https://threejs.org/`
+- left-pad — latest version deprecated (truthy `deprecated` field)
+
+## PyPI packages
+- requests — latest 2.34.2; author_email `Kenneth Reitz <me@kennethreitz.org>`
+- flask — project_urls: Changes, Chat (discord.gg/pallets), Documentation (flask.palletsprojects.com), Donate, Source (github.com/pallets/flask); no Homepage key; home_page null
+- numpy — 148 releases
+- django — latest 6.0.6
+- pandas — summary "Powerful data structures for data analysis, time series, and statistics"
+- black — requires_python `>=3.10`
+- setuptools — 623 releases; earliest keys 0.6b1..0.6c4
+- pytest — classifiers include Dev Status Mature, Python 3.10–3.15
+- beautifulsoup4 — author_email `Leonard Richardson <leonardr@segfault.org>`; author/maintainer null
+- pip — latest 26.1.2; provides wheel + sdist urls on files.pythonhosted.org
+- click — latest sdist `click-8.4.2.tar.gz`
+- fastapi — 32 requires_dist entries; core deps: starlette>=0.46.0, pydantic>=2.9.0, typing-extensions>=4.8.0, typing-inspection>=0.4.2, annotated-doc>=0.0.2; extras: standard, standard-no-fastapi-cloud-cli, all
+- rich — project_urls: Documentation (rich.readthedocs.io), Homepage (github.com/Textualize/rich)
+
+## GitHub repos / users
+- facebook/react — canonical id 10270250; forks 51121; readme accessible via `repos/facebook/react/readme` (with `-L`).
+- facebook/react-native — canonical id 29028775 (301 redirects to `/repositories/29028775`); subscribers_count 3526 (only visible with `-L`).
+- tensorflow/tensorflow — stargazers_count 195871.
+- kubernetes/kubernetes — latest release tag `v1.36.2`.
+- nodejs/node — most recent tags: v26.4.0, v26.3.1, v26.3.0, v26.2.0, v26.1.0, v26.0.0, v25.9.0, v25.8.2, v25.8.1, v25.8.0.
+- apache/httpd — license Apache-2.0 (spdx `Apache-2.0`).
+- apache/kafka — default_branch `trunk`.
+- golang/go — languages dominated by Go (55237420 bytes) then Assembly, HTML, C.
+- rust-lang/rust — description "Empowering everyone to build reliable and efficient software."
+- git/git — active repo; commits API returns SHAs; recent RelNotes reference release v2.55.0 (from v2.55.0-rc2 → v2.55.0 in GIT-VERSION-GEN).
+- octocat/Hello-World — contains single file `README` (size 13, default branch `master`); issue #1 has multi-user comment thread (masonzou, siekier, yzwork, vamshimolleti, ahmadjoon, damontenegrod, ghost, souker, heliogabalo, ...).
+- octocat/Spoon-Knife — has very large number of forks (paginated `/forks?per_page=100`).
+- torvalds — public_repos 12; user id 1024025; primary active repos torvalds/linux (id 2325298, default branch `master`) and torvalds/GuitarPedal (id 1058343058, default branch `main`); events feed dated 2026.
+- defunkt — orgs include `mustache` (id 197655, "Logic-less templates.").
+- microsoft/vscode — issue search `bug in:title` reports total_count 3499.
+- expressjs/express — accessible via pulls API.
+- python/cpython — active branches include `main`, `3.15`, `3.14`, `3.13`, `3.12`, `3.11`, `3.10` (branch maintainers seen: freakboy3742, pablogsal, hugovk).
+- antirez (user) — recent repos in creation-desc order: ds4, gguf-tools, redis, linenoise, llama.cpp-deepseek-v4-flash, bme680-pure-mp, bplog, ZOT, PixelWall, picol, qwen-asr, voxtral.c, dump1090, iris.c, whisperbot, tgterm, botlib, microfont, gte-pure-C, zxfy. ds4 last updated 2026-06-17.
+- GitHub user search `John followers:>100` → total_count 709; first result `john` (id 1668).

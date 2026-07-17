@@ -459,6 +459,50 @@ def test_build_low_tier_skips_gepa(tmp_path) -> None:  # noqa: ANN001
     assert ArtifactPaths(root).optimized_prompt.read_text(encoding="utf-8") == BASE_ENV_PROMPT
 
 
+def test_build_drop_degenerate_filters_all_empty_traces(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A capture can be polluted with all-empty-observation traces (swe-bench is ~66% such junk);
+    # --drop-degenerate must filter them before the split so the model isn't built on damage.
+    import importlib
+
+    build_mod = importlib.import_module("wmh.engine.build")
+    seen: dict[str, int] = {}
+    real = build_mod.split_traces_3way
+
+    def spy(traces, *a, **k):  # noqa: ANN001, ANN002, ANN003, ANN202
+        seen["n"] = len(traces)
+        return real(traces, *a, **k)
+
+    monkeypatch.setattr(build_mod, "split_traces_3way", spy)
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=0,
+        train_split=0.5,
+    )
+    # 4 real trace-pairs + 2 all-empty-observation degenerate traces appended.
+    trace_file = _tiny_trace_file(tmp_path)
+    import json as _json
+    from pathlib import Path as _Path
+
+    lines = _Path(trace_file).read_text(encoding="utf-8").splitlines()
+    for i in range(2):
+        tid = f"deadbeef{i:024x}"
+        lines.append(_json.dumps({**_json.loads(lines[0]), "traceId": tid, "spanId": f"z{i}"}))
+    _Path(trace_file).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    build(
+        config,
+        file=trace_file,
+        root=str(tmp_path / ".wmh"),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+        drop_degenerate=True,
+    )
+    # The degenerate single-span traces are gone before the split sees them.
+    assert seen["n"] <= 4
+
+
 def test_build_estimate_only_ships_the_signature_config_without_search(tmp_path) -> None:  # noqa: ANN001
     # The low tier: no GEPA, no LLM search, but a real winner (the signature estimate) is
     # persisted so --max-fidelity serves it and the higher tiers seed the same floor.

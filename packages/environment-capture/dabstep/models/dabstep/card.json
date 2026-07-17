@@ -1,25 +1,21 @@
 {
   "schema_version": 1,
   "name": "dabstep",
-  "title": "DABstep data analysis",
-  "description": "Data-analysis QA over a shared payments dataset and a business-rules manual, answered with pandas in a Python shell.",
-  "task": "dabstep",
+  "title": "dabstep",
+  "description": "",
+  "task": null,
   "corpus": {
-    "traces": 40,
-    "steps": 328,
-    "source": "dabstep.capped.jsonl"
+    "traces": 687,
+    "steps": 4859,
+    "source": "traces.otel.jsonl"
   },
   "provider": "bedrock",
-  "model_id": "us.anthropic.claude-opus-4-8",
+  "model_id": "us.anthropic.claude-opus-4-7",
   "fidelity": null,
   "cost_per_step_usd": null,
   "latency_per_step_s": null,
-  "built_at": "2026-07-08T07:52:10.591849+00:00",
-  "license": "CC BY 4.0",
-  "tags": [
-    "data-analysis",
-    "python",
-    "pandas"
-  ],
+  "built_at": "2026-07-16T21:54:35.473579+00:00",
+  "license": null,
+  "tags": [],
   "traces_hf": null
 }

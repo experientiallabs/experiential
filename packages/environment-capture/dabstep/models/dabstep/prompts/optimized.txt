@@ -37,3 +37,56 @@ Predict precisely:
 
 Never address the agent, explain your reasoning, or add commentary. Emit only the observation in the
 required output format.
+
+Environment-specific notes:
+- File reads (cat, head -n large, sed 'p', etc.) must reproduce the FULL file contents byte-for-byte
+  when the file has been shown earlier in the session or in retrieved examples. Never abbreviate,
+  summarize, elide with "[...]" placeholders, or drop middle sections — the agent sees the raw
+  bytes. If the file's contents are not established anywhere in evidence, only then may you
+  reconstruct a plausible full document consistent with references to it; still never truncate with
+  ellipses.
+- For shell stdout from `python3 -c "..."`, `echo`, and similar: each `print(...)` call ends with
+  exactly one `\n` internally between prints. HOWEVER, this environment's bash tool observation
+  STRIPS the single trailing newline from the command's final stdout line. So for a command whose
+  stdout would naturally end in "...last_line\n", emit "...last_line" with NO trailing newline.
+  Newlines BETWEEN prints/lines are preserved; only the final terminating "\n" is dropped. If the
+  command's last statement is a bare expression or an assignment, it prints nothing (empty
+  observation). Multi-line pandas/repr output follows the same rule: keep internal newlines, drop
+  the final one.
+- Derivable computations (values computable directly from files/data shown or from arithmetic in the
+  action itself) must be produced exactly — compute them; do not approximate. When the underlying
+  data has not been shown in the session, the numeric result is class-(d) unknowable: keep the exact
+  print format the command implies (separator characters, decimal places, f-string width) and emit
+  plausible values.
+- This environment's dataset conventions (payments/fees domain): "day_of_year" and "year" are
+  integer columns; "day 10 of year YYYY" means day_of_year<=10 within January (natural month).
+  Monthly aggregations use natural calendar months. Fee formula is
+  `fee = fixed_amount + rate * transaction_value / 10000`. A null field in a fee rule matches all
+  values of that field (i.e. the rule applies broadly, not narrowly).
+- Fee-rule filter semantics (critical for `fees.json` scans): an EMPTY LIST for
+  `account_type`, `merchant_category_code`, or `aci` behaves the same as `null` — it matches ALL
+  values of that field, not "none". Likewise `null` for scalar fields (`capture_delay`,
+  `monthly_fraud_level`, `monthly_volume`, `is_credit`, `intracountry`) means the rule applies to
+  every value. When simulating a Python filter like
+  `if r['merchant_category_code'] and X not in r['merchant_category_code']: continue`,
+  the truthy check already skips empty lists correctly; but when simulating "rules matching a given
+  MCC", rules with empty MCC lists MUST be included. Undercounting broad rules is a common failure
+  mode — expect scans over a single `card_scheme` to return dozens of rules, not a handful.
+- Established/reference files are byte-stable: when a file like `data/manual.md`,
+  `data/merchant_category_codes.csv`, or any schema/config file has been shown in past examples,
+  its bytes DO NOT drift between episodes. Reproduce it exactly, including trailing whitespace,
+  blank lines, and the presence/absence of a final newline. A single-byte difference changes the
+  hash and fails verification even when the visible text looks right. Do not "clean up" spacing,
+  quote style, or bullet markers.
+- For scans that enumerate rules from `fees.json`: the exact set of IDs, rates, and fixed_amounts
+  is class-(d) unknowable unless the file has been shown. Keep the printed dict format (Python
+  repr with single quotes, key order matching the JSON schema: ID, card_scheme, account_type,
+  capture_delay, monthly_fraud_level, monthly_volume, merchant_category_code, is_credit, aci,
+  fixed_amount, rate, intracountry), and emit a plausible-sized set consistent with the filter
+  semantics above — but recognize the concrete IDs/values cannot be recovered.
+- Python `print(dict)` uses `repr`: strings in single quotes, `None` (not `null`), `True`/`False`
+  (not `true`/`false`), floats like `0.1` not `0.10` (trailing zeros are dropped by repr), lists
+  with spaces after commas. Match this exactly when simulating printed dict/JSON-loaded output.
+- `ls` output: one filename per line in alphabetical order (no color codes, no trailing slash on
+  directories unless `-F`/`-p` is used). Follow the trailing-newline-stripping rule above: the last
+  filename has no trailing newline in the observation.

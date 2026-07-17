@@ -1,0 +1,86 @@
+## Brand
+- Shoes & Clothings — athletic footwear, apparel, and equipment retailer.
+
+## Core objects (Salesforce-style)
+- Account (201), Contact (208), User (152 — internal agents/owners).
+- Case (977): customer support case; links to Contact, Account, OwnerId (User), OrderItemId__c (OrderItem), IssueId__c (Issue__c). CreatedDate range: 2020-01-02 → 2024-05-26. All 977 have non-null OrderItemId__c. 918 have ClosedDate (closed cases).
+- CaseHistory__c (2983): audit trail; `Field__c` is one of exactly three values: `Case Creation` (977), `Owner Assignment` (1088), `Case Closed` (918).
+  - `Case Creation` rows: one per Case (977 total); `OldValue__c` and `NewValue__c` both NULL.
+  - `Owner Assignment` rows: 1088 total across 977 cases; `OldValue__c` NULL on first assignment; `NewValue__c` = User Id (005...). Additional rows per case represent owner transfers (`OldValue__c` = previous OwnerId, `NewValue__c` = new OwnerId).
+  - `Case Closed` rows: mark case closure timestamp in `CreatedDate`; both value fields NULL.
+- EmailMessage (3241): `ParentId` links to Case. `FromAddress` is a plain email address; `ToIds` is a JSON-encoded array of Id strings (User Id for inbound customer→agent, Contact Id for outbound agent→customer).
+- LiveChatTranscript (774): `CaseId` links to Case; `Body` is a chat log with `[timestamp] Name (Role):` lines; HTML-escaped (`&#39;`, `&amp;`). Not every Case has a transcript.
+- Issue__c (10 rows, complete taxonomy):
+  - `a1MWs0000012tvtMAA` Billing/Payment Issue
+  - `a1MWs0000012txVMAQ` Return Policy Issue
+  - `a1MWs0000012tz7MAA` Product Defect
+  - `a1MWs0000012u0jMAA` Size Mismatch
+  - `a1MWs0000012u2LMAQ` Shipping Delay
+  - `a1MWs0000012u2MMAQ` Product Availability
+  - `a1MWs0000012u3xMAA` Order Cancellation
+  - `a1MWs0000012u5ZMAQ` Warranty Issue
+  - `a1MWs0000012u7BMAQ` Incorrect Item Received
+  - `a1MWs0000012u8nMAA` Loyalty Program Inquiry
+- Knowledge__kav (45): FAQ/knowledge articles with Title, Summary, FAQ_Answer__c, UrlName. UrlName format `1726808617-<5char>`.
+- Order (2069) → OrderItem (7100) → Product2 (501).
+- Pricebook2 (46), PricebookEntry (22000).
+- ProductCategory (12), ProductCategoryProduct (762).
+
+## Sample entities
+- Product2 `01tWs000002wSKYIA2` = "Women's Trail Running Shorts", IsActive=1, External_ID__c="Women's Athletic Wear, Outdoor Apparel_75".
+- Product2 `01tWs000002wROTIA2` = "Pro Speed Rope"; `01tWs000002wRQ6IAM` = "High-Performance Speed Rope"; `01tWs000002wSikIAE` = "Cross Training Jump Rope"; `01tWs000002wUz3IAE` = "Pro Training Jump Rope".
+- Product2 `01tWs000002wTRtIAM` = "Women's High-Performance Jacket".
+- Product2 `01tWs000002wRDCIA2` = "Pro Swim Goggles" (124 OrderItem rows).
+- Product2 `01tWs000002wRgEIAU` = "Home Gym Dumbbell Set"; `01tWs000002wT0TIAU` = "Elite Training Dumbbells"; `01tWs000002wSArIAM` = "Resistance Training Bands".
+- Product2 `01tWs000002wRhpIAE` = "Hiking Waterproof Boots".
+- Product2 `01tWs000002wSIvIAM` = "Dynamic Run Shorts".
+- Yoga products: `01tWs000002wSXSIA2` ZenPro Yoga Mat; `01tWs000002wUcVIAU` ZenPro Yoga Blocks.
+- Backpack Product2 lineup: `01tWs000002wRLIIA2` Pro Basketball Backpack; `01tWs000002wRLJIA2` Outdoor Adventure Backpack; `01tWs000002wSUDIA2` Trail Runner Backpack; `01tWs000002wTGcIAM` Terrain Hiking Backpack; `01tWs000002wTLSIA2` High-Performance Running Backpack; `01tWs000002wUEHIA2` Pro Hiking Backpack; `01tWs000002wVThIAM` Insulated Hydration Backpack; `01tWs000002wWUbIAM` TrailGuard Hiking Backpack.
+- Knowledge__kav (complete list of 45):
+  - `ka0Ws000000QrdNIAS` Resolving Billing and Payment Issues: Overcharged Purchases with Promotional Codes
+  - `ka0Ws000000QrezIAC` Understanding Shoes & Clothings' Return Policy: Clear Solutions for Online Purchases
+  - `ka0Ws000000QrgbIAC` Addressing Product Defects: Ensuring Quality Footwear from Shoes & Clothings
+  - `ka0Ws000000QriDIAS` Navigating Size Mismatches: Ensuring the Perfect Fit with Shoes & Clothings
+  - `ka0Ws000000QriEIAS` Ensuring Product Availability: Solutions for When Popular Sneakers Are Out of Stock
+  - `ka0Ws000000QrjpIAC` Addressing Shipping Delays: Solutions for Enhanced Customer Satisfaction
+  - `ka0Ws000000QrlRIAS` How to Handle Order Cancellation Issues with Shoes & Clothings
+  - `ka0Ws000000Qrn3IAC` Navigating Warranty Claims for Defective Equipment at Shoes & Clothings (Replacement within 60 days; Extended Warranty up to 365 days)
+  - `ka0Ws000000QrofIAC` How to Address Incorrect Items Received at Shoes & Clothings
+  - `ka0Ws000000QrqHIAS` How to Redeem Loyalty Points for Discounts at Shoes & Clothings
+  - `ka0Ws000000QrrtIAC` Maintaining Trail Running Gear: Best Practices and Solutions
+  - `ka0Ws000000QrtVIAS` Enhancing Your Marathon Training: Tips and Essential Gear
+  - `ka0Ws000000Qrv7IAC` Maximizing Comfort with Basketball Apparel: Solutions for Common Issues
+  - `ka0Ws000000QrwjIAC` Addressing Sizing Inconsistencies in Basketball Footwear
+  - `ka0Ws000000QryLIAS` Enhancing Performance with Basketball Training Equipment
+  - `ka0Ws000000QryMIAS` Enhancing Precision on the Greens: Advanced Golf Equipment Solutions
+  - `ka0Ws000000QrzxIAC` Comprehensive Care for Training Equipment: Maintaining Peak Performance
+  - `ka0Ws000000Qs1ZIAS` Enhancing Flexibility and Stability with Yoga Gear
+  - `ka0Ws000000Qs3BIAS` Optimizing Your Street Style: A Guide to Lifestyle Sneakers
+  - `ka0Ws000000Qs4nIAC` Solving Comfort Issues in High-Performance Sneakers
+  - `ka0Ws000000Qs6PIAS` Maximizing Soccer Performance: A Guide to Elite-Level Gear
+  - `ka0Ws000000Qs81IAC` Innovation in Soccer Training: Leveraging Smart Gear
+  - `ka0Ws000000Qs9dIAC` Choosing the Right Soccer Cleats: Speed and Agility on the Field
+  - `ka0Ws000000QsBFIA0` Maximizing Fitness Tracking Efficiency: Tips and Tools
+  - `ka0Ws000000QsCrIAK` Hydration and Activity Reminders: Enhancing Fitness Performance
+  - `ka0Ws000000QsETIA0` Innovations in Outdoor Fitness Equipment: Accurate Tracking and Data Analysis
+  - `ka0Ws000000QsG5IAK` Mastering Outdoor Running: Essential Gear and Tips for Trail Runners
+  - `ka0Ws000000QsHhIAK` Maximizing Comfort in Cold Weather: Outdoor Apparel Essentials
+  - `ka0Ws000000QsJJIA0` Eco-Friendly Outdoor Gear: Sustainable Choices for the Modern Adventurer
+  - `ka0Ws000000QsKvIAK` Maximizing Your Yoga Practice: Essential Gear and Maintenance Tips
+  - `ka0Ws000000QsMXIA0` Ensuring Comfort and Support in Women's Yoga Apparel
+  - `ka0Ws000000QsO9IAK` Advanced Yoga Accessories for Enhanced Flexibility and Stability
+  - `ka0Ws000000QsPlIAK` Maximizing Golf Performance: Essential Gear and Care Tips
+  - `ka0Ws000000QsRNIA0` Enhancing Women's Athletic Wear: Performance and Comfort Solutions
+  - `ka0Ws000000QsSzIAK` Ensuring Quality and Performance of Swimming Gear from Shoes & Clothings
+  - `ka0Ws000000QsUbIAK` Maintenance Tips for Swimming Gear: Maximizing Longevity and Performance
+  - `ka0Ws000000QsWDIA0` Optimal Training with Swimming Gear: Enhancing Speed and Efficiency
+  - `ka0Ws000000QsXpIAK` Optimize Your Cycling Experience: Essential Gear and Maintenance Tips
+  - `ka0Ws000000QsZRIA0` Understanding Shoes & Clothings' Exchange Policy: Seamless Swaps for Purchased Items
+  - `ka0Ws000000Qsb3IAC` Warranty Claims Simplified: Shoes & Clothings' Approach to Warranty Service
+  - `ka0Ws000000QscfIAC` Efficient Cancelation Policy for Orders at Shoes & Clothings
+  - `ka0Ws000000QseHIAS` Shoes & Clothings' Customer Service Excellence: Comprehensive Support Channels
+  - `ka0Ws000000QsftIAC` Resolving Product Mislabeling Issues: Steps and Solutions Provided by Shoes & Clothings
+  - `ka0Ws000000QshVIAS` Shoes & Clothings Loyalty Program Redemption: How to Make the Most of Your Points
+  - `ka0Ws000000Qsj7IAC` Return Policy for Purchased Items: Guidelines for Hassle-Free Returns
+- Contact `003Ws000004FzfCIAS` → Account `001Ws00003Ljq4tIAB`; Account has Order `801Ws00003LkMWDIA3` (EffectiveDate 2020-01-01, Status Activated) containing OrderItems for Home Gym Dumbbell Set, Pro Speed Rope, High-Performance Speed Rope.
+- Sample Case `500Ws000007qt5PIAQ`: "Unable to Cancel Order", Order Cancellation issue, closed 2020-06-06, OrderItemId__c `802Ws000001lzE7IAI` on Order `801Ws00003LjiovIAB` (EffectiveDate 2020-06-06, Activated).

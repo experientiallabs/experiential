@@ -37,3 +37,37 @@ Predict precisely:
 
 Never address the agent, explain your reasoning, or add commentary. Emit only the observation in the
 required output format.
+
+Environment-specific notes:
+- Value derivation: For actions whose output is fully determined by the action itself (e.g.
+  `python3 -c "print(...)"`, `echo`, arithmetic, string ops), COMPUTE the exact result and emit
+  only that — do not add trailing prose. For file reads/greps where prior history or examples show
+  the exact bytes, reproduce them verbatim.
+- File content unknowability (class d): When a shell action reads a file whose bytes are not in
+  the state/history/examples (e.g. `sed -n`, `cat`, `head` on a doc not previously shown), the
+  exact whitespace, blank-line counts, and character-level formatting cannot be recovered. Aim for
+  correct shape and plausible content; character-exact fidelity is not achievable.
+- Whitespace fidelity for text files: Financial/report text extracts frequently contain runs of
+  blank lines (often DOUBLE blank lines) between sections and around section headers/totals. When
+  reproducing such content, preserve blank-line groups rather than collapsing them to single
+  blanks — collapsing is a common source of small length mismatches.
+- Shell listing outputs (`ls`, `grep -l`, `find`): one path per line, newline-separated, no
+  bullets, no quoting, no trailing commentary. Order matches the tool's natural order (lexical for
+  globs).
+- Silent success: assignments, successful writes/redirects, `cd`, `mv`, `cp`, `rm` on existing
+  targets produce no stdout — return empty, not a confirmation message.
+- grep across a document corpus (`grep -l <term> docs/*`): the set of matching files is generally
+  unknowable without reading contents (class d for the exact list). However, note two systemic
+  patterns to avoid biased guesses:
+  (1) A single company/entity often appears in MULTIPLE evidence files (different fiscal years,
+      filings, or excerpts share the same company name). Defaulting to exactly one match
+      systematically under-predicts. If prior history or examples show a specific count, use that;
+      otherwise a plausible small set (1–3 files) in lexical order is safer than always one.
+  (2) A query term may also legitimately have ZERO matches, in which case grep prints nothing and
+      exits non-zero (is_error=true, empty stdout). Do not manufacture filenames — if the state
+      offers no signal that the term appears, an empty error result is a valid outcome.
+  Decide from this step's own evidence (filenames visible in history, prior successful greps for
+  the same term, task context), never from a fixed prior.
+- Corpus filename convention: evidence files in `docs/` typically follow a stable pattern like
+  `docs/financebench_id_<5-digit>_ev<n>.txt`. When inventing plausible paths is unavoidable, match
+  this shape exactly; do not introduce ad-hoc names.

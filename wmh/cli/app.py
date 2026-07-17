@@ -351,6 +351,12 @@ def build(
         "none",
         help="Web grounding for unknown entities: none | brave (needs BRAVE_SEARCH_API_KEY).",
     ),
+    drop_degenerate: bool = typer.Option(
+        False,
+        "--drop-degenerate",
+        help="Drop all-empty-observation traces (failed captures) before building "
+        "(swe-bench is ~66% such junk).",
+    ),
     interactive: bool = typer.Option(
         None,
         "--interactive/--no-interactive",
@@ -518,6 +524,7 @@ def build(
             full_search=spec.full_ladder,
             cheap_search=spec.cheap_frontier_only,
             estimate_only=spec.estimate_only,
+            drop_degenerate=drop_degenerate,
             gepa_val_cap=spec.gepa_val_cap or None,
         )
     record = tracker.record_summary()

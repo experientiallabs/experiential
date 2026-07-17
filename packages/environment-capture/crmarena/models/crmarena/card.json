@@ -1,25 +1,21 @@
 {
   "schema_version": 1,
   "name": "crmarena",
-  "title": "CRMArena analytics",
-  "description": "Professional CRM analytics over a realistic Salesforce org snapshot: case routing, handle-time analytics, and entity disambiguation via SQL.",
-  "task": "crmarena",
+  "title": "crmarena",
+  "description": "",
+  "task": null,
   "corpus": {
-    "traces": 40,
-    "steps": 307,
-    "source": "crmarena.capped.jsonl"
+    "traces": 80,
+    "steps": 553,
+    "source": "traces.otel.jsonl"
   },
   "provider": "bedrock",
-  "model_id": "us.anthropic.claude-opus-4-8",
+  "model_id": "us.anthropic.claude-opus-4-7",
   "fidelity": null,
   "cost_per_step_usd": null,
   "latency_per_step_s": null,
-  "built_at": "2026-07-08T07:52:04.704352+00:00",
-  "license": "CC BY-NC 4.0",
-  "tags": [
-    "crm",
-    "sql",
-    "analytics"
-  ],
+  "built_at": "2026-07-16T20:25:50.251921+00:00",
+  "license": null,
+  "tags": [],
   "traces_hf": null
 }

@@ -1,0 +1,26 @@
+# Environment Rules
+
+- Environment is a read-only SQLite database at `./database.db` queried via `sqlite3` CLI or Python `sqlite3` module through the `bash` tool.
+- No auth / no state-changing gates observed; tools execute mechanically.
+- Data-quality caveats the environment exposes (must be handled by queries, not enforced by DB):
+  - `fdbk_g1.ts` and `fdbk_g2.ts` are INTEGER epoch values but include CORRUPT rows with values far outside plausible ms range (e.g. 999499485000000, 975552466000000). Out of 377,472 `fdbk_g1` rows: 0 null, 0 <1e12, 377,414 in [1e12, 2e12) (plausible ms), 58 ≥2e12 (corrupt). Filter to a plausible range before `datetime.utcfromtimestamp(ts/1000)` or Python raises `ValueError: year ... is out of range`.
+  - `fdbk_g1.ts` / `fdbk_g2.ts` semantics differ: g1 is epoch MILLISECONDS (samples ~1.0e12–1.6e12, ~2001+); g2 is epoch SECONDS (samples ~1.0e9–1.7e9, ~2001+). In SQL: g1 uses `datetime(f.ts/1000,'unixepoch')`, g2 uses `datetime(f.ts,'unixepoch')`.
+  - `fdbk_g3.ts` is TEXT (`YYYY-MM-DD` or NULL); many rows have NULL ts. Use `date(f.ts)` in SQL.
+  - Observed fdbk date ranges (joined to `main_cat='All Electronics'`): g1 2001-09-26..2023-09-04 (42,092 rows), g2 2002-08-28..2023-03-25 (17,708 rows), g3 2005-07-14..2023-09-03 (9,748 rows).
+  - `items.prc` is frequently NULL. Non-null counts out of 20,000: items_g1 7,867 (range 0.18..13914.85), items_g2 `prc` 6,570 (range 9..2,688,800), items_g2 `prc_usd` 6,346 (range 0.09..499.99), items_g3 7,949 (range 0.05..5369.0).
+  - `items_g2.prc` appears to be `prc_usd * 100` (integer cents): e.g. prc=794/prc_usd=7.94, prc=3999/prc_usd=39.99, prc=25717/prc_usd=257.17. But `prc/100.0` and `prc_usd` do NOT always agree in aggregate — `AVG(prc_usd)` for All Electronics=44.67 (n=1763) vs `AVG(prc/100.0)`=70.95 (n=1799); use `prc_usd` when present and fall back to `prc/100.0` (e.g. `coalesce(prc_usd, prc/100.0)`).
+  - `items_g2` prc/prc_usd column counts are NOT identical — 6,570 prc rows vs 6,346 prc_usd rows; there are items with only one of the two populated.
+  - `items_g3.str_nm` is NULL for all sampled rows; use `attrs_g3` `attr_key='Brand'` (11,643 rows) or `'Manufacturer'` (2,481) for brand grouping instead. `attrs_g3` has 0 items with duplicate `Brand` rows per ref_id.
+  - `items.main_cat` may be NULL (g1: 741 NULL, g2: 1,304 NULL, g3: 321 NULL).
+  - `main_cat` in `items_gN` does NOT always match the lvl-0 category in `taxn_gN`. E.g. items_g1 with `main_cat='Office Products'` = 13,933; `taxn_g1` refs with `cat_lvl=0 AND cat_nm='Office Products'` = 17,825 distinct; union = 19,981. Some items even have `main_cat='All Electronics'` while their taxonomy path starts with 'Office Products'. Choose one source deliberately.
+  - `main_cat` value spaces differ from taxonomy value spaces. Neither `items_g1`, `items_g2`, nor `items_g3` ever use the literals 'Electronics' or 'Computers & Accessories' as `main_cat` (0 rows each) — those are taxonomy-only labels. Instead items use 'All Electronics', 'Computers', 'Cell Phones & Accessories', etc.
+  - `taxn_gN` category paths are level-indexed (cat_lvl 0..5 in g1). Level 0 is the top-level department (e.g. 'Office Products', 'Electronics'). Not all items have all levels: for the 17,825 g1 Office Products items — lvl0/1: 17,825; lvl2: 17,549; lvl3: 16,975; lvl4: 11,732; lvl5: 2,215.
+  - `taxn_g2` lvl-0 is 'Electronics' (not the department names used in `items_g2.main_cat` such as 'Computers', 'Camera & Photo', etc.). Do NOT filter `taxn_g2` by `cat_nm='<items.main_cat>'` at `cat_lvl=0`.
+  - `taxn_g2` node 'Computers & Accessories' appears at `cat_lvl=1` (8,089 refs); its items span many `main_cat` values including Toys & Games, Books, Office Products, Home Audio & Theater — i.e. taxonomy branches cross-cut `main_cat`.
+  - Per-item stored `items.avg_rtg` does NOT always match `AVG(fdbk.rtg)` for that ref_id; ~1,833 Office Products items in g1 (by `items_g1.main_cat`) have `|stored_avg - actual_avg| > 1.0` (2,387 if scoped by `taxn_g1` lvl-0='Office Products'; 2,712 by union). Treat `avg_rtg` as a stored/denormalized field, not a computed truth.
+  - Not every `items_gN.ref_id` has feedback: g1 9,999 refs have fdbk_stats (of 20,000 items); g2 8,655 distinct ref_ids appear in fdbk_g2; g3 19,998 distinct ref_ids appear in fdbk_g3. Per-item review counts (from GROUP BY ref_id) range g1 1..6130, g2 1..5891, g3 1..4461; per-item AVG(rtg) spans 1.0..5.0 in all three groups.
+  - In `fdbk_g1`, `item_id` and `ref_id` differ on a substantial minority of rows: e.g. for rtg≤2.0 (57,838 rows) there are 10,059 distinct `item_id` vs 8,227 distinct `ref_id` (diff 1,832); neither column is NULL in that slice.
+  - `attrs_gN.attr_val` for `attr_key='Date First Available'` is a free-text English date (e.g. 'October 31, 2015'); parse with a regex/`strptime`. Year range observed 1973–2023.
+  - `fdbk_gN.vrf` encoding differs by group: g1 INTEGER (1=verified 351,745 / 0=25,727); g2 TEXT ('true'=71,517 / 'false'=5,505); g3 INTEGER (1=264,096 / 0=22,530). Filter accordingly.
+  - `fdbk_gN.body` is rarely NULL/empty (never NULL; empty-trim: g1 375/377,472, g2 23/77,022, g3 297/286,626). Guard with `trim(coalesce(body,''))<>''` when analyzing text.
+- No observed rate limits, timeouts, or output truncation.
