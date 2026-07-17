@@ -323,7 +323,8 @@ def build(
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     fidelity: str = typer.Option(
         "medium",
-        help="Build effort: low (RAG only) | medium (+light GEPA + cheap-lever search) | "
+        help="Build effort (higher can only improve on lower): low (free; ships the "
+        "estimated-best config, no search) | medium (+light GEPA + cheap-lever search) | "
         "high (+GEPA + config search) | max (deep GEPA + full config search).",
     ),
     chain: str = typer.Option(

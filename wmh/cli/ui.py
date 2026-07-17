@@ -408,11 +408,20 @@ def run_build_wizard(
         console.print("  [yellow]pick a different judge model[/yellow]")
         judge_default = judge_model
 
-    # Build effort is a tier, not an iteration count — raw budgets live in the Python API.
+    # Build effort is a tier, not an iteration count (raw budgets live in the Python API).
+    # Each tier searches harder and can only IMPROVE on the one below it — the ladder is
+    # monotonic by construction (a strong free estimate as the floor; higher tiers replace it
+    # only when a config measurably beats it). So "higher is never worse", just more build cost.
     console.print(
-        "  [dim]low: RAG only · medium: +light prompt optimization + cheap-lever search · "
-        "high: +optimization + config search · max: deep optimization + full search[/dim]"
+        "  [dim]each tier can only improve on the one below — higher = more build cost, "
+        "never lower fidelity. low is free.[/dim]"
     )
+    fidelity_notes = {
+        "low": "free · ships the estimated-best config for your traces, no search",
+        "medium": "+ light prompt optimization & a cheap-lever search on top of low",
+        "high": "+ full config search (knowledge/verify/grounding) — recommended",
+        "max": "+ deep optimization & exhaustive search — highest cost, to be certain",
+    }
     fidelity = _select(
         console,
         ask,
@@ -420,6 +429,7 @@ def run_build_wizard(
         ["low", "medium", "high", "max"],
         defaults.fidelity,
         interactive=interactive,
+        notes=fidelity_notes,
     )
 
     # Retrieval phi embedder: offline lexical hashing is the measured-best default at EVERY
