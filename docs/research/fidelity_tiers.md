@@ -6,9 +6,17 @@ hit on the way. Raw per-suite ladder JSONs live in the workspace layer
 (`.agents/docs/research/fidelity_tiers/`, PR #55); the numbers below are complete without
 them.*
 
-## Monotonicity: a strong estimate + an incumbent floor (2026-07-16)
+## A strong estimate + an incumbent floor (2026-07-16)
 
-The tiers are **improve-or-hold by construction**, and `low` is no longer plain base RAG:
+Every searching tier is **floored at the low estimate** (improve-or-hold *relative to low*), and
+`low` is no longer plain base RAG. **Scope of the guarantee (be precise):** the floor gives
+`tier ≥ low`, *not* `high ≥ medium`. Medium and high search different candidate menus on
+different sample sizes, both seeded from the same low estimate — so adjacent searching tiers are
+not strictly ordered against each other; only the floor at `low` is guaranteed. (Making
+`high ≥ medium` strict would require seeding each tier's incumbent from the *previous tier's
+winner* — cumulative search — which this design does not do; see the follow-ups.) Separately,
+the chosen config activates at serve time under `--max-fidelity`; a plain `wmh serve` stays pure
+RAG regardless of tier.
 
 - **`low` ships the corpus-signature's strongest ESTIMATED config** — `signature_estimate`
   reads the zero-token `CorpusSignature` and returns the D27 matrix winner for the corpus shape
@@ -21,11 +29,13 @@ The tiers are **improve-or-hold by construction**, and `low` is no longer plain 
   invocations recompute the identical estimate from the signature, so the floor is consistent
   across tiers without running the lower tier first.
 
-This directly fixes the old non-monotonicity: the pre-2026-07-16 ladder ran an *independent*
-search per tier, so a fluke +0.002 on the selection sample could crown a config that then lost
-on test — which is how tau went **low 0.865 → medium 0.891 → high 0.886 → max 0.882** (peaking
-at medium, then declining). With the incumbent floor a higher tier can only match or beat the
-config a lower tier would have shipped.
+This raises the floor over the old ladder, where every tier searched from base with no floor at
+all, so a tier could ship *worse than base* on a fluke. With the incumbent floor no searching
+tier ships worse than the low estimate. It does **not** by itself make the ladder strictly
+monotonic across adjacent tiers — the old **low 0.865 → medium 0.891 → high 0.886 → max 0.882**
+shape (high < medium) can still occur, because high's win is measured against *low*, not against
+medium. The honest ladder claim is "no tier is worse than low," and per-corpus the search
+finds the best config it can resolve at that tier's budget.
 
 ## The design (D30)
 

@@ -323,9 +323,10 @@ def build(
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     fidelity: str = typer.Option(
         "medium",
-        help="Build effort (higher can only improve on lower): low (free; ships the "
-        "estimated-best config, no search) | medium (+light GEPA + cheap-lever search) | "
-        "high (+GEPA + config search) | max (deep GEPA + full config search).",
+        help="Build effort (all searching tiers are floored at low's estimate — more effort "
+        "never ships worse than low): low (free; the estimated-best config, no search) | "
+        "medium (+light GEPA + cheap-lever search) | high (+GEPA + config search) | max (deep "
+        "GEPA + full config search). The chosen config serves under `--max-fidelity`.",
     ),
     chain: str = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
@@ -560,11 +561,17 @@ def build(
     auto_report = Path(model_dir) / "auto_fidelity.json"
     if auto_report.exists():
         auto = json.loads(auto_report.read_text(encoding="utf-8"))
-        scores = ", ".join(f"{k}={v:.3f}" for k, v in auto["scores"].items())
+        # The low tier writes an estimate with no scores (no search ran); higher tiers write
+        # the searched scores. Render each honestly rather than an empty "(; 0 traces)".
+        if auto.get("scores"):
+            scores = ", ".join(f"{k}={v:.3f}" for k, v in auto["scores"].items())
+            provenance = f"searched: {scores}; {auto['val_traces']} held-out traces"
+        else:
+            provenance = "signature estimate — no search"
         _console.print(
             f"[bold]max-fidelity config[/bold]: [bold]{auto['winner_label']}[/bold] "
-            f"({scores}; {auto['val_traces']} held-out traces) — activate with "
-            f"`wmh serve --max-fidelity` / `wmh play --max-fidelity`"
+            f"({provenance}) — activate with `wmh serve --max-fidelity` / "
+            f"`wmh play --max-fidelity`"
         )
     _console.print(
         f"[bold]run[/bold] {record.run_id[:8]}: {record.duration_seconds:.1f}s, "

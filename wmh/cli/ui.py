@@ -409,16 +409,17 @@ def run_build_wizard(
         judge_default = judge_model
 
     # Build effort is a tier, not an iteration count (raw budgets live in the Python API).
-    # Each tier searches harder and can only IMPROVE on the one below it — the ladder is
-    # monotonic by construction (a strong free estimate as the floor; higher tiers replace it
-    # only when a config measurably beats it). So "higher is never worse", just more build cost.
+    # `low` picks the corpus-signature's estimated-best config for free; the searching tiers
+    # spend more to find (and verify) a config that beats that estimate — each is floored at the
+    # low estimate, so more build effort never ships worse than low. The chosen config activates
+    # at serve time with `--max-fidelity` (a plain `wmh serve` stays pure RAG).
     console.print(
-        "  [dim]each tier can only improve on the one below — higher = more build cost, "
-        "never lower fidelity. low is free.[/dim]"
+        "  [dim]low estimates the best config free; medium/high/max search harder for one that "
+        "beats it (floored at low). Serve the chosen config with --max-fidelity.[/dim]"
     )
     fidelity_notes = {
-        "low": "free · ships the estimated-best config for your traces, no search",
-        "medium": "+ light prompt optimization & a cheap-lever search on top of low",
+        "low": "free · the estimated-best config for your traces, no search",
+        "medium": "+ light prompt optimization & a cheap-lever search over low",
         "high": "+ full config search (knowledge/verify/grounding) — recommended",
         "max": "+ deep optimization & exhaustive search — highest cost, to be certain",
     }

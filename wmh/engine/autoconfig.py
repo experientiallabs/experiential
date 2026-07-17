@@ -353,7 +353,10 @@ def search_max_fidelity(
         # Improve-or-hold: keep the incumbent unless a challenger clears it by > the noise band.
         incumbent_score = scores.get(incumbent.label, -1.0)
         if best.label != incumbent.label and best_score <= incumbent_score + _NOISE_MARGIN:
-            best = next(c for c in candidates if c.label == incumbent.label)
+            # Defensive default: the incumbent is prepended into `candidates` above, so the
+            # lookup always finds it today — but a future caller passing an explicit
+            # `candidates` omitting it should fall back to the incumbent, not StopIteration.
+            best = next((c for c in candidates if c.label == incumbent.label), incumbent)
 
     return AutoFidelityReport(
         winner_label=best.label,

@@ -55,8 +55,11 @@ class TierSpec:
     # kb/verify scoring), but a nearly-free grounding win should be discoverable cheaply.
     cheap_frontier_only: bool
     # True = ship the corpus-signature's strongest ESTIMATED config with no LLM search (the
-    # `low` tier). It's the ladder's floor: a strong prior that every searching tier seeds its
-    # incumbent from and can only improve on, so low->max is monotonic by construction.
+    # `low` tier). It's the ladder's FLOOR: every searching tier seeds its incumbent from this
+    # same estimate and only replaces it on a clear win, so no searching tier ships worse than
+    # low. (This guarantees "tier >= low", NOT "high >= medium" — medium and high search
+    # different menus on different samples, so adjacent tiers are not strictly ordered; the
+    # floor is at low, not at the previous tier.)
     estimate_only: bool
     # Recommend provider-backed semantic phi. Kept as a field for explicit opt-in experiments,
     # but NO tier sets it: semantic retrieval was measured WORSE than lexical hashing on every

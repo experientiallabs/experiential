@@ -27,10 +27,11 @@ from pathlib import Path
 from wmh.config import FIDELITY_TIERS, FidelityTier
 from wmh.core.types import Trace
 from wmh.engine.autoconfig import (
-    CandidateConfig,
+    DEFAULT_CANDIDATES,
     CorpusSignature,
     search_max_fidelity,
     select_candidates,
+    signature_estimate,
 )
 from wmh.engine.eval_suites import resolve_eval_suite
 from wmh.engine.grounding import FetchGrounder, Grounder
@@ -165,20 +166,22 @@ def main() -> None:
         else:
             prompt = BASE_ENV_PROMPT
 
-        winner = CandidateConfig(label="base")
-        considered: list[str] = ["base"]
+        # The ladder's floor: the signature estimate the `low` tier ships and every searching
+        # tier seeds as its incumbent — matches `wmh build` exactly (no parallel tier logic).
+        signature = CorpusSignature.from_traces(train)
+        incumbent = signature_estimate(signature, has_pins=False)
+        winner = incumbent
+        considered: list[str] = [incumbent.label]
         knowledge: str | None = None
         if spec.config_search:
             print(f"[{tier_name}] config search (val_cap {spec.search_budget}) ...", flush=True)
-            # Seed the KB ONCE and hand the same text to the search and the final replay: a
-            # second extraction is a different nondeterministic KB, so the reported number
-            # would not be the configuration the search selected.
             menu = select_candidates(
-                CorpusSignature.from_traces(train),
-                full_ladder=spec.full_ladder,
-                cheap_only=spec.cheap_frontier_only,
+                signature, full_ladder=spec.full_ladder, cheap_only=spec.cheap_frontier_only
             )
-            if any(c.knowledge for c in menu):
+            # Seed the KB ONCE and hand the same text to the search: a second extraction is a
+            # different nondeterministic KB, so the reported number would not be the config the
+            # search selected. Seed when the menu OR the incumbent floor needs it.
+            if any(c.knowledge for c in menu) or incumbent.knowledge:
                 knowledge = seeded_knowledge_text(train, serve)
             auto = search_max_fidelity(
                 prompt,
@@ -188,8 +191,8 @@ def main() -> None:
                 judge,
                 embedder,
                 val_cap=spec.search_budget,
-                full_ladder=spec.full_ladder,
-                cheap_only=spec.cheap_frontier_only,  # medium's cheap frontier, same as build
+                candidates=menu,
+                incumbent=incumbent,  # floored at low, same as `wmh build`
                 knowledge_text=knowledge,
                 concurrency=args.concurrency,
                 on_candidate_done=lambda label, score: print(

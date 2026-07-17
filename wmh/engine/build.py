@@ -142,8 +142,9 @@ def build(
     traces = ingest(config, file=file, vendor=vendor)
     if drop_degenerate:
         # Some captures are polluted with all-empty-observation traces (swe-bench is 66% such
-        # junk, D24); building on them trains and measures the model on capture damage. Same
-        # filter `wmh eval --drop-degenerate` and the research runners use.
+        # junk, D24); building on them trains and measures the model on capture damage. Reuses
+        # `wmh.ingest.drop_degenerate_traces` — the same filter the research runners
+        # (run_trace_scaling / run_fidelity_tiers, via their own --drop-degenerate) apply.
         traces, dropped = drop_degenerate_traces(traces)
         report.activity(f"dropped {dropped} degenerate (all-empty-observation) traces")
     if not traces:
@@ -286,8 +287,10 @@ def build(
             RubricJudge(judge_provider),
             embed,
             val_cap=fidelity_budget,
-            full_ladder=full_search,
-            cheap_only=cheap_search,
+            # Pass the already-computed menu so the search doesn't recompute the identical
+            # signature+select_candidates (and so the KB-seed decision above and the scored set
+            # can't drift from separate calls).
+            candidates=menu,
             incumbent=incumbent,
             # Whatever the artifact's KB renders (even empty) is what candidates measure —
             # passing None here would let the search re-extract a DIFFERENT ephemeral KB
