@@ -1695,6 +1695,37 @@ def test_durable_channel_resume_fences_a_concurrent_old_liveness_probe() -> None
     assert channel._fatal_error is None  # noqa: SLF001
 
 
+def test_durable_channel_resume_rejects_a_fatal_state_set_during_connect() -> None:
+    """The post-connect guard cannot return a newly attached but poisoned channel."""
+    handle = _ScriptedHandle([], hold_open=True)
+    resumed = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle, reconnect_handles=[resumed])
+    _store_outbox(fake, [])
+    channel = _durable_channel(fake, handle)
+    release_connect = threading.Event()
+    fake.commands.connect_gate = release_connect
+    resume_errors: list[Exception] = []
+
+    def resume() -> None:
+        try:
+            channel.resume(fake)
+        except Exception as error:  # noqa: BLE001 - asserted below
+            resume_errors.append(error)
+
+    resume_thread = threading.Thread(target=resume)
+    resume_thread.start()
+    assert fake.commands.connect_started.wait(0.5)
+    with channel._state_lock:  # noqa: SLF001
+        channel._mark_fatal_locked("simulated concurrent fatal state")  # noqa: SLF001
+    release_connect.set()
+    resume_thread.join(timeout=0.5)
+
+    assert not resume_thread.is_alive()
+    assert len(resume_errors) == 1
+    assert "simulated concurrent fatal state" in str(resume_errors[0])
+    assert resumed.disconnects == 1
+
+
 def test_durable_channel_retries_a_transiently_missing_committed_frame() -> None:
     hello: JsonObject = {"type": "hello"}
     ready: JsonObject = {"type": "state", "status": "ready"}

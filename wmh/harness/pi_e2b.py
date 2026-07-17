@@ -487,21 +487,32 @@ class E2BDurableChannel:
                     self._resume_condition.notify_all()
                 raise
             now = time.monotonic()
+            fatal_during_connect: str | None = None
             with self._resume_condition:
-                self._sandbox = sandbox
-                self._handle = handle
-                self._stream_dead_at = None
-                self._stream_death_probe_done = False
-                self._stream_error = None
-                self._last_stdout_at = now
-                self._head_failure_since = None
-                self._last_head_failure_at = None
-                self._next_pid_check_at = now + self._pid_probe_interval_s
-                self._pid_dead_at = None
-                self._last_outbox_error = None
-                self._missing_since.clear()
+                fatal_during_connect = self._fatal_error
+                if fatal_during_connect is None:
+                    self._sandbox = sandbox
+                    self._handle = handle
+                    self._stream_dead_at = None
+                    self._stream_death_probe_done = False
+                    self._stream_error = None
+                    self._last_stdout_at = now
+                    self._head_failure_since = None
+                    self._last_head_failure_at = None
+                    self._next_pid_check_at = now + self._pid_probe_interval_s
+                    self._pid_dead_at = None
+                    self._last_outbox_error = None
+                    self._missing_since.clear()
                 self._resuming = False
                 self._resume_condition.notify_all()
+            if fatal_during_connect is not None:
+                disconnect = getattr(handle, "disconnect", None)
+                if callable(disconnect):
+                    with contextlib.suppress(Exception):
+                        disconnect()
+                raise RuntimeError(
+                    f"durable runner channel failed while resuming: {fatal_during_connect}"
+                )
             reader = self._new_reader(handle, generation=generation)
             self._reader = reader
 
