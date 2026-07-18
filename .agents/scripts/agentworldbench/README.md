@@ -91,6 +91,35 @@ over the 7 domains (their paper convention, NOT `eval.py score`'s micro-average)
   reading required); android source data has one duplicate `(id, turn_idx)` key (both rows
   predicted + judged); swe-bench model serves haiku-4.5 by repo default (that's "as built").
 
+## wmh-max row (2026-07-18 — merged-main rebuilds, same pinned judge)
+
+The "new machine" run: tau/terminal/swe rebuilt with `wmh build --fidelity max` on merged main
+(GEPA v2 + full lever search; winners tau=`reason`, terminal=`reason+kb`, swe=`reason+verify`;
+swe re-served on **Opus 4.8** instead of its haiku default), served with `--max-fidelity`;
+the 4 corpus-free domains ran BASE_ENV_PROMPT + reasoning + verify. Same judge as every row
+below (gpt-5.4-mini via shim, temp 0). ≤1 judge failure per arm.
+
+| domain | old (2026-07-10) | **wmh-max** | Δ | Qwen-AW-35B anchor |
+|---|---:|---:|---:|---:|
+| MCP | 54.00 | 55.37 | +1.37 | 44.83 |
+| Search | 43.06 | 44.46 | +1.40 | 38.50 |
+| Terminal | 52.63 | 53.56 | +0.93 | 27.29 |
+| SWE | 53.39 | **66.73** | **+13.34** | 44.66 |
+| Android | 60.68 | 59.72 | −0.96 | 47.35 |
+| Web | 56.35 | 56.93 | +0.58 | 52.88 |
+| OS | 53.02 | 53.47 | +0.45 | 54.87 |
+| **Macro Overall** | 53.30 | **55.75** | **+2.45** | 44.34 |
+
+Decomposition: nearly all of the macro gain is **swe's serve-model upgrade + reason+verify**
+(haiku→opus, +13.34); every corpus/lever effect elsewhere is ±1.4 — replicating the finding
+that off-distribution, test-time levers and corpus-derived context move their metric only
+marginally (reason+verify on base arms ≈ noise for 2× infer cost; android slightly negative).
+Costs: infer $743.52 (verify's double pass dominates: search $208, swe $145), judge ≈$37.
+Builds: ~60-80 min each, winners replicated WS-A3's lever research (fetch rejected by the
+search on terminal — convenient, as live-fetch vs recorded data was a validity risk).
+Ops note: judge stage initially no-op'd silently — the /tmp eval-repo clone had been purged by
+the tmp cleaner; their code now lives pinned under `.wmh/qwen-agentworld` (same @354f733).
+
 ## Anchor row: Qwen-AgentWorld-35B-A3B, same judge (2026-07-11)
 
 Their released model, served per their README (vLLM `--language-model-only --reasoning-parser
