@@ -14,6 +14,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 from wmh.serving.builds import BuildManager
+from wmh.serving.public_play import PublicPlayLimiter, PublicPlayLimits
 from wmh.serving.server import _load_card_or_none, create_app, resolve_model_dirs
 
 
@@ -381,3 +382,45 @@ def test_traces_downloadable_when_card_declares_hub_source() -> None:
 def test_download_traces_400_without_source() -> None:
     resp = _client().post("/world_models/airline/traces/download")
     assert resp.status_code == 400
+
+
+def _public_client(limiter: PublicPlayLimiter) -> TestClient:
+    return TestClient(create_app(world_models={"airline": _world_model()}, public_play=limiter))
+
+
+def _message(text: str) -> dict:
+    return {"action": {"kind": "message", "content": text}}
+
+
+def test_public_play_disabled_returns_404() -> None:
+    # No limiter -> the /public routes do not serve.
+    resp = _client().post("/public/world_models/airline/sessions", json={})
+    assert resp.status_code == 404
+
+
+def test_public_play_session_and_step() -> None:
+    client = _public_client(PublicPlayLimiter(PublicPlayLimits(max_total_steps=5)))
+    session_id = client.post("/public/world_models/airline/sessions", json={}).json()["session_id"]
+    resp = client.post(f"/public/sessions/{session_id}/step", json=_message("hello"))
+    assert resp.status_code == 200
+    assert resp.json()["observation"]["content"] == "user found"
+
+
+def test_public_play_step_ceiling_returns_429() -> None:
+    client = _public_client(PublicPlayLimiter(PublicPlayLimits(max_total_steps=1)))
+    session_id = client.post("/public/world_models/airline/sessions", json={}).json()["session_id"]
+    assert client.post(f"/public/sessions/{session_id}/step", json=_message("a")).status_code == 200
+    capped = client.post(f"/public/sessions/{session_id}/step", json=_message("b"))
+    assert capped.status_code == 429
+
+
+def test_public_play_unknown_session_returns_404() -> None:
+    client = _public_client(PublicPlayLimiter())
+    resp = client.post("/public/sessions/nope/step", json=_message("a"))
+    assert resp.status_code == 404
+
+
+def test_public_play_session_ceiling_returns_429() -> None:
+    client = _public_client(PublicPlayLimiter(PublicPlayLimits(max_sessions=1)))
+    assert client.post("/public/world_models/airline/sessions", json={}).status_code == 200
+    assert client.post("/public/world_models/airline/sessions", json={}).status_code == 429

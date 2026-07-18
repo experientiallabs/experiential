@@ -107,6 +107,7 @@ from wmh.scenarios import (
     build_scenario_set,
     verify_scenarios,
 )
+from wmh.serving.public_play import PublicPlayLimiter, PublicPlayLimits
 from wmh.serving.server import create_app
 from wmh.telemetry import (
     BuildTelemetryStats,
@@ -746,18 +747,35 @@ def serve(
         help="Serve with the online extras on: the build-measured winning config when the "
         "artifact has one, otherwise every extra it supports. Default: pure RAG.",
     ),
+    public_play: bool = typer.Option(
+        False,
+        "--public-play",
+        help="Expose /public/... routes for anonymous play, capped by a shared step ceiling "
+        "(bounds total spend). For the public catalog; do not enable for private serving.",
+    ),
+    public_max_steps: int = typer.Option(
+        500, help="Global step ceiling for --public-play across all anonymous sessions."
+    ),
 ) -> None:
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
     Serves every built model by default, or just the `--name` ones, from one or more roots
     (e.g. `--root .wmh --root examples/tau-bench`). Routes are namespaced:
-    `/world_models/{name}/sessions` and `.../step`.
+    `/world_models/{name}/sessions` and `.../step`. With `--public-play`, adds capped
+    `/public/...` routes for the anonymous catalog.
     """
     names = list(name) if name else None
+    limiter = (
+        PublicPlayLimiter(PublicPlayLimits(max_total_steps=public_max_steps))
+        if public_play
+        else None
+    )
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
     # not a traceback; load the models before uvicorn takes over the process.
     try:
-        server_app = create_app(list(root), names=names, max_fidelity=max_fidelity)
+        server_app = create_app(
+            list(root), names=names, max_fidelity=max_fidelity, public_play=limiter
+        )
     except (ValueError, FileNotFoundError) as err:
         raise typer.BadParameter(str(err)) from None
     uvicorn.run(server_app, host="127.0.0.1", port=port)

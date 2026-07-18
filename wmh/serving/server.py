@@ -33,6 +33,7 @@ from wmh.engine.loader import load_world_model
 from wmh.engine.world_model import WorldModel
 from wmh.optimize.reward import EpisodeScore
 from wmh.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
+from wmh.serving.public_play import PublicPlayLimiter, PublicPlayLimitError
 from wmh.serving.traces_source import (
     TRACES_FILENAME,
     TracesDownloader,
@@ -184,6 +185,7 @@ def create_app(
     cards: dict[str, ModelCard | None] | None = None,
     build_manager: BuildManager | None = None,
     max_fidelity: bool = False,
+    public_play: PublicPlayLimiter | None = None,
 ) -> FastAPI:
     """Build the FastAPI app serving one or more named WorldModels.
 
@@ -375,6 +377,43 @@ def create_app(
     def step(world_model_name: str, session_id: str, req: StepRequest) -> StepResponse:
         wm = _model_or_404(world_model_name)
         _session_or_404(wm, session_id)
+        observation = wm.step(session_id, req.action)
+        return StepResponse(observation=observation, state=wm.get_session(session_id).state)
+
+    # -- public (anonymous) play -------------------------------------------------------------------
+    # A logged-out visitor can step a public model live. These routes exist only when the server is
+    # started with --public-play; a shared limiter caps total steps (bounding spend), per-session
+    # steps, and session count, returning 429 at the ceiling. Sessions are unenriched so anonymous
+    # play never feeds the shared retrieval buffer.
+    def _public_or_404() -> PublicPlayLimiter:
+        if public_play is None:
+            raise HTTPException(status_code=404, detail="public play is not enabled on this server")
+        return public_play
+
+    @app.post("/public/world_models/{world_model_name}/sessions", response_model=NewSessionResponse)
+    def public_new_session(world_model_name: str, req: NewSessionRequest) -> NewSessionResponse:
+        limiter = _public_or_404()
+        wm = _model_or_404(world_model_name)
+        session = wm.new_session(task=req.task, seed_state=req.seed_state, enrich=False)
+        try:
+            limiter.open_session(world_model_name, session.id)
+        except PublicPlayLimitError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        return NewSessionResponse(session_id=session.id, state=session.state)
+
+    @app.post("/public/sessions/{session_id}/step", response_model=StepResponse)
+    def public_step(session_id: str, req: StepRequest) -> StepResponse:
+        limiter = _public_or_404()
+        name = limiter.model_for_session(session_id)
+        if name is None:
+            raise HTTPException(status_code=404, detail="unknown or expired public session")
+        wm = _model_or_404(name)
+        _session_or_404(wm, session_id)
+        try:
+            # Charged before the model call, so a refused step spends nothing.
+            limiter.charge_step(session_id)
+        except PublicPlayLimitError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         observation = wm.step(session_id, req.action)
         return StepResponse(observation=observation, state=wm.get_session(session_id).state)
 
