@@ -22,6 +22,8 @@ from llm_waterfall.types import (
     ChatMessage,
     ChatUsage,
 )
+from openai.types.completion_usage import CompletionUsage
+from openai.types.responses.response_usage import ResponseUsage
 from pydantic import ValidationError
 
 from wmh.providers.base import (
@@ -1628,6 +1630,67 @@ def test_budgeted_chat_accepts_a_consistent_derived_total_token_field(tmp_path: 
     assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
 
 
+def test_budgeted_chat_accepts_openai_sdk_null_usage_detail_placeholders(
+    tmp_path: Path,
+) -> None:
+    sdk_usage = CompletionUsage(
+        prompt_tokens=11,
+        completion_tokens=7,
+        total_tokens=18,
+    ).model_dump(mode="json")
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(chat_usage=ChatUsage.model_validate(sdk_usage)),
+        ids=iter(["chat-sdk-null-details"]),
+    )
+
+    provider.complete_chat(
+        ChatRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+            max_completion_tokens=20,
+        )
+    )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
+
+
+def test_budgeted_chat_accepts_responses_sdk_null_usage_detail_placeholders(
+    tmp_path: Path,
+) -> None:
+    sdk_usage = ResponseUsage.model_construct(
+        input_tokens=11,
+        input_tokens_details=None,
+        output_tokens=7,
+        output_tokens_details=None,
+        total_tokens=18,
+    ).model_dump(mode="json")
+    chat_usage = ChatUsage.model_validate(
+        {
+            "prompt_tokens": sdk_usage.pop("input_tokens"),
+            "completion_tokens": sdk_usage.pop("output_tokens"),
+            **sdk_usage,
+        }
+    )
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(chat_usage=chat_usage),
+        ids=iter(["responses-sdk-null-details"]),
+    )
+
+    provider.complete_chat(
+        ChatRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+            max_completion_tokens=20,
+        )
+    )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
+
+
 def test_budgeted_chat_rejects_a_non_numeric_derived_total_token_field(tmp_path: Path) -> None:
     provider, ledger = _budgeted_provider(
         tmp_path,
@@ -1640,6 +1703,33 @@ def test_budgeted_chat_rejects_a_non_numeric_derived_total_token_field(tmp_path:
     )
 
     with pytest.raises(UnpricedProviderUsageError, match="total_tokens"):
+        provider.complete_chat(
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hello")],
+                max_completion_tokens=20,
+            )
+        )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+
+
+def test_budgeted_chat_rejects_an_unknown_null_usage_dimension(tmp_path: Path) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            chat_usage=ChatUsage.model_validate(
+                {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "future_billable_tokens": None,
+                }
+            )
+        ),
+        ids=iter(["chat-unknown-null-dimension"]),
+    )
+
+    with pytest.raises(UnpricedProviderUsageError, match="future_billable_tokens"):
         provider.complete_chat(
             ChatRequest(
                 messages=[ChatMessage(role="user", content="hello")],
@@ -1670,6 +1760,34 @@ def test_budgeted_text_forfeits_before_settlement_on_unpriced_usage_dimensions(
     [reservation] = ledger.reservations()
     assert reservation.status is ReservationStatus.FORFEITED
     assert reservation.failure_type == "UnpricedUsage"
+
+
+def test_budgeted_text_accepts_openai_sdk_null_usage_detail_placeholders(
+    tmp_path: Path,
+) -> None:
+    sdk_usage = CompletionUsage(
+        prompt_tokens=4,
+        completion_tokens=2,
+        total_tokens=6,
+    ).model_dump(mode="json")
+    text_usage = TokenUsage.model_validate(
+        {
+            "input_tokens": sdk_usage.pop("prompt_tokens"),
+            "output_tokens": sdk_usage.pop("completion_tokens"),
+            **sdk_usage,
+        }
+    )
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(text_usage=text_usage),
+        ids=iter(["text-sdk-null-details"]),
+    )
+
+    provider.complete("", [Message(role="user", content="hello")], max_tokens=10)
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 4 * 2 + 2 * 5
 
 
 def test_budgeted_chat_ceiling_dominates_both_compatibility_token_fields(

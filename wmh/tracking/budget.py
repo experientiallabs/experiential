@@ -53,6 +53,14 @@ _NANO_USD_PER_USD = 1_000_000_000
 _TOKENS_PER_MILLION = 1_000_000
 _SQLITE_INTEGER_MAX = (1 << 63) - 1
 _FAILURE_CODE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_KNOWN_NULL_USAGE_DETAIL_PLACEHOLDERS = frozenset(
+    {
+        "completion_tokens_details",
+        "input_tokens_details",
+        "output_tokens_details",
+        "prompt_tokens_details",
+    }
+)
 
 
 class BudgetExceededError(RuntimeError):
@@ -1984,7 +1992,15 @@ class BudgetedProvider:
         output_field: str,
     ) -> None:
         """Forfeit and stop when a response exposes dimensions absent from the tariff."""
-        extras = dict(usage.model_extra or {})
+        # OpenAI's typed SDK models predeclare these detail objects and serialize an omitted
+        # object as ``None``. A null container reports no usage dimension, so it is safe to drop.
+        # Keep every populated detail object and every unknown field, including unknown nulls,
+        # so a new or semantically present billing dimension still fails closed.
+        extras = {
+            name: value
+            for name, value in (usage.model_extra or {}).items()
+            if not (name in _KNOWN_NULL_USAGE_DETAIL_PLACEHOLDERS and value is None)
+        }
         total_present = "total_tokens" in extras
         total = extras.pop("total_tokens", None)
         input_tokens = getattr(usage, input_field)
