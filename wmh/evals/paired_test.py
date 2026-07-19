@@ -61,21 +61,22 @@ def _outcomes(
     ]
 
 
-def test_schedule_is_deterministic_complete_and_balanced_with_odd_attempts() -> None:
-    design = _design(attempts=5)
-    repeated = _design(attempts=5)
+def test_schedule_is_deterministic_complete_and_balanced_across_tasks() -> None:
+    task_ids = tuple(f"task-{index}" for index in range(5))
+    design = _design(task_ids=task_ids, attempts=3)
+    repeated = _design(task_ids=task_ids, attempts=3)
 
     assert design == repeated
     assert design.digest == repeated.digest
-    assert len(design.blocks) == 4 * 3 * 5
-    grouped: Counter[tuple[str, str, PairedArm]] = Counter(
-        (block.task_id, block.panel_member, block.first_arm) for block in design.blocks
-    )
-    for task_id in design.task_ids:
-        for member in design.panel_members:
-            baseline_first = grouped[(task_id, member, PairedArm.BASELINE)]
-            candidate_first = grouped[(task_id, member, PairedArm.CANDIDATE)]
-            assert abs(baseline_first - candidate_first) == 1
+    assert len(design.blocks) == 5 * 3 * 3
+    for member in design.panel_members:
+        first_arm_by_task: dict[str, set[PairedArm]] = {}
+        for block in design.blocks:
+            if block.panel_member == member:
+                first_arm_by_task.setdefault(block.task_id, set()).add(block.first_arm)
+        assert all(len(arms) == 1 for arms in first_arm_by_task.values())
+        counts = Counter(next(iter(arms)) for arms in first_arm_by_task.values())
+        assert abs(counts[PairedArm.BASELINE] - counts[PairedArm.CANDIDATE]) == 1
 
 
 def test_schedule_supports_predeclared_member_specific_attempt_counts() -> None:
