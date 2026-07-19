@@ -1491,6 +1491,10 @@ def _validate_settlement_event(
                 BudgetBreachKind.OUTPUT_TOKEN_CEILING,
             }:
                 raise BudgetIntegrityError("timed resource settlement uses a token breach kind")
+            if action.usage_quantity < meter.billing_quantum_seconds:
+                raise BudgetIntegrityError(
+                    "timed resource settlement must include at least one billing quantum"
+                )
             if action.usage_quantity % meter.billing_quantum_seconds:
                 raise BudgetIntegrityError(
                     "timed resource settlement is not aligned to its billing quantum"

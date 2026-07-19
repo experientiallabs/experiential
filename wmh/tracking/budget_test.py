@@ -356,6 +356,13 @@ def test_ledger_rejects_settlement_that_differs_from_frozen_tariff(
             usage_quantity=60,
             usage_unit="billing_second",
         )
+    with pytest.raises(BudgetIntegrityError, match="at least one billing quantum"):
+        resource_ledger.settle(
+            "resource-1",
+            charged_nano_usd=0,
+            usage_quantity=0,
+            usage_unit="billing_second",
+        )
 
     assert provider_ledger.reservations()[0].status is ReservationStatus.RESERVED
     assert resource_ledger.reservations()[0].status is ReservationStatus.RESERVED
