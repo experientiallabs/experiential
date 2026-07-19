@@ -9,8 +9,8 @@ import json
 import multiprocessing
 import os
 from collections import Counter, defaultdict
-from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -37,6 +37,7 @@ from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.evals.paired import (
     BoundedMeanBet,
     PairedArm,
+    PairedBlock,
     PairedEvaluationDesign,
     PairedPanelPlan,
     PairedTaskPlan,
@@ -171,6 +172,19 @@ def _provider() -> ProviderConfig:
         kind=ProviderKind.BEDROCK,
         model="worker-model",
         region="us-west-2",
+    )
+
+
+def _slice_policy(
+    *,
+    max_new_blocks: int = 4,
+    max_concurrent_waves: int = 4,
+) -> mod.PairedHarborSlicePolicy:
+    return mod.PairedHarborSlicePolicy(
+        max_new_blocks=max_new_blocks,
+        max_concurrent_waves=max_concurrent_waves,
+        max_block_runtime_s=900,
+        max_invocation_runtime_s=7_200,
     )
 
 
@@ -309,6 +323,57 @@ def test_execution_plan_admits_long_official_task_timeout_with_e2b_runner_lease(
     assert plan.create_rate_policy.minimum_spacing_ns == 250_000_000
 
 
+def test_slice_policy_is_path_free_and_fails_closed_on_unsafe_runtime_bounds(
+    tmp_path: Path,
+) -> None:
+    policy = mod.PairedHarborSlicePolicy(
+        max_new_blocks=24,
+        max_concurrent_waves=1,
+        max_block_runtime_s=28_800,
+        max_invocation_runtime_s=82_800,
+    )
+
+    assert policy.digest.startswith("sha256:")
+    assert "path" not in policy.model_dump(mode="json")
+    with pytest.raises(ValueError, match="less than or equal to 82800"):
+        mod.PairedHarborSlicePolicy(
+            max_new_blocks=1,
+            max_concurrent_waves=1,
+            max_block_runtime_s=1,
+            max_invocation_runtime_s=86_400,
+        )
+    with pytest.raises(ValueError, match="waves exceed"):
+        mod.PairedHarborSlicePolicy(
+            max_new_blocks=2,
+            max_concurrent_waves=2,
+            max_block_runtime_s=1_000,
+            max_invocation_runtime_s=1_999,
+        )
+
+    below_two_arms = mod.PairedHarborSlicePolicy(
+        max_new_blocks=1,
+        max_concurrent_waves=1,
+        max_block_runtime_s=599,
+        max_invocation_runtime_s=1_000,
+    )
+    with pytest.raises(ValueError, match="below two frozen arm timeouts"):
+        _runner(tmp_path / "arm-timeout", _candidate(), slice_policy=below_two_arms)
+
+    above_capacity = mod.PairedHarborSlicePolicy(
+        max_new_blocks=3,
+        max_concurrent_waves=2,
+        max_block_runtime_s=900,
+        max_invocation_runtime_s=2_000,
+    )
+    with pytest.raises(ValueError, match="exceeds its frozen concurrency waves"):
+        _runner(
+            tmp_path / "capacity",
+            _candidate(),
+            max_concurrent_blocks=1,
+            slice_policy=above_capacity,
+        )
+
+
 def test_confirmation_selection_is_a_deterministic_projection_of_full_roster() -> None:
     """Opening can select qualified entries but cannot supply a free-form task spec."""
     candidate = _candidate()
@@ -394,6 +459,7 @@ def test_preopen_commitment_derives_exact_design_and_selection_after_open(
         panel_routes=routes,
         qualification_roster=roster,
         max_concurrent_blocks=4,
+        slice_policy=_slice_policy(),
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_runtime=budget,
     )
@@ -495,6 +561,7 @@ def test_typed_commitment_digest_controls_candidate_freeze_and_one_shot_open(
         panel_routes=routes,
         qualification_roster=roster,
         max_concurrent_blocks=1,
+        slice_policy=_slice_policy(),
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_runtime=budget,
     )
@@ -593,6 +660,7 @@ def test_candidate_freeze_rejects_wrong_full_qualification_roster_before_persist
         panel_routes=routes,
         qualification_roster=wrong_roster,
         max_concurrent_blocks=1,
+        slice_policy=_slice_policy(),
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_runtime=budget,
     )
@@ -617,6 +685,7 @@ def test_candidate_freeze_rejects_wrong_full_qualification_roster_before_persist
         panel_routes=routes,
         qualification_roster=correct_roster,
         max_concurrent_blocks=1,
+        slice_policy=_slice_policy(),
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_runtime=budget,
     )
@@ -724,6 +793,7 @@ def _preopen_commitment(
     roster: mod.PrequalifiedHarborRoster,
     max_concurrent_blocks: int,
     budget: mod.PairedHarborBudgetRuntime,
+    slice_policy: mod.PairedHarborSlicePolicy | None = None,
 ) -> mod.HarborConfirmationExecutionCommitment:
     return mod.HarborConfirmationExecutionCommitment.freeze(
         discovery=_discovery(),
@@ -734,6 +804,7 @@ def _preopen_commitment(
         panel_routes=routes,
         qualification_roster=roster,
         max_concurrent_blocks=max_concurrent_blocks,
+        slice_policy=slice_policy or _slice_policy(),
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_runtime=budget,
     )
@@ -883,6 +954,7 @@ def test_preopen_commitment_rejects_budget_route_name_drift(tmp_path: Path) -> N
             panel_routes=routes,
             qualification_roster=roster,
             max_concurrent_blocks=1,
+            slice_policy=_slice_policy(),
             retry_policy_digest=_RETRY_POLICY_DIGEST,
             budget_runtime=drifted_budget,
         )
@@ -917,6 +989,7 @@ def test_preopen_commitment_rejects_provider_meter_route_drift(tmp_path: Path) -
             panel_routes=drifted_routes,
             qualification_roster=roster,
             max_concurrent_blocks=1,
+            slice_policy=_slice_policy(),
             retry_policy_digest=_RETRY_POLICY_DIGEST,
             budget_runtime=budget,
         )
@@ -966,6 +1039,7 @@ def test_preopen_commitment_rejects_incomplete_e2b_resource_meters(
             panel_routes=routes,
             qualification_roster=roster,
             max_concurrent_blocks=1,
+            slice_policy=_slice_policy(),
             retry_policy_digest=_RETRY_POLICY_DIGEST,
             budget_runtime=budget,
         )
@@ -1085,6 +1159,16 @@ def _runner(
         updates.pop("qualified_tasks", _qualifications()),
     )
     max_concurrent_blocks = cast("int", updates.pop("max_concurrent_blocks", 4))
+    slice_policy = cast(
+        "mod.PairedHarborSlicePolicy",
+        updates.pop(
+            "slice_policy",
+            _slice_policy(
+                max_new_blocks=len(design.blocks),
+                max_concurrent_waves=len(design.blocks),
+            ),
+        ),
+    )
     if updates:
         raise AssertionError(f"unsupported paired test helper updates: {sorted(updates)}")
     plan = mod.HarborExecutionPlan.freeze(
@@ -1107,6 +1191,7 @@ def _runner(
         roster=roster,
         max_concurrent_blocks=max_concurrent_blocks,
         budget=budget_runtime,
+        slice_policy=slice_policy,
     )
     confirmation = (
         _confirmation(candidate, confirmation_protocol_digest=commitment.digest)
@@ -1347,6 +1432,312 @@ def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
         assert provider.model_dump() == _provider().model_dump()
 
 
+def test_bounded_slices_complete_across_restarts_without_replaying_pairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=1)
+    first_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    first_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+
+    first = asyncio.run(first_runner.run_slice(baseline=baseline, candidate=candidate))
+
+    assert first.report is None
+    assert first.progress.selected_blocks == (_design().blocks[0], _design().blocks[2])
+    assert first.progress.completed_block_count == 2
+    assert first.progress.remaining_block_count == 2
+    assert len(first_calls) == 4
+
+    second_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    second_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    second = asyncio.run(second_runner.run_slice(baseline=baseline, candidate=candidate))
+
+    assert second.report is not None
+    assert second.progress.selected_blocks == (_design().blocks[1], _design().blocks[3])
+    assert second.progress.completed_block_count == len(_design().blocks)
+    assert second.progress.remaining_block_count == 0
+    assert second.progress.previous_progress_digest == first.progress.progress_digest
+    assert len(second_calls) == 4
+    assert tuple(item.block for item in second.report.evidence) == _design().blocks
+
+    late_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    late = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+
+    assert late.progress == second.progress
+    assert late.report == second.report
+    assert late_calls == []
+
+
+def test_each_slice_holds_one_operation_lease_through_all_block_leases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=1)
+
+    class RecordingCoordinator:
+        def __init__(self) -> None:
+            self.active = False
+            self.operation_entries = 0
+            self.operation_exits = 0
+            self.block_entries = 0
+
+        @asynccontextmanager
+        async def operation_lease(
+            self,
+            *,
+            protocol_digest: str,
+            operation_id: str,
+        ) -> AsyncIterator[None]:
+            assert protocol_digest.startswith("sha256:")
+            assert operation_id == "offline-test-operation"
+            assert not self.active
+            self.active = True
+            self.operation_entries += 1
+            try:
+                yield
+            finally:
+                self.active = False
+                self.operation_exits += 1
+
+        @asynccontextmanager
+        async def block_lease(
+            self,
+            *,
+            protocol_digest: str,
+            block: PairedBlock,
+            max_concurrent_blocks: int,
+            max_concurrent_route_blocks: int,
+        ) -> AsyncIterator[None]:
+            assert self.active
+            assert protocol_digest.startswith("sha256:")
+            assert block in _design().blocks
+            assert max_concurrent_blocks == 4
+            assert max_concurrent_route_blocks == 2
+            self.block_entries += 1
+            yield
+
+    coordinator = RecordingCoordinator()
+    for _ in range(2):
+        _install_fake_evaluator(monkeypatch, candidate=candidate)
+        asyncio.run(
+            _runner(
+                tmp_path,
+                candidate,
+                baseline=baseline,
+                slice_policy=policy,
+                durable_coordinator=coordinator,
+            ).run_slice(baseline=baseline, candidate=candidate)
+        )
+
+    assert coordinator.operation_entries == 2
+    assert coordinator.operation_exits == 2
+    assert coordinator.block_entries == len(_design().blocks)
+    assert not coordinator.active
+
+
+def test_partial_final_slice_is_smaller_and_analysis_waits_for_complete_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=3, max_concurrent_waves=2)
+    calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    real_analyze = mod.analyze_paired_outcomes
+
+    def reject_partial_analysis(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("partial paired evidence reached final analysis")
+
+    monkeypatch.setattr(mod, "analyze_paired_outcomes", reject_partial_analysis)
+    first = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(
+            baseline=baseline,
+            candidate=candidate,
+            max_new_blocks=3,
+        )
+    )
+    assert first.report is None
+    assert len(first.progress.selected_blocks) == 3
+    assert len(calls) == 6
+
+    monkeypatch.setattr(mod, "analyze_paired_outcomes", real_analyze)
+    final_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    final = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+
+    assert final.report is not None
+    assert final.progress.selected_blocks == (_design().blocks[-1],)
+    assert len(final_calls) == 2
+
+
+def test_slice_crash_requires_pair_retry_and_never_replays_completed_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=2)
+    failed_calls, _ = _install_fake_evaluator(
+        monkeypatch,
+        candidate=candidate,
+        fail_job=4,
+    )
+    first_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+        slice_policy=policy,
+    )
+
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(first_runner.run_slice(baseline=baseline, candidate=candidate))
+    assert len(failed_calls) == 4
+    first_block = first_runner._protocol.design.blocks[0]
+    failed_block = first_runner._protocol.design.blocks[1]
+    assert (
+        mod._read_pair_generation_state(first_runner._pair_state_path(first_block)).status
+        == "complete"
+    )
+    failed_state = mod._read_pair_generation_state(first_runner._pair_state_path(failed_block))
+    assert failed_state.status == "failed"
+
+    mod.authorize_paired_harbor_pair_retry(
+        jobs_dir=first_runner._runtime.jobs_dir,
+        protocol=first_runner._protocol,
+        operation_id="offline-test-operation",
+        failed_state=failed_state,
+    )
+    retry_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    resumed = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            generation_id=2,
+            max_concurrent_blocks=1,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+
+    assert resumed.report is None
+    assert resumed.progress.completed_block_count == 3
+    assert resumed.progress.selected_blocks == _design().blocks[1:3]
+    assert len(retry_calls) == 4
+    completion_generations = {
+        item.block: item.generation_id for item in resumed.progress.completed_blocks
+    }
+    assert completion_generations[first_block] == 1
+    assert completion_generations[failed_block] == 2
+
+    final_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    final = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            generation_id=2,
+            max_concurrent_blocks=1,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+    assert final.report is not None
+    assert len(final_calls) == 2
+
+
+def test_slice_rejects_policy_progress_and_generation_drift_before_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=1)
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    first_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    first = asyncio.run(first_runner.run_slice(baseline=baseline, candidate=candidate))
+
+    with pytest.raises(ValueError, match="execution semantics|slice policy digest"):
+        mod.PairedHarborProtocol.model_validate(
+            first_runner._protocol.model_copy(
+                update={"slice_policy_digest": "sha256:" + "f" * 64}
+            ).model_dump()
+        )
+    with pytest.raises(ValueError, match="within the frozen slice policy"):
+        asyncio.run(
+            first_runner.run_slice(
+                baseline=baseline,
+                candidate=candidate,
+                max_new_blocks=3,
+            )
+        )
+
+    generation_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    with pytest.raises(mod.PartialPairedHarborReuseError, match="generation.*retry"):
+        asyncio.run(
+            _runner(
+                tmp_path,
+                candidate,
+                baseline=baseline,
+                generation_id=2,
+                slice_policy=policy,
+            ).run_slice(baseline=baseline, candidate=candidate)
+        )
+    assert generation_calls == []
+
+    progress_path = first_runner._progress_record_path(first.progress)
+    progress_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress_payload["progress_digest"] = "sha256:" + "e" * 64
+    progress_path.write_text(json.dumps(progress_payload), encoding="utf-8")
+    progress_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    with pytest.raises(mod.PairedHarborProgressStateError, match="progress"):
+        asyncio.run(
+            _runner(
+                tmp_path,
+                candidate,
+                baseline=baseline,
+                slice_policy=policy,
+            ).run_slice(baseline=baseline, candidate=candidate)
+        )
+    assert progress_calls == []
+
+
 def test_job_names_are_deterministic_and_bind_each_arm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1571,6 +1962,7 @@ def test_protocol_digest_binds_budget_authority_and_nonsecret_execution_inputs(
         panel_routes=(changed_route,),
         qualification_roster=first.qualification_roster,
         max_concurrent_blocks=4,
+        slice_policy=_slice_policy(),
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_runtime=first_budget,
     )

@@ -26,6 +26,7 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    StrictBool,
     StrictInt,
     TypeAdapter,
     ValidationError,
@@ -121,6 +122,7 @@ class _CreateRateKwargs(TypedDict, total=False):
 
 PAIRED_HARBOR_PROTOCOL_VERSION: Literal["9"] = "9"
 PAIRED_HARBOR_RUN_VERSION: Literal["10"] = "10"
+MAX_RESUMABLE_INVOCATION_RUNTIME_S = 82_800
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -408,6 +410,48 @@ class PairedHarborPanelRoute(BaseModel):
                 "paired scored receipts currently support Bedrock and OpenAI-shaped routes"
             )
         return self
+
+
+class PairedHarborSlicePolicy(BaseModel):
+    """Path-free bounds for one resumable paired execution invocation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    policy_version: Literal["1"] = "1"
+    max_new_blocks: StrictInt = Field(ge=1)
+    max_concurrent_waves: StrictInt = Field(ge=1)
+    max_block_runtime_s: StrictInt = Field(ge=1)
+    max_invocation_runtime_s: StrictInt = Field(
+        ge=1,
+        le=MAX_RESUMABLE_INVOCATION_RUNTIME_S,
+    )
+    selection_order: Literal["frozen-design-order"] = "frozen-design-order"
+    completion_boundary: Literal["complete-paired-block"] = "complete-paired-block"
+    analysis_boundary: Literal["complete-frozen-matrix"] = "complete-frozen-matrix"
+
+    @field_validator(
+        "max_new_blocks",
+        "max_concurrent_waves",
+        "max_block_runtime_s",
+        "max_invocation_runtime_s",
+        mode="before",
+    )
+    @classmethod
+    def _reject_boolean_limits(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("paired slice limits cannot be boolean")
+        return value
+
+    @model_validator(mode="after")
+    def _require_bounded_invocation(self) -> Self:
+        if self.max_block_runtime_s * self.max_concurrent_waves > (self.max_invocation_runtime_s):
+            raise ValueError("paired slice waves exceed the frozen invocation runtime limit")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return the path-free slicing and completion identity."""
+        return _canonical_digest(self.model_dump(mode="json"))
 
 
 class PairedHarborBudgetRuntime(BaseModel):
@@ -866,7 +910,7 @@ class HarborConfirmationExecutionCommitment(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    commitment_version: Literal["1"] = "1"
+    commitment_version: Literal["2"] = "2"
     discovery: DiscoveryPartition
     partition_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation_commitment: str = Field(pattern=_DIGEST_PATTERN)
@@ -883,6 +927,8 @@ class HarborConfirmationExecutionCommitment(BaseModel):
     qualification_roster_digest: str = Field(pattern=_DIGEST_PATTERN)
     max_concurrent_blocks: StrictInt = Field(ge=1)
     same_task_concurrency: Literal[1] = 1
+    slice_policy: PairedHarborSlicePolicy
+    slice_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
@@ -910,6 +956,16 @@ class HarborConfirmationExecutionCommitment(BaseModel):
             raise ValueError("pre-open commitment qualification roster digest is inconsistent")
         if self.qualification_roster.execution_plan_digest != self.execution_plan.digest:
             raise ValueError("pre-open qualification roster differs from its execution plan")
+        if self.slice_policy_digest != self.slice_policy.digest:
+            raise ValueError("pre-open slice policy digest is inconsistent")
+        if self.slice_policy.max_new_blocks > (
+            self.max_concurrent_blocks * self.slice_policy.max_concurrent_waves
+        ):
+            raise ValueError("pre-open slice exceeds its frozen concurrency waves")
+        if self.slice_policy.max_block_runtime_s < math.ceil(
+            2 * self.execution_plan.turn_timeout_s
+        ):
+            raise ValueError("pre-open slice block runtime is below two frozen arm timeouts")
         if self.baseline_execution_digest == self.candidate_execution_digest:
             raise ValueError("pre-open baseline and candidate must differ")
         routes = tuple(route.panel_member for route in self.panel_routes)
@@ -977,6 +1033,7 @@ class HarborConfirmationExecutionCommitment(BaseModel):
         panel_routes: tuple[PairedHarborPanelRoute, ...],
         qualification_roster: PrequalifiedHarborRoster,
         max_concurrent_blocks: int,
+        slice_policy: PairedHarborSlicePolicy,
         retry_policy_digest: str,
         budget_runtime: PairedHarborBudgetRuntime,
     ) -> HarborConfirmationExecutionCommitment:
@@ -987,6 +1044,7 @@ class HarborConfirmationExecutionCommitment(BaseModel):
         )
         frozen_plan = HarborExecutionPlan.model_validate(execution_plan.model_dump())
         frozen_roster = PrequalifiedHarborRoster.model_validate(qualification_roster.model_dump())
+        frozen_slice_policy = PairedHarborSlicePolicy.model_validate(slice_policy.model_dump())
         frozen_budget = PairedHarborBudgetRuntime.model_validate(budget_runtime.model_dump())
         routes = tuple(
             sorted(
@@ -1035,6 +1093,8 @@ class HarborConfirmationExecutionCommitment(BaseModel):
             qualification_roster=frozen_roster,
             qualification_roster_digest=frozen_roster.digest,
             max_concurrent_blocks=max_concurrent_blocks,
+            slice_policy=frozen_slice_policy,
+            slice_policy_digest=frozen_slice_policy.digest,
             retry_policy_digest=retry_policy_digest,
             budget_policy_digest=frozen_budget.policy.policy_digest,
             budget_ledger_identity=frozen_budget.ledger_identity,
@@ -1183,6 +1243,8 @@ class PairedHarborProtocol(BaseModel):
     opened_selection_digest: str = Field(pattern=_DIGEST_PATTERN)
     max_concurrent_blocks: StrictInt = Field(ge=1)
     same_task_concurrency: Literal[1] = 1
+    slice_policy: PairedHarborSlicePolicy
+    slice_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     arm_route_expectations: tuple[PairedHarborArmRouteExpectation, ...]
     retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -1217,6 +1279,8 @@ class PairedHarborProtocol(BaseModel):
             or self.qualification_roster != commitment.qualification_roster
             or self.max_concurrent_blocks != commitment.max_concurrent_blocks
             or self.same_task_concurrency != commitment.same_task_concurrency
+            or self.slice_policy != commitment.slice_policy
+            or self.slice_policy_digest != commitment.slice_policy_digest
             or self.retry_policy_digest != commitment.retry_policy_digest
             or self.budget_policy_digest != commitment.budget_policy_digest
             or self.budget_ledger_identity != commitment.budget_ledger_identity
@@ -1225,6 +1289,8 @@ class PairedHarborProtocol(BaseModel):
             raise ValueError("paired Harbor execution semantics drifted after pre-open commitment")
         if self.design_digest != self.design.digest:
             raise ValueError("paired Harbor protocol design digest differs from its design")
+        if self.slice_policy_digest != self.slice_policy.digest:
+            raise ValueError("paired Harbor slice policy digest is inconsistent")
         if self.confirmation_protocol_digest != _confirmation_protocol_digest(self.confirmation):
             raise ValueError("paired Harbor confirmation protocol digest is inconsistent")
         if _confirmation_candidate_digest(self.confirmation) != self.candidate_execution_digest:
@@ -1446,6 +1512,8 @@ class PairedHarborProtocol(BaseModel):
             opened_selection=frozen_selection,
             opened_selection_digest=frozen_selection.digest,
             max_concurrent_blocks=max_concurrent_blocks,
+            slice_policy=frozen_commitment.slice_policy,
+            slice_policy_digest=frozen_commitment.slice_policy_digest,
             arm_route_expectations=tuple(route_expectations),
             retry_policy_digest=retry_policy_digest,
             budget_policy_digest=frozen_commitment.budget_policy_digest,
@@ -1571,6 +1639,139 @@ class PairedHarborBlockEvidence(BaseModel):
         return _canonical_digest(self.model_dump(mode="json"))
 
 
+class PairedHarborCompletedBlock(BaseModel):
+    """Compact durable identity for one completed paired block."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    block: PairedBlock
+    generation_id: StrictInt = Field(ge=1)
+    pair_generation_id: str = Field(pattern=_DIGEST_PATTERN)
+    evidence_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator("generation_id", mode="before")
+    @classmethod
+    def _reject_boolean_generation(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("completed block generation cannot be boolean")
+        return value
+
+
+class PairedHarborSliceProgress(BaseModel):
+    """Append-only, path-free progress evidence for one completed invocation slice."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    progress_version: Literal["1"] = "1"
+    protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    slice_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    operation_id: str = Field(min_length=1, max_length=256)
+    invocation_generation_id: StrictInt = Field(ge=1)
+    slice_index: StrictInt = Field(ge=1)
+    requested_max_new_blocks: StrictInt = Field(ge=1)
+    previous_progress_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    completed_before: tuple[PairedHarborCompletedBlock, ...]
+    selected_blocks: tuple[PairedBlock, ...]
+    completed_blocks: tuple[PairedHarborCompletedBlock, ...]
+    expected_block_count: StrictInt = Field(ge=1)
+    completed_block_count: StrictInt = Field(ge=0)
+    remaining_block_count: StrictInt = Field(ge=0)
+    complete: StrictBool
+    progress_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator(
+        "invocation_generation_id",
+        "slice_index",
+        "requested_max_new_blocks",
+        "expected_block_count",
+        "completed_block_count",
+        "remaining_block_count",
+        mode="before",
+    )
+    @classmethod
+    def _reject_boolean_counts(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("paired slice progress counts cannot be boolean")
+        return value
+
+    @field_validator("operation_id")
+    @classmethod
+    def _require_operation_id(cls, value: str) -> str:
+        return _validate_operation_id(value)
+
+    @model_validator(mode="after")
+    def _validate_progress(self) -> Self:
+        before_blocks = tuple(item.block for item in self.completed_before)
+        completed_blocks = tuple(item.block for item in self.completed_blocks)
+        if len(before_blocks) != len(set(before_blocks)):
+            raise ValueError("paired slice prior completion evidence contains duplicate blocks")
+        if len(self.selected_blocks) != len(set(self.selected_blocks)):
+            raise ValueError("paired slice selection contains duplicate blocks")
+        if len(completed_blocks) != len(set(completed_blocks)):
+            raise ValueError("paired slice completion evidence contains duplicate blocks")
+        if set(before_blocks) & set(self.selected_blocks):
+            raise ValueError("paired slice selection repeats a previously completed block")
+        before_by_block = {item.block: item for item in self.completed_before}
+        completed_by_block = {item.block: item for item in self.completed_blocks}
+        if any(completed_by_block.get(block) != item for block, item in before_by_block.items()):
+            raise ValueError("paired slice completion evidence rewrites prior completed blocks")
+        if set(completed_blocks) != set(before_blocks) | set(self.selected_blocks):
+            raise ValueError("paired slice completed blocks differ from prior plus selection")
+        if len(self.selected_blocks) > self.requested_max_new_blocks:
+            raise ValueError("paired slice selected more blocks than requested")
+        if self.completed_block_count != len(self.completed_blocks):
+            raise ValueError("paired slice completed block count is inconsistent")
+        if self.expected_block_count != (self.completed_block_count + self.remaining_block_count):
+            raise ValueError("paired slice expected block count is inconsistent")
+        if self.complete != (self.remaining_block_count == 0):
+            raise ValueError("paired slice completion flag is inconsistent")
+        expected_digest = _canonical_digest(
+            self.model_dump(mode="json", exclude={"progress_digest"})
+        )
+        if self.progress_digest != expected_digest:
+            raise ValueError("paired slice progress digest is inconsistent")
+        return self
+
+    def require_protocol(self, protocol: PairedHarborProtocol) -> None:
+        """Validate this progress snapshot against the exact frozen protocol."""
+        if (
+            self.protocol_digest != protocol.digest
+            or self.slice_policy_digest != protocol.slice_policy_digest
+            or self.expected_block_count != len(protocol.design.blocks)
+            or self.requested_max_new_blocks > protocol.slice_policy.max_new_blocks
+        ):
+            raise ValueError("paired slice progress differs from its frozen protocol")
+        design_index = {block: index for index, block in enumerate(protocol.design.blocks)}
+        for items, label in (
+            (self.completed_before, "prior completion"),
+            (self.completed_blocks, "completion"),
+        ):
+            blocks = tuple(item.block for item in items)
+            if any(block not in design_index for block in blocks):
+                raise ValueError(f"paired slice {label} contains a foreign block")
+            if blocks != tuple(sorted(blocks, key=design_index.__getitem__)):
+                raise ValueError(f"paired slice {label} blocks are not in frozen order")
+            for item in items:
+                expected_pair_id = paired_harbor_pair_generation_id(
+                    protocol_digest=self.protocol_digest,
+                    operation_id=self.operation_id,
+                    generation_id=item.generation_id,
+                    block=item.block,
+                )
+                if (
+                    item.generation_id > self.invocation_generation_id
+                    or item.pair_generation_id != expected_pair_id
+                ):
+                    raise ValueError(f"paired slice {label} has generation drift")
+        expected_selection = _select_paired_harbor_slice_blocks(
+            protocol,
+            completed_blocks=frozenset(item.block for item in self.completed_before),
+            max_new_blocks=self.requested_max_new_blocks,
+        )
+        if self.selected_blocks != expected_selection:
+            raise ValueError("paired slice selection differs from frozen deterministic order")
+
+
 class PairedHarborRunReport(BaseModel):
     """Reload-safe paired execution evidence plus its predeclared statistical analysis."""
 
@@ -1583,6 +1784,7 @@ class PairedHarborRunReport(BaseModel):
     generation_id: StrictInt = Field(ge=1)
     retry_authorizations: tuple[PairedHarborPairRetryAuthorization, ...] = ()
     evidence: tuple[PairedHarborBlockEvidence, ...]
+    completion_progress: PairedHarborSliceProgress
     analysis: PairedAnalysisReport
 
     @field_validator("operation_id")
@@ -1601,11 +1803,21 @@ class PairedHarborRunReport(BaseModel):
     def _validate_complete_report(self) -> Self:
         if self.protocol_digest != self.protocol.digest:
             raise ValueError("paired Harbor report protocol digest is inconsistent")
+        self.completion_progress.require_protocol(self.protocol)
+        if (
+            not self.completion_progress.complete
+            or self.completion_progress.operation_id != self.operation_id
+            or self.completion_progress.invocation_generation_id != self.generation_id
+        ):
+            raise ValueError("paired Harbor report lacks final matching progress evidence")
         expected_blocks = tuple(self.protocol.design.blocks)
         if tuple(item.block for item in self.evidence) != expected_blocks:
             raise ValueError("paired Harbor evidence does not contain the exact frozen blocks")
 
         evidence_by_block = {item.block: item for item in self.evidence}
+        progress_by_block = {item.block: item for item in self.completion_progress.completed_blocks}
+        if tuple(progress_by_block) != expected_blocks:
+            raise ValueError("paired Harbor final progress omits frozen blocks")
         authorization_keys = tuple(
             (item.block, item.from_generation_id) for item in self.retry_authorizations
         )
@@ -1731,6 +1943,14 @@ class PairedHarborRunReport(BaseModel):
             raise ValueError(
                 "paired Harbor report reuses an E2B resource across independent arm jobs"
             )
+        for item in self.evidence:
+            progress_item = progress_by_block[item.block]
+            if (
+                progress_item.generation_id != item.generation_id
+                or progress_item.pair_generation_id != item.pair_generation_id
+                or progress_item.evidence_digest != item.digest
+            ):
+                raise ValueError("paired Harbor final progress differs from admitted evidence")
 
         recomputed = analyze_paired_outcomes(
             self.protocol.design,
@@ -1744,6 +1964,24 @@ class PairedHarborRunReport(BaseModel):
     def digest(self) -> str:
         """Return the canonical identity of all paired run evidence."""
         return _canonical_digest(self.model_dump(mode="json"))
+
+
+class PairedHarborSliceResult(BaseModel):
+    """One bounded invocation result, with final analysis only at full completion."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    result_version: Literal["1"] = "1"
+    progress: PairedHarborSliceProgress
+    report: PairedHarborRunReport | None = None
+
+    @model_validator(mode="after")
+    def _bind_report_to_completion(self) -> Self:
+        if self.progress.complete != (self.report is not None):
+            raise ValueError("paired slice report must exist exactly at full completion")
+        if self.report is not None and self.report.completion_progress != self.progress:
+            raise ValueError("paired slice report differs from its completion progress")
+        return self
 
 
 class PairedHarborMatrixError(RuntimeError):
@@ -1760,6 +1998,21 @@ class PairedHarborMatrixError(RuntimeError):
 
 class PartialPairedHarborReuseError(RuntimeError):
     """A pair generation cannot be safely resumed without explicit retry authority."""
+
+
+class PairedHarborIncompleteError(RuntimeError):
+    """A bounded invocation completed safely before the frozen matrix was complete."""
+
+    def __init__(self, progress: PairedHarborSliceProgress) -> None:
+        self.progress = progress
+        super().__init__(
+            "paired Harbor matrix is incomplete after one bounded slice; resume the same "
+            "operation and generation with run_slice"
+        )
+
+
+class PairedHarborProgressStateError(RuntimeError):
+    """Durable paired slice progress is unreadable, inconsistent, or non-monotone."""
 
 
 class ConcurrentPairedHarborRunError(RuntimeError):
@@ -1986,7 +2239,11 @@ class _LocalPairedHarborLeaseCoordinator:
 class _FairBlockScheduler:
     """Bounded route-round-robin queue with route caps and one active block per task."""
 
-    def __init__(self, protocol: PairedHarborProtocol) -> None:
+    def __init__(
+        self,
+        protocol: PairedHarborProtocol,
+        blocks: tuple[PairedBlock, ...],
+    ) -> None:
         self._routes = protocol.design.panel_members
         self._route_caps = {
             route.panel_member: route.max_concurrent_blocks for route in protocol.panel_routes
@@ -1994,9 +2251,9 @@ class _FairBlockScheduler:
         self._pending: dict[str, list[tuple[int, PairedBlock]]] = {
             member: [] for member in self._routes
         }
-        for index, block in enumerate(protocol.design.blocks):
+        for index, block in enumerate(blocks):
             self._pending[block.panel_member].append((index, block))
-        self._pending_count = len(protocol.design.blocks)
+        self._pending_count = len(blocks)
         self._active_count = 0
         self._active_by_route = Counter[str]()
         self._active_tasks: set[str] = set()
@@ -2133,7 +2390,112 @@ class PairedHarborRunner:
         baseline: HarnessDoc,
         candidate: HarnessDoc,
     ) -> PairedHarborRunReport:
-        """Execute the exact frozen matrix; any non-admissible block invalidates the report."""
+        """Run one frozen slice and require that it completes the exact matrix."""
+        result = await self.run_slice(baseline=baseline, candidate=candidate)
+        if result.report is None:
+            raise PairedHarborIncompleteError(result.progress)
+        return result.report
+
+    async def run_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+        max_new_blocks: int | None = None,
+    ) -> PairedHarborSliceResult:
+        """Run a deterministic bounded subset and persist complete-block progress."""
+        requested = (
+            self._protocol.slice_policy.max_new_blocks if max_new_blocks is None else max_new_blocks
+        )
+        if (
+            isinstance(requested, bool)
+            or not isinstance(requested, int)
+            or requested < 1
+            or requested > self._protocol.slice_policy.max_new_blocks
+        ):
+            raise ValueError(
+                "max_new_blocks must be a positive integer within the frozen slice policy"
+            )
+        self._require_runtime_protocol(baseline=baseline, candidate=candidate)
+
+        async with self._lease_coordinator.operation_lease(
+            protocol_digest=self._protocol.digest,
+            operation_id=self._operation_id,
+        ):
+            progress_chain = self._load_progress_chain()
+            generation_by_block, retry_authorizations = self._plan_pair_generations()
+            if self._generation_id > 1 and not any(
+                item.to_generation_id == self._generation_id for item in retry_authorizations
+            ):
+                raise PartialPairedHarborReuseError(
+                    "paired Harbor operation generation can advance only through exact pair "
+                    "retry authority"
+                )
+            completed_before = self._load_completed_blocks(generation_by_block)
+            self._validate_progress_against_evidence(
+                progress_chain,
+                completed=completed_before,
+            )
+            selected = _select_paired_harbor_slice_blocks(
+                self._protocol,
+                completed_blocks=frozenset(completed_before),
+                max_new_blocks=requested,
+            )
+            newly_completed: tuple[PairedHarborBlockEvidence, ...] = ()
+            if selected:
+                newly_completed = await self._run_fair_matrix(
+                    baseline=baseline,
+                    candidate=candidate,
+                    generation_by_block=generation_by_block,
+                    blocks=selected,
+                )
+            completed_after = {**completed_before}
+            completed_after.update({item.block: item for item in newly_completed})
+
+            latest = progress_chain[-1] if progress_chain else None
+            if (
+                not selected
+                and latest is not None
+                and self._progress_matches_evidence(latest, completed_after)
+            ):
+                progress = latest
+            else:
+                progress = self._create_progress(
+                    requested_max_new_blocks=requested,
+                    selected_blocks=selected,
+                    completed_before=completed_before,
+                    completed_after=completed_after,
+                    previous=latest,
+                )
+                self._persist_progress(progress)
+
+            report: PairedHarborRunReport | None = None
+            if progress.complete:
+                evidence = tuple(completed_after[block] for block in self._protocol.design.blocks)
+                analysis = analyze_paired_outcomes(
+                    self._protocol.design,
+                    [item.outcome for item in evidence],
+                )
+                report = PairedHarborRunReport(
+                    run_version=PAIRED_HARBOR_RUN_VERSION,
+                    protocol=self._protocol,
+                    protocol_digest=self._protocol.digest,
+                    operation_id=self._operation_id,
+                    generation_id=self._generation_id,
+                    retry_authorizations=retry_authorizations,
+                    evidence=evidence,
+                    completion_progress=progress,
+                    analysis=analysis,
+                )
+            return PairedHarborSliceResult(progress=progress, report=report)
+
+    def _require_runtime_protocol(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> None:
+        """Reconstruct every caller-supplied arm input before side effects."""
         reconstructed = PairedHarborProtocol.freeze(
             preopen_commitment=self._protocol.preopen_commitment,
             design=self._protocol.design,
@@ -2150,37 +2512,186 @@ class PairedHarborRunner:
         if reconstructed != self._protocol:
             raise ValueError("runtime inputs do not reconstruct the frozen paired Harbor protocol")
 
-        async with self._lease_coordinator.operation_lease(
-            protocol_digest=self._protocol.digest,
-            operation_id=self._operation_id,
-        ):
-            generation_by_block, retry_authorizations = self._plan_pair_generations()
-            evidence = await self._run_fair_matrix(
-                baseline=baseline,
-                candidate=candidate,
-                generation_by_block=generation_by_block,
+    def _load_completed_blocks(
+        self,
+        generation_by_block: dict[PairedBlock, int],
+    ) -> dict[PairedBlock, PairedHarborBlockEvidence]:
+        """Reload all immutable completed blocks in frozen design order."""
+        completed: dict[PairedBlock, PairedHarborBlockEvidence] = {}
+        for block in self._protocol.design.blocks:
+            state = self._inspect_pair_generation(
+                block,
+                generation_id=generation_by_block[block],
+                create=False,
+                allow_incomplete=True,
             )
+            if state is not None and state.status == "complete":
+                completed[block] = self._load_complete_pair_generation(state)
+        return completed
+
+    def _create_progress(
+        self,
+        *,
+        requested_max_new_blocks: int,
+        selected_blocks: tuple[PairedBlock, ...],
+        completed_before: dict[PairedBlock, PairedHarborBlockEvidence],
+        completed_after: dict[PairedBlock, PairedHarborBlockEvidence],
+        previous: PairedHarborSliceProgress | None,
+    ) -> PairedHarborSliceProgress:
+        """Create one canonical progress snapshot from admitted pair evidence."""
+        before = self._completed_progress_entries(completed_before)
+        completed = self._completed_progress_entries(completed_after)
+        payload = {
+            "progress_version": "1",
+            "protocol_digest": self._protocol.digest,
+            "slice_policy_digest": self._protocol.slice_policy_digest,
+            "operation_id": self._operation_id,
+            "invocation_generation_id": self._generation_id,
+            "slice_index": 1 if previous is None else previous.slice_index + 1,
+            "requested_max_new_blocks": requested_max_new_blocks,
+            "previous_progress_digest": (None if previous is None else previous.progress_digest),
+            "completed_before": tuple(item.model_dump(mode="json") for item in before),
+            "selected_blocks": tuple(block.model_dump(mode="json") for block in selected_blocks),
+            "completed_blocks": tuple(item.model_dump(mode="json") for item in completed),
+            "expected_block_count": len(self._protocol.design.blocks),
+            "completed_block_count": len(completed),
+            "remaining_block_count": len(self._protocol.design.blocks) - len(completed),
+            "complete": len(completed) == len(self._protocol.design.blocks),
+        }
+        progress = PairedHarborSliceProgress.model_validate(
+            {**payload, "progress_digest": _canonical_digest(payload)}
+        )
+        progress.require_protocol(self._protocol)
+        return progress
+
+    def _completed_progress_entries(
+        self,
+        evidence_by_block: dict[PairedBlock, PairedHarborBlockEvidence],
+    ) -> tuple[PairedHarborCompletedBlock, ...]:
+        return tuple(
+            PairedHarborCompletedBlock(
+                block=block,
+                generation_id=evidence_by_block[block].generation_id,
+                pair_generation_id=evidence_by_block[block].pair_generation_id,
+                evidence_digest=evidence_by_block[block].digest,
+            )
+            for block in self._protocol.design.blocks
+            if block in evidence_by_block
+        )
+
+    def _load_progress_chain(self) -> tuple[PairedHarborSliceProgress, ...]:
+        """Load and validate the append-only operation progress chain."""
+        directory = self._progress_directory()
+        if not os.path.lexists(directory):
+            return ()
+        if directory.is_symlink() or not directory.is_dir():
+            raise PairedHarborProgressStateError(
+                "paired Harbor progress directory must be a regular directory"
+            )
+        records: list[PairedHarborSliceProgress] = []
+        for path in sorted(directory.iterdir()):
+            if path.is_symlink() or not path.is_file():
+                raise PairedHarborProgressStateError(
+                    "paired Harbor progress directory contains an unsafe entry"
+                )
+            progress = _read_paired_harbor_slice_progress(path)
             try:
-                analysis = analyze_paired_outcomes(
-                    self._protocol.design,
-                    [item.outcome for item in evidence],
+                progress.require_protocol(self._protocol)
+            except ValueError as exc:
+                raise PairedHarborProgressStateError(
+                    "paired Harbor progress differs from its frozen protocol"
+                ) from exc
+            if (
+                progress.operation_id != self._operation_id
+                or progress.invocation_generation_id > self._generation_id
+                or path != self._progress_record_path(progress)
+            ):
+                raise PairedHarborProgressStateError(
+                    "paired Harbor progress has operation, generation, or path drift"
                 )
-                return PairedHarborRunReport(
-                    run_version=PAIRED_HARBOR_RUN_VERSION,
-                    protocol=self._protocol,
-                    protocol_digest=self._protocol.digest,
-                    operation_id=self._operation_id,
-                    generation_id=self._generation_id,
-                    retry_authorizations=retry_authorizations,
-                    evidence=evidence,
-                    analysis=analysis,
-                )
-            except BaseException:
-                for item in evidence:
-                    self._fail_pair_generation(
-                        _read_pair_generation_state(self._pair_state_path(item.block))
+            records.append(progress)
+
+        previous: PairedHarborSliceProgress | None = None
+        for progress in records:
+            if previous is None:
+                if progress.slice_index != 1 or progress.previous_progress_digest is not None:
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor progress chain lacks a canonical genesis"
                     )
-                raise
+            else:
+                if (
+                    progress.slice_index != previous.slice_index + 1
+                    or progress.previous_progress_digest != previous.progress_digest
+                    or progress.invocation_generation_id < previous.invocation_generation_id
+                ):
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor progress chain is non-contiguous"
+                    )
+                previous_completed = {item.block: item for item in previous.completed_blocks}
+                current_before = {item.block: item for item in progress.completed_before}
+                if any(
+                    current_before.get(block) != item for block, item in previous_completed.items()
+                ):
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor progress chain rewrites completed evidence"
+                    )
+                if previous.complete:
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor progress continues after complete evidence"
+                    )
+            previous = progress
+        return tuple(records)
+
+    def _validate_progress_against_evidence(
+        self,
+        progress_chain: tuple[PairedHarborSliceProgress, ...],
+        *,
+        completed: dict[PairedBlock, PairedHarborBlockEvidence],
+    ) -> None:
+        if not progress_chain:
+            return
+        latest = progress_chain[-1]
+        actual = {item.block: item for item in self._completed_progress_entries(completed)}
+        if any(
+            actual.get(block) != item
+            for block, item in {entry.block: entry for entry in latest.completed_blocks}.items()
+        ):
+            raise PairedHarborProgressStateError(
+                "paired Harbor progress differs from immutable pair evidence"
+            )
+
+    def _progress_matches_evidence(
+        self,
+        progress: PairedHarborSliceProgress,
+        completed: dict[PairedBlock, PairedHarborBlockEvidence],
+    ) -> bool:
+        return progress.completed_blocks == self._completed_progress_entries(completed)
+
+    def _progress_directory(self) -> Path:
+        token = _lease_token("progress", self._protocol.digest, self._operation_id)
+        return self._runtime.jobs_dir / ".wmh-paired-progress" / token
+
+    def _progress_record_path(self, progress: PairedHarborSliceProgress) -> Path:
+        """Return the deterministic host path for one immutable progress snapshot."""
+        return self._progress_directory() / (
+            f"{progress.slice_index:08d}-{progress.progress_digest.removeprefix('sha256:')}.json"
+        )
+
+    def _persist_progress(self, progress: PairedHarborSliceProgress) -> None:
+        path = self._progress_record_path(progress)
+        if os.path.lexists(path):
+            if _read_paired_harbor_slice_progress(path) != progress:
+                raise PairedHarborProgressStateError(
+                    "paired Harbor progress path contains different evidence"
+                )
+            return
+        try:
+            _create_immutable_json_record(
+                path,
+                progress.model_dump_json(indent=2) + "\n",
+            )
+        except PairedHarborPairStateError as exc:
+            raise PairedHarborProgressStateError(str(exc)) from exc
 
     async def _run_fair_matrix(
         self,
@@ -2188,11 +2699,30 @@ class PairedHarborRunner:
         baseline: HarnessDoc,
         candidate: HarnessDoc,
         generation_by_block: dict[PairedBlock, int],
+        blocks: tuple[PairedBlock, ...],
     ) -> tuple[PairedHarborBlockEvidence, ...]:
-        scheduler = _FairBlockScheduler(self._protocol)
-        results: list[PairedHarborBlockEvidence | None] = [
-            None for _ in self._protocol.design.blocks
-        ]
+        completed: dict[PairedBlock, PairedHarborBlockEvidence] = {}
+        for wave in _partition_paired_harbor_slice_waves(self._protocol, blocks):
+            evidence = await self._run_fair_wave(
+                baseline=baseline,
+                candidate=candidate,
+                generation_by_block=generation_by_block,
+                blocks=wave,
+            )
+            completed.update({item.block: item for item in evidence})
+        return tuple(completed[block] for block in blocks)
+
+    async def _run_fair_wave(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+        generation_by_block: dict[PairedBlock, int],
+        blocks: tuple[PairedBlock, ...],
+    ) -> tuple[PairedHarborBlockEvidence, ...]:
+        """Execute one conflict-free wave under the frozen concurrency limits."""
+        scheduler = _FairBlockScheduler(self._protocol, blocks)
+        results: list[PairedHarborBlockEvidence | None] = [None for _ in blocks]
         failures: list[tuple[PairedBlock, BaseException]] = []
         evaluator_session = HarborEvaluatorSession(
             runner_spec=self._protocol.execution_plan.runner_spec
@@ -2223,7 +2753,7 @@ class PairedHarborRunner:
 
         worker_count = min(
             self._protocol.max_concurrent_blocks,
-            len(self._protocol.design.blocks),
+            len(blocks),
         )
         try:
             async with asyncio.TaskGroup() as workers:
@@ -2232,10 +2762,10 @@ class PairedHarborRunner:
         except* _StopPairedHarborWorkers:
             pass
         if failures:
-            failures.sort(key=lambda item: self._protocol.design.blocks.index(item[0]))
+            failures.sort(key=lambda item: blocks.index(item[0]))
             raise PairedHarborMatrixError(failures)
         evidence = tuple(item for item in results if item is not None)
-        if len(evidence) != len(self._protocol.design.blocks):
+        if len(evidence) != len(blocks):
             raise RuntimeError("paired Harbor runner lost a block result")
         return evidence
 
@@ -2997,6 +3527,90 @@ def _pair_retry_authorization(
     )
 
 
+def _select_paired_harbor_slice_blocks(
+    protocol: PairedHarborProtocol,
+    *,
+    completed_blocks: frozenset[PairedBlock],
+    max_new_blocks: int,
+) -> tuple[PairedBlock, ...]:
+    """Select the next bounded blocks solely from frozen order and durable completion."""
+    if (
+        isinstance(max_new_blocks, bool)
+        or not isinstance(max_new_blocks, int)
+        or max_new_blocks < 1
+        or max_new_blocks > protocol.slice_policy.max_new_blocks
+    ):
+        raise ValueError("slice selection limit differs from the frozen policy")
+    design_blocks = frozenset(protocol.design.blocks)
+    if not completed_blocks <= design_blocks:
+        raise ValueError("slice completion contains a block outside the frozen design")
+
+    wave_blocks: list[list[PairedBlock]] = [
+        [] for _ in range(protocol.slice_policy.max_concurrent_waves)
+    ]
+    wave_tasks: list[set[str]] = [set() for _ in wave_blocks]
+    wave_routes: list[Counter[str]] = [Counter() for _ in wave_blocks]
+    route_limits = {
+        route.panel_member: route.max_concurrent_blocks for route in protocol.panel_routes
+    }
+    selected: list[PairedBlock] = []
+    for block in protocol.design.blocks:
+        if block in completed_blocks:
+            continue
+        wave_index = next(
+            (
+                index
+                for index, items in enumerate(wave_blocks)
+                if len(items) < protocol.max_concurrent_blocks
+                and block.task_id not in wave_tasks[index]
+                and wave_routes[index][block.panel_member] < route_limits[block.panel_member]
+            ),
+            None,
+        )
+        if wave_index is None:
+            continue
+        wave_blocks[wave_index].append(block)
+        wave_tasks[wave_index].add(block.task_id)
+        wave_routes[wave_index][block.panel_member] += 1
+        selected.append(block)
+        if len(selected) >= max_new_blocks:
+            break
+    return tuple(selected)
+
+
+def _partition_paired_harbor_slice_waves(
+    protocol: PairedHarborProtocol,
+    blocks: tuple[PairedBlock, ...],
+) -> tuple[tuple[PairedBlock, ...], ...]:
+    """Reconstruct the fixed bounded waves for an already-selected block subset."""
+    selected = _select_paired_harbor_slice_blocks(
+        protocol,
+        completed_blocks=frozenset(protocol.design.blocks) - frozenset(blocks),
+        max_new_blocks=max(1, len(blocks)),
+    )
+    if selected != blocks:
+        raise ValueError("paired slice blocks cannot be scheduled within frozen waves")
+
+    waves: list[list[PairedBlock]] = [[] for _ in range(protocol.slice_policy.max_concurrent_waves)]
+    tasks: list[set[str]] = [set() for _ in waves]
+    routes: list[Counter[str]] = [Counter() for _ in waves]
+    route_limits = {
+        route.panel_member: route.max_concurrent_blocks for route in protocol.panel_routes
+    }
+    for block in blocks:
+        wave_index = next(
+            index
+            for index, items in enumerate(waves)
+            if len(items) < protocol.max_concurrent_blocks
+            and block.task_id not in tasks[index]
+            and routes[index][block.panel_member] < route_limits[block.panel_member]
+        )
+        waves[wave_index].append(block)
+        tasks[wave_index].add(block.task_id)
+        routes[wave_index][block.panel_member] += 1
+    return tuple(tuple(wave) for wave in waves if wave)
+
+
 def paired_harbor_job_name(
     *,
     protocol_digest: str,
@@ -3127,6 +3741,19 @@ def _read_pair_retry_authorization(path: Path) -> PairedHarborPairRetryAuthoriza
     except (OSError, UnicodeDecodeError, ValidationError) as exc:
         raise PairedHarborPairStateError(
             f"paired Harbor retry authorization is unreadable or invalid: {path}"
+        ) from exc
+
+
+def _read_paired_harbor_slice_progress(path: Path) -> PairedHarborSliceProgress:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborProgressStateError(
+            f"paired Harbor progress must be a regular file: {path}"
+        )
+    try:
+        return PairedHarborSliceProgress.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborProgressStateError(
+            f"paired Harbor progress is unreadable or invalid: {path}"
         ) from exc
 
 
