@@ -28,9 +28,9 @@ from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.trial.network_policy import resolve_trial_network_plan
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from wmh.core.file_lease import exclusive_posix_file_lease
 from wmh.core.text import validate_durable_text
 from wmh.core.types import JsonObject
-from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.agent import (
     HarborTaskEnvironmentAttestation,
     WmhPiAgent,

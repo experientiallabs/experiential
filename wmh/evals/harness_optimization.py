@@ -16,18 +16,23 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from wmh.core.text import validate_durable_text
-from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.paired_runner import (
+    HarborConfirmationExecutionCommitment,
+    HarborExecutionPlan,
+    OpenedHarborExecutionSelection,
+    PairedHarborBudgetRuntime,
     PairedHarborPanelRoute,
     PairedHarborProtocol,
     PairedHarborRunReport,
-    QualifiedHarborTask,
+    PrequalifiedHarborRoster,
 )
 from wmh.evals.paired import (
     BoundedMeanBet,
     PairedEvaluationDesign,
     PairedPanelPlan,
+    PairedTaskPlan,
 )
+from wmh.evals.paired_commitment import PairedEvaluationDesignTemplate
 from wmh.evals.partition import (
     BenchmarkPartitionManifest,
     CandidateFreezeRecord,
@@ -36,6 +41,13 @@ from wmh.evals.partition import (
     PartitionControlStore,
     freeze_confirmation_candidate,
     open_confirmation_once,
+)
+from wmh.evals.study_journal import StudyPhase
+from wmh.evals.study_lifecycle import (
+    CandidatePublishedPayload,
+    ConfirmationOpenedPayload,
+    DiscoveryRunningPayload,
+    StudyLifecycleController,
 )
 from wmh.harness.create import (
     CreateProgress,
@@ -46,7 +58,6 @@ from wmh.harness.create import (
 )
 from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc, SurfaceKind
-from wmh.harness.pi_local import validate_pi_container_image
 from wmh.harness.proposer import DeltaProposer
 from wmh.harness.scoring import HarnessScorer
 
@@ -130,13 +141,12 @@ class ConfirmationDecisionRule(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     panel: tuple[PairedPanelPlan, ...]
-    bounded_mean_bets: tuple[BoundedMeanBet, ...]
+    primary_e_value_bets: tuple[BoundedMeanBet, ...]
     schedule_seed: str = Field(min_length=1)
     analysis_seed: str = Field(min_length=1)
     randomization_samples: StrictInt = Field(ge=999)
     alpha: float = Field(default=0.05, gt=0.0, lt=1.0)
-    minimum_panel_delta: float = Field(ge=-1.0, le=1.0)
-    minimum_member_delta: float = Field(ge=-1.0, le=1.0)
+    minimum_equal_task_member_delta: float = Field(ge=-1.0, le=1.0)
     noninferiority_margin: float = Field(ge=0.0, le=1.0)
 
     @field_validator("randomization_samples", mode="before")
@@ -148,8 +158,7 @@ class ConfirmationDecisionRule(BaseModel):
 
     @field_validator(
         "alpha",
-        "minimum_panel_delta",
-        "minimum_member_delta",
+        "minimum_equal_task_member_delta",
         "noninferiority_margin",
         mode="before",
     )
@@ -171,27 +180,32 @@ class ConfirmationDecisionRule(BaseModel):
     def _validate_rule(self) -> Self:
         if not self.panel:
             raise ValueError("confirmation panel cannot be empty")
-        if not self.bounded_mean_bets:
+        if not self.primary_e_value_bets:
             raise ValueError("confirmation bounded-mean bet mixture cannot be empty")
         members = tuple(item.panel_member for item in self.panel)
         if members != tuple(sorted(set(members))):
             raise ValueError("confirmation panel must be unique and in canonical order")
         return self
 
-    def create_design(self, task_ids: tuple[str, ...]) -> PairedEvaluationDesign:
-        """Create the exact balanced schedule only after held-out identities open."""
-        return PairedEvaluationDesign.create(
-            task_ids=task_ids,
+    def template(self) -> PairedEvaluationDesignTemplate:
+        """Return the task-blind statistical commitment used before opening."""
+        return PairedEvaluationDesignTemplate(
             panel=self.panel,
-            bounded_mean_bets=self.bounded_mean_bets,
+            primary_e_value_bets=self.primary_e_value_bets,
             schedule_seed=self.schedule_seed,
             analysis_seed=self.analysis_seed,
             randomization_samples=self.randomization_samples,
             alpha=self.alpha,
-            minimum_panel_delta=self.minimum_panel_delta,
-            minimum_member_delta=self.minimum_member_delta,
+            minimum_equal_task_member_delta=self.minimum_equal_task_member_delta,
             noninferiority_margin=self.noninferiority_margin,
         )
+
+    def create_design(
+        self,
+        tasks: tuple[PairedTaskPlan, ...],
+    ) -> PairedEvaluationDesign:
+        """Create the exact balanced schedule only after held-out identities open."""
+        return self.template().derive(tasks=tasks)
 
 
 class HarnessOptimizationProtocol(BaseModel):
@@ -211,13 +225,16 @@ class HarnessOptimizationProtocol(BaseModel):
     candidate_policy: CandidateChangePolicy
     confirmation: ConfirmationDecisionRule
     panel_routes: tuple[PairedHarborPanelRoute, ...]
-    environment_backend: HarborEnvironmentBackend = HarborEnvironmentBackend.LOCAL
-    runner_image: str = Field(min_length=1)
-    reward_key: str = Field(min_length=1, max_length=512)
-    turn_timeout_s: float = Field(gt=0.0)
+    execution_plan: HarborExecutionPlan
+    qualification_roster_digest: str = Field(pattern=_DIGEST_PATTERN)
     max_concurrent_blocks: StrictInt = Field(ge=1)
     retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
-    budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    search_cost_binding_digest: str = Field(pattern=_DIGEST_PATTERN)
+    confirmation_budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    confirmation_budget_ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
+    confirmation_budget_binding_digest: str = Field(pattern=_DIGEST_PATTERN)
+    create_rate_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    confirmation_slice_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
 
     @classmethod
     def create(
@@ -232,13 +249,14 @@ class HarnessOptimizationProtocol(BaseModel):
         candidate_policy: CandidateChangePolicy,
         confirmation: ConfirmationDecisionRule,
         panel_routes: tuple[PairedHarborPanelRoute, ...],
-        environment_backend: HarborEnvironmentBackend = HarborEnvironmentBackend.LOCAL,
-        runner_image: str,
-        reward_key: str,
-        turn_timeout_s: float,
+        execution_plan: HarborExecutionPlan,
+        qualification_roster: PrequalifiedHarborRoster,
         max_concurrent_blocks: int,
         retry_policy_digest: str,
-        budget_policy_digest: str,
+        search_cost_binding_digest: str,
+        confirmation_budget: PairedHarborBudgetRuntime,
+        create_rate_policy_digest: str,
+        confirmation_slice_policy_digest: str,
     ) -> HarnessOptimizationProtocol:
         """Freeze the public contract from a still-private benchmark partition."""
         expected_roster_digest = _partition_roster_digest(partition)
@@ -246,6 +264,19 @@ class HarnessOptimizationProtocol(BaseModel):
             raise ValueError(
                 "benchmark provenance roster_digest differs from the frozen partition roster"
             )
+        frozen_plan = HarborExecutionPlan.model_validate(execution_plan.model_dump(mode="json"))
+        frozen_roster = PrequalifiedHarborRoster.model_validate(
+            qualification_roster.model_dump(mode="json")
+        )
+        frozen_budget = PairedHarborBudgetRuntime.model_validate(
+            confirmation_budget.model_dump(mode="json")
+        )
+        if frozen_roster.execution_plan_digest != frozen_plan.digest:
+            raise ValueError("qualified roster differs from the optimization execution plan")
+        expected_tasks = {task.task_id: task.content_digest for task in partition.tasks}
+        qualified_tasks = {task.task_id: task.content_digest for task in frozen_roster.tasks}
+        if qualified_tasks != expected_tasks:
+            raise ValueError("qualified roster differs from the optimization benchmark roster")
         return cls(
             experiment_id=experiment_id,
             protocol_id=protocol_id,
@@ -258,13 +289,16 @@ class HarnessOptimizationProtocol(BaseModel):
             candidate_policy=candidate_policy,
             confirmation=confirmation,
             panel_routes=tuple(sorted(panel_routes, key=lambda item: item.panel_member)),
-            environment_backend=environment_backend,
-            runner_image=runner_image,
-            reward_key=reward_key,
-            turn_timeout_s=turn_timeout_s,
+            execution_plan=frozen_plan,
+            qualification_roster_digest=frozen_roster.digest,
             max_concurrent_blocks=max_concurrent_blocks,
             retry_policy_digest=retry_policy_digest,
-            budget_policy_digest=budget_policy_digest,
+            search_cost_binding_digest=search_cost_binding_digest,
+            confirmation_budget_policy_digest=frozen_budget.policy.policy_digest,
+            confirmation_budget_ledger_identity=frozen_budget.ledger_identity,
+            confirmation_budget_binding_digest=frozen_budget.binding_digest,
+            create_rate_policy_digest=create_rate_policy_digest,
+            confirmation_slice_policy_digest=confirmation_slice_policy_digest,
         )
 
     @property
@@ -277,7 +311,6 @@ class HarnessOptimizationProtocol(BaseModel):
         for label, value in (
             ("experiment_id", self.experiment_id),
             ("protocol_id", self.protocol_id),
-            ("reward_key", self.reward_key),
         ):
             if value != value.strip():
                 raise ValueError(f"{label} cannot have surrounding whitespace")
@@ -292,7 +325,6 @@ class HarnessOptimizationProtocol(BaseModel):
         expected_members = tuple(item.panel_member for item in self.confirmation.panel)
         if route_members != expected_members:
             raise ValueError("worker routes must exactly match the canonical confirmation panel")
-        validate_pi_container_image(self.runner_image)
         return self
 
 
@@ -313,6 +345,8 @@ class PreparedHarnessOptimizationStudy(BaseModel):
     protocol: HarnessOptimizationProtocol
     partition: BenchmarkPartitionManifest
     baseline: HarnessDoc
+    qualification_roster: PrequalifiedHarborRoster
+    confirmation_budget: PairedHarborBudgetRuntime
 
     @model_validator(mode="after")
     def _validate_prepared_state(self) -> Self:
@@ -331,6 +365,19 @@ class PreparedHarnessOptimizationStudy(BaseModel):
             raise ValueError("baseline differs from the optimization protocol")
         if self.baseline.runtime_kind() != "pi-node":
             raise ValueError("harness optimization currently requires a pi-node baseline")
+        if self.qualification_roster.digest != self.protocol.qualification_roster_digest:
+            raise ValueError("qualified roster differs from the optimization protocol")
+        if self.qualification_roster.execution_plan_digest != self.protocol.execution_plan.digest:
+            raise ValueError("qualified roster differs from the optimization execution plan")
+        if (
+            self.confirmation_budget.policy.policy_digest
+            != self.protocol.confirmation_budget_policy_digest
+            or self.confirmation_budget.ledger_identity
+            != self.protocol.confirmation_budget_ledger_identity
+            or self.confirmation_budget.binding_digest
+            != self.protocol.confirmation_budget_binding_digest
+        ):
+            raise ValueError("confirmation budget differs from the optimization protocol")
         return self
 
     def discovery_contract(self) -> HarnessOptimizationDiscoveryContract:
@@ -346,16 +393,22 @@ class FrozenHarnessOptimizationCandidate(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    study_protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     checkpoint_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     baseline: HarnessDoc
     candidate: HarnessDoc
+    confirmation_commitment: HarborConfirmationExecutionCommitment
     freeze_record: CandidateFreezeRecord
 
     @model_validator(mode="after")
     def _validate_frozen_candidate(self) -> Self:
-        if self.freeze_record.confirmation_protocol_digest != self.protocol_digest:
-            raise ValueError("candidate freeze record differs from the optimization protocol")
+        if self.freeze_record.confirmation_protocol_digest != self.confirmation_commitment.digest:
+            raise ValueError("candidate freeze record differs from the confirmation commitment")
+        if (
+            self.confirmation_commitment.candidate_execution_digest
+            != self.candidate.execution_digest
+        ):
+            raise ValueError("confirmation commitment differs from the selected harness")
         if self.freeze_record.candidate_execution_digest != self.candidate.execution_digest:
             raise ValueError("candidate freeze record differs from the selected harness")
         if self.freeze_record.selection_evidence_digest != self.checkpoint_payload_digest:
@@ -372,13 +425,14 @@ class OpenedHarnessOptimizationConfirmation(BaseModel):
     baseline: HarnessDoc
     candidate: HarnessDoc
     freeze_record: CandidateFreezeRecord
+    confirmation_commitment: HarborConfirmationExecutionCommitment
     confirmation: ConfirmationPartition
     design: PairedEvaluationDesign
 
     @model_validator(mode="after")
     def _validate_opened_confirmation(self) -> Self:
-        if self.confirmation.confirmation_protocol_digest != self.protocol.digest:
-            raise ValueError("opened confirmation differs from the optimization protocol")
+        if self.confirmation.confirmation_protocol_digest != self.confirmation_commitment.digest:
+            raise ValueError("opened confirmation differs from the confirmation commitment")
         if self.confirmation.candidate_execution_digest != self.candidate.execution_digest:
             raise ValueError("opened confirmation differs from the frozen candidate")
         if self.confirmation.candidate_freeze_digest != self.freeze_record.digest:
@@ -387,6 +441,8 @@ class OpenedHarnessOptimizationConfirmation(BaseModel):
             raise ValueError("paired design differs from the opened confirmation task matrix")
         if self.design.panel != self.protocol.confirmation.panel:
             raise ValueError("paired design differs from the frozen confirmation panel")
+        if self.design != self.confirmation_commitment.derive_design(self.confirmation):
+            raise ValueError("paired design differs from the pre-open confirmation commitment")
         return self
 
 
@@ -396,10 +452,19 @@ class HarnessOptimizationMemberOutcome(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     panel_member: str = Field(min_length=1)
-    delta: float = Field(ge=-1.0, le=1.0)
-    simultaneous_lower_bound: float = Field(ge=-1.0, le=1.0)
+    equal_task_delta: float = Field(ge=-1.0, le=1.0)
+    primary_lower_bound: float = Field(ge=-1.0, le=1.0)
     minimum_required_delta: float = Field(ge=-1.0, le=1.0)
     passed: bool
+
+    @model_validator(mode="after")
+    def _validate_decision(self) -> Self:
+        expected = (
+            self.equal_task_delta >= self.minimum_required_delta and self.primary_lower_bound > 0.0
+        )
+        if self.passed != expected:
+            raise ValueError("optimization member decision differs from its frozen evidence")
+        return self
 
 
 class HarnessOptimizationOutcome(BaseModel):
@@ -412,9 +477,7 @@ class HarnessOptimizationOutcome(BaseModel):
     paired_report_digest: str = Field(pattern=_DIGEST_PATTERN)
     baseline_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
     candidate_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
-    panel_delta: float = Field(ge=-1.0, le=1.0)
-    minimum_required_panel_delta: float = Field(ge=-1.0, le=1.0)
-    panel_passed: bool
+    equal_task_panel_delta: float = Field(ge=-1.0, le=1.0)
     members: tuple[HarnessOptimizationMemberOutcome, ...]
     passed: bool
 
@@ -425,10 +488,7 @@ class HarnessOptimizationOutcome(BaseModel):
         names = tuple(item.panel_member for item in self.members)
         if names != tuple(sorted(set(names))):
             raise ValueError("optimization outcome members must be unique and canonical")
-        expected_panel = self.panel_delta >= self.minimum_required_panel_delta
-        if self.panel_passed != expected_panel:
-            raise ValueError("optimization outcome panel decision differs from its threshold")
-        if self.passed != (self.panel_passed and all(item.passed for item in self.members)):
+        if self.passed != all(item.passed for item in self.members):
             raise ValueError("optimization outcome decision differs from its frozen decisions")
         return self
 
@@ -438,12 +498,20 @@ def prepare_harness_optimization_study(
     protocol: HarnessOptimizationProtocol,
     partition: BenchmarkPartitionManifest,
     baseline: HarnessDoc,
+    qualification_roster: PrequalifiedHarborRoster,
+    confirmation_budget: PairedHarborBudgetRuntime,
 ) -> PreparedHarnessOptimizationStudy:
     """Validate and detach private study inputs before discovery can spend budget."""
     return PreparedHarnessOptimizationStudy(
         protocol=HarnessOptimizationProtocol.model_validate(protocol.model_dump(mode="json")),
         partition=BenchmarkPartitionManifest.model_validate(partition.model_dump(mode="json")),
         baseline=HarnessDoc.model_validate(baseline.model_dump(mode="json")),
+        qualification_roster=PrequalifiedHarborRoster.model_validate(
+            qualification_roster.model_dump(mode="json")
+        ),
+        confirmation_budget=PairedHarborBudgetRuntime.model_validate(
+            confirmation_budget.model_dump(mode="json")
+        ),
     )
 
 
@@ -452,6 +520,8 @@ def run_harness_optimization_search(
     *,
     scorer: HarnessScorer,
     proposer: DeltaProposer,
+    lifecycle: StudyLifecycleController,
+    authorization: DiscoveryRunningPayload,
     resume_from: SearchCheckpoint | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
@@ -462,25 +532,35 @@ def run_harness_optimization_search(
 ) -> SearchResult:
     """Run the predeclared discovery search without any held-out scorer or adaptive matrix."""
     study = HarnessOptimizationDiscoveryContract.model_validate(discovery.model_dump(mode="json"))
+    if (
+        authorization.protocol_digest != study.protocol.digest
+        or authorization.search_configuration_digest
+        != _canonical_digest(study.protocol.search.model_dump(mode="json"))
+    ):
+        raise ValueError("discovery authorization differs from the optimization protocol")
     _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
     plan = study.protocol.search
-    return search_harness(
-        plan.candidate_name,
-        study.baseline.model_copy(deep=True),
-        scorer,
-        proposer,
-        iterations=plan.iterations,
-        proposal_batch_size=plan.proposal_batch_size,
-        screen_proposals=plan.screen_proposals,
-        holdout_scorer=None,
-        confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
-        resume_from=resume_from,
-        on_progress=on_progress,
-        on_note=on_note,
-        on_proposal=on_proposal,
-        on_accept=on_accept,
-        on_checkpoint=on_checkpoint,
-        should_cancel=should_cancel,
+    return lifecycle.call_in_phase(
+        StudyPhase.DISCOVERY_RUNNING,
+        lambda: search_harness(
+            plan.candidate_name,
+            study.baseline.model_copy(deep=True),
+            scorer,
+            proposer,
+            iterations=plan.iterations,
+            proposal_batch_size=plan.proposal_batch_size,
+            screen_proposals=plan.screen_proposals,
+            holdout_scorer=None,
+            confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
+            resume_from=resume_from,
+            on_progress=on_progress,
+            on_note=on_note,
+            on_proposal=on_proposal,
+            on_accept=on_accept,
+            on_checkpoint=on_checkpoint,
+            should_cancel=should_cancel,
+        ),
+        payload_digest=authorization.digest,
     )
 
 
@@ -489,9 +569,17 @@ def freeze_harness_optimization_candidate(
     *,
     prepared: PreparedHarnessOptimizationStudy,
     checkpoint: SearchCheckpoint,
+    lifecycle: StudyLifecycleController,
+    authorization: DiscoveryRunningPayload,
 ) -> FrozenHarnessOptimizationCandidate:
     """Freeze only a complete search checkpoint's champion, then enforce source policy."""
     study = PreparedHarnessOptimizationStudy.model_validate(prepared.model_dump(mode="json"))
+    if (
+        authorization.protocol_digest != study.protocol.digest
+        or authorization.search_configuration_digest
+        != _canonical_digest(study.protocol.search.model_dump(mode="json"))
+    ):
+        raise ValueError("discovery authorization differs from the optimization protocol")
     state = SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
     _validate_completed_search_checkpoint(study, state)
     candidate = state.docs[state.champion_doc_hash].model_copy(
@@ -504,19 +592,41 @@ def freeze_harness_optimization_candidate(
         policy=study.protocol.candidate_policy,
     )
     checkpoint_payload_digest = "sha256:" + state.payload_sha256
-    freeze_record = freeze_confirmation_candidate(
-        control_store,
-        manifest=study.partition,
-        candidate_execution_digest=candidate.execution_digest,
-        confirmation_protocol_digest=study.protocol.digest,
-        selection_evidence_digest=checkpoint_payload_digest,
-    )
-    return FrozenHarnessOptimizationCandidate(
-        protocol_digest=study.protocol.digest,
-        checkpoint_payload_digest=checkpoint_payload_digest,
-        baseline=study.baseline.model_copy(deep=True),
+    commitment = HarborConfirmationExecutionCommitment.freeze(
+        discovery=study.protocol.discovery,
+        design_template=study.protocol.confirmation.template(),
+        baseline=study.baseline,
         candidate=candidate,
-        freeze_record=freeze_record,
+        execution_plan=study.protocol.execution_plan,
+        panel_routes=study.protocol.panel_routes,
+        qualification_roster=study.qualification_roster,
+        max_concurrent_blocks=study.protocol.max_concurrent_blocks,
+        retry_policy_digest=study.protocol.retry_policy_digest,
+        budget_runtime=study.confirmation_budget,
+    )
+    _validate_confirmation_commitment(study.protocol, commitment)
+
+    def _freeze() -> FrozenHarnessOptimizationCandidate:
+        freeze_record = freeze_confirmation_candidate(
+            control_store,
+            manifest=study.partition,
+            candidate_execution_digest=candidate.execution_digest,
+            confirmation_protocol_digest=commitment.digest,
+            selection_evidence_digest=checkpoint_payload_digest,
+        )
+        return FrozenHarnessOptimizationCandidate(
+            study_protocol_digest=study.protocol.digest,
+            checkpoint_payload_digest=checkpoint_payload_digest,
+            baseline=study.baseline.model_copy(deep=True),
+            candidate=candidate,
+            confirmation_commitment=commitment,
+            freeze_record=freeze_record,
+        )
+
+    return lifecycle.call_in_phase(
+        StudyPhase.DISCOVERY_RUNNING,
+        _freeze,
+        payload_digest=authorization.digest,
     )
 
 
@@ -525,56 +635,89 @@ def open_harness_optimization_confirmation(
     *,
     prepared: PreparedHarnessOptimizationStudy,
     frozen: FrozenHarnessOptimizationCandidate,
+    lifecycle: StudyLifecycleController,
+    authorization: CandidatePublishedPayload,
 ) -> OpenedHarnessOptimizationConfirmation:
     """Open held-out identities once, after revalidating the frozen study and candidate."""
     study = PreparedHarnessOptimizationStudy.model_validate(prepared.model_dump(mode="json"))
     selected = FrozenHarnessOptimizationCandidate.model_validate(frozen.model_dump(mode="json"))
-    if selected.protocol_digest != study.protocol.digest:
+    if selected.study_protocol_digest != study.protocol.digest:
         raise ValueError("frozen candidate belongs to a different optimization protocol")
     if selected.baseline != study.baseline:
         raise ValueError("frozen candidate baseline differs from the prepared study")
-    confirmation = open_confirmation_once(
-        control_store,
-        manifest=study.partition,
-        confirmation_protocol_digest=study.protocol.digest,
-    )
-    task_ids = tuple(task.task_id for task in confirmation.tasks)
-    design = study.protocol.confirmation.create_design(task_ids)
-    return OpenedHarnessOptimizationConfirmation(
-        protocol=study.protocol.model_copy(deep=True),
-        baseline=selected.baseline.model_copy(deep=True),
-        candidate=selected.candidate.model_copy(deep=True),
-        freeze_record=selected.freeze_record.model_copy(deep=True),
-        confirmation=confirmation,
-        design=design,
+    if (
+        authorization.protocol_digest != study.protocol.digest
+        or authorization.candidate_execution_digest != selected.candidate.execution_digest
+    ):
+        raise ValueError("candidate publication authorization differs from the frozen candidate")
+    _validate_confirmation_commitment(study.protocol, selected.confirmation_commitment)
+
+    def _open() -> OpenedHarnessOptimizationConfirmation:
+        confirmation = open_confirmation_once(
+            control_store,
+            manifest=study.partition,
+            confirmation_protocol_digest=selected.confirmation_commitment.digest,
+        )
+        design = selected.confirmation_commitment.derive_design(confirmation)
+        return OpenedHarnessOptimizationConfirmation(
+            protocol=study.protocol.model_copy(deep=True),
+            baseline=selected.baseline.model_copy(deep=True),
+            candidate=selected.candidate.model_copy(deep=True),
+            freeze_record=selected.freeze_record.model_copy(deep=True),
+            confirmation_commitment=selected.confirmation_commitment.model_copy(deep=True),
+            confirmation=confirmation,
+            design=design,
+        )
+
+    return lifecycle.call_in_phase(
+        StudyPhase.CANDIDATE_PUBLISHED,
+        _open,
+        payload_digest=authorization.digest,
     )
 
 
 def freeze_harness_optimization_harbor_protocol(
     opened: OpenedHarnessOptimizationConfirmation,
     *,
-    job_spec: HarborJobSpec,
-    qualified_tasks: tuple[QualifiedHarborTask, ...],
+    lifecycle: StudyLifecycleController,
+    authorization: ConfirmationOpenedPayload,
 ) -> PairedHarborProtocol:
     """Bind concrete Harbor task qualifications to the already-opened study protocol."""
     study = OpenedHarnessOptimizationConfirmation.model_validate(opened.model_dump(mode="json"))
-    spec = HarborJobSpec.model_validate(job_spec.model_dump(mode="json"))
-    if spec.environment_backend is not study.protocol.environment_backend:
-        raise ValueError("Harbor backend differs from the frozen optimization protocol")
-    return PairedHarborProtocol.freeze(
-        design=study.design,
+    if (
+        authorization.protocol_digest != study.protocol.digest
+        or authorization.candidate_execution_digest != study.candidate.execution_digest
+        or authorization.candidate_freeze_record_digest != study.freeze_record.digest
+        or authorization.confirmation_opening_record_digest
+        != study.confirmation.opening_record_digest
+        or authorization.confirmation_partition_digest
+        != _canonical_digest(study.confirmation.model_dump(mode="json"))
+        or authorization.paired_design_digest != study.design.digest
+        or authorization.confirmation_task_count != len(study.confirmation.tasks)
+    ):
+        raise ValueError("confirmation opening authorization differs from the opened study")
+    selection = OpenedHarborExecutionSelection.project(
+        execution_plan=study.protocol.execution_plan,
+        roster=study.confirmation_commitment.qualification_roster,
         confirmation=study.confirmation,
-        baseline=study.baseline,
-        candidate=study.candidate,
-        job_spec=spec,
-        panel_routes=study.protocol.panel_routes,
-        qualified_tasks=qualified_tasks,
-        reward_key=study.protocol.reward_key,
-        runner_image=study.protocol.runner_image,
-        turn_timeout_s=study.protocol.turn_timeout_s,
-        max_concurrent_blocks=study.protocol.max_concurrent_blocks,
-        retry_policy_digest=study.protocol.retry_policy_digest,
-        budget_policy_digest=study.protocol.budget_policy_digest,
+        design=study.design,
+    )
+    return lifecycle.call_in_phase(
+        StudyPhase.CONFIRMATION_OPENED,
+        lambda: PairedHarborProtocol.freeze(
+            preopen_commitment=study.confirmation_commitment,
+            design=study.design,
+            confirmation=study.confirmation,
+            baseline=study.baseline,
+            candidate=study.candidate,
+            execution_plan=study.protocol.execution_plan,
+            panel_routes=study.protocol.panel_routes,
+            qualification_roster=study.confirmation_commitment.qualification_roster,
+            opened_selection=selection,
+            max_concurrent_blocks=study.protocol.max_concurrent_blocks,
+            retry_policy_digest=study.protocol.retry_policy_digest,
+        ),
+        payload_digest=authorization.digest,
     )
 
 
@@ -587,28 +730,28 @@ def summarize_harness_optimization_outcome(
     result = PairedHarborRunReport.model_validate(report.model_dump(mode="json"))
     protocol = result.protocol
     if (
-        protocol.confirmation_protocol_digest != study.protocol.digest
+        protocol.preopen_commitment != study.confirmation_commitment
         or protocol.confirmation != study.confirmation
         or protocol.design != study.design
         or protocol.baseline_execution_digest != study.baseline.execution_digest
         or protocol.candidate_execution_digest != study.candidate.execution_digest
         or protocol.panel_routes != study.protocol.panel_routes
-        or protocol.runner_image != study.protocol.runner_image
-        or protocol.turn_timeout_s != study.protocol.turn_timeout_s
+        or protocol.execution_plan != study.protocol.execution_plan
         or protocol.max_concurrent_blocks != study.protocol.max_concurrent_blocks
         or protocol.retry_policy_digest != study.protocol.retry_policy_digest
-        or protocol.budget_policy_digest != study.protocol.budget_policy_digest
-        or protocol.job_template.reward_key != study.protocol.reward_key
+        or protocol.budget_policy_digest != study.protocol.confirmation_budget_policy_digest
+        or protocol.budget_ledger_identity != study.protocol.confirmation_budget_ledger_identity
+        or protocol.budget_binding_digest != study.protocol.confirmation_budget_binding_digest
     ):
         raise ValueError("paired Harbor report differs from the frozen optimization study")
-    minimum_delta = study.protocol.confirmation.minimum_member_delta
+    minimum_delta = study.protocol.confirmation.minimum_equal_task_member_delta
     members = tuple(
         HarnessOptimizationMemberOutcome(
             panel_member=item.panel_member,
-            delta=item.delta,
-            simultaneous_lower_bound=item.simultaneous_lower_bound,
+            equal_task_delta=item.equal_task_delta,
+            primary_lower_bound=item.primary_lower_bound,
             minimum_required_delta=minimum_delta,
-            passed=item.delta >= minimum_delta and item.simultaneous_lower_bound > 0.0,
+            passed=item.equal_task_delta >= minimum_delta and item.primary_lower_bound > 0.0,
         )
         for item in result.analysis.members
     )
@@ -618,11 +761,9 @@ def summarize_harness_optimization_outcome(
         paired_report_digest=result.digest,
         baseline_execution_digest=study.baseline.execution_digest,
         candidate_execution_digest=study.candidate.execution_digest,
-        panel_delta=result.analysis.panel_delta,
-        minimum_required_panel_delta=study.protocol.confirmation.minimum_panel_delta,
-        panel_passed=result.analysis.panel_lift_passed,
+        equal_task_panel_delta=result.analysis.equal_task_panel_delta,
         members=members,
-        passed=result.analysis.panel_lift_passed and result.analysis.passed,
+        passed=result.analysis.passed,
     )
 
 
@@ -679,6 +820,28 @@ def _validate_completed_search_checkpoint(
         or config.proposer.configuration_id != plan.proposer_configuration_id
     ):
         raise ValueError("search checkpoint components differ from the optimization protocol")
+
+
+def _validate_confirmation_commitment(
+    protocol: HarnessOptimizationProtocol,
+    commitment: HarborConfirmationExecutionCommitment,
+) -> None:
+    """Reject any candidate-specific commitment that drifts from preregistered inputs."""
+    if (
+        commitment.discovery != protocol.discovery
+        or commitment.design_template != protocol.confirmation.template()
+        or commitment.baseline_execution_hash != protocol.baseline_execution_hash
+        or commitment.baseline_execution_digest != protocol.baseline_execution_digest
+        or commitment.panel_routes != protocol.panel_routes
+        or commitment.execution_plan != protocol.execution_plan
+        or commitment.qualification_roster_digest != protocol.qualification_roster_digest
+        or commitment.max_concurrent_blocks != protocol.max_concurrent_blocks
+        or commitment.retry_policy_digest != protocol.retry_policy_digest
+        or commitment.budget_policy_digest != protocol.confirmation_budget_policy_digest
+        or commitment.budget_ledger_identity != protocol.confirmation_budget_ledger_identity
+        or commitment.budget_binding_digest != protocol.confirmation_budget_binding_digest
+    ):
+        raise ValueError("candidate confirmation commitment differs from the study protocol")
 
 
 def _validate_candidate_change(
