@@ -863,6 +863,13 @@ class HarborRosterQualifier:
             raise HarborRosterQualificationDriftError(
                 "qualified task evidence belongs to a different prepared roster"
             )
+        if previous is not None:
+            self._validate_resumed_task_evidence(
+                item,
+                evidence=previous,
+                build_records=build_records,
+            )
+            return previous
         trial_paths = TrialPaths(self._environment_root(item.commitment))
         trial_paths.mkdir()
         task = item.prepared.task
@@ -910,12 +917,35 @@ class HarborRosterQualifier:
             attestation=attestation,
             cleanup_receipt=cleanup_receipt,
         )
-        if previous is not None and previous.semantic_identity != current.semantic_identity:
-            raise HarborRosterQualificationDriftError(
-                f"task environment evidence drifted during resume for {task_id!r}"
-            )
         _atomic_write_model(evidence_path, current)
         return current
+
+    def _validate_resumed_task_evidence(
+        self,
+        item: _ResolvedQualificationTask,
+        *,
+        evidence: _QualifiedTaskEvidence,
+        build_records: Mapping[str, ExactE2BBuildRecord],
+    ) -> None:
+        """Rebind terminal evidence to current prepared inputs without relaunching a task."""
+        attestation = HarborTaskEnvironmentAttestation.from_evidence(
+            evidence.task_environment_attestation
+        )
+        try:
+            expected = self._qualified_task(
+                item,
+                attestation=attestation,
+                build_records=build_records,
+            )
+        except KeyError as exc:
+            raise HarborRosterQualificationDriftError(
+                f"qualified task build evidence is unavailable for {item.commitment.task_id!r}"
+            ) from exc
+        if evidence.qualification != expected:
+            raise HarborRosterQualificationDriftError(
+                f"qualified task evidence differs from prepared inputs for "
+                f"{item.commitment.task_id!r}"
+            )
 
     def _create_environment(
         self,

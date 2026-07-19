@@ -319,7 +319,7 @@ def test_local_qualification_walks_complete_roster_without_execution(
     assert stops == []
 
 
-def test_partial_failure_cleans_up_and_resume_revalidates_before_publication(
+def test_partial_failure_reuses_completed_evidence_without_relaunch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -350,12 +350,12 @@ def test_partial_failure_cleans_up_and_resume_revalidates_before_publication(
     roster = asyncio.run(qualifier.qualify())
 
     assert tuple(task.task_id for task in roster.tasks) == ("task-a", "task-b")
-    assert starts == ["task-a", "task-b", "task-a", "task-b"]
+    assert starts == ["task-a", "task-b", "task-b"]
     assert stops == starts
     assert qualifier.roster_path.is_file()
 
 
-def test_resume_rejects_environment_attestation_drift(
+def test_resume_reuses_immutable_environment_attestation_without_runtime_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -381,10 +381,32 @@ def test_resume_rejects_environment_attestation_drift(
 
     failures.clear()
     revisions["task-a"] = 2
-    with pytest.raises(mod.HarborRosterQualificationDriftError):
-        asyncio.run(qualifier.qualify())
+    roster = asyncio.run(qualifier.qualify())
 
-    assert not qualifier.roster_path.exists()
+    task_a = next(task for task in roster.tasks if task.task_id == "task-a")
+    assert (
+        task_a.task_environment_digest
+        == HarborTaskEnvironmentAttestation.from_evidence(
+            {
+                "schema_version": 2,
+                "backend": "docker",
+                "daemon_platform": "linux/x86_64",
+                "requested_storage_mb": None,
+                "storage_capacity_scope": "shared_task_filesystem_available",
+                "storage_provider_enforced": False,
+                "storage_requirement_satisfied": True,
+                "services": [
+                    {
+                        "service": "main",
+                        "replica": 1,
+                        "image_id": "sha256:" + "1" * 64,
+                        "image_platform": "linux/x86_64",
+                    }
+                ],
+            }
+        ).digest
+    )
+    assert starts == ["task-a", "task-b", "task-b"]
 
 
 def test_resume_rejects_prepared_task_source_drift_before_launch(
@@ -416,6 +438,61 @@ def test_resume_rejects_prepared_task_source_drift_before_launch(
 
     assert starts == ["task-a", "task-b"]
     assert not qualifier.roster_path.exists()
+
+
+def test_resume_rejects_stored_task_evidence_drift_before_relaunch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "task-a")
+    _write_task(dataset, "task-b")
+    starts: list[str] = []
+    stops: list[str] = []
+    failures = {"task-b"}
+    _forbid_agent_provider_and_verifier(monkeypatch)
+    _install_fake_environments(
+        monkeypatch,
+        backend=HarborEnvironmentBackend.LOCAL,
+        starts=starts,
+        stops=stops,
+        fail_start=failures,
+    )
+    qualifier = _local_qualifier(tmp_path, dataset)
+    with pytest.raises(mod.HarborRosterQualificationError):
+        asyncio.run(qualifier.qualify())
+
+    prepared = mod._read_model(
+        qualifier.roster_path.parent / "prepared.json",
+        mod._PreparedRosterCommitment,
+    )
+    assert prepared is not None
+    prepared_task = next(task for task in prepared.tasks if task.task_id == "task-a")
+    evidence_path = qualifier._evidence_path(prepared_task)
+    evidence = mod._read_model(evidence_path, mod._QualifiedTaskEvidence)
+    assert evidence is not None
+    changed = evidence.qualification.model_copy(update={"content_digest": "sha256:" + "f" * 64})
+    mod._atomic_write_model(
+        evidence_path,
+        mod._QualifiedTaskEvidence.freeze(
+            prepared_commitment_digest=prepared.commitment_digest,
+            qualification=changed,
+            attestation=HarborTaskEnvironmentAttestation.from_evidence(
+                evidence.task_environment_attestation
+            ),
+            cleanup_receipt=None,
+        ),
+    )
+    failures.clear()
+
+    with pytest.raises(
+        mod.HarborRosterQualificationDriftError,
+        match="differs from prepared inputs",
+    ):
+        asyncio.run(qualifier.qualify())
+
+    assert starts == ["task-a", "task-b"]
+    assert stops == starts
 
 
 def test_published_roster_reload_rebinds_each_task_to_prepared_commitment(
@@ -901,6 +978,59 @@ def test_e2b_qualification_dedupes_builds_and_binds_launch_accounts(
         cast("Any", kwargs["config"]).kwargs["resource_budget_bindings"]
         for kwargs in constructor_kwargs
     )
+
+
+def test_e2b_partial_resume_reuses_completed_task_without_second_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "task-a")
+    _write_task(dataset, "task-b")
+    budget = _e2b_budget_runtime(tmp_path)
+    builds_by_task: dict[str, ExactE2BBuildRecord] = {}
+
+    async def prepare_build(
+        *,
+        spec: ExactE2BBuildSpec,
+        **_kwargs: object,
+    ) -> ExactE2BBuildRecord:
+        record = _budgeted_build_record(
+            spec=spec,
+            budget=budget,
+            template_id="template-shared",
+            build_id="build-shared",
+        )
+        builds_by_task.update({"task-a": record, "task-b": record})
+        return record
+
+    monkeypatch.setattr(mod, "prepare_exact_e2b_build", prepare_build)
+    starts: list[str] = []
+    stops: list[str] = []
+    failures = {"task-b"}
+    _forbid_agent_provider_and_verifier(monkeypatch)
+    _install_fake_environments(
+        monkeypatch,
+        backend=HarborEnvironmentBackend.E2B,
+        starts=starts,
+        stops=stops,
+        fail_start=failures,
+        e2b_builds_by_task=builds_by_task,
+    )
+    qualifier = _e2b_qualifier(tmp_path, dataset, budget=budget)
+
+    with pytest.raises(mod.HarborRosterQualificationError):
+        asyncio.run(qualifier.qualify())
+
+    assert starts == ["task-a", "task-b"]
+    assert stops == starts
+    failures.clear()
+
+    roster = asyncio.run(qualifier.qualify())
+
+    assert tuple(task.task_id for task in roster.tasks) == ("task-a", "task-b")
+    assert starts == ["task-a", "task-b", "task-b"]
+    assert stops == starts
 
 
 def test_e2b_qualification_refreshes_provider_limit_for_each_unique_build(
