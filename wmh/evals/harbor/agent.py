@@ -169,9 +169,37 @@ class _TaskEnvironmentUnavailableError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _TaskEnvironmentAttestation:
+class HarborTaskEnvironmentAttestation:
+    """Bounded canonical identity of one successfully started Harbor task environment."""
+
     digest: str
     evidence: JsonObject
+
+    @classmethod
+    def from_evidence(
+        cls,
+        evidence: JsonObject,
+    ) -> HarborTaskEnvironmentAttestation:
+        """Defensively freeze trusted backend evidence and derive its stable digest."""
+        canonical = json.dumps(
+            evidence,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+        if len(canonical) > _MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES:
+            raise RuntimeError("task environment attestation exceeds its evidence limit")
+        parsed = json.loads(canonical)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("task environment attestation must be a JSON object")
+        return cls(
+            digest="sha256:" + hashlib.sha256(canonical).hexdigest(),
+            evidence=cast("JsonObject", parsed),
+        )
+
+
+_TaskEnvironmentAttestation = HarborTaskEnvironmentAttestation
 
 
 @dataclass
@@ -967,6 +995,13 @@ def _require_complete_provider_receipt_trace(
 async def _attest_task_environment(
     environment: BaseEnvironment,
 ) -> _TaskEnvironmentAttestation:
+    return await attest_harbor_task_environment(environment)
+
+
+async def attest_harbor_task_environment(
+    environment: BaseEnvironment,
+) -> HarborTaskEnvironmentAttestation:
+    """Attest a live Harbor task backend without constructing or running an agent."""
     environment_type = environment.type()
     backend = getattr(environment_type, "value", environment_type)
     if backend == "docker":
@@ -978,19 +1013,7 @@ async def _attest_task_environment(
         )
     else:
         raise RuntimeError("unsupported task environment backend")
-    canonical = json.dumps(
-        evidence,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode()
-    if len(canonical) > _MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES:
-        raise RuntimeError("task environment attestation exceeds its evidence limit")
-    return _TaskEnvironmentAttestation(
-        digest="sha256:" + hashlib.sha256(canonical).hexdigest(),
-        evidence=evidence,
-    )
+    return HarborTaskEnvironmentAttestation.from_evidence(evidence)
 
 
 async def _attest_docker_environment(

@@ -115,6 +115,7 @@ class QualifiedE2BBuildIdentity(BaseModel):
     docker_image: str | None = Field(default=None, min_length=1, max_length=2_048)
     cpu_count: int = Field(ge=1)
     memory_mb: int = Field(ge=1)
+    storage_mb: int | None = Field(default=None, ge=1)
     template_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
     build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
 
@@ -126,6 +127,7 @@ class QualifiedE2BBuildIdentity(BaseModel):
             docker_image=self.docker_image,
             cpu_count=self.cpu_count,
             memory_mb=self.memory_mb,
+            storage_mb=self.storage_mb,
         )
         if self.build_config_digest != spec.digest:
             raise ValueError("qualified E2B build config digest is inconsistent")
@@ -1914,6 +1916,7 @@ class PairedHarborRunner:
             docker_image=identity.docker_image,
             cpu_count=identity.cpu_count,
             memory_mb=identity.memory_mb,
+            storage_mb=identity.storage_mb,
             expected_budget_authority=task_resource_accounts[0],
             allow_preexisting_outside_study=False,
         )
@@ -1922,6 +1925,7 @@ class PairedHarborRunner:
             or record.digest != identity.build_record_digest
             or record.template_id != identity.template_id
             or record.build_id != identity.build_id
+            or record.storage_mb != identity.storage_mb
         ):
             raise ValueError("scored E2B task build differs from full-roster qualification")
 

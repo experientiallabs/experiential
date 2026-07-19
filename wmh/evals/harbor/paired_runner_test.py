@@ -406,6 +406,7 @@ def _e2b_build_identity() -> mod.QualifiedE2BBuildIdentity:
         docker_image="registry.example/task@sha256:" + "9" * 64,
         cpu_count=2,
         memory_mb=1024,
+        storage_mb=None,
     )
     return mod.QualifiedE2BBuildIdentity(
         build_config_digest=spec.digest,
@@ -415,6 +416,7 @@ def _e2b_build_identity() -> mod.QualifiedE2BBuildIdentity:
         docker_image=spec.docker_image,
         cpu_count=spec.cpu_count,
         memory_mb=spec.memory_mb,
+        storage_mb=spec.storage_mb,
         template_id="task-template",
         build_id="task-build",
     )
@@ -1148,6 +1150,7 @@ def test_e2b_budget_bindings_cover_full_prequalified_roster(tmp_path: Path) -> N
         docker_image="registry.example/discovery@sha256:" + "7" * 64,
         cpu_count=discovery_class.cpu_count,
         memory_mb=discovery_class.memory_mb,
+        storage_mb=None,
     )
     discovery_build = mod.QualifiedE2BBuildIdentity(
         build_config_digest=discovery_spec.digest,
@@ -1157,6 +1160,7 @@ def test_e2b_budget_bindings_cover_full_prequalified_roster(tmp_path: Path) -> N
         docker_image=discovery_spec.docker_image,
         cpu_count=discovery_spec.cpu_count,
         memory_mb=discovery_spec.memory_mb,
+        storage_mb=discovery_spec.storage_mb,
         template_id="discovery-template",
         build_id="discovery-build",
     )
@@ -1234,6 +1238,7 @@ def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
             build_config_digest = identity.build_config_digest
             template_id = identity.template_id
             build_id = identity.build_id
+            storage_mb = identity.storage_mb
             digest = identity.build_record_digest
 
         return Record()

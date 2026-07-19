@@ -298,7 +298,7 @@ class _DigestWriter(Protocol):
     def update(self, value: bytes, /) -> None: ...
 
 
-class _AtomicHarborJob(Job):
+class AtomicHarborJob(Job):
     """Pinned Harbor job with job-root-safe replacement of its live root result."""
 
     @override
@@ -310,11 +310,16 @@ class _AtomicHarborJob(Job):
             )
         else:
             payload = self._job_result.model_dump_json(indent=4)
-        _atomic_replace_job_result(self._job_result_path, payload)
+            _atomic_replace_job_result(self._job_result_path, payload)
+
+
+_AtomicHarborJob = AtomicHarborJob
 
 
 @dataclass(frozen=True)
-class _PreparedTrial:
+class PreparedHarborTrialIdentity:
+    """Stable evaluator identity for one task before any trial begins."""
+
     config: TrialConfig
     task_key: str
     task_name: str
@@ -335,6 +340,15 @@ class _PreparedTrial:
             self.task_instruction,
             self.trial_lock_digest,
         )
+
+
+@dataclass(frozen=True)
+class PreparedHarborTask:
+    """One Harbor-resolved task plus the exact evaluator identity derived from its lock."""
+
+    task: Task
+    trial_config: TrialConfig
+    identity: PreparedHarborTrialIdentity
 
 
 @dataclass
@@ -527,17 +541,12 @@ class HarborEvaluator:
                     trial_config.environment,
                     expected_type=expected_environment_type,
                 )
-            tasks = _load_and_validate_tasks(
+            prepared_tasks, job_lock = prepare_harbor_job_tasks(
                 job,
                 environment_backend=self._spec.environment_backend,
-            )
-            job_lock = _build_prepared_job_lock(job)
-            prepared_trials = _prepare_trials(
-                job,
-                job_lock,
-                tasks,
                 agent_config_digest=agent_digest,
             )
+            prepared_trials = [item.identity for item in prepared_tasks]
             if existing_manifest is not None:
                 _validate_existing_job_lock(job_dir, job_lock)
                 _restore_manifest_trial_names(job, prepared_trials, existing_manifest)
@@ -621,6 +630,11 @@ async def _reject_executable_harbor_metrics(config: JobConfig) -> None:
                 "Remove the executable metric and compute trusted analysis from canonical "
                 "per-trial rewards."
             )
+
+
+async def reject_executable_harbor_metrics(config: JobConfig) -> None:
+    """Apply the evaluator's host-code metric boundary without starting a job."""
+    await _reject_executable_harbor_metrics(config)
 
 
 def _reject_uv_script_metrics(metrics: list[MetricConfig], *, source: str) -> None:
@@ -707,6 +721,11 @@ def _preflight_task_environment(config: JobConfig) -> None:
     except SystemExit as exc:
         detail = str(exc).strip() or "task environment is unavailable"
         raise RuntimeError(f"Harbor task-environment preflight failed: {detail}") from None
+
+
+def preflight_harbor_task_environment(config: JobConfig) -> None:
+    """Apply the evaluator's backend availability check without running a trial."""
+    _preflight_task_environment(config)
 
 
 def _preflight_exact_e2b_builds(
@@ -981,6 +1000,11 @@ def _snapshot_local_datasets(config: JobConfig) -> JobConfig:
     frozen = config.model_copy(update={"datasets": frozen_datasets}, deep=True)
     _preflight_local_task_trees(frozen)
     return frozen
+
+
+def snapshot_local_harbor_datasets(config: JobConfig) -> JobConfig:
+    """Snapshot local datasets with the evaluator's fail-closed copy semantics."""
+    return _snapshot_local_datasets(config)
 
 
 def _build_or_reuse_dataset_snapshot(
@@ -1683,14 +1707,45 @@ def _load_and_validate_tasks(
     return tasks
 
 
+def prepare_harbor_job_tasks(
+    job: Job,
+    *,
+    environment_backend: HarborEnvironmentBackend,
+    agent_config_digest: str,
+) -> tuple[tuple[PreparedHarborTask, ...], JobLock]:
+    """Resolve task trees and identities through the evaluator's exact preparation path."""
+    tasks = _load_and_validate_tasks(
+        job,
+        environment_backend=environment_backend,
+    )
+    job_lock = _build_prepared_job_lock(job)
+    identities = _prepare_trials(
+        job,
+        job_lock,
+        tasks,
+        agent_config_digest=agent_config_digest,
+    )
+    return (
+        tuple(
+            PreparedHarborTask(
+                task=tasks[trial_config.task.get_task_id()],
+                trial_config=trial_config,
+                identity=identity,
+            )
+            for trial_config, identity in zip(job._trial_configs, identities, strict=True)
+        ),
+        job_lock,
+    )
+
+
 def _prepare_trials(
     job: Job,
     job_lock: JobLock,
     tasks: dict[TaskIdType, Task],
     *,
     agent_config_digest: str,
-) -> list[_PreparedTrial]:
-    prepared_trials: list[_PreparedTrial] = []
+) -> list[PreparedHarborTrialIdentity]:
+    prepared_trials: list[PreparedHarborTrialIdentity] = []
     for trial_config, trial_lock in zip(
         job._trial_configs,
         job_lock.trials,
@@ -1706,7 +1761,7 @@ def _prepare_trials(
             task_checksum=trial_lock.task.digest,
         )
         prepared_trials.append(
-            _PreparedTrial(
+            PreparedHarborTrialIdentity(
                 config=trial_config,
                 task_key=task_key,
                 task_name=task.name,
@@ -1734,7 +1789,7 @@ def _bound_task_instruction(instruction: str) -> str:
 
 def _build_manifest(
     job_name: str,
-    prepared_trials: list[_PreparedTrial],
+    prepared_trials: list[PreparedHarborTrialIdentity],
     *,
     identity: BenchmarkRunIdentity,
     agent_config_digest: str,
@@ -1772,7 +1827,7 @@ def _build_manifest(
 
 def _restore_manifest_trial_names(
     job: Job,
-    prepared_trials: list[_PreparedTrial],
+    prepared_trials: list[PreparedHarborTrialIdentity],
     manifest: HarborTrialManifest,
 ) -> None:
     """Bind Harbor's regenerated remaining configs back to immutable manifest cells."""
@@ -1783,7 +1838,7 @@ def _restore_manifest_trial_names(
 
     entries_by_name = {entry.trial_name: entry for entry in manifest.entries}
     remaining_config_ids = {id(config) for config in job._remaining_trial_configs}
-    remaining_prepared: list[_PreparedTrial] = []
+    remaining_prepared: list[PreparedHarborTrialIdentity] = []
     completed_names: set[str] = set()
 
     for prepared in prepared_trials:
@@ -1801,7 +1856,7 @@ def _restore_manifest_trial_names(
         entry for entry in manifest.entries if entry.trial_name not in completed_names
     ]
     prepared_by_key: defaultdict[
-        tuple[str, str, str, str, str | None, str, str], list[_PreparedTrial]
+        tuple[str, str, str, str, str | None, str, str], list[PreparedHarborTrialIdentity]
     ] = defaultdict(list)
     entries_by_key: defaultdict[
         tuple[str, str, str, str, str | None, str, str], list[HarborTrialManifestEntry]
@@ -1814,7 +1869,7 @@ def _restore_manifest_trial_names(
     if set(prepared_by_key) != set(entries_by_key):
         raise StaleHarborJobError("Harbor resume task identities or resolved trial locks changed")
 
-    assignments: list[tuple[_PreparedTrial, HarborTrialManifestEntry]] = []
+    assignments: list[tuple[PreparedHarborTrialIdentity, HarborTrialManifestEntry]] = []
     for immutable_key, prepared_group in prepared_by_key.items():
         entry_group = entries_by_key[immutable_key]
         if len(prepared_group) != len(entry_group):
