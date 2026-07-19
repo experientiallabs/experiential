@@ -310,7 +310,7 @@ class AtomicHarborJob(Job):
             )
         else:
             payload = self._job_result.model_dump_json(indent=4)
-            _atomic_replace_job_result(self._job_result_path, payload)
+        _atomic_replace_job_result(self._job_result_path, payload)
 
 
 _AtomicHarborJob = AtomicHarborJob

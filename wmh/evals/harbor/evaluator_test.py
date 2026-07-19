@@ -892,6 +892,43 @@ def test_atomic_root_result_replace_preserves_the_last_valid_file(
     assert not temporary_paths[0].exists()
 
 
+def test_atomic_job_persists_result_when_trial_results_are_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Harbor's lightweight progress checkpoint must use the same atomic write path."""
+    result_path = tmp_path / "result.json"
+    writes: list[tuple[Path, str]] = []
+
+    class Result:
+        def model_dump_json(
+            self,
+            *,
+            indent: int,
+            exclude: set[str] | None = None,
+        ) -> str:
+            assert indent == 4
+            assert exclude == {"trial_results"}
+            return '{"progress": true}'
+
+    class JobView:
+        _job_result = Result()
+        _job_result_path = result_path
+
+    monkeypatch.setattr(
+        mod,
+        "_atomic_replace_job_result",
+        lambda path, payload: writes.append((path, payload)),
+    )
+
+    mod.AtomicHarborJob._write_job_result(
+        cast("mod.AtomicHarborJob", JobView()),
+        exclude_trial_results=True,
+    )
+
+    assert writes == [(result_path, '{"progress": true}')]
+
+
 def test_run_config_digest_binds_semantics_and_concurrency_but_not_paths(tmp_path: Path) -> None:
     spec = _spec(tmp_path, tmp_path / "dataset")
     agent_digest = "sha256:" + "a" * 64

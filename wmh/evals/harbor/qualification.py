@@ -1039,8 +1039,16 @@ class HarborRosterQualifier:
             if (
                 evidence is None
                 or evidence.prepared_commitment_digest != commitment.commitment_digest
-                or evidence.qualification
-                != next(item for item in roster.tasks if item.task_id == task.task_id)
+                or evidence.qualification.dataset_id != task.dataset_id
+                or evidence.qualification.task_id != task.task_id
+                or evidence.qualification.content_digest != task.content_digest
+                or evidence.qualification.task_key != task.task_key
+            ):
+                raise HarborRosterQualificationDriftError(
+                    "published roster differs from its prepared task identity"
+                )
+            if evidence.qualification != next(
+                item for item in roster.tasks if item.task_id == task.task_id
             ):
                 raise HarborRosterQualificationDriftError(
                     "published roster lacks exact complete task evidence"

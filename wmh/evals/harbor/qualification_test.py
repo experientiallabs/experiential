@@ -414,6 +414,61 @@ def test_resume_rejects_prepared_task_source_drift_before_launch(
     assert not qualifier.roster_path.exists()
 
 
+def test_published_roster_reload_rebinds_each_task_to_prepared_commitment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "task-a")
+    starts: list[str] = []
+    stops: list[str] = []
+    _forbid_agent_provider_and_verifier(monkeypatch)
+    _install_fake_environments(
+        monkeypatch,
+        backend=HarborEnvironmentBackend.LOCAL,
+        starts=starts,
+        stops=stops,
+    )
+    qualifier = _local_qualifier(tmp_path, dataset)
+    roster = asyncio.run(qualifier.qualify())
+    prepared = mod._read_model(
+        qualifier.roster_path.parent / "prepared.json",
+        mod._PreparedRosterCommitment,
+    )
+    assert prepared is not None
+    prepared_task = prepared.tasks[0]
+    evidence_path = qualifier._evidence_path(prepared_task)
+    evidence = mod._read_model(evidence_path, mod._QualifiedTaskEvidence)
+    assert evidence is not None
+
+    changed_task = roster.tasks[0].model_copy(update={"content_digest": "sha256:" + "f" * 64})
+    changed_evidence = mod._QualifiedTaskEvidence.freeze(
+        prepared_commitment_digest=prepared.commitment_digest,
+        qualification=changed_task,
+        attestation=mod.HarborTaskEnvironmentAttestation.from_evidence(
+            evidence.task_environment_attestation
+        ),
+        cleanup_receipt=None,
+    )
+    mod._atomic_write_model(evidence_path, changed_evidence)
+    mod._atomic_write_model(
+        qualifier.roster_path,
+        mod.PrequalifiedHarborRoster(
+            execution_plan_digest=roster.execution_plan_digest,
+            tasks=(changed_task,),
+        ),
+    )
+
+    with pytest.raises(
+        mod.HarborRosterQualificationDriftError,
+        match="prepared task identity",
+    ):
+        asyncio.run(qualifier.qualify())
+
+    assert starts == ["task-a"]
+    assert stops == starts
+
+
 def test_cleanup_failure_never_publishes_task_or_roster_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
