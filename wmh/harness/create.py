@@ -28,6 +28,7 @@ import hmac
 import json
 import os
 import tempfile
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isclose
@@ -1292,7 +1293,9 @@ def _validate_proposal_batch_witness_request(
         if actual != wanted:
             raise ValueError(f"proposal batch witness {label} does not match resume state")
     if witness.phase == "completed" and witness.prepared_payload_sha256 != expected.payload_sha256:
-        raise ValueError("proposal batch witness prepared transaction does not match resume state")
+        raise ValueError(
+            "proposal batch witness prepared transaction does not bind proposer state before"
+        )
 
 
 def _proposal_batch_from_witness(
@@ -1314,6 +1317,79 @@ def _proposal_batch_from_witness(
         else:
             batch.append(None)
     return batch
+
+
+def _validate_consumed_proposal_batch_witness(
+    witness: SearchProposalBatchWitness,
+    checkpoint: SearchCheckpoint,
+) -> None:
+    """Bind an already-consumed witness back to the checkpoint's committed iteration output."""
+    if witness.phase != "completed":
+        raise ValueError("a committed proposal batch witness must be completed")
+    if witness.configuration != checkpoint.configuration:
+        raise ValueError("committed proposal witness configuration does not match checkpoint")
+
+    records = [
+        record for record in checkpoint.proposal_records if record.iteration == witness.iteration
+    ]
+    if len(records) != witness.count:
+        raise ValueError("committed proposal witness slot count does not match checkpoint")
+
+    parent_doc_hash = checkpoint.configuration.seed_doc_hash
+    for iteration in range(1, witness.iteration):
+        selected = [
+            record
+            for record in checkpoint.proposal_records
+            if record.iteration == iteration and record.selected
+        ]
+        if selected:
+            assert selected[0].candidate_doc_hash is not None
+            parent_doc_hash = selected[0].candidate_doc_hash
+    parent = checkpoint.docs[parent_doc_hash]
+    if (
+        witness.parent_doc_hash != parent.doc_hash
+        or witness.parent_execution_hash != parent.execution_hash
+    ):
+        raise ValueError("committed proposal witness parent does not match checkpoint")
+
+    trigger = records[0].trigger
+    if trigger is None or witness.trigger != trigger:
+        raise ValueError("committed proposal witness trigger does not match checkpoint")
+    if witness.evidence != render_score_evidence(trigger, checkpoint.reports[parent.doc_hash]):
+        raise ValueError("committed proposal witness evidence does not match checkpoint")
+
+    delta_records = [
+        record for record in checkpoint.proposal_records if record.delta_id is not None
+    ]
+    committed_by_slot = {
+        (record.iteration, record.proposal_index): delta
+        for record, delta in zip(delta_records, checkpoint.archive.deltas, strict=True)
+    }
+    prior_history = tuple(
+        delta
+        for record, delta in zip(delta_records, checkpoint.archive.deltas, strict=True)
+        if record.iteration < witness.iteration
+    )
+    if witness.history != prior_history:
+        raise ValueError("committed proposal witness history does not match checkpoint")
+
+    for record, slot in zip(records, witness.slots, strict=True):
+        if slot.kind == "delta":
+            assert slot.delta is not None
+            committed = committed_by_slot.get((record.iteration, record.proposal_index))
+            if committed is None:
+                raise ValueError("committed proposal output is missing its delta")
+            unevaluated = committed.model_copy(
+                update={"child_doc_hash": None, "verdict": None},
+                deep=True,
+            )
+            if slot.delta != unevaluated:
+                raise ValueError("committed proposal output does not match checkpoint delta")
+        elif slot.kind == "failure":
+            if record.outcome != "proposer_error" or record.reason != slot.reason:
+                raise ValueError("committed proposal output does not match proposer failure")
+        elif record.outcome != "unusable":
+            raise ValueError("committed proposal output does not match unusable slot")
 
 
 def search_harness(
@@ -1348,7 +1424,8 @@ def search_harness(
 
     Args:
         name: Name assigned to the final champion.
-        search_run_id: Optional caller-issued durable identity for this exact search run.
+        search_run_id: Optional caller-issued durable identity for this exact search run. A fresh
+            checkpointed search generates one when omitted; resume inherits it from the checkpoint.
         seed_doc: Initial harness document.
         scorer: Discovery evaluator and candidate eligibility boundary.
         proposer: Existing delta proposer fed bounded scorer evidence.
@@ -1454,9 +1531,15 @@ def search_harness(
             on_proposal_batch_witness,
         )
     )
+    resumed = _validated_checkpoint_copy(resume_from) if resume_from is not None else None
+    resolved_search_run_id = search_run_id
+    if checkpointing and resolved_search_run_id is None:
+        resolved_search_run_id = (
+            resumed.configuration.search_run_id if resumed is not None else uuid.uuid4().hex
+        )
     configuration = (
         _search_configuration(
-            search_run_id=search_run_id,
+            search_run_id=resolved_search_run_id,
             name=name,
             seed_doc=seed_doc,
             scorer=scorer,
@@ -1478,7 +1561,6 @@ def search_harness(
             proposer,
             durable_state_required=configuration.proposer.durable_state_required,
         )
-    resumed = _validated_checkpoint_copy(resume_from) if resume_from is not None else None
     if resumed is not None:
         assert configuration is not None
         _validate_resume_configuration(resumed.configuration, configuration)
@@ -1498,6 +1580,7 @@ def search_harness(
                 raise ValueError(
                     "already-consumed proposal batch does not match its committed witness digest"
                 )
+            _validate_consumed_proposal_batch_witness(recovered_witness, resumed)
             recovered_witness = None
         elif recovered_witness.iteration != resumed.completed_iteration + 1:
             raise ValueError("proposal batch witness iteration is not the next resume iteration")
@@ -1764,6 +1847,30 @@ def search_harness(
         completed_witness: SearchProposalBatchWitness | None = None
         if configuration is not None:
             assert current_checkpoint is not None
+            if recovered_witness is not None:
+                # Validate every request field that does not depend on the pre-batch callback
+                # before allowing that callback any side effect. The second validation below
+                # proves its state transition reached the exact witnessed pre-call snapshot.
+                claimed_prepared_witness = _build_prepared_proposal_batch_witness(
+                    prior_checkpoint=current_checkpoint,
+                    configuration=configuration,
+                    iteration=iteration_index,
+                    parent=parent,
+                    trigger=trigger,
+                    evidence=evidence,
+                    history=history,
+                    count=proposal_batch_size,
+                    proposer_state_before=recovered_witness.proposer_state_before,
+                )
+                _validate_proposal_batch_witness_request(
+                    recovered_witness,
+                    claimed_prepared_witness,
+                )
+                if recovered_witness.phase == "prepared":
+                    _proposal_batch_from_witness(recovered_witness)
+            scorer.before_proposal_batch()
+            if holdout_scorer is not None and holdout_scorer is not scorer:
+                holdout_scorer.before_proposal_batch()
             proposer_state_before = _export_proposer_state(
                 proposer,
                 required=configuration.proposer.durable_state_required,
@@ -1790,13 +1897,7 @@ def search_harness(
                 )
                 completed_witness = recovered_witness
                 recovered_witness = None
-                scorer.before_proposal_batch()
-                if holdout_scorer is not None and holdout_scorer is not scorer:
-                    holdout_scorer.before_proposal_batch()
             else:
-                scorer.before_proposal_batch()
-                if holdout_scorer is not None and holdout_scorer is not scorer:
-                    holdout_scorer.before_proposal_batch()
                 if on_proposal_batch_prepare is not None:
                     on_proposal_batch_prepare(prepared_witness.model_copy(deep=True))
                 try:

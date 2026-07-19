@@ -1033,6 +1033,100 @@ def test_search_harness_replays_a_witnessed_batch_without_recalling_proposer() -
     assert resumed_checkpoints[-1].proposal_batch_witness_digests == (witness.payload_sha256,)
 
 
+def test_replay_preserves_pre_batch_callback_order_in_witnessed_proposer_state() -> None:
+    """The pre-batch hook must run before both snapshots, not twice around a replay."""
+
+    class StatefulProposer(_HistoryProposer):
+        configuration_id = "callback-ordered-stateful-proposer-v1"
+        durable_state_required = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.state = 0
+            self.calls = 0
+
+        def export_search_state(self) -> JsonObject:
+            return {"state": self.state}
+
+        def restore_search_state(self, raw_state: JsonObject) -> None:
+            state = raw_state["state"]
+            assert isinstance(state, int)
+            self.state = state
+
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            self.calls += 1
+            self.state += 1
+            return super().propose_batch(
+                parent,
+                trigger,
+                evidence,
+                history=history,
+                count=count,
+                should_cancel=should_cancel,
+            )
+
+    class StatefulScorer(_NeutralScorer):
+        configuration_id = "callback-ordered-stateful-scorer-v1"
+
+        def __init__(self, proposer: StatefulProposer) -> None:
+            super().__init__()
+            self._proposer = proposer
+
+        def before_proposal_batch(self) -> None:
+            super().before_proposal_batch()
+            self._proposer.state += 10
+
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    first_proposer = StatefulProposer()
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            StatefulScorer(first_proposer),
+            first_proposer,
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=lambda witness: (
+                witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+
+    [witness] = witnesses
+    assert witness.proposer_state_before == {"state": 10}
+    assert witness.proposer_state_after == {"state": 11}
+
+    resumed_proposer = StatefulProposer()
+    resumed = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        StatefulScorer(resumed_proposer),
+        resumed_proposer,
+        iterations=1,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        resume_from=checkpoints[0],
+        resume_proposal_batch_witness=witness,
+    )
+
+    assert resumed.iterations == 1
+    assert resumed_proposer.calls == 0
+    assert resumed_proposer.state == 11
+
+
 def test_search_harness_witnesses_proposer_failures_before_any_candidate_score() -> None:
     class FailingStatefulProposer(_HistoryProposer):
         configuration_id = "failing-stateful-witness-proposer-v1"
@@ -1558,6 +1652,55 @@ def test_search_harness_recognizes_only_the_exact_already_consumed_witness() -> 
     assert scorer.requests == []
 
 
+def test_consumed_witness_cannot_substitute_output_behind_a_rehashed_checkpoint() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+
+    def _stop_after_first_iteration(checkpoint: SearchCheckpoint) -> None:
+        checkpoints.append(checkpoint)
+        if checkpoint.completed_iteration == 1:
+            raise RuntimeError("stop after first iteration")
+
+    with pytest.raises(RuntimeError, match="stop after first iteration"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_stop_after_first_iteration,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=witnesses.append,
+        )
+
+    witness_payload = witnesses[0].model_dump(mode="json")
+    witness_payload["slots"][0]["delta"]["expected_effect"] = "stale substituted output"
+    _rehash_witness_payload(witness_payload)
+    substituted_witness = SearchProposalBatchWitness.model_validate(witness_payload)
+
+    checkpoint_payload = checkpoints[-1].model_dump(mode="json")
+    checkpoint_payload["proposal_batch_witness_digests"][0] = substituted_witness.payload_sha256
+    _rehash_checkpoint_payload(checkpoint_payload)
+    substituted_checkpoint = SearchCheckpoint.model_validate(checkpoint_payload)
+
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match="committed proposal output"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=substituted_checkpoint,
+            resume_proposal_batch_witness=substituted_witness,
+        )
+    assert scorer.requests == []
+
+
 def test_search_harness_rejects_resume_configuration_drift_before_scoring() -> None:
     checkpoints: list[SearchCheckpoint] = []
     with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
@@ -1628,6 +1771,67 @@ def test_search_harness_binds_search_run_id_into_checkpoint_and_witness() -> Non
             resume_proposal_batch_witness=witnesses[0],
         )
     assert scorer.requests == []
+
+
+def test_generated_search_run_id_rejects_stale_cross_run_witness_substitution() -> None:
+    first_checkpoints: list[SearchCheckpoint] = []
+    first_witnesses: list[SearchProposalBatchWitness] = []
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=first_checkpoints.append,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=lambda witness: (
+                first_witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+
+    second_checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="stop at second seed checkpoint"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=lambda checkpoint: (
+                second_checkpoints.append(checkpoint),
+                (_ for _ in ()).throw(RuntimeError("stop at second seed checkpoint")),
+            ),
+        )
+
+    first_run_id = first_checkpoints[0].configuration.search_run_id
+    second_run_id = second_checkpoints[0].configuration.search_run_id
+    assert first_run_id is not None
+    assert second_run_id is not None
+    assert first_run_id != second_run_id
+    assert first_checkpoints[0].payload_sha256 != second_checkpoints[0].payload_sha256
+
+    scorer = _NeutralScorer()
+    proposer = _HistoryProposer()
+    with pytest.raises(ValueError, match="proposal batch witness (configuration|prior checkpoint)"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            proposer,
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=second_checkpoints[0],
+            resume_proposal_batch_witness=first_witnesses[0],
+        )
+    assert scorer.requests == []
+    assert proposer.history_ids == []
 
 
 def test_search_harness_rejects_resume_scorer_matrix_drift_before_scoring() -> None:
