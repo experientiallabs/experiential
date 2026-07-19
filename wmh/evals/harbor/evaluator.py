@@ -711,7 +711,7 @@ def _copy_local_tasks_from_open_dataset(
                 source_device=source_metadata.st_dev,
             )
         final_source_metadata = os.fstat(source_fd)
-        if _directory_metadata_changed(source_metadata, final_source_metadata):
+        if _metadata_changed(source_metadata, final_source_metadata):
             raise UnsupportedHarborTaskError(
                 "local Harbor dataset root changed while its task snapshot was copied"
             )
@@ -773,7 +773,7 @@ def _discover_local_task_names(
             task_names.append(name)
         finally:
             os.close(directory_fd)
-    if _directory_metadata_changed(source_metadata, os.fstat(source_fd)):
+    if _metadata_changed(source_metadata, os.fstat(source_fd)):
         raise UnsupportedHarborTaskError("local Harbor dataset root changed during task discovery")
     return tuple(task_names)
 
@@ -858,7 +858,7 @@ def _copy_source_directory(
                         "local Harbor task snapshot source can contain only single-link regular "
                         "files and directories"
                     )
-            if _directory_metadata_changed(source_metadata, os.fstat(source_fd)):
+            if _metadata_changed(source_metadata, os.fstat(source_fd)):
                 raise UnsupportedHarborTaskError(
                     "local Harbor task directory changed while its snapshot was copied"
                 )
@@ -890,6 +890,7 @@ def _copy_source_file(
                 0o600 | (source_metadata.st_mode & 0o111),
                 dir_fd=destination_parent_fd,
             )
+            # Enforce the exact normalized mode after the process umask affected os.open.
             os.fchmod(destination_fd, 0o600 | (source_metadata.st_mode & 0o111))
             while chunk := os.read(source_fd, 1024 * 1024):
                 _write_all(destination_fd, chunk)
@@ -897,7 +898,7 @@ def _copy_source_file(
             raise UnsupportedHarborTaskError(
                 "local Harbor task file could not be copied safely"
             ) from None
-        if _file_metadata_changed(source_metadata, os.fstat(source_fd)):
+        if _metadata_changed(source_metadata, os.fstat(source_fd)):
             raise UnsupportedHarborTaskError(
                 "local Harbor task file changed while its snapshot was copied"
             )
@@ -980,12 +981,7 @@ def _write_all(destination_fd: int, value: bytes) -> None:
         remaining = remaining[written:]
 
 
-def _directory_metadata_changed(before: os.stat_result, after: os.stat_result) -> bool:
-    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
-    return any(getattr(before, field) != getattr(after, field) for field in fields)
-
-
-def _file_metadata_changed(before: os.stat_result, after: os.stat_result) -> bool:
+def _metadata_changed(before: os.stat_result, after: os.stat_result) -> bool:
     fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
     return any(getattr(before, field) != getattr(after, field) for field in fields)
 
