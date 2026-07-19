@@ -549,6 +549,34 @@ def test_play_with_traces_seeds_state(patched_provider, tmp_path) -> None:  # no
     assert "my seeded scratchpad" in result.output
 
 
+def test_play_auto_discovered_trace_empty_does_not_raise(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    _build(root, "default", tmp_path)
+
+    # Put a trace file where auto-discovery will find it (default model root),
+    # but make sure it has no replayable steps (e.g. just a generic span).
+    model_root = root / "models" / "default"
+    path = model_root / "traces.otel.jsonl"
+    span_generic = {
+        "traceId": "c" * 32,
+        "spanId": "s1",
+        "name": "something_else",
+        "startTimeUnixNano": 1,
+        "attributes": [],
+    }
+    path.write_text(json.dumps(span_generic) + "\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["play", "--root", str(root)],
+        input=':state\n:quit\n',
+    )
+    assert result.exit_code == 0, result.output
+    # seed_state should be None, meaning state is empty.
+    assert "no task set" in result.output
+    assert "task: (none)" in result.output
+
+
 def test_build_interactive_wizard_creates_model(
     patched_provider,  # noqa: ANN001 - pytest fixture
     tmp_path,  # noqa: ANN001 - pytest fixture

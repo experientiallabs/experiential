@@ -1804,7 +1804,8 @@ def demo(
             provider = wrap_provider_with_retries(
                 providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
             )
-            wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
+            model_dir_resolved = WorldModelStore(str(model_root)).resolve(resolved_name)
+            wm = WorldModel.load(str(model_dir_resolved), provider, telemetry_root=str(model_root))
             _console.print(
                 f"[dim]resuming from step {len(done) + 1} with "
                 f"{provider_name} ({model_type})…[/dim]"
@@ -1849,6 +1850,7 @@ def play(
     suggestions = _action_suggestions(wm)
     run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions, seed_state=seed_state)
 
+
 def _sample_trace(
     model_root: Path,
     resolved_name: str,
@@ -1868,7 +1870,9 @@ def _sample_trace(
     config = load_config(model_dir)  # the model dir holds its own HarnessConfig
     candidates = [t for t in ingest(config, file=str(traces_file)) if t.steps]
     if not candidates:
-        raise typer.BadParameter(f"{traces_file} contains no replayable traces")
+        if require_trace or traces:
+            raise typer.BadParameter(f"{traces_file} contains no replayable traces")
+        return None
     return random.Random(seed).choice(candidates)
 
 def _traces_for_root(model_root: Path) -> Path | None:
