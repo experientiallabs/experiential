@@ -1146,9 +1146,10 @@ class PairedHarborRunner:
             raise ValueError("paired budget runtime differs from the frozen ledger identity")
         if not isinstance(multi_host, bool):
             raise ValueError("multi_host must be a boolean")
-        if multi_host and durable_coordinator is None:
+        if multi_host:
             raise ValueError(
-                "paired Harbor multi-host execution requires a durable lease coordinator"
+                "paired Harbor multi-host execution is not supported by the host-local SQLite "
+                "budget authority; use one shared transactional budget authority"
             )
 
         spec = HarborJobSpec.model_validate(job_spec.model_dump())

@@ -6,9 +6,11 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import sqlite3
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -236,8 +238,8 @@ def test_identity_bound_account_rejects_replaced_ledger_after_restart(tmp_path: 
     )
     ledger.reserve(_scope(), meter_id="worker", max_nano_usd=100, reservation_id="spent")
     authority.ledger_path.rename(tmp_path / "spent.sqlite3")
-    replacement = SpendLedger(authority.ledger_path, policy)
-    assert replacement.ledger_identity != authority.ledger_identity
+    with pytest.raises(BudgetIntegrityError, match="authority differs"):
+        SpendLedger(authority.ledger_path, policy)
 
     context = multiprocessing.get_context("spawn")
     outcomes = context.Queue()
@@ -249,8 +251,149 @@ def test_identity_bound_account_rejects_replaced_ledger_after_restart(tmp_path: 
     process.join(timeout=10)
 
     assert process.exitcode == 0
-    assert "different ledger identity" in outcomes.get(timeout=1)
-    assert replacement.reservations() == []
+    assert "authority differs" in outcomes.get(timeout=1)
+
+
+def test_identity_bound_account_rejects_stale_ledger_snapshot_after_restart(
+    tmp_path: Path,
+) -> None:
+    policy = _policy(hard=100, search=100, final=0).model_copy(
+        update={"study_id": "rollback-study"}
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "budget.sqlite3", policy)
+    account = authority.provider_account(scope=_scope(), meter_id="worker")
+    snapshot_path = tmp_path / "budget-before-spend.sqlite3"
+    shutil.copyfile(authority.ledger_path, snapshot_path)
+    ledger = open_shared_spend_ledger(
+        authority.ledger_path,
+        policy,
+        expected_ledger_identity=authority.ledger_identity,
+    )
+    ledger.reserve(_scope(), meter_id="worker", max_nano_usd=100, reservation_id="spent")
+    shutil.copyfile(snapshot_path, authority.ledger_path)
+
+    context = multiprocessing.get_context("spawn")
+    outcomes = context.Queue()
+    process = context.Process(
+        target=_bind_account_in_fresh_process,
+        args=(account.model_dump_json(), outcomes),
+    )
+    process.start()
+    process.join(timeout=10)
+
+    assert process.exitcode == 0
+    assert "rolled back" in outcomes.get(timeout=1)
+
+
+def test_cached_paid_open_rejects_stale_ledger_snapshot(tmp_path: Path) -> None:
+    policy = _policy(hard=100, search=100, final=0).model_copy(
+        update={"study_id": "cached-rollback-study"}
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "budget.sqlite3", policy)
+    snapshot_path = tmp_path / "budget-before-spend.sqlite3"
+    shutil.copyfile(authority.ledger_path, snapshot_path)
+    ledger = open_shared_spend_ledger(
+        authority.ledger_path,
+        policy,
+        expected_ledger_identity=authority.ledger_identity,
+    )
+    ledger.reserve(_scope(), meter_id="worker", max_nano_usd=100, reservation_id="spent")
+    shutil.copyfile(snapshot_path, authority.ledger_path)
+
+    with pytest.raises(BudgetIntegrityError, match="rolled back"):
+        open_shared_spend_ledger(
+            authority.ledger_path,
+            policy,
+            expected_ledger_identity=authority.ledger_identity,
+        )
+
+
+def test_rejected_operation_after_authority_backfill_remains_usable(tmp_path: Path) -> None:
+    policy = _policy(hard=100, search=100, final=0).model_copy(
+        update={"study_id": "backfill-rejection-study"}
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "budget.sqlite3", policy)
+    first = SpendLedger(authority.ledger_path, policy, allow_create=False)
+    second = SpendLedger(authority.ledger_path, policy, allow_create=False)
+    authority_snapshot = tmp_path / "authority-before-spend.sqlite3"
+    shutil.copyfile(first.authority_path, authority_snapshot)
+    first.reserve(_scope(), meter_id="worker", max_nano_usd=100, reservation_id="spent")
+    shutil.copyfile(authority_snapshot, first.authority_path)
+
+    with pytest.raises(BudgetExceededError):
+        second.reserve(_scope(), meter_id="worker", max_nano_usd=1, reservation_id="rejected")
+
+    second.audit()
+    assert second.snapshot().reserved_nano_usd == 100
+
+
+def test_ledger_commit_authority_rollback_recovers_without_releasing_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy(hard=100, search=100, final=0).model_copy(
+        update={"study_id": "authority-commit-gap-study"}
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "budget.sqlite3", policy)
+    ledger = SpendLedger(authority.ledger_path, policy, allow_create=False)
+    original_authority_transaction = ledger._authority_transaction
+    original_authority_connection = ledger._authority_connection
+
+    @contextmanager
+    def fail_authority_commit() -> Iterator[sqlite3.Connection]:
+        with original_authority_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.rollback()
+                raise sqlite3.OperationalError("injected authority commit failure")
+
+    monkeypatch.setattr(ledger, "_authority_transaction", fail_authority_commit)
+    with pytest.raises(sqlite3.OperationalError, match="injected authority commit failure"):
+        ledger.reserve(_scope(), meter_id="worker", max_nano_usd=60, reservation_id="committed")
+    monkeypatch.setattr(ledger, "_authority_transaction", original_authority_transaction)
+
+    ledger.audit()
+    assert ledger.snapshot().reserved_nano_usd == 60
+
+
+def test_ledger_commit_failure_rolls_back_both_files_and_remains_usable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy(hard=100, search=100, final=0).model_copy(
+        update={"study_id": "ledger-commit-failure-study"}
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "budget.sqlite3", policy)
+    ledger = SpendLedger(authority.ledger_path, policy, allow_create=False)
+    original_transaction = ledger._transaction
+    original_connection = ledger._connection
+
+    @contextmanager
+    def fail_ledger_commit() -> Iterator[sqlite3.Connection]:
+        with original_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.rollback()
+                raise sqlite3.OperationalError("injected ledger commit failure")
+
+    monkeypatch.setattr(ledger, "_transaction", fail_ledger_commit)
+    with pytest.raises(sqlite3.OperationalError, match="injected ledger commit failure"):
+        ledger.reserve(_scope(), meter_id="worker", max_nano_usd=60, reservation_id="rolled-back")
+    monkeypatch.setattr(ledger, "_transaction", original_transaction)
+
+    assert ledger.snapshot().reserved_nano_usd == 0
+    ledger.reserve(_scope(), meter_id="worker", max_nano_usd=60, reservation_id="usable")
+    assert ledger.snapshot().reserved_nano_usd == 60
 
 
 def test_one_policy_cannot_bind_two_bootstrapped_ledgers(tmp_path: Path) -> None:

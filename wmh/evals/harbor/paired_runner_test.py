@@ -855,9 +855,20 @@ def test_canonical_receipt_trace_preserves_exact_turn_call_indexes() -> None:
         )
 
 
-def test_multi_host_execution_requires_durable_coordinator(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="requires a durable lease coordinator"):
+def test_multi_host_execution_rejects_host_local_budget_authority(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not supported.*shared transactional"):
         _runner(tmp_path, _candidate(), multi_host=True)
+
+
+def test_multi_host_execution_rejects_process_local_budget_authority(tmp_path: Path) -> None:
+    coordinator = mod._LocalPairedHarborLeaseCoordinator(tmp_path / "jobs")
+    with pytest.raises(ValueError, match="not supported.*shared transactional"):
+        _runner(
+            tmp_path,
+            _candidate(),
+            multi_host=True,
+            durable_coordinator=coordinator,
+        )
 
 
 def test_job_and_pair_generation_identities_bind_operation_generation_and_block(

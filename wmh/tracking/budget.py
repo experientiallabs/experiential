@@ -1,10 +1,12 @@
 """Crash-safe hard-budget admission and provider-boundary cost ceilings.
 
 The budget database is an append-only, hash-chained audit log plus a transactionally maintained
-reservation index. A paid call must reserve its conservative maximum cost before dispatch. Exact
+reservation index. An independent append-only high-water database makes a stale ledger-only
+restore fail closed. A paid call must reserve its conservative maximum cost before dispatch. Exact
 usage settles the reservation; missing usage or an exception forfeits the full ceiling. Open
 reservations continue to consume budget after a process crash, so an orphaned request can never
-silently release money for a second call.
+silently release money for a second call. Both files remain one single-host authority; a storage
+snapshot that rolls back both trusted files together is outside this local authority's guarantees.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from wmh.providers.base import (
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _ZERO_DIGEST = "sha256:" + "0" * 64
 _SCHEMA_VERSION = 3
+_AUTHORITY_SCHEMA_VERSION = 1
 _DEFAULT_BUSY_TIMEOUT_MS = 30_000
 _NANO_USD_PER_USD = 1_000_000_000
 _TOKENS_PER_MILLION = 1_000_000
@@ -478,6 +481,7 @@ class SpendLedger:
         *,
         now: Callable[[], datetime] | None = None,
         allow_create: bool = True,
+        allow_authority_create: bool | None = None,
     ) -> None:
         requested = Path(path).expanduser()
         if requested.is_symlink():
@@ -487,7 +491,11 @@ class SpendLedger:
         elif not requested.parent.is_dir():
             raise BudgetIntegrityError("budget ledger parent must exist after bootstrap")
         self.path = requested.parent.resolve() / requested.name
+        self._authority_path = _authority_path_for_ledger(self.path)
         self._allow_create = allow_create
+        self._allow_authority_create = (
+            allow_create if allow_authority_create is None else allow_authority_create
+        )
         if not allow_create and not self.path.exists():
             raise BudgetIntegrityError("budget ledger must be explicitly bootstrapped before use")
         if self.path.exists() and not stat.S_ISREG(self.path.stat(follow_symlinks=False).st_mode):
@@ -498,10 +506,22 @@ class SpendLedger:
         self._verified_sequence = 0
         self._verified_digest = _ZERO_DIGEST
         self._verified_reservations: dict[str, BudgetReservation] = {}
+        self._verified_authority_sequence = 0
+        self._verified_authority_digest = _ZERO_DIGEST
         self._initialize()
         ledger_stat = self.path.stat(follow_symlinks=False)
         self._file_identity = (ledger_stat.st_dev, ledger_stat.st_ino)
         self.audit()
+        self._initialize_authority()
+        authority_stat = self._authority_path.stat(follow_symlinks=False)
+        self._authority_file_identity = (authority_stat.st_dev, authority_stat.st_ino)
+        with self._authority_transaction() as connection:
+            # Another process may have advanced the ledger between the first audit and our
+            # acquisition of the cross-process authority lock.
+            with self._state_lock:
+                self._audit_unlocked()
+            verified_authority = self._synchronize_authority(connection, full_audit=True)
+        self._verified_authority_sequence, self._verified_authority_digest = verified_authority
 
     @property
     def policy(self) -> BudgetPolicy:
@@ -509,12 +529,18 @@ class SpendLedger:
         return self._policy.model_copy(deep=True)
 
     @property
+    def authority_path(self) -> Path:
+        """Return the host-local high-water database paired with this ledger."""
+        return self._authority_path
+
+    @property
     def ledger_identity(self) -> str:
         """Return an opaque identity unique to this initialized ledger and canonical path."""
         return _digest_json(
             {
-                "identity_version": 1,
+                "identity_version": 2,
                 "ledger_nonce": self._ledger_nonce,
+                "authority_nonce": self._authority_nonce,
                 "canonical_path": str(self.path),
                 "policy_digest": self._policy.policy_digest,
             }
@@ -715,8 +741,8 @@ class SpendLedger:
 
     def events(self) -> list[BudgetEvent]:
         """Return the append-only audit events after verifying each serialized entry."""
+        self.audit()
         with self._state_lock:
-            self._audit_unlocked()
             verified_sequence = self._verified_sequence
             with self._connection() as connection:
                 rows = connection.execute(
@@ -743,7 +769,19 @@ class SpendLedger:
     def audit(self) -> None:
         """Rebuild state from the full hash chain and compare the derived index exactly."""
         with self._state_lock:
-            self._audit_unlocked()
+            if hasattr(self, "_authority_nonce"):
+                with self._authority_transaction() as authority:
+                    self._audit_unlocked()
+                    verified_authority = self._synchronize_authority(
+                        authority,
+                        full_audit=True,
+                    )
+                (
+                    self._verified_authority_sequence,
+                    self._verified_authority_digest,
+                ) = verified_authority
+            else:
+                self._audit_unlocked()
 
     def _audit_unlocked(self) -> None:
         """Full audit implementation; caller owns the process-local state lock."""
@@ -790,6 +828,11 @@ class SpendLedger:
             reconstructed_reservations,
             self._policy,
         )
+        prior_sequence = self._verified_sequence
+        prior_digest = self._verified_digest
+        if prior_sequence:
+            if len(events) < prior_sequence or events[prior_sequence - 1].digest != prior_digest:
+                raise BudgetIntegrityError("budget ledger was rolled back after audit")
         self._verified_sequence = events[-1].sequence
         self._verified_digest = events[-1].digest
         self._verified_reservations = {
@@ -849,6 +892,178 @@ class SpendLedger:
                 if row["policy_digest"] != self._policy.policy_digest or persisted != self._policy:
                     raise BudgetIntegrityError("budget policy differs from the existing ledger")
 
+    def _initialize_authority(self) -> None:
+        """Create or validate the independent monotonic ledger-head authority."""
+        path = self._authority_path
+        if path.is_symlink():
+            raise BudgetIntegrityError("budget authority path cannot be a symlink")
+        if not path.exists():
+            if not self._allow_authority_create:
+                raise BudgetIntegrityError(
+                    "budget authority must be explicitly bootstrapped before paid use"
+                )
+            flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(path, flags, 0o600)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise BudgetIntegrityError("budget authority could not be created safely") from exc
+            else:
+                os.close(descriptor)
+        if not path.exists() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+            raise BudgetIntegrityError("budget authority path must be a regular file")
+        try:
+            connection = sqlite3.connect(
+                path.as_uri() + "?mode=rw",
+                timeout=_DEFAULT_BUSY_TIMEOUT_MS / 1000,
+                uri=True,
+            )
+        except sqlite3.OperationalError as exc:
+            raise BudgetIntegrityError("budget authority must remain readable") from exc
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {_DEFAULT_BUSY_TIMEOUT_MS}")
+            connection.executescript(_AUTHORITY_SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM budget_authority_metadata WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                if not self._allow_authority_create:
+                    raise BudgetIntegrityError("budget authority metadata is missing")
+                if self._verified_sequence != 1:
+                    raise BudgetIntegrityError(
+                        "missing budget authority cannot be recreated after ledger use"
+                    )
+                authority_nonce = secrets.token_hex(32)
+                connection.execute(
+                    """
+                    INSERT INTO budget_authority_metadata (
+                        id, schema_version, authority_nonce, ledger_nonce,
+                        canonical_ledger_path, policy_digest
+                    ) VALUES (1, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _AUTHORITY_SCHEMA_VERSION,
+                        authority_nonce,
+                        self._ledger_nonce,
+                        str(self.path),
+                        self._policy.policy_digest,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO budget_authority_heads (sequence, digest) VALUES (?, ?)",
+                    (self._verified_sequence, self._verified_digest),
+                )
+                self._authority_nonce = authority_nonce
+            else:
+                self._authority_nonce = self._validate_authority_metadata(row)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        os.chmod(path, 0o600)
+
+    def _validate_authority_metadata(self, row: sqlite3.Row) -> str:
+        if row["schema_version"] != _AUTHORITY_SCHEMA_VERSION:
+            raise BudgetIntegrityError("unsupported budget authority schema version")
+        authority_nonce = row["authority_nonce"]
+        if (
+            not isinstance(authority_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{64}", authority_nonce) is None
+        ):
+            raise BudgetIntegrityError("budget authority identity is malformed")
+        if (
+            row["ledger_nonce"] != self._ledger_nonce
+            or row["canonical_ledger_path"] != str(self.path)
+            or row["policy_digest"] != self._policy.policy_digest
+        ):
+            raise BudgetIntegrityError("budget authority differs from its ledger")
+        return authority_nonce
+
+    def _synchronize_authority(
+        self,
+        authority: sqlite3.Connection,
+        *,
+        ledger: sqlite3.Connection | None = None,
+        full_audit: bool = False,
+    ) -> tuple[int, str]:
+        """Verify monotonic chain progress and append every newly durable ledger head."""
+        metadata = authority.execute(
+            "SELECT * FROM budget_authority_metadata WHERE id = 1"
+        ).fetchone()
+        if metadata is None or self._validate_authority_metadata(metadata) != self._authority_nonce:
+            raise BudgetIntegrityError("budget authority identity changed after audit")
+        latest = authority.execute(
+            "SELECT sequence, digest FROM budget_authority_heads ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if latest is None:
+            raise BudgetIntegrityError("budget authority has no ledger head")
+        latest_sequence = cast("int", latest["sequence"])
+        latest_digest = cast("str", latest["digest"])
+        if latest_sequence < self._verified_authority_sequence:
+            raise BudgetIntegrityError("budget authority was rolled back after audit")
+        if (
+            latest_sequence == self._verified_authority_sequence
+            and latest_digest != self._verified_authority_digest
+        ):
+            raise BudgetIntegrityError("budget authority head changed after audit")
+        if latest_sequence > self._verified_sequence:
+            raise BudgetIntegrityError("budget ledger was rolled back behind its authority")
+
+        owns_ledger = ledger is None
+        if ledger is None:
+            ledger_context = self._connection()
+            ledger = ledger_context.__enter__()
+        try:
+            start = 1 if full_audit else self._verified_authority_sequence + 1
+            authority_rows = authority.execute(
+                "SELECT sequence, digest FROM budget_authority_heads "
+                "WHERE sequence >= ? ORDER BY sequence",
+                (start,),
+            ).fetchall()
+            expected_sequence = start
+            for row in authority_rows:
+                sequence = cast("int", row["sequence"])
+                digest = cast("str", row["digest"])
+                if sequence != expected_sequence:
+                    raise BudgetIntegrityError("budget authority head sequence is not contiguous")
+                ledger_row = ledger.execute(
+                    "SELECT digest FROM budget_events WHERE sequence = ?",
+                    (sequence,),
+                ).fetchone()
+                if ledger_row is None or ledger_row["digest"] != digest:
+                    raise BudgetIntegrityError("budget ledger was rolled back behind its authority")
+                expected_sequence += 1
+            if expected_sequence - 1 != latest_sequence:
+                raise BudgetIntegrityError("budget authority head sequence is not contiguous")
+            missing = ledger.execute(
+                "SELECT sequence, digest FROM budget_events WHERE sequence > ? ORDER BY sequence",
+                (latest_sequence,),
+            ).fetchall()
+            expected_sequence = latest_sequence + 1
+            for row in missing:
+                sequence = cast("int", row["sequence"])
+                digest = cast("str", row["digest"])
+                if sequence != expected_sequence:
+                    raise BudgetIntegrityError("budget ledger head sequence is not contiguous")
+                authority.execute(
+                    "INSERT INTO budget_authority_heads (sequence, digest) VALUES (?, ?)",
+                    (sequence, digest),
+                )
+                expected_sequence += 1
+            if expected_sequence - 1 != self._verified_sequence:
+                raise BudgetIntegrityError("budget ledger verified head changed unexpectedly")
+            return self._verified_sequence, self._verified_digest
+        finally:
+            if owns_ledger:
+                ledger_context.__exit__(None, None, None)
+
     def _append_event(
         self,
         connection: sqlite3.Connection,
@@ -878,6 +1093,17 @@ class SpendLedger:
 
     def _sync_verified_state(self, connection: sqlite3.Connection) -> None:
         """Apply newly committed hash-linked events to authoritative process-local state."""
+        head = connection.execute(
+            "SELECT sequence, digest FROM budget_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if head is None:
+            raise BudgetIntegrityError("budget ledger has no genesis event")
+        head_sequence = cast("int", head["sequence"])
+        head_digest = cast("str", head["digest"])
+        if head_sequence < self._verified_sequence:
+            raise BudgetIntegrityError("budget ledger was rolled back after audit")
+        if head_sequence == self._verified_sequence and head_digest != self._verified_digest:
+            raise BudgetIntegrityError("budget ledger verified head changed after audit")
         rows = connection.execute(
             "SELECT sequence, entry_json FROM budget_events WHERE sequence > ? ORDER BY sequence",
             (self._verified_sequence,),
@@ -1024,6 +1250,49 @@ class SpendLedger:
             raise BudgetIntegrityError("budget ledger file changed after audit")
 
     @contextmanager
+    def _authority_connection(self) -> Iterator[sqlite3.Connection]:
+        expected = getattr(self, "_authority_file_identity", None)
+        try:
+            current = self._authority_path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise BudgetIntegrityError("budget authority path disappeared after audit") from exc
+        if not stat.S_ISREG(current.st_mode) or (
+            expected is not None and (current.st_dev, current.st_ino) != expected
+        ):
+            raise BudgetIntegrityError("budget authority file changed after audit")
+        try:
+            connection = sqlite3.connect(
+                self._authority_path.as_uri() + "?mode=rw",
+                timeout=_DEFAULT_BUSY_TIMEOUT_MS / 1000,
+                uri=True,
+            )
+        except sqlite3.OperationalError as exc:
+            raise BudgetIntegrityError("budget authority must remain readable after audit") from exc
+        connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout = {_DEFAULT_BUSY_TIMEOUT_MS}")
+        try:
+            reopened = self._authority_path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(reopened.st_mode) or (
+                expected is not None and (reopened.st_dev, reopened.st_ino) != expected
+            ):
+                raise BudgetIntegrityError("budget authority file changed while opening")
+            yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _authority_transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._authority_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+
+    @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1038,9 +1307,43 @@ class SpendLedger:
     @contextmanager
     def _verified_transaction(self) -> Iterator[sqlite3.Connection]:
         with self._state_lock:
-            with self._transaction() as connection:
-                self._sync_verified_state(connection)
-                yield connection
+            prior_state = (
+                self._verified_sequence,
+                self._verified_digest,
+                {
+                    reservation_id: reservation.model_copy(deep=True)
+                    for reservation_id, reservation in self._verified_reservations.items()
+                },
+                self._verified_authority_sequence,
+                self._verified_authority_digest,
+            )
+            try:
+                with self._authority_transaction() as authority:
+                    with self._transaction() as connection:
+                        self._sync_verified_state(connection)
+                        verified_authority = self._synchronize_authority(
+                            authority,
+                            ledger=connection,
+                        )
+                        yield connection
+                        self._sync_verified_state(connection)
+                        verified_authority = self._synchronize_authority(
+                            authority,
+                            ledger=connection,
+                        )
+            except BaseException:
+                (
+                    self._verified_sequence,
+                    self._verified_digest,
+                    self._verified_reservations,
+                    self._verified_authority_sequence,
+                    self._verified_authority_digest,
+                ) = prior_state
+                raise
+            (
+                self._verified_authority_sequence,
+                self._verified_authority_digest,
+            ) = verified_authority
 
 
 _SHARED_LEDGER_LOCK = threading.Lock()
@@ -1077,7 +1380,12 @@ def bootstrap_budget_ledger(
         raise BudgetIntegrityError("budget ledger could not be bootstrapped safely") from exc
     else:
         os.close(descriptor)
-    ledger = SpendLedger(canonical_path, frozen_policy, allow_create=False)
+    ledger = SpendLedger(
+        canonical_path,
+        frozen_policy,
+        allow_create=False,
+        allow_authority_create=True,
+    )
     with _SHARED_LEDGER_LOCK:
         existing = _SHARED_LEDGERS.get(canonical_path)
         if existing is not None:
@@ -1878,6 +2186,10 @@ def _digest_json(value: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json(value).encode()).hexdigest()
 
 
+def _authority_path_for_ledger(path: Path) -> Path:
+    return path.with_name(f".{path.name}.authority.sqlite3")
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -1934,5 +2246,46 @@ CREATE TRIGGER IF NOT EXISTS budget_metadata_no_delete
 BEFORE DELETE ON budget_metadata
 BEGIN
     SELECT RAISE(ABORT, 'budget metadata is immutable');
+END;
+"""
+
+
+_AUTHORITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS budget_authority_metadata (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    schema_version INTEGER NOT NULL,
+    authority_nonce TEXT NOT NULL CHECK (length(authority_nonce) = 64),
+    ledger_nonce TEXT NOT NULL CHECK (length(ledger_nonce) = 64),
+    canonical_ledger_path TEXT NOT NULL,
+    policy_digest TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS budget_authority_heads (
+    sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
+    digest TEXT NOT NULL UNIQUE
+);
+
+CREATE TRIGGER IF NOT EXISTS budget_authority_metadata_no_update
+BEFORE UPDATE ON budget_authority_metadata
+BEGIN
+    SELECT RAISE(ABORT, 'budget authority metadata is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS budget_authority_metadata_no_delete
+BEFORE DELETE ON budget_authority_metadata
+BEGIN
+    SELECT RAISE(ABORT, 'budget authority metadata is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS budget_authority_heads_no_update
+BEFORE UPDATE ON budget_authority_heads
+BEGIN
+    SELECT RAISE(ABORT, 'budget authority heads are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS budget_authority_heads_no_delete
+BEFORE DELETE ON budget_authority_heads
+BEGIN
+    SELECT RAISE(ABORT, 'budget authority heads are append-only');
 END;
 """
