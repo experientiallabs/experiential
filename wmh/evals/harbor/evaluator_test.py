@@ -773,6 +773,36 @@ def test_complete_matching_job_is_reused_without_rerunning_completed_trials(
     assert readiness_images == [mod.PI_CONTAINER_IMAGE]
 
 
+def test_evaluator_session_shares_one_concurrent_runner_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    session = mod.HarborEvaluatorSession(runner_image=mod.PI_CONTAINER_IMAGE)
+    evaluators = [
+        mod.HarborEvaluator(
+            _spec(tmp_path, dataset, job_name=f"evaluation-{index}"),
+            _provider(),
+            session=session,
+        )
+        for index in range(4)
+    ]
+    readiness_images: list[str] = []
+
+    def record_readiness(*, image: str) -> None:
+        readiness_images.append(image)
+
+    monkeypatch.setattr(mod, "verify_container_pi_runner_ready", record_readiness)
+
+    async def exercise() -> None:
+        await asyncio.gather(*(evaluator._ensure_runner_ready() for evaluator in evaluators))
+
+    asyncio.run(exercise())
+
+    assert readiness_images == [mod.PI_CONTAINER_IMAGE]
+
+
 def test_agent_runtime_version_change_rejects_stale_completed_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

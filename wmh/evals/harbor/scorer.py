@@ -35,7 +35,7 @@ from wmh.evals.benchmark import (
 )
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
-from wmh.evals.harbor.evaluator import HarborEvaluator
+from wmh.evals.harbor.evaluator import HarborEvaluator, harbor_run_expectation
 from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
@@ -110,11 +110,16 @@ class _TraceEvidence:
 
 
 @dataclass(frozen=True)
-class _ScoredTrial:
+class AdmittedHarborTrial:
+    """One exact Harbor trial admitted as binary analysis evidence."""
+
     trial: BenchmarkTrialResult
     verifier_reward: float | None
     score: float
-    trace: _TraceEvidence
+    trace_text: str
+    trace_digest: str
+    provider_receipts: tuple[ChatProviderReceipt, ...]
+    provider_receipt_call_indexes: tuple[int, ...]
 
 
 class HarborHarnessScorer:
@@ -181,14 +186,17 @@ class HarborHarnessScorer:
             deep=True,
         )
         _validate_job_prefix(spec.job_name)
-        _validate_exact_dataset_selection(spec, frozen_task_ids)
+        validate_exact_harbor_dataset_selection(spec, frozen_task_ids)
         if spec.environment_backend is HarborEnvironmentBackend.E2B:
             raise ValueError(
                 "HarborHarnessScorer cannot validate E2B runs until Harbor exposes the immutable "
                 "build ID used to create each sandbox; use local Docker for scored search"
             )
         provider = ProviderConfig.model_validate(provider_config.model_dump())
-        envelope = _compute_envelope(reference_harness, turn_timeout_s=turn_timeout_s)
+        envelope = harbor_agent_compute_envelope(
+            reference_harness,
+            turn_timeout_s=turn_timeout_s,
+        )
         if envelope.runtime_kind != "pi-node":
             raise ValueError(
                 "HarborHarnessScorer requires a pi-node reference harness, got "
@@ -239,7 +247,7 @@ class HarborHarnessScorer:
     def validate_candidate(self, candidate: HarnessDoc) -> str | None:
         """Reject candidates that change the frozen runtime or agent compute envelope."""
         try:
-            actual = _compute_envelope(
+            actual = harbor_agent_compute_envelope(
                 candidate,
                 turn_timeout_s=self._compute_envelope.turn_timeout_s,
             )
@@ -328,14 +336,15 @@ class HarborHarnessScorer:
         request: ScoreRequest,
     ) -> HarnessScoreReport:
         result = loaded.result
-        _validate_run_identity(
+        validate_harbor_run_identity(
             result,
             candidate=candidate,
             spec=spec,
             provider_config=self._provider_config,
             runner_image=self._runner_image,
+            turn_timeout_s=self._compute_envelope.turn_timeout_s,
         )
-        ordered = _validate_and_order_matrix(
+        ordered = admit_harbor_matrix(
             loaded,
             task_ids=self._task_ids,
             task_keys=self._task_keys,
@@ -380,7 +389,7 @@ class HarborHarnessScorer:
                         candidate_outcome=trial.candidate_outcome,
                         run_health=trial.run_health,
                         error_kind=trial.error.kind if trial.error is not None else None,
-                        trace_digest=item.trace.digest,
+                        trace_digest=item.trace_digest,
                     )
                 )
 
@@ -449,11 +458,12 @@ class HarborHarnessScorer:
             raise RuntimeError("HarborHarnessScorer is closed")
 
 
-def _compute_envelope(
+def harbor_agent_compute_envelope(
     harness: HarnessDoc,
     *,
     turn_timeout_s: float,
 ) -> HarborAgentComputeEnvelope:
+    """Project the candidate-controlled settings that must stay equal across arms."""
     tools = harness.tools()
     if harness.skills() and READ_SKILL.name not in tools:
         tools.append(READ_SKILL.name)
@@ -480,7 +490,11 @@ def _validate_job_prefix(job_name: str) -> None:
         raise ValueError("Harbor scorer job_name must be at most 200 UTF-8 bytes")
 
 
-def _validate_exact_dataset_selection(spec: HarborJobSpec, task_ids: tuple[str, ...]) -> None:
+def validate_exact_harbor_dataset_selection(
+    spec: HarborJobSpec,
+    task_ids: tuple[str, ...],
+) -> None:
+    """Require explicit, ordered, preflightable local task selection."""
     selected: list[str] = []
     for dataset in spec.datasets:
         if not dataset.is_local():
@@ -503,14 +517,17 @@ def _validate_exact_dataset_selection(spec: HarborJobSpec, task_ids: tuple[str, 
         raise ValueError("Harbor dataset task_names must exactly match task_ids in order")
 
 
-def _validate_run_identity(
+def validate_harbor_run_identity(
     result: BenchmarkRunResult,
     *,
     candidate: HarnessDoc,
     spec: HarborJobSpec,
     provider_config: ProviderConfig,
     runner_image: str,
+    turn_timeout_s: float,
+    require_exact_run_config: bool = False,
 ) -> None:
+    """Require loaded evidence to match its frozen harness and execution route."""
     if result.job_name != spec.job_name:
         raise ValueError(
             f"Harbor result job name {result.job_name!r} does not match {spec.job_name!r}"
@@ -535,11 +552,21 @@ def _validate_run_identity(
         mismatches.append("task backend")
     if identity.runner_image != runner_image:
         mismatches.append("runner image")
+    if require_exact_run_config:
+        expectation = harbor_run_expectation(
+            candidate=candidate,
+            spec=spec,
+            provider_config=provider_config,
+            runner_image=runner_image,
+            turn_timeout_s=turn_timeout_s,
+        )
+        if identity != expectation.identity:
+            mismatches.append("exact run config")
     if mismatches:
         raise ValueError(f"Harbor result identity mismatches frozen scorer: {sorted(mismatches)}")
 
 
-def _validate_and_order_matrix(
+def admit_harbor_matrix(
     loaded: LoadedHarborJobResult,
     *,
     task_ids: tuple[str, ...],
@@ -549,7 +576,8 @@ def _validate_and_order_matrix(
     reward_key: str,
     provider_config: ProviderConfig,
     compute_envelope: HarborAgentComputeEnvelope,
-) -> dict[str, list[_ScoredTrial]]:
+) -> dict[str, list[AdmittedHarborTrial]]:
+    """Admit an exact Harbor matrix and map candidate-owned failures to analysis zero."""
     result = loaded.result
     expected_keys = [(cell.task_key, cell.attempt) for cell in result.expected_cells]
     observed_keys = [(trial.cell.task_key, trial.cell.attempt) for trial in result.trials]
@@ -601,7 +629,7 @@ def _validate_and_order_matrix(
             f"Harbor task identities differ from frozen scorer: missing={missing}, extra={extra}"
         )
 
-    ordered: dict[str, list[_ScoredTrial]] = {}
+    ordered: dict[str, list[AdmittedHarborTrial]] = {}
     expected_attempts = list(range(1, attempts + 1))
     expected_keys_by_task = dict(zip(task_ids, task_keys, strict=True))
     expected_environment_by_task = dict(zip(task_ids, task_environment_digests, strict=True))
@@ -620,7 +648,7 @@ def _validate_and_order_matrix(
             expected_task_key=expected_keys_by_task[task_id],
             expected_environment_digest=expected_environment_by_task[task_id],
         )
-        scored: list[_ScoredTrial] = []
+        scored: list[AdmittedHarborTrial] = []
         for trial in trials:
             if trial.run_health not in {
                 BenchmarkRunHealth.VALID,
@@ -689,25 +717,10 @@ def _validate_and_order_matrix(
                     f"Harbor task {task_id!r} attempt {trial.cell.attempt} lacks trusted "
                     "candidate outcome metadata"
                 )
-            verifier_reward: float | None
-            score: float
-            if trial.status is BenchmarkTrialStatus.CANDIDATE_FAILURE:
-                verifier_reward = None
-                score = 0.0
-            else:
-                if trial.rewards is None or reward_key not in trial.rewards:
-                    raise ValueError(
-                        f"Harbor task {task_id!r} attempt {trial.cell.attempt} omits binary reward "
-                        f"{reward_key!r}"
-                    )
-                raw_reward = trial.rewards[reward_key]
-                if isinstance(raw_reward, bool) or raw_reward not in (0, 0.0, 1, 1.0):
-                    raise ValueError(
-                        f"Harbor task {task_id!r} attempt {trial.cell.attempt} reward "
-                        f"{reward_key!r} must be binary, got {raw_reward!r}"
-                    )
-                verifier_reward = float(raw_reward)
-                score = _analysis_score(trial, verifier_reward=verifier_reward)
+            verifier_reward, score = harbor_trial_analysis_values(
+                trial,
+                reward_key=reward_key,
+            )
             if (
                 trial.usage.calls is None
                 or trial.usage.calls_status is not BenchmarkUsageStatus.EXACT
@@ -733,11 +746,14 @@ def _validate_and_order_matrix(
                 raise ValueError("Harbor provider request identity was reused across trials")
             provider_request_ids.update(request_ids)
             scored.append(
-                _ScoredTrial(
+                AdmittedHarborTrial(
                     trial=trial,
                     verifier_reward=verifier_reward,
                     score=score,
-                    trace=trace,
+                    trace_text=trace.text,
+                    trace_digest=trace.digest,
+                    provider_receipts=trace.provider_receipts,
+                    provider_receipt_call_indexes=trace.provider_call_indexes,
                 )
             )
         ordered[task_id] = scored
@@ -857,7 +873,7 @@ def _read_trace(
     )
 
 
-def _failure_mechanisms(trials: list[_ScoredTrial]) -> tuple[str, ...]:
+def _failure_mechanisms(trials: list[AdmittedHarborTrial]) -> tuple[str, ...]:
     mechanisms: set[str] = set()
     for item in trials:
         if item.score == 1.0:
@@ -883,7 +899,7 @@ def _failure_mechanisms(trials: list[_ScoredTrial]) -> tuple[str, ...]:
     return tuple(sorted(mechanisms))
 
 
-def _render_task_evidence(trials: list[_ScoredTrial]) -> str:
+def _render_task_evidence(trials: list[AdmittedHarborTrial]) -> str:
     separator_chars = 2 * (len(trials) - 1)
     per_attempt_limit = max(
         0,
@@ -909,7 +925,7 @@ def _render_task_evidence(trials: list[_ScoredTrial]) -> str:
             details.append(f"candidate_terminal_reason={outcome.terminal_reason.value}")
         if trial.error is not None:
             details.append(f"trial_error={trial.error.kind.value}")
-        details.extend([f"trace_digest={item.trace.digest}", item.trace.text])
+        details.extend([f"trace_digest={item.trace_digest}", item.trace_text])
         sections.append(
             _bound_text(
                 "\n".join(details),
@@ -943,6 +959,35 @@ def _analysis_score(trial: BenchmarkTrialResult, *, verifier_reward: float) -> f
     if trial.error is not None and trial.error.kind is BenchmarkFailureKind.TASK_TIMEOUT:
         return 0.0
     return verifier_reward
+
+
+def harbor_trial_analysis_values(
+    trial: BenchmarkTrialResult,
+    *,
+    reward_key: str,
+) -> tuple[float | None, float]:
+    """Recompute the canonical binary reward and attributed analysis score.
+
+    Reports can call this on JSON reload so a stored score cannot silently disagree with the full
+    typed trial status and candidate-failure attribution that justified it.
+    """
+    if trial.status is BenchmarkTrialStatus.CANDIDATE_FAILURE:
+        return None, 0.0
+    if trial.status is not BenchmarkTrialStatus.SCORED:
+        raise ValueError("only admitted scored or candidate-failure trials have analysis values")
+    if trial.rewards is None or reward_key not in trial.rewards:
+        raise ValueError(
+            f"Harbor task {trial.task_identity!r} attempt {trial.cell.attempt} omits binary reward "
+            f"{reward_key!r}"
+        )
+    raw_reward = trial.rewards[reward_key]
+    if isinstance(raw_reward, bool) or raw_reward not in (0, 0.0, 1, 1.0):
+        raise ValueError(
+            f"Harbor task {trial.task_identity!r} attempt {trial.cell.attempt} reward "
+            f"{reward_key!r} must be binary, got {raw_reward!r}"
+        )
+    verifier_reward = float(raw_reward)
+    return verifier_reward, _analysis_score(trial, verifier_reward=verifier_reward)
 
 
 def _evaluation_id(

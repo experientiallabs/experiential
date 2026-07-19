@@ -81,6 +81,9 @@ def test_execution_hash_includes_code_materialization_path() -> None:
 
     assert original.doc_hash == renamed.doc_hash
     assert original.execution_hash != renamed.execution_hash
+    assert original.execution_digest != renamed.execution_digest
+    assert original.execution_digest.startswith("sha256:")
+    assert len(original.execution_digest) == 71
 
 
 def test_duplicate_surface_ids_rejected() -> None:

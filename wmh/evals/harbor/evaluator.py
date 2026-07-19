@@ -36,7 +36,7 @@ from harbor.models.trial.result import TrialResult
 from harbor.registry.client.factory import RegistryClientFactory
 from harbor.registry.client.package import PackageDatasetClient
 from harbor.tasks.client import TaskIdType
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmh.core.text import normalize_durable_text
 from wmh.evals.benchmark import (
@@ -83,6 +83,7 @@ _TASK_SNAPSHOT_ROOT = ".wmh-task-snapshots"
 _JOB_ROOT_FILES = frozenset(
     {_MANIFEST_FILENAME, "config.json", "job.log", "lock.json", "result.json"}
 )
+HARBOR_EVALUATOR_VERSION = "1"
 
 
 class StaleHarborJobError(RuntimeError):
@@ -99,6 +100,119 @@ class UnsupportedHarborTaskError(ValueError):
 
 class UnsupportedHarborMetricError(ValueError):
     """A Harbor metric could execute untrusted code on the credential-bearing host."""
+
+
+class HarborRunExpectation(BaseModel):
+    """Canonical identity one Harbor evaluator invocation must publish.
+
+    This public contract lets higher-level experiment protocols freeze the exact evaluator
+    identity without copying Harbor adapter internals. It intentionally contains no credentials or
+    host paths.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    job_name: str = Field(min_length=1)
+    harness_execution_hash: str = Field(min_length=1)
+    harness_execution_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    identity: BenchmarkRunIdentity
+
+
+def harbor_run_expectation(
+    *,
+    candidate: HarnessDoc,
+    spec: HarborJobSpec,
+    provider_config: ProviderConfig,
+    runner_image: str,
+    turn_timeout_s: float,
+    require_provider_receipts: bool = True,
+) -> HarborRunExpectation:
+    """Build the path-independent identity expected from one exact Harbor run."""
+    validate_pi_container_image(runner_image)
+    if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
+        raise ValueError("turn_timeout_s must be finite and positive")
+    frozen_spec = HarborJobSpec.model_validate(spec.model_dump())
+    frozen_provider = ProviderConfig.model_validate(provider_config.model_dump())
+    agent = _build_harbor_agent_config(
+        candidate=candidate,
+        provider_config=frozen_provider,
+        runner_image=runner_image,
+        turn_timeout_s=turn_timeout_s,
+        agent_n_concurrent=frozen_spec.agent_n_concurrent,
+        require_provider_receipts=require_provider_receipts,
+    )
+    run_config_digest = harbor_run_config_digest(
+        frozen_spec,
+        harbor_agent_config_digest(agent),
+    )
+    environment = {
+        HarborEnvironmentBackend.LOCAL: BenchmarkTaskEnvironment.DOCKER,
+        HarborEnvironmentBackend.E2B: BenchmarkTaskEnvironment.E2B,
+    }[frozen_spec.environment_backend]
+    return HarborRunExpectation(
+        job_name=frozen_spec.job_name,
+        harness_execution_hash=candidate.execution_hash,
+        harness_execution_digest=candidate.execution_digest,
+        identity=BenchmarkRunIdentity(
+            candidate_hash=candidate.execution_hash,
+            agent_name=WmhPiAgent.name(),
+            agent_version=WMH_PI_AGENT_VERSION,
+            provider=frozen_provider.kind.value,
+            model_name=frozen_provider.model,
+            task_environment=environment,
+            runner_image=runner_image,
+            run_config_digest=run_config_digest,
+        ),
+    )
+
+
+def _build_harbor_agent_config(
+    *,
+    candidate: HarnessDoc,
+    provider_config: ProviderConfig,
+    runner_image: str,
+    turn_timeout_s: float,
+    agent_n_concurrent: int | None,
+    require_provider_receipts: bool,
+) -> AgentConfig:
+    model_name = f"{provider_config.kind.value}/{provider_config.model}"
+    return AgentConfig(
+        import_path=WmhPiAgent.import_path(),
+        model_name=model_name,
+        n_concurrent=agent_n_concurrent,
+        kwargs={
+            "harness": candidate.model_dump(mode="json"),
+            "provider_config": provider_config.model_dump(mode="json"),
+            "runner_image": runner_image,
+            "turn_timeout_s": turn_timeout_s,
+            "require_provider_receipts": require_provider_receipts,
+        },
+    )
+
+
+class HarborEvaluatorSession:
+    """Share one trusted runner-readiness probe across concurrent exact Harbor jobs."""
+
+    def __init__(self, *, runner_image: str = PI_CONTAINER_IMAGE) -> None:
+        validate_pi_container_image(runner_image)
+        self._runner_image = runner_image
+        self._ready = False
+        self._lock = asyncio.Lock()
+
+    async def ensure_runner_ready(self, *, runner_image: str) -> None:
+        """Probe the immutable runner image once for this event-loop-scoped session."""
+        if runner_image != self._runner_image:
+            raise ValueError("Harbor evaluator session runner image differs from evaluator")
+        if self._ready:
+            return
+        async with self._lock:
+            if self._ready:
+                return
+            await asyncio.to_thread(
+                verify_container_pi_runner_ready,
+                image=self._runner_image,
+            )
+            self._ready = True
 
 
 class _DigestWriter(Protocol):
@@ -165,6 +279,7 @@ class HarborEvaluator:
         runner_image: str = PI_CONTAINER_IMAGE,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = True,
+        session: HarborEvaluatorSession | None = None,
     ) -> None:
         validate_pi_container_image(runner_image)
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
@@ -180,6 +295,7 @@ class HarborEvaluator:
         self._runner_image = runner_image
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
+        self._session = session
         self._runner_ready = False
 
     async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
@@ -269,6 +385,9 @@ class HarborEvaluator:
 
     async def _ensure_runner_ready(self) -> None:
         """Probe the trusted local runner once before Harbor can create a job."""
+        if self._session is not None:
+            await self._session.ensure_runner_ready(runner_image=self._runner_image)
+            return
         if self._runner_ready:
             return
         await asyncio.to_thread(
@@ -278,18 +397,13 @@ class HarborEvaluator:
         self._runner_ready = True
 
     def _build_agent(self, candidate: HarnessDoc) -> AgentConfig:
-        model_name = f"{self._provider_config.kind.value}/{self._provider_config.model}"
-        return AgentConfig(
-            import_path=WmhPiAgent.import_path(),
-            model_name=model_name,
-            n_concurrent=self._spec.agent_n_concurrent,
-            kwargs={
-                "harness": candidate.model_dump(mode="json"),
-                "provider_config": self._provider_config.model_dump(mode="json"),
-                "runner_image": self._runner_image,
-                "turn_timeout_s": self._turn_timeout_s,
-                "require_provider_receipts": self._require_provider_receipts,
-            },
+        return _build_harbor_agent_config(
+            candidate=candidate,
+            provider_config=self._provider_config,
+            runner_image=self._runner_image,
+            turn_timeout_s=self._turn_timeout_s,
+            agent_n_concurrent=self._spec.agent_n_concurrent,
+            require_provider_receipts=self._require_provider_receipts,
         )
 
     def _run_identity(
@@ -1184,6 +1298,7 @@ def harbor_run_config_digest(spec: HarborJobSpec, agent_config_digest: str) -> s
     payload = {
         "schema_version": 2,
         "evaluator": "wmh-harbor",
+        "evaluator_version": HARBOR_EVALUATOR_VERSION,
         "harbor_version": SUPPORTED_HARBOR_VERSION,
         "agent_version": WMH_PI_AGENT_VERSION,
         "agent_config_digest": agent_config_digest,

@@ -194,6 +194,13 @@ class HarnessDoc(BaseModel):
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return _digest(canonical)
 
+    @property
+    def execution_digest(self) -> str:
+        """Canonical SHA-256 execution identity for cross-system commitments."""
+        payload = [surface.model_dump(mode="json") for surface in self.surfaces]
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
     # -- derived, validated views ------------------------------------------------------------
 
     def system_prompt(self) -> str:
