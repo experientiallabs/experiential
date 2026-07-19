@@ -419,6 +419,7 @@ def test_usage_total_is_reported_only_when_every_cell_is_metered(tmp_path: Path)
     [
         "WmhPiProviderDeadlineError",
         "WmhPiProviderError",
+        "WmhPiProviderReceiptError",
         "AgentTimeoutError",
         "CancelledError",
     ],
@@ -474,6 +475,11 @@ def test_interrupted_usage_is_a_known_lower_bound_not_an_exact_total(
         ),
         (
             "WmhPiProviderDeadlineError",
+            BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+            BenchmarkFailureKind.PROVIDER,
+        ),
+        (
+            "WmhPiProviderReceiptError",
             BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
             BenchmarkFailureKind.PROVIDER,
         ),
@@ -535,6 +541,11 @@ def test_exception_classification_is_not_blanket_infrastructure(
         ),
         (
             "WmhPiProviderDeadlineError",
+            BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+            BenchmarkFailureKind.PROVIDER,
+        ),
+        (
+            "WmhPiProviderReceiptError",
             BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
             BenchmarkFailureKind.PROVIDER,
         ),

@@ -74,6 +74,7 @@ _PROVIDER_EXCEPTIONS = frozenset(
         "UnknownApiError",
         "WmhPiProviderDeadlineError",
         "WmhPiProviderError",
+        "WmhPiProviderReceiptError",
     }
 )
 _VERIFIER_EXCEPTIONS = frozenset(
