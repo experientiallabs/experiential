@@ -430,6 +430,102 @@ class _CostBoundProposer(_HistoryProposer):
         self.search_cost_binding = binding
 
 
+class _NeverCalledCostBoundScorer(_CostBoundScorer):
+    """Expose cost state while making every executable scorer hook fail the test."""
+
+    def validate_candidate(self, candidate: HarnessDoc) -> str | None:
+        del candidate
+        raise AssertionError("cost-bound scorer was called before omission rejection")
+
+    def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+        del candidate, request
+        raise AssertionError("cost-bound scorer was called before omission rejection")
+
+
+class _NeverCalledCostBoundProposer(_CostBoundProposer):
+    """Expose cost state while making every executable proposer hook fail the test."""
+
+    def propose_batch(
+        self,
+        parent: HarnessDoc,
+        trigger: FailureSignature,
+        evidence: str,
+        *,
+        history: list[HarnessDelta],
+        count: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[HarnessDelta | ProposalFailure | None]:
+        del parent, trigger, evidence, history, count, should_cancel
+        raise AssertionError("cost-bound proposer was called before omission rejection")
+
+
+class _NeverCalledBudgetMarkerScorer(_NeutralScorer):
+    """Expose a lower-level budget marker without a component cost binding."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._budget_account = object()
+
+    def validate_candidate(self, candidate: HarnessDoc) -> str | None:
+        del candidate
+        raise AssertionError("budget-marked scorer was called before omission rejection")
+
+    def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+        del candidate, request
+        raise AssertionError("budget-marked scorer was called before omission rejection")
+
+
+@pytest.mark.parametrize("bound_role", ["proposer", "scorer", "holdout_scorer"])
+def test_cost_bound_component_requires_top_level_binding_before_component_calls(
+    tmp_path: Path,
+    bound_role: str,
+) -> None:
+    binding = _search_cost_binding(tmp_path, label=f"omitted-{bound_role}")
+    proposer: _HistoryProposer = _HistoryProposer()
+    scorer: _NeutralScorer = _NeutralScorer()
+    holdout: _NeutralScorer | None = None
+    if bound_role == "proposer":
+        proposer = _NeverCalledCostBoundProposer(binding.proposer)
+    elif bound_role == "scorer":
+        scorer = _NeverCalledCostBoundScorer(binding.scorer)
+    else:
+        holdout_binding = binding.scorer.model_copy(
+            update={"role": SearchComponentRole.HOLDOUT_SCORER}
+        )
+        holdout = _NeverCalledCostBoundScorer(holdout_binding)
+
+    with pytest.raises(ValueError, match=f"{bound_role} exposes budgeted cost state"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            proposer,
+            iterations=0,
+            screen_proposals=False,
+            holdout_scorer=holdout,
+            confirm_narrow_vetoes=False,
+        )
+
+    assert scorer.requests == []
+
+
+def test_budget_account_marker_requires_top_level_binding_before_component_calls() -> None:
+    scorer = _NeverCalledBudgetMarkerScorer()
+
+    with pytest.raises(ValueError, match="scorer exposes budgeted cost state"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+    assert scorer.requests == []
+
+
 def test_budgeted_search_rejects_unbound_components_before_scoring(tmp_path: Path) -> None:
     scorer = _NeutralScorer()
     with pytest.raises(ValueError, match="proposer.search_cost_binding"):

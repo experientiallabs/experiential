@@ -1546,6 +1546,17 @@ def test_v4_policy_without_tariff_receipt_requires_a_new_v5_ledger(tmp_path: Pat
         SpendLedger(path, policy)
 
 
+def test_cached_ledger_full_audit_revalidates_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "budget.sqlite3"
+    ledger = SpendLedger(path, _policy())
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute("UPDATE budget_metadata SET schema_version = 1 WHERE id = 1")
+
+    with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version 1"):
+        ledger.audit()
+
+
 def test_exposed_policy_is_a_defensive_deep_copy(tmp_path: Path) -> None:
     ledger = SpendLedger(tmp_path / "budget.sqlite3", _policy())
     exposed = ledger.policy

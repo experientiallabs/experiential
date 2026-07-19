@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from wmh.harness.cost import (
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
+    BudgetIntegrityError,
     BudgetLedgerAuthority,
     BudgetPolicy,
     BudgetScope,
@@ -105,6 +107,7 @@ def _resource_binding(
     *,
     category: str,
     meter_id: str,
+    configuration_id: str,
 ) -> TimedResourceCostBinding:
     account = authority.timed_resource_account(
         scope=BudgetScope(
@@ -117,6 +120,7 @@ def _resource_binding(
     meter = authority.policy.meters[meter_id]
     assert isinstance(meter, TimedResourceCostMeter)
     return TimedResourceCostBinding(
+        component_configuration_id=configuration_id,
         resource_type=meter.resource_type,
         resource_class_digest=meter.resource_class_digest,
         account=bind_timed_resource_account(account),
@@ -152,6 +156,7 @@ def _binding(
                     authority,
                     category="proposer",
                     meter_id="proposer-project",
+                    configuration_id=proposer_configuration_id,
                 ),
             ),
         ),
@@ -172,6 +177,7 @@ def _binding(
                     authority,
                     category="scorer",
                     meter_id="task-environment",
+                    configuration_id=scorer_configuration_id,
                 ),
             ),
         ),
@@ -275,6 +281,11 @@ def test_search_cost_binding_rejects_resource_role_or_class_drift(tmp_path: Path
     with pytest.raises(ValidationError, match="resource class differs"):
         SearchCostBinding.model_validate(payload)
 
+    payload = binding.model_dump(mode="json")
+    payload["scorer"]["timed_resources"][0]["component_configuration_id"] = "other-scorer"
+    with pytest.raises(ValidationError, match="resource binding component configuration differs"):
+        SearchCostBinding.model_validate(payload)
+
 
 def test_search_cost_binding_rejects_duplicate_accounts_or_component_roles(
     tmp_path: Path,
@@ -299,14 +310,23 @@ def test_search_cost_runtime_audits_authority_and_mints_only_bound_accounts(
     binding = _binding(authority)
     runtime = SearchCostRuntime(authority=authority, binding=binding)
 
-    proposer_account = runtime.provider_account(binding.proposer.providers[0])
-    task_account = runtime.timed_resource_account(binding.scorer.timed_resources[0])
+    proposer_runtime = runtime.for_component(SearchComponentRole.PROPOSER)
+    scorer_runtime = runtime.for_component(SearchComponentRole.SCORER)
+
+    proposer_account = proposer_runtime.provider_account(binding.proposer.providers[0])
+    task_account = scorer_runtime.timed_resource_account(binding.scorer.timed_resources[0])
+    serialized_runtime = runtime.model_dump_json()
+    serialized_component_runtime = proposer_runtime.model_dump_json()
 
     assert proposer_account.ledger_path == authority.ledger_path
     assert proposer_account.ledger_identity == binding.ledger_identity
     assert proposer_account.scope == binding.proposer.providers[0].account.scope
     assert task_account.ledger_path == authority.ledger_path
     assert task_account.meter_id == "task-environment"
+    assert str(authority.ledger_path) not in serialized_runtime
+    assert "ledger_path" not in serialized_runtime
+    assert str(authority.ledger_path) not in serialized_component_runtime
+    assert "ledger_path" not in serialized_component_runtime
 
     provider_binding = binding.scorer.providers[0]
     unbound = provider_binding.model_copy(
@@ -316,8 +336,34 @@ def test_search_cost_runtime_audits_authority_and_mints_only_bound_accounts(
             )
         }
     )
-    with pytest.raises(ValueError, match="not present in the frozen search cost binding"):
-        runtime.provider_account(unbound)
+    with pytest.raises(ValueError, match="not present in the scorer cost binding"):
+        scorer_runtime.provider_account(unbound)
+
+
+def test_component_runtime_rejects_cross_role_provider_and_resource_swizzles(
+    tmp_path: Path,
+) -> None:
+    authority = _authority(tmp_path, "runtime-role-scope")
+    binding = _binding(authority)
+    proposer_runtime = SearchCostRuntime(
+        authority=authority,
+        binding=binding,
+    ).for_component(SearchComponentRole.PROPOSER)
+
+    with pytest.raises(ValueError, match="provider account is not present in the proposer"):
+        proposer_runtime.provider_account(binding.scorer.providers[0])
+    with pytest.raises(ValueError, match="resource account is not present in the proposer"):
+        proposer_runtime.timed_resource_account(binding.scorer.timed_resources[0])
+
+
+def test_component_runtime_rejects_an_absent_holdout_role(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "runtime-no-holdout")
+
+    with pytest.raises(ValueError, match="holdout_scorer has no frozen search cost binding"):
+        SearchCostRuntime(
+            authority=authority,
+            binding=_binding(authority),
+        ).for_component(SearchComponentRole.HOLDOUT_SCORER)
 
 
 def test_search_cost_runtime_rejects_same_policy_on_a_different_ledger(tmp_path: Path) -> None:
@@ -327,6 +373,22 @@ def test_search_cost_runtime_rejects_same_policy_on_a_different_ledger(tmp_path:
 
     with pytest.raises(ValidationError, match="ledger identity differs"):
         SearchCostRuntime(authority=second, binding=binding)
+
+
+def test_component_runtime_reaudits_the_ledger_before_each_account_mint(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "runtime-reaudit")
+    binding = _binding(authority)
+    component_runtime = SearchCostRuntime(
+        authority=authority,
+        binding=binding,
+    ).for_component(SearchComponentRole.PROPOSER)
+
+    with sqlite3.connect(authority.ledger_path) as connection:
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute("UPDATE budget_metadata SET schema_version = 1 WHERE id = 1")
+
+    with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version"):
+        component_runtime.provider_account(binding.proposer.providers[0])
 
 
 def test_binding_and_runtime_detach_mutable_source_models(tmp_path: Path) -> None:
@@ -339,14 +401,14 @@ def test_binding_and_runtime_detach_mutable_source_models(tmp_path: Path) -> Non
 
     assert runtime.authority.policy.meters
     assert runtime.binding.policy.meters
-    assert runtime.provider_account(runtime.binding.proposer.providers[0]).meter_id == (
-        "proposer-provider"
-    )
+    assert runtime.for_component(SearchComponentRole.PROPOSER).provider_account(
+        runtime.binding.proposer.providers[0]
+    ).meter_id == ("proposer-provider")
 
     provider_binding = runtime.binding.proposer.providers[0]
     runtime.binding.policy.meters.clear()
     with pytest.raises((ValidationError, ValueError), match="meter"):
-        runtime.provider_account(provider_binding)
+        runtime.for_component(SearchComponentRole.PROPOSER).provider_account(provider_binding)
 
 
 class _BoundComponent:

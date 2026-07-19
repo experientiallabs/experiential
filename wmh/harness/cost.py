@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from enum import StrEnum
 from typing import Literal, Self
@@ -13,9 +14,11 @@ from wmh.providers.base import ProviderConfig
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
+    BudgetedProvider,
     BudgetLedgerAuthority,
     BudgetPolicy,
     ProviderCostMeter,
+    TimedResourceBudget,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     bind_budget_account,
@@ -49,6 +52,7 @@ class TimedResourceCostBinding(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    component_configuration_id: str = Field(min_length=1, max_length=1_024)
     resource_type: str = Field(
         min_length=1,
         max_length=64,
@@ -78,7 +82,10 @@ class SearchComponentCostBinding(BaseModel):
             if provider.component_configuration_id != self.configuration_id:
                 raise ValueError("provider binding component configuration differs")
             accounts.append(provider.account)
-        accounts.extend(resource.account for resource in self.timed_resources)
+        for resource in self.timed_resources:
+            if resource.component_configuration_id != self.configuration_id:
+                raise ValueError("resource binding component configuration differs")
+            accounts.append(resource.account)
         if any(account.scope.category != self.scope_category for account in accounts):
             raise ValueError("search component account scope category differs from its binding")
         identities = [_account_identity(account) for account in accounts]
@@ -219,12 +226,70 @@ class SearchCostRuntime(BaseModel):
         _audit_runtime_state(self.authority, self.binding)
         return self
 
-    def provider_account(self, binding: ProviderCostBinding) -> BudgetAccount:
-        """Mint one exact provider account already present in the frozen binding."""
+    def for_component(self, role: SearchComponentRole) -> SearchComponentCostRuntime:
+        """Return a resolver that can mint accounts for exactly one component role."""
         authority, frozen_binding = self._validated_state()
+        component = _component_binding(frozen_binding, role)
+        return SearchComponentCostRuntime(
+            authority=authority,
+            search_binding=frozen_binding,
+            binding=component,
+        )
+
+    def _validated_state(self) -> tuple[BudgetLedgerAuthority, SearchCostBinding]:
+        """Revalidate nested mutable policy containers before minting an account."""
+        authority = BudgetLedgerAuthority.model_validate(self.authority.model_dump())
+        binding = SearchCostBinding.model_validate(self.binding.model_dump())
+        _audit_runtime_state(authority, binding)
+        return authority, binding
+
+
+class SearchComponentCostRuntime(BaseModel):
+    """Host-private account resolver restricted to one frozen component role."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    authority: BudgetLedgerAuthority = Field(exclude=True, repr=False)
+    search_binding: SearchCostBinding = Field(exclude=True, repr=False)
+    binding: SearchComponentCostBinding
+
+    @field_validator("authority", mode="before")
+    @classmethod
+    def _detach_authority(cls, value: object) -> object:
+        if isinstance(value, BudgetLedgerAuthority):
+            return value.model_dump()
+        return value
+
+    @field_validator("search_binding", mode="before")
+    @classmethod
+    def _detach_search_binding(cls, value: object) -> object:
+        if isinstance(value, SearchCostBinding):
+            return value.model_dump()
+        return value
+
+    @field_validator("binding", mode="before")
+    @classmethod
+    def _detach_component_binding(cls, value: object) -> object:
+        if isinstance(value, SearchComponentCostBinding):
+            return value.model_dump()
+        return value
+
+    @model_validator(mode="after")
+    def _audit_component(self) -> Self:
+        _audit_runtime_state(self.authority, self.search_binding)
+        expected = _component_binding(self.search_binding, self.binding.role)
+        if self.binding != expected:
+            raise ValueError("component runtime binding differs from the frozen search binding")
+        return self
+
+    def provider_account(self, binding: ProviderCostBinding) -> BudgetAccount:
+        """Mint one provider account belonging to this component and no other role."""
+        authority, component = self._validated_state()
         validated = ProviderCostBinding.model_validate(binding.model_dump())
-        if validated not in _provider_bindings(frozen_binding):
-            raise ValueError("provider account is not present in the frozen search cost binding")
+        if validated not in component.providers:
+            raise ValueError(
+                f"provider account is not present in the {component.role.value} cost binding"
+            )
         return authority.provider_account(
             scope=validated.account.scope,
             meter_id=validated.account.meter_id,
@@ -234,22 +299,65 @@ class SearchCostRuntime(BaseModel):
         self,
         binding: TimedResourceCostBinding,
     ) -> TimedResourceBudgetAccount:
-        """Mint one exact resource account already present in the frozen binding."""
-        authority, frozen_binding = self._validated_state()
+        """Mint one timed resource account belonging to this component and no other role."""
+        authority, component = self._validated_state()
         validated = TimedResourceCostBinding.model_validate(binding.model_dump())
-        if validated not in _resource_bindings(frozen_binding):
-            raise ValueError("resource account is not present in the frozen search cost binding")
+        if validated not in component.timed_resources:
+            raise ValueError(
+                f"resource account is not present in the {component.role.value} cost binding"
+            )
         return authority.timed_resource_account(
             scope=validated.account.scope,
             meter_id=validated.account.meter_id,
         )
 
-    def _validated_state(self) -> tuple[BudgetLedgerAuthority, SearchCostBinding]:
-        """Revalidate nested mutable policy containers before minting an account."""
+    def _validated_state(self) -> tuple[BudgetLedgerAuthority, SearchComponentCostBinding]:
+        """Reopen the shared authority and revalidate the exact component before minting."""
         authority = BudgetLedgerAuthority.model_validate(self.authority.model_dump())
-        binding = SearchCostBinding.model_validate(self.binding.model_dump())
-        _audit_runtime_state(authority, binding)
-        return authority, binding
+        search_binding = SearchCostBinding.model_validate(self.search_binding.model_dump())
+        component = SearchComponentCostBinding.model_validate(self.binding.model_dump())
+        _audit_runtime_state(authority, search_binding)
+        expected = _component_binding(search_binding, component.role)
+        if component != expected:
+            raise ValueError("component runtime binding differs from the frozen search binding")
+        return authority, component
+
+
+def search_component_requires_cost_binding(component: object) -> bool:
+    """Return whether a live component exposes any paid-cost state.
+
+    The check uses static attributes and instance state only. It does not invoke component
+    properties or executable hooks, so omission is rejected before validation, scoring, or
+    proposal code can run.
+    """
+    marker_names = (
+        "search_cost_binding",
+        "budget_account",
+        "_budget_account",
+        "budget_binding",
+        "_budget_binding",
+        "budget_policy_digest",
+        "_budget_policy_digest",
+        "budget_ledger_identity",
+        "_budget_ledger_identity",
+        "timed_resource_account",
+        "_timed_resource_account",
+    )
+    missing = object()
+    for marker_name in marker_names:
+        marker = inspect.getattr_static(component, marker_name, missing)
+        if marker is not missing and marker is not None:
+            return True
+    account_types = (
+        BudgetAccount,
+        BudgetAccountBinding,
+        BudgetedProvider,
+        TimedResourceBudget,
+        TimedResourceBudgetAccount,
+    )
+    return isinstance(component, account_types) or any(
+        isinstance(value, account_types) for value in _instance_state(component).values()
+    )
 
 
 def validate_search_cost_components(
@@ -329,11 +437,32 @@ def _provider_bindings(binding: SearchCostBinding) -> tuple[ProviderCostBinding,
     return tuple(provider for component in components for provider in component.providers)
 
 
+def _component_binding(
+    binding: SearchCostBinding,
+    role: SearchComponentRole,
+) -> SearchComponentCostBinding:
+    if role is SearchComponentRole.PROPOSER:
+        return binding.proposer
+    if role is SearchComponentRole.SCORER:
+        return binding.scorer
+    if binding.holdout_scorer is None:
+        raise ValueError("holdout_scorer has no frozen search cost binding")
+    return binding.holdout_scorer
+
+
 def _resource_bindings(binding: SearchCostBinding) -> tuple[TimedResourceCostBinding, ...]:
     components = [binding.proposer, binding.scorer]
     if binding.holdout_scorer is not None:
         components.append(binding.holdout_scorer)
     return tuple(resource for component in components for resource in component.timed_resources)
+
+
+def _instance_state(component: object) -> dict[str, object]:
+    try:
+        state = object.__getattribute__(component, "__dict__")
+    except AttributeError:
+        return {}
+    return state if isinstance(state, dict) else {}
 
 
 def _account_identity(account: BudgetAccountBinding) -> tuple[str, ...]:

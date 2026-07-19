@@ -41,7 +41,11 @@ from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_loop
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
-from wmh.harness.cost import SearchCostBinding, validate_search_cost_components
+from wmh.harness.cost import (
+    SearchCostBinding,
+    search_component_requires_cost_binding,
+    validate_search_cost_components,
+)
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
@@ -1039,6 +1043,17 @@ def search_harness(
         if cost_binding is not None
         else None
     )
+    live_components = (
+        ("proposer", proposer),
+        ("scorer", scorer),
+        ("holdout_scorer", holdout_scorer),
+    )
+    if frozen_cost_binding is None:
+        for label, component in live_components:
+            if component is not None and search_component_requires_cost_binding(component):
+                raise ValueError(
+                    f"{label} exposes budgeted cost state; supply the complete cost_binding"
+                )
     if frozen_cost_binding is not None:
         validate_search_cost_components(
             frozen_cost_binding,

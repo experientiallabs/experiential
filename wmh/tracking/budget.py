@@ -1596,12 +1596,16 @@ class SpendLedger:
         # report a false integrity failure merely because a reservation landed between reads.
         with self._connection() as connection:
             connection.execute("BEGIN")
+            metadata_row = connection.execute(
+                "SELECT * FROM budget_metadata WHERE id = 1"
+            ).fetchone()
             event_rows = connection.execute(
                 "SELECT sequence, entry_json FROM budget_events ORDER BY sequence"
             ).fetchall()
             reservation_rows = connection.execute(
                 "SELECT * FROM budget_reservations ORDER BY reservation_id"
             ).fetchall()
+        self._validate_ledger_metadata(metadata_row)
         events = [
             self._parse_event(row["entry_json"], sequence=row["sequence"]) for row in event_rows
         ]
@@ -1645,6 +1649,26 @@ class SpendLedger:
             reservation_id: reservation.model_copy(deep=True)
             for reservation_id, reservation in reconstructed.items()
         }
+
+    def _validate_ledger_metadata(self, row: sqlite3.Row | None) -> None:
+        """Revalidate immutable ledger identity and policy metadata during every full audit."""
+        if row is None:
+            raise BudgetIntegrityError("budget metadata disappeared after initialization")
+        if row["schema_version"] != _SCHEMA_VERSION:
+            raise BudgetIntegrityError(f"unsupported budget schema version {row['schema_version']}")
+        ledger_nonce = row["ledger_nonce"]
+        if (
+            not isinstance(ledger_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{64}", ledger_nonce) is None
+            or ledger_nonce != self._ledger_nonce
+        ):
+            raise BudgetIntegrityError("budget ledger identity changed after initialization")
+        try:
+            persisted = BudgetPolicy.model_validate_json(row["policy_json"])
+        except ValueError as exc:
+            raise BudgetIntegrityError("budget policy metadata is malformed") from exc
+        if row["policy_digest"] != self._policy.policy_digest or persisted != self._policy:
+            raise BudgetIntegrityError("budget policy metadata changed after initialization")
 
     def _initialize(self) -> None:
         with self._connection() as connection:
