@@ -178,13 +178,13 @@ def _provider() -> ProviderConfig:
 def _slice_policy(
     *,
     max_new_blocks: int = 4,
-    max_concurrent_waves: int = 4,
+    max_waves_per_invocation: int = 4,
 ) -> mod.PairedHarborSlicePolicy:
     return mod.PairedHarborSlicePolicy(
         max_new_blocks=max_new_blocks,
-        max_concurrent_waves=max_concurrent_waves,
+        max_waves_per_invocation=max_waves_per_invocation,
         max_block_runtime_s=900,
-        max_invocation_runtime_s=7_200,
+        max_invocation_runtime_s=max(7_200, max_waves_per_invocation * 900 + 1),
     )
 
 
@@ -328,7 +328,7 @@ def test_slice_policy_is_path_free_and_fails_closed_on_unsafe_runtime_bounds(
 ) -> None:
     policy = mod.PairedHarborSlicePolicy(
         max_new_blocks=24,
-        max_concurrent_waves=1,
+        max_waves_per_invocation=1,
         max_block_runtime_s=28_800,
         max_invocation_runtime_s=82_800,
     )
@@ -338,21 +338,29 @@ def test_slice_policy_is_path_free_and_fails_closed_on_unsafe_runtime_bounds(
     with pytest.raises(ValueError, match="less than or equal to 82800"):
         mod.PairedHarborSlicePolicy(
             max_new_blocks=1,
-            max_concurrent_waves=1,
+            max_waves_per_invocation=1,
             max_block_runtime_s=1,
             max_invocation_runtime_s=86_400,
         )
-    with pytest.raises(ValueError, match="waves exceed"):
+    with pytest.raises(ValueError, match="leave headroom"):
         mod.PairedHarborSlicePolicy(
             max_new_blocks=2,
-            max_concurrent_waves=2,
+            max_waves_per_invocation=2,
             max_block_runtime_s=1_000,
             max_invocation_runtime_s=1_999,
         )
 
+    with pytest.raises(ValueError, match="leave headroom"):
+        mod.PairedHarborSlicePolicy(
+            max_new_blocks=2,
+            max_waves_per_invocation=2,
+            max_block_runtime_s=1_000,
+            max_invocation_runtime_s=2_000,
+        )
+
     below_two_arms = mod.PairedHarborSlicePolicy(
         max_new_blocks=1,
-        max_concurrent_waves=1,
+        max_waves_per_invocation=1,
         max_block_runtime_s=599,
         max_invocation_runtime_s=1_000,
     )
@@ -361,11 +369,11 @@ def test_slice_policy_is_path_free_and_fails_closed_on_unsafe_runtime_bounds(
 
     above_capacity = mod.PairedHarborSlicePolicy(
         max_new_blocks=3,
-        max_concurrent_waves=2,
+        max_waves_per_invocation=2,
         max_block_runtime_s=900,
         max_invocation_runtime_s=2_000,
     )
-    with pytest.raises(ValueError, match="exceeds its frozen concurrency waves"):
+    with pytest.raises(ValueError, match="exceeds its frozen wave capacity"):
         _runner(
             tmp_path / "capacity",
             _candidate(),
@@ -1165,7 +1173,7 @@ def _runner(
             "slice_policy",
             _slice_policy(
                 max_new_blocks=len(design.blocks),
-                max_concurrent_waves=len(design.blocks),
+                max_waves_per_invocation=len(design.blocks),
             ),
         ),
     )
@@ -1438,7 +1446,7 @@ def test_bounded_slices_complete_across_restarts_without_replaying_pairs(
 ) -> None:
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
-    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=1)
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
     first_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
     first_runner = _runner(
         tmp_path,
@@ -1487,13 +1495,86 @@ def test_bounded_slices_complete_across_restarts_without_replaying_pairs(
     assert late_calls == []
 
 
+def test_slice_enforces_frozen_invocation_and_wave_deadlines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    real_timeout = asyncio.timeout
+    observed: list[float | None] = []
+
+    def recording_timeout(delay: float | None) -> asyncio.Timeout:
+        observed.append(delay)
+        return real_timeout(delay)
+
+    monkeypatch.setattr(mod.asyncio, "timeout", recording_timeout)
+    result = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+
+    assert result.report is None
+    assert observed == [policy.max_invocation_runtime_s, policy.max_block_runtime_s]
+    assert len(calls) == 4
+
+
+def test_slice_timeout_fails_before_unbounded_wave_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    real_timeout = asyncio.timeout
+
+    class ImmediateTimeout:
+        async def __aenter__(self) -> None:
+            raise TimeoutError("synthetic wave timeout")
+
+        async def __aexit__(
+            self,
+            error_type: type[BaseException] | None,
+            error: BaseException | None,
+            traceback: object,
+        ) -> bool:
+            del error_type, error, traceback
+            return False
+
+    def timeout_for_scope(delay: float | None) -> asyncio.Timeout | ImmediateTimeout:
+        if delay == policy.max_block_runtime_s:
+            return ImmediateTimeout()
+        return real_timeout(delay)
+
+    monkeypatch.setattr(mod.asyncio, "timeout", timeout_for_scope)
+    with pytest.raises(mod.PairedHarborSliceTimeoutError, match="wave.*900") as captured:
+        asyncio.run(
+            _runner(
+                tmp_path,
+                candidate,
+                baseline=baseline,
+                slice_policy=policy,
+            ).run_slice(baseline=baseline, candidate=candidate)
+        )
+
+    assert captured.value.scope == "wave"
+    assert calls == []
+
+
 def test_each_slice_holds_one_operation_lease_through_all_block_leases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
-    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=1)
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
 
     class RecordingCoordinator:
         def __init__(self) -> None:
@@ -1562,7 +1643,7 @@ def test_crash_before_progress_publish_recovers_pairs_without_provider_replay(
 ) -> None:
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
-    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=2)
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=2)
     crashed_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
     crashed_runner = _runner(
         tmp_path,
@@ -1603,7 +1684,7 @@ def test_partial_final_slice_is_smaller_and_analysis_waits_for_complete_matrix(
 ) -> None:
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
-    policy = _slice_policy(max_new_blocks=3, max_concurrent_waves=2)
+    policy = _slice_policy(max_new_blocks=3, max_waves_per_invocation=2)
     calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
     real_analyze = mod.analyze_paired_outcomes
 
@@ -1649,7 +1730,7 @@ def test_slice_crash_requires_pair_retry_and_never_replays_completed_work(
 ) -> None:
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
-    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=2)
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=2)
     failed_calls, _ = _install_fake_evaluator(
         monkeypatch,
         candidate=candidate,
@@ -1724,7 +1805,7 @@ def test_slice_rejects_policy_progress_and_generation_drift_before_provider_acce
 ) -> None:
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
-    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=1)
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
     _install_fake_evaluator(monkeypatch, candidate=candidate)
     first_runner = _runner(
         tmp_path,

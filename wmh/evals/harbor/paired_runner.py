@@ -423,7 +423,7 @@ class PairedHarborSlicePolicy(BaseModel):
 
     policy_version: Literal["1"] = "1"
     max_new_blocks: StrictInt = Field(ge=1)
-    max_concurrent_waves: StrictInt = Field(ge=1)
+    max_waves_per_invocation: StrictInt = Field(ge=1)
     max_block_runtime_s: StrictInt = Field(ge=1)
     max_invocation_runtime_s: StrictInt = Field(
         ge=1,
@@ -435,7 +435,7 @@ class PairedHarborSlicePolicy(BaseModel):
 
     @field_validator(
         "max_new_blocks",
-        "max_concurrent_waves",
+        "max_waves_per_invocation",
         "max_block_runtime_s",
         "max_invocation_runtime_s",
         mode="before",
@@ -448,8 +448,11 @@ class PairedHarborSlicePolicy(BaseModel):
 
     @model_validator(mode="after")
     def _require_bounded_invocation(self) -> Self:
-        if self.max_block_runtime_s * self.max_concurrent_waves > (self.max_invocation_runtime_s):
-            raise ValueError("paired slice waves exceed the frozen invocation runtime limit")
+        scheduled_runtime_s = self.max_block_runtime_s * self.max_waves_per_invocation
+        if scheduled_runtime_s >= self.max_invocation_runtime_s:
+            raise ValueError(
+                "paired slice waves must leave headroom within the frozen invocation runtime"
+            )
         return self
 
     @property
@@ -963,9 +966,9 @@ class HarborConfirmationExecutionCommitment(BaseModel):
         if self.slice_policy_digest != self.slice_policy.digest:
             raise ValueError("pre-open slice policy digest is inconsistent")
         if self.slice_policy.max_new_blocks > (
-            self.max_concurrent_blocks * self.slice_policy.max_concurrent_waves
+            self.max_concurrent_blocks * self.slice_policy.max_waves_per_invocation
         ):
-            raise ValueError("pre-open slice exceeds its frozen concurrency waves")
+            raise ValueError("pre-open slice exceeds its frozen wave capacity")
         if self.slice_policy.max_block_runtime_s < math.ceil(
             2 * self.execution_plan.turn_timeout_s
         ):
@@ -2015,6 +2018,15 @@ class PairedHarborIncompleteError(RuntimeError):
         )
 
 
+class PairedHarborSliceTimeoutError(RuntimeError):
+    """A frozen invocation or conflict-free wave exceeded its enforced deadline."""
+
+    def __init__(self, *, scope: Literal["invocation", "wave"], timeout_s: int) -> None:
+        self.scope = scope
+        self.timeout_s = timeout_s
+        super().__init__(f"paired Harbor {scope} exceeded its frozen {timeout_s}s deadline")
+
+
 class PairedHarborProgressStateError(RuntimeError):
     """Durable paired slice progress is unreadable, inconsistent, or non-monotone."""
 
@@ -2428,6 +2440,25 @@ class PairedHarborRunner:
                 "max_new_blocks must be a positive integer within the frozen slice policy"
             )
         self._require_runtime_protocol(baseline=baseline, candidate=candidate)
+        timeout_s = self._protocol.slice_policy.max_invocation_runtime_s
+        try:
+            async with asyncio.timeout(timeout_s):
+                return await self._run_slice_with_lease(
+                    baseline=baseline,
+                    candidate=candidate,
+                    requested=requested,
+                )
+        except TimeoutError as exc:
+            raise PairedHarborSliceTimeoutError(scope="invocation", timeout_s=timeout_s) from exc
+
+    async def _run_slice_with_lease(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+        requested: int,
+    ) -> PairedHarborSliceResult:
+        """Execute one validated slice while its operation-wide deadline is active."""
 
         async with self._lease_coordinator.operation_lease(
             protocol_digest=self._protocol.digest,
@@ -2714,12 +2745,17 @@ class PairedHarborRunner:
     ) -> tuple[PairedHarborBlockEvidence, ...]:
         completed: dict[PairedBlock, PairedHarborBlockEvidence] = {}
         for wave in _partition_paired_harbor_slice_waves(self._protocol, blocks):
-            evidence = await self._run_fair_wave(
-                baseline=baseline,
-                candidate=candidate,
-                generation_by_block=generation_by_block,
-                blocks=wave,
-            )
+            timeout_s = self._protocol.slice_policy.max_block_runtime_s
+            try:
+                async with asyncio.timeout(timeout_s):
+                    evidence = await self._run_fair_wave(
+                        baseline=baseline,
+                        candidate=candidate,
+                        generation_by_block=generation_by_block,
+                        blocks=wave,
+                    )
+            except TimeoutError as exc:
+                raise PairedHarborSliceTimeoutError(scope="wave", timeout_s=timeout_s) from exc
             completed.update({item.block: item for item in evidence})
         return tuple(completed[block] for block in blocks)
 
@@ -3557,7 +3593,7 @@ def _select_paired_harbor_slice_blocks(
         raise ValueError("slice completion contains a block outside the frozen design")
 
     wave_blocks: list[list[PairedBlock]] = [
-        [] for _ in range(protocol.slice_policy.max_concurrent_waves)
+        [] for _ in range(protocol.slice_policy.max_waves_per_invocation)
     ]
     wave_tasks: list[set[str]] = [set() for _ in wave_blocks]
     wave_routes: list[Counter[str]] = [Counter() for _ in wave_blocks]
@@ -3602,7 +3638,9 @@ def _partition_paired_harbor_slice_waves(
     if selected != blocks:
         raise ValueError("paired slice blocks cannot be scheduled within frozen waves")
 
-    waves: list[list[PairedBlock]] = [[] for _ in range(protocol.slice_policy.max_concurrent_waves)]
+    waves: list[list[PairedBlock]] = [
+        [] for _ in range(protocol.slice_policy.max_waves_per_invocation)
+    ]
     tasks: list[set[str]] = [set() for _ in waves]
     routes: list[Counter[str]] = [Counter() for _ in waves]
     route_limits = {
