@@ -577,6 +577,35 @@ on the declared complete-task-vector independence and near-zero residual attempt
 all-lane power was 80.4% at ICC 0.01 and 58.3% at ICC 0.05. The weighted semantic-cluster sensitivity
 is expected to be underpowered and remains non-gating.
 
+The reusable simulator contract lives in `wmh.evals.power`. Build its private
+`PairedPowerTaskProfileManifest` only after partition genesis has frozen the complete private split
+and exact confirmation design. This does not open confirmation identities to search. The profile
+contains task identities, strata, semantic groups, and fixed lane nuisance rates, so it stays in the
+private experiment control store. Creating
+`PairedPowerSimulationManifest` binds only digests of that profile and its task metadata into the
+portable simulation identity. It also binds the exact v5 evaluation-design digest, lane attempts,
+bet mixture, effect floor, DGP and effect atoms, residual attempt ICC, seed, fixed replication
+horizon, deterministic chunk size, simulator schema, and simulator and paired-analysis source
+bytes.
+
+Run every prescribed null and target chunk with `run_paired_power_chunk`, or use
+`resume_paired_power_simulation` for atomic local checkpoints. Chunk identities derive from the
+frozen scenario and inclusive replicate range. Merge rejects missing, duplicate, extra, or
+digest-drifted ranges. The merged `PairedPowerTrialArtifact` stores complete decision bitsets and
+chunk digests but no task identities, strata, group names, baseline rates, or outcomes. Persist and
+reload it with `write_paired_power_trial_artifact` and `load_paired_power_trial_artifact`; the loaded
+compact artifact can be passed directly to `evaluate_paired_power_gate` without expanding 100,000
+Pydantic trial records. The gate streams the bitsets into the same canonical per-replicate evidence
+identity used by expanded trials, so either representation produces the same evidence and report
+digests.
+
+The checked-in tests use only a four-task synthetic profile and are explicitly not study evidence.
+Generate the scored 50,000-replication artifact per scenario only after the private 59-task design
+and profile are frozen, and finish its executable power gate before any paid discovery call. Never
+commit the private task profile, split opening, chunk directory, or an artifact that exposes sealed
+identities. A public report may retain the compact identity-free trial artifact after a string audit
+and after its simulation manifest digest has been committed to the experiment chronology.
+
 The same manifest must freeze the Azure transfer task and attempt matrix, or a finite conditional
 ladder of matrices selected only by measured per-cell cost and quota. If a ladder is used, record
 its thresholds before qualification, keep candidate rewards hidden, and resolve it from cost and

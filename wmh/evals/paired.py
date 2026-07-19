@@ -453,6 +453,41 @@ class _JackknifeStudentTInference:
     lower_bound: float
 
 
+def paired_primary_decision_passed(
+    design: PairedEvaluationDesign,
+    task_deltas_by_member: tuple[tuple[float, ...], ...],
+) -> bool:
+    """Evaluate only the exact frozen v5 primary decision.
+
+    Rows must follow ``design.panel_members`` and columns must follow
+    ``design.task_ids``. This compact surface lets locked operating-characteristic
+    simulations exercise the production effect floor, one-sided bounded-mean
+    rejection, and all-lane intersection rule without constructing diagnostics or
+    synthetic block records. It is equivalent to ``analyze_paired_outcomes(...).passed``
+    for a complete matrix with the supplied task means.
+    """
+    if len(task_deltas_by_member) != len(design.panel_members):
+        raise ValueError("primary decision rows must exactly match the frozen lane set")
+    if any(len(row) != len(design.task_ids) for row in task_deltas_by_member):
+        raise ValueError("primary decision columns must exactly match the frozen task roster")
+    if any(
+        not math.isfinite(delta) or not -1.0 <= delta <= 1.0
+        for row in task_deltas_by_member
+        for delta in row
+    ):
+        raise ValueError("primary decision task deltas must be finite and in [-1, 1]")
+    return all(
+        fmean(row) >= design.minimum_equal_task_member_delta
+        and _bounded_mean_exact_rejects(
+            row,
+            null_mean=0.0,
+            alpha=design.alpha,
+            bets=design.primary_e_value_bets,
+        )
+        for row in task_deltas_by_member
+    )
+
+
 def analyze_paired_outcomes(
     design: PairedEvaluationDesign,
     outcomes: list[PairedBlockOutcome],
@@ -519,6 +554,10 @@ def analyze_paired_outcomes(
         member: tuple(task_member_deltas[(task, member)] for task in design.task_ids)
         for member in design.panel_members
     }
+    primary_decision_passed = paired_primary_decision_passed(
+        design,
+        tuple(member_task_deltas[member] for member in design.panel_members),
+    )
     member_semantic_observations = {
         member: _semantic_group_observations(
             design,
@@ -595,6 +634,8 @@ def analyze_paired_outcomes(
         for delta in equal_task_member_deltas.values()
     )
     member_primary_bounds_passed = all(value > 0.0 for value in primary_lower_bounds.values())
+    if primary_decision_passed != (equal_task_member_lifts_passed and member_primary_bounds_passed):
+        raise RuntimeError("exact primary rejection and inverted lower bound disagree")
     member_semantic_cluster_sensitivity_bounds_positive = all(
         value > 0.0 for value in semantic_cluster_sensitivity_lower_bounds.values()
     )

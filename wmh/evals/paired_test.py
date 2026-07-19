@@ -23,6 +23,7 @@ from wmh.evals.paired import (
     _divide_float_downward,
     _holm_adjust,
     analyze_paired_outcomes,
+    paired_primary_decision_passed,
 )
 
 
@@ -164,6 +165,12 @@ def test_primary_bounded_mean_passes_strong_fixed_roster_effect() -> None:
     assert report.equal_task_member_lifts_passed is True
     assert report.member_primary_bounds_passed is True
     assert report.passed is True
+
+    compact = paired_primary_decision_passed(
+        design,
+        tuple(tuple(0.1 for _task in design.task_ids) for _member in design.panel_members),
+    )
+    assert compact is report.passed
 
 
 def test_primary_iut_uses_unadjusted_alpha_for_every_lane() -> None:

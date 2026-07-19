@@ -1,25 +1,53 @@
-"""Tests for the preregistered paired-simulation power gate."""
+"""Tests for locked paired-simulation manifests, artifacts, and power gates."""
 
 from __future__ import annotations
 
 import math
 from decimal import ROUND_CEILING, Decimal, localcontext
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 from scipy.stats import beta
 
+from wmh.evals.paired import (
+    BoundedMeanBet,
+    PairedEvaluationDesign,
+    PairedPanelPlan,
+    PairedTaskPlan,
+)
 from wmh.evals.power import (
+    PairedPowerDependenceManifest,
+    PairedPowerDgpManifest,
+    PairedPowerEffectAtom,
+    PairedPowerEffectShapeManifest,
     PairedPowerGateDesign,
     PairedPowerGateReport,
+    PairedPowerLaneBaseline,
+    PairedPowerReplicationManifest,
+    PairedPowerScenarioManifest,
+    PairedPowerSeedManifest,
+    PairedPowerSimulationManifest,
+    PairedPowerTaskProfileEntry,
+    PairedPowerTaskProfileManifest,
     PairedPowerTrial,
+    PairedPowerTrialArtifact,
     _binomial_lower_bound,
     _binomial_upper_bound,
     evaluate_paired_power_gate,
+    load_paired_power_trial_artifact,
+    merge_paired_power_chunks,
+    resume_paired_power_simulation,
+    run_paired_power_chunk,
+    write_paired_power_chunk,
+    write_paired_power_trial_artifact,
 )
 
 _SIMULATION_DIGEST = "sha256:" + "a" * 64
 _PAIRED_DESIGN_DIGEST = "sha256:" + "c" * 64
+_CANONICAL_TRIAL_EVIDENCE_DIGEST = (
+    "sha256:a51e821fb8960fb64d485c9cf8f937dddd94c3bc216a7d3e01f602bfbb87d568"
+)
 
 
 def _design() -> PairedPowerGateDesign:
@@ -33,6 +61,87 @@ def _design() -> PairedPowerGateDesign:
         minimum_power=0.9,
         monte_carlo_alpha=0.01,
         replications_per_scenario=100,
+    )
+
+
+def _synthetic_evaluation_design() -> PairedEvaluationDesign:
+    """Return a tiny non-study design containing no benchmark identities."""
+    return PairedEvaluationDesign.create(
+        tasks=tuple(
+            PairedTaskPlan(
+                task_id=f"synthetic-task-{index}",
+                group_id="synthetic-family" if index < 2 else f"synthetic-group-{index}",
+            )
+            for index in range(4)
+        ),
+        panel=tuple(
+            PairedPanelPlan(panel_member=lane, attempts=2)
+            for lane in ("lane-a", "lane-b", "lane-c")
+        ),
+        primary_e_value_bets=(
+            BoundedMeanBet(fraction=0.25, weight=1 / 16),
+            BoundedMeanBet(fraction=0.5, weight=1 / 16),
+            BoundedMeanBet(fraction=1.0, weight=7 / 8),
+        ),
+        schedule_seed="synthetic-schedule",
+        analysis_seed="synthetic-analysis",
+        randomization_samples=999,
+        minimum_equal_task_member_delta=0.03,
+        noninferiority_margin=0.02,
+    )
+
+
+def _synthetic_task_profile() -> PairedPowerTaskProfileManifest:
+    """Return fixed synthetic rates for schema and resume tests, not a study profile."""
+    return PairedPowerTaskProfileManifest(
+        tasks=tuple(
+            PairedPowerTaskProfileEntry(
+                task_id=f"synthetic-task-{index}",
+                stratum="synthetic-easy" if index == 0 else "synthetic-hard",
+                group_id="synthetic-family" if index < 2 else f"synthetic-group-{index}",
+                lane_baselines=tuple(
+                    PairedPowerLaneBaseline(panel_member=lane, probability=probability)
+                    for lane, probability in (
+                        ("lane-a", 0.25 + index * 0.05),
+                        ("lane-b", 0.35 + index * 0.05),
+                        ("lane-c", 0.45 + index * 0.05),
+                    )
+                ),
+            )
+            for index in range(4)
+        )
+    )
+
+
+def _synthetic_simulation_manifest(
+    design: PairedEvaluationDesign,
+    profile: PairedPowerTaskProfileManifest,
+) -> PairedPowerSimulationManifest:
+    """Freeze a tiny deterministic simulator contract that is explicitly non-study."""
+    return PairedPowerSimulationManifest.create(
+        evaluation_design=design,
+        task_profile=profile,
+        dgp=PairedPowerDgpManifest(
+            effect_shape=PairedPowerEffectShapeManifest(
+                atoms=(
+                    PairedPowerEffectAtom(multiplier=-0.5, probability=0.2),
+                    PairedPowerEffectAtom(multiplier=1.375, probability=0.8),
+                )
+            ),
+            dependence=PairedPowerDependenceManifest(residual_attempt_intraclass_correlation=0.0),
+        ),
+        seeds=PairedPowerSeedManifest(root_seed="synthetic-root-seed-v1"),
+        replications=PairedPowerReplicationManifest(
+            replications_per_scenario=6,
+            chunk_size=2,
+        ),
+        scenarios=(
+            PairedPowerScenarioManifest(scenario="weak-null", equal_task_effect=0.0),
+            PairedPowerScenarioManifest(
+                scenario="target-alternative",
+                equal_task_effect=0.1,
+            ),
+        ),
     )
 
 
@@ -63,7 +172,7 @@ def test_strong_locked_simulation_fixture_passes_both_power_gates() -> None:
 
     assert report.design == design
     assert report.design.paired_evaluation_design_digest == _PAIRED_DESIGN_DIGEST
-    assert report.trial_evidence_digest.startswith("sha256:")
+    assert report.trial_evidence_digest == _CANONICAL_TRIAL_EVIDENCE_DIGEST
     assert report.digest == report.report_digest
     assert report.empirical_type_i_error == 0.0
     assert report.type_i_error_upper_bound < design.maximum_type_i_error
@@ -250,3 +359,247 @@ def _independent_binomial_tail_upper(
             )
             total = context.add(total, term)
         return +total
+
+
+def test_simulation_manifest_binds_private_profile_and_exact_primary_matrix() -> None:
+    evaluation_design = _synthetic_evaluation_design()
+    profile = _synthetic_task_profile()
+    manifest = _synthetic_simulation_manifest(evaluation_design, profile)
+
+    assert manifest.paired_evaluation_design_digest == evaluation_design.digest
+    assert manifest.task_profile_digest == profile.digest
+    assert manifest.task_strata_group_metadata_digest == profile.metadata_digest
+    assert manifest.task_count == 4
+    assert manifest.lane_set == ("lane-a", "lane-b", "lane-c")
+    assert {item.panel_member: item.attempts for item in manifest.attempts_by_lane} == {
+        "lane-a": 2,
+        "lane-b": 2,
+        "lane-c": 2,
+    }
+    assert manifest.primary_e_value_bets == evaluation_design.primary_e_value_bets
+    assert manifest.minimum_equal_task_member_delta == 0.03
+    manifest.validate_frozen_inputs(evaluation_design, profile)
+
+    changed_profile = profile.model_copy(
+        update={
+            "tasks": (
+                profile.tasks[0].model_copy(
+                    update={
+                        "lane_baselines": (
+                            profile.tasks[0]
+                            .lane_baselines[0]
+                            .model_copy(update={"probability": 0.2}),
+                            *profile.tasks[0].lane_baselines[1:],
+                        )
+                    }
+                ),
+                *profile.tasks[1:],
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="task profile digest"):
+        manifest.validate_frozen_inputs(evaluation_design, changed_profile)
+
+
+def test_locked_chunk_is_deterministic_and_artifact_is_public_safe(tmp_path: Path) -> None:
+    evaluation_design = _synthetic_evaluation_design()
+    profile = _synthetic_task_profile()
+    manifest = _synthetic_simulation_manifest(evaluation_design, profile)
+
+    first = run_paired_power_chunk(
+        manifest,
+        evaluation_design,
+        profile,
+        scenario="target-alternative",
+        first_replicate=1,
+        last_replicate=2,
+    )
+    repeated = run_paired_power_chunk(
+        manifest,
+        evaluation_design,
+        profile,
+        scenario="target-alternative",
+        first_replicate=1,
+        last_replicate=2,
+    )
+    assert first == repeated
+    assert first.digest == repeated.digest
+
+    chunks = tuple(
+        run_paired_power_chunk(
+            manifest,
+            evaluation_design,
+            profile,
+            scenario=scenario,
+            first_replicate=first_replicate,
+            last_replicate=last_replicate,
+        )
+        for scenario in ("weak-null", "target-alternative")
+        for first_replicate, last_replicate in ((1, 2), (3, 4), (5, 6))
+    )
+    artifact = merge_paired_power_chunks(manifest, chunks)
+    assert isinstance(artifact, PairedPowerTrialArtifact)
+    assert artifact.replications_per_scenario == 6
+
+    artifact_path = tmp_path / "synthetic-power-artifact.json"
+    write_paired_power_trial_artifact(artifact_path, artifact)
+    loaded = load_paired_power_trial_artifact(artifact_path)
+    assert loaded == artifact
+    serialized = artifact_path.read_text()
+    assert "synthetic-task" not in serialized
+    assert "synthetic-family" not in serialized
+
+    gate = PairedPowerGateDesign(
+        simulation_design_digest=manifest.digest,
+        paired_evaluation_design_digest=evaluation_design.digest,
+        target_effect=0.1,
+        maximum_type_i_error=0.9,
+        minimum_power=0.01,
+        monte_carlo_alpha=0.1,
+        replications_per_scenario=6,
+    )
+    report = evaluate_paired_power_gate(gate, loaded)
+    expanded_trials = tuple(
+        PairedPowerTrial(
+            simulation_design_digest=artifact.simulation_design_digest,
+            paired_evaluation_design_digest=artifact.paired_evaluation_design_digest,
+            scenario=scenario.scenario,
+            replicate=replicate,
+            primary_passed=primary_passed,
+        )
+        for scenario in artifact.scenarios
+        for replicate, primary_passed in enumerate(scenario.decisions.decisions(), start=1)
+    )
+    expanded_report = evaluate_paired_power_gate(gate, expanded_trials)
+    assert report.null_rejections == artifact.rejection_count("weak-null")
+    assert report.target_rejections == artifact.rejection_count("target-alternative")
+    assert report.trial_evidence_digest == artifact.trial_evidence_digest
+    assert report.trial_evidence_digest == expanded_report.trial_evidence_digest
+    assert report.digest == expanded_report.digest
+    with pytest.raises(ValueError, match="target effect differs"):
+        evaluate_paired_power_gate(gate.model_copy(update={"target_effect": 0.2}), loaded)
+
+
+def test_chunk_merge_rejects_missing_duplicate_and_drifted_chunks() -> None:
+    evaluation_design = _synthetic_evaluation_design()
+    profile = _synthetic_task_profile()
+    manifest = _synthetic_simulation_manifest(evaluation_design, profile)
+    chunks = tuple(
+        run_paired_power_chunk(
+            manifest,
+            evaluation_design,
+            profile,
+            scenario=scenario,
+            first_replicate=first_replicate,
+            last_replicate=last_replicate,
+        )
+        for scenario in ("weak-null", "target-alternative")
+        for first_replicate, last_replicate in ((1, 2), (3, 4), (5, 6))
+    )
+
+    with pytest.raises(ValueError, match="exactly fill"):
+        merge_paired_power_chunks(manifest, chunks[:-1])
+    with pytest.raises(ValueError, match="duplicate"):
+        merge_paired_power_chunks(manifest, (*chunks, chunks[0]))
+    with pytest.raises(ValueError, match="simulation design digest"):
+        merge_paired_power_chunks(
+            manifest,
+            (
+                chunks[0].model_copy(update={"simulation_design_digest": "sha256:" + "f" * 64}),
+                *chunks[1:],
+            ),
+        )
+
+
+def test_resume_reuses_valid_chunks_and_rejects_corruption(tmp_path: Path) -> None:
+    evaluation_design = _synthetic_evaluation_design()
+    profile = _synthetic_task_profile()
+    manifest = _synthetic_simulation_manifest(evaluation_design, profile)
+    completed = run_paired_power_chunk(
+        manifest,
+        evaluation_design,
+        profile,
+        scenario="weak-null",
+        first_replicate=1,
+        last_replicate=2,
+    )
+    chunk_dir = tmp_path / "chunks"
+    chunk_dir.mkdir()
+    first_path = chunk_dir / "weak-null-000000001-000000002.json"
+    write_paired_power_chunk(first_path, completed)
+    original_stat = first_path.stat()
+
+    artifact = resume_paired_power_simulation(
+        manifest,
+        evaluation_design,
+        profile,
+        chunk_dir,
+    )
+    assert artifact.replications_per_scenario == 6
+    assert first_path.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    first_path.write_text(first_path.read_text().replace("sha256:", "sha256:0", 1))
+    with pytest.raises(ValueError, match="digest|artifact"):
+        resume_paired_power_simulation(
+            manifest,
+            evaluation_design,
+            profile,
+            chunk_dir,
+        )
+
+
+def test_resume_rejects_foreign_json_but_tolerates_crash_temporary(tmp_path: Path) -> None:
+    evaluation_design = _synthetic_evaluation_design()
+    profile = _synthetic_task_profile()
+    manifest = _synthetic_simulation_manifest(evaluation_design, profile)
+    chunk_dir = tmp_path / "chunks"
+    chunk_dir.mkdir()
+    crash_temporary = chunk_dir / ".weak-null-000000001-000000002.json.crash.tmp"
+    crash_temporary.write_text("incomplete")
+
+    artifact = resume_paired_power_simulation(
+        manifest,
+        evaluation_design,
+        profile,
+        chunk_dir,
+    )
+    assert artifact.replications_per_scenario == 6
+    assert crash_temporary.read_text() == "incomplete"
+
+    (chunk_dir / "foreign.json").write_text("{}")
+    with pytest.raises(ValueError, match="unexpected JSON"):
+        resume_paired_power_simulation(
+            manifest,
+            evaluation_design,
+            profile,
+            chunk_dir,
+        )
+
+
+def test_resume_rejects_drift_before_writing_missing_chunks(tmp_path: Path) -> None:
+    evaluation_design = _synthetic_evaluation_design()
+    profile = _synthetic_task_profile()
+    manifest = _synthetic_simulation_manifest(evaluation_design, profile)
+    drifted = run_paired_power_chunk(
+        manifest,
+        evaluation_design,
+        profile,
+        scenario="target-alternative",
+        first_replicate=5,
+        last_replicate=6,
+    ).model_copy(update={"simulation_design_digest": "sha256:" + "f" * 64})
+    chunk_dir = tmp_path / "chunks"
+    chunk_dir.mkdir()
+    write_paired_power_chunk(
+        chunk_dir / "target-alternative-000000005-000000006.json",
+        drifted,
+    )
+
+    with pytest.raises(ValueError, match="simulation digest"):
+        resume_paired_power_simulation(
+            manifest,
+            evaluation_design,
+            profile,
+            chunk_dir,
+        )
+    assert not (chunk_dir / "weak-null-000000001-000000002.json").exists()
