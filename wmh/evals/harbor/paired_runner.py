@@ -27,6 +27,7 @@ from pydantic import (
     Field,
     JsonValue,
     StrictInt,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -47,6 +48,10 @@ from wmh.evals.harbor.config import (
     HarborEnvironmentBackend,
     HarborJobSpec,
 )
+from wmh.evals.harbor.e2b_environment import (
+    ExactE2BBuildSpec,
+    require_exact_e2b_build_record,
+)
 from wmh.evals.harbor.evaluator import (
     HARBOR_EVALUATOR_VERSION,
     HarborEvaluator,
@@ -58,7 +63,6 @@ from wmh.evals.harbor.scorer import (
     admit_harbor_matrix,
     harbor_agent_compute_envelope,
     harbor_trial_analysis_values,
-    validate_exact_harbor_dataset_selection,
     validate_harbor_run_identity,
 )
 from wmh.evals.paired import (
@@ -72,21 +76,62 @@ from wmh.evals.paired import (
 )
 from wmh.evals.partition import ConfirmationPartition
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.pi_local import PI_CONTAINER_IMAGE, validate_pi_container_image
-from wmh.harness.pi_runner_backend import LocalPiRunnerSpec
+from wmh.harness.pi_runner_backend import (
+    E2BPiRunnerSpec,
+    LocalPiRunnerSpec,
+    PiRunnerBackendSpec,
+    e2b_runner_resource_class,
+)
 from wmh.providers.base import ProviderConfig
 from wmh.providers.receipt import validate_chat_provider_receipt
 from wmh.tracking.budget import (
     BudgetAccount,
+    BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    TimedResourceBudgetAccount,
+    TimedResourceClass,
+    TimedResourceCostMeter,
+    TimedResourceRole,
     open_shared_spend_ledger,
+    validate_timed_resource_class,
 )
 
-PAIRED_HARBOR_PROTOCOL_VERSION: Literal["6"] = "6"
-PAIRED_HARBOR_RUN_VERSION: Literal["7"] = "7"
+PAIRED_HARBOR_PROTOCOL_VERSION: Literal["7"] = "7"
+PAIRED_HARBOR_RUN_VERSION: Literal["8"] = "8"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+
+
+class QualifiedE2BBuildIdentity(BaseModel):
+    """Exact prequalified E2B build identity required again before scored launch."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    build_config_digest: str = Field(pattern=_DIGEST_PATTERN)
+    build_record_digest: str = Field(pattern=_DIGEST_PATTERN)
+    environment_id: str = Field(min_length=1, max_length=512)
+    build_context_digest: str = Field(pattern=_DIGEST_PATTERN)
+    docker_image: str | None = Field(default=None, min_length=1, max_length=2_048)
+    cpu_count: int = Field(ge=1)
+    memory_mb: int = Field(ge=1)
+    template_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
+    build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
+
+    @model_validator(mode="after")
+    def _bind_build_spec(self) -> Self:
+        spec = ExactE2BBuildSpec(
+            environment_id=self.environment_id,
+            build_context_digest=self.build_context_digest,
+            docker_image=self.docker_image,
+            cpu_count=self.cpu_count,
+            memory_mb=self.memory_mb,
+        )
+        if self.build_config_digest != spec.digest:
+            raise ValueError("qualified E2B build config digest is inconsistent")
+        if self.template_id == self.build_id:
+            raise ValueError("qualified E2B template and build identities must differ")
+        return self
 
 
 class QualifiedHarborTask(BaseModel):
@@ -95,17 +140,163 @@ class QualifiedHarborTask(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     task_id: str = Field(min_length=1, max_length=512)
+    dataset_id: str = Field(min_length=1, max_length=512)
     content_digest: str = Field(pattern=_DIGEST_PATTERN)
     task_key: str = Field(pattern=_DIGEST_PATTERN)
     task_environment_digest: str = Field(pattern=_DIGEST_PATTERN)
+    environment_backend: HarborEnvironmentBackend
+    e2b_build_config_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    e2b_build_record_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    task_resource_class_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    e2b_build_identity: QualifiedE2BBuildIdentity | None = None
+    task_resource_class: TimedResourceClass | None = None
 
-    @field_validator("task_id")
+    @field_validator("task_id", "dataset_id")
     @classmethod
     def _require_canonical_task_id(cls, value: str) -> str:
         if value != value.strip():
-            raise ValueError("qualified task_id cannot have surrounding whitespace")
-        validate_durable_text(value, field="qualified Harbor task id")
+            raise ValueError("qualified task and dataset IDs cannot have surrounding whitespace")
+        validate_durable_text(value, field="qualified Harbor task or dataset id")
         return value
+
+    @model_validator(mode="after")
+    def _require_backend_qualification(self) -> Self:
+        e2b_fields = (
+            self.e2b_build_config_digest,
+            self.e2b_build_record_digest,
+            self.task_resource_class_digest,
+            self.e2b_build_identity,
+            self.task_resource_class,
+        )
+        if self.environment_backend is HarborEnvironmentBackend.LOCAL:
+            if any(value is not None for value in e2b_fields):
+                raise ValueError("local task qualification cannot carry E2B build identities")
+        elif any(value is None for value in e2b_fields):
+            raise ValueError(
+                "E2B task qualification requires exact build and resource class identities"
+            )
+        else:
+            assert self.e2b_build_identity is not None
+            assert self.task_resource_class is not None
+            if (
+                self.e2b_build_config_digest != self.e2b_build_identity.build_config_digest
+                or self.e2b_build_record_digest != self.e2b_build_identity.build_record_digest
+                or self.task_resource_class_digest != self.task_resource_class.digest
+            ):
+                raise ValueError("E2B task qualification identities are inconsistent")
+            if self.task_resource_class.role is not TimedResourceRole.TASK_ENVIRONMENT:
+                raise ValueError("E2B task qualification names the wrong resource role")
+            if (
+                self.task_resource_class.cpu_count != self.e2b_build_identity.cpu_count
+                or self.task_resource_class.memory_mb != self.e2b_build_identity.memory_mb
+            ):
+                raise ValueError("E2B task build and launch resource identities differ")
+        return self
+
+
+class PrequalifiedHarborRoster(BaseModel):
+    """Full task roster qualified against one task-independent execution plan."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    roster_version: Literal["1"] = "1"
+    execution_plan_digest: str = Field(pattern=_DIGEST_PATTERN)
+    tasks: tuple[QualifiedHarborTask, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _require_canonical_full_roster(self) -> Self:
+        task_ids = tuple(task.task_id for task in self.tasks)
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("prequalified Harbor roster contains duplicate task IDs")
+        if task_ids != tuple(sorted(task_ids)):
+            raise ValueError("prequalified Harbor roster tasks must be sorted by task ID")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return the full pre-open roster identity."""
+        return _canonical_digest(self.model_dump(mode="json"))
+
+
+class OpenedHarborExecutionSelection(BaseModel):
+    """Deterministic post-open projection from a prequalified full roster."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    selection_version: Literal["1"] = "1"
+    execution_plan_digest: str = Field(pattern=_DIGEST_PATTERN)
+    roster_digest: str = Field(pattern=_DIGEST_PATTERN)
+    confirmation_protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    design_digest: str = Field(pattern=_DIGEST_PATTERN)
+    tasks: tuple[QualifiedHarborTask, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _require_unique_tasks(self) -> Self:
+        if len(self.task_ids) != len(set(self.task_ids)):
+            raise ValueError("opened Harbor execution selection contains duplicate task IDs")
+        return self
+
+    @property
+    def task_ids(self) -> tuple[str, ...]:
+        """Return selected task IDs in frozen design order."""
+        return tuple(task.task_id for task in self.tasks)
+
+    @property
+    def digest(self) -> str:
+        """Return the exact post-open selection identity."""
+        return _canonical_digest(self.model_dump(mode="json"))
+
+    @classmethod
+    def project(
+        cls,
+        *,
+        execution_plan: HarborExecutionPlan,
+        roster: PrequalifiedHarborRoster,
+        confirmation: ConfirmationPartition,
+        design: PairedEvaluationDesign,
+    ) -> OpenedHarborExecutionSelection:
+        """Project opened task IDs without accepting replacement task semantics."""
+        frozen_plan = HarborExecutionPlan.model_validate(execution_plan.model_dump())
+        frozen_roster = PrequalifiedHarborRoster.model_validate(roster.model_dump())
+        frozen_confirmation = ConfirmationPartition.model_validate(confirmation.model_dump())
+        frozen_design = PairedEvaluationDesign.model_validate(design.model_dump())
+        if frozen_roster.execution_plan_digest != frozen_plan.digest:
+            raise ValueError("prequalified Harbor roster differs from its execution plan")
+        roster_backend_mismatch = [
+            task.task_id
+            for task in frozen_roster.tasks
+            if task.environment_backend is not frozen_plan.environment_backend
+        ]
+        if roster_backend_mismatch:
+            raise ValueError(
+                "prequalified Harbor full roster backend differs for task(s): "
+                f"{roster_backend_mismatch}"
+            )
+        confirmation_ids = tuple(task.task_id for task in frozen_confirmation.tasks)
+        if confirmation_ids != frozen_design.task_ids:
+            raise ValueError("opened confirmation tasks differ from the paired design")
+        roster_by_id = {task.task_id: task for task in frozen_roster.tasks}
+        missing = sorted(set(frozen_design.task_ids) - set(roster_by_id))
+        if missing:
+            raise ValueError(f"opened confirmation contains unqualified task(s): {missing}")
+        confirmation_by_id = {task.task_id: task for task in frozen_confirmation.tasks}
+        selected = tuple(roster_by_id[task_id] for task_id in frozen_design.task_ids)
+        content_mismatch = [
+            task.task_id
+            for task in selected
+            if task.content_digest != confirmation_by_id[task.task_id].content_digest
+        ]
+        if content_mismatch:
+            raise ValueError(
+                f"opened confirmation qualification content differs for task(s): {content_mismatch}"
+            )
+        return cls(
+            execution_plan_digest=frozen_plan.digest,
+            roster_digest=frozen_roster.digest,
+            confirmation_protocol_digest=_confirmation_protocol_digest(frozen_confirmation),
+            design_digest=frozen_design.digest,
+            tasks=selected,
+        )
 
 
 class PairedHarborProviderConfig(ProviderConfig):
@@ -185,7 +376,7 @@ class PairedHarborPanelRoute(BaseModel):
 
 
 class PairedHarborBudgetRuntime(BaseModel):
-    """Host-private ledger location and route meters for one frozen paired protocol."""
+    """Host-private accounts minted from one frozen paired budget authority."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -193,8 +384,12 @@ class PairedHarborBudgetRuntime(BaseModel):
     ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
     policy: BudgetPolicy
     phase: str = Field(min_length=1)
-    meter_by_panel_member: dict[str, str] = Field(min_length=1)
-    category: str = Field(default="worker", min_length=1)
+    provider_meter_by_panel_member: dict[str, str] = Field(min_length=1)
+    task_resource_meter_by_class_digest: dict[str, str] = Field(default_factory=dict)
+    runner_resource_meter_id: str | None = Field(default=None, min_length=1)
+    provider_category: str = Field(default="worker", min_length=1)
+    task_resource_category: str = Field(default="task_environment", min_length=1)
+    runner_resource_category: str = Field(default="agent_runner", min_length=1)
 
     @model_validator(mode="after")
     def _validate_runtime(self) -> Self:
@@ -204,16 +399,48 @@ class PairedHarborBudgetRuntime(BaseModel):
             raise ValueError("paired budget phase is absent from its policy")
         if any(
             not key.strip() or not value.strip()
-            for key, value in self.meter_by_panel_member.items()
+            for key, value in self.provider_meter_by_panel_member.items()
         ):
             raise ValueError("paired budget route and meter names cannot be blank")
-        missing = sorted(
-            meter
-            for meter in self.meter_by_panel_member.values()
-            if meter not in self.policy.meters
+        if any(
+            not _is_sha256_digest(class_digest) or not meter_id.strip()
+            for class_digest, meter_id in self.task_resource_meter_by_class_digest.items()
+        ):
+            raise ValueError("paired task resource mappings must name exact classes and meters")
+        meter_ids = set(self.provider_meter_by_panel_member.values()) | set(
+            self.task_resource_meter_by_class_digest.values()
         )
+        if self.runner_resource_meter_id is not None:
+            meter_ids.add(self.runner_resource_meter_id)
+        missing = sorted(meter for meter in meter_ids if meter not in self.policy.meters)
         if missing:
             raise ValueError(f"paired budget runtime names unknown meter(s): {missing}")
+        wrong_provider = sorted(
+            meter_id
+            for meter_id in self.provider_meter_by_panel_member.values()
+            if not isinstance(self.policy.meters[meter_id], ProviderCostMeter)
+        )
+        if wrong_provider:
+            raise ValueError(
+                f"paired provider mappings name non-provider meter(s): {wrong_provider}"
+            )
+        for class_digest, meter_id in self.task_resource_meter_by_class_digest.items():
+            meter = self.policy.meters[meter_id]
+            if (
+                not isinstance(meter, TimedResourceCostMeter)
+                or meter.resource_type != TimedResourceRole.TASK_ENVIRONMENT.value
+                or meter.resource_class_digest != class_digest
+            ):
+                raise ValueError(
+                    "paired task resource meter differs from its exact task environment class"
+                )
+        if self.runner_resource_meter_id is not None:
+            meter = self.policy.meters[self.runner_resource_meter_id]
+            if (
+                not isinstance(meter, TimedResourceCostMeter)
+                or meter.resource_type != TimedResourceRole.AGENT_RUNNER.value
+            ):
+                raise ValueError("paired runner resource meter must meter an agent runner")
         open_shared_spend_ledger(
             self.ledger_path,
             self.policy,
@@ -221,22 +448,40 @@ class PairedHarborBudgetRuntime(BaseModel):
         )
         return self
 
-    def account_for(
+    @property
+    def binding_digest(self) -> str:
+        """Bind account semantics without retaining the host ledger path."""
+        return _canonical_digest(
+            {
+                "schema_version": 1,
+                "policy_digest": self.policy.policy_digest,
+                "ledger_identity": self.ledger_identity,
+                "phase": self.phase,
+                "provider_meter_by_panel_member": self.provider_meter_by_panel_member,
+                "task_resource_meter_by_class_digest": (self.task_resource_meter_by_class_digest),
+                "runner_resource_meter_id": self.runner_resource_meter_id,
+                "provider_category": self.provider_category,
+                "task_resource_category": self.task_resource_category,
+                "runner_resource_category": self.runner_resource_category,
+            }
+        )
+
+    def provider_account_for(
         self,
         *,
         panel_member: str,
         arm: PairedArm,
         run_id: str,
     ) -> BudgetAccount:
-        """Build the exact per-arm attribution sharing this runtime's hard ledger."""
-        meter_id = self.meter_by_panel_member[panel_member]
+        """Build one provider-call account sharing this runtime's hard ledger."""
+        meter_id = self.provider_meter_by_panel_member[panel_member]
         return BudgetAccount(
             ledger_path=self.ledger_path,
             ledger_identity=self.ledger_identity,
             policy=self.policy,
             scope=BudgetScope(
                 phase=self.phase,
-                category=self.category,
+                category=self.provider_category,
                 run_id=run_id,
                 lane=panel_member,
                 arm=arm.value,
@@ -244,31 +489,102 @@ class PairedHarborBudgetRuntime(BaseModel):
             meter_id=meter_id,
         )
 
+    def task_resource_accounts_for(
+        self,
+        *,
+        qualification: QualifiedHarborTask,
+        panel_member: str,
+        arm: PairedArm,
+        run_id: str,
+    ) -> tuple[TimedResourceBudgetAccount, ...]:
+        """Build the exact E2B task account, or no account for local Docker."""
+        if qualification.environment_backend is HarborEnvironmentBackend.LOCAL:
+            return ()
+        class_digest = qualification.task_resource_class_digest
+        if class_digest is None:
+            raise ValueError("E2B task qualification omits its resource class")
+        try:
+            meter_id = self.task_resource_meter_by_class_digest[class_digest]
+        except KeyError:
+            raise ValueError(
+                "paired budget runtime has no meter for the qualified E2B task class"
+            ) from None
+        return (
+            TimedResourceBudgetAccount(
+                ledger_path=self.ledger_path,
+                ledger_identity=self.ledger_identity,
+                policy=self.policy,
+                scope=BudgetScope(
+                    phase=self.phase,
+                    category=self.task_resource_category,
+                    run_id=run_id,
+                    lane=panel_member,
+                    arm=arm.value,
+                ),
+                meter_id=meter_id,
+            ),
+        )
 
-class PairedHarborJobTemplate(BaseModel):
-    """Path-independent Harbor semantics shared by every single-task arm job.
+    def runner_resource_account_for(
+        self,
+        *,
+        runner_spec: PiRunnerBackendSpec,
+        panel_member: str,
+        arm: PairedArm,
+        run_id: str,
+    ) -> TimedResourceBudgetAccount | None:
+        """Build the exact E2B runner account, or no account for a local runner."""
+        if isinstance(runner_spec, LocalPiRunnerSpec):
+            return None
+        if self.runner_resource_meter_id is None:
+            raise ValueError("paired budget runtime has no E2B runner meter")
+        account = TimedResourceBudgetAccount(
+            ledger_path=self.ledger_path,
+            ledger_identity=self.ledger_identity,
+            policy=self.policy,
+            scope=BudgetScope(
+                phase=self.phase,
+                category=self.runner_resource_category,
+                run_id=run_id,
+                lane=panel_member,
+                arm=arm.value,
+            ),
+            meter_id=self.runner_resource_meter_id,
+        )
+        try:
+            validate_timed_resource_class(account, e2b_runner_resource_class(runner_spec))
+        except BudgetIntegrityError as exc:
+            raise ValueError(str(exc)) from exc
+        return account
 
-    Local dataset paths and the output directory are storage coordinates, not experiment
-    semantics. Exact selected task bytes and environments are bound separately by
-    ``QualifiedHarborTask``.
-    """
+
+class HarborExecutionPlan(BaseModel):
+    """Task-independent scored Harbor and Pi execution semantics."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    template_version: Literal["1"] = "1"
-    dataset_task_groups: tuple[tuple[str, ...], ...]
+    plan_version: Literal["1"] = "1"
+    environment_backend: HarborEnvironmentBackend = HarborEnvironmentBackend.LOCAL
+    runner_spec: PiRunnerBackendSpec
+    runner_config_digest: str = Field(pattern=_DIGEST_PATTERN)
+    runner_environment_digest: str = Field(pattern=_DIGEST_PATTERN)
+    compute_envelope: HarborAgentComputeEnvelope
+    turn_timeout_s: float = Field(gt=0.0, allow_inf_nan=False)
     attempts_per_job: Literal[1] = 1
     trial_concurrency: Literal[1] = 1
     agent_concurrency: Literal[1] = 1
-    environment_backend: Literal[HarborEnvironmentBackend.LOCAL] = HarborEnvironmentBackend.LOCAL
-    artifact_paths: tuple[str, ...]
+    artifact_paths: tuple[str, ...] = ()
     reward_key: str = Field(min_length=1)
     max_retries: Literal[0] = 0
     retry_exceptions: tuple[()] = ()
+    allow_preexisting_e2b_builds: Literal[False] = False
+    harbor_version: str = Field(min_length=1)
+    evaluator_version: str = Field(min_length=1)
+    agent_version: str = Field(min_length=1)
 
     @field_validator("reward_key")
     @classmethod
-    def _require_reward_key(cls, value: str) -> str:
+    def _require_plan_reward_key(cls, value: str) -> str:
         if value != value.strip():
             raise ValueError("reward_key must be a non-empty canonical string")
         validate_durable_text(value, field="Harbor reward key")
@@ -276,7 +592,7 @@ class PairedHarborJobTemplate(BaseModel):
 
     @field_validator("artifact_paths")
     @classmethod
-    def _require_durable_artifact_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def _require_plan_artifact_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         for item in value:
             if item != item.strip() or not item:
                 raise ValueError("Harbor artifact paths must be non-empty canonical strings")
@@ -284,66 +600,137 @@ class PairedHarborJobTemplate(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _require_exact_task_groups(self) -> Self:
-        if not self.dataset_task_groups or any(not group for group in self.dataset_task_groups):
-            raise ValueError("paired Harbor template needs non-empty dataset task groups")
-        flattened = tuple(task for group in self.dataset_task_groups for task in group)
-        if len(flattened) != len(set(flattened)):
-            raise ValueError("paired Harbor template task groups cannot contain duplicates")
+    def _validate_plan(self) -> Self:
+        if self.runner_config_digest != self.runner_spec.config_digest:
+            raise ValueError("Harbor execution plan runner configuration digest is inconsistent")
+        if self.runner_environment_digest != self.runner_spec.attestation.digest:
+            raise ValueError("Harbor execution plan runner environment digest is inconsistent")
+        if self.compute_envelope.turn_timeout_s != self.turn_timeout_s:
+            raise ValueError("Harbor execution plan timeout differs from its compute envelope")
+        if self.compute_envelope.runtime_kind != "pi-node":
+            raise ValueError("Harbor execution requires pi-node harnesses")
+        if self.harbor_version != SUPPORTED_HARBOR_VERSION:
+            raise ValueError("Harbor execution plan uses an unsupported Harbor version")
+        if self.evaluator_version != HARBOR_EVALUATOR_VERSION:
+            raise ValueError("Harbor execution plan uses an unsupported evaluator version")
+        if self.agent_version != WMH_PI_AGENT_VERSION:
+            raise ValueError("Harbor execution plan uses an unsupported agent version")
         return self
 
     @property
     def digest(self) -> str:
-        """Return the semantic, host-path-independent template identity."""
+        """Return the path- and task-independent scored execution identity."""
         return _canonical_digest(self.model_dump(mode="json"))
 
     @classmethod
-    def from_spec(
+    def freeze(
         cls,
-        spec: HarborJobSpec,
         *,
+        reference_harness: HarnessDoc,
         reward_key: str,
-        task_ids: tuple[str, ...],
-    ) -> PairedHarborJobTemplate:
-        """Freeze supported scored semantics while rejecting unprovable E2B execution."""
-        frozen = HarborJobSpec.model_validate(spec.model_dump())
-        validate_exact_harbor_dataset_selection(frozen, task_ids)
-        for dataset in frozen.datasets:
-            if (
-                dataset.name is not None
-                or dataset.version is not None
-                or dataset.ref is not None
-                or dataset.registry_url is not None
-                or dataset.registry_path is not None
-                or dataset.repo is not None
-                or dataset.overwrite
-                or dataset.download_dir is not None
-            ):
-                raise ValueError(
-                    "paired Harbor local datasets cannot mix path selection with remote, "
-                    "registry, repository, or cache inputs"
-                )
-        if frozen.environment_backend is HarborEnvironmentBackend.E2B:
-            raise ValueError(
-                "scored paired E2B is unsupported until immutable sandbox build identity is "
-                "admitted into every trial; use local Docker"
-            )
-        if (
-            frozen.n_attempts != 1
-            or frozen.n_concurrent_trials != 1
-            or frozen.agent_n_concurrent != 1
-        ):
-            raise ValueError(
-                "paired Harbor job template requires one attempt, one trial, and one agent at a "
-                "time; outer-loop block concurrency is configured separately"
-            )
-        return cls(
-            dataset_task_groups=tuple(
-                tuple(dataset.task_names or ()) for dataset in frozen.datasets
-            ),
-            artifact_paths=tuple(frozen.artifact_paths),
-            reward_key=reward_key,
+        artifact_paths: tuple[str, ...] = (),
+        environment_backend: HarborEnvironmentBackend = HarborEnvironmentBackend.LOCAL,
+        runner_spec: PiRunnerBackendSpec | None = None,
+        turn_timeout_s: float = 300.0,
+    ) -> HarborExecutionPlan:
+        """Freeze equal-compute arm semantics without task selection or host paths."""
+        if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
+            raise ValueError("turn_timeout_s must be finite and positive")
+        frozen_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
+            LocalPiRunnerSpec() if runner_spec is None else runner_spec
         )
+        compute_envelope = harbor_agent_compute_envelope(
+            reference_harness,
+            turn_timeout_s=turn_timeout_s,
+        )
+        return cls(
+            environment_backend=environment_backend,
+            runner_spec=frozen_runner,
+            runner_config_digest=frozen_runner.config_digest,
+            runner_environment_digest=frozen_runner.attestation.digest,
+            compute_envelope=compute_envelope,
+            turn_timeout_s=turn_timeout_s,
+            artifact_paths=artifact_paths,
+            reward_key=reward_key,
+            harbor_version=SUPPORTED_HARBOR_VERSION,
+            evaluator_version=HARBOR_EVALUATOR_VERSION,
+            agent_version=WMH_PI_AGENT_VERSION,
+        )
+
+
+class HarborExecutionRuntime(BaseModel):
+    """Host-only dataset, artifact-root, and budget coordinates for scored execution."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    jobs_dir: Path
+    dataset_paths_by_id: dict[str, Path] = Field(min_length=1)
+    budget: PairedHarborBudgetRuntime
+
+    @model_validator(mode="after")
+    def _require_absolute_private_coordinates(self) -> Self:
+        if not self.jobs_dir.is_absolute():
+            raise ValueError("Harbor execution jobs_dir must be absolute")
+        if any(not dataset_id.strip() for dataset_id in self.dataset_paths_by_id):
+            raise ValueError("Harbor execution dataset IDs cannot be blank")
+        if any(not path.is_absolute() for path in self.dataset_paths_by_id.values()):
+            raise ValueError("Harbor execution dataset paths must be absolute")
+        normalized = tuple(
+            path.expanduser().resolve() for path in self.dataset_paths_by_id.values()
+        )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Harbor execution dataset IDs must map to distinct roots")
+        return self
+
+    def single_task_spec(
+        self,
+        *,
+        plan: HarborExecutionPlan,
+        qualification: QualifiedHarborTask,
+        job_name: str,
+    ) -> HarborJobSpec:
+        """Project one qualified task onto this host without changing frozen semantics."""
+        try:
+            dataset_path = self.dataset_paths_by_id[qualification.dataset_id]
+        except KeyError:
+            raise ValueError(
+                f"Harbor runtime lacks qualified dataset {qualification.dataset_id!r}"
+            ) from None
+        return HarborJobSpec(
+            job_name=job_name,
+            jobs_dir=self.jobs_dir,
+            datasets=[DatasetConfig(path=dataset_path, task_names=[qualification.task_id])],
+            n_attempts=plan.attempts_per_job,
+            n_concurrent_trials=plan.trial_concurrency,
+            agent_n_concurrent=plan.agent_concurrency,
+            environment_backend=plan.environment_backend,
+            allow_preexisting_e2b_builds=plan.allow_preexisting_e2b_builds,
+            max_retries=plan.max_retries,
+            retry_exceptions=set(plan.retry_exceptions),
+            artifact_paths=list(plan.artifact_paths),
+        )
+
+
+def _execution_plan_expectation_spec(plan: HarborExecutionPlan) -> HarborJobSpec:
+    """Materialize path-insensitive plan semantics for evaluator identity construction."""
+    return HarborJobSpec(
+        job_name="wmh-paired-plan-expectation",
+        jobs_dir=Path("/wmh/path-independent/jobs"),
+        datasets=[
+            DatasetConfig(
+                path=Path("/wmh/path-independent/dataset"),
+                task_names=["qualified-task"],
+            )
+        ],
+        n_attempts=plan.attempts_per_job,
+        n_concurrent_trials=plan.trial_concurrency,
+        agent_n_concurrent=plan.agent_concurrency,
+        environment_backend=plan.environment_backend,
+        allow_preexisting_e2b_builds=plan.allow_preexisting_e2b_builds,
+        max_retries=plan.max_retries,
+        retry_exceptions=set(plan.retry_exceptions),
+        artifact_paths=list(plan.artifact_paths),
+    )
 
 
 class PairedHarborArmRouteExpectation(BaseModel):
@@ -375,7 +762,7 @@ class PairedHarborProtocol(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    protocol_version: Literal["6"] = PAIRED_HARBOR_PROTOCOL_VERSION
+    protocol_version: Literal["7"] = PAIRED_HARBOR_PROTOCOL_VERSION
     design: PairedEvaluationDesign
     design_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation: ConfirmationPartition
@@ -385,21 +772,19 @@ class PairedHarborProtocol(BaseModel):
     candidate_execution_hash: str = Field(min_length=1)
     candidate_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
     panel_routes: tuple[PairedHarborPanelRoute, ...]
-    qualified_tasks: tuple[QualifiedHarborTask, ...]
-    job_template: PairedHarborJobTemplate
-    job_template_digest: str = Field(pattern=_DIGEST_PATTERN)
-    runner_image: str = Field(min_length=1)
-    compute_envelope: HarborAgentComputeEnvelope
-    turn_timeout_s: float = Field(gt=0.0, allow_inf_nan=False)
+    execution_plan: HarborExecutionPlan
+    execution_plan_digest: str = Field(pattern=_DIGEST_PATTERN)
+    qualification_roster: PrequalifiedHarborRoster
+    qualification_roster_digest: str = Field(pattern=_DIGEST_PATTERN)
+    opened_selection: OpenedHarborExecutionSelection
+    opened_selection_digest: str = Field(pattern=_DIGEST_PATTERN)
     max_concurrent_blocks: StrictInt = Field(ge=1)
     same_task_concurrency: Literal[1] = 1
-    harbor_version: str = Field(min_length=1)
-    evaluator_version: str = Field(min_length=1)
-    agent_version: str = Field(min_length=1)
     arm_route_expectations: tuple[PairedHarborArmRouteExpectation, ...]
     retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
+    budget_binding_digest: str = Field(pattern=_DIGEST_PATTERN)
 
     @field_validator("max_concurrent_blocks", mode="before")
     @classmethod
@@ -418,53 +803,28 @@ class PairedHarborProtocol(BaseModel):
             raise ValueError("paired Harbor candidate differs from the confirmation opening")
         if self.baseline_execution_digest == self.candidate_execution_digest:
             raise ValueError("paired Harbor baseline and candidate must differ")
-        if self.job_template_digest != self.job_template.digest:
-            raise ValueError("paired Harbor job template digest is inconsistent")
-        validate_pi_container_image(self.runner_image)
-        if self.compute_envelope.turn_timeout_s != self.turn_timeout_s:
-            raise ValueError("paired Harbor turn timeout differs from its compute envelope")
-        if self.compute_envelope.runtime_kind != "pi-node":
-            raise ValueError("paired Harbor evaluation requires pi-node harnesses")
-        if self.harbor_version != SUPPORTED_HARBOR_VERSION:
-            raise ValueError("paired Harbor protocol uses an unsupported Harbor version")
-        if self.evaluator_version != HARBOR_EVALUATOR_VERSION:
-            raise ValueError("paired Harbor protocol uses an unsupported evaluator version")
-        if self.agent_version != WMH_PI_AGENT_VERSION:
-            raise ValueError("paired Harbor protocol uses an unsupported agent version")
+        if self.execution_plan_digest != self.execution_plan.digest:
+            raise ValueError("paired Harbor execution plan digest is inconsistent")
+        if self.qualification_roster_digest != self.qualification_roster.digest:
+            raise ValueError("paired Harbor qualification roster digest is inconsistent")
+        if self.opened_selection_digest != self.opened_selection.digest:
+            raise ValueError("paired Harbor opened selection digest is inconsistent")
+        expected_selection = OpenedHarborExecutionSelection.project(
+            execution_plan=self.execution_plan,
+            roster=self.qualification_roster,
+            confirmation=self.confirmation,
+            design=self.design,
+        )
+        if self.opened_selection != expected_selection:
+            raise ValueError(
+                "paired Harbor selection is not the deterministic full-roster projection"
+            )
 
         routes = tuple(route.panel_member for route in self.panel_routes)
         if len(routes) != len(set(routes)):
             raise ValueError("paired Harbor protocol has duplicate routes")
         if routes != self.design.panel_members:
             raise ValueError("paired Harbor protocol routes differ from its design")
-        qualified_ids = tuple(task.task_id for task in self.qualified_tasks)
-        if qualified_ids != self.design.task_ids:
-            raise ValueError("paired Harbor protocol qualifications differ from its design")
-        confirmation_tasks = tuple(
-            PairedTaskPlan(task_id=task.task_id, group_id=task.group_id)
-            for task in self.confirmation.tasks
-        )
-        if confirmation_tasks != self.design.tasks:
-            raise ValueError(
-                "paired Harbor design task clusters differ from its opened confirmation tasks"
-            )
-        confirmation_by_id = {task.task_id: task for task in self.confirmation.tasks}
-        mismatched_content = [
-            task.task_id
-            for task in self.qualified_tasks
-            if task.content_digest != confirmation_by_id[task.task_id].content_digest
-        ]
-        if mismatched_content:
-            raise ValueError(
-                "paired Harbor qualification content differs from confirmation: "
-                f"{mismatched_content}"
-            )
-        template_tasks = tuple(
-            task for group in self.job_template.dataset_task_groups for task in group
-        )
-        if template_tasks != self.design.task_ids:
-            raise ValueError("paired Harbor job template differs from the frozen task matrix")
-
         expected_keys = tuple(
             (member, arm)
             for member in self.design.panel_members
@@ -474,7 +834,10 @@ class PairedHarborProtocol(BaseModel):
         if actual_keys != expected_keys:
             raise ValueError("paired Harbor arm-route expectations are incomplete or unordered")
         route_by_member = {route.panel_member: route for route in self.panel_routes}
-        frozen_runner = LocalPiRunnerSpec(image=self.runner_image)
+        expected_task_environment = {
+            HarborEnvironmentBackend.LOCAL: "docker",
+            HarborEnvironmentBackend.E2B: "e2b",
+        }[self.execution_plan.environment_backend]
         for item in self.arm_route_expectations:
             expected_hash, expected_digest = self.harness_identity(item.arm)
             if (
@@ -487,11 +850,13 @@ class PairedHarborProtocol(BaseModel):
             if (
                 identity.provider != route.provider_config.kind.value
                 or identity.model_name != route.provider_config.model
-                or identity.runner_config_digest != frozen_runner.config_digest
-                or identity.runner_environment_digest != frozen_runner.attestation.digest
+                or identity.reasoning_effort != route.provider_config.reasoning_effort
+                or identity.runner_config_digest != self.execution_plan.runner_config_digest
+                or identity.runner_environment_digest
+                != self.execution_plan.runner_environment_digest
                 or identity.agent_name != "wmh-pi"
-                or identity.agent_version != self.agent_version
-                or identity.task_environment.value != "docker"
+                or identity.agent_version != self.execution_plan.agent_version
+                or identity.task_environment.value != expected_task_environment
             ):
                 raise ValueError("paired Harbor arm-route expectation has runtime drift")
         return self
@@ -527,21 +892,17 @@ class PairedHarborProtocol(BaseModel):
         confirmation: ConfirmationPartition,
         baseline: HarnessDoc,
         candidate: HarnessDoc,
-        job_spec: HarborJobSpec,
+        execution_plan: HarborExecutionPlan,
         panel_routes: tuple[PairedHarborPanelRoute, ...],
-        qualified_tasks: tuple[QualifiedHarborTask, ...],
-        reward_key: str,
-        runner_image: str = PI_CONTAINER_IMAGE,
-        turn_timeout_s: float = 300.0,
+        qualification_roster: PrequalifiedHarborRoster,
+        opened_selection: OpenedHarborExecutionSelection,
         max_concurrent_blocks: int = 1,
         retry_policy_digest: str,
         budget_policy_digest: str,
         budget_ledger_identity: str,
+        budget_binding_digest: str,
     ) -> PairedHarborProtocol:
-        """Construct a frozen protocol from concrete runtime inputs before execution."""
-        validate_pi_container_image(runner_image)
-        if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
-            raise ValueError("turn_timeout_s must be finite and positive")
+        """Freeze paired evidence semantics after deterministic confirmation opening."""
         if (
             isinstance(max_concurrent_blocks, bool)
             or not isinstance(max_concurrent_blocks, int)
@@ -551,6 +912,21 @@ class PairedHarborProtocol(BaseModel):
 
         frozen_design = PairedEvaluationDesign.model_validate(design.model_dump())
         frozen_confirmation = ConfirmationPartition.model_validate(confirmation.model_dump())
+        frozen_plan = HarborExecutionPlan.model_validate(execution_plan.model_dump())
+        frozen_roster = PrequalifiedHarborRoster.model_validate(qualification_roster.model_dump())
+        frozen_selection = OpenedHarborExecutionSelection.model_validate(
+            opened_selection.model_dump()
+        )
+        expected_selection = OpenedHarborExecutionSelection.project(
+            execution_plan=frozen_plan,
+            roster=frozen_roster,
+            confirmation=frozen_confirmation,
+            design=frozen_design,
+        )
+        if frozen_selection != expected_selection:
+            raise ValueError(
+                "opened Harbor execution selection differs from the deterministic projection"
+            )
         routes = tuple(
             sorted(
                 (
@@ -560,32 +936,24 @@ class PairedHarborProtocol(BaseModel):
                 key=lambda item: item.panel_member,
             )
         )
-        qualifications = tuple(
-            sorted(
-                (QualifiedHarborTask.model_validate(task.model_dump()) for task in qualified_tasks),
-                key=lambda item: item.task_id,
-            )
-        )
-        spec = HarborJobSpec.model_validate(job_spec.model_dump())
-        template = PairedHarborJobTemplate.from_spec(
-            spec,
-            reward_key=reward_key,
-            task_ids=frozen_design.task_ids,
-        )
         baseline_envelope = harbor_agent_compute_envelope(
             baseline,
-            turn_timeout_s=turn_timeout_s,
+            turn_timeout_s=frozen_plan.turn_timeout_s,
         )
         candidate_envelope = harbor_agent_compute_envelope(
             candidate,
-            turn_timeout_s=turn_timeout_s,
+            turn_timeout_s=frozen_plan.turn_timeout_s,
         )
-        if baseline_envelope != candidate_envelope:
+        if (
+            baseline_envelope != frozen_plan.compute_envelope
+            or candidate_envelope != frozen_plan.compute_envelope
+        ):
             raise ValueError(
-                "paired Harbor candidate changes the frozen agent compute envelope; only harness "
-                "source may differ between arms"
+                "paired Harbor arm changes the predeclared agent compute envelope; only harness "
+                "source may differ"
             )
 
+        semantic_spec = _execution_plan_expectation_spec(frozen_plan)
         arm_docs = {
             PairedArm.BASELINE: baseline,
             PairedArm.CANDIDATE: candidate,
@@ -596,10 +964,10 @@ class PairedHarborProtocol(BaseModel):
                 harness = arm_docs[arm]
                 expectation = harbor_run_expectation(
                     candidate=harness,
-                    spec=spec,
+                    spec=semantic_spec,
                     provider_config=route.provider_config,
-                    runner_image=runner_image,
-                    turn_timeout_s=turn_timeout_s,
+                    runner_spec=frozen_plan.runner_spec,
+                    turn_timeout_s=frozen_plan.turn_timeout_s,
                     budget_policy_digest=budget_policy_digest,
                 )
                 route_expectations.append(
@@ -623,20 +991,18 @@ class PairedHarborProtocol(BaseModel):
             candidate_execution_hash=candidate.execution_hash,
             candidate_execution_digest=candidate.execution_digest,
             panel_routes=routes,
-            qualified_tasks=qualifications,
-            job_template=template,
-            job_template_digest=template.digest,
-            runner_image=runner_image,
-            compute_envelope=baseline_envelope,
-            turn_timeout_s=turn_timeout_s,
+            execution_plan=frozen_plan,
+            execution_plan_digest=frozen_plan.digest,
+            qualification_roster=frozen_roster,
+            qualification_roster_digest=frozen_roster.digest,
+            opened_selection=frozen_selection,
+            opened_selection_digest=frozen_selection.digest,
             max_concurrent_blocks=max_concurrent_blocks,
-            harbor_version=SUPPORTED_HARBOR_VERSION,
-            evaluator_version=HARBOR_EVALUATOR_VERSION,
-            agent_version=WMH_PI_AGENT_VERSION,
             arm_route_expectations=tuple(route_expectations),
             retry_policy_digest=retry_policy_digest,
             budget_policy_digest=budget_policy_digest,
             budget_ledger_identity=budget_ledger_identity,
+            budget_binding_digest=budget_binding_digest,
         )
 
 
@@ -749,7 +1115,7 @@ class PairedHarborRunReport(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    run_version: Literal["7"]
+    run_version: Literal["8"]
     protocol: PairedHarborProtocol
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
@@ -777,10 +1143,11 @@ class PairedHarborRunReport(BaseModel):
         if tuple(item.block for item in self.evidence) != expected_blocks:
             raise ValueError("paired Harbor evidence does not contain the exact frozen blocks")
 
-        qualification_by_id = {task.task_id: task for task in self.protocol.qualified_tasks}
+        qualification_by_id = {task.task_id: task for task in self.protocol.opened_selection.tasks}
         route_by_member = {route.panel_member: route for route in self.protocol.panel_routes}
         job_names: list[str] = []
         provider_request_ids: list[str] = []
+        external_resource_ids: list[str] = []
         for item in self.evidence:
             qualification = qualification_by_id[item.block.task_id]
             if item.pair_generation_id != paired_harbor_pair_generation_id(
@@ -818,8 +1185,10 @@ class PairedHarborRunReport(BaseModel):
                     _validate_provider_receipt_for_route(
                         receipt,
                         route=route,
-                        max_output_tokens=self.protocol.compute_envelope.max_output_tokens,
-                        temperature=self.protocol.compute_envelope.temperature,
+                        max_output_tokens=(
+                            self.protocol.execution_plan.compute_envelope.max_output_tokens
+                        ),
+                        temperature=self.protocol.execution_plan.compute_envelope.temperature,
                     )
                     provider_request_ids.append(receipt.provider_request_id)
                 trial = arm_evidence.trial
@@ -830,11 +1199,24 @@ class PairedHarborRunReport(BaseModel):
                     or trial.cell.attempt != 1
                     or trial.task_checksum != qualification.content_digest
                     or trial.task_environment_digest != qualification.task_environment_digest
+                    or trial.runner_environment_digest
+                    != self.protocol.execution_plan.runner_environment_digest
                 ):
                     raise ValueError("paired Harbor evidence differs from task qualification")
+                _validate_backend_trial_evidence(
+                    trial,
+                    plan=self.protocol.execution_plan,
+                    qualification=qualification,
+                )
+                external_resource_ids.extend(
+                    _external_resource_ids(
+                        trial,
+                        plan=self.protocol.execution_plan,
+                    )
+                )
                 verifier_reward, score = harbor_trial_analysis_values(
                     trial,
-                    reward_key=self.protocol.job_template.reward_key,
+                    reward_key=self.protocol.execution_plan.reward_key,
                 )
                 if (
                     arm_evidence.verifier_reward != verifier_reward
@@ -846,6 +1228,10 @@ class PairedHarborRunReport(BaseModel):
         if len(provider_request_ids) != len(set(provider_request_ids)):
             raise ValueError(
                 "paired Harbor report reuses a provider request ID across independent blocks"
+            )
+        if len(external_resource_ids) != len(set(external_resource_ids)):
+            raise ValueError(
+                "paired Harbor report reuses an E2B resource across independent arm jobs"
             )
 
         recomputed = analyze_paired_outcomes(
@@ -1134,10 +1520,9 @@ class PairedHarborRunner:
         self,
         *,
         protocol: PairedHarborProtocol,
-        job_spec: HarborJobSpec,
+        runtime: HarborExecutionRuntime,
         operation_id: str,
         generation_id: int,
-        budget_runtime: PairedHarborBudgetRuntime,
         multi_host: bool = False,
         durable_coordinator: PairedHarborLeaseCoordinator | None = None,
     ) -> None:
@@ -1148,11 +1533,14 @@ class PairedHarborRunner:
         if generation_id < 1:
             raise ValueError("generation_id must be a positive integer")
         self._generation_id = generation_id
-        self._budget_runtime = PairedHarborBudgetRuntime.model_validate(budget_runtime.model_dump())
+        self._runtime = HarborExecutionRuntime.model_validate(runtime.model_dump())
+        self._budget_runtime = self._runtime.budget
         if self._budget_runtime.policy.policy_digest != self._protocol.budget_policy_digest:
             raise ValueError("paired budget runtime differs from the frozen policy digest")
         if self._budget_runtime.ledger_identity != self._protocol.budget_ledger_identity:
             raise ValueError("paired budget runtime differs from the frozen ledger identity")
+        if self._budget_runtime.binding_digest != self._protocol.budget_binding_digest:
+            raise ValueError("paired budget runtime differs from the frozen account bindings")
         if not isinstance(multi_host, bool):
             raise ValueError("multi_host must be a boolean")
         if multi_host:
@@ -1161,28 +1549,20 @@ class PairedHarborRunner:
                 "budget authority; use one shared transactional budget authority"
             )
 
-        spec = HarborJobSpec.model_validate(job_spec.model_dump())
-        spec = spec.model_copy(
-            update={"jobs_dir": spec.jobs_dir.expanduser().resolve()},
-            deep=True,
-        )
-        actual_template = PairedHarborJobTemplate.from_spec(
-            spec,
-            reward_key=self._protocol.job_template.reward_key,
-            task_ids=self._protocol.design.task_ids,
-        )
-        if actual_template != self._protocol.job_template:
-            raise ValueError("runtime Harbor job template differs from frozen protocol")
-        self._job_spec = spec
+        roster_dataset_ids = {task.dataset_id for task in self._protocol.qualification_roster.tasks}
+        if set(self._runtime.dataset_paths_by_id) != roster_dataset_ids:
+            raise ValueError("Harbor runtime dataset paths differ from the full qualified roster")
         self._lease_coordinator = durable_coordinator or _LocalPairedHarborLeaseCoordinator(
-            spec.jobs_dir
+            self._runtime.jobs_dir
         )
         self._routes = {route.panel_member: route for route in self._protocol.panel_routes}
-        self._qualifications = {task.task_id: task for task in self._protocol.qualified_tasks}
-        if set(self._budget_runtime.meter_by_panel_member) != set(self._routes):
+        self._qualifications = {
+            task.task_id: task for task in self._protocol.opened_selection.tasks
+        }
+        if set(self._budget_runtime.provider_meter_by_panel_member) != set(self._routes):
             raise ValueError("paired budget runtime routes differ from the frozen panel")
         for member, route in self._routes.items():
-            meter_id = self._budget_runtime.meter_by_panel_member[member]
+            meter_id = self._budget_runtime.provider_meter_by_panel_member[member]
             meter = self._budget_runtime.policy.meters[meter_id]
             if (
                 not isinstance(meter, ProviderCostMeter)
@@ -1191,6 +1571,26 @@ class PairedHarborRunner:
                 raise ValueError(
                     f"paired budget meter for {member!r} differs from its provider route"
                 )
+        selected_task_classes = {
+            task.task_resource_class_digest
+            for task in self._protocol.opened_selection.tasks
+            if task.task_resource_class_digest is not None
+        }
+        if set(self._budget_runtime.task_resource_meter_by_class_digest) != selected_task_classes:
+            raise ValueError(
+                "paired task resource meters differ from opened E2B qualification classes"
+            )
+        runner_spec = self._protocol.execution_plan.runner_spec
+        if isinstance(runner_spec, LocalPiRunnerSpec):
+            if self._budget_runtime.runner_resource_meter_id is not None:
+                raise ValueError("local Pi runner cannot carry an E2B resource meter")
+        else:
+            self._budget_runtime.runner_resource_account_for(
+                runner_spec=runner_spec,
+                panel_member=self._protocol.design.panel_members[0],
+                arm=PairedArm.BASELINE,
+                run_id="paired-runner-meter-preflight",
+            )
 
     async def run(
         self,
@@ -1204,16 +1604,15 @@ class PairedHarborRunner:
             confirmation=self._protocol.confirmation,
             baseline=baseline,
             candidate=candidate,
-            job_spec=self._job_spec,
+            execution_plan=self._protocol.execution_plan,
             panel_routes=self._protocol.panel_routes,
-            qualified_tasks=self._protocol.qualified_tasks,
-            reward_key=self._protocol.job_template.reward_key,
-            runner_image=self._protocol.runner_image,
-            turn_timeout_s=self._protocol.turn_timeout_s,
+            qualification_roster=self._protocol.qualification_roster,
+            opened_selection=self._protocol.opened_selection,
             max_concurrent_blocks=self._protocol.max_concurrent_blocks,
             retry_policy_digest=self._protocol.retry_policy_digest,
             budget_policy_digest=self._protocol.budget_policy_digest,
             budget_ledger_identity=self._protocol.budget_ledger_identity,
+            budget_binding_digest=self._protocol.budget_binding_digest,
         )
         if reconstructed != self._protocol:
             raise ValueError("runtime inputs do not reconstruct the frozen paired Harbor protocol")
@@ -1260,7 +1659,9 @@ class PairedHarborRunner:
             None for _ in self._protocol.design.blocks
         ]
         failures: list[tuple[PairedBlock, BaseException]] = []
-        evaluator_session = HarborEvaluatorSession(runner_image=self._protocol.runner_image)
+        evaluator_session = HarborEvaluatorSession(
+            runner_spec=self._protocol.execution_plan.runner_spec
+        )
 
         async def worker() -> None:
             while True:
@@ -1379,19 +1780,43 @@ class PairedHarborRunner:
             block=block,
             arm=arm,
         )
-        spec = self._single_task_spec(task_id=block.task_id, job_name=job_name)
+        plan = self._protocol.execution_plan
+        spec = self._runtime.single_task_spec(
+            plan=plan,
+            qualification=qualification,
+            job_name=job_name,
+        )
+        provider_account = self._budget_runtime.provider_account_for(
+            panel_member=block.panel_member,
+            arm=arm,
+            run_id=job_name,
+        )
+        task_resource_accounts = self._budget_runtime.task_resource_accounts_for(
+            qualification=qualification,
+            panel_member=block.panel_member,
+            arm=arm,
+            run_id=job_name,
+        )
+        self._require_prequalified_task_build(
+            qualification=qualification,
+            task_resource_accounts=task_resource_accounts,
+        )
+        runner_resource_account = self._budget_runtime.runner_resource_account_for(
+            runner_spec=plan.runner_spec,
+            panel_member=block.panel_member,
+            arm=arm,
+            run_id=job_name,
+        )
         evaluator = HarborEvaluator(
             spec,
             route.provider_config.model_copy(deep=True),
-            runner_image=self._protocol.runner_image,
-            turn_timeout_s=self._protocol.turn_timeout_s,
+            runner_spec=plan.runner_spec,
+            turn_timeout_s=plan.turn_timeout_s,
             require_provider_receipts=True,
             session=evaluator_session,
-            budget_account=self._budget_runtime.account_for(
-                panel_member=block.panel_member,
-                arm=arm,
-                run_id=job_name,
-            ),
+            budget_account=provider_account,
+            task_resource_budget_accounts=task_resource_accounts,
+            runner_resource_budget_account=runner_resource_account,
         )
         loaded = await evaluator.evaluate(harness)
         validate_harbor_run_identity(
@@ -1399,8 +1824,8 @@ class PairedHarborRunner:
             candidate=harness,
             spec=spec,
             provider_config=route.provider_config,
-            runner_image=self._protocol.runner_image,
-            turn_timeout_s=self._protocol.turn_timeout_s,
+            runner_spec=plan.runner_spec,
+            turn_timeout_s=plan.turn_timeout_s,
             require_exact_run_config=True,
             budget_policy_digest=self._protocol.budget_policy_digest,
         )
@@ -1410,9 +1835,9 @@ class PairedHarborRunner:
             task_keys=(qualification.task_key,),
             task_environment_digests=(qualification.task_environment_digest,),
             attempts=1,
-            reward_key=self._protocol.job_template.reward_key,
+            reward_key=plan.reward_key,
             provider_config=route.provider_config,
-            compute_envelope=self._protocol.compute_envelope,
+            compute_envelope=plan.compute_envelope,
         )[block.task_id]
         if len(admitted) != 1:
             raise RuntimeError("single-cell paired Harbor job admitted an unexpected matrix")
@@ -1421,6 +1846,11 @@ class PairedHarborRunner:
             raise ValueError(
                 f"Harbor task {block.task_id!r} content differs from frozen qualification"
             )
+        _validate_backend_trial_evidence(
+            item.trial,
+            plan=plan,
+            qualification=qualification,
+        )
         run_identity = PairedHarborRunIdentity.model_validate(loaded.result.identity.model_dump())
         provider_receipts = item.provider_receipt_trace.receipts
         provider_receipt_call_indexes = item.provider_receipt_trace.call_indexes
@@ -1428,8 +1858,8 @@ class PairedHarborRunner:
             _validate_provider_receipt_for_route(
                 receipt,
                 route=route,
-                max_output_tokens=self._protocol.compute_envelope.max_output_tokens,
-                temperature=self._protocol.compute_envelope.temperature,
+                max_output_tokens=plan.compute_envelope.max_output_tokens,
+                temperature=plan.compute_envelope.temperature,
             )
         draft = PairedHarborArmEvidence.model_construct(
             arm=arm,
@@ -1463,30 +1893,37 @@ class PairedHarborRunner:
             admission_digest=admission_digest,
         )
 
-    def _single_task_spec(self, *, task_id: str, job_name: str) -> HarborJobSpec:
-        selected: list[DatasetConfig] = []
-        for dataset in self._job_spec.datasets:
-            if dataset.task_names is not None and task_id in dataset.task_names:
-                selected.append(
-                    dataset.model_copy(
-                        update={"task_names": [task_id]},
-                        deep=True,
-                    )
-                )
-        if len(selected) != 1:
-            raise ValueError(
-                f"paired Harbor task {task_id!r} must belong to exactly one dataset source"
-            )
-        return self._job_spec.model_copy(
-            update={
-                "job_name": job_name,
-                "datasets": selected,
-                "n_attempts": 1,
-                "n_concurrent_trials": 1,
-                "agent_n_concurrent": 1,
-            },
-            deep=True,
+    def _require_prequalified_task_build(
+        self,
+        *,
+        qualification: QualifiedHarborTask,
+        task_resource_accounts: tuple[TimedResourceBudgetAccount, ...],
+    ) -> None:
+        """Load the exact qualified E2B record before any scored evaluator dispatch."""
+        if qualification.environment_backend is HarborEnvironmentBackend.LOCAL:
+            if task_resource_accounts:
+                raise ValueError("local task unexpectedly received an E2B resource account")
+            return
+        identity = qualification.e2b_build_identity
+        if identity is None or len(task_resource_accounts) != 1:
+            raise ValueError("E2B task lacks one exact prequalified build account")
+        record = require_exact_e2b_build_record(
+            jobs_dir=self._runtime.jobs_dir,
+            environment_id=identity.environment_id,
+            build_context_digest=identity.build_context_digest,
+            docker_image=identity.docker_image,
+            cpu_count=identity.cpu_count,
+            memory_mb=identity.memory_mb,
+            expected_budget_authority=task_resource_accounts[0],
+            allow_preexisting_outside_study=False,
         )
+        if (
+            record.build_config_digest != identity.build_config_digest
+            or record.digest != identity.build_record_digest
+            or record.template_id != identity.template_id
+            or record.build_id != identity.build_id
+        ):
+            raise ValueError("scored E2B task build differs from full-roster qualification")
 
     def _begin_pair_generation(self, block: PairedBlock) -> PairedHarborPairGenerationState:
         state = self._inspect_pair_generation(block, create=True)
@@ -1502,7 +1939,7 @@ class PairedHarborRunner:
     ) -> PairedHarborPairGenerationState | None:
         path = self._pair_state_path(block)
         names = self._arm_job_names(block)
-        job_paths = tuple(self._job_spec.jobs_dir / name for name in names.values())
+        job_paths = tuple(self._runtime.jobs_dir / name for name in names.values())
         job_exists = tuple(os.path.lexists(path) for path in job_paths)
         if not os.path.lexists(path):
             if any(job_exists):
@@ -1557,7 +1994,7 @@ class PairedHarborRunner:
     ) -> None:
         admissions = {item.arm: item.admission_digest for item in (evidence.first, evidence.second)}
         for job_name in self._arm_job_names(evidence.block).values():
-            _require_completed_arm_job(self._job_spec.jobs_dir / job_name)
+            _require_completed_arm_job(self._runtime.jobs_dir / job_name)
         completed = self._pair_state(
             evidence.block,
             status="complete",
@@ -1636,7 +2073,7 @@ class PairedHarborRunner:
             generation_id=self._generation_id,
             block=block,
         ).removeprefix("sha256:")
-        return self._job_spec.jobs_dir / ".wmh-paired-state" / f"{pair_id}.json"
+        return self._runtime.jobs_dir / ".wmh-paired-state" / f"{pair_id}.json"
 
     def _reject_partial_pair_reuse(self) -> None:
         for block in self._protocol.design.blocks:
@@ -1875,6 +2312,63 @@ def _task_execution_identity(trial: BenchmarkTrialResult) -> tuple[object, ...]:
         trial.task_instruction,
         trial.task_environment_digest,
     )
+
+
+def _validate_backend_trial_evidence(
+    trial: BenchmarkTrialResult,
+    *,
+    plan: HarborExecutionPlan,
+    qualification: QualifiedHarborTask,
+) -> None:
+    """Bind E2B build evidence and the exact local or E2B runner attestation."""
+    if plan.environment_backend is HarborEnvironmentBackend.E2B:
+        attestation = trial.task_environment_attestation
+        if (
+            not isinstance(attestation, dict)
+            or attestation.get("backend") != "e2b"
+            or attestation.get("build_config_digest") != qualification.e2b_build_config_digest
+            or attestation.get("build_record_digest") != qualification.e2b_build_record_digest
+        ):
+            raise ValueError("paired Harbor E2B task build differs from full-roster qualification")
+    runner_attestation = trial.runner_environment_attestation
+    if isinstance(plan.runner_spec, E2BPiRunnerSpec):
+        if runner_attestation != plan.runner_spec.attestation.evidence:
+            raise ValueError("paired Harbor E2B runner attestation differs from execution plan")
+    elif (
+        runner_attestation is not None
+        and runner_attestation != plan.runner_spec.attestation.evidence
+    ):
+        raise ValueError("paired Harbor local runner attestation differs from execution plan")
+
+
+def _external_resource_ids(
+    trial: BenchmarkTrialResult,
+    *,
+    plan: HarborExecutionPlan,
+) -> tuple[str, ...]:
+    """Return terminal E2B resource IDs, requiring one fresh resource per arm job."""
+    receipts: list[JsonValue] = []
+    if plan.environment_backend is HarborEnvironmentBackend.E2B:
+        if trial.task_environment_lease_receipt is None:
+            raise ValueError("paired Harbor E2B task lacks terminal cleanup evidence")
+        receipts.append(trial.task_environment_lease_receipt)
+    if isinstance(plan.runner_spec, E2BPiRunnerSpec):
+        if not trial.runner_lease_receipts:
+            raise ValueError("paired Harbor E2B runner lacks terminal cleanup evidence")
+        receipts.extend(trial.runner_lease_receipts)
+    resource_ids: list[str] = []
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("backend") != "e2b"
+            or receipt.get("state") != "retired"
+            or not isinstance(receipt.get("resource_id"), str)
+        ):
+            raise ValueError("paired Harbor E2B resource cleanup evidence is not terminal")
+        resource_ids.append(receipt["resource_id"])
+    if len(resource_ids) != len(set(resource_ids)):
+        raise ValueError("paired Harbor arm reuses one E2B resource for multiple roles")
+    return tuple(resource_ids)
 
 
 def _other_arm(arm: PairedArm) -> PairedArm:

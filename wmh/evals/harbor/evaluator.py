@@ -713,7 +713,7 @@ def _preflight_exact_e2b_builds(
     config: JobConfig,
     resource_accounts: tuple[TimedResourceBudgetAccount, ...],
 ) -> None:
-    """Require every immutable task build before Harbor can publish the job directory."""
+    """Require every selected immutable task build before Harbor publishes the job directory."""
     if config.environment.type is not EnvironmentType.E2B:
         return
     admitted_account_ids: set[int] = set()
@@ -723,10 +723,15 @@ def _preflight_exact_e2b_builds(
                 "exact E2B build preflight requires preflightable local dataset paths"
             )
         root = dataset.path.expanduser()
+        selected_names = None if dataset.task_names is None else set(dataset.task_names)
+        found_names: set[str] = set()
         for task_dir in sorted(root.iterdir(), key=lambda path: path.name):
             config_path = task_dir / "task.toml"
             if not task_dir.is_dir() or not config_path.is_file():
                 continue
+            if selected_names is not None and task_dir.name not in selected_names:
+                continue
+            found_names.add(task_dir.name)
             task_config = TaskConfig.model_validate_toml(config_path.read_text(encoding="utf-8"))
             try:
                 validate_exact_e2b_task_resource_requests(task_config.environment)
@@ -789,6 +794,11 @@ def _preflight_exact_e2b_builds(
                 allow_preexisting_outside_study=bool(
                     config.environment.kwargs.get("allow_preexisting_e2b_builds", False)
                 ),
+            )
+        if selected_names is not None and found_names != selected_names:
+            missing = sorted(selected_names - found_names)
+            raise UnsupportedHarborTaskError(
+                f"exact E2B build preflight could not find selected task(s): {missing}"
             )
     if admitted_account_ids != set(range(len(resource_accounts))):
         raise ValueError("E2B task resource accounts must exactly cover the frozen task classes")

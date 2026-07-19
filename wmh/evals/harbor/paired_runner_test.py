@@ -31,6 +31,7 @@ from wmh.evals.benchmark import (
     BenchmarkUsage,
 )
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.e2b_environment import ExactE2BBuildSpec, ExactE2BEnvironment
 from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.evals.paired import (
@@ -42,15 +43,19 @@ from wmh.evals.paired import (
 )
 from wmh.evals.partition import ConfirmationPartition, PartitionTask
 from wmh.harness.doc import HarnessDoc, Surface
-from wmh.harness.pi_local import PI_CONTAINER_IMAGE
 from wmh.harness.pi_runner import pi_node_baseline
-from wmh.harness.pi_runner_backend import LocalPiRunnerSpec
+from wmh.harness.pi_runner_backend import (
+    E2BPiRunnerSpec,
+    LocalPiRunnerSpec,
+    e2b_runner_resource_class,
+)
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     ProviderCostMeter,
     SpendLedger,
+    TimedResourceCostMeter,
     TokenPriceCeiling,
     bootstrap_budget_ledger,
 )
@@ -210,12 +215,139 @@ def _qualifications() -> tuple[mod.QualifiedHarborTask, ...]:
     return tuple(
         mod.QualifiedHarborTask(
             task_id=task_id,
+            dataset_id="terminalbench2",
             content_digest=_CONTENT_DIGESTS[task_id],
             task_key=_TASK_KEYS[task_id],
             task_environment_digest=_ENVIRONMENT_DIGESTS[task_id],
+            environment_backend=HarborEnvironmentBackend.LOCAL,
         )
         for task_id in _TASK_IDS
     )
+
+
+def test_execution_plan_is_task_and_host_path_independent() -> None:
+    """The frozen execution contract contains no selected task or host coordinate."""
+    baseline = pi_node_baseline("baseline")
+
+    plan = mod.HarborExecutionPlan.freeze(
+        reference_harness=baseline,
+        reward_key="reward",
+        artifact_paths=("agent/log.txt",),
+    )
+
+    assert plan.environment_backend is HarborEnvironmentBackend.LOCAL
+    assert isinstance(plan.runner_spec, LocalPiRunnerSpec)
+    assert plan.reward_key == "reward"
+    assert plan.artifact_paths == ("agent/log.txt",)
+    assert "task" not in plan.model_dump(mode="json")
+    assert "jobs_dir" not in plan.model_dump(mode="json")
+
+
+def test_confirmation_selection_is_a_deterministic_projection_of_full_roster() -> None:
+    """Opening can select qualified entries but cannot supply a free-form task spec."""
+    candidate = _candidate()
+    plan = mod.HarborExecutionPlan.freeze(
+        reference_harness=pi_node_baseline("baseline"),
+        reward_key="reward",
+    )
+    roster = mod.PrequalifiedHarborRoster(
+        execution_plan_digest=plan.digest,
+        tasks=_qualifications()
+        + (
+            mod.QualifiedHarborTask(
+                task_id="task-unopened",
+                dataset_id="terminalbench2",
+                content_digest="sha256:" + "1" * 64,
+                task_key="sha256:" + "2" * 64,
+                task_environment_digest="sha256:" + "3" * 64,
+                environment_backend=HarborEnvironmentBackend.LOCAL,
+            ),
+        ),
+    )
+
+    selected = mod.OpenedHarborExecutionSelection.project(
+        execution_plan=plan,
+        roster=roster,
+        confirmation=_confirmation(candidate),
+        design=_design(),
+    )
+
+    assert tuple(task.task_id for task in selected.tasks) == _TASK_IDS
+    assert selected.roster_digest == roster.digest
+    assert "task-unopened" not in selected.task_ids
+    assert selected == mod.OpenedHarborExecutionSelection.project(
+        execution_plan=plan,
+        roster=roster,
+        confirmation=_confirmation(candidate),
+        design=_design(),
+    )
+
+    changed_confirmation = _confirmation(candidate).model_copy(
+        update={
+            "tasks": (
+                _confirmation(candidate)
+                .tasks[0]
+                .model_copy(update={"content_digest": "sha256:" + "9" * 64}),
+                _confirmation(candidate).tasks[1],
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="qualification content"):
+        mod.OpenedHarborExecutionSelection.project(
+            execution_plan=plan,
+            roster=roster,
+            confirmation=changed_confirmation,
+            design=_design(),
+        )
+
+
+def test_projection_rejects_backend_drift_anywhere_in_full_roster() -> None:
+    """Unopened roster entries must still be qualified under the pre-search plan."""
+    candidate = _candidate()
+    plan = mod.HarborExecutionPlan.freeze(
+        reference_harness=pi_node_baseline("baseline"),
+        reward_key="reward",
+        environment_backend=HarborEnvironmentBackend.E2B,
+    )
+    task_class = ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024)
+    build = _e2b_build_identity()
+    roster = mod.PrequalifiedHarborRoster(
+        execution_plan_digest=plan.digest,
+        tasks=tuple(
+            mod.QualifiedHarborTask(
+                task_id=task_id,
+                dataset_id="terminalbench2",
+                content_digest=_CONTENT_DIGESTS[task_id],
+                task_key=_TASK_KEYS[task_id],
+                task_environment_digest=_ENVIRONMENT_DIGESTS[task_id],
+                environment_backend=HarborEnvironmentBackend.E2B,
+                e2b_build_config_digest=build.build_config_digest,
+                e2b_build_record_digest=build.build_record_digest,
+                task_resource_class_digest=task_class.digest,
+                e2b_build_identity=build,
+                task_resource_class=task_class,
+            )
+            for task_id in _TASK_IDS
+        )
+        + (
+            mod.QualifiedHarborTask(
+                task_id="task-unopened",
+                dataset_id="terminalbench2",
+                content_digest="sha256:" + "4" * 64,
+                task_key="sha256:" + "5" * 64,
+                task_environment_digest="sha256:" + "6" * 64,
+                environment_backend=HarborEnvironmentBackend.LOCAL,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="full roster.*backend"):
+        mod.OpenedHarborExecutionSelection.project(
+            execution_plan=plan,
+            roster=roster,
+            confirmation=_confirmation(candidate),
+            design=_design(),
+        )
 
 
 def _budget_runtime(
@@ -250,7 +382,166 @@ def _budget_runtime(
         ledger_identity=ledger_identity,
         policy=policy,
         phase="confirmation",
-        meter_by_panel_member=meter_by_member,
+        provider_meter_by_panel_member=meter_by_member,
+    )
+
+
+def _e2b_runner_spec() -> E2BPiRunnerSpec:
+    return E2BPiRunnerSpec(
+        template_id="runner-template",
+        build_id="runner-build",
+        cpu_count=2,
+        memory_mb=1024,
+        platform="linux/x86_64",
+        envd_version="v1",
+        lease_timeout_s=360,
+    )
+
+
+def _e2b_build_identity() -> mod.QualifiedE2BBuildIdentity:
+    spec = ExactE2BBuildSpec(
+        environment_id="qualified-environment",
+        build_context_digest="sha256:" + "6" * 64,
+        docker_image="registry.example/task@sha256:" + "9" * 64,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    return mod.QualifiedE2BBuildIdentity(
+        build_config_digest=spec.digest,
+        build_record_digest="sha256:" + "8" * 64,
+        environment_id=spec.environment_id,
+        build_context_digest=spec.build_context_digest,
+        docker_image=spec.docker_image,
+        cpu_count=spec.cpu_count,
+        memory_mb=spec.memory_mb,
+        template_id="task-template",
+        build_id="task-build",
+    )
+
+
+def _e2b_qualifications() -> tuple[mod.QualifiedHarborTask, ...]:
+    task_class = ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024)
+    build = _e2b_build_identity()
+    return tuple(
+        mod.QualifiedHarborTask(
+            task_id=task_id,
+            dataset_id="terminalbench2",
+            content_digest=_CONTENT_DIGESTS[task_id],
+            task_key=_TASK_KEYS[task_id],
+            task_environment_digest=_ENVIRONMENT_DIGESTS[task_id],
+            environment_backend=HarborEnvironmentBackend.E2B,
+            e2b_build_config_digest=build.build_config_digest,
+            e2b_build_record_digest=build.build_record_digest,
+            task_resource_class_digest=task_class.digest,
+            e2b_build_identity=build,
+            task_resource_class=task_class,
+        )
+        for task_id in _TASK_IDS
+    )
+
+
+def _e2b_budget_runtime(
+    tmp_path: Path,
+    routes: tuple[mod.PairedHarborPanelRoute, ...],
+    runner_spec: E2BPiRunnerSpec,
+) -> mod.PairedHarborBudgetRuntime:
+    task_class = ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024)
+    runner_class = e2b_runner_resource_class(runner_spec)
+    provider_meters = {route.panel_member: f"worker-{route.panel_member}" for route in routes}
+    policy = BudgetPolicy(
+        study_id="paired-e2b-test",
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
+        hard_limit_nano_usd=1_000_000_000,
+        phase_limits_nano_usd={"confirmation": 1_000_000_000},
+        meters={
+            **{
+                provider_meters[route.panel_member]: ProviderCostMeter(
+                    provider_config=route.provider_config,
+                    price=TokenPriceCeiling(
+                        input_nano_usd_per_token=1,
+                        output_nano_usd_per_token=5,
+                    ),
+                )
+                for route in routes
+            },
+            "task-e2b": TimedResourceCostMeter(
+                resource_type=task_class.role.value,
+                resource_class_digest=task_class.digest,
+                nano_usd_per_second=1,
+                max_billing_seconds=task_class.max_host_observation_seconds,
+            ),
+            "runner-e2b": TimedResourceCostMeter(
+                resource_type=runner_class.role.value,
+                resource_class_digest=runner_class.digest,
+                nano_usd_per_second=1,
+                max_billing_seconds=runner_class.max_host_observation_seconds,
+            ),
+        },
+    )
+    ledger_path = (tmp_path / "budget-e2b.sqlite3").resolve()
+    ledger_identity = bootstrap_budget_ledger(ledger_path, policy).ledger_identity
+    return mod.PairedHarborBudgetRuntime(
+        ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
+        policy=policy,
+        phase="confirmation",
+        provider_meter_by_panel_member=provider_meters,
+        task_resource_meter_by_class_digest={task_class.digest: "task-e2b"},
+        runner_resource_meter_id="runner-e2b",
+    )
+
+
+def _e2b_runner(tmp_path: Path, candidate: HarnessDoc) -> mod.PairedHarborRunner:
+    baseline = pi_node_baseline("baseline")
+    routes = (
+        mod.PairedHarborPanelRoute(
+            panel_member="worker",
+            provider_config=_provider(),
+            max_concurrent_blocks=1,
+        ),
+    )
+    runner_spec = _e2b_runner_spec()
+    plan = mod.HarborExecutionPlan.freeze(
+        reference_harness=baseline,
+        reward_key="reward",
+        environment_backend=HarborEnvironmentBackend.E2B,
+        runner_spec=runner_spec,
+    )
+    roster = mod.PrequalifiedHarborRoster(
+        execution_plan_digest=plan.digest,
+        tasks=_e2b_qualifications(),
+    )
+    selection = mod.OpenedHarborExecutionSelection.project(
+        execution_plan=plan,
+        roster=roster,
+        confirmation=_confirmation(candidate),
+        design=_design(),
+    )
+    budget = _e2b_budget_runtime(tmp_path, routes, runner_spec)
+    protocol = mod.PairedHarborProtocol.freeze(
+        design=_design(),
+        confirmation=_confirmation(candidate),
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=plan,
+        panel_routes=routes,
+        qualification_roster=roster,
+        opened_selection=selection,
+        max_concurrent_blocks=1,
+        retry_policy_digest=_RETRY_POLICY_DIGEST,
+        budget_policy_digest=budget.policy.policy_digest,
+        budget_ledger_identity=budget.ledger_identity,
+        budget_binding_digest=budget.binding_digest,
+    )
+    return mod.PairedHarborRunner(
+        protocol=protocol,
+        runtime=mod.HarborExecutionRuntime(
+            jobs_dir=(tmp_path / "jobs").resolve(),
+            dataset_paths_by_id={"terminalbench2": (tmp_path / "dataset").resolve()},
+            budget=budget,
+        ),
+        operation_id="e2b-wiring",
+        generation_id=1,
     )
 
 
@@ -266,37 +557,72 @@ def _runner(
     **updates: object,
 ) -> mod.PairedHarborRunner:
     baseline = baseline or pi_node_baseline("baseline")
-    routes = (
+    default_routes = (
         mod.PairedHarborPanelRoute(
             panel_member="worker",
             provider_config=_provider(),
             max_concurrent_blocks=2,
         ),
     )
-    protocol_values: dict[str, object] = {
-        "design": _design(),
-        "confirmation": _confirmation(candidate),
-        "baseline": baseline,
-        "candidate": candidate,
-        "job_spec": _spec(tmp_path),
-        "panel_routes": routes,
-        "qualified_tasks": _qualifications(),
-        "reward_key": "reward",
-        "max_concurrent_blocks": 4,
-        "retry_policy_digest": _RETRY_POLICY_DIGEST,
-    }
-    protocol_values.update(updates)
-    frozen_routes = cast("tuple[mod.PairedHarborPanelRoute, ...]", protocol_values["panel_routes"])
-    budget_runtime = _budget_runtime(tmp_path, frozen_routes)
-    protocol_values.setdefault("budget_policy_digest", budget_runtime.policy.policy_digest)
-    protocol_values.setdefault("budget_ledger_identity", budget_runtime.ledger_identity)
-    protocol = mod.PairedHarborProtocol.freeze(**cast("Any", protocol_values))
+    design = cast("PairedEvaluationDesign", updates.pop("design", _design()))
+    confirmation = cast(
+        "ConfirmationPartition",
+        updates.pop("confirmation", _confirmation(candidate)),
+    )
+    job_spec = cast("HarborJobSpec", updates.pop("job_spec", _spec(tmp_path)))
+    routes = cast(
+        "tuple[mod.PairedHarborPanelRoute, ...]",
+        updates.pop("panel_routes", default_routes),
+    )
+    qualifications = cast(
+        "tuple[mod.QualifiedHarborTask, ...]",
+        updates.pop("qualified_tasks", _qualifications()),
+    )
+    max_concurrent_blocks = cast("int", updates.pop("max_concurrent_blocks", 4))
+    if updates:
+        raise AssertionError(f"unsupported paired test helper updates: {sorted(updates)}")
+    plan = mod.HarborExecutionPlan.freeze(
+        reference_harness=baseline,
+        reward_key="reward",
+        artifact_paths=tuple(job_spec.artifact_paths),
+        environment_backend=job_spec.environment_backend,
+    )
+    roster = mod.PrequalifiedHarborRoster(
+        execution_plan_digest=plan.digest,
+        tasks=tuple(sorted(qualifications, key=lambda item: item.task_id)),
+    )
+    selection = mod.OpenedHarborExecutionSelection.project(
+        execution_plan=plan,
+        roster=roster,
+        confirmation=confirmation,
+        design=design,
+    )
+    budget_runtime = _budget_runtime(tmp_path, routes)
+    protocol = mod.PairedHarborProtocol.freeze(
+        design=design,
+        confirmation=confirmation,
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=plan,
+        panel_routes=routes,
+        qualification_roster=roster,
+        opened_selection=selection,
+        max_concurrent_blocks=max_concurrent_blocks,
+        retry_policy_digest=_RETRY_POLICY_DIGEST,
+        budget_policy_digest=budget_runtime.policy.policy_digest,
+        budget_ledger_identity=budget_runtime.ledger_identity,
+        budget_binding_digest=budget_runtime.binding_digest,
+    )
+    runtime = mod.HarborExecutionRuntime(
+        jobs_dir=job_spec.jobs_dir.resolve(),
+        dataset_paths_by_id={"terminalbench2": cast("Path", job_spec.datasets[0].path).resolve()},
+        budget=budget_runtime,
+    )
     return mod.PairedHarborRunner(
         protocol=protocol,
-        job_spec=protocol_values["job_spec"],  # type: ignore[arg-type]
+        runtime=runtime,
         operation_id=operation_id,
         generation_id=generation_id,
-        budget_runtime=budget_runtime,
         multi_host=multi_host,
         durable_coordinator=durable_coordinator,
     )
@@ -372,7 +698,7 @@ def _loaded_result(
         candidate=harness,
         spec=spec,
         provider_config=provider,
-        runner_image=PI_CONTAINER_IMAGE,
+        runner_spec=LocalPiRunnerSpec(),
         turn_timeout_s=300.0,
         budget_policy_digest=budget_policy_digest,
     ).identity
@@ -414,16 +740,20 @@ def _install_fake_evaluator(
             spec: HarborJobSpec,
             provider_config: ProviderConfig,
             *,
-            runner_image: str,
+            runner_spec: object,
             turn_timeout_s: float,
             require_provider_receipts: bool,
             session: object,
             budget_account: BudgetAccount,
+            task_resource_budget_accounts: tuple[object, ...],
+            runner_resource_budget_account: object | None,
         ) -> None:
-            assert runner_image == PI_CONTAINER_IMAGE
+            assert isinstance(runner_spec, LocalPiRunnerSpec)
             assert turn_timeout_s == 300.0
             assert require_provider_receipts is True
             assert isinstance(session, mod.HarborEvaluatorSession)
+            assert task_resource_budget_accounts == ()
+            assert runner_resource_budget_account is None
             self._spec = spec
             self._provider = provider_config
             self._budget_policy_digest = budget_account.policy.policy_digest
@@ -702,7 +1032,8 @@ def test_protocol_digest_binds_budget_authority_and_nonsecret_execution_inputs(
     first = _runner(tmp_path / "host-a", candidate, baseline=baseline)._protocol
     second = _runner(tmp_path / "host-b", candidate, baseline=baseline)._protocol
 
-    assert first.job_template == second.job_template
+    assert first.execution_plan == second.execution_plan
+    assert first.qualification_roster == second.qualification_roster
     assert first.budget_policy_digest != second.budget_policy_digest
     assert first.budget_ledger_identity != second.budget_ledger_identity
     assert first.digest != second.digest
@@ -713,14 +1044,15 @@ def test_protocol_digest_binds_budget_authority_and_nonsecret_execution_inputs(
         confirmation=_confirmation(candidate),
         baseline=baseline,
         candidate=candidate,
-        job_spec=_spec(tmp_path / "host-c"),
+        execution_plan=first.execution_plan,
         panel_routes=(changed_route,),
-        qualified_tasks=_qualifications(),
-        reward_key="reward",
+        qualification_roster=first.qualification_roster,
+        opened_selection=first.opened_selection,
         max_concurrent_blocks=4,
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_policy_digest=_BUDGET_POLICY_DIGEST,
         budget_ledger_identity=first.budget_ledger_identity,
+        budget_binding_digest=first.budget_binding_digest,
     )
     assert changed.digest != first.digest
 
@@ -762,18 +1094,129 @@ def test_runner_rejects_protocol_ledger_fork_before_evaluator_construction(
     with pytest.raises(ValueError, match="frozen ledger identity"):
         mod.PairedHarborRunner(
             protocol=forked,
-            job_spec=runner._job_spec,
+            runtime=runner._runtime,
             operation_id="forked-ledger",
             generation_id=1,
-            budget_runtime=runner._budget_runtime,
         )
 
 
-def test_rejects_scored_e2b_even_when_job_shape_is_otherwise_exact(tmp_path: Path) -> None:
+def test_e2b_execution_requires_prequalified_e2b_tasks(tmp_path: Path) -> None:
     candidate = _candidate()
     e2b = _spec(tmp_path).model_copy(update={"environment_backend": HarborEnvironmentBackend.E2B})
-    with pytest.raises(ValueError, match="scored paired E2B is unsupported"):
+    with pytest.raises(ValueError, match="full roster backend differs"):
         _runner(tmp_path, candidate, job_spec=e2b)
+
+
+def test_runtime_host_paths_do_not_change_frozen_protocol(tmp_path: Path) -> None:
+    candidate = _candidate()
+    first = _runner(tmp_path, candidate)
+    alternate_runtime = first._runtime.model_copy(
+        update={
+            "jobs_dir": (tmp_path / "alternate-jobs").resolve(),
+            "dataset_paths_by_id": {"terminalbench2": (tmp_path / "alternate-dataset").resolve()},
+        },
+        deep=True,
+    )
+
+    second = mod.PairedHarborRunner(
+        protocol=first._protocol,
+        runtime=alternate_runtime,
+        operation_id="alternate-host-paths",
+        generation_id=1,
+    )
+
+    assert second._protocol == first._protocol
+    assert second._protocol.digest == first._protocol.digest
+    assert second._runtime.jobs_dir != first._runtime.jobs_dir
+
+
+def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _candidate()
+    observed: list[dict[str, object]] = []
+    build_calls = 0
+    record_loads = 0
+
+    async def unexpected_build(**_kwargs: object) -> None:
+        nonlocal build_calls
+        build_calls += 1
+        raise AssertionError("scored paired execution dispatched an E2B build")
+
+    def load_prequalified_record(**_kwargs: object) -> object:
+        nonlocal record_loads
+        record_loads += 1
+        identity = _e2b_build_identity()
+
+        class Record:
+            build_config_digest = identity.build_config_digest
+            template_id = identity.template_id
+            build_id = identity.build_id
+            digest = identity.build_record_digest
+
+        return Record()
+
+    class WiringEvaluator:
+        def __init__(
+            self,
+            spec: HarborJobSpec,
+            provider_config: ProviderConfig,
+            **kwargs: object,
+        ) -> None:
+            observed.append({"spec": spec, "provider": provider_config, **kwargs})
+
+        async def evaluate(self, _harness: HarnessDoc) -> LoadedHarborJobResult:
+            raise RuntimeError("stop after wiring inspection")
+
+    monkeypatch.setattr(
+        "wmh.evals.harbor.e2b_environment.prepare_exact_e2b_build",
+        unexpected_build,
+    )
+    monkeypatch.setattr(mod, "HarborEvaluator", WiringEvaluator)
+    monkeypatch.setattr(mod, "require_exact_e2b_build_record", load_prequalified_record)
+    runner = _e2b_runner(tmp_path, candidate)
+
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(
+            runner.run(
+                baseline=pi_node_baseline("baseline"),
+                candidate=candidate,
+            )
+        )
+
+    assert build_calls == 0
+    assert record_loads == 1
+    assert len(observed) == 1
+    wiring = observed[0]
+    spec = cast("HarborJobSpec", wiring["spec"])
+    provider_account = cast("BudgetAccount", wiring["budget_account"])
+    task_accounts = cast(
+        "tuple[object, ...]",
+        wiring["task_resource_budget_accounts"],
+    )
+    runner_account = wiring["runner_resource_budget_account"]
+    assert spec.environment_backend is HarborEnvironmentBackend.E2B
+    assert spec.allow_preexisting_e2b_builds is False
+    assert isinstance(wiring["runner_spec"], E2BPiRunnerSpec)
+    assert len(task_accounts) == 1
+    assert runner_account is not None
+    accounts = (provider_account, task_accounts[0], runner_account)
+    assert len({cast("Any", account).ledger_path for account in accounts}) == 1
+    assert len({cast("Any", account).ledger_identity for account in accounts}) == 1
+    assert len({cast("Any", account).policy.policy_digest for account in accounts}) == 1
+    assert len({cast("Any", account).scope.run_id for account in accounts}) == 1
+    assert len({cast("Any", account).scope.lane for account in accounts}) == 1
+    assert len({cast("Any", account).scope.arm for account in accounts}) == 1
+
+
+def test_protocol_rejects_opened_e2b_build_drift_on_reload(tmp_path: Path) -> None:
+    protocol = _e2b_runner(tmp_path, _candidate())._protocol
+    payload = cast("dict[str, Any]", protocol.model_dump(mode="json"))
+    payload["opened_selection"]["tasks"][0]["e2b_build_record_digest"] = "sha256:" + "f" * 64
+
+    with pytest.raises(ValueError, match="qualification identities|opened selection"):
+        mod.PairedHarborProtocol.model_validate(payload)
 
 
 def test_provider_receipt_contract_distinguishes_bedrock_and_openai_evidence() -> None:
@@ -998,7 +1441,7 @@ def test_partial_existing_pair_is_rejected_before_any_provider_call(
         block=block,
         arm=PairedArm.BASELINE,
     )
-    (runner._job_spec.jobs_dir / one_arm).mkdir(parents=True)
+    (runner._runtime.jobs_dir / one_arm).mkdir(parents=True)
 
     with pytest.raises(
         mod.PartialPairedHarborReuseError,
@@ -1025,7 +1468,7 @@ def test_two_arm_directories_without_pair_state_are_rejected_before_provider_acc
             block=block,
             arm=arm,
         )
-        (runner._job_spec.jobs_dir / name).mkdir(parents=True)
+        (runner._runtime.jobs_dir / name).mkdir(parents=True)
 
     with pytest.raises(
         mod.PartialPairedHarborReuseError,
@@ -1083,7 +1526,7 @@ def test_failed_pair_with_both_arm_directories_requires_new_generation(
     failed_state = mod._read_pair_generation_state(first_generation._pair_state_path(first_block))
     assert failed_state.status == "failed"
     assert all(
-        (first_generation._job_spec.jobs_dir / name).exists()
+        (first_generation._runtime.jobs_dir / name).exists()
         for name in (
             failed_state.baseline_job_name,
             failed_state.candidate_job_name,
@@ -1117,7 +1560,7 @@ def test_complete_state_with_incomplete_arm_is_rejected_before_provider_access(
     _install_fake_evaluator(monkeypatch, candidate=candidate)
     runner = _runner(tmp_path, candidate, baseline=baseline)
     report = asyncio.run(runner.run(baseline=baseline, candidate=candidate))
-    incomplete_job = runner._job_spec.jobs_dir / report.evidence[0].second.job_name
+    incomplete_job = runner._runtime.jobs_dir / report.evidence[0].second.job_name
     (incomplete_job / "trial" / "result.json").unlink()
 
     replay_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
@@ -1565,20 +2008,13 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
             max_concurrent_blocks=1,
         ),
     )
-    budget_runtime = _budget_runtime(tmp_path, routes)
-    protocol = mod.PairedHarborProtocol.freeze(
-        design=design,
-        confirmation=_confirmation(candidate),
+    runner = _runner(
+        tmp_path,
+        candidate,
         baseline=baseline,
-        candidate=candidate,
-        job_spec=_spec(tmp_path),
+        design=design,
         panel_routes=routes,
-        qualified_tasks=_qualifications(),
-        reward_key="reward",
         max_concurrent_blocks=2,
-        retry_policy_digest=_RETRY_POLICY_DIGEST,
-        budget_policy_digest=budget_runtime.policy.policy_digest,
-        budget_ledger_identity=budget_runtime.ledger_identity,
     )
 
     active_global = 0
@@ -1631,15 +2067,7 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
                 active_tasks[task_id] -= 1
 
     monkeypatch.setattr(mod, "HarborEvaluator", FairEvaluator)
-    report = asyncio.run(
-        mod.PairedHarborRunner(
-            protocol=protocol,
-            job_spec=_spec(tmp_path),
-            operation_id="fair-operation",
-            generation_id=1,
-            budget_runtime=budget_runtime,
-        ).run(baseline=baseline, candidate=candidate)
-    )
+    report = asyncio.run(runner.run(baseline=baseline, candidate=candidate))
 
     assert len(report.evidence) == len(design.blocks)
     assert maximum_global == 2

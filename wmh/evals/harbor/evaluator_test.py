@@ -22,7 +22,7 @@ from harbor.models.job.result import JobResult, JobStats
 from harbor.models.metric.config import MetricConfig
 from harbor.models.metric.type import MetricType
 from harbor.models.registry import DatasetMetadata
-from harbor.models.trial.config import AgentConfig, TrialConfig
+from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TrialConfig
 from harbor.models.trial.result import AgentInfo, ExceptionInfo, ModelInfo, TrialResult
 from harbor.models.verifier.result import VerifierResult
 from harbor.utils.logger import logger as harbor_logger
@@ -464,6 +464,45 @@ def test_exact_e2b_rejects_unsupported_accelerators_before_build_lookup_or_job_c
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
     assert not (tmp_path / "jobs" / "evaluation").exists()
+
+
+def test_exact_e2b_preflight_checks_only_explicitly_selected_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "selected")
+    _write_task(dataset, "unselected")
+    config = JobConfig(
+        job_name="selected-only",
+        jobs_dir=tmp_path / "jobs",
+        datasets=[DatasetConfig(path=dataset, task_names=["selected"])],
+        environment=EnvironmentConfig(type=EnvironmentType.E2B),
+    )
+    account = _e2b_budget_kwargs(tmp_path, task_environment=True)["task_resource_budget_accounts"][
+        0
+    ]
+    observed: list[str] = []
+
+    def freeze_build(*, environment_dir: Path, **_kwargs: object) -> object:
+        task_name = environment_dir.parent.name
+
+        class BuildSpec:
+            environment_id = task_name
+            build_context_digest = "sha256:" + "a" * 64
+            docker_image = f"example.invalid/{task_name}:frozen"
+
+        return BuildSpec()
+
+    def require_build(*, environment_id: str, **_kwargs: object) -> None:
+        observed.append(environment_id)
+
+    monkeypatch.setattr(mod, "freeze_exact_e2b_build_spec", freeze_build)
+    monkeypatch.setattr(mod, "require_exact_e2b_build_record", require_build)
+
+    mod._preflight_exact_e2b_builds(config, (account,))
+
+    assert observed == ["selected"]
 
 
 def test_direct_executable_metric_is_rejected_without_constructing_harbor_job(
