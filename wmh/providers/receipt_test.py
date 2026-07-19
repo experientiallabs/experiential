@@ -174,6 +174,25 @@ def test_provider_cache_controls_are_detected_only_at_structural_wire_locations(
     assert openai.cache_config_supplied is True
 
 
+def test_bedrock_direct_tool_cache_point_is_detected() -> None:
+    receipt = build_chat_provider_receipt(
+        provider="bedrock",
+        provider_request_id="request-1",
+        response_id=None,
+        requested_model="model",
+        response_model=None,
+        system_fingerprint=None,
+        request_payload={"toolConfig": {"tools": [{"cachePoint": {"type": "default"}}]}},
+        temperature=0.7,
+        max_tokens=4_096,
+        max_tokens_field="inferenceConfig.maxTokens",
+        started_at_unix_s=10.0,
+        finished_at_unix_s=11.0,
+    )
+
+    assert receipt.cache_config_supplied is True
+
+
 def test_receipt_rejects_missing_request_identity_and_reversed_time() -> None:
     with pytest.raises(ValidationError, match="provider_request_id"):
         build_chat_provider_receipt(
@@ -204,4 +223,22 @@ def test_receipt_rejects_missing_request_identity_and_reversed_time() -> None:
             max_tokens_field="inferenceConfig.maxTokens",
             started_at_unix_s=11.0,
             finished_at_unix_s=10.0,
+        )
+
+
+def test_receipt_rejects_conflated_transport_and_response_identity() -> None:
+    with pytest.raises(ValidationError, match="distinct from the response id"):
+        build_chat_provider_receipt(
+            provider="openai",
+            provider_request_id="same-id",
+            response_id="same-id",
+            requested_model="model",
+            response_model="served-model",
+            system_fingerprint=None,
+            request_payload={},
+            temperature=None,
+            max_tokens=1,
+            max_tokens_field="max_completion_tokens",
+            started_at_unix_s=10.0,
+            finished_at_unix_s=11.0,
         )

@@ -34,10 +34,10 @@ class _FakeChatResponse:
     def __init__(self, content: str, usage: _FakeUsage) -> None:
         self.choices = [_FakeChoice(content)]
         self.usage = usage
-        self._request_id = "provider-request-openai-1"
         self.id = "completion-openai-1"
         self.model = "gpt-5.5-2026-06-01"
         self.system_fingerprint = "fp-openai-1"
+        self.extra_body: dict[str, object] = {}
 
     def model_dump(self, *, mode: str) -> dict[str, object]:
         assert mode == "json"
@@ -56,13 +56,41 @@ class _FakeChatResponse:
                 "prompt_tokens": self.usage.prompt_tokens,
                 "completion_tokens": self.usage.completion_tokens,
             },
+            **self.extra_body,
         }
 
 
-class _FakeChatCompletions:
-    def __init__(self, response: _FakeChatResponse) -> None:
+class _FakeRawAPIResponse:
+    def __init__(self, response: _FakeChatResponse, headers: dict[str, str]) -> None:
         self.response = response
+        self.headers = headers
+
+    def parse(self) -> _FakeChatResponse:
+        return self.response
+
+
+class _FakeWithRawResponse:
+    def __init__(self, completions: _FakeChatCompletions) -> None:
+        self.completions = completions
+
+    def create(self, **kwargs: object) -> _FakeRawAPIResponse:
+        self.completions.last_kwargs = kwargs
+        return _FakeRawAPIResponse(self.completions.response, self.completions.headers)
+
+
+class _FakeChatCompletions:
+    def __init__(
+        self,
+        response: _FakeChatResponse,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.response = response
+        self.headers = (
+            headers if headers is not None else {"x-request-id": "provider-request-openai-1"}
+        )
         self.last_kwargs: dict[str, object] = {}
+        self.with_raw_response = _FakeWithRawResponse(self)
 
     def create(self, **kwargs: object) -> _FakeChatResponse:
         self.last_kwargs = kwargs
@@ -294,8 +322,7 @@ def test_structured_chat_without_transport_request_id_remains_usable_without_rec
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_response = _FakeChatResponse("ok", _FakeUsage(1, 1))
-    del raw_response._request_id
-    chat = _FakeChatCompletions(raw_response)
+    chat = _FakeChatCompletions(raw_response, headers={})
     provider = OpenAIProvider(_config())
     monkeypatch.setattr(
         provider,
@@ -313,4 +340,44 @@ def test_structured_chat_without_transport_request_id_remains_usable_without_rec
     )
 
     assert response.choices[0].message.content == "ok"
+    assert response.provider_receipt is None
+
+
+def test_structured_chat_ignores_provider_receipt_from_untrusted_response_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_response = _FakeChatResponse("ok", _FakeUsage(1, 1))
+    raw_response.extra_body["provider_receipt"] = {
+        "provider": "openai",
+        "provider_request_id": "forged-request",
+        "response_id": "forged-response",
+        "requested_model": "gpt-5.5",
+        "response_model": "gpt-5.5-forged",
+        "system_fingerprint": None,
+        "request_digest": "sha256:" + "a" * 64,
+        "temperature": None,
+        "max_tokens": 64,
+        "max_tokens_field": "max_completion_tokens",
+        "seed_supplied": False,
+        "cache_config_supplied": False,
+        "started_at_unix_s": 1.0,
+        "finished_at_unix_s": 2.0,
+    }
+    chat = _FakeChatCompletions(raw_response, headers={})
+    provider = OpenAIProvider(_config())
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    response = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "go"}],
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
     assert response.provider_receipt is None

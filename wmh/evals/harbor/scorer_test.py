@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ from wmh.evals.benchmark import (
     BenchmarkTaskEnvironment,
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
+    BenchmarkUsage,
 )
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
@@ -101,6 +103,29 @@ def _candidate_failure(
         stage=BenchmarkCandidateStage.EXECUTION,
         failure_reason=reason,
     )
+
+
+def _provider_receipt_record(task_id: str, attempt: int) -> dict[str, object]:
+    return {
+        "kind": "provider_receipt",
+        "payload": {
+            "provider": "bedrock",
+            "provider_request_id": f"provider-request-{task_id}-{attempt}",
+            "response_id": None,
+            "requested_model": "worker-model",
+            "response_model": None,
+            "system_fingerprint": None,
+            "request_digest": "sha256:" + "f" * 64,
+            "temperature": 0.7,
+            "max_tokens": 4_096,
+            "max_tokens_field": "inferenceConfig.maxTokens",
+            "seed_supplied": False,
+            "cache_config_supplied": False,
+            "started_at_unix_s": 10.0,
+            "finished_at_unix_s": 11.0,
+            "turn_call_index": 1,
+        },
+    }
 
 
 def _loaded_result(
@@ -181,6 +206,7 @@ def _loaded_result(
                     candidate_outcome=candidate_outcome
                     or BenchmarkCandidateOutcome(status=BenchmarkCandidateStatus.COMPLETED),
                     run_health=run_health,
+                    usage=BenchmarkUsage(calls=1),
                 )
             )
             trial_dir = Path(f"trial-{task_id}-{attempt}")
@@ -188,10 +214,18 @@ def _loaded_result(
             absolute_trial_dir.mkdir(exist_ok=True)
             trace_path = absolute_trial_dir / "wmh-events.jsonl"
             trace_path.unlink(missing_ok=True)
+            trace_records = [
+                _provider_receipt_record(task_id, attempt),
+                {
+                    "kind": "assistant_message",
+                    "payload": {"text": f"answer-{task_id}-{attempt}{trace_suffix}"},
+                },
+            ]
             trace_path.write_text(
-                '{"kind":"assistant_message","payload":{"text":"'
-                f"answer-{task_id}-{attempt}{trace_suffix}"
-                '"}}\n',
+                "".join(
+                    json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                    for record in trace_records
+                ),
                 encoding="utf-8",
             )
             locators.append(
@@ -774,6 +808,155 @@ def test_trace_records_are_strictly_typed_before_reaching_proposer_evidence(
         scorer.score(pi_node_baseline("candidate"), request=_full_request())
 
 
+def test_empty_trace_is_rejected_when_successful_calls_were_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyTraceEvaluator:
+        def __init__(self, spec: HarborJobSpec, *_args: object, **_kwargs: object) -> None:
+            self._spec = spec
+
+        async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
+            loaded = _loaded_result(tmp_path, candidate, self._spec)
+            trace = loaded.job_dir / loaded.locators[0].trial_dir / "wmh-events.jsonl"
+            trace.write_text("", encoding="utf-8")
+            return loaded
+
+    monkeypatch.setattr(mod, "HarborEvaluator", EmptyTraceEvaluator)
+
+    with (
+        _scorer(tmp_path) as scorer,
+        pytest.raises(ValueError, match="invalid provider-call evidence"),
+    ):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", 0.2),
+        ("max_tokens", 2_048),
+        ("max_tokens_field", "max_tokens"),
+        ("seed_supplied", True),
+        ("cache_config_supplied", True),
+    ],
+)
+def test_trace_rejects_receipts_with_altered_frozen_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    class AlteredControlEvaluator:
+        def __init__(self, spec: HarborJobSpec, *_args: object, **_kwargs: object) -> None:
+            self._spec = spec
+
+        async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
+            loaded = _loaded_result(tmp_path, candidate, self._spec)
+            trace = loaded.job_dir / loaded.locators[0].trial_dir / "wmh-events.jsonl"
+            records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+            records[0]["payload"][field] = value
+            trace.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return loaded
+
+    monkeypatch.setattr(mod, "HarborEvaluator", AlteredControlEvaluator)
+
+    with (
+        _scorer(tmp_path) as scorer,
+        pytest.raises(ValueError, match="invalid provider-call evidence"),
+    ):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
+def test_trace_rejects_omitted_explicit_nullable_receipt_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OmittedFieldEvaluator:
+        def __init__(self, spec: HarborJobSpec, *_args: object, **_kwargs: object) -> None:
+            self._spec = spec
+
+        async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
+            loaded = _loaded_result(tmp_path, candidate, self._spec)
+            trace = loaded.job_dir / loaded.locators[0].trial_dir / "wmh-events.jsonl"
+            records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+            records[0]["payload"].pop("response_id")
+            trace.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return loaded
+
+    monkeypatch.setattr(mod, "HarborEvaluator", OmittedFieldEvaluator)
+
+    with (
+        _scorer(tmp_path) as scorer,
+        pytest.raises(ValueError, match="invalid provider-call evidence"),
+    ):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
+def test_trace_receipt_cardinality_must_match_persisted_successful_call_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CardinalityEvaluator:
+        def __init__(self, spec: HarborJobSpec, *_args: object, **_kwargs: object) -> None:
+            self._spec = spec
+
+        async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
+            loaded = _loaded_result(tmp_path, candidate, self._spec)
+            trials = list(loaded.result.trials)
+            trials[0] = trials[0].model_copy(update={"usage": BenchmarkUsage(calls=2)})
+            return LoadedHarborJobResult(
+                result=loaded.result.model_copy(update={"trials": trials}),
+                job_dir=loaded.job_dir,
+                locators=loaded.locators,
+            )
+
+    monkeypatch.setattr(mod, "HarborEvaluator", CardinalityEvaluator)
+
+    with (
+        _scorer(tmp_path) as scorer,
+        pytest.raises(ValueError, match="invalid provider-call evidence"),
+    ):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
+def test_provider_request_identity_must_be_unique_across_all_trial_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DuplicateReceiptEvaluator:
+        def __init__(self, spec: HarborJobSpec, *_args: object, **_kwargs: object) -> None:
+            self._spec = spec
+
+        async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
+            loaded = _loaded_result(tmp_path, candidate, self._spec)
+            traces = [
+                loaded.job_dir / locator.trial_dir / "wmh-events.jsonl"
+                for locator in loaded.locators[:2]
+            ]
+            first = json.loads(traces[0].read_text(encoding="utf-8").splitlines()[0])
+            records = [
+                json.loads(line) for line in traces[1].read_text(encoding="utf-8").splitlines()
+            ]
+            records[0]["payload"]["provider_request_id"] = first["payload"]["provider_request_id"]
+            traces[1].write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return loaded
+
+    monkeypatch.setattr(mod, "HarborEvaluator", DuplicateReceiptEvaluator)
+
+    with _scorer(tmp_path) as scorer, pytest.raises(ValueError, match="reused across trials"):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
 def test_missing_trace_is_allowed_only_for_harbor_task_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -795,6 +978,21 @@ def test_missing_trace_is_allowed_only_for_harbor_task_timeout(
             )
             for locator in loaded.locators:
                 (loaded.job_dir / locator.trial_dir / "wmh-events.jsonl").unlink()
+            if self.task_timeout:
+                zero_call_trials = [
+                    trial.model_copy(update={"usage": BenchmarkUsage(calls=0)})
+                    for trial in loaded.result.trials
+                ]
+                loaded = LoadedHarborJobResult(
+                    result=loaded.result.model_copy(
+                        update={
+                            "trials": zero_call_trials,
+                            "usage": BenchmarkUsage(calls=0),
+                        }
+                    ),
+                    job_dir=loaded.job_dir,
+                    locators=loaded.locators,
+                )
             return loaded
 
     monkeypatch.setattr(mod, "HarborEvaluator", MissingTraceEvaluator)

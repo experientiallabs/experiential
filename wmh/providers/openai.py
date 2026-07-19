@@ -96,6 +96,7 @@ class OpenAIProvider:
             self.config.model,
             request,
             provider=self.config.kind.value,
+            provider_request_id_header="x-request-id",
             max_tokens_field=self.config.resolved_chat_max_tokens_field(),
         )
 

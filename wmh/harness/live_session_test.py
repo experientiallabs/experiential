@@ -390,7 +390,72 @@ def test_provider_receipt_indices_count_only_successful_provider_calls() -> None
 
     provider_events = [event for event in events if event.kind == "provider_receipt"]
     assert session.worker_usage.calls == 1
+    assert len(provider_events) == 1
     assert provider_events[0].payload["turn_call_index"] == 1
+
+
+def test_failed_provider_calls_emit_no_receipts_or_successful_call_count() -> None:
+    events: list[SessionEvent] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+            {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}},
+        ]
+    )
+
+    def worker(_request: ChatRequest) -> ChatResponse:
+        raise RuntimeError("provider unavailable")
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=events.append,
+        worker_fn=worker,
+    )
+
+    session.start()
+    session.send_user_message("do the task")
+    _drain(session)
+
+    assert session.worker_usage.calls == 0
+    assert [event for event in events if event.kind == "provider_receipt"] == []
+
+
+def test_two_successful_provider_calls_emit_exact_contiguous_receipt_indexes() -> None:
+    events: list[SessionEvent] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+            {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}},
+        ]
+    )
+    calls = 0
+
+    def worker(_request: ChatRequest) -> ChatResponse:
+        nonlocal calls
+        calls += 1
+        receipt = _provider_receipt()
+        receipt["provider_request_id"] = f"request-{calls}"
+        return _completion("ok", provider_receipt=receipt)
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=events.append,
+        worker_fn=worker,
+    )
+
+    session.start()
+    session.send_user_message("do the task")
+    _drain(session)
+
+    provider_events = [event for event in events if event.kind == "provider_receipt"]
+    assert session.worker_usage.calls == 2
+    assert [event.payload["turn_call_index"] for event in provider_events] == [1, 2]
 
 
 def test_harness_output_budget_overrides_and_canonicalizes_runner_request() -> None:

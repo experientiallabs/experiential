@@ -164,6 +164,8 @@ class BenchmarkError(BaseModel):
 class BenchmarkUsage(BaseModel):
     """Token and cost evidence without conflating exact, partial, and missing metering."""
 
+    calls: int | None = Field(default=None, ge=0)
+    calls_status: BenchmarkUsageStatus = BenchmarkUsageStatus.UNAVAILABLE
     input_tokens: int | None = Field(default=None, ge=0)
     input_tokens_status: BenchmarkUsageStatus = BenchmarkUsageStatus.UNAVAILABLE
     cache_tokens: int | None = Field(default=None, ge=0)
@@ -173,7 +175,14 @@ class BenchmarkUsage(BaseModel):
     cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     cost_usd_status: BenchmarkUsageStatus = BenchmarkUsageStatus.UNAVAILABLE
 
-    @field_validator("input_tokens", "cache_tokens", "output_tokens", "cost_usd", mode="before")
+    @field_validator(
+        "calls",
+        "input_tokens",
+        "cache_tokens",
+        "output_tokens",
+        "cost_usd",
+        mode="before",
+    )
     @classmethod
     def _reject_boolean_measurements(cls, value: int | float | None) -> int | float | None:
         if isinstance(value, bool):
@@ -182,6 +191,12 @@ class BenchmarkUsage(BaseModel):
 
     @model_validator(mode="after")
     def _validate_measurement_statuses(self) -> Self:
+        self.calls_status = _resolve_usage_status(
+            "calls",
+            self.calls,
+            self.calls_status,
+            explicit="calls_status" in self.model_fields_set,
+        )
         self.input_tokens_status = _resolve_usage_status(
             "input_tokens",
             self.input_tokens,
@@ -228,6 +243,9 @@ def _resolve_usage_status(
 def aggregate_benchmark_usage(usages: Iterable[BenchmarkUsage]) -> BenchmarkUsage:
     """Aggregate usage while retaining observed lower bounds from incomplete metering."""
     collected = list(usages)
+    calls, calls_status = _aggregate_int_measurements(
+        (usage.calls, usage.calls_status) for usage in collected
+    )
     input_tokens, input_status = _aggregate_int_measurements(
         (usage.input_tokens, usage.input_tokens_status) for usage in collected
     )
@@ -241,6 +259,8 @@ def aggregate_benchmark_usage(usages: Iterable[BenchmarkUsage]) -> BenchmarkUsag
         (usage.cost_usd, usage.cost_usd_status) for usage in collected
     )
     return BenchmarkUsage(
+        calls=calls,
+        calls_status=calls_status,
         input_tokens=input_tokens,
         input_tokens_status=input_status,
         cache_tokens=cache_tokens,

@@ -180,6 +180,11 @@ def _provider_receipt_payload(
     response_id: str | None = None,
     response_model: str | None = None,
     system_fingerprint: str | None = None,
+    temperature: float | None = 0.7,
+    max_tokens: int = 4_096,
+    max_tokens_field: str = "inferenceConfig.maxTokens",
+    seed_supplied: bool = False,
+    cache_config_supplied: bool = False,
 ) -> JsonObject:
     return cast(
         "JsonObject",
@@ -191,11 +196,11 @@ def _provider_receipt_payload(
             "response_model": response_model,
             "system_fingerprint": system_fingerprint,
             "request_digest": "sha256:" + "a" * 64,
-            "temperature": None,
-            "max_tokens": 64,
-            "max_tokens_field": "inferenceConfig.maxTokens",
-            "seed_supplied": False,
-            "cache_config_supplied": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "max_tokens_field": max_tokens_field,
+            "seed_supplied": seed_supplied,
+            "cache_config_supplied": cache_config_supplied,
             "started_at_unix_s": 10.0,
             "finished_at_unix_s": 11.0,
             "turn_call_index": call_index,
@@ -1071,6 +1076,7 @@ def test_success_populates_usage_and_backend_identity(
     assert context.metadata["task_environment_digest"] == _TASK_ENVIRONMENT_DIGEST
     assert context.metadata["task_environment_attestation"] == _TASK_ENVIRONMENT_ATTESTATION
     assert context.metadata["run_health"] == "valid"
+    assert context.metadata["model_calls"] == 1
 
 
 def test_confirmation_rejects_missing_receipt_as_infrastructure(
@@ -1136,6 +1142,8 @@ def test_confirmation_receipt_trace_rejects_missing_extra_noncontiguous_or_misma
             events,
             TokenUsage(calls=1),
             config,
+            requested_temperature=0.7,
+            max_tokens=4_096,
         )
 
     assert caught.value.kind is mod.PiInfrastructureFailureKind.PROVIDER_RECEIPT
@@ -1148,7 +1156,13 @@ def test_confirmation_receipt_trace_accepts_exact_contiguous_frozen_evidence() -
         SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload(call_index=2)),
     )
 
-    mod._require_complete_provider_receipt_trace(events, TokenUsage(calls=2), config)
+    mod._require_complete_provider_receipt_trace(
+        events,
+        TokenUsage(calls=2),
+        config,
+        requested_temperature=0.7,
+        max_tokens=4_096,
+    )
 
 
 def test_confirmation_receipt_trace_rejects_reused_provider_request_identity() -> None:
@@ -1171,7 +1185,13 @@ def test_confirmation_receipt_trace_rejects_reused_provider_request_identity() -
     )
 
     with pytest.raises(mod.PiInfrastructureError) as caught:
-        mod._require_complete_provider_receipt_trace(events, TokenUsage(calls=2), config)
+        mod._require_complete_provider_receipt_trace(
+            events,
+            TokenUsage(calls=2),
+            config,
+            requested_temperature=0.7,
+            max_tokens=4_096,
+        )
 
     assert caught.value.kind is mod.PiInfrastructureFailureKind.PROVIDER_RECEIPT
 
@@ -1184,6 +1204,8 @@ def test_openai_receipt_response_identity_must_match_completion() -> None:
         response_id="different-completion",
         response_model="gpt-5.5-served",
         system_fingerprint="fp-1",
+        temperature=None,
+        max_tokens_field="max_completion_tokens",
     )
     payload.pop("turn_call_index")
     response = ChatResponse.model_validate(
@@ -1197,7 +1219,41 @@ def test_openai_receipt_response_identity_must_match_completion() -> None:
     )
 
     with pytest.raises(ValueError, match="response id disagrees"):
-        mod._validate_provider_response_receipt(response, config)
+        mod._validate_provider_response_receipt(
+            response,
+            config,
+            requested_temperature=0.7,
+            max_tokens=4_096,
+        )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"temperature": 0.2},
+        {"max_tokens": 2_048},
+        {"max_tokens_field": "max_tokens"},
+        {"seed_supplied": True},
+        {"cache_config_supplied": True},
+    ],
+)
+def test_confirmation_receipt_trace_rejects_altered_request_controls(
+    updates: dict[str, object],
+) -> None:
+    payload = _provider_receipt_payload()
+    payload.update(cast("JsonObject", updates))
+    event = SessionEvent(kind="provider_receipt", payload=payload)
+
+    with pytest.raises(mod.PiInfrastructureError) as caught:
+        mod._require_complete_provider_receipt_trace(
+            (event,),
+            TokenUsage(calls=1),
+            ProviderConfig(kind=ProviderKind.BEDROCK, model="model"),
+            requested_temperature=0.7,
+            max_tokens=4_096,
+        )
+
+    assert caught.value.kind is mod.PiInfrastructureFailureKind.PROVIDER_RECEIPT
 
 
 def test_infrastructure_error_does_not_persist_raw_provider_secret(

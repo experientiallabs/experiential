@@ -244,6 +244,8 @@ class ChatProviderReceipt(BaseModel):
     def _validate_time_order(self) -> ChatProviderReceipt:
         if self.finished_at_unix_s < self.started_at_unix_s:
             raise ValueError("provider receipt cannot finish before it starts")
+        if self.response_id is not None and self.provider_request_id == self.response_id:
+            raise ValueError("provider request id must be distinct from the response id")
         return self
 
 

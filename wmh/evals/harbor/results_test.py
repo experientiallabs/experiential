@@ -164,6 +164,7 @@ def _trial(
             metadata={
                 "harness_hash": _HARNESS.execution_hash,
                 "runner_image": "runner-image",
+                "model_calls": 1,
                 "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
                 "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
                 "run_health": "valid",
@@ -318,6 +319,8 @@ def test_load_uses_exact_manifest_and_preserves_rewards_usage_and_missing_cells(
     )
     assert trials["missing"].source == _TASK_SOURCE
     assert trials["missing"].status is BenchmarkTrialStatus.INCOMPLETE
+    assert result.usage.calls == 2
+    assert result.usage.calls_status is BenchmarkUsageStatus.LOWER_BOUND
     assert result.usage.input_tokens == 20
     assert result.usage.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
     assert result.usage.cache_tokens == 4
@@ -399,6 +402,8 @@ def test_usage_total_is_reported_only_when_every_cell_is_metered(tmp_path: Path)
         ),
     ).result
 
+    assert result.usage.calls == 2
+    assert result.usage.calls_status is BenchmarkUsageStatus.EXACT
     assert result.usage.input_tokens == 20
     assert result.usage.input_tokens_status is BenchmarkUsageStatus.EXACT
     assert result.usage.cache_tokens == 4
@@ -432,6 +437,8 @@ def test_interrupted_usage_is_a_known_lower_bound_not_an_exact_total(
     ).result
 
     assert result.trials[0].usage.input_tokens == 10
+    assert result.trials[0].usage.calls == 1
+    assert result.trials[0].usage.calls_status is BenchmarkUsageStatus.EXACT
     assert result.trials[0].usage.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
     assert result.trials[0].usage.output_tokens == 4
     assert result.trials[0].usage.output_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
@@ -868,6 +875,49 @@ def test_inconsistent_step_candidate_outcomes_are_rejected(tmp_path: Path) -> No
     _write_job(job_dir, [trial], expected=1)
 
     with pytest.raises(ValueError, match="inconsistent candidate outcome"):
+        load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
+
+
+def test_inconsistent_step_model_call_counts_are_rejected(tmp_path: Path) -> None:
+    trial = _trial(tmp_path, "task", rewards={"reward": 1})
+    identity = {
+        "harness_hash": _HARNESS.execution_hash,
+        "runner_image": "runner-image",
+        "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
+        "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
+        "candidate_failure": False,
+        "terminal_reason": "completed",
+    }
+    trial.agent_result = None
+    trial.step_results = [
+        StepResult(
+            step_name="first",
+            agent_result=AgentContext(metadata={**identity, "model_calls": 1}),
+        ),
+        StepResult(
+            step_name="second",
+            agent_result=AgentContext(metadata={**identity, "model_calls": 2}),
+        ),
+    ]
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    with pytest.raises(ValueError, match="inconsistent model call metadata"):
+        load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
+
+
+@pytest.mark.parametrize("model_calls", [True, -1, 1.5, "1"])
+def test_invalid_model_call_count_is_rejected(tmp_path: Path, model_calls: object) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        rewards={"reward": 1},
+        candidate_metadata={"model_calls": model_calls},
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    with pytest.raises(ValueError, match="model_calls must be a non-negative integer"):
         load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
 
 

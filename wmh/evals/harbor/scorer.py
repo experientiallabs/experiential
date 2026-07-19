@@ -12,6 +12,7 @@ from pathlib import Path
 from statistics import fmean
 from typing import Self
 
+from llm_waterfall import ChatProviderReceipt
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 
@@ -28,12 +29,14 @@ from wmh.evals.benchmark import (
     BenchmarkTaskEnvironment,
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
+    BenchmarkUsageStatus,
     Rewards,
     is_sha256_digest,
 )
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.evaluator import HarborEvaluator
+from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.live_session import EventKind
@@ -102,6 +105,8 @@ class _EvaluationCellIdentity(BaseModel):
 class _TraceEvidence:
     text: str
     digest: str
+    provider_receipts: tuple[ChatProviderReceipt, ...]
+    provider_call_indexes: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -337,6 +342,8 @@ class HarborHarnessScorer:
             task_environment_digests=self._task_environment_digests,
             attempts=self.default_attempts,
             reward_key=self._reward_key,
+            provider_config=self._provider_config,
+            compute_envelope=self._compute_envelope,
         )
         per_task: dict[str, TaskScore] = {}
         identity_cells: list[_EvaluationCellIdentity] = []
@@ -540,6 +547,8 @@ def _validate_and_order_matrix(
     task_environment_digests: tuple[str, ...],
     attempts: int,
     reward_key: str,
+    provider_config: ProviderConfig,
+    compute_envelope: HarborAgentComputeEnvelope,
 ) -> dict[str, list[_ScoredTrial]]:
     result = loaded.result
     expected_keys = [(cell.task_key, cell.attempt) for cell in result.expected_cells]
@@ -596,6 +605,7 @@ def _validate_and_order_matrix(
     expected_attempts = list(range(1, attempts + 1))
     expected_keys_by_task = dict(zip(task_ids, task_keys, strict=True))
     expected_environment_by_task = dict(zip(task_ids, task_environment_digests, strict=True))
+    provider_request_ids: set[str] = set()
     for task_id in task_ids:
         trials = sorted(by_task[task_id], key=lambda trial: trial.cell.attempt)
         found_attempts = [trial.cell.attempt for trial in trials]
@@ -698,20 +708,36 @@ def _validate_and_order_matrix(
                     )
                 verifier_reward = float(raw_reward)
                 score = _analysis_score(trial, verifier_reward=verifier_reward)
+            if (
+                trial.usage.calls is None
+                or trial.usage.calls_status is not BenchmarkUsageStatus.EXACT
+            ):
+                raise ValueError(
+                    f"Harbor task {task_id!r} attempt {trial.cell.attempt} lacks an exact "
+                    "successful provider call count"
+                )
             locator = locators[(trial.cell.task_key, trial.cell.attempt)]
+            trace = _read_trace(
+                loaded,
+                locator,
+                allow_missing=(
+                    trial.error is not None
+                    and trial.error.kind is BenchmarkFailureKind.TASK_TIMEOUT
+                ),
+                expected_calls=trial.usage.calls,
+                provider_config=provider_config,
+                compute_envelope=compute_envelope,
+            )
+            request_ids = {receipt.provider_request_id for receipt in trace.provider_receipts}
+            if provider_request_ids.intersection(request_ids):
+                raise ValueError("Harbor provider request identity was reused across trials")
+            provider_request_ids.update(request_ids)
             scored.append(
                 _ScoredTrial(
                     trial=trial,
                     verifier_reward=verifier_reward,
                     score=score,
-                    trace=_read_trace(
-                        loaded,
-                        locator,
-                        allow_missing=(
-                            trial.error is not None
-                            and trial.error.kind is BenchmarkFailureKind.TASK_TIMEOUT
-                        ),
-                    ),
+                    trace=trace,
                 )
             )
         ordered[task_id] = scored
@@ -758,13 +784,21 @@ def _read_trace(
     locator: HarborTrialLocator,
     *,
     allow_missing: bool,
+    expected_calls: int,
+    provider_config: ProviderConfig,
+    compute_envelope: HarborAgentComputeEnvelope,
 ) -> _TraceEvidence:
     relative_path = locator.trial_dir / _TRACE_FILENAME
     trace_path = loaded.resolve_path(relative_path)
     if not trace_path.exists():
-        if not allow_missing:
+        if not allow_missing or expected_calls != 0:
             raise ValueError(f"completed Harbor trial is missing its WMH trace: {relative_path}")
-        return _TraceEvidence(text="(trace unavailable)", digest="missing")
+        return _TraceEvidence(
+            text="(trace unavailable)",
+            digest="missing",
+            provider_receipts=(),
+            provider_call_indexes=(),
+        )
     if not trace_path.is_file():
         raise ValueError(f"Harbor trace must be a regular file: {relative_path}")
     with trace_path.open("rb") as handle:
@@ -778,6 +812,7 @@ def _read_trace(
     except UnicodeDecodeError as exc:
         raise ValueError(f"Harbor trace is not valid UTF-8: {relative_path}") from exc
     canonical_lines: list[str] = []
+    receipt_payloads: list[JsonObject] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         if not line:
             raise ValueError(
@@ -799,10 +834,26 @@ def _read_trace(
                 allow_nan=False,
             )
         )
+        if record.kind == "provider_receipt":
+            receipt_payloads.append(record.payload)
+    try:
+        receipt_trace = validate_provider_receipt_trace(
+            receipt_payloads,
+            expected_calls=expected_calls,
+            provider_config=provider_config,
+            requested_temperature=compute_envelope.temperature,
+            max_tokens=compute_envelope.max_output_tokens,
+        )
+    except (TypeError, ValueError, PydanticValidationError) as exc:
+        raise ValueError(
+            f"Harbor trace contains invalid provider-call evidence: {relative_path}"
+        ) from exc
     canonical = "\n".join(canonical_lines)
     return _TraceEvidence(
         text=normalize_durable_text(canonical) if canonical else "(trace contained no events)",
         digest="sha256:" + hashlib.sha256(payload).hexdigest(),
+        provider_receipts=receipt_trace.receipts,
+        provider_call_indexes=receipt_trace.call_indexes,
     )
 
 

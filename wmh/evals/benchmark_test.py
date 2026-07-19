@@ -129,6 +129,18 @@ def test_usage_requires_explicit_lower_bounds_instead_of_exact_unknown_totals() 
         )
 
 
+def test_usage_tracks_successful_call_count_with_the_same_status_contract() -> None:
+    exact = BenchmarkUsage(calls=0)
+    lower_bound = BenchmarkUsage(calls=2, calls_status=BenchmarkUsageStatus.LOWER_BOUND)
+
+    assert exact.calls_status is BenchmarkUsageStatus.EXACT
+    assert lower_bound.calls_status is BenchmarkUsageStatus.LOWER_BOUND
+    with pytest.raises(ValidationError):
+        BenchmarkUsage(calls=True)
+    with pytest.raises(ValidationError, match="without a value must be unavailable"):
+        BenchmarkUsage(calls_status=BenchmarkUsageStatus.EXACT)
+
+
 def test_run_counts_incomplete_and_infrastructure_cells_separately() -> None:
     cells = [
         _cell("task-a"),
@@ -172,6 +184,7 @@ def test_run_usage_is_derived_from_trials_and_rejects_a_conflicting_total() -> N
             BenchmarkTrialStatus.SCORED,
             rewards={"reward": 1},
             usage=BenchmarkUsage(
+                calls=2,
                 input_tokens=10,
                 cache_tokens=3,
                 output_tokens=4,
@@ -183,6 +196,7 @@ def test_run_usage_is_derived_from_trials_and_rejects_a_conflicting_total() -> N
             BenchmarkTrialStatus.SCORED,
             rewards={"reward": 0},
             usage=BenchmarkUsage(
+                calls=3,
                 input_tokens=20,
                 cache_tokens=5,
                 output_tokens=6,
@@ -199,6 +213,7 @@ def test_run_usage_is_derived_from_trials_and_rejects_a_conflicting_total() -> N
     )
 
     assert result.usage == BenchmarkUsage(
+        calls=5,
         input_tokens=30,
         cache_tokens=8,
         output_tokens=10,

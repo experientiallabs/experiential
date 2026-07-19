@@ -105,6 +105,7 @@ def complete_chat(
     request: ChatRequest,
     *,
     provider: str,
+    provider_request_id_header: str,
     max_tokens_field: ChatMaxTokensField,
 ) -> ChatResponse:
     """Run a validated structured request against an OpenAI-compatible SDK resource."""
@@ -114,10 +115,15 @@ def complete_chat(
     resource = cast("Any", chat_completions)
     payload = request.provider_payload(model, max_tokens_field=max_tokens_field)
     started_at = time.time()
-    raw_response = resource.create(**payload)
+    raw_api_response = resource.with_raw_response.create(**payload)
+    raw_response = raw_api_response.parse()
     finished_at = time.time()
-    response = ChatResponse.model_validate(raw_response.model_dump(mode="json"))
-    provider_request_id = getattr(raw_response, "_request_id", None)
+    # The provider response namespace is not an attestation namespace. Explicitly clear a
+    # colliding body field before attaching the only trusted receipt built by this adapter.
+    response = ChatResponse.model_validate(raw_response.model_dump(mode="json")).model_copy(
+        update={"provider_receipt": None}
+    )
+    provider_request_id = raw_api_response.headers.get(provider_request_id_header)
     max_tokens_value = payload.get(max_tokens_field)
     temperature = payload.get("temperature")
     if (

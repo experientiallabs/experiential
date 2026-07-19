@@ -126,6 +126,7 @@ _CANDIDATE_OUTCOME_METADATA_KEYS = frozenset(
 )
 _TASK_ENVIRONMENT_DIGEST_KEY = "task_environment_digest"
 _TASK_ENVIRONMENT_ATTESTATION_KEY = "task_environment_attestation"
+_MODEL_CALLS_KEY = "model_calls"
 _MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES = 64 * 1024
 _RUN_HEALTH_MAP = {
     "valid": BenchmarkRunHealth.VALID,
@@ -140,6 +141,7 @@ class _TrustedRunEvidence:
     candidate_outcome: BenchmarkCandidateOutcome
     run_health: BenchmarkRunHealth
     task_environment_digest: str | None
+    model_calls: int | None
 
 
 class HarborTrialManifestEntry(BaseModel):
@@ -490,6 +492,7 @@ def _validate_run_identity(
     )
     outcomes: list[tuple[BenchmarkCandidateOutcome, BenchmarkRunHealth]] = []
     environment_digests: list[str] = []
+    model_calls: list[int | None] = []
     for context in contexts:
         metadata = context.metadata or {}
         candidate_hash = metadata.get("harness_hash")
@@ -509,6 +512,7 @@ def _validate_run_identity(
                 expected_backend=expected.task_environment.value,
             )
         )
+        model_calls.append(_parse_model_calls(metadata))
         outcome = _parse_candidate_outcome(metadata)
         run_health = _parse_run_health(metadata)
         if (
@@ -524,6 +528,7 @@ def _validate_run_identity(
             candidate_outcome=BenchmarkCandidateOutcome(),
             run_health=BenchmarkRunHealth.UNKNOWN,
             task_environment_digest=None,
+            model_calls=None,
         )
     first = outcomes[0]
     if any(outcome != first for outcome in outcomes[1:]):
@@ -533,11 +538,25 @@ def _validate_run_identity(
     first_environment_digest = environment_digests[0]
     if any(digest != first_environment_digest for digest in environment_digests[1:]):
         raise ValueError("Harbor step contexts contain inconsistent task environment metadata")
+    first_model_calls = model_calls[0]
+    if any(calls != first_model_calls for calls in model_calls[1:]):
+        raise ValueError("Harbor step contexts contain inconsistent model call metadata")
     return _TrustedRunEvidence(
         candidate_outcome=first[0],
         run_health=first[1],
         task_environment_digest=first_environment_digest,
+        model_calls=first_model_calls,
     )
+
+
+def _parse_model_calls(metadata: dict[str, object]) -> int | None:
+    """Parse the adapter-authored count of successfully completed provider calls."""
+    if _MODEL_CALLS_KEY not in metadata:
+        return None
+    value = metadata[_MODEL_CALLS_KEY]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("Harbor agent metadata model_calls must be a non-negative integer")
+    return value
 
 
 def _parse_task_environment_attestation(
@@ -742,6 +761,12 @@ def _convert_trial(
         candidate_outcome=candidate_outcome,
         run_health=run_health,
         usage=BenchmarkUsage(
+            calls=run_evidence.model_calls,
+            calls_status=(
+                BenchmarkUsageStatus.EXACT
+                if run_evidence.model_calls is not None
+                else BenchmarkUsageStatus.UNAVAILABLE
+            ),
             input_tokens=n_input,
             input_tokens_status=_usage_status(
                 n_input,

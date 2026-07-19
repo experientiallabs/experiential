@@ -26,9 +26,10 @@ from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import MCPServerConfig
-from llm_waterfall import ChatProviderReceipt, ChatResponse
+from llm_waterfall import ChatResponse
 
 from wmh.core.types import JsonObject
+from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.live_session import OutputEmitter, SessionEvent, ToolOutcome
 from wmh.harness.pi_local import (
@@ -57,6 +58,7 @@ from wmh.providers.process_worker import (
     ProviderWorkerFailure,
     ProviderWorkerUnavailable,
 )
+from wmh.providers.receipt import validate_chat_provider_receipt
 
 _TOOL_OUTPUT_CHARS = 16_000
 _TOOL_STREAM_CHARS = _TOOL_OUTPUT_CHARS // 2
@@ -73,7 +75,7 @@ _MIN_TASK_FREE_DISK_KIB = 128 * 1024
 _TRACE_FILE = "wmh-events.jsonl"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.4.0"
+WMH_PI_AGENT_VERSION: Final = "0.5.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -859,6 +861,8 @@ def _run_isolated_turn(
                     partial(
                         _validate_provider_response_receipt,
                         provider_config=provider_config,
+                        requested_temperature=harness.temperature(),
+                        max_tokens=harness.max_output_tokens(),
                     )
                     if require_provider_receipts
                     else None
@@ -870,6 +874,8 @@ def _run_isolated_turn(
                     exc.events,
                     exc.worker_usage,
                     provider_config,
+                    requested_temperature=harness.temperature(),
+                    max_tokens=harness.max_output_tokens(),
                 )
             raise
         if require_provider_receipts:
@@ -877,6 +883,8 @@ def _run_isolated_turn(
                 result.events,
                 result.worker_usage,
                 provider_config,
+                requested_temperature=harness.temperature(),
+                max_tokens=harness.max_output_tokens(),
             )
         return result
     finally:
@@ -886,12 +894,20 @@ def _run_isolated_turn(
 def _validate_provider_response_receipt(
     response: ChatResponse,
     provider_config: ProviderConfig,
+    *,
+    requested_temperature: float,
+    max_tokens: int,
 ) -> None:
     """Require response evidence to agree with the immutable provider target."""
     receipt = response.provider_receipt
     if receipt is None:
         raise ValueError("provider receipt is missing")
-    _validate_provider_receipt_identity(receipt, provider_config)
+    validate_chat_provider_receipt(
+        receipt,
+        provider_config=provider_config,
+        requested_temperature=requested_temperature,
+        max_tokens=max_tokens,
+    )
     if provider_config.kind is ProviderKind.BEDROCK:
         if response.model != provider_config.model:
             raise ValueError("Bedrock response model disagrees with the frozen provider model")
@@ -904,70 +920,29 @@ def _validate_provider_response_receipt(
         raise ValueError("provider receipt fingerprint disagrees with the completion")
 
 
-def _validate_provider_receipt_identity(
-    receipt: ChatProviderReceipt,
-    provider_config: ProviderConfig,
-) -> None:
-    """Validate receipt routing against the frozen provider configuration."""
-    expected_model = (
-        provider_config.deployment
-        if provider_config.kind is ProviderKind.AZURE_OPENAI
-        else provider_config.model
-    )
-    if not expected_model:
-        raise ValueError("frozen provider configuration has no request model")
-    if receipt.provider != provider_config.kind.value:
-        raise ValueError("provider receipt disagrees with the frozen provider")
-    if receipt.requested_model != expected_model:
-        raise ValueError("provider receipt disagrees with the frozen request model")
-    if provider_config.kind is ProviderKind.BEDROCK:
-        if receipt.response_id is not None:
-            raise ValueError("Bedrock provider receipt must not contain a response id")
-        if receipt.response_model is not None or receipt.system_fingerprint is not None:
-            raise ValueError("Bedrock provider receipt contains unsupported response metadata")
-    elif receipt.response_id is None or receipt.response_model is None:
-        raise ValueError("OpenAI-compatible provider receipt is missing response identity")
-
-
 def _require_complete_provider_receipt_trace(
     events: tuple[SessionEvent, ...],
     usage: TokenUsage,
     provider_config: ProviderConfig,
+    *,
+    requested_temperature: float,
+    max_tokens: int,
 ) -> None:
     """Reconcile one receipt event with every successfully metered provider call."""
-    receipt_events = tuple(event for event in events if event.kind == "provider_receipt")
-    if len(receipt_events) != usage.calls:
+    try:
+        validate_provider_receipt_trace(
+            (event.payload for event in events if event.kind == "provider_receipt"),
+            expected_calls=usage.calls,
+            provider_config=provider_config,
+            requested_temperature=requested_temperature,
+            max_tokens=max_tokens,
+        )
+    except Exception:  # noqa: BLE001 - trace contents never enter the persisted error text
         raise PiInfrastructureError(
             PiInfrastructureFailureKind.PROVIDER_RECEIPT,
             events=events,
             worker_usage=usage,
-        )
-    provider_request_ids: set[str] = set()
-    for expected_index, event in enumerate(receipt_events, start=1):
-        payload = dict(event.payload)
-        call_index = payload.pop("turn_call_index", None)
-        if (
-            isinstance(call_index, bool)
-            or not isinstance(call_index, int)
-            or call_index != expected_index
-        ):
-            raise PiInfrastructureError(
-                PiInfrastructureFailureKind.PROVIDER_RECEIPT,
-                events=events,
-                worker_usage=usage,
-            )
-        try:
-            receipt = ChatProviderReceipt.model_validate(payload)
-            _validate_provider_receipt_identity(receipt, provider_config)
-            if receipt.provider_request_id in provider_request_ids:
-                raise ValueError("provider request identity was reused")
-            provider_request_ids.add(receipt.provider_request_id)
-        except Exception:  # noqa: BLE001 - trace contents never enter the persisted error text
-            raise PiInfrastructureError(
-                PiInfrastructureFailureKind.PROVIDER_RECEIPT,
-                events=events,
-                worker_usage=usage,
-            ) from None
+        ) from None
 
 
 async def _attest_task_environment(
@@ -1473,7 +1448,7 @@ def _populate_context(
 ) -> None:
     context.n_input_tokens = usage.input_tokens
     context.n_output_tokens = usage.output_tokens
-    context.metadata = dict(metadata)
+    context.metadata = {**metadata, "model_calls": usage.calls}
 
 
 def _typed_infrastructure_error(error: Exception) -> RuntimeError:

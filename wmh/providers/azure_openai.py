@@ -113,6 +113,7 @@ class AzureOpenAIProvider:
             self._deployment(),
             request,
             provider=self.config.kind.value,
+            provider_request_id_header="apim-request-id",
             max_tokens_field=self.config.resolved_chat_max_tokens_field(),
         )
 

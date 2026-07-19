@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
+from openai import AzureOpenAI
 
 from wmh.providers.azure_openai import AzureOpenAIProvider
 from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
@@ -28,7 +30,6 @@ class _FakeChatResponse:
     def __init__(self, content: str, usage: _FakeUsage) -> None:
         self.choices = [_FakeChoice(content)]
         self.usage = usage
-        self._request_id = "provider-request-azure-1"
         self.id = "completion-azure-1"
         self.model = "gpt-5.5-2026-06-01"
         self.system_fingerprint = "fp-azure-1"
@@ -54,13 +55,40 @@ class _FakeChatResponse:
 
 
 class _FakeChatCompletions:
-    def __init__(self, response: _FakeChatResponse) -> None:
+    def __init__(
+        self,
+        response: _FakeChatResponse,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.response = response
+        self.headers = (
+            headers if headers is not None else {"apim-request-id": "provider-request-azure-1"}
+        )
         self.last_kwargs: dict[str, object] = {}
+        self.with_raw_response = _FakeWithRawResponse(self)
 
     def create(self, **kwargs: object) -> _FakeChatResponse:
         self.last_kwargs = kwargs
         return self.response
+
+
+class _FakeRawAPIResponse:
+    def __init__(self, response: _FakeChatResponse, headers: dict[str, str]) -> None:
+        self.response = response
+        self.headers = headers
+
+    def parse(self) -> _FakeChatResponse:
+        return self.response
+
+
+class _FakeWithRawResponse:
+    def __init__(self, completions: _FakeChatCompletions) -> None:
+        self.completions = completions
+
+    def create(self, **kwargs: object) -> _FakeRawAPIResponse:
+        self.completions.last_kwargs = kwargs
+        return _FakeRawAPIResponse(self.completions.response, self.completions.headers)
 
 
 class _FakeChat:
@@ -154,6 +182,65 @@ def test_structured_chat_applies_model_temperature_capability(
     assert response.provider_receipt.response_model == "gpt-5.5-2026-06-01"
     assert response.provider_receipt.system_fingerprint == "fp-azure-1"
     assert response.provider_receipt.temperature == (0.3 if expects_temperature else None)
+
+
+def test_structured_chat_uses_azure_apim_request_id_from_real_sdk_transport() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "apim-request-id": "azure-transport-request-1",
+                "x-sensitive-test-header": "must-not-be-persisted",
+            },
+            json={
+                "id": "completion-azure-sdk-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-5.5-2026-06-01",
+                "system_fingerprint": "fp-azure-sdk-1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = AzureOpenAI(
+        api_key="dummy-test-key",
+        api_version="2024-10-21",
+        azure_endpoint="https://example.openai.azure.com",
+        http_client=http_client,
+        max_retries=0,
+    )
+    provider = AzureOpenAIProvider(_config())
+    provider._client = client
+    try:
+        response = provider.complete_chat(
+            ChatRequest.model_validate(
+                {
+                    "messages": [{"role": "user", "content": "go"}],
+                    "max_completion_tokens": 64,
+                }
+            )
+        )
+    finally:
+        client.close()
+
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.provider_request_id == "azure-transport-request-1"
+    assert response.provider_receipt.response_id == "completion-azure-sdk-1"
+    receipt_json = response.provider_receipt.model_dump_json()
+    assert "x-sensitive-test-header" not in receipt_json
+    assert "must-not-be-persisted" not in receipt_json
 
 
 def test_missing_deployment_raises(monkeypatch: pytest.MonkeyPatch) -> None:
