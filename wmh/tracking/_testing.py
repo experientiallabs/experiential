@@ -3,7 +3,11 @@
 from datetime import date
 
 from wmh.providers.base import ProviderConfig
-from wmh.tracking.budget import ProviderTariffProvenance, ProviderTariffRoute
+from wmh.tracking.budget import (
+    ProviderTariffBillingMeter,
+    ProviderTariffProvenance,
+    ProviderTariffRoute,
+)
 
 
 def synthetic_tariff_provenance(
@@ -23,5 +27,15 @@ def synthetic_tariff_provenance(
             provider_config=provider_config,
             billing_region=provider_config.region or default_billing_region,
             billing_sku="test-sku",
+            billing_meters=(
+                ProviderTariffBillingMeter(
+                    usage_dimension="input_tokens",
+                    rate_id="test-input-meter",
+                ),
+                ProviderTariffBillingMeter(
+                    usage_dimension="output_tokens",
+                    rate_id="test-output-meter",
+                ),
+            ),
         ),
     )

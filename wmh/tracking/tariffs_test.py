@@ -10,7 +10,9 @@ from pydantic import ValidationError
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
     ProviderCostMeter,
+    ProviderTariffBillingMeter,
     ProviderTariffProvenance,
+    ProviderTariffRoute,
     TokenPriceCeiling,
 )
 from wmh.tracking.pricing import price_for
@@ -23,16 +25,58 @@ from wmh.tracking.tariffs import (
 
 
 @pytest.mark.parametrize(
-    ("model_type", "model_id", "input_nano_usd", "output_nano_usd"),
+    (
+        "model_type",
+        "model_id",
+        "input_nano_usd",
+        "output_nano_usd",
+        "source_locator",
+        "source_snapshot_digest",
+        "effective_on",
+        "billing_sku",
+        "input_rate_id",
+        "output_rate_id",
+    ),
     [
         (
             "claude-haiku-4-5",
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             1_100,
             5_500,
+            "https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/"
+            "bedrockfoundationmodels/USD/current/bedrockfoundationmodels.json",
+            "sha256:70ac2fe2f4153bf763492345b2029f06fefdb683023c420319a5b25679f02a11",
+            date(2026, 7, 19),
+            "geo-cross-region",
+            "JQDUC8Q4K8C6GSGH.4799GE89SK.6YS6EN2CT7",
+            "X629GDA2GXAP6R54.4799GE89SK.6YS6EN2CT7",
         ),
-        ("glm-5", "zai.glm-5", 1_000, 3_200),
-        ("claude-opus-4-8", "us.anthropic.claude-opus-4-8", 5_500, 27_500),
+        (
+            "glm-5",
+            "zai.glm-5",
+            1_000,
+            3_200,
+            "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/"
+            "AmazonBedrock/current/index.json",
+            "sha256:2df66ba105f0d831725f825d73bbb8c01d3d4fae2bc64ee5527619c62aedced2",
+            date(2026, 7, 1),
+            "on-demand",
+            "YTB2BH9W4UZVKTEG.JRTCKXETXF.6YS6EN2CT7",
+            "8RQBEKEP5KG2MZY7.JRTCKXETXF.6YS6EN2CT7",
+        ),
+        (
+            "claude-opus-4-8",
+            "us.anthropic.claude-opus-4-8",
+            5_500,
+            27_500,
+            "https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/"
+            "bedrockfoundationmodels/USD/current/bedrockfoundationmodels.json",
+            "sha256:70ac2fe2f4153bf763492345b2029f06fefdb683023c420319a5b25679f02a11",
+            date(2026, 7, 19),
+            "geo-cross-region",
+            "4AVHTD2NXFKSU6HU.4799GE89SK.6YS6EN2CT7",
+            "YKJ5FPMCZAQF5BHF.4799GE89SK.6YS6EN2CT7",
+        ),
     ],
 )
 def test_catalog_freezes_verified_bedrock_routes_and_exact_nominal_prices(
@@ -40,6 +84,12 @@ def test_catalog_freezes_verified_bedrock_routes_and_exact_nominal_prices(
     model_id: str,
     input_nano_usd: int,
     output_nano_usd: int,
+    source_locator: str,
+    source_snapshot_digest: str,
+    effective_on: date,
+    billing_sku: str,
+    input_rate_id: str,
+    output_rate_id: str,
 ) -> None:
     config = ProviderConfig(
         kind=ProviderKind.BEDROCK,
@@ -53,16 +103,20 @@ def test_catalog_freezes_verified_bedrock_routes_and_exact_nominal_prices(
 
     assert tariff.provider_config == config
     assert tariff.provenance.verified_on == date(2026, 7, 19)
-    assert tariff.provenance.effective_on == date(2026, 7, 19)
-    assert tariff.provenance.source_locator == "https://aws.amazon.com/bedrock/pricing/"
-    assert tariff.provenance.source_snapshot_digest == (
-        "sha256:1936d89d798e83cbee0d3d95a886a720c7e2de2bb6fe6e86cdfa3e249b5b8649"
-    )
+    assert tariff.provenance.effective_on == effective_on
+    assert tariff.provenance.source_locator == source_locator
+    assert tariff.provenance.source_snapshot_digest == source_snapshot_digest
     assert tariff.provenance.currency == "USD"
     assert tariff.provenance.price_unit == "per_1m_tokens"
     assert tariff.provenance.route.provider_config == config
     assert tariff.provenance.route.billing_region == "us-east-1"
-    assert tariff.provenance.route.billing_sku in {"geo-cross-region", "on-demand"}
+    assert tariff.provenance.route.billing_sku == billing_sku
+    assert tuple(
+        (meter.usage_dimension, meter.rate_id) for meter in tariff.provenance.route.billing_meters
+    ) == (
+        ("input_tokens", input_rate_id),
+        ("output_tokens", output_rate_id),
+    )
     assert tariff.price == TokenPriceCeiling(
         input_nano_usd_per_token=input_nano_usd,
         output_nano_usd_per_token=output_nano_usd,
@@ -96,6 +150,36 @@ def test_catalog_lookup_requires_the_exact_frozen_route() -> None:
                 model="zai.glm-5-preview",
                 region="us-east-1",
             )
+        )
+
+
+@pytest.mark.parametrize(
+    "billing_meters",
+    [
+        (ProviderTariffBillingMeter(usage_dimension="input_tokens", rate_id="input-meter"),),
+        (
+            ProviderTariffBillingMeter(usage_dimension="output_tokens", rate_id="output-meter"),
+            ProviderTariffBillingMeter(usage_dimension="input_tokens", rate_id="input-meter"),
+        ),
+        (
+            ProviderTariffBillingMeter(usage_dimension="input_tokens", rate_id="input-meter-one"),
+            ProviderTariffBillingMeter(usage_dimension="input_tokens", rate_id="input-meter-two"),
+        ),
+    ],
+)
+def test_tariff_route_requires_exact_input_and_output_billing_meters(
+    billing_meters: tuple[ProviderTariffBillingMeter, ...],
+) -> None:
+    with pytest.raises(ValidationError, match="billing_meters|input_tokens then output_tokens"):
+        ProviderTariffRoute(
+            provider_config=ProviderConfig(
+                kind=ProviderKind.BEDROCK,
+                model="zai.glm-5",
+                region="us-east-1",
+            ),
+            billing_region="us-east-1",
+            billing_sku="on-demand",
+            billing_meters=billing_meters,
         )
 
 
@@ -155,6 +239,8 @@ def test_caller_supplied_tariff_freezes_an_exact_azure_responses_route() -> None
         price_unit="per_1m_tokens",
         billing_region="eastus2",
         billing_sku="global-standard",
+        input_rate_id="synthetic-input-meter",
+        output_rate_id="synthetic-output-meter",
     )
 
     meter = provider_cost_meter(tariff, input_overhead_tokens=16_384)
@@ -192,6 +278,8 @@ def test_azure_tariff_cannot_be_rebound_to_a_different_deployment() -> None:
         price_unit="per_1m_tokens",
         billing_region="eastus2",
         billing_sku="global-standard",
+        input_rate_id="synthetic-input-meter",
+        output_rate_id="synthetic-output-meter",
     )
     drifted_config = config.model_copy(update={"deployment": "different-deployment"})
 
@@ -244,6 +332,8 @@ def test_tariff_rejects_routes_with_environment_resolved_coordinates(
             price_unit="per_1m_tokens",
             billing_region="us-east-1",
             billing_sku="test-sku",
+            input_rate_id="test-input-meter",
+            output_rate_id="test-output-meter",
         )
 
 
@@ -323,6 +413,8 @@ def test_azure_tariff_route_rejects_endpoint_credential_channels(endpoint: str) 
             price_unit="per_1m_tokens",
             billing_region="eastus2",
             billing_sku="global-standard",
+            input_rate_id="synthetic-input-meter",
+            output_rate_id="synthetic-output-meter",
         )
 
 

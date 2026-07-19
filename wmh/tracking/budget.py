@@ -163,15 +163,33 @@ class TokenPriceCeiling(BaseModel):
         )
 
 
+class ProviderTariffBillingMeter(BaseModel):
+    """One exact provider billing identifier for a priced usage dimension."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    usage_dimension: Literal["input_tokens", "output_tokens"]
+    rate_id: str = Field(min_length=1, max_length=256)
+
+    @field_validator("rate_id")
+    @classmethod
+    def _require_exact_nonblank_rate_id(cls, value: str) -> str:
+        if value != value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError("tariff billing rate identifier must be an exact printable value")
+        return value
+
+
 class ProviderTariffRoute(BaseModel):
     """Exact nonsecret execution and billing coordinates for one price record."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     provider_config: ProviderConfig
     billing_region: str = Field(min_length=1, max_length=128)
     billing_sku: str = Field(min_length=1, max_length=128)
+    billing_meters: tuple[ProviderTariffBillingMeter, ...] = Field(min_length=2, max_length=2)
 
     @field_validator("provider_config", mode="after")
     @classmethod
@@ -187,6 +205,11 @@ class ProviderTariffRoute(BaseModel):
 
     @model_validator(mode="after")
     def _require_complete_execution_route(self) -> Self:
+        if tuple(meter.usage_dimension for meter in self.billing_meters) != (
+            "input_tokens",
+            "output_tokens",
+        ):
+            raise ValueError("tariff billing meters must identify input_tokens then output_tokens")
         config = self.provider_config
         if config.kind is ProviderKind.BEDROCK:
             if config.region is None:
@@ -227,7 +250,7 @@ class ProviderTariffProvenance(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     source_locator: str = Field(min_length=1, max_length=2_048)
     source_snapshot_digest: str = Field(pattern=_DIGEST_PATTERN)
     verified_on: date

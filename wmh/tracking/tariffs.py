@@ -14,14 +14,29 @@ from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.models import resolve_provider_model
 from wmh.tracking.budget import (
     ProviderCostMeter,
+    ProviderTariffBillingMeter,
     ProviderTariffProvenance,
     ProviderTariffRoute,
     TokenPriceCeiling,
 )
 
-_AWS_BEDROCK_PRICING = "https://aws.amazon.com/bedrock/pricing/"
+_AWS_BEDROCK_METER_MAP = (
+    "https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/"
+    "bedrockfoundationmodels/USD/current/bedrockfoundationmodels.json"
+)
+# SHA-256 of the decoded JSON entity published as
+# plc-bedrockfoundationmodels-usd-20260703085857 on 2026-07-03.
+_AWS_BEDROCK_METER_MAP_DIGEST = (
+    "sha256:70ac2fe2f4153bf763492345b2029f06fefdb683023c420319a5b25679f02a11"
+)
+_AWS_BEDROCK_PRICE_LIST = (
+    "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrock/current/index.json"
+)
+# SHA-256 of AmazonBedrock offer version 20260707080509, published on 2026-07-07.
+_AWS_BEDROCK_PRICE_LIST_DIGEST = (
+    "sha256:2df66ba105f0d831725f825d73bbb8c01d3d4fae2bc64ee5527619c62aedced2"
+)
 _CATALOG_VERIFIED_ON = date(2026, 7, 19)
-_CATALOG_EFFECTIVE_ON = date(2026, 7, 19)
 _CATALOG_CURRENCY = "USD"
 _CATALOG_PRICE_UNIT = "per_1m_tokens"
 
@@ -34,6 +49,11 @@ class _BedrockCatalogRecord(BaseModel):
     model_type: str
     model: str
     billing_sku: str
+    source_locator: str
+    source_snapshot_digest: str
+    effective_on: date
+    input_rate_id: str
+    output_rate_id: str
     input_usd: str
     output_usd: str
 
@@ -43,6 +63,11 @@ _BEDROCK_CATALOG_RECORDS = (
         model_type="claude-haiku-4-5",
         model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
         billing_sku="geo-cross-region",
+        source_locator=_AWS_BEDROCK_METER_MAP,
+        source_snapshot_digest=_AWS_BEDROCK_METER_MAP_DIGEST,
+        effective_on=date(2026, 7, 19),
+        input_rate_id="JQDUC8Q4K8C6GSGH.4799GE89SK.6YS6EN2CT7",
+        output_rate_id="X629GDA2GXAP6R54.4799GE89SK.6YS6EN2CT7",
         input_usd="1.1",
         output_usd="5.5",
     ),
@@ -50,6 +75,11 @@ _BEDROCK_CATALOG_RECORDS = (
         model_type="glm-5",
         model="zai.glm-5",
         billing_sku="on-demand",
+        source_locator=_AWS_BEDROCK_PRICE_LIST,
+        source_snapshot_digest=_AWS_BEDROCK_PRICE_LIST_DIGEST,
+        effective_on=date(2026, 7, 1),
+        input_rate_id="YTB2BH9W4UZVKTEG.JRTCKXETXF.6YS6EN2CT7",
+        output_rate_id="8RQBEKEP5KG2MZY7.JRTCKXETXF.6YS6EN2CT7",
         input_usd="1",
         output_usd="3.2",
     ),
@@ -57,43 +87,15 @@ _BEDROCK_CATALOG_RECORDS = (
         model_type="claude-opus-4-8",
         model="us.anthropic.claude-opus-4-8",
         billing_sku="geo-cross-region",
+        source_locator=_AWS_BEDROCK_METER_MAP,
+        source_snapshot_digest=_AWS_BEDROCK_METER_MAP_DIGEST,
+        effective_on=date(2026, 7, 19),
+        input_rate_id="4AVHTD2NXFKSU6HU.4799GE89SK.6YS6EN2CT7",
+        output_rate_id="YKJ5FPMCZAQF5BHF.4799GE89SK.6YS6EN2CT7",
         input_usd="5.5",
         output_usd="27.5",
     ),
 )
-
-_AWS_BEDROCK_SOURCE_SNAPSHOT_DIGEST = (
-    "sha256:1936d89d798e83cbee0d3d95a886a720c7e2de2bb6fe6e86cdfa3e249b5b8649"
-)
-
-
-def _normalized_bedrock_source_snapshot_digest() -> str:
-    return (
-        "sha256:"
-        + hashlib.sha256(
-            json.dumps(
-                {
-                    "currency": _CATALOG_CURRENCY,
-                    "effective_on": _CATALOG_EFFECTIVE_ON.isoformat(),
-                    "price_unit": _CATALOG_PRICE_UNIT,
-                    "records": [
-                        record.model_dump(mode="json") for record in _BEDROCK_CATALOG_RECORDS
-                    ],
-                    "source_locator": _AWS_BEDROCK_PRICING,
-                    "verified_on": _CATALOG_VERIFIED_ON.isoformat(),
-                },
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
-    )
-
-
-# A new route, SKU, region, or effective price requires an explicitly reviewed source snapshot
-# digest update. This fail-closed check prevents the evidence digest from following edited rows.
-if _normalized_bedrock_source_snapshot_digest() != _AWS_BEDROCK_SOURCE_SNAPSHOT_DIGEST:
-    raise RuntimeError("built-in Bedrock tariff rows differ from their source snapshot digest")
 
 
 class ProviderTokenTariff(BaseModel):
@@ -160,6 +162,8 @@ class ProviderTokenTariff(BaseModel):
         price_unit: Literal["per_1m_tokens"],
         billing_region: str,
         billing_sku: str,
+        input_rate_id: str,
+        output_rate_id: str,
     ) -> ProviderTokenTariff:
         """Freeze a live-verified route price using exact nano-USD ceilings.
 
@@ -183,6 +187,16 @@ class ProviderTokenTariff(BaseModel):
                     provider_config=provider_config,
                     billing_region=billing_region,
                     billing_sku=billing_sku,
+                    billing_meters=(
+                        ProviderTariffBillingMeter(
+                            usage_dimension="input_tokens",
+                            rate_id=input_rate_id,
+                        ),
+                        ProviderTariffBillingMeter(
+                            usage_dimension="output_tokens",
+                            rate_id=output_rate_id,
+                        ),
+                    ),
                 ),
             ),
         )
@@ -230,14 +244,16 @@ def _bedrock_tariff(
         ),
         input_usd=record.input_usd,
         output_usd=record.output_usd,
-        source_locator=_AWS_BEDROCK_PRICING,
-        source_snapshot_digest=_AWS_BEDROCK_SOURCE_SNAPSHOT_DIGEST,
+        source_locator=record.source_locator,
+        source_snapshot_digest=record.source_snapshot_digest,
         verified_on=_CATALOG_VERIFIED_ON,
-        effective_on=_CATALOG_EFFECTIVE_ON,
+        effective_on=record.effective_on,
         currency="USD",
         price_unit="per_1m_tokens",
         billing_region="us-east-1",
         billing_sku=record.billing_sku,
+        input_rate_id=record.input_rate_id,
+        output_rate_id=record.output_rate_id,
     )
 
 
