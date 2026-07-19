@@ -18,8 +18,8 @@ from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, model_validator
 
+from wmh.core.file_lease import exclusive_posix_file_lease
 from wmh.core.text import validate_durable_text
-from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _JOURNAL_VERSION: Literal["1"] = "1"

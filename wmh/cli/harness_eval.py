@@ -16,7 +16,7 @@ from pydantic import TypeAdapter
 from rich.console import Console
 
 from wmh.config import ARTIFACT_DIR
-from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
+from wmh.core.file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.e2b_environment import (
     E2BSpendLimitAttestation,

@@ -12,6 +12,7 @@ from harbor.models.job.config import DatasetConfig
 from typer.testing import CliRunner, Result
 
 from wmh.cli import app
+from wmh.core import file_lease as _file_lease
 from wmh.evals.benchmark import (
     BenchmarkCandidateFailureReason,
     BenchmarkCandidateOutcome,
@@ -26,7 +27,6 @@ from wmh.evals.benchmark import (
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
 )
-from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.e2b_environment import (
     ExactE2BEnvironment,
