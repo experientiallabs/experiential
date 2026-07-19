@@ -248,3 +248,54 @@ def test_load_rejects_backward_publication_time_and_public_record_mode(
     os.chmod(first_path, 0o644)
     with pytest.raises(OSError, match="group or other users"):
         load_study_journal(store)
+
+
+def test_append_never_follows_a_replaced_journal_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    original_directory = tmp_path / "original-journal"
+    original_publish = publisher.publish
+
+    def publish_after_replacement(
+        commitment: StudyPhaseCommitment,
+    ) -> ExternalPublicationReceipt:
+        receipt = original_publish(commitment)
+        store.directory.rename(original_directory)
+        store.directory.mkdir(mode=0o700)
+        return receipt
+
+    monkeypatch.setattr(publisher, "publish", publish_after_replacement)
+
+    with pytest.raises(OSError, match="directory was replaced"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            payload_digest=_digest("plan"),
+            publisher=publisher,
+        )
+
+    assert not (store.directory / "000-preparation_planned.json").exists()
+    assert (original_directory / "000-preparation_planned.json").is_file()
+
+
+def test_create_fsyncs_the_parent_after_creating_the_journal_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    fsynced_identities: set[tuple[int, int]] = set()
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        fsynced_identities.add((metadata.st_dev, metadata.st_ino))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+
+    _store(tmp_path)
+
+    assert parent_identity in fsynced_identities
