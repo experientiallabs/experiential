@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
+    CommandOutput,
     SandboxCleanupError,
     SandboxFactory,
     SandboxHandle,
@@ -91,6 +92,8 @@ class AgentProjectState(BaseModel):
                 candidate = PurePosixPath(path)
                 if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
                     raise ValueError(f"{label} project state contains unsafe path {path!r}")
+                if "\x00" in path or candidate.as_posix() != path:
+                    raise ValueError(f"{label} project state contains non-canonical path {path!r}")
         return self
 
 
@@ -264,7 +267,7 @@ class AgentProject:
         return cast("JsonObject", state.model_dump(mode="json"))
 
     def restore_search_state(self, raw_state: JsonObject) -> None:
-        """Restore a checkpoint into an empty or byte-identical project filesystem.
+        """Restore a checkpoint into an empty project filesystem.
 
         Private files replay only beneath the host-only sibling root. They are never copied into
         the agent-visible workspace or admitted through project tools.
@@ -274,11 +277,10 @@ class AgentProject:
         if self._active_event_sink is not None:
             raise RuntimeError("cannot restore project state during an active agent turn")
         state = AgentProjectState.model_validate(raw_state)
-        if self._file_contents and self._file_contents != state.visible_files:
-            raise ValueError("cannot restore over different agent-visible project state")
-        if self._private_file_contents and self._private_file_contents != state.private_files:
-            raise ValueError("cannot restore over different private project state")
+        if self._file_contents or self._private_file_contents:
+            raise ValueError("cannot restore search state over an initialized project")
         self._close_agent_session()
+        self._initialize_sandbox(self._sandbox, require_empty=True)
         self._file_contents = dict(state.visible_files)
         self._private_file_contents = dict(state.private_files)
         self._initialize_sandbox(self._sandbox)
@@ -612,12 +614,35 @@ class AgentProject:
             PurePosixPath(absolute).relative_to(PurePosixPath(self._private_workspace)).as_posix()
         )
 
-    def _initialize_sandbox(self, sandbox: SandboxHandle) -> None:
+    def _initialize_sandbox(
+        self,
+        sandbox: SandboxHandle,
+        *,
+        require_empty: bool = False,
+    ) -> None:
         """Create the workspace and replay the authoritative project-file mirror."""
-        sandbox.commands.run(
+        created = sandbox.commands.run(
             f"mkdir -p {shlex.quote(self.workspace)} {shlex.quote(self._private_workspace)}",
             timeout=30,
         )
+        if not isinstance(created, CommandOutput):
+            raise RuntimeError("meta-project workspace creation unexpectedly ran in background")
+        if created.exit_code != 0:
+            raise RuntimeError("failed to create the meta-project workspace roots")
+        if require_empty:
+            roots = f"{shlex.quote(self.workspace)} {shlex.quote(self._private_workspace)}"
+            inspected = sandbox.commands.run(
+                f"find {roots} -mindepth 1 -print -quit",
+                timeout=30,
+            )
+            if not isinstance(inspected, CommandOutput):
+                raise RuntimeError("meta-project workspace inspection ran in background")
+            if inspected.exit_code != 0:
+                raise RuntimeError("failed to inspect the meta-project workspace roots")
+            if inspected.stdout:
+                raise ValueError(
+                    "meta-project visible and private workspace roots must be empty before replay"
+                )
         for relative, content in self._file_contents.items():
             absolute = f"{self.workspace}/{relative}"
             self._write_sandbox_file(sandbox, absolute, content)
@@ -653,7 +678,7 @@ class AgentProject:
         self._sandbox_count += 1
         self._live_sandboxes[id(replacement)] = (replacement, replacement_started_at)
         try:
-            self._initialize_sandbox(replacement)
+            self._initialize_sandbox(replacement, require_empty=True)
         except Exception as error:
             try:
                 self._retire_sandbox(replacement)

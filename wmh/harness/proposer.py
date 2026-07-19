@@ -283,14 +283,13 @@ class ProjectDeltaProposer:
             evaluation_dir = f"evaluations/{iteration_dir}/proposal-{record.proposal_index:02d}"
             expected_proposals.setdefault(record.delta_id, proposal_file)
             expected_evaluations.setdefault(record.delta_id, evaluation_dir)
-        for delta_id, proposal_file in expected_proposals.items():
-            evaluation_dir = expected_evaluations[delta_id]
-            existing_proposal = self._proposal_files.setdefault(delta_id, proposal_file)
-            existing_evaluation = self._evaluation_dirs.setdefault(delta_id, evaluation_dir)
-            if existing_proposal != proposal_file or existing_evaluation != evaluation_dir:
-                raise ValueError(
-                    f"delta {delta_id!r} maps to conflicting committed proposal records"
-                )
+        if (
+            self._proposal_files != expected_proposals
+            or self._evaluation_dirs != expected_evaluations
+        ):
+            raise ValueError(
+                "project proposer durable links do not exactly match committed proposal history"
+            )
 
     def propose_batch(
         self,

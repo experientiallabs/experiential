@@ -301,6 +301,42 @@ def test_project_search_state_restores_visible_and_private_roots_without_disclos
     assert "escapes project workspace" in outcome.content
 
 
+def test_project_search_state_rejects_noncanonical_paths() -> None:
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(ValueError, match="non-canonical"):
+        project.restore_search_state(
+            {
+                "schema_version": "wmh.agent-project-state.v1",
+                "visible_files": {"context//iteration.json": "{}"},
+                "private_files": {},
+            }
+        )
+
+
+def test_project_search_restore_rejects_preexisting_workspace_entries() -> None:
+    sandbox = _Sandbox()
+    sandbox.files.values["/home/user/project/stale-checkpoint.json"] = '{"stale": true}'
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(ValueError, match="must be empty"):
+        project.restore_search_state(
+            {
+                "schema_version": "wmh.agent-project-state.v1",
+                "visible_files": {},
+                "private_files": {},
+            }
+        )
+
+
 def test_project_grants_agent_writes_to_exact_files_only() -> None:
     """A turn grant contains agent writes without constraining trusted host writes."""
     sandbox = _Sandbox()

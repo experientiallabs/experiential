@@ -247,6 +247,15 @@ class SearchConfiguration(BaseModel):
     holdout_scorer: SearchScorerConfiguration | None = None
     proposer: SearchProposerConfiguration
 
+    @model_validator(mode="after")
+    def _validate_independent_scorers(self) -> SearchConfiguration:
+        if (
+            self.holdout_scorer is not None
+            and self.holdout_scorer.configuration_id == self.discovery_scorer.configuration_id
+        ):
+            raise ValueError("checkpointed holdout requires an independent scorer configuration")
+        return self
+
 
 class FailureClusterExpansionRecord(BaseModel):
     """Serializable count for one parent-scoped failure-cluster selection key."""
@@ -356,13 +365,18 @@ class SearchCheckpoint(BaseModel):
         if self.archive.reconstruct(self.champion_doc_hash).doc_hash != self.champion_doc_hash:
             raise ValueError("checkpoint champion is not reconstructable from accepted history")
         checkpoint_delta_ids = [delta.delta_id for delta in self.archive.deltas]
-        recorded_delta_ids = [
-            record.delta_id for record in self.proposal_records if record.delta_id is not None
-        ]
+        delta_records = [record for record in self.proposal_records if record.delta_id is not None]
+        recorded_delta_ids = [record.delta_id for record in delta_records]
         if checkpoint_delta_ids != recorded_delta_ids:
             raise ValueError("checkpoint delta archive does not match ordered proposal records")
         if any(delta.verdict is None for delta in self.archive.deltas):
             raise ValueError("checkpoint delta archive contains an unresolved proposal")
+        for delta, record in zip(self.archive.deltas, delta_records, strict=True):
+            assert delta.verdict is not None
+            if delta.verdict.accepted != record.selected:
+                raise ValueError("checkpoint selection does not match delta verdict")
+            if delta.child_doc_hash != record.candidate_doc_hash:
+                raise ValueError("checkpoint proposal candidate does not match delta child")
         if self.proposal_records != sorted(
             self.proposal_records,
             key=lambda record: (record.iteration, record.proposal_index),
@@ -441,6 +455,11 @@ class SearchCheckpoint(BaseModel):
                 or record.report_fingerprint != _score_report_fingerprint(report)
             ):
                 raise ValueError("checkpoint discovery evaluation identity drifted")
+            expected_request = ScoreRequest(
+                purpose=("seed" if doc_hash == self.configuration.seed_doc_hash else "full")
+            )
+            if record.request != expected_request:
+                raise ValueError("checkpoint discovery report request identity drifted")
         for doc_hash, report in self.holdout_reports.items():
             record = evaluations_by_id.get(report.evaluation_id)
             if record is None:
@@ -451,6 +470,8 @@ class SearchCheckpoint(BaseModel):
                 or record.report_fingerprint != _score_report_fingerprint(report)
             ):
                 raise ValueError("checkpoint holdout evaluation identity drifted")
+            if record.request != ScoreRequest(purpose="holdout"):
+                raise ValueError("checkpoint holdout report request identity drifted")
         if self.configuration.proposer.durable_state_required and self.proposer_state is None:
             raise ValueError("checkpoint is missing required durable proposer state")
         return self
@@ -1150,9 +1171,6 @@ def search_harness(
                         "holdout seed task matrix does not match holdout_scorer.task_ids"
                     )
             holdout_reports[seed_doc.doc_hash] = seed_holdout
-        if on_progress is not None:
-            on_progress(0, seed_doc.name, seed_report.score, True)
-
         champion_hash = seed_doc.doc_hash
         best_full = seed_report.score
         suite = sorted(task_id for task_id, task in seed_report.per_task.items() if task.passed)
@@ -1234,6 +1252,8 @@ def search_harness(
 
     if resumed is None:
         _emit_checkpoint(0)
+        if on_progress is not None:
+            on_progress(0, seed_doc.name, reports[seed_doc.doc_hash].score, True)
 
     def _stage_dead(records: list[ProposalRecord], record: ProposalRecord) -> None:
         records.append(record)
@@ -1293,7 +1313,7 @@ def search_harness(
         batch_deltas: list[HarnessDelta] = []
         scored_proposals: list[_ScoredProposal] = []
         seen_delta_ids = {delta.delta_id for delta in archive.deltas}
-        seen_child_hashes = {
+        seen_child_hashes = set(docs) | {
             delta.child_doc_hash for delta in archive.deltas if delta.child_doc_hash is not None
         }
 
@@ -1390,7 +1410,10 @@ def search_harness(
             if child.doc_hash in seen_child_hashes:
                 delta.verdict = GateRecord(
                     accepted=False,
-                    reason="invalid before eval: duplicate of an already-proposed child",
+                    reason=(
+                        "invalid before eval: candidate document hash duplicates an existing "
+                        "scored or proposed document"
+                    ),
                 )
                 skipped += 1
                 _stage_dead(
@@ -1406,7 +1429,10 @@ def search_harness(
                         expected_effect=expected_effect,
                         ops=ops_summary,
                         rationales=rationales,
-                        reason="duplicate of an already-proposed child",
+                        reason=(
+                            "candidate document hash duplicates an existing scored or proposed "
+                            "document"
+                        ),
                         champion_score=frozen_champion_score,
                     ),
                 )
@@ -1747,10 +1773,11 @@ def search_harness(
                 set(suite)
                 | {task_id for task_id, task in winner.report.per_task.items() if task.passed}
             )
-            if on_accept is not None:
-                on_accept(winner.child, winner.delta, winner.report.score)
 
         proposal_records.extend(batch_records)
+        _emit_checkpoint(iteration_index)
+        if winner is not None and on_accept is not None:
+            on_accept(winner.child, winner.delta, winner.report.score)
         if on_proposal is not None:
             for record in batch_records:
                 on_proposal(record)
@@ -1762,7 +1789,6 @@ def search_harness(
                 reports[champion_hash].score,
                 winner is not None,
             )
-        _emit_checkpoint(iteration_index)
 
     _check_cancelled()
     best = docs[champion_hash].model_copy(update={"name": name, "version": 0})

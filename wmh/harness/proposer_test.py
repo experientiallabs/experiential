@@ -793,6 +793,41 @@ def test_project_proposer_checkpoint_restores_private_archives_and_iteration_lin
     assert history["proposal_file"].endswith("/proposals/iteration-0001/proposal-01.json")
 
 
+def test_project_proposer_resume_rejects_uncommitted_link_state() -> None:
+    parent = HarnessDoc.baseline("parent")
+    first_project = _Project([_payload(parent, "first revision")])
+    first = ProjectDeltaProposer(first_project, meta_agent(), _Provider("unused"))
+    [proposal] = first.propose_batch(
+        parent,
+        _trigger(),
+        "inspect failures",
+        history=[],
+        count=1,
+    )
+    assert isinstance(proposal, HarnessDelta)
+    state = first.export_search_state()
+    proposal_files = state["proposal_files"]
+    evaluation_dirs = state["evaluation_dirs"]
+    assert isinstance(proposal_files, dict)
+    assert isinstance(evaluation_dirs, dict)
+    proposal_files["uncommitted-delta"] = "/home/user/project/private-evidence.json"
+    evaluation_dirs["uncommitted-delta"] = "evaluations/uncommitted"
+
+    restored = ProjectDeltaProposer(
+        _Project([]),
+        meta_agent(),
+        _Provider("unused"),
+    )
+    restored.restore_search_state(state)
+    with pytest.raises(ValueError, match="committed proposal history"):
+        restored.resume_from_history(
+            completed_iteration=1,
+            proposal_records=[
+                _ResumeRecord(iteration=1, proposal_index=1, delta_id=proposal.delta_id)
+            ],
+        )
+
+
 def test_project_proposer_recovers_post_manifest_cancellation_without_identity_overwrite() -> None:
     harness = HarnessDoc.baseline("parent")
     project = _Project([])
