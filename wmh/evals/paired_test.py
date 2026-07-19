@@ -352,13 +352,13 @@ def test_preopen_design_template_derives_the_exact_post_open_design() -> None:
     design = _design()
 
     template = PairedEvaluationDesignTemplate.from_design(design)
-    derived = template.derive(task_ids=design.task_ids)
+    derived = template.derive(tasks=design.tasks)
 
     assert derived == design
     assert template.digest.startswith("sha256:")
     assert "task_ids" not in template.model_dump(mode="json")
     assert "blocks" not in template.model_dump(mode="json")
-    assert template.derive(task_ids=tuple(reversed(design.task_ids))) == design
+    assert template.derive(tasks=tuple(reversed(design.tasks))) == design
 
 
 def test_schedule_exactly_balances_even_attempt_counts_within_each_task() -> None:

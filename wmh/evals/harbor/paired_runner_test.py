@@ -153,7 +153,7 @@ def _confirmation(
 
 def _discovery() -> DiscoveryPartition:
     return DiscoveryPartition(
-        partition_version="1",
+        partition_version="2",
         partition_manifest_digest="sha256:" + "3" * 64,
         tasks=(
             DiscoveryTask(
@@ -382,17 +382,17 @@ def test_preopen_commitment_derives_exact_design_and_selection_after_open(
     assert commitment.partition_manifest_digest == confirmation.partition_manifest_digest
     assert commitment.qualification_roster_digest == roster.digest
 
+    original_design = _design()
     drifted_design = PairedEvaluationDesign.create(
-        task_ids=_TASK_IDS,
-        panel=_design().panel,
-        bounded_mean_bets=_design().bounded_mean_bets,
-        schedule_seed=_design().schedule_seed,
+        tasks=original_design.tasks,
+        panel=original_design.panel,
+        primary_e_value_bets=original_design.primary_e_value_bets,
+        schedule_seed=original_design.schedule_seed,
         analysis_seed="drifted-after-open",
-        randomization_samples=_design().randomization_samples,
-        alpha=_design().alpha,
-        minimum_panel_delta=_design().minimum_panel_delta,
-        minimum_member_delta=_design().minimum_member_delta,
-        noninferiority_margin=_design().noninferiority_margin,
+        randomization_samples=original_design.randomization_samples,
+        alpha=original_design.alpha,
+        minimum_equal_task_member_delta=original_design.minimum_equal_task_member_delta,
+        noninferiority_margin=original_design.noninferiority_margin,
     )
     with pytest.raises(ValueError, match="design drifted from the pre-open commitment"):
         mod.PairedHarborProtocol.freeze(

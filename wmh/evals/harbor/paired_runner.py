@@ -963,8 +963,13 @@ class HarborConfirmationExecutionCommitment(BaseModel):
             or frozen.confirmation_protocol_digest != self.digest
         ):
             raise ValueError("confirmation opening differs from the pre-open commitment")
-        task_ids = tuple(task.task_id for task in frozen.tasks)
-        design = self.design_template.derive(task_ids=task_ids)
+        design = self.design_template.derive(
+            tasks=tuple(
+                PairedTaskPlan(task_id=task.task_id, group_id=task.group_id)
+                for task in frozen.tasks
+            )
+        )
+        task_ids = design.task_ids
         roster_by_id = {task.task_id: task for task in self.qualification_roster.tasks}
         expected_ids = set(roster_by_id) - {task.task_id for task in self.discovery.tasks}
         if set(task_ids) != expected_ids:
@@ -1248,7 +1253,12 @@ class PairedHarborProtocol(BaseModel):
         frozen_selection = OpenedHarborExecutionSelection.model_validate(
             opened_selection.model_dump()
         )
-        if frozen_design != frozen_commitment.derive_design(frozen_confirmation):
+        expected_design = frozen_commitment.derive_design(frozen_confirmation)
+        if frozen_design.tasks != expected_design.tasks:
+            raise ValueError(
+                "paired Harbor design task clusters drifted from the pre-open commitment"
+            )
+        if frozen_design != expected_design:
             raise ValueError("paired Harbor design drifted from the pre-open commitment")
         expected_selection = OpenedHarborExecutionSelection.project(
             execution_plan=frozen_plan,
