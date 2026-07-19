@@ -19,16 +19,16 @@ from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import JsonObject
 from wmh.engine.world_model import WorldModel
-from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
-from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
+from wmh.evals.closed_loop import ClosedLoopReport, RolloutEvidence, TaskOutcome
+from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness import create as create_module
 from wmh.harness.create import (
     CreateResult,
     HarnessSearchCancelled,
     ProposalRecord,
-    cluster_failures,
     create_harness,
+    search_harness,
     select_failure_cluster,
 )
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta
@@ -36,7 +36,13 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.mutate import parse_delta
 from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
-from wmh.harness.runtime import Runtime
+from wmh.harness.runtime import Runtime, StopReason
+from wmh.harness.scoring import (
+    HarnessScoreReport,
+    ScoreCapabilities,
+    ScoreRequest,
+    TaskScore,
+)
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
@@ -174,6 +180,352 @@ def _run(
     )
 
 
+class _NeutralScorer:
+    """A ground-truth-like scorer with no world-model dependencies."""
+
+    capabilities = ScoreCapabilities()
+    default_attempts = 2
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, ScoreRequest]] = []
+        self.before_proposal_calls = 0
+
+    def validate_candidate(self, candidate: HarnessDoc) -> str | None:
+        return None
+
+    def before_proposal_batch(self) -> None:
+        self.before_proposal_calls += 1
+
+    def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+        self.requests.append((candidate.doc_hash, request))
+        prompt = candidate.surface("prompt:core")
+        passed = prompt is not None and "careful agent" in prompt.content
+        score = 1.0 if passed else 0.0
+        return HarnessScoreReport(
+            evaluation_id=f"fake:{candidate.doc_hash}:{request.purpose}",
+            label=candidate.name,
+            score=score,
+            secondary_score=score,
+            attempts=self.default_attempts,
+            per_task={
+                "ground-truth-task": TaskScore(
+                    task_id="ground-truth-task",
+                    score=score,
+                    secondary_score=score,
+                    passed=passed,
+                    description="repair the repository",
+                    mechanisms=() if passed else ("missing verification",),
+                    evidence="verifier reward and execution trace",
+                )
+            },
+        )
+
+
+class _EvidenceRecordingProposer:
+    """Return one deterministic delta and retain the scorer evidence."""
+
+    def __init__(self) -> None:
+        self.evidence: list[str] = []
+
+    def propose_batch(
+        self,
+        parent: HarnessDoc,
+        trigger: FailureSignature,
+        evidence: str,
+        *,
+        history: list[HarnessDelta],
+        count: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[HarnessDelta | ProposalFailure | None]:
+        del history, should_cancel
+        assert count == 1
+        self.evidence.append(evidence)
+        proposal = parse_delta(parent, trigger, _meta_reply(parent, _CAREFUL_PROMPT))
+        assert proposal is not None
+        return [proposal]
+
+
+def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:
+    seed = HarnessDoc.baseline("seed")
+    scorer = _NeutralScorer()
+    proposer = _EvidenceRecordingProposer()
+
+    result = search_harness(
+        "winner",
+        seed,
+        scorer,
+        proposer,
+        iterations=1,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+    )
+
+    assert result.best_score == 1.0
+    assert result.best.name == "winner"
+    assert [request.purpose for _, request in scorer.requests] == ["seed", "full"]
+    assert scorer.before_proposal_calls == 1
+    assert "verifier reward and execution trace" in proposer.evidence[0]
+    assert result.suite == ["ground-truth-task"]
+
+
+def test_search_harness_rejects_unsupported_paid_stages_before_scoring() -> None:
+    scorer = _NeutralScorer()
+
+    with pytest.raises(ValueError, match="screen_proposals=False"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _EvidenceRecordingProposer(),
+            iterations=0,
+        )
+
+    assert scorer.requests == []
+
+
+def test_search_harness_rejects_negative_iterations() -> None:
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match="iterations must be non-negative"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _EvidenceRecordingProposer(),
+            iterations=-1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+    assert scorer.requests == []
+
+
+def test_search_harness_rejects_default_attempt_count_drift() -> None:
+    class WrongAttemptsScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            return report.model_copy(update={"attempts": self.default_attempts + 1})
+
+    with pytest.raises(ValueError, match="attempts=3.*expected attempts=2"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            WrongAttemptsScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_rejects_candidate_that_omits_a_discovery_task() -> None:
+    class OmittingScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            if request.purpose != "seed":
+                return report
+            required = TaskScore(
+                task_id="required-task",
+                score=0.0,
+                secondary_score=0.0,
+                passed=False,
+            )
+            return report.model_copy(
+                update={"per_task": {**report.per_task, required.task_id: required}}
+            )
+
+    with pytest.raises(ValueError, match="wrong task set.*required-task"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            OmittingScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_rejects_candidate_that_omits_a_holdout_task() -> None:
+    class OmittingHoldoutScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            if len(self.requests) != 1:
+                return report
+            required = TaskScore(
+                task_id="held-out-required",
+                score=0.0,
+                secondary_score=0.0,
+                passed=False,
+            )
+            return report.model_copy(
+                update={"per_task": {**report.per_task, required.task_id: required}}
+            )
+
+    with pytest.raises(ValueError, match="wrong task set.*held-out-required"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            holdout_scorer=OmittingHoldoutScorer(),
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_rejects_evaluation_identity_collision() -> None:
+    class CollidingScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            return report.model_copy(update={"evaluation_id": "reused-id"})
+
+    with pytest.raises(ValueError, match="evaluation_id 'reused-id'.*different report"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            CollidingScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_snapshots_and_canonicalizes_scorer_owned_reports() -> None:
+    class RetainingScorer(_NeutralScorer):
+        source_report: HarnessScoreReport | None = None
+
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            extra = TaskScore(
+                task_id="another-task",
+                score=0.0,
+                secondary_score=0.0,
+                passed=False,
+                evidence="another immutable trace",
+            )
+            self.source_report = report.model_copy(
+                update={
+                    "per_task": {
+                        "ground-truth-task": report.per_task["ground-truth-task"],
+                        "another-task": extra,
+                    }
+                }
+            )
+            return self.source_report
+
+    seed = HarnessDoc.baseline("seed")
+    scorer = RetainingScorer()
+    result = search_harness(
+        "winner",
+        seed,
+        scorer,
+        _EvidenceRecordingProposer(),
+        iterations=0,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+    )
+    source = scorer.source_report
+    assert source is not None
+    audited = result.reports[seed.doc_hash]
+    assert list(audited.per_task) == ["another-task", "ground-truth-task"]
+
+    source.score = 1.0
+    source.per_task["ground-truth-task"].score = 1.0
+    source.per_task["ground-truth-task"].evidence = "mutated after return"
+    source.per_task["late-task"] = TaskScore(
+        task_id="late-task",
+        score=1.0,
+        secondary_score=1.0,
+        passed=True,
+    )
+
+    assert audited.score == 0.0
+    assert audited.per_task["ground-truth-task"].score == 0.0
+    assert audited.per_task["ground-truth-task"].evidence == "verifier reward and execution trace"
+    assert "late-task" not in audited.per_task
+
+
+def test_search_harness_rejects_empty_seed_and_holdout_matrices() -> None:
+    class EmptyScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            return report.model_copy(update={"score": 0.0, "secondary_score": 0.0, "per_task": {}})
+
+    with pytest.raises(ValueError, match="seed score report contains no tasks"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            EmptyScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+    with pytest.raises(ValueError, match="holdout seed score report contains no tasks"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            holdout_scorer=EmptyScorer(),
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_validates_and_retires_both_scorers() -> None:
+    class RejectingHoldoutScorer(_NeutralScorer):
+        def validate_candidate(self, candidate: HarnessDoc) -> str | None:
+            prompt = candidate.surface("prompt:core")
+            return (
+                "holdout runtime rejected candidate"
+                if prompt and "careful" in prompt.content
+                else None
+            )
+
+    discovery = _NeutralScorer()
+    holdout = RejectingHoldoutScorer()
+    result = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        discovery,
+        _EvidenceRecordingProposer(),
+        iterations=1,
+        screen_proposals=False,
+        holdout_scorer=holdout,
+        confirm_narrow_vetoes=False,
+    )
+
+    assert [request.purpose for _, request in discovery.requests] == ["seed"]
+    assert [request.purpose for _, request in holdout.requests] == ["holdout"]
+    assert discovery.before_proposal_calls == holdout.before_proposal_calls == 1
+    assert result.proposal_records[0].outcome == "invalid"
+    assert "holdout runtime rejected candidate" in (result.proposal_records[0].reason or "")
+
+
+def test_search_harness_validates_seed_against_holdout_before_scoring() -> None:
+    class RejectingHoldoutScorer(_NeutralScorer):
+        def validate_candidate(self, candidate: HarnessDoc) -> str | None:
+            return "holdout runtime rejected seed"
+
+    discovery = _NeutralScorer()
+    holdout = RejectingHoldoutScorer()
+    with pytest.raises(ValueError, match="holdout seed is not eligible"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            discovery,
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            holdout_scorer=holdout,
+            confirm_narrow_vetoes=False,
+        )
+    assert discovery.requests == holdout.requests == []
+
+
 def test_create_accepts_improving_delta_and_promotes_suite() -> None:
     seed = HarnessDoc.baseline("seed")
     provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
@@ -307,17 +659,17 @@ def test_cancellation_wins_before_accepted_lineage_and_callback_mutate(
     provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
     cancelled = False
     crowned: list[str] = []
-    gate_delta = create_module.gate_delta
+    gate_delta = create_module.gate_score_delta
 
     def cancelling_gate(
         delta: HarnessDelta,
         *,
-        child: ClosedLoopReport,
-        champion: ClosedLoopReport,
+        child: HarnessScoreReport,
+        champion: HarnessScoreReport,
         best_full: float,
         suite: list[str],
-        child_holdout: ClosedLoopReport | None = None,
-        champion_holdout: ClosedLoopReport | None = None,
+        child_holdout: HarnessScoreReport | None = None,
+        champion_holdout: HarnessScoreReport | None = None,
     ) -> GateRecord:
         nonlocal cancelled
         verdict = gate_delta(
@@ -333,7 +685,7 @@ def test_cancellation_wins_before_accepted_lineage_and_callback_mutate(
             cancelled = True
         return verdict
 
-    monkeypatch.setattr(create_module, "gate_delta", cancelling_gate)
+    monkeypatch.setattr(create_module, "gate_score_delta", cancelling_gate)
 
     with pytest.raises(HarnessSearchCancelled, match="cancelled"):
         _run(
@@ -393,44 +745,6 @@ def test_holdout_regression_rejects_a_full_split_win() -> None:
 
 
 # -- deterministic failure clustering ---------------------------------------------------------
-
-
-def _failing(task_id: str, unmet: list[str]) -> TaskOutcome:
-    verdict = GoldVerdict(
-        passed=False,
-        fraction=0.0,
-        assertions=[AssertionResult(assertion=a, passed=False, why="w") for a in unmet],
-    )
-    return TaskOutcome(
-        task_id=task_id, success_rate=0.0, mean_fraction=0.0, passes=2, verdicts=[verdict, verdict]
-    )
-
-
-def test_cluster_failures_groups_by_shared_assertions() -> None:
-    report = ClosedLoopReport(
-        per_task={
-            "t1": _failing("t1", ["a", "b"]),
-            "t2": _failing("t2", ["b", "c"]),
-            "t3": _failing("t3", ["z"]),
-            "t4": TaskOutcome(task_id="t4", success_rate=1.0, mean_fraction=1.0, passes=2),
-            "t5": _failing("t5", []),  # unparseable judge: no per-assertion detail
-        }
-    )
-    tasks = [TaskSpec(task_id=t, instruction=t) for t in ("t1", "t2", "t3", "t4", "t5")]
-    clusters = cluster_failures(report, tasks)
-    assert [c.task_ids for c in clusters] == [["t1", "t2"], ["t5"], ["t3"]]
-    # t1+t2 connect through shared assertion "b", which also labels the mechanism.
-    assert clusters[0].mechanism == "b"
-    assert clusters[0].unmet_assertions == ["a", "b", "c"]
-    assert clusters[1].mechanism == "run failed without per-assertion verdicts"
-    assert clusters[2].mechanism == "z"
-
-
-def test_cluster_failures_empty_when_everything_passes() -> None:
-    report = ClosedLoopReport(
-        per_task={"t1": TaskOutcome(task_id="t1", success_rate=1.0, mean_fraction=1.0, passes=3)}
-    )
-    assert cluster_failures(report, [TaskSpec(task_id="t1", instruction="i")]) == []
 
 
 def test_select_failure_cluster_rotates_equally_sized_failures() -> None:
@@ -644,8 +958,8 @@ def test_screen_uses_assertion_fraction_to_admit_partial_improvement() -> None:
     [record] = result.proposal_records
     assert record.outcome == "scored"
     assert record.screen_child == record.screen_parent == 0.0
-    assert record.screen_parent_fraction == 0.0
-    assert record.screen_child_fraction == 0.5
+    assert record.screen_parent_secondary == 0.0
+    assert record.screen_child_secondary == 0.5
 
 
 def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regresses() -> None:
@@ -653,24 +967,28 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
     delta = HarnessDelta.model_construct(
         trigger=FailureSignature(mechanism="target", task_ids=["target"])
     )
-    champion = ClosedLoopReport(
-        success_rate=0.0,
-        mean_fraction=0.45,
+    champion = HarnessScoreReport(
+        evaluation_id="champion",
+        score=0.0,
+        secondary_score=0.45,
+        attempts=1,
         per_task={
-            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.0),
-            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.9),
+            "target": TaskScore(task_id="target", score=0.0, secondary_score=0.0, passed=False),
+            "other": TaskScore(task_id="other", score=0.0, secondary_score=0.9, passed=False),
         },
     )
-    child = ClosedLoopReport(
-        success_rate=0.0,
-        mean_fraction=0.25,
+    child = HarnessScoreReport(
+        evaluation_id="child",
+        score=0.0,
+        secondary_score=0.25,
+        attempts=1,
         per_task={
-            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.5),
-            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.0),
+            "target": TaskScore(task_id="target", score=0.0, secondary_score=0.5, passed=False),
+            "other": TaskScore(task_id="other", score=0.0, secondary_score=0.0, passed=False),
         },
     )
 
-    verdict = create_module.gate_delta(
+    verdict = create_module.gate_score_delta(
         delta,
         child=child,
         champion=champion,
@@ -680,32 +998,36 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
 
     assert verdict.accepted is False
     assert verdict.full_delta == 0.0
-    assert verdict.full_fraction_delta == pytest.approx(-0.2)
-    assert "full-split assertion fraction regressed" in verdict.reason
+    assert verdict.full_secondary_delta == pytest.approx(-0.2)
+    assert "full-split secondary score regressed" in verdict.reason
 
 
 def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() -> None:
     delta = HarnessDelta.model_construct(
         trigger=FailureSignature(mechanism="target", task_ids=["target"])
     )
-    champion = ClosedLoopReport(
-        success_rate=0.0,
-        mean_fraction=0.1,
+    champion = HarnessScoreReport(
+        evaluation_id="champion",
+        score=0.0,
+        secondary_score=0.1,
+        attempts=1,
         per_task={
-            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.0),
-            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.2),
+            "target": TaskScore(task_id="target", score=0.0, secondary_score=0.0, passed=False),
+            "other": TaskScore(task_id="other", score=0.0, secondary_score=0.2, passed=False),
         },
     )
-    child = ClosedLoopReport(
-        success_rate=0.0,
-        mean_fraction=0.35,
+    child = HarnessScoreReport(
+        evaluation_id="child",
+        score=0.0,
+        secondary_score=0.35,
+        attempts=1,
         per_task={
-            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.5),
-            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.2),
+            "target": TaskScore(task_id="target", score=0.0, secondary_score=0.5, passed=False),
+            "other": TaskScore(task_id="other", score=0.0, secondary_score=0.2, passed=False),
         },
     )
 
-    verdict = create_module.gate_delta(
+    verdict = create_module.gate_score_delta(
         delta,
         child=child,
         champion=champion,
@@ -714,7 +1036,7 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
     )
 
     assert verdict.accepted is True
-    assert verdict.full_fraction_delta == pytest.approx(0.25)
+    assert verdict.full_secondary_delta == pytest.approx(0.25)
 
 
 def test_search_records_screen_and_full_trace_feedback_for_project_proposers() -> None:
@@ -929,7 +1251,7 @@ def test_narrow_failing_tiers_eligibility() -> None:
         full_delta=0.05,
         suite_delta=-0.05,
         holdout_delta=0.0,
-        holdout_fraction_delta=-0.2,
+        holdout_secondary_delta=-0.2,
     )
     assert narrow_failing_tiers(dense_veto, k=5, n_suite=8, n_holdout=4) is None
     # Accepted verdicts are never retried.
@@ -1043,10 +1365,92 @@ def _pi_seed() -> HarnessDoc:
 
 
 def _canned_report(rate: float, *, k: int = 3) -> ClosedLoopReport:
-    outcome = TaskOutcome(task_id="t1", success_rate=rate, mean_fraction=rate, passes=k)
+    successes = round(rate * k)
+    if abs(successes / k - rate) > 1e-9:
+        raise ValueError(f"rate {rate} cannot be represented by k={k} binary verdicts")
+    verdicts = [
+        GoldVerdict(passed=index < successes, fraction=1.0 if index < successes else 0.0)
+        for index in range(k)
+    ]
+    attempts = [RolloutEvidence(stop_reason=StopReason.SUBMITTED) for _ in range(k)]
+    outcome = TaskOutcome(
+        task_id="t1",
+        success_rate=rate,
+        mean_fraction=rate,
+        passes=k,
+        verdicts=verdicts,
+        attempts=attempts,
+    )
     return ClosedLoopReport(
         label="x", success_rate=rate, mean_fraction=rate, k=k, per_task={"t1": outcome}
     )
+
+
+def _corrupt_closed_loop_report(kind: str) -> ClosedLoopReport:
+    """Return one malformed raw evaluator result for adapter fail-closed tests."""
+    report = _canned_report(1.0)
+    outcome = report.per_task["t1"].model_copy(deep=True)
+    if kind == "missing task":
+        return report.model_copy(update={"per_task": {}})
+    if kind == "extra task":
+        extra = outcome.model_copy(update={"task_id": "t2"})
+        return report.model_copy(update={"per_task": {"t1": outcome, "t2": extra}})
+    if kind == "mismatched task id":
+        outcome = outcome.model_copy(update={"task_id": "not-t1"})
+    elif kind == "wrong pass count":
+        outcome = outcome.model_copy(update={"passes": 2})
+    elif kind == "missing verdict":
+        outcome = outcome.model_copy(update={"verdicts": outcome.verdicts[:-1]})
+    elif kind == "missing evidence":
+        outcome = outcome.model_copy(update={"attempts": outcome.attempts[:-1]})
+    elif kind == "task score drift":
+        outcome = outcome.model_copy(update={"success_rate": 0.5})
+    elif kind == "task secondary drift":
+        outcome = outcome.model_copy(update={"mean_fraction": 0.5})
+    elif kind == "aggregate score drift":
+        return report.model_copy(update={"success_rate": 0.5})
+    elif kind == "aggregate secondary drift":
+        return report.model_copy(update={"mean_fraction": 0.5})
+    else:
+        raise AssertionError(f"unknown corruption {kind!r}")
+    return report.model_copy(update={"per_task": {"t1": outcome}})
+
+
+@pytest.mark.parametrize(
+    ("kind", "error"),
+    [
+        ("missing task", "wrong task set.*missing=\\['t1'\\]"),
+        ("extra task", "wrong task set.*extra=\\['t2'\\]"),
+        ("mismatched task id", "key 't1'.*task_id 'not-t1'"),
+        ("wrong pass count", "task 't1'.*passes=2.*expected 3"),
+        ("missing verdict", "task 't1'.*2 verdicts.*expected 3"),
+        ("missing evidence", "task 't1'.*2 evidence.*expected 3"),
+        ("task score drift", "task 't1'.*success_rate=0.5.*verdicts=1.0"),
+        ("task secondary drift", "task 't1'.*mean_fraction=0.5.*verdicts=1.0"),
+        ("aggregate score drift", "report success_rate=0.5.*per-task mean=1.0"),
+        ("aggregate secondary drift", "report mean_fraction=0.5.*per-task mean=1.0"),
+    ],
+)
+def test_closed_loop_adapter_rejects_incomplete_or_inconsistent_raw_reports(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    error: str,
+) -> None:
+    provider = RoleProvider()
+    malformed = _corrupt_closed_loop_report(kind)
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", lambda *args, **kwargs: malformed)
+
+    with pytest.raises(ValueError, match=error):
+        create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            iterations=0,
+        )
 
 
 class _ScriptedPoolChannel:
@@ -1290,6 +1694,37 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
     assert observed_usage == [SandboxUsage(count=0, seconds=0.0)]
 
 
+@pytest.mark.parametrize("duplicate_split", ["discovery", "holdout"])
+def test_e2b_pool_is_closed_when_scorer_construction_rejects_duplicate_task_ids(
+    fake_pool_cls: type[_FakePool], duplicate_split: str
+) -> None:
+    """Task validation after pool creation remains inside the pool's lifecycle boundary."""
+    provider = RoleProvider()
+    duplicate_tasks = [*_tasks(), *_tasks()]
+    discovery = duplicate_tasks if duplicate_split == "discovery" else _tasks()
+    holdout = duplicate_tasks if duplicate_split == "holdout" else None
+    observed_usage: list[SandboxUsage] = []
+
+    with pytest.raises(ValueError, match="closed-loop search task ids must be unique"):
+        create_harness(
+            "winner",
+            _pi_seed(),
+            discovery,
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            iterations=0,
+            holdout=holdout,
+            harness_backend="e2b",
+            on_sandbox_usage=observed_usage.append,
+        )
+
+    [pool] = fake_pool_cls.instances
+    assert pool.closes == 1
+    assert observed_usage == [SandboxUsage(count=0, seconds=0.0)]
+
+
 def test_e2b_cleanup_failure_replaces_cancellation_and_withholds_final_usage(
     monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
 ) -> None:
@@ -1402,6 +1837,7 @@ def test_cancellation_carries_completed_and_partial_wave_worker_usage(
             ProviderDeltaProposer(provider),
             GoldJudge(provider),
             iterations=1,
+            k=2,
             harness_backend="e2b",
         )
 
@@ -1433,6 +1869,7 @@ def test_e2b_pool_retires_idle_runners_once_per_proposal_batch(
         GoldJudge(provider),
         iterations=2,
         proposal_batch_size=3,
+        k=2,
         harness_backend="e2b",
     )
 
@@ -1529,6 +1966,7 @@ def test_create_sums_worker_usage_across_score_waves(
         ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
+        k=2,
         harness_backend="e2b",
     )
 
@@ -1611,6 +2049,7 @@ def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
         ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
+        k=2,
         harness_backend="e2b",
     )
 
@@ -1870,17 +2309,17 @@ def test_cancellation_during_later_sibling_commits_no_iteration(
         ]
     )
     cancelled = False
-    gate_delta = create_module.gate_delta
+    gate_delta = create_module.gate_score_delta
 
     def cancel_after_first_gate(
         delta: HarnessDelta,
         *,
-        child: ClosedLoopReport,
-        champion: ClosedLoopReport,
+        child: HarnessScoreReport,
+        champion: HarnessScoreReport,
         best_full: float,
         suite: list[str],
-        child_holdout: ClosedLoopReport | None = None,
-        champion_holdout: ClosedLoopReport | None = None,
+        child_holdout: HarnessScoreReport | None = None,
+        champion_holdout: HarnessScoreReport | None = None,
     ) -> GateRecord:
         nonlocal cancelled
         verdict = gate_delta(
@@ -1895,7 +2334,7 @@ def test_cancellation_during_later_sibling_commits_no_iteration(
         cancelled = True
         return verdict
 
-    monkeypatch.setattr(create_module, "gate_delta", cancel_after_first_gate)
+    monkeypatch.setattr(create_module, "gate_score_delta", cancel_after_first_gate)
     progress: list[tuple[int, str, float, bool]] = []
     crowned: list[str] = []
     proposals: list[ProposalRecord] = []
@@ -2033,21 +2472,21 @@ def test_sibling_holdout_gates_use_frozen_iteration_champion(
         True if "the holdout task" in user else "done-verified" in user
     )
     holdout = [TaskSpec(task_id="h1", instruction="the holdout task", gold=["still works"])]
-    gate_delta = create_module.gate_delta
+    gate_delta = create_module.gate_score_delta
     holdout_gate_champions: list[tuple[float, float]] = []
 
     def capture_gate_baselines(
         delta: HarnessDelta,
         *,
-        child: ClosedLoopReport,
-        champion: ClosedLoopReport,
+        child: HarnessScoreReport,
+        champion: HarnessScoreReport,
         best_full: float,
         suite: list[str],
-        child_holdout: ClosedLoopReport | None = None,
-        champion_holdout: ClosedLoopReport | None = None,
+        child_holdout: HarnessScoreReport | None = None,
+        champion_holdout: HarnessScoreReport | None = None,
     ) -> GateRecord:
         if child_holdout is not None and champion_holdout is not None:
-            holdout_gate_champions.append((champion.success_rate, champion_holdout.success_rate))
+            holdout_gate_champions.append((champion.score, champion_holdout.score))
         return gate_delta(
             delta,
             child=child,
@@ -2058,7 +2497,7 @@ def test_sibling_holdout_gates_use_frozen_iteration_champion(
             champion_holdout=champion_holdout,
         )
 
-    monkeypatch.setattr(create_module, "gate_delta", capture_gate_baselines)
+    monkeypatch.setattr(create_module, "gate_score_delta", capture_gate_baselines)
 
     result = _run(provider, proposal_batch_size=2, holdout=holdout)
 

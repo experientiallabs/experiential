@@ -6,12 +6,11 @@ import json
 
 import pytest
 
-from wmh.evals.closed_loop import ClosedLoopReport, RolloutEvidence, TaskOutcome
+from wmh.evals.closed_loop import RolloutEvidence, TaskOutcome
 from wmh.evals.gold import AssertionResult, GoldVerdict
-from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.mutate import parse_delta, propose_delta, render_evidence
+from wmh.harness.mutate import parse_delta, propose_delta, render_task_attempt_evidence
 from wmh.harness.runtime import StopReason
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
@@ -52,7 +51,7 @@ def _trigger() -> FailureSignature:
     return FailureSignature(
         mechanism="the file was created",
         task_ids=["t1"],
-        unmet_assertions=["the file was created"],
+        mechanism_labels=["the file was created"],
     )
 
 
@@ -179,85 +178,42 @@ def test_parse_delta_expands_compact_exact_replacement_edits() -> None:
     assert delta.ops[0].content == core.content.replace(old, "You are a careful agent")
 
 
-def test_render_evidence_shows_cluster_tasks_and_unmet_assertions() -> None:
-    report = ClosedLoopReport(
-        label="parent",
-        per_task={
-            "t1": TaskOutcome(task_id="t1", success_rate=0.0, mean_fraction=0.0, passes=2),
-            "t2": TaskOutcome(task_id="t2", success_rate=1.0, mean_fraction=1.0, passes=2),
-        },
-    )
-    tasks = [
-        TaskSpec(task_id="t1", instruction="create the file", gold=["the file was created"]),
-        TaskSpec(task_id="t2", instruction="easy one", gold=["done"]),
-    ]
-    evidence = render_evidence(_trigger(), report, tasks)
-    assert "the file was created" in evidence
-    assert "create the file" in evidence
-    assert "0.00 over 2 passes" in evidence
-    assert "[TARGET] t1" in evidence
-    assert "[other] t2" in evidence
-    assert "easy one" in evidence  # passing behavior remains visible in the compact scorecard
-
-
-def test_render_evidence_includes_execution_trace_answer_and_judge_reason() -> None:
-    report = ClosedLoopReport(
-        label="parent",
-        per_task={
-            "t1": TaskOutcome(
-                task_id="t1",
-                success_rate=0.0,
-                mean_fraction=0.5,
-                passes=1,
-                attempts=[
-                    RolloutEvidence(
-                        answer="I could not verify it",
-                        transcript="[1] tool_call: curl endpoint\n    -> connection reset",
-                        stop_reason=StopReason.SUBMITTED,
-                        turns=2,
-                    )
-                ],
-                verdicts=[
-                    GoldVerdict(
+def test_render_task_attempt_evidence_includes_trace_answer_and_judge_reason() -> None:
+    outcome = TaskOutcome(
+        task_id="t1",
+        success_rate=0.0,
+        mean_fraction=0.5,
+        passes=1,
+        attempts=[
+            RolloutEvidence(
+                answer="I could not verify it",
+                transcript="[1] tool_call: curl endpoint\n    -> connection reset",
+                stop_reason=StopReason.SUBMITTED,
+                turns=2,
+            )
+        ],
+        verdicts=[
+            GoldVerdict(
+                passed=False,
+                fraction=0.5,
+                assertions=[
+                    AssertionResult(
+                        assertion="the value was printed",
                         passed=False,
-                        fraction=0.5,
-                        assertions=[
-                            AssertionResult(
-                                assertion="the value was printed",
-                                passed=False,
-                                why="the final answer contained no value",
-                            )
-                        ],
+                        why="the final answer contained no value",
                     )
                 ],
             )
-        },
-    )
-    trigger = FailureSignature(
-        mechanism="the value was printed",
-        task_ids=["t1"],
-        unmet_assertions=["the value was printed"],
+        ],
     )
 
-    evidence = render_evidence(
-        trigger,
-        report,
-        [TaskSpec(task_id="t1", instruction="fetch the value", gold=["the value was printed"])],
-    )
+    evidence = render_task_attempt_evidence(outcome)
 
     assert "assertion_fraction=0.50" in evidence
     assert "Stop: submitted; turns=2" in evidence
     assert "I could not verify it" in evidence
     assert "connection reset" in evidence
     assert "the final answer contained no value" in evidence
-
-
-def test_all_pass_evidence_asks_for_generalization() -> None:
-    trigger = FailureSignature(mechanism="none: all tasks pass")
-    report = ClosedLoopReport(label="x", success_rate=1.0)
-    evidence = render_evidence(trigger, report, [TaskSpec(task_id="t", instruction="do it")])
-    assert "passed every task" in evidence
-    assert "GENERALIZE" in evidence
 
 
 def test_prompt_exposes_pi_code_files_as_editable_levers() -> None:

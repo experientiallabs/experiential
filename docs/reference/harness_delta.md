@@ -80,9 +80,9 @@ never to "whatever the harness currently is".
 ```python
 class FailureSignature(BaseModel):
     """Machine-clustered trigger: WHY this delta exists, queryably."""
-    mechanism: str               # e.g. the shared unmet assertion, or "none: all tasks pass"
+    mechanism: str               # e.g. a shared failure label, or "none: all tasks pass"
     task_ids: list[str]          # the cluster of failing tasks exhibiting it
-    unmet_assertions: list[str]  # deduped gold assertions the mechanism explains
+    mechanism_labels: list[str]  # deduped scorer labels the mechanism explains
 
 class SurfaceOp(BaseModel):
     op: Literal["add", "replace", "remove"]
@@ -95,11 +95,11 @@ class SurfaceOp(BaseModel):
 class GateRecord(BaseModel):
     """Filled at evaluation time; the delta carries its own verdict."""
     suite_delta: float           # regression suite: child − champion   (tier 1)
-    suite_fraction_delta: float  # assertion credit when suite success ties
+    suite_secondary_delta: float  # secondary score when suite score ties
     full_delta: float            # full split: child − best-seen        (tier 2)
-    full_fraction_delta: float   # assertion credit when full success ties
+    full_secondary_delta: float   # secondary score when full score ties
     holdout_delta: float | None  # held-out split: child − champion     (tier 3; None = no holdout)
-    holdout_fraction_delta: float | None
+    holdout_secondary_delta: float | None
     accepted: bool
     reason: str                  # accept/reject reasoning, incl. the expected-effect audit
 
@@ -132,10 +132,10 @@ class HarnessDelta(BaseModel):
   fails the episode, not the eval).
 - **Verification is staged by cost**: before a full-split eval, a child is screened on its own
   trigger cluster — the failing tasks its delta claims to fix. The screen compares full-task
-  success first and assertion-level partial credit second, so a partial fix is not flattened into
+  primary score first and secondary score second, so a partial fix is not flattened into
   a binary tie. A delta that improves neither signal is rejected (and archived) for a fraction of
   the price. The authoritative full gate repeats the same lexicographic contract across the whole
-  split: binary success remains primary, and assertion credit cannot regress when success ties.
+  split: the primary score leads, and the secondary score cannot regress when the primary ties.
   Every judged delta is fed back to the proposer as trace-level history, so the search iterates
   instead of re-proposing rejected ideas.
 - **Search breadth is independent from evaluation depth**: `proposal_batch_size` asks the
@@ -145,12 +145,12 @@ class HarnessDelta(BaseModel):
   project while every turn runs through the same ordinary agent-session runtime.
 - **Acceptance is the gate, not "applied cleanly"** (`gate_delta`): regression-suite
   non-regression vs the champion → full-split never-worse-than-best → held-out non-regression vs
-  the champion (when a holdout split is given). Binary ties consult assertion-level partial credit;
+  the champion (when a holdout split is given). Primary ties consult the secondary score;
   a stepping stone may advance on dense signal but cannot hide a global dense regression. On
   accept, newly-passing tasks promote into the regression suite, so wins are locked in and later
   deltas cannot quietly trade them away. The verdict is written onto the delta.
-- **The trigger is machine-made** (`cluster_failures`): failing tasks group by shared unmet gold
-  assertions (connected components; the most common unmet assertion labels the mechanism),
+- **The trigger is machine-made** (`cluster_score_failures`): failing tasks group by shared scorer
+  mechanism labels (connected components; the most common label names the mechanism),
   deterministically — no LLM, no entropy — so mechanism labels are comparable across deltas and
   runs. Selection weights cluster size but discounts rounds already spent on the same cluster and
   parent, so one environment-limited singleton cannot absorb the whole search. An all-pass parent
@@ -183,7 +183,7 @@ that fails atomic application is a counted skip that is still archived with its 
 2. **Merge.** Identity-keyed surfaces + content lineage make a surface-keyed three-way merge of
    two accepted lineages nearly free. Deferred to a follow-up.
 3. **Gate resolution.** With k=3 and small suites, binary per-task deltas are coarse (0, ⅓, ⅔, 1).
-   Assertion-level fractions break otherwise-flat ties; if flappy accepts show up in practice,
+   Secondary scores break otherwise-flat ties; if flappy accepts show up in practice,
    raise k on gate evals rather than adding arbitrary thresholds.
 4. **Suite demotion.** Newly-passing tasks promote into the regression suite; nothing ever leaves
    it. A permanently-flaky task could wedge the gate. Punted until observed.

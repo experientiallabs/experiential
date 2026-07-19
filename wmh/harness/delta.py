@@ -35,22 +35,22 @@ from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 class FailureSignature(BaseModel):
     """The clustered failure mechanism a delta answers to: WHY it exists, queryably.
 
-    Built deterministically from a closed-loop report (`wmh.harness.create.cluster_failures`),
+    Built deterministically from a score report (`wmh.harness.scoring.cluster_score_failures`),
     never free-typed by the proposer — so the archive's mechanism labels are comparable across
     deltas and runs.
     """
 
-    mechanism: str  # e.g. the shared unmet assertion, or "none: all tasks pass"
+    mechanism: str  # e.g. the shared failure label, or "none: all tasks pass"
     task_ids: list[str] = Field(default_factory=list)  # the failing tasks exhibiting it
-    unmet_assertions: list[str] = Field(default_factory=list)  # deduped, order-stable
+    mechanism_labels: list[str] = Field(default_factory=list)  # deduped, order-stable
 
     @model_validator(mode="after")
     def _validate_text(self) -> FailureSignature:
         validate_durable_text(self.mechanism, field="failure mechanism")
         for task_id in self.task_ids:
             validate_durable_text(task_id, field="failure task id")
-        for assertion in self.unmet_assertions:
-            validate_durable_text(assertion, field="failure assertion")
+        for label in self.mechanism_labels:
+            validate_durable_text(label, field="failure mechanism label")
         return self
 
 
@@ -90,11 +90,11 @@ class GateRecord(BaseModel):
     """The acceptance verdict, filled at evaluation time and persisted on the delta."""
 
     suite_delta: float = 0.0  # regression suite: child - champion (tier 1; >= 0 to pass)
-    suite_fraction_delta: float = 0.0  # assertion credit; vetoes only when suite success ties
+    suite_secondary_delta: float = 0.0  # secondary score; vetoes only when suite score ties
     full_delta: float = 0.0  # full split: child - best seen (tier 2; >= 0 to pass)
-    full_fraction_delta: float = 0.0  # assertion credit; vetoes only when full success ties
+    full_secondary_delta: float = 0.0  # secondary score; vetoes only when full score ties
     holdout_delta: float | None = None  # held-out split (tier 3; None when no holdout given)
-    holdout_fraction_delta: float | None = None  # dense held-out signal when success ties
+    holdout_secondary_delta: float | None = None  # secondary held-out signal when score ties
     accepted: bool
     reason: str  # accept/reject reasoning, incl. whether `expected_effect` came true
 

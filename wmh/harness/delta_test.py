@@ -34,7 +34,7 @@ def _delta(
     return HarnessDelta(
         delta_id=compute_delta_id(parent.doc_hash, ops),
         parent_doc_hash=parent.doc_hash,
-        trigger=FailureSignature(mechanism="m", task_ids=["t1"], unmet_assertions=["a"]),
+        trigger=FailureSignature(mechanism="m", task_ids=["t1"], mechanism_labels=["a"]),
         preconditions=preconditions if preconditions is not None else {},
         ops=ops,
         expected_effect="t1 flips to pass",

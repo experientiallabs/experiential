@@ -96,7 +96,7 @@ class TaskOutcome(BaseModel):
     task_id: str
     success_rate: float = 0.0  # fraction of k passes that fully passed gold
     mean_fraction: float = 0.0  # mean fraction-of-assertions across passes (partial credit)
-    passes: int = 0
+    passes: int = 0  # number of completed evaluation passes, not successful verdicts
     verdicts: list[GoldVerdict] = Field(default_factory=list)
     attempts: list[RolloutEvidence] = Field(default_factory=list)
 

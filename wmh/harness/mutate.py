@@ -21,9 +21,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 from wmh.core.parsing import extract_json_object
 from wmh.core.text import normalize_durable_text
-from wmh.evals.closed_loop import ClosedLoopReport, RolloutEvidence
+from wmh.evals.closed_loop import RolloutEvidence, TaskOutcome
 from wmh.evals.gold import GoldVerdict
-from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, HarnessDelta, SurfaceOp, compute_delta_id
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
@@ -200,67 +199,15 @@ def _apply_edits(content: str, value: object) -> str:
     return content
 
 
-def render_evidence(
-    trigger: FailureSignature, report: ClosedLoopReport, tasks: list[TaskSpec]
-) -> str:
-    """Render one failure cluster (instructions + unmet assertions) as reflection fuel.
-
-    A trigger with no failing tasks (the all-pass case) gets an explicit "nothing failed" prompt
-    asking for a generalization/efficiency improvement — not a fake failure section that would
-    send the meta-agent chasing nonexistent problems.
-    """
-    if not trigger.task_ids:
-        return (
-            "The harness passed every task on every pass. There are no failures to fix. "
-            "Propose a change that should GENERALIZE or ECONOMIZE: a tighter, more transferable "
-            "prompt surface; a lower param:max-turns if runs finish early; or a reusable skill "
-            "distilled from what worked."
-        )
-    by_id = {task.task_id: task for task in tasks}
-    selected = set(trigger.task_ids)
-    scorecard = [
-        "## Evaluation scorecard",
-        "The selected failure is marked TARGET; preserve behavior on the other tasks.",
-    ]
-    for task in tasks:
-        outcome = report.per_task.get(task.task_id)
-        success = outcome.success_rate if outcome is not None else 0.0
-        fraction = outcome.mean_fraction if outcome is not None else 0.0
-        instruction = " ".join(normalize_durable_text(task.instruction).split())
-        if len(instruction) > 240:
-            instruction = f"{instruction[:237]}..."
-        marker = "TARGET" if task.task_id in selected else "other"
-        scorecard.append(
-            f"- [{marker}] {task.task_id}: success={success:.2f}, "
-            f"assertion_fraction={fraction:.2f} — {instruction}"
-        )
-    sections = [
-        "\n".join(scorecard),
-        f"## Selected failure\n\nFailure mechanism: {trigger.mechanism}",
-    ]
-    for task_id in trigger.task_ids:
-        task = by_id.get(task_id)
-        outcome = report.per_task.get(task_id)
-        instruction = (
-            normalize_durable_text(task.instruction) if task is not None else "(unknown task)"
-        )
-        rate = f"{outcome.success_rate:.2f} over {outcome.passes} passes" if outcome else "?"
-        fraction = f", assertion_fraction={outcome.mean_fraction:.2f}" if outcome else ""
-        task_section = [
-            f"### Task {task_id} (success_rate={rate}{fraction})",
-            f"Instruction: {instruction}",
-        ]
-        if outcome is not None:
-            for index, verdict in enumerate(outcome.verdicts, 1):
-                attempt = outcome.attempts[index - 1] if index <= len(outcome.attempts) else None
-                task_section.append(_render_attempt(index=index, attempt=attempt, verdict=verdict))
-        sections.append("\n\n".join(task_section))
-    unmet = "\n".join(f"- {a}" for a in trigger.unmet_assertions)
-    sections.append(
-        "Original trigger assertions from the parent (current attempt verdicts above are "
-        f"authoritative):\n{unmet or '- (none recorded)'}"
-    )
-    return "\n\n".join(sections)
+def render_task_attempt_evidence(outcome: TaskOutcome | None) -> str:
+    """Render the bounded attempts from one closed-loop task outcome."""
+    if outcome is None:
+        return ""
+    rendered: list[str] = []
+    for index, verdict in enumerate(outcome.verdicts, 1):
+        attempt = outcome.attempts[index - 1] if index <= len(outcome.attempts) else None
+        rendered.append(_render_attempt(index=index, attempt=attempt, verdict=verdict))
+    return "\n\n".join(rendered)
 
 
 def _render_attempt(*, index: int, attempt: RolloutEvidence | None, verdict: GoldVerdict) -> str:
