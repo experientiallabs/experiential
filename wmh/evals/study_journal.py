@@ -383,9 +383,23 @@ def append_study_phase(
     publisher: ExternalCommitmentPublisher,
 ) -> StudyPhaseRecord:
     """Publish then durably append exactly the next phase, idempotently on restart."""
+    return append_study_phase_derived(
+        store,
+        phase=phase,
+        derive_payload_digest=lambda _records: payload_digest,
+        publisher=publisher,
+    )
+
+
+def append_study_phase_derived(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    derive_payload_digest: Callable[[tuple[StudyPhaseRecord, ...]], str],
+    publisher: ExternalCommitmentPublisher,
+) -> StudyPhaseRecord:
+    """Derive evidence and append its phase under one journal lease."""
     requested_phase = StudyPhase(phase)
-    if not _is_digest(payload_digest):
-        raise ValueError("study phase payload_digest must be a canonical SHA-256 digest")
     _validate_publisher(store, publisher)
     with store.locked() as directory_descriptor:
         records = _load_records_locked(store, directory_descriptor)
@@ -402,19 +416,8 @@ def append_study_phase(
             (record for record in records if record.commitment.phase is requested_phase),
             None,
         )
-        if existing is not None:
-            if existing.commitment.payload_digest != payload_digest:
-                raise ValueError("study phase is already committed with a different payload")
-            _verify_external_chain_locked(
-                store,
-                directory_descriptor,
-                publisher,
-                records,
-                (pending, pending_is_complete),
-            )
-            return existing
-        allowed = _allowed_next_phases(records)
-        if requested_phase not in allowed:
+        allowed = _allowed_next_phases(records) if existing is None else ()
+        if existing is None and requested_phase not in allowed:
             if not allowed:
                 raise ValueError("study journal is terminal and cannot accept another phase")
             expected = ", ".join(phase.value for phase in allowed)
@@ -427,6 +430,13 @@ def append_study_phase(
             records,
             (pending, pending_is_complete),
         )
+        payload_digest = derive_payload_digest(records)
+        if not _is_digest(payload_digest):
+            raise ValueError("study phase payload_digest must be a canonical SHA-256 digest")
+        if existing is not None:
+            if existing.commitment.payload_digest != payload_digest:
+                raise ValueError("study phase is already committed with a different payload")
+            return existing
 
         commitment = StudyPhaseCommitment(
             journal_genesis_digest=store.genesis.digest,

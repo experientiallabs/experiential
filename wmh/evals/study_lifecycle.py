@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Protocol, TypeVar
+from typing import Annotated, Literal, Protocol, TypedDict, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -29,15 +29,35 @@ from wmh.evals.study_journal import (
     StudyPhaseRecord,
     StudyRunClaim,
     append_study_phase,
+    append_study_phase_derived,
     call_in_study_phase,
     claim_study_run,
     load_study_journal,
 )
 from wmh.harness.create import SearchCheckpoint
 from wmh.harness.doc import HarnessDoc
+from wmh.tracking.budget import (
+    BudgetAuditState,
+    BudgetLedgerAuthority,
+    open_shared_spend_ledger,
+)
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _ResultT = TypeVar("_ResultT")
+
+
+class _TerminalBudgetFields(TypedDict):
+    budget_policy_digest: str
+    budget_ledger_identity: str
+    ledger_head_sequence: int
+    ledger_head_digest: str
+    budget_report_digest: str
+    budget_report_publication_digest: str
+    cumulative_paid_cost_nano_usd: int
+    outstanding_reserved_cost_nano_usd: int
+    budget_hard_limit_nano_usd: int
+    budget_remaining_nano_usd: int
+    budget_breached: bool
 
 
 class _StudyPayload(BaseModel):
@@ -56,6 +76,9 @@ class _StudyPayload(BaseModel):
             allow_nan=False,
         ).encode()
         return "sha256:" + hashlib.sha256(serialized).hexdigest()
+
+
+_StudyPayloadT = TypeVar("_StudyPayloadT", bound=_StudyPayload)
 
 
 class StudyArtifactPublication(BaseModel):
@@ -125,6 +148,53 @@ class ExternalArtifactVerifier(Protocol):
         ...
 
 
+class StudyBudgetReport(BaseModel):
+    """Canonical public report captured from one exact audited budget-ledger head."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    report_version: Literal["1"] = "1"
+    audit_state: BudgetAuditState
+
+    @classmethod
+    def capture(cls, authority: BudgetLedgerAuthority) -> StudyBudgetReport:
+        """Audit and capture the exact ledger named by a pre-existing authority."""
+        validated = BudgetLedgerAuthority.model_validate(authority.model_dump(mode="python"))
+        state = open_shared_spend_ledger(
+            validated.ledger_path,
+            validated.policy,
+            expected_ledger_identity=validated.ledger_identity,
+        ).audit_state()
+        if state.policy != validated.policy or state.ledger_identity != validated.ledger_identity:
+            raise ValueError("budget report differs from its ledger authority")
+        return cls(audit_state=state)
+
+    @property
+    def digest(self) -> str:
+        """Return the exact identity of the audited report artifact."""
+        return _canonical_digest(self.model_dump(mode="json"))
+
+    @property
+    def ledger_head_sequence(self) -> int:
+        """Return the captured append-only ledger sequence."""
+        return self.audit_state.ledger_head_sequence
+
+    @property
+    def ledger_head_digest(self) -> str:
+        """Return the captured append-only ledger digest."""
+        return self.audit_state.ledger_head_digest
+
+    @property
+    def cumulative_paid_cost_nano_usd(self) -> int:
+        """Return exact settled exposure in nano-USD."""
+        return self.audit_state.snapshot.charged_nano_usd
+
+    @property
+    def outstanding_reserved_cost_nano_usd(self) -> int:
+        """Return exact unsettled conservative exposure in nano-USD."""
+        return self.audit_state.snapshot.reserved_nano_usd
+
+
 class PreparationPlannedPayload(_StudyPayload):
     """Budget and immutable plan identity accepted before any preparation side effect."""
 
@@ -132,7 +202,8 @@ class PreparationPlannedPayload(_StudyPayload):
     study_plan_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_binding_digest: str = Field(pattern=_DIGEST_PATTERN)
-    maximum_paid_cost_microusd: StrictInt = Field(ge=0)
+    budget_ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
+    maximum_paid_cost_nano_usd: StrictInt = Field(ge=0)
 
 
 class RosterQualifiedPayload(_StudyPayload):
@@ -244,15 +315,43 @@ class ConfirmationRunningPayload(_StudyPayload):
         return value
 
 
-class StudyCompletePayload(_StudyPayload):
-    """Final outcome, complete evidence, and exact cumulative paid cost."""
+class _BudgetTerminalPayload(_StudyPayload):
+    """Exact live-ledger evidence shared by every terminal study record."""
+
+    budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    budget_ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
+    ledger_head_sequence: StrictInt = Field(ge=1)
+    ledger_head_digest: str = Field(pattern=_DIGEST_PATTERN)
+    budget_report_digest: str = Field(pattern=_DIGEST_PATTERN)
+    budget_report_publication_digest: str = Field(pattern=_DIGEST_PATTERN)
+    cumulative_paid_cost_nano_usd: StrictInt = Field(ge=0)
+    outstanding_reserved_cost_nano_usd: StrictInt = Field(ge=0)
+    budget_hard_limit_nano_usd: StrictInt = Field(gt=0)
+    budget_remaining_nano_usd: StrictInt = Field(ge=0)
+    budget_breached: bool
+
+    @model_validator(mode="after")
+    def _validate_terminal_exposure(self) -> _BudgetTerminalPayload:
+        exposure = self.cumulative_paid_cost_nano_usd + self.outstanding_reserved_cost_nano_usd
+        expected_remaining = max(self.budget_hard_limit_nano_usd - exposure, 0)
+        if self.budget_remaining_nano_usd != expected_remaining:
+            raise ValueError("terminal budget remaining differs from exact exposure")
+        return self
+
+
+class StudyCompletePayload(_BudgetTerminalPayload):
+    """Final outcome, complete evidence, and exact live-ledger accounting."""
 
     phase: Literal[StudyPhase.COMPLETE] = StudyPhase.COMPLETE
     paired_protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     paired_report_digest: str = Field(pattern=_DIGEST_PATTERN)
     outcome_digest: str = Field(pattern=_DIGEST_PATTERN)
-    spend_ledger_digest: str = Field(pattern=_DIGEST_PATTERN)
-    cumulative_paid_cost_microusd: StrictInt = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _require_settled_budget(self) -> StudyCompletePayload:
+        if self.outstanding_reserved_cost_nano_usd:
+            raise ValueError("complete study cannot retain outstanding budget reservations")
+        return self
 
 
 class StudyStopReason(StrEnum):
@@ -264,14 +363,13 @@ class StudyStopReason(StrEnum):
     PROTOCOL_INVALIDATED = "protocol_invalidated"
 
 
-class StoppedPayload(_StudyPayload):
+class StoppedPayload(_BudgetTerminalPayload):
     """Honest terminal record for a study that cannot complete its fixed protocol."""
 
     phase: Literal[StudyPhase.STOPPED] = StudyPhase.STOPPED
     reason: StudyStopReason
     last_evidence_digest: str = Field(pattern=_DIGEST_PATTERN)
-    spend_ledger_digest: str = Field(pattern=_DIGEST_PATTERN)
-    cumulative_paid_cost_microusd: StrictInt = Field(ge=0)
+    blocked_request_nano_usd: StrictInt | None = Field(default=None, ge=0)
     detail: str = Field(min_length=1, max_length=2_048)
 
     @field_validator("detail")
@@ -281,6 +379,17 @@ class StoppedPayload(_StudyPayload):
             raise ValueError("study stop detail cannot have surrounding whitespace")
         validate_durable_text(value, field="study stop detail")
         return value
+
+    @model_validator(mode="after")
+    def _validate_stop_reason(self) -> StoppedPayload:
+        if self.reason is StudyStopReason.BUDGET_EXHAUSTED:
+            if self.blocked_request_nano_usd is None:
+                raise ValueError("budget-exhausted stop requires the blocked request cost")
+            if self.blocked_request_nano_usd <= self.budget_remaining_nano_usd:
+                raise ValueError("blocked request does not exhaust the remaining hard budget")
+        elif self.blocked_request_nano_usd is not None:
+            raise ValueError("only a budget-exhausted stop can name a blocked request cost")
+        return self
 
 
 StudyPhasePayload = Annotated[
@@ -332,6 +441,8 @@ class StudyLifecycleController:
             StudyPhase.PROTOCOL_PUBLISHED: "publish_protocol",
             StudyPhase.CANDIDATE_FROZEN: "publish_candidate_frozen",
             StudyPhase.CANDIDATE_PUBLISHED: "publish_candidate_source",
+            StudyPhase.COMPLETE: "publish_complete",
+            StudyPhase.STOPPED: "stop",
         }
         required_method = protected.get(frozen.phase)
         if required_method is not None:
@@ -363,6 +474,8 @@ class StudyLifecycleController:
         checkpoint: SearchCheckpoint,
         search_configuration_digest: str,
         search_cost_binding_digest: str,
+        budget_authority: BudgetLedgerAuthority,
+        search_cost_report: StudyBudgetReport,
         search_cost_report_publication: StudyArtifactPublication,
         freeze_record: CandidateFreezeRecord,
         completed_iterations: int,
@@ -381,21 +494,86 @@ class StudyLifecycleController:
             or frozen_record.selection_evidence_digest != "sha256:" + state.payload_sha256
         ):
             raise ValueError("candidate freeze record differs from the completed search")
-        cost_publication = self._verify_artifact(search_cost_report_publication)
-        payload = CandidateFrozenPayload(
-            protocol_digest=protocol_digest,
-            candidate_execution_digest=selected.execution_digest,
-            search_checkpoint_digest="sha256:" + state.payload_sha256,
-            search_configuration_digest=search_configuration_digest,
-            search_cost_binding_digest=search_cost_binding_digest,
-            search_cost_report_digest=cost_publication.artifact_digest,
-            search_cost_report_publication_digest=cost_publication.digest,
-            champion_reconstruction_digest=_canonical_digest(selected.model_dump(mode="json")),
-            candidate_freeze_record_digest=frozen_record.digest,
-            completed_iterations=completed_iterations,
-        )
-        self._publish(payload)
-        return payload
+
+        def _derive(_records: tuple[StudyPhaseRecord, ...]) -> CandidateFrozenPayload:
+            report, cost_publication = self._verify_budget_report(
+                budget_authority,
+                search_cost_report,
+                search_cost_report_publication,
+            )
+            return CandidateFrozenPayload(
+                protocol_digest=protocol_digest,
+                candidate_execution_digest=selected.execution_digest,
+                search_checkpoint_digest="sha256:" + state.payload_sha256,
+                search_configuration_digest=search_configuration_digest,
+                search_cost_binding_digest=search_cost_binding_digest,
+                search_cost_report_digest=report.digest,
+                search_cost_report_publication_digest=cost_publication.digest,
+                champion_reconstruction_digest=_canonical_digest(selected.model_dump(mode="json")),
+                candidate_freeze_record_digest=frozen_record.digest,
+                completed_iterations=completed_iterations,
+            )
+
+        return self._publish_derived(StudyPhase.CANDIDATE_FROZEN, _derive)
+
+    def publish_complete(
+        self,
+        *,
+        paired_protocol_digest: str,
+        paired_report_digest: str,
+        outcome_digest: str,
+        budget_authority: BudgetLedgerAuthority,
+        budget_report: StudyBudgetReport,
+        budget_report_publication: StudyArtifactPublication,
+    ) -> StudyCompletePayload:
+        """Publish final evidence with accounting recaptured from the exact live ledger."""
+
+        def _derive(_records: tuple[StudyPhaseRecord, ...]) -> StudyCompletePayload:
+            report, publication = self._verify_budget_report(
+                budget_authority,
+                budget_report,
+                budget_report_publication,
+            )
+            if report.outstanding_reserved_cost_nano_usd:
+                raise ValueError("complete study cannot retain outstanding budget reservations")
+            return StudyCompletePayload(
+                paired_protocol_digest=paired_protocol_digest,
+                paired_report_digest=paired_report_digest,
+                outcome_digest=outcome_digest,
+                **self._terminal_budget_fields(report, publication),
+            )
+
+        return self._publish_derived(StudyPhase.COMPLETE, _derive)
+
+    def stop(
+        self,
+        *,
+        reason: StudyStopReason,
+        budget_authority: BudgetLedgerAuthority,
+        budget_report: StudyBudgetReport,
+        budget_report_publication: StudyArtifactPublication,
+        blocked_request_nano_usd: int | None = None,
+        detail: str,
+    ) -> StoppedPayload:
+        """Stop without a result claim using exact current evidence and ledger accounting."""
+
+        def _derive(records: tuple[StudyPhaseRecord, ...]) -> StoppedPayload:
+            if not records:
+                raise ValueError("study cannot stop before preparation is committed")
+            report, publication = self._verify_budget_report(
+                budget_authority,
+                budget_report,
+                budget_report_publication,
+            )
+            return StoppedPayload(
+                reason=reason,
+                last_evidence_digest=records[-1].digest,
+                blocked_request_nano_usd=blocked_request_nano_usd,
+                detail=detail,
+                **self._terminal_budget_fields(report, publication),
+            )
+
+        return self._publish_derived(StudyPhase.STOPPED, _derive)
 
     def publish_candidate_source(
         self,
@@ -429,6 +607,47 @@ class StudyLifecycleController:
         self._artifact_verifier.verify_artifact(receipt)
         return receipt
 
+    def _verify_budget_report(
+        self,
+        authority: BudgetLedgerAuthority,
+        report: StudyBudgetReport,
+        publication: StudyArtifactPublication,
+    ) -> tuple[StudyBudgetReport, StudyArtifactPublication]:
+        validated_authority = BudgetLedgerAuthority.model_validate(
+            authority.model_dump(mode="python")
+        )
+        if validated_authority.policy.study_id != self._store.genesis.study_id:
+            raise ValueError("budget authority belongs to a different study")
+        claimed = StudyBudgetReport.model_validate(report.model_dump(mode="json"))
+        current = StudyBudgetReport.capture(validated_authority)
+        if claimed != current:
+            raise ValueError("budget report is not the exact current live-ledger state")
+        receipt = self._verify_artifact(publication)
+        if receipt.artifact_digest != current.digest:
+            raise ValueError("budget publication does not contain the exact current report")
+        return current, receipt
+
+    @staticmethod
+    def _terminal_budget_fields(
+        report: StudyBudgetReport,
+        publication: StudyArtifactPublication,
+    ) -> _TerminalBudgetFields:
+        state = report.audit_state
+        snapshot = state.snapshot
+        return {
+            "budget_policy_digest": state.policy_digest,
+            "budget_ledger_identity": state.ledger_identity,
+            "ledger_head_sequence": state.ledger_head_sequence,
+            "ledger_head_digest": state.ledger_head_digest,
+            "budget_report_digest": report.digest,
+            "budget_report_publication_digest": publication.digest,
+            "cumulative_paid_cost_nano_usd": snapshot.charged_nano_usd,
+            "outstanding_reserved_cost_nano_usd": snapshot.reserved_nano_usd,
+            "budget_hard_limit_nano_usd": snapshot.hard_limit_nano_usd,
+            "budget_remaining_nano_usd": snapshot.remaining_nano_usd,
+            "budget_breached": snapshot.breached,
+        }
+
     def _publish(self, payload: StudyPhasePayload) -> StudyPhaseRecord:
         frozen = _PAYLOAD_ADAPTER.validate_python(payload.model_dump(mode="json"))
         return append_study_phase(
@@ -437,6 +656,32 @@ class StudyLifecycleController:
             payload_digest=frozen.digest,
             publisher=self._publisher,
         )
+
+    def _publish_derived(
+        self,
+        phase: StudyPhase,
+        derive: Callable[[tuple[StudyPhaseRecord, ...]], _StudyPayloadT],
+    ) -> _StudyPayloadT:
+        requested_phase = StudyPhase(phase)
+        selected: _StudyPayloadT | None = None
+
+        def _derive_digest(records: tuple[StudyPhaseRecord, ...]) -> str:
+            nonlocal selected
+            selected = derive(records)
+            frozen = _PAYLOAD_ADAPTER.validate_python(selected.model_dump(mode="json"))
+            if frozen.phase is not requested_phase:
+                raise ValueError("derived study payload has the wrong phase")
+            return frozen.digest
+
+        append_study_phase_derived(
+            self._store,
+            phase=requested_phase,
+            derive_payload_digest=_derive_digest,
+            publisher=self._publisher,
+        )
+        if selected is None:
+            raise RuntimeError("study phase payload was not derived")
+        return selected
 
     def require_current_phase(
         self,

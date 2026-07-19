@@ -24,8 +24,19 @@ from wmh.evals.study_lifecycle import (
     RosterQualifiedPayload,
     StoppedPayload,
     StudyArtifactPublication,
+    StudyBudgetReport,
     StudyLifecycleController,
     StudyStopReason,
+)
+from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import (
+    BudgetLedgerAuthority,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    TokenPriceCeiling,
+    bootstrap_budget_ledger,
+    open_shared_spend_ledger,
 )
 
 
@@ -105,8 +116,32 @@ def _preparation() -> PreparationPlannedPayload:
         study_plan_digest=_digest("plan"),
         budget_policy_digest=_digest("budget-policy"),
         budget_binding_digest=_digest("budget-binding"),
-        maximum_paid_cost_microusd=15_000_000_000,
+        budget_ledger_identity=_digest("budget-ledger"),
+        maximum_paid_cost_nano_usd=15_000_000_000_000,
     )
+
+
+def _budget_authority(tmp_path: Path) -> BudgetLedgerAuthority:
+    policy = BudgetPolicy(
+        study_id="study-1",
+        manifest_digest=_digest("study-manifest"),
+        hard_limit_nano_usd=15_000_000_000_000,
+        phase_limits_nano_usd={"discovery": 5_000_000_000_000},
+        meters={
+            "worker": ProviderCostMeter(
+                provider_config=ProviderConfig(
+                    kind=ProviderKind.BEDROCK,
+                    model="test-model",
+                    region="us-east-1",
+                ),
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            )
+        },
+    )
+    return bootstrap_budget_ledger((tmp_path / "study-budget.sqlite3").resolve(), policy)
 
 
 def test_typed_payload_digest_is_canonical_and_phase_bound() -> None:
@@ -118,12 +153,13 @@ def test_typed_payload_digest_is_canonical_and_phase_bound() -> None:
         payload.digest
         == PreparationPlannedPayload.model_validate(payload.model_dump(mode="json")).digest
     )
-    with pytest.raises(ValueError, match="maximum_paid_cost_microusd"):
+    with pytest.raises(ValueError, match="maximum_paid_cost_nano_usd"):
         PreparationPlannedPayload(
             study_plan_digest=_digest("plan"),
             budget_policy_digest=_digest("budget-policy"),
             budget_binding_digest=_digest("budget-binding"),
-            maximum_paid_cost_microusd=True,
+            budget_ledger_identity=_digest("budget-ledger"),
+            maximum_paid_cost_nano_usd=True,
         )
 
 
@@ -272,18 +308,19 @@ def test_guard_holds_operation_lease_against_a_concurrent_terminal_transition(
 ) -> None:
     controller = _controller(tmp_path)
     controller.publish(_preparation())
-    stop = StoppedPayload(
-        reason=StudyStopReason.OPERATOR_STOPPED,
-        last_evidence_digest=_digest("preparation-evidence"),
-        spend_ledger_digest=_digest("spend-ledger"),
-        cumulative_paid_cost_microusd=0,
-        detail="Operator requested a stop.",
-    )
+    authority = _budget_authority(tmp_path)
+    report = StudyBudgetReport.capture(authority)
     transition_errors: list[RuntimeError] = []
 
     def operation() -> str:
         try:
-            controller.publish(stop)
+            controller.stop(
+                reason=StudyStopReason.OPERATOR_STOPPED,
+                budget_authority=authority,
+                budget_report=report,
+                budget_report_publication=_artifact_publication(report.digest),
+                detail="Operator requested a stop.",
+            )
         except RuntimeError as error:
             transition_errors.append(error)
         return "completed"
@@ -300,7 +337,13 @@ def test_guard_holds_operation_lease_against_a_concurrent_terminal_transition(
     assert "locked" in str(transition_errors[0])
     assert controller.current_phase is StudyPhase.PREPARATION_PLANNED
 
-    controller.publish(stop)
+    controller.stop(
+        reason=StudyStopReason.OPERATOR_STOPPED,
+        budget_authority=authority,
+        budget_report=report,
+        budget_report_publication=_artifact_publication(report.digest),
+        detail="Operator requested a stop.",
+    )
     assert controller.current_phase is StudyPhase.STOPPED
 
 
@@ -356,20 +399,27 @@ def test_protected_evidence_phases_reject_unverified_generic_publication(
         )
 
 
-def test_stopped_payload_terminates_lifecycle_with_budget_evidence(tmp_path: Path) -> None:
+def test_stop_derives_exact_terminal_accounting_from_the_live_ledger(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     controller.publish(_preparation())
-    stopped = StoppedPayload(
+    authority = _budget_authority(tmp_path)
+    report = StudyBudgetReport.capture(authority)
+    stopped = controller.stop(
         reason=StudyStopReason.BUDGET_EXHAUSTED,
-        last_evidence_digest=_digest("last-evidence"),
-        spend_ledger_digest=_digest("spend-ledger"),
-        cumulative_paid_cost_microusd=15_000_000_000,
+        budget_authority=authority,
+        budget_report=report,
+        budget_report_publication=_artifact_publication(report.digest),
+        blocked_request_nano_usd=15_000_000_000_001,
         detail="Hard paid budget ceiling reached.",
     )
 
-    controller.publish(stopped)
-
     assert controller.current_phase is StudyPhase.STOPPED
+    assert stopped.last_evidence_digest == controller.records[-2].digest
+    assert stopped.budget_policy_digest == authority.policy.policy_digest
+    assert stopped.budget_ledger_identity == authority.ledger_identity
+    assert stopped.budget_report_digest == report.digest
+    assert stopped.cumulative_paid_cost_nano_usd == 0
+    assert stopped.blocked_request_nano_usd == 15_000_000_000_001
     with pytest.raises(ValueError, match="terminal"):
         controller.publish(
             RosterQualifiedPayload(
@@ -379,3 +429,71 @@ def test_stopped_payload_terminates_lifecycle_with_budget_evidence(tmp_path: Pat
                 qualified_task_count=89,
             )
         )
+
+
+def test_stop_rejects_caller_asserted_accounting_and_false_budget_exhaustion(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    controller.publish(_preparation())
+    authority = _budget_authority(tmp_path)
+    report = StudyBudgetReport.capture(authority)
+    fabricated = StoppedPayload(
+        reason=StudyStopReason.BUDGET_EXHAUSTED,
+        last_evidence_digest=_digest("fabricated-last-evidence"),
+        budget_policy_digest=authority.policy.policy_digest,
+        budget_ledger_identity=authority.ledger_identity,
+        ledger_head_sequence=report.ledger_head_sequence,
+        ledger_head_digest=report.ledger_head_digest,
+        budget_report_digest=_digest("fabricated-ledger-report"),
+        budget_report_publication_digest=_digest("fabricated-publication"),
+        cumulative_paid_cost_nano_usd=99_000_000_000_000,
+        outstanding_reserved_cost_nano_usd=0,
+        budget_hard_limit_nano_usd=15_000_000_000_000,
+        budget_remaining_nano_usd=0,
+        budget_breached=True,
+        blocked_request_nano_usd=1,
+        detail="Fabricated accounting.",
+    )
+
+    with pytest.raises(ValueError, match="stop"):
+        controller.publish(fabricated)
+    with pytest.raises(ValueError, match="does not exhaust"):
+        controller.stop(
+            reason=StudyStopReason.BUDGET_EXHAUSTED,
+            budget_authority=authority,
+            budget_report=report,
+            budget_report_publication=_artifact_publication(report.digest),
+            blocked_request_nano_usd=1,
+            detail="False exhaustion.",
+        )
+    assert controller.current_phase is StudyPhase.PREPARATION_PLANNED
+
+
+def test_stop_rejects_a_report_from_an_older_live_ledger_head(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    controller.publish(_preparation())
+    authority = _budget_authority(tmp_path)
+    stale = StudyBudgetReport.capture(authority)
+    ledger = open_shared_spend_ledger(
+        authority.ledger_path,
+        authority.policy,
+        expected_ledger_identity=authority.ledger_identity,
+    )
+    ledger.reserve(
+        BudgetScope(phase="discovery", category="worker", run_id="run-1"),
+        meter_id="worker",
+        max_nano_usd=1,
+        reservation_id="newer-reservation",
+    )
+
+    with pytest.raises(ValueError, match="exact current live-ledger state"):
+        controller.stop(
+            reason=StudyStopReason.OPERATOR_STOPPED,
+            budget_authority=authority,
+            budget_report=stale,
+            budget_report_publication=_artifact_publication(stale.digest),
+            detail="Operator requested a stop.",
+        )
+
+    assert controller.current_phase is StudyPhase.PREPARATION_PLANNED

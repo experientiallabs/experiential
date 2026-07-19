@@ -54,6 +54,7 @@ from wmh.evals.study_lifecycle import (
     ProtocolPublishedPayload,
     RosterQualifiedPayload,
     StudyArtifactPublication,
+    StudyBudgetReport,
     StudyLifecycleController,
 )
 from wmh.harness.create import SearchCheckpoint
@@ -74,6 +75,7 @@ from wmh.harness.scoring import (
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
+    BudgetLedgerAuthority,
     BudgetPolicy,
     ProviderCostMeter,
     TokenPriceCeiling,
@@ -434,6 +436,15 @@ def _prepare(
     return prepared, protocol
 
 
+def _budget_authority(prepared: PreparedHarnessOptimizationStudy) -> BudgetLedgerAuthority:
+    runtime = prepared.confirmation_budget
+    return BudgetLedgerAuthority(
+        ledger_path=runtime.ledger_path,
+        ledger_identity=runtime.ledger_identity,
+        policy=runtime.policy,
+    )
+
+
 def _discovery_lifecycle(
     tmp_path: Path,
     protocol: HarnessOptimizationProtocol,
@@ -456,7 +467,8 @@ def _discovery_lifecycle(
             study_plan_digest=_digest("study-plan"),
             budget_policy_digest=protocol.confirmation_budget_policy_digest,
             budget_binding_digest=protocol.confirmation_budget_binding_digest,
-            maximum_paid_cost_microusd=15_000_000_000,
+            budget_ledger_identity=protocol.confirmation_budget_ledger_identity,
+            maximum_paid_cost_nano_usd=15_000_000_000_000,
         )
     )
     controller.publish(
@@ -536,13 +548,17 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
             }
         )
 
-    cost_publication = _artifact_publication(_digest("search-cost-report"))
+    budget_authority = _budget_authority(prepared)
+    search_cost_report = StudyBudgetReport.capture(budget_authority)
+    cost_publication = _artifact_publication(search_cost_report.digest)
     lifecycle.publish_candidate_frozen(
         protocol_digest=protocol.digest,
         candidate=frozen.candidate,
         checkpoint=checkpoints[-1],
         search_configuration_digest=discovery_authorization.search_configuration_digest,
         search_cost_binding_digest=protocol.search_cost_binding_digest,
+        budget_authority=budget_authority,
+        search_cost_report=search_cost_report,
         search_cost_report_publication=cost_publication,
         freeze_record=frozen.freeze_record,
         completed_iterations=protocol.search.iterations,
@@ -591,13 +607,17 @@ def test_heldout_open_rejects_a_candidate_publication_for_different_source(
         lifecycle=lifecycle,
         authorization=authorization,
     )
-    cost_publication = _artifact_publication(_digest("search-cost-report"))
+    budget_authority = _budget_authority(prepared)
+    search_cost_report = StudyBudgetReport.capture(budget_authority)
+    cost_publication = _artifact_publication(search_cost_report.digest)
     lifecycle.publish_candidate_frozen(
         protocol_digest=protocol.digest,
         candidate=frozen.candidate,
         checkpoint=checkpoints[-1],
         search_configuration_digest=authorization.search_configuration_digest,
         search_cost_binding_digest=protocol.search_cost_binding_digest,
+        budget_authority=budget_authority,
+        search_cost_report=search_cost_report,
         search_cost_report_publication=cost_publication,
         freeze_record=frozen.freeze_record,
         completed_iterations=protocol.search.iterations,
