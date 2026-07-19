@@ -495,6 +495,66 @@ def test_resume_rejects_stored_task_evidence_drift_before_relaunch(
     assert stops == starts
 
 
+def test_resume_rejects_stored_resource_drift_before_relaunch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "task-a", storage_mb=10_240)
+    _write_task(dataset, "task-b")
+    starts: list[str] = []
+    stops: list[str] = []
+    failures = {"task-b"}
+    _forbid_agent_provider_and_verifier(monkeypatch)
+    _install_fake_environments(
+        monkeypatch,
+        backend=HarborEnvironmentBackend.LOCAL,
+        starts=starts,
+        stops=stops,
+        fail_start=failures,
+    )
+    qualifier = _local_qualifier(tmp_path, dataset)
+    with pytest.raises(mod.HarborRosterQualificationError):
+        asyncio.run(qualifier.qualify())
+
+    prepared = mod._read_model(
+        qualifier.roster_path.parent / "prepared.json",
+        mod._PreparedRosterCommitment,
+    )
+    assert prepared is not None
+    prepared_task = next(task for task in prepared.tasks if task.task_id == "task-a")
+    evidence_path = qualifier._evidence_path(prepared_task)
+    evidence = mod._read_model(evidence_path, mod._QualifiedTaskEvidence)
+    assert evidence is not None
+    changed_attestation = dict(evidence.task_environment_attestation)
+    changed_attestation["requested_storage_mb"] = 5_120
+    changed_attestation_model = HarborTaskEnvironmentAttestation.from_evidence(changed_attestation)
+    mod._atomic_write_model(
+        evidence_path,
+        mod._QualifiedTaskEvidence.freeze(
+            prepared_commitment_digest=prepared.commitment_digest,
+            qualification=evidence.qualification.model_copy(
+                update={
+                    "requested_storage_mb": 5_120,
+                    "task_environment_digest": changed_attestation_model.digest,
+                }
+            ),
+            attestation=changed_attestation_model,
+            cleanup_receipt=None,
+        ),
+    )
+    failures.clear()
+
+    with pytest.raises(
+        mod.HarborRosterQualificationDriftError,
+        match="resource request",
+    ):
+        asyncio.run(qualifier.qualify())
+
+    assert starts == ["task-a", "task-b"]
+    assert stops == starts
+
+
 def test_published_roster_reload_rebinds_each_task_to_prepared_commitment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

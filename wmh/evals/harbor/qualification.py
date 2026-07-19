@@ -1088,6 +1088,16 @@ class HarborRosterQualifier:
         attestation: HarborTaskEnvironmentAttestation,
         build_records: Mapping[str, ExactE2BBuildRecord],
     ) -> QualifiedHarborTask:
+        environment_config = item.prepared.trial_config.environment
+        requested_storage_mb = (
+            environment_config.override_storage_mb
+            if environment_config.override_storage_mb is not None
+            else item.prepared.task.config.environment.storage_mb
+        )
+        if attestation.evidence.get("requested_storage_mb") != requested_storage_mb:
+            raise HarborRosterQualificationDriftError(
+                "task environment attestation differs from its prepared resource request"
+            )
         common: dict[str, Any] = {
             "task_id": item.commitment.task_id,
             "dataset_id": item.dataset_id,
@@ -1095,7 +1105,7 @@ class HarborRosterQualifier:
             "task_key": item.commitment.task_key,
             "task_environment_digest": attestation.digest,
             "environment_backend": self._plan.environment_backend,
-            "requested_storage_mb": attestation.evidence.get("requested_storage_mb"),
+            "requested_storage_mb": requested_storage_mb,
         }
         if item.build_spec is None:
             return QualifiedHarborTask(**common)
