@@ -1,10 +1,10 @@
 """Per-model token pricing → USD cost.
 
-Provider-agnostic: prices are keyed by a normalized model id (routing prefixes like Bedrock's
-`us.anthropic.` are stripped before lookup), so the same Opus 4.8 row covers the direct API and
-Bedrock. Prices are USD per 1M tokens; an unknown model costs 0.0 and `price_for` returns None so
-callers can surface "cost unavailable" rather than silently under-reporting. Per-call overrides are
-passed explicitly — there is no global mutable registry.
+Direct-provider prices are keyed by a normalized model id. Cost-driving Bedrock geographic
+inference-profile prefixes remain part of the route and resolve only through an audited exact row.
+Prices are USD per 1M tokens; an unknown model costs 0.0 and `price_for` returns None so callers can
+surface "cost unavailable" rather than silently under-reporting. Per-call overrides are passed
+explicitly. There is no global mutable registry.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from llm_waterfall.types import TokenUsage
 # `claude-haiku-4-5-20251001-v1:0` or `claude-opus-4-6-v1`. Strip them so the lookup key matches
 # the undated table rows (`claude-haiku-4-5`). Only applied to `claude-*` ids.
 _BEDROCK_SUFFIX = re.compile(r"(-\d{8})?(-v\d+)?(:\d+)?$")
+_BEDROCK_GEO_PREFIXES = ("us.", "eu.", "apac.", "us-gov.", "global.", "jp.", "au.", "ca.")
 
 
 class ModelPrice(BaseModel):
@@ -46,6 +47,7 @@ _PRICES: dict[str, ModelPrice] = {
     "claude-sonnet-5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-sonnet-4-6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0),
+    "zai.glm-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=3.2),
     # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
     "gpt-5.5": ModelPrice(input_per_mtok=5.0, output_per_mtok=30.0),
     "gpt-5.5-pro": ModelPrice(input_per_mtok=30.0, output_per_mtok=180.0),
@@ -61,9 +63,16 @@ _PRICES: dict[str, ModelPrice] = {
     "amazon.titan-embed-text-v2:0": ModelPrice(input_per_mtok=0.02, output_per_mtok=0.0),
 }
 
+# Exact provider routes whose geographic inference-profile price was audited separately from the
+# direct-provider row. A geographic route absent from this table is intentionally unpriced.
+_ROUTE_PRICES: dict[str, ModelPrice] = {
+    "us.anthropic.claude-haiku-4-5": ModelPrice(input_per_mtok=1.1, output_per_mtok=5.5),
+    "us.anthropic.claude-opus-4-8": ModelPrice(input_per_mtok=5.5, output_per_mtok=27.5),
+}
+
 
 def _normalize(model: str) -> str:
-    """Strip provider/region routing prefixes so one row covers a model across providers.
+    """Normalize a direct or non-geographic provider model id.
 
     Bedrock ids look like `us.anthropic.claude-opus-4-8`; the direct API uses `claude-opus-4-8`.
     We drop a leading region segment (`us.`/`eu.`/...) and an `anthropic.` vendor segment, but keep
@@ -84,13 +93,29 @@ def _normalize(model: str) -> str:
     return normalized
 
 
+def _route_key(model: str) -> str:
+    """Retain a geographic route while removing only a Claude snapshot suffix."""
+    route = model.strip()
+    if route.startswith(_BEDROCK_GEO_PREFIXES) and ".anthropic.claude-" in route:
+        return _BEDROCK_SUFFIX.sub("", route)
+    return route
+
+
 def price_for(model: str, prices: Mapping[str, ModelPrice] | None = None) -> ModelPrice | None:
     """The price row for `model` (after normalization), or None if unknown.
 
     `prices` are per-caller overrides consulted before the static table; they are never merged
     into it, so one Waterfall's overrides can't leak into another's.
     """
-    key = _normalize(model)
+    route_key = _route_key(model)
+    if route_key.startswith(_BEDROCK_GEO_PREFIXES):
+        if prices is not None:
+            override = prices.get(model) or prices.get(route_key)
+            if override is not None:
+                return override
+        return _ROUTE_PRICES.get(route_key)
+
+    key = _normalize(route_key)
     if prices is not None:
         override = prices.get(key) or prices.get(model)
         if override is not None:

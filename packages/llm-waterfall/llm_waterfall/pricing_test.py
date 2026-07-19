@@ -6,14 +6,16 @@ from llm_waterfall.pricing import ModelPrice, cost_usd, price_for
 from llm_waterfall.types import TokenUsage
 
 
-def test_bedrock_id_normalizes_to_table_row() -> None:
+def test_us_bedrock_id_uses_the_audited_geo_route_price() -> None:
     dated = price_for("us.anthropic.claude-opus-4-8-20260101-v1:0")
     bare = price_for("claude-opus-4-8")
-    assert dated is not None and dated == bare
+    assert dated == ModelPrice(input_per_mtok=5.5, output_per_mtok=27.5)
+    assert bare == ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0)
 
 
-def test_region_and_vendor_prefixes_stripped() -> None:
-    assert price_for("eu.anthropic.claude-sonnet-4-6") == price_for("claude-sonnet-4-6")
+def test_unaudited_geo_route_does_not_inherit_a_direct_provider_price() -> None:
+    assert price_for("eu.anthropic.claude-sonnet-4-6") is None
+    assert price_for("us.anthropic.claude-sonnet-4-6") is None
     assert price_for("anthropic.claude-haiku-4-5") == price_for("claude-haiku-4-5")
 
 
@@ -46,10 +48,16 @@ def test_override_adds_unknown_model() -> None:
     assert cost_usd("my-azure-deployment", usage, prices=override) == 5.0
 
 
-def test_global_inference_profile_prefix_stripped() -> None:
-    # Regression: global./jp./au. cross-region profiles must price like their us. siblings.
-    assert price_for("global.anthropic.claude-sonnet-4-6") == price_for("claude-sonnet-4-6")
-    assert price_for("jp.anthropic.claude-haiku-4-5") == price_for("claude-haiku-4-5")
+def test_other_unaudited_inference_profile_prefixes_are_unpriced() -> None:
+    assert price_for("global.anthropic.claude-sonnet-4-6") is None
+    assert price_for("jp.anthropic.claude-haiku-4-5") is None
+
+
+def test_us_geo_haiku_snapshot_uses_the_audited_route_price() -> None:
+    assert price_for("us.anthropic.claude-haiku-4-5-20251001-v1:0") == ModelPrice(
+        input_per_mtok=1.1,
+        output_per_mtok=5.5,
+    )
 
 
 def test_no_zero_price_placeholder_rows() -> None:

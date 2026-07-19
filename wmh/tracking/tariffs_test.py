@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import ProviderCostMeter, TokenPriceCeiling
+from wmh.tracking.pricing import price_for
 from wmh.tracking.tariffs import (
     ProviderTokenTariff,
     catalog_provider_token_tariff,
@@ -82,6 +83,19 @@ def test_catalog_lookup_requires_the_exact_frozen_route() -> None:
                 model="zai.glm-5-preview",
                 region="us-east-1",
             )
+        )
+
+
+def test_descriptive_prices_match_every_hard_budget_tariff_route() -> None:
+    for tariff in catalog_provider_token_tariffs():
+        descriptive_price = price_for(tariff.provider_config.model)
+
+        assert descriptive_price is not None
+        assert descriptive_price.input_per_mtok * 1_000 == pytest.approx(
+            tariff.price.input_nano_usd_per_token
+        )
+        assert descriptive_price.output_per_mtok * 1_000 == pytest.approx(
+            tariff.price.output_nano_usd_per_token
         )
 
 

@@ -14,21 +14,25 @@ def test_opus_4_8_cost_is_5_in_25_out_per_mtok() -> None:
     assert cost == pytest.approx(30.0)
 
 
-def test_bedrock_prefix_normalizes_to_same_price() -> None:
-    # The Bedrock-prefixed id prices identically to the direct id.
+def test_bedrock_us_geo_profile_uses_the_audited_route_price() -> None:
     usage = TokenUsage(input_tokens=1_000_000, output_tokens=0)
-    assert cost_usd("us.anthropic.claude-opus-4-8", usage) == cost_usd("claude-opus-4-8", usage)
-    assert cost_usd("us.anthropic.claude-opus-4-8", usage) == pytest.approx(5.0)
+    assert cost_usd("us.anthropic.claude-opus-4-8", usage) == pytest.approx(5.5)
+    assert cost_usd("claude-opus-4-8", usage) == pytest.approx(5.0)
 
 
 def test_bedrock_dated_inference_profile_id_normalizes() -> None:
-    # Bedrock inference-profile ids carry a snapshot date + version, e.g.
-    # `us.anthropic.claude-haiku-4-5-20251001-v1:0`; they must price like the undated row.
+    # Bedrock inference-profile ids carry a snapshot date + version, but the geo route remains
+    # cost-driving and must not collapse into the direct-provider row.
     usage = TokenUsage(input_tokens=1_000_000, output_tokens=0)
     assert price_for("us.anthropic.claude-haiku-4-5-20251001-v1:0") is not None
-    assert cost_usd("us.anthropic.claude-haiku-4-5-20251001-v1:0", usage) == pytest.approx(1.0)
+    assert cost_usd("us.anthropic.claude-haiku-4-5-20251001-v1:0", usage) == pytest.approx(1.1)
     # The `-v1` version suffix alone is also stripped.
     assert cost_usd("anthropic.claude-opus-4-6-v1", usage) == pytest.approx(5.0)
+
+
+def test_unaudited_bedrock_geo_route_has_no_descriptive_price() -> None:
+    assert price_for("us.anthropic.claude-sonnet-4-6") is None
+    assert price_for("eu.anthropic.claude-opus-4-8") is None
 
 
 def test_bedrock_glm_5_uses_the_verified_nominal_price() -> None:
