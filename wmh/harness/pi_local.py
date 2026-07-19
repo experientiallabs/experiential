@@ -211,11 +211,18 @@ _MAX_INBOUND_ENCODED_FRAME_CHARS = 4 * ((_MAX_INBOUND_FRAME_BYTES + 2) // 3)
 _MAX_STDERR_LINE_CHARS = 64 * 1024
 _MAX_PENDING_FRAMES = 16
 _MAX_PENDING_FRAME_BYTES = 2 * 1024 * 1024
+PI_CONTAINER_INDEX_DIGEST = (
+    "sha256:4a4884e8a44826194dff92ba316264f392056cbe243dcc9fd3551e71cea02b90"
+)
+PI_CONTAINER_PLATFORM = "linux/amd64"
 PI_CONTAINER_IMAGE = (
     "node:22.19.0-bookworm-slim"
-    "@sha256:4a4884e8a44826194dff92ba316264f392056cbe243dcc9fd3551e71cea02b90"
+    "@sha256:cff78eb5aa1cf27dc2b6aeea9d31366415a43e9a9ea0ddec00d780b2b66fad0f"
 )
 _DIGEST_IMAGE = re.compile(r"[^@\s]+@sha256:[0-9a-fA-F]{64}\Z")
+_CONTAINER_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
+_CONTAINER_LABEL_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
+_CONTAINER_PLATFORM = re.compile(r"[a-z0-9_.-]{1,64}/[a-z0-9_.-]{1,64}\Z")
 _CONTAINER_RUNTIME_DIR = "/opt/wmh-pi"
 _CONTAINER_WORK_DIR = "/work"
 _CONTAINER_RUNNER_COMMAND = f"""\
@@ -671,6 +678,15 @@ class DockerStdioChannel(LocalStdioChannel):
         self._close_lock = threading.Lock()
         self._fully_closed = False
 
+    @property
+    def container_id(self) -> str:
+        """Return the daemon resource identity, falling back to its unique name."""
+        cid_file = self._control_dir / "container.cid"
+        container_id = cid_file.read_text(encoding="utf-8").strip() if cid_file.is_file() else ""
+        if re.fullmatch(r"[0-9a-fA-F]{12,64}", container_id) is not None:
+            return container_id.lower()
+        return self._container_name
+
     def close(self) -> None:
         """Close the client stream, force-remove the container, and verify daemon state."""
         with self._close_lock:
@@ -803,27 +819,21 @@ def ensure_container_pi_runtime(
     *,
     docker: str,
     image: str = PI_CONTAINER_IMAGE,
+    platform: str = PI_CONTAINER_PLATFORM,
     run_command: Callable[..., _CompletedCommand] = subprocess.run,
 ) -> Path:
     """Atomically publish one immutable, content-addressed pi runtime namespace."""
     validate_pi_container_image(image)
+    validate_pi_container_platform(platform)
     cache_root = runtime_dir.expanduser().resolve()
     package_lock = _container_package_lock()
     entry_files = session_entry_files()
-    source_manifest = json.dumps(
-        {
-            "entry_files": dict(sorted(entry_files.items())),
-            "package_json": _PACKAGE_JSON,
-            "package_lock": package_lock,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    source_fingerprint = hashlib.sha256(source_manifest.encode()).hexdigest()
+    source_fingerprint = container_pi_bundle_digest().removeprefix("sha256:")
     image_identity = "sha256:" + image.rsplit("@sha256:", 1)[1].lower()
     namespace_input = json.dumps(
         {
             "image": image_identity,
+            "platform": platform,
             "source": f"sha256:{source_fingerprint}",
         },
         sort_keys=True,
@@ -879,6 +889,8 @@ def ensure_container_pi_runtime(
                     docker,
                     "run",
                     "--rm",
+                    "--platform",
+                    platform,
                     "--log-driver",
                     "none",
                     "--network",
@@ -920,11 +932,15 @@ def start_container_live_runner(
     *,
     runtime_dir: Path | None = None,
     image: str = PI_CONTAINER_IMAGE,
+    platform: str = PI_CONTAINER_PLATFORM,
+    labels: dict[str, str] | None = None,
     hello_timeout: float = HELLO_TIMEOUT_S,
     run_command: Callable[..., _CommandResult] = subprocess.run,
 ) -> LocalStdioChannel:
     """Start pi in an isolated local container with no host credentials or network."""
     validate_pi_container_image(image)
+    validate_pi_container_platform(platform)
+    validated_labels = _validate_container_labels(labels or {})
     docker = shutil.which("docker")
     if docker is None:
         raise RuntimeError("the local isolated pi runner requires Docker on PATH")
@@ -932,6 +948,7 @@ def start_container_live_runner(
         runtime_dir or default_container_pi_runtime_dir(),
         docker=docker,
         image=image,
+        platform=platform,
         run_command=run_command,
     )
     control_root = Path(tempfile.mkdtemp(prefix="wmh-pi-container-control-"))
@@ -942,6 +959,8 @@ def start_container_live_runner(
         "--rm",
         "--interactive",
         "--init",
+        "--platform",
+        platform,
         "--log-driver",
         "none",
         "--name",
@@ -979,11 +998,10 @@ def start_container_live_runner(
         "/tmp:rw,nosuid,nodev,size=64m",
         "--workdir",
         _CONTAINER_WORK_DIR,
-        image,
-        "/bin/sh",
-        "-c",
-        _CONTAINER_RUNNER_COMMAND,
     ]
+    for key, value in sorted(validated_labels.items()):
+        command.extend(("--label", f"{key}={value}"))
+    command.extend((image, "/bin/sh", "-c", _CONTAINER_RUNNER_COMMAND))
     try:
         process = subprocess.Popen(  # noqa: S603 - fixed Docker argv, no shell
             command,
@@ -1017,13 +1035,88 @@ def start_container_live_runner(
 def verify_container_pi_runner_ready(
     *,
     image: str = PI_CONTAINER_IMAGE,
+    platform: str = PI_CONTAINER_PLATFORM,
     hello_timeout: float = HELLO_TIMEOUT_S,
 ) -> None:
     """Prove the isolated local runner can bootstrap, start, and clean up."""
     with contextlib.closing(
         start_container_live_runner(
             image=image,
+            platform=platform,
             hello_timeout=hello_timeout,
         )
     ):
         pass
+
+
+def container_pi_bundle_digest() -> str:
+    """Return the canonical digest of every file mounted into the Pi runner."""
+    source_manifest = json.dumps(
+        {
+            "entry_files": dict(sorted(session_entry_files().items())),
+            "package_json": _PACKAGE_JSON,
+            "package_lock": _container_package_lock(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return "sha256:" + hashlib.sha256(source_manifest).hexdigest()
+
+
+def validate_pi_container_platform(platform: str) -> None:
+    """Reject implicit or malformed local runner platforms."""
+    if _CONTAINER_PLATFORM.fullmatch(platform) is None:
+        raise ValueError("pi container platform must use lowercase os/architecture form")
+
+
+def _validate_container_labels(labels: dict[str, str]) -> dict[str, str]:
+    """Validate bounded Docker labels before adding them to argv."""
+    for key, value in labels.items():
+        if _CONTAINER_LABEL.fullmatch(key) is None:
+            raise ValueError("pi container label key is invalid")
+        if _CONTAINER_LABEL_VALUE.fullmatch(value) is None:
+            raise ValueError("pi container label value is invalid")
+    return dict(labels)
+
+
+def reap_container_runner_lease(
+    lease_id: str,
+    *,
+    run_command: Callable[..., _CommandResult] = subprocess.run,
+) -> tuple[str, ...]:
+    """Remove and then prove absence of every container carrying one lease label."""
+    if _CONTAINER_LABEL_VALUE.fullmatch(lease_id) is None:
+        raise ValueError("pi container lease identity is invalid")
+    docker = shutil.which("docker")
+    if docker is None:
+        raise RuntimeError("the local isolated pi runner requires Docker on PATH")
+    label = f"wmh.runner.lease={lease_id}"
+    listed = run_command(
+        [docker, "container", "ls", "--all", "--quiet", "--filter", f"label={label}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    resource_ids = tuple(line.strip() for line in listed.stdout.splitlines() if line.strip())
+    if any(re.fullmatch(r"[0-9a-fA-F]{12,64}", item) is None for item in resource_ids):
+        raise RuntimeError("Docker returned an invalid orphan container identity")
+    for resource_id in resource_ids:
+        run_command(
+            [docker, "container", "rm", "--force", resource_id],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    remaining = run_command(
+        [docker, "container", "ls", "--all", "--quiet", "--filter", f"label={label}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if remaining.stdout.strip():
+        raise RuntimeError("Docker runner orphan cleanup could not prove resource absence")
+    return resource_ids

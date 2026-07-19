@@ -13,6 +13,7 @@ from harbor.models.trial.config import AgentConfig, EnvironmentConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from wmh.evals.harbor.docker_environment import REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
+from wmh.evals.harbor.e2b_environment import EXACT_E2B_ENVIRONMENT_IMPORT_PATH
 
 SUPPORTED_HARBOR_VERSION = "0.18.0"
 
@@ -94,7 +95,11 @@ def build_harbor_job_config(spec: HarborJobSpec, *, agent: AgentConfig) -> JobCo
         agents=[agent.model_copy(deep=True)],
         environment=EnvironmentConfig(
             type=environment_type,
-            import_path=REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH if local_environment else None,
+            import_path=(
+                REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
+                if local_environment
+                else EXACT_E2B_ENVIRONMENT_IMPORT_PATH
+            ),
             force_build=False,
             delete=True,
             mounts=None,
@@ -128,12 +133,11 @@ def validate_controlled_harbor_environment(
     expected_import_path = (
         REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
         if environment.type is EnvironmentType.DOCKER
-        else None
+        else EXACT_E2B_ENVIRONMENT_IMPORT_PATH
     )
     if environment.import_path != expected_import_path:
         raise ValueError(
-            "Harbor environment import_path must be the trusted local reaping adapter for "
-            "Docker and absent for E2B"
+            "Harbor environment import_path must name the trusted WMH adapter for its backend"
         )
     if environment.force_build:
         raise ValueError("Harbor environment force_build must remain disabled")

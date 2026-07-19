@@ -27,6 +27,8 @@ from wmh.evals.benchmark import (
 
 _RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
 _CELL_CONFIG_DIGEST = "sha256:" + "b" * 64
+_RUNNER_CONFIG_DIGEST = "sha256:" + "c" * 64
+_RUNNER_ENVIRONMENT_DIGEST = "sha256:" + "d" * 64
 _IDENTITY = BenchmarkRunIdentity(
     candidate_hash="candidate-hash",
     agent_name="wmh-pi",
@@ -34,7 +36,8 @@ _IDENTITY = BenchmarkRunIdentity(
     provider="bedrock",
     model_name="model",
     task_environment=BenchmarkTaskEnvironment.DOCKER,
-    runner_image="runner-image",
+    runner_config_digest=_RUNNER_CONFIG_DIGEST,
+    runner_environment_digest=_RUNNER_ENVIRONMENT_DIGEST,
     run_config_digest=_RUN_CONFIG_DIGEST,
 )
 

@@ -38,7 +38,13 @@ from wmh.evals.harbor.results import (
     harbor_agent_config_digest,
     harbor_trial_lock_digest,
 )
+from wmh.harness.e2b_sandbox import E2B_API_KEY_ENV
 from wmh.harness.pi_runner import pi_node_baseline
+from wmh.harness.pi_runner_backend import (
+    E2BPiRunnerSpec,
+    LocalPiRunnerSpec,
+    runner_owner_id,
+)
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 _TASK_ENVIRONMENT_ATTESTATION = {
@@ -64,6 +70,34 @@ _TASK_ENVIRONMENT_DIGEST = (
         ).encode()
     ).hexdigest()
 )
+_LOCAL_RUNNER = LocalPiRunnerSpec()
+
+
+def _runner_lease_receipt(trial_name: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "backend": "local",
+        "lease_id": f"lease-{trial_name}",
+        "owner_id": runner_owner_id(trial_name),
+        "config_digest": _LOCAL_RUNNER.config_digest,
+        "state": "retired",
+        "resource_id": f"container-{trial_name}",
+        "created_at": "2026-07-18T11:59:00Z",
+        "expected_end_at": None,
+        "retired_at": "2026-07-18T12:00:00Z",
+    }
+
+
+def _e2b_runner(*, lease_timeout_s: int = 420) -> E2BPiRunnerSpec:
+    return E2BPiRunnerSpec(
+        template_id="template-immutable",
+        build_id="build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        platform="linux/x86_64",
+        envd_version="0.2.1",
+        lease_timeout_s=lease_timeout_s,
+    )
 
 
 def _write_task(
@@ -117,7 +151,7 @@ def _stub_runner_readiness_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("runner_image", ["node:latest", ""])
-def test_evaluator_rejects_mutable_runner_image_before_job_creation(
+def test_evaluator_rejects_mutable_runner_spec_before_job_creation(
     tmp_path: Path,
     runner_image: str,
 ) -> None:
@@ -125,7 +159,7 @@ def test_evaluator_rejects_mutable_runner_image_before_job_creation(
         mod.HarborEvaluator(
             _spec(tmp_path, tmp_path / "dataset"),
             _provider(),
-            runner_image=runner_image,
+            runner_spec={"backend": "local", "image": runner_image},
         )
 
 
@@ -140,6 +174,53 @@ def test_evaluator_rejects_non_finite_turn_timeout(
             _provider(),
             turn_timeout_s=turn_timeout_s,
         )
+
+
+def test_evaluator_requires_fixed_e2b_lease_to_cover_the_turn(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="lease_timeout_s"):
+        mod.HarborEvaluator(
+            _spec(tmp_path, tmp_path / "dataset"),
+            _provider(),
+            runner_spec=_e2b_runner(lease_timeout_s=300),
+            turn_timeout_s=300,
+        )
+
+
+def test_e2b_runner_readiness_checks_only_local_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(E2B_API_KEY_ENV, "present-but-never-read-by-the-test")
+    monkeypatch.setattr(mod, "find_spec", lambda _name: object())
+    monkeypatch.setattr(
+        mod,
+        "verify_container_pi_runner_ready",
+        lambda **_kwargs: pytest.fail("E2B runner readiness must not probe Docker"),
+    )
+    evaluator = mod.HarborEvaluator(
+        _spec(tmp_path, tmp_path / "dataset"),
+        _provider(),
+        runner_spec=_e2b_runner(),
+    )
+
+    asyncio.run(evaluator._ensure_runner_ready())
+    assert evaluator._runner_ready is True
+
+
+def test_e2b_runner_missing_host_credential_fails_before_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_API_KEY_ENV, raising=False)
+    monkeypatch.setattr(mod, "find_spec", lambda _name: object())
+    evaluator = mod.HarborEvaluator(
+        _spec(tmp_path, tmp_path / "dataset"),
+        _provider(),
+        runner_spec=_e2b_runner(),
+    )
+
+    with pytest.raises(RuntimeError, match=E2B_API_KEY_ENV):
+        asyncio.run(evaluator._ensure_runner_ready())
 
 
 def test_direct_executable_metric_is_rejected_without_constructing_harbor_job(
@@ -366,7 +447,7 @@ def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_key
     assert agent.kwargs == {
         "harness": candidate.model_dump(mode="json"),
         "provider_config": _provider().model_dump(mode="json"),
-        "runner_image": mod.PI_CONTAINER_IMAGE,
+        "runner_spec": _LOCAL_RUNNER.model_dump(mode="json"),
         "turn_timeout_s": 300.0,
         "require_provider_receipts": True,
     }
@@ -380,8 +461,9 @@ def test_runner_readiness_failure_precedes_harbor_job_and_task_work(
     dataset = tmp_path / "dataset"
     _write_task(dataset)
 
-    def fail_probe(*, image: str) -> None:
-        assert image == mod.PI_CONTAINER_IMAGE
+    def fail_probe(*, image: str, platform: str) -> None:
+        assert image == _LOCAL_RUNNER.image
+        assert platform == _LOCAL_RUNNER.platform
         events.append("runner-probe")
         raise RuntimeError("runner unavailable")
 
@@ -784,7 +866,10 @@ def _materialize_job(
                 n_output_tokens=1,
                 metadata={
                     "harness_hash": candidate_hash,
-                    "runner_image": mod.PI_CONTAINER_IMAGE,
+                    "runner_config_digest": _LOCAL_RUNNER.config_digest,
+                    "runner_environment_digest": _LOCAL_RUNNER.attestation.digest,
+                    "runner_environment_attestation": _LOCAL_RUNNER.attestation.evidence,
+                    "runner_lease_receipt": _runner_lease_receipt(trial_config.trial_name),
                     "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
                     "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
                     "run_health": "valid",
@@ -843,10 +928,10 @@ def test_complete_matching_job_is_reused_without_rerunning_completed_trials(
     _write_task(dataset)
     candidate = pi_node_baseline("candidate")
     evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
-    readiness_images: list[str] = []
+    readiness_configs: list[tuple[str, str]] = []
 
-    def record_readiness(*, image: str) -> None:
-        readiness_images.append(image)
+    def record_readiness(*, image: str, platform: str) -> None:
+        readiness_configs.append((image, platform))
 
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", record_readiness)
 
@@ -867,7 +952,7 @@ def test_complete_matching_job_is_reused_without_rerunning_completed_trials(
 
     assert remaining == [0]
     assert resumed.result == first.result
-    assert readiness_images == [mod.PI_CONTAINER_IMAGE]
+    assert readiness_configs == [(_LOCAL_RUNNER.image, _LOCAL_RUNNER.platform)]
 
 
 def test_evaluator_session_shares_one_concurrent_runner_probe(

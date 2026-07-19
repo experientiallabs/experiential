@@ -18,6 +18,7 @@ from wmh.evals.harbor.config import (
     validate_controlled_harbor_environment,
 )
 from wmh.evals.harbor.docker_environment import REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
+from wmh.evals.harbor.e2b_environment import EXACT_E2B_ENVIRONMENT_IMPORT_PATH
 
 _DATASET_REF = "sha256:" + "a" * 64
 
@@ -76,7 +77,7 @@ def test_e2b_is_an_explicit_environment_with_no_docker_fallback(tmp_path: Path) 
     )
 
     assert config.environment.type is EnvironmentType.E2B
-    assert config.environment.import_path is None
+    assert config.environment.import_path == EXACT_E2B_ENVIRONMENT_IMPORT_PATH
 
 
 def test_native_local_and_git_dataset_sources_are_preserved(tmp_path: Path) -> None:
@@ -206,3 +207,15 @@ def test_controlled_environment_rejects_backend_drift() -> None:
             environment,
             expected_type=EnvironmentType.DOCKER,
         )
+
+
+def test_controlled_e2b_environment_requires_exact_build_adapter() -> None:
+    with pytest.raises(ValueError, match="trusted WMH adapter"):
+        validate_controlled_harbor_environment(EnvironmentConfig(type=EnvironmentType.E2B))
+
+    validate_controlled_harbor_environment(
+        EnvironmentConfig(
+            type=EnvironmentType.E2B,
+            import_path=EXACT_E2B_ENVIRONMENT_IMPORT_PATH,
+        )
+    )

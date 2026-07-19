@@ -21,6 +21,7 @@ import wmh.harness.pi_local as mod
 from wmh.harness.pi_e2b import TRANSPORT_KEEPALIVE_TYPE
 from wmh.harness.pi_local import (
     PI_CONTAINER_IMAGE,
+    PI_CONTAINER_PLATFORM,
     DockerStdioChannel,
     LocalStdioChannel,
     ensure_container_pi_runtime,
@@ -217,12 +218,15 @@ def test_container_runtime_bootstrap_is_pinned_and_installs_once(tmp_path: Path)
     assert calls == []
 
 
-def test_container_image_is_multi_platform_and_mutable_refs_are_rejected(tmp_path: Path) -> None:
-    """Production runner images are immutable multi-platform OCI references."""
+def test_container_image_is_platform_manifest_pinned_and_mutable_refs_are_rejected(
+    tmp_path: Path,
+) -> None:
+    """Production runner images use one immutable platform-specific manifest."""
     assert PI_CONTAINER_IMAGE == (
         "node:22.19.0-bookworm-slim"
-        "@sha256:4a4884e8a44826194dff92ba316264f392056cbe243dcc9fd3551e71cea02b90"
+        "@sha256:cff78eb5aa1cf27dc2b6aeea9d31366415a43e9a9ea0ddec00d780b2b66fad0f"
     )
+    assert PI_CONTAINER_PLATFORM == "linux/amd64"
 
     with pytest.raises(ValueError, match="digest-qualified"):
         ensure_container_pi_runtime(
@@ -236,23 +240,44 @@ def test_container_image_is_multi_platform_and_mutable_refs_are_rejected(tmp_pat
 def test_container_runner_readiness_requires_start_hello_and_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed: list[tuple[str, float]] = []
+    observed: list[tuple[str, str, float]] = []
     closed: list[bool] = []
 
     class ReadyChannel:
         def close(self) -> None:
             closed.append(True)
 
-    def start(*, image: str, hello_timeout: float) -> LocalStdioChannel:
-        observed.append((image, hello_timeout))
+    def start(*, image: str, platform: str, hello_timeout: float) -> LocalStdioChannel:
+        observed.append((image, platform, hello_timeout))
         return cast("LocalStdioChannel", ReadyChannel())
 
     monkeypatch.setattr(mod, "start_container_live_runner", start)
 
     mod.verify_container_pi_runner_ready(image=_TEST_IMAGE, hello_timeout=17.0)
 
-    assert observed == [(_TEST_IMAGE, 17.0)]
+    assert observed == [(_TEST_IMAGE, PI_CONTAINER_PLATFORM, 17.0)]
     assert closed == [True]
+
+
+def test_container_lease_reaper_removes_labeled_resources_and_proves_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource_id = "a" * 12
+    calls: list[list[str]] = []
+    list_outputs = iter((resource_id + "\n", ""))
+
+    def run(command: list[str], **_kwargs: object) -> _FakeResult:
+        calls.append(command)
+        if command[2:4] == ["ls", "--all"]:
+            return _FakeResult(next(list_outputs))
+        assert command[2:5] == ["rm", "--force", resource_id]
+        return _FakeResult("")
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/docker")
+
+    assert mod.reap_container_runner_lease("lease-1", run_command=run) == (resource_id,)
+    assert calls[0][-1] == "label=wmh.runner.lease=lease-1"
+    assert calls[-1][-1] == "label=wmh.runner.lease=lease-1"
 
 
 def test_container_runtime_does_not_publish_marker_without_dependencies(tmp_path: Path) -> None:

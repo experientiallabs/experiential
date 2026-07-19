@@ -7,15 +7,23 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Self, cast
 from uuid import UUID
 
 from harbor.models.job.lock import TrialLock
 from harbor.models.job.result import JobResult
 from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import ExceptionInfo, TrialResult
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
+from wmh.core.types import JsonObject
 from wmh.evals.benchmark import (
     MAX_BENCHMARK_TASK_INSTRUCTION_CHARS,
     BenchmarkCandidateFailureReason,
@@ -37,7 +45,13 @@ from wmh.evals.benchmark import (
     is_sha256_digest,
 )
 from wmh.evals.harbor.config import _require_supported_harbor_version
+from wmh.evals.harbor.e2b_environment import TASK_E2B_LEASE_FILE
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.pi_runner_backend import (
+    PiRunnerBackendSpec,
+    RunnerLeaseRecord,
+    runner_owner_id,
+)
 from wmh.providers.base import ProviderConfig
 
 _TASK_TIMEOUT_EXCEPTIONS = frozenset({"AgentTimeoutError"})
@@ -129,6 +143,11 @@ _TASK_ENVIRONMENT_DIGEST_KEY = "task_environment_digest"
 _TASK_ENVIRONMENT_ATTESTATION_KEY = "task_environment_attestation"
 _MODEL_CALLS_KEY = "model_calls"
 _MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES = 64 * 1024
+_RUNNER_CONFIG_DIGEST_KEY = "runner_config_digest"
+_RUNNER_ENVIRONMENT_DIGEST_KEY = "runner_environment_digest"
+_RUNNER_ENVIRONMENT_ATTESTATION_KEY = "runner_environment_attestation"
+_RUNNER_LEASE_RECEIPT_KEY = "runner_lease_receipt"
+_MAX_RUNNER_ENVIRONMENT_ATTESTATION_BYTES = 64 * 1024
 _RUN_HEALTH_MAP = {
     "valid": BenchmarkRunHealth.VALID,
     "candidate_damaged": BenchmarkRunHealth.CANDIDATE_DAMAGED,
@@ -142,7 +161,28 @@ class _TrustedRunEvidence:
     candidate_outcome: BenchmarkCandidateOutcome
     run_health: BenchmarkRunHealth
     task_environment_digest: str | None
+    task_environment_attestation: JsonObject | None
+    runner_environment_digest: str | None
+    runner_environment_attestation: JsonObject | None
+    runner_lease_receipts: tuple[JsonObject, ...]
     model_calls: int | None
+
+
+@dataclass(frozen=True)
+class _ParsedRunnerEvidence:
+    """One context's stable environment evidence and resource lifecycle receipt."""
+
+    digest: str | None
+    attestation: JsonObject | None
+    receipt: JsonObject | None
+
+
+@dataclass(frozen=True)
+class _ParsedTaskEnvironmentEvidence:
+    """One context's stable task-environment identity and full evidence."""
+
+    digest: str
+    attestation: JsonObject
 
 
 class HarborTrialManifestEntry(BaseModel):
@@ -279,6 +319,7 @@ def load_harbor_job_result(
         trials.append(trial)
         locators.append(locator)
 
+    _validate_unique_resource_leases(trials)
     return LoadedHarborJobResult(
         result=BenchmarkRunResult(
             job_name=manifest.job_name,
@@ -290,6 +331,20 @@ def load_harbor_job_result(
         job_dir=root,
         locators=tuple(locators),
     )
+
+
+def _validate_unique_resource_leases(trials: list[BenchmarkTrialResult]) -> None:
+    """Reject any resource lifecycle receipt replayed into another benchmark cell."""
+    owners: dict[str, BenchmarkCell] = {}
+    for trial in trials:
+        receipts = list(trial.runner_lease_receipts)
+        if trial.task_environment_lease_receipt is not None:
+            receipts.append(trial.task_environment_lease_receipt)
+        for receipt in receipts:
+            lease_id = cast("str", receipt["lease_id"])
+            previous = owners.setdefault(lease_id, trial.cell)
+            if previous != trial.cell:
+                raise ValueError("Harbor runner lease receipt was reused across benchmark cells")
 
 
 def _load_manifest_entry(
@@ -351,7 +406,17 @@ def _load_manifest_entry(
         manifest.identity,
         manifest.agent_config_digest,
     )
-    return _convert_trial(result, entry, run_evidence), locator
+    trial = _convert_trial(result, entry, run_evidence)
+    if manifest.identity.task_environment.value == "e2b":
+        receipt = _load_task_environment_lease_receipt(
+            trial_dir,
+            run_evidence=run_evidence,
+            trial_name=result.trial_name,
+            required=trial.run_health
+            in {BenchmarkRunHealth.VALID, BenchmarkRunHealth.CANDIDATE_DAMAGED},
+        )
+        trial = trial.model_copy(update={"task_environment_lease_receipt": receipt})
+    return trial, locator
 
 
 def _load_incomplete_trial(
@@ -492,22 +557,24 @@ def _validate_run_identity(
         step.agent_result for step in result.step_results or [] if step.agent_result is not None
     )
     outcomes: list[tuple[BenchmarkCandidateOutcome, BenchmarkRunHealth]] = []
-    environment_digests: list[str] = []
+    environment_evidence: list[_ParsedTaskEnvironmentEvidence] = []
+    runner_evidence: list[_ParsedRunnerEvidence] = []
     model_calls: list[int | None] = []
     for context in contexts:
         metadata = context.metadata or {}
         candidate_hash = metadata.get("harness_hash")
-        runner_image = metadata.get("runner_image")
         if candidate_hash != expected.candidate_hash:
             raise ValueError(
                 f"manifest expected candidate hash {expected.candidate_hash!r}, "
                 f"found {candidate_hash!r}"
             )
-        if runner_image != expected.runner_image:
+        runner_config_digest = metadata.get(_RUNNER_CONFIG_DIGEST_KEY)
+        if runner_config_digest != expected.runner_config_digest:
             raise ValueError(
-                f"manifest expected runner image {expected.runner_image!r}, found {runner_image!r}"
+                "manifest expected runner configuration digest "
+                f"{expected.runner_config_digest!r}, found {runner_config_digest!r}"
             )
-        environment_digests.append(
+        environment_evidence.append(
             _parse_task_environment_attestation(
                 metadata,
                 expected_backend=expected.task_environment.value,
@@ -516,6 +583,16 @@ def _validate_run_identity(
         model_calls.append(_parse_model_calls(metadata))
         outcome = _parse_candidate_outcome(metadata)
         run_health = _parse_run_health(metadata)
+        runner_evidence.append(
+            _parse_runner_environment_attestation(
+                metadata,
+                expected_digest=expected.runner_environment_digest,
+                expected_config_digest=expected.runner_config_digest,
+                expected_owner_id=runner_owner_id(result.trial_name),
+                required=run_health
+                in {BenchmarkRunHealth.VALID, BenchmarkRunHealth.CANDIDATE_DAMAGED},
+            )
+        )
         if (
             run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
             and outcome.status is not BenchmarkCandidateStatus.FAILED
@@ -529,6 +606,10 @@ def _validate_run_identity(
             candidate_outcome=BenchmarkCandidateOutcome(),
             run_health=BenchmarkRunHealth.UNKNOWN,
             task_environment_digest=None,
+            task_environment_attestation=None,
+            runner_environment_digest=None,
+            runner_environment_attestation=None,
+            runner_lease_receipts=(),
             model_calls=None,
         )
     first = outcomes[0]
@@ -536,16 +617,36 @@ def _validate_run_identity(
         raise ValueError(
             "Harbor step contexts contain inconsistent candidate outcome or run health metadata"
         )
-    first_environment_digest = environment_digests[0]
-    if any(digest != first_environment_digest for digest in environment_digests[1:]):
+    first_environment = environment_evidence[0]
+    if any(evidence != first_environment for evidence in environment_evidence[1:]):
         raise ValueError("Harbor step contexts contain inconsistent task environment metadata")
     first_model_calls = model_calls[0]
     if any(calls != first_model_calls for calls in model_calls[1:]):
         raise ValueError("Harbor step contexts contain inconsistent model call metadata")
+    first_runner_digest = runner_evidence[0].digest
+    first_runner_attestation = runner_evidence[0].attestation
+    if any(
+        evidence.digest != first_runner_digest or evidence.attestation != first_runner_attestation
+        for evidence in runner_evidence[1:]
+    ):
+        raise ValueError("Harbor step contexts contain inconsistent runner environment metadata")
+    receipts_by_lease: dict[str, JsonObject] = {}
+    for evidence in runner_evidence:
+        receipt = evidence.receipt
+        if receipt is None:
+            continue
+        lease_id = cast("str", receipt["lease_id"])
+        previous = receipts_by_lease.setdefault(lease_id, receipt)
+        if previous != receipt:
+            raise ValueError("Harbor step contexts contain inconsistent runner lease receipts")
     return _TrustedRunEvidence(
         candidate_outcome=first[0],
         run_health=first[1],
-        task_environment_digest=first_environment_digest,
+        task_environment_digest=first_environment.digest,
+        task_environment_attestation=first_environment.attestation,
+        runner_environment_digest=first_runner_digest,
+        runner_environment_attestation=first_runner_attestation,
+        runner_lease_receipts=tuple(receipts_by_lease.values()),
         model_calls=first_model_calls,
     )
 
@@ -564,14 +665,18 @@ def _parse_task_environment_attestation(
     metadata: dict[str, object],
     *,
     expected_backend: str,
-) -> str:
+) -> _ParsedTaskEnvironmentEvidence:
     digest = metadata.get(_TASK_ENVIRONMENT_DIGEST_KEY)
     attestation = metadata.get(_TASK_ENVIRONMENT_ATTESTATION_KEY)
     if not is_sha256_digest(digest):
         raise ValueError("Harbor agent metadata omits a valid task environment digest")
     if not isinstance(attestation, dict):
         raise ValueError("Harbor agent metadata omits task environment attestation evidence")
-    if attestation.get("schema_version") != 1 or attestation.get("backend") != expected_backend:
+    expected_schema = 2 if expected_backend == "e2b" else 1
+    if (
+        attestation.get("schema_version") != expected_schema
+        or attestation.get("backend") != expected_backend
+    ):
         raise ValueError("Harbor task environment attestation names the wrong backend or schema")
     try:
         canonical = json.dumps(
@@ -588,7 +693,151 @@ def _parse_task_environment_attestation(
     actual = "sha256:" + hashlib.sha256(canonical).hexdigest()
     if actual != digest:
         raise ValueError("Harbor task environment attestation does not match its digest")
-    return digest
+    parsed = cast("JsonObject", json.loads(canonical))
+    if expected_backend == "e2b":
+        launch_digest = parsed.get("launch_config_digest")
+        if not is_sha256_digest(launch_digest):
+            raise ValueError("Harbor E2B task attestation omits its launch configuration digest")
+    return _ParsedTaskEnvironmentEvidence(digest=digest, attestation=parsed)
+
+
+def _load_task_environment_lease_receipt(
+    trial_dir: Path,
+    *,
+    run_evidence: _TrustedRunEvidence,
+    trial_name: str,
+    required: bool,
+) -> JsonObject | None:
+    """Load the host-authored E2B cleanup proof written after Harbor stops the trial."""
+    attestation = run_evidence.task_environment_attestation
+    receipt_path = trial_dir / TASK_E2B_LEASE_FILE
+    if attestation is None:
+        if required:
+            raise ValueError("Harbor E2B trial omits task environment attestation evidence")
+        return None
+    if receipt_path.is_symlink():
+        raise ValueError("Harbor E2B task environment lease receipt cannot be a symlink")
+    try:
+        with receipt_path.open("rb") as handle:
+            payload = handle.read(_MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES + 1)
+    except FileNotFoundError:
+        if required:
+            raise ValueError(
+                "Harbor E2B trial omits the task environment cleanup receipt"
+            ) from None
+        return None
+    except OSError:
+        raise ValueError("Harbor E2B task environment lease receipt cannot be read") from None
+    if len(payload) > _MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES:
+        raise ValueError("Harbor E2B task environment lease receipt exceeds its evidence limit")
+    try:
+        record = RunnerLeaseRecord.model_validate_json(payload)
+    except (TypeError, ValueError):
+        raise ValueError("Harbor E2B task environment lease receipt is invalid") from None
+    launch_digest = attestation.get("launch_config_digest")
+    if not isinstance(launch_digest, str) or record.config_digest != launch_digest:
+        raise ValueError(
+            "Harbor E2B task environment lease receipt does not match its launch configuration"
+        )
+    if record.backend != "e2b":
+        raise ValueError("Harbor E2B task environment lease receipt names the wrong backend")
+    if record.owner_id != runner_owner_id(trial_name):
+        raise ValueError("Harbor E2B task environment lease receipt names the wrong trial owner")
+    if required and (record.state != "retired" or record.resource_id is None):
+        raise ValueError("Harbor E2B task environment receipt does not prove terminal cleanup")
+    return cast("JsonObject", record.model_dump(mode="json"))
+
+
+def _parse_runner_environment_attestation(
+    metadata: dict[str, object],
+    *,
+    expected_digest: str,
+    expected_config_digest: str,
+    expected_owner_id: str,
+    required: bool,
+) -> _ParsedRunnerEvidence:
+    digest = metadata.get(_RUNNER_ENVIRONMENT_DIGEST_KEY)
+    attestation = metadata.get(_RUNNER_ENVIRONMENT_ATTESTATION_KEY)
+    raw_receipt = metadata.get(_RUNNER_LEASE_RECEIPT_KEY)
+    if digest is None and attestation is None and not required:
+        receipt = _parse_runner_lease_receipt(
+            raw_receipt,
+            expected_backend=None,
+            expected_config_digest=expected_config_digest,
+            expected_owner_id=expected_owner_id,
+            required=False,
+        )
+        return _ParsedRunnerEvidence(digest=None, attestation=None, receipt=receipt)
+    if not is_sha256_digest(digest):
+        raise ValueError("Harbor agent metadata omits a valid runner environment digest")
+    if digest != expected_digest:
+        raise ValueError("Harbor runner environment digest does not match the frozen run")
+    if not isinstance(attestation, dict):
+        raise ValueError("Harbor agent metadata omits runner environment attestation evidence")
+    if attestation.get("schema_version") != 2 or attestation.get("backend") not in {
+        "local",
+        "e2b",
+    }:
+        raise ValueError("Harbor runner environment attestation has an unknown backend or schema")
+    try:
+        canonical = json.dumps(
+            attestation,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    except (TypeError, ValueError):
+        raise ValueError("Harbor runner environment attestation is not canonical JSON") from None
+    if len(canonical) > _MAX_RUNNER_ENVIRONMENT_ATTESTATION_BYTES:
+        raise ValueError("Harbor runner environment attestation exceeds its evidence limit")
+    actual = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    if actual != digest:
+        raise ValueError("Harbor runner environment attestation does not match its digest")
+    parsed_attestation = cast("JsonObject", json.loads(canonical))
+    backend = cast("str", parsed_attestation["backend"])
+    receipt = _parse_runner_lease_receipt(
+        raw_receipt,
+        expected_backend=backend,
+        expected_config_digest=expected_config_digest,
+        expected_owner_id=expected_owner_id,
+        required=required,
+    )
+    return _ParsedRunnerEvidence(
+        digest=digest,
+        attestation=parsed_attestation,
+        receipt=receipt,
+    )
+
+
+def _parse_runner_lease_receipt(
+    value: object,
+    *,
+    expected_backend: str | None,
+    expected_config_digest: str,
+    expected_owner_id: str,
+    required: bool,
+) -> JsonObject | None:
+    """Validate and normalize one host-authored runner lifecycle receipt."""
+    if value is None:
+        if required:
+            raise ValueError("Harbor agent metadata omits the runner lease cleanup receipt")
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Harbor runner lease receipt is not a JSON object")
+    try:
+        record = RunnerLeaseRecord.model_validate(value)
+    except (TypeError, ValueError):
+        raise ValueError("Harbor runner lease receipt is invalid") from None
+    if record.config_digest != expected_config_digest:
+        raise ValueError("Harbor runner lease receipt does not match the frozen configuration")
+    if record.owner_id != expected_owner_id:
+        raise ValueError("Harbor runner lease receipt does not match its trial owner")
+    if expected_backend is not None and record.backend != expected_backend:
+        raise ValueError("Harbor runner lease receipt names the wrong backend")
+    if required and record.state != "retired":
+        raise ValueError("Harbor runner lease receipt does not prove terminal cleanup")
+    return cast("JsonObject", record.model_dump(mode="json"))
 
 
 def _parse_run_health(metadata: dict[str, object]) -> BenchmarkRunHealth:
@@ -669,12 +918,18 @@ def _validate_agent_config_identity(
             f"manifest expected candidate hash {expected.candidate_hash!r}, "
             f"found {harness.execution_hash!r} in Harbor agent config"
         )
-    runner_image = config.kwargs.get("runner_image")
-    if runner_image != expected.runner_image:
+    try:
+        runner = TypeAdapter(PiRunnerBackendSpec).validate_python(config.kwargs.get("runner_spec"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Harbor agent config contains an invalid runner spec") from exc
+    if runner.config_digest != expected.runner_config_digest:
         raise ValueError(
-            f"manifest expected runner image {expected.runner_image!r}, "
-            f"found {runner_image!r} in Harbor agent config"
+            "manifest expected runner configuration digest "
+            f"{expected.runner_config_digest!r}, found {runner.config_digest!r} "
+            "in Harbor agent config"
         )
+    if runner.attestation.digest != expected.runner_environment_digest:
+        raise ValueError("Harbor agent runner spec does not match the frozen environment digest")
     try:
         provider = ProviderConfig.model_validate(config.kwargs.get("provider_config"))
     except (TypeError, ValueError) as exc:
@@ -756,6 +1011,10 @@ def _convert_trial(
         source=entry.task_source,
         task_instruction=entry.task_instruction,
         task_environment_digest=run_evidence.task_environment_digest,
+        task_environment_attestation=run_evidence.task_environment_attestation,
+        runner_environment_digest=run_evidence.runner_environment_digest,
+        runner_environment_attestation=run_evidence.runner_environment_attestation,
+        runner_lease_receipts=list(run_evidence.runner_lease_receipts),
         status=status,
         rewards=rewards,
         error=error,

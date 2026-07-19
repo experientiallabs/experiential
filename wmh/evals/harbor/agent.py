@@ -13,9 +13,8 @@ import re
 import shlex
 import tempfile
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from concurrent.futures import Future
-from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -27,17 +26,12 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import MCPServerConfig
 from llm_waterfall import ChatResponse
+from pydantic import TypeAdapter
 
 from wmh.core.types import JsonObject
 from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.live_session import OutputEmitter, SessionEvent, ToolOutcome
-from wmh.harness.pi_local import (
-    PI_CONTAINER_IMAGE,
-    DockerStdioChannel,
-    start_container_live_runner,
-    validate_pi_container_image,
-)
 from wmh.harness.pi_runner import (
     AmbiguousTaskEnvironmentError,
     PiCandidateError,
@@ -49,7 +43,14 @@ from wmh.harness.pi_runner import (
     TurnDeadlineExceeded,
     run_pi_turn,
 )
-from wmh.harness.runner_link import Channel, TokenUsage
+from wmh.harness.pi_runner_backend import (
+    LocalPiRunnerSpec,
+    ManagedPiRunnerFactory,
+    PiRunnerBackendSpec,
+    build_pi_runner_factory,
+    runner_owner_id,
+)
+from wmh.harness.runner_link import TokenUsage
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.process_worker import (
     ProviderProcessWorker,
@@ -78,9 +79,10 @@ _MAX_ENVIRONMENT_CONTAINERS = 64
 _TASK_DISK_HEALTH_TIMEOUT_S = 10
 _MIN_TASK_FREE_DISK_KIB = 128 * 1024
 _TRACE_FILE = "wmh-events.jsonl"
+_RUNNER_LEASE_FILE = "wmh-runner-lease.json"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.6.0"
+WMH_PI_AGENT_VERSION: Final = "0.7.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -194,19 +196,9 @@ class _DockerEnvironmentView(Protocol):
     ) -> ExecResult: ...
 
 
-class _E2BSandboxInfoView(Protocol):
-    template_id: str
-    cpu_count: int
-    memory_mb: int
-    started_at: datetime
-
-
-class _E2BSandboxView(Protocol):
-    async def get_info(self) -> _E2BSandboxInfoView: ...
-
-
 class _E2BEnvironmentView(Protocol):
-    _sandbox: _E2BSandboxView | None
+    @property
+    def wmh_environment_attestation(self) -> JsonObject | None: ...
 
 
 class HarborToolExecutor:
@@ -491,68 +483,6 @@ class HarborToolExecutor:
                 pass
 
 
-class LocalContainerRunnerFactory:
-    """Open one isolated local pi container and support fail-closed cancellation."""
-
-    def __init__(self, *, image: str = PI_CONTAINER_IMAGE) -> None:
-        self._image = image
-        self._lock = threading.Lock()
-        self._active: DockerStdioChannel | None = None
-        self._cancelled = False
-        self._opening = False
-        self._closed = threading.Event()
-
-    def __call__(self) -> AbstractContextManager[Channel]:
-        return self._open()
-
-    @contextmanager
-    def _open(self) -> Iterator[Channel]:
-        with self._lock:
-            self._opening = True
-        try:
-            channel = cast("DockerStdioChannel", start_container_live_runner(image=self._image))
-        except BaseException:
-            with self._lock:
-                self._opening = False
-            self._closed.set()
-            raise
-        with self._lock:
-            self._opening = False
-            cancelled = self._cancelled
-            if not cancelled:
-                self._active = channel
-        if cancelled:
-            try:
-                channel.close()
-            finally:
-                self._closed.set()
-            raise RuntimeError("pi runner was cancelled before startup completed")
-        try:
-            yield channel
-        finally:
-            try:
-                channel.close()
-            finally:
-                with self._lock:
-                    self._active = None
-                self._closed.set()
-
-    def cancel(self) -> None:
-        """Stop an active runner, or arrange to stop one still being created."""
-        with self._lock:
-            self._cancelled = True
-            channel = self._active
-            opening = self._opening
-        if channel is None and not opening:
-            self._closed.set()
-        if channel is not None:
-            channel.close()
-
-    def wait_closed(self, timeout_s: float) -> bool:
-        """Wait until the runner context proves cleanup."""
-        return self._closed.wait(timeout_s)
-
-
 class WmhPiAgent(BaseAgent):
     """Run serialized pi harness source while Harbor owns the task and verifier lifecycle."""
 
@@ -569,7 +499,7 @@ class WmhPiAgent(BaseAgent):
         provider_config: JsonObject,
         budget_policy_digest: str | None = None,
         budget_binding: JsonObject | None = None,
-        runner_image: str = PI_CONTAINER_IMAGE,
+        runner_spec: JsonObject | None = None,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = False,
     ) -> None:
@@ -608,14 +538,16 @@ class WmhPiAgent(BaseAgent):
                 "WMH pi benchmark evaluation requires runtime kind 'pi-node', got "
                 f"{self._harness.runtime_kind()!r}"
             )
-        validate_pi_container_image(runner_image)
+        validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
+            runner_spec if runner_spec is not None else LocalPiRunnerSpec().model_dump(mode="json")
+        )
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
         if not isinstance(require_provider_receipts, bool):
             raise ValueError("require_provider_receipts must be a boolean")
         self._provider_config = config.model_copy(deep=True)
         self._budget_account = account.model_copy(deep=True) if account is not None else None
-        self._runner_image = runner_image
+        self._runner_spec = validated_runner
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
         self._task_environment_attestation: _TaskEnvironmentAttestation | None = None
@@ -646,17 +578,33 @@ class WmhPiAgent(BaseAgent):
         attestation = self._task_environment_attestation
         if attestation is None:
             raise WmhPiEnvironmentError("task environment attestation is unavailable")
-        identity_metadata = cast(
-            "JsonObject",
-            {
-                "harness_hash": self._harness.execution_hash,
-                "runner_image": self._runner_image,
-                "task_environment_digest": attestation.digest,
-                "task_environment_attestation": attestation.evidence,
-                "run_health": PiRunHealth.VALID.value,
-            },
+        runner_factory = build_pi_runner_factory(
+            self._runner_spec,
+            ledger_path=self.logs_dir.parent / _RUNNER_LEASE_FILE,
+            owner_id=runner_owner_id(self.logs_dir.parent.name),
         )
-        _populate_context(context, TokenUsage(), identity_metadata)
+
+        def identity_metadata() -> JsonObject:
+            runner_attestation = runner_factory.attestation
+            metadata = cast(
+                "JsonObject",
+                {
+                    "harness_hash": self._harness.execution_hash,
+                    "runner_config_digest": runner_factory.config_digest,
+                    "task_environment_digest": attestation.digest,
+                    "task_environment_attestation": attestation.evidence,
+                    "run_health": PiRunHealth.VALID.value,
+                },
+            )
+            if runner_attestation is not None:
+                metadata["runner_environment_digest"] = runner_attestation.digest
+                metadata["runner_environment_attestation"] = runner_attestation.evidence
+            lease_receipt = runner_factory.lease_receipt
+            if lease_receipt is not None:
+                metadata["runner_lease_receipt"] = lease_receipt
+            return metadata
+
+        _populate_context(context, TokenUsage(), identity_metadata())
         try:
             self._prepare_trace()
         except Exception:  # noqa: BLE001 - never expose host filesystem details
@@ -666,7 +614,7 @@ class WmhPiAgent(BaseAgent):
                 cast(
                     "JsonObject",
                     {
-                        **identity_metadata,
+                        **identity_metadata(),
                         "infrastructure_failure": True,
                         "run_health": PiRunHealth.INFRASTRUCTURE_FAILURE.value,
                     },
@@ -675,7 +623,6 @@ class WmhPiAgent(BaseAgent):
             raise WmhPiRunnerError("WMH pi trace persistence failed") from None
         event_loop = asyncio.get_running_loop()
         executor = HarborToolExecutor(event_loop, environment)
-        runner_factory = LocalContainerRunnerFactory(image=self._runner_image)
         provider_worker = ProviderProcessWorker(
             self._provider_config,
             budget_account=self._budget_account,
@@ -713,7 +660,7 @@ class WmhPiAgent(BaseAgent):
                     cast(
                         "JsonObject",
                         {
-                            **identity_metadata,
+                            **identity_metadata(),
                             "infrastructure_failure": True,
                             "run_health": PiRunHealth.INFRASTRUCTURE_FAILURE.value,
                         },
@@ -736,7 +683,7 @@ class WmhPiAgent(BaseAgent):
                 metadata = cast(
                     "JsonObject",
                     {
-                        **identity_metadata,
+                        **identity_metadata(),
                         "infrastructure_failure": True,
                         "infrastructure_failure_kind": exc.kind.value,
                         "run_health": run_health.value,
@@ -754,7 +701,7 @@ class WmhPiAgent(BaseAgent):
                     cast(
                         "JsonObject",
                         {
-                            **identity_metadata,
+                            **identity_metadata(),
                             "infrastructure_failure": True,
                             "run_health": run_health.value,
                         },
@@ -778,7 +725,7 @@ class WmhPiAgent(BaseAgent):
             metadata = cast(
                 "JsonObject",
                 {
-                    **identity_metadata,
+                    **identity_metadata(),
                     "terminal_reason": result.terminal_reason,
                     "candidate_failure": False,
                     "run_health": result.run_health.value,
@@ -791,7 +738,7 @@ class WmhPiAgent(BaseAgent):
             metadata = cast(
                 "JsonObject",
                 {
-                    **identity_metadata,
+                    **identity_metadata(),
                     "candidate_failure": True,
                     "candidate_failure_stage": candidate_error.stage.value,
                     "candidate_failure_reason": candidate_error.reason.value,
@@ -808,7 +755,7 @@ class WmhPiAgent(BaseAgent):
                 cast(
                     "JsonObject",
                     {
-                        **identity_metadata,
+                        **identity_metadata(),
                         "infrastructure_failure": True,
                         "run_health": PiRunHealth.INFRASTRUCTURE_FAILURE.value,
                     },
@@ -860,7 +807,7 @@ class WmhPiAgent(BaseAgent):
 
 def _run_isolated_turn(
     provider_worker: ProviderProcessWorker,
-    runner_factory: LocalContainerRunnerFactory,
+    runner_factory: ManagedPiRunnerFactory,
     executor: HarborToolExecutor,
     harness: HarnessDoc,
     instruction: str,
@@ -1092,13 +1039,29 @@ async def _attest_e2b_environment(
     environment: BaseEnvironment,
     view: _E2BEnvironmentView,
 ) -> JsonObject:
-    sandbox = view._sandbox
-    if sandbox is None:
-        raise RuntimeError("E2B sandbox is unavailable")
-    info = await sandbox.get_info()
-    template_id = _bounded_identity(info.template_id, label="E2B template identity")
-    cpu_count = info.cpu_count
-    memory_mb = info.memory_mb
+    del environment
+    evidence = view.wmh_environment_attestation
+    if evidence is None:
+        raise RuntimeError("trusted E2B environment attestation is unavailable")
+    if evidence.get("schema_version") != 2 or evidence.get("backend") != "e2b":
+        raise RuntimeError("trusted E2B environment attestation has an invalid schema")
+    template_id = _bounded_identity(
+        evidence.get("template_id"),
+        label="E2B template identity",
+    )
+    build_id = _bounded_identity(evidence.get("build_id"), label="E2B build identity")
+    environment_id = _bounded_identity(
+        evidence.get("environment_id"),
+        label="E2B environment identity",
+    )
+    platform = evidence.get("platform")
+    if (
+        not isinstance(platform, str)
+        or re.fullmatch(r"[a-z0-9_.-]{1,64}/[a-z0-9_.-]{1,64}", platform) is None
+    ):
+        raise RuntimeError("E2B returned invalid sandbox platform evidence")
+    cpu_count = evidence.get("cpu_count")
+    memory_mb = evidence.get("memory_mb")
     if (
         isinstance(cpu_count, bool)
         or not isinstance(cpu_count, int)
@@ -1108,42 +1071,52 @@ async def _attest_e2b_environment(
         or memory_mb < 1
     ):
         raise RuntimeError("E2B returned invalid sandbox resource evidence")
-    tags = await _get_e2b_template_tags(template_id)
-    default_tags = [
-        (build_id, created_at) for tag, build_id, created_at in tags if tag == "default"
-    ]
-    if len(default_tags) != 1:
-        raise RuntimeError("E2B template default tag did not resolve to one immutable build")
-    raw_build_id, tag_created_at = default_tags[0]
+    if evidence.get("timeout_action") != "kill" or evidence.get("auto_resume") is not False:
+        raise RuntimeError("E2B task environment lifecycle evidence is not fail closed")
+    if evidence.get("volume_mounts") is not False:
+        raise RuntimeError("E2B task environment volume isolation evidence is invalid")
+    for field in ("build_config_digest", "launch_config_digest"):
+        value = evidence.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise RuntimeError(f"E2B task environment {field} is invalid")
+    _bounded_identity(evidence.get("envd_version"), label="E2B envd identity")
+    lease_timeout_s = evidence.get("lease_timeout_s")
     if (
-        not isinstance(info.started_at, datetime)
-        or info.started_at.tzinfo is None
-        or not isinstance(tag_created_at, datetime)
-        or tag_created_at.tzinfo is None
-        or tag_created_at > info.started_at
+        isinstance(lease_timeout_s, bool)
+        or not isinstance(lease_timeout_s, int)
+        or not 60 <= lease_timeout_s <= 3600
     ):
-        raise RuntimeError("E2B template tag changed after the sandbox started")
-    build_id = _bounded_identity(raw_build_id, label="E2B build identity")
-    platform_result = await environment.exec(
-        "/bin/uname -s && /bin/uname -m",
-        timeout_sec=_ENVIRONMENT_ATTESTATION_TIMEOUT_S,
-    )
-    if platform_result.return_code != 0:
-        raise RuntimeError("E2B sandbox platform attestation failed")
-    platform_lines = _bounded_lines(
-        platform_result.stdout,
-        label="E2B sandbox platform",
-    )
-    if len(platform_lines) != 2:
-        raise RuntimeError("E2B returned malformed sandbox platform evidence")
-    platform = "/".join(part.lower() for part in platform_lines)
-    if re.fullmatch(r"[a-z0-9_.-]{1,64}/[a-z0-9_.-]{1,64}", platform) is None:
-        raise RuntimeError("E2B returned invalid sandbox platform evidence")
+        raise RuntimeError("E2B task environment lease lifetime is invalid")
+    network_mode = evidence.get("network_mode")
+    if network_mode not in {"public", "no_network", "allowlist"}:
+        raise RuntimeError("E2B task environment network mode is invalid")
+    network_lists: dict[str, list[str]] = {}
+    for field in ("allowed_hosts", "network_allow_out", "network_deny_out"):
+        value = evidence.get(field)
+        if (
+            not isinstance(value, list)
+            or not all(isinstance(item, str) and 0 < len(item) <= 512 for item in value)
+            or value != sorted(set(value))
+        ):
+            raise RuntimeError(f"E2B task environment {field} is invalid")
+        network_lists[field] = value
+    expected_internet = network_mode != "no_network"
+    if evidence.get("internet_access") is not expected_internet:
+        raise RuntimeError("E2B task environment internet policy is invalid")
+    if network_mode == "allowlist" and (
+        network_lists["allowed_hosts"] != network_lists["network_allow_out"]
+        or not network_lists["network_deny_out"]
+    ):
+        raise RuntimeError("E2B task environment allowlist evidence is invalid")
+    if network_mode == "public" and (
+        network_lists["network_allow_out"] or network_lists["network_deny_out"]
+    ):
+        raise RuntimeError("E2B public task environment has unexpected network rules")
     return cast(
         "JsonObject",
         {
-            "schema_version": 1,
-            "backend": "e2b",
+            **evidence,
+            "environment_id": environment_id,
             "template_id": template_id,
             "build_id": build_id,
             "platform": platform,
@@ -1151,15 +1124,6 @@ async def _attest_e2b_environment(
             "memory_mb": memory_mb,
         },
     )
-
-
-async def _get_e2b_template_tags(
-    template_id: str,
-) -> tuple[tuple[str, str, datetime], ...]:
-    from e2b import AsyncTemplate
-
-    tags = await AsyncTemplate.get_tags(template_id)
-    return tuple((tag.tag, tag.build_id, tag.created_at) for tag in tags)
 
 
 async def _run_host_command(*command: str) -> str:
@@ -1231,7 +1195,7 @@ def _single_platform(value: str, *, label: str) -> str:
 
 
 def _bounded_identity(value: object, *, label: str) -> str:
-    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,512}", value) is None:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,512}", value) is None:
         raise RuntimeError(f"{label} is invalid")
     return value
 
@@ -1239,7 +1203,7 @@ def _bounded_identity(value: object, *, label: str) -> str:
 async def _cancel_and_wait_execution(
     executor: HarborToolExecutor,
     provider_worker: ProviderProcessWorker,
-    runner_factory: LocalContainerRunnerFactory,
+    runner_factory: ManagedPiRunnerFactory,
     turn_task: asyncio.Task[PiTurnResult],
 ) -> None:
     """Cancel all trusted execution and do not abandon its threads or subprocesses."""
@@ -1263,7 +1227,7 @@ async def _cancel_and_wait_execution(
 async def _prove_execution_cleanup(
     executor: HarborToolExecutor,
     provider_worker: ProviderProcessWorker,
-    runner_factory: LocalContainerRunnerFactory,
+    runner_factory: ManagedPiRunnerFactory,
     turn_task: asyncio.Task[PiTurnResult],
 ) -> bool:
     cleanup_proved = True

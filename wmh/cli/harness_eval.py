@@ -11,6 +11,7 @@ from pathlib import Path
 import typer
 from click import ClickException
 from harbor.models.job.config import DatasetConfig
+from pydantic import TypeAdapter
 from rich.console import Console
 
 from wmh.config import ARTIFACT_DIR
@@ -18,13 +19,14 @@ from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.evaluator import HarborEvaluator, harbor_job_lease_path
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.pi_local import PI_CONTAINER_IMAGE
+from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import BudgetAccount
 
 _console = Console()
 _OUTPUT_LEASE_SUFFIX = ".wmh-eval-output.lock"
+_MAX_RUNNER_SPEC_BYTES = 64 * 1024
 
 
 class ConcurrentHarnessOutputError(RuntimeError):
@@ -89,8 +91,8 @@ def eval_harness(
         "local",
         "--task-backend",
         help=(
-            "Harbor task environment: local Docker or E2B. The pi runner always uses local "
-            "Docker, so Docker is required for both."
+            "Harbor task environment: local Docker or E2B. This is independent of the Pi "
+            "runner backend."
         ),
     ),
     attempts: int = typer.Option(1, "--attempts", min=1, help="Attempts per task."),
@@ -116,10 +118,10 @@ def eval_harness(
         min=0.001,
         help="Maximum seconds for one WMH pi turn.",
     ),
-    runner_image: str = typer.Option(
-        PI_CONTAINER_IMAGE,
-        "--runner-image",
-        help="Digest-pinned image used by the local Docker pi runner on every task backend.",
+    runner_spec_path: str | None = typer.Option(
+        None,
+        "--runner-spec",
+        help="Pi runner backend spec JSON. Local Docker is the default when omitted.",
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project artifact directory."),
     out: str = typer.Option(..., "--out", help="Canonical benchmark result JSON output."),
@@ -169,6 +171,10 @@ def eval_harness(
         _load_budget_account(budget_account_path) if budget_account_path is not None else None
     )
     backend = _parse_task_backend(task_backend)
+    try:
+        runner_spec = _load_runner_spec(runner_spec_path)
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--runner-spec") from exc
     resolved_jobs_dir = (
         Path(jobs_dir).expanduser().resolve()
         if jobs_dir is not None
@@ -186,7 +192,7 @@ def eval_harness(
         evaluator = HarborEvaluator(
             spec,
             provider_config,
-            runner_image=runner_image,
+            runner_spec=runner_spec,
             turn_timeout_s=turn_timeout_s,
             budget_account=budget_account,
         )
@@ -203,7 +209,8 @@ def eval_harness(
         f"harness eval: [bold]{candidate.name}@v{candidate.version}[/bold], "
         f"provider [bold]{provider_config.kind.value}/{provider_config.model}[/bold], "
         f"{attempts} attempt(s) per task, concurrency {concurrency}, "
-        f"task backend {backend.value}. This run can incur model and environment costs."
+        f"task backend {backend.value}, runner backend {runner_spec.backend}. "
+        "This run can incur model and environment costs."
     )
     if not yes and not typer.confirm("Proceed with paid evaluation?", default=False):
         raise typer.Exit(1)
@@ -427,6 +434,16 @@ def _parse_task_backend(value: str) -> HarborEnvironmentBackend:
             f"unknown task backend {value!r}; choose local or e2b",
             param_hint="--task-backend",
         ) from None
+
+
+def _load_runner_spec(path: str | None) -> PiRunnerBackendSpec:
+    """Load one bounded secret-free runner spec, or return the local default."""
+    if path is None:
+        return LocalPiRunnerSpec()
+    payload = Path(path).expanduser().resolve().read_bytes()
+    if len(payload) > _MAX_RUNNER_SPEC_BYTES:
+        raise ValueError("runner spec exceeds 64 KiB")
+    return TypeAdapter(PiRunnerBackendSpec).validate_json(payload)
 
 
 def _validate_output_path(

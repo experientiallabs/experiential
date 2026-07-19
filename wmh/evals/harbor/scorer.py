@@ -12,7 +12,7 @@ from pathlib import Path
 from statistics import fmean
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from wmh.core.text import normalize_durable_text, validate_durable_text
@@ -42,7 +42,10 @@ from wmh.evals.harbor.receipt_trace import (
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.live_session import EventKind
-from wmh.harness.pi_local import PI_CONTAINER_IMAGE, validate_pi_container_image
+from wmh.harness.pi_runner_backend import (
+    LocalPiRunnerSpec,
+    PiRunnerBackendSpec,
+)
 from wmh.harness.scoring import (
     MAX_TASK_EVIDENCE_CHARS,
     HarnessScoreReport,
@@ -93,6 +96,7 @@ class _EvaluationCellIdentity(BaseModel):
     source: str | None
     task_instruction_digest: str
     task_environment_digest: str
+    runner_environment_digest: str
     status: BenchmarkTrialStatus
     rewards_digest: str
     verifier_reward: float | None = Field(ge=0.0, le=1.0)
@@ -141,11 +145,13 @@ class HarborHarnessScorer:
         task_keys: tuple[str, ...],
         task_environment_digests: tuple[str, ...],
         reward_key: str,
-        runner_image: str = PI_CONTAINER_IMAGE,
+        runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
         turn_timeout_s: float = 300.0,
     ) -> None:
-        """Freeze task selection, provider route, backend, image, and agent compute."""
-        validate_pi_container_image(runner_image)
+        """Freeze task selection, provider route, backend, runner, and agent compute."""
+        validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
+            runner_spec if runner_spec is not None else LocalPiRunnerSpec().model_dump(mode="json")
+        )
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
         if not reward_key.strip():
@@ -187,11 +193,6 @@ class HarborHarnessScorer:
         )
         _validate_job_prefix(spec.job_name)
         validate_exact_harbor_dataset_selection(spec, frozen_task_ids)
-        if spec.environment_backend is HarborEnvironmentBackend.E2B:
-            raise ValueError(
-                "HarborHarnessScorer cannot validate E2B runs until Harbor exposes the immutable "
-                "build ID used to create each sandbox; use local Docker for scored search"
-            )
         provider = ProviderConfig.model_validate(provider_config.model_dump())
         envelope = harbor_agent_compute_envelope(
             reference_harness,
@@ -209,7 +210,7 @@ class HarborHarnessScorer:
         self._task_keys = frozen_task_keys
         self._task_environment_digests = frozen_environment_digests
         self._reward_key = reward_key
-        self._runner_image = runner_image
+        self._runner_spec = validated_runner
         self._compute_envelope = envelope
         self._runner: asyncio.Runner | None = None
         self._closed = False
@@ -306,7 +307,7 @@ class HarborHarnessScorer:
         evaluator = HarborEvaluator(
             spec,
             self._provider_config.model_copy(deep=True),
-            runner_image=self._runner_image,
+            runner_spec=self._runner_spec,
             turn_timeout_s=self._compute_envelope.turn_timeout_s,
         )
         try:
@@ -366,7 +367,7 @@ class HarborHarnessScorer:
             candidate=candidate,
             spec=spec,
             provider_config=self._provider_config,
-            runner_image=self._runner_image,
+            runner_spec=self._runner_spec,
             turn_timeout_s=self._compute_envelope.turn_timeout_s,
         )
         ordered = admit_harbor_matrix(
@@ -407,6 +408,7 @@ class HarborHarnessScorer:
                         source=trial.source,
                         task_instruction_digest=_sha256_text(trial.task_instruction),
                         task_environment_digest=_required_task_environment_digest(trial),
+                        runner_environment_digest=_required_runner_environment_digest(trial),
                         status=trial.status,
                         rewards_digest=_rewards_digest(trial.rewards),
                         verifier_reward=item.verifier_reward,
@@ -465,7 +467,7 @@ class HarborHarnessScorer:
             "task_keys": list(self._task_keys),
             "task_environment_digests": list(self._task_environment_digests),
             "reward_key": self._reward_key,
-            "runner_image": self._runner_image,
+            "runner_spec": self._runner_spec.model_dump(mode="json"),
             "compute_envelope": self._compute_envelope.model_dump(mode="json"),
             "agent_version": WMH_PI_AGENT_VERSION,
         }
@@ -548,12 +550,20 @@ def validate_harbor_run_identity(
     candidate: HarnessDoc,
     spec: HarborJobSpec,
     provider_config: ProviderConfig,
-    runner_image: str,
+    runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
+    runner_image: str | None = None,
     turn_timeout_s: float,
     require_exact_run_config: bool = False,
     budget_policy_digest: str | None = None,
 ) -> None:
     """Require loaded evidence to match its frozen harness and execution route."""
+    if runner_spec is not None and runner_image is not None:
+        raise ValueError("runner_spec and runner_image are mutually exclusive")
+    validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
+        runner_spec
+        if runner_spec is not None
+        else LocalPiRunnerSpec(image=runner_image) if runner_image is not None else LocalPiRunnerSpec()
+    )
     if result.job_name != spec.job_name:
         raise ValueError(
             f"Harbor result job name {result.job_name!r} does not match {spec.job_name!r}"
@@ -576,14 +586,16 @@ def validate_harbor_run_identity(
         mismatches.append("provider route")
     if identity.task_environment is not expected_environment:
         mismatches.append("task backend")
-    if identity.runner_image != runner_image:
-        mismatches.append("runner image")
+    if identity.runner_config_digest != validated_runner.config_digest:
+        mismatches.append("runner configuration")
+    if identity.runner_environment_digest != validated_runner.attestation.digest:
+        mismatches.append("runner environment")
     if require_exact_run_config:
         expectation = harbor_run_expectation(
             candidate=candidate,
             spec=spec,
             provider_config=provider_config,
-            runner_image=runner_image,
+            runner_spec=validated_runner,
             turn_timeout_s=turn_timeout_s,
             budget_policy_digest=budget_policy_digest,
         )
@@ -625,6 +637,10 @@ def admit_harbor_matrix(
         key = (trial.cell.task_key, trial.cell.attempt)
         if trial.cell != expected_by_key[key]:
             raise ValueError(f"observed Harbor cell identity differs from plan: {key}")
+        if _required_runner_environment_digest(trial) != (
+            result.identity.runner_environment_digest
+        ):
+            raise ValueError(f"observed Harbor runner identity differs from plan: {key}")
 
     locator_keys = [(locator.cell.task_key, locator.cell.attempt) for locator in loaded.locators]
     duplicate_locators = sorted(key for key, count in Counter(locator_keys).items() if count > 1)
@@ -1061,6 +1077,16 @@ def _required_task_environment_digest(trial: BenchmarkTrialResult) -> str:
         raise ValueError(
             f"Harbor task {trial.task_identity!r} attempt {trial.cell.attempt} omits trusted "
             "task environment identity"
+        )
+    return digest
+
+
+def _required_runner_environment_digest(trial: BenchmarkTrialResult) -> str:
+    digest = trial.runner_environment_digest
+    if digest is None:
+        raise ValueError(
+            f"Harbor task {trial.task_identity!r} attempt {trial.cell.attempt} omits trusted "
+            "runner environment identity"
         )
     return digest
 

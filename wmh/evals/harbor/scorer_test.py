@@ -31,8 +31,8 @@ from wmh.evals.benchmark import (
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
-from wmh.harness.pi_local import PI_CONTAINER_IMAGE
 from wmh.harness.pi_runner import pi_node_baseline
+from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.scoring import ScoreRequest, ScoreRunHealth
 from wmh.providers.base import ProviderConfig, ProviderKind
 
@@ -41,6 +41,7 @@ _TASK_KEYS = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
 _TASK_ENVIRONMENT_DIGESTS = ("sha256:" + "c" * 64, "sha256:" + "d" * 64)
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RUN_DIGEST = "sha256:" + "2" * 64
+_RUNNER = LocalPiRunnerSpec()
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class _ResultOptions:
     run_health: BenchmarkRunHealth = BenchmarkRunHealth.VALID
     candidate_damage_error: bool = False
     failure_kind: BenchmarkFailureKind = BenchmarkFailureKind.ENVIRONMENT
+    runner_environment_digest: str | None = _RUNNER.attestation.digest
 
 
 def _provider() -> ProviderConfig:
@@ -145,6 +147,7 @@ def _loaded_result(
     run_health: BenchmarkRunHealth = BenchmarkRunHealth.VALID,
     candidate_damage_error: bool = False,
     failure_kind: BenchmarkFailureKind = BenchmarkFailureKind.ENVIRONMENT,
+    runner_environment_digest: str | None = _RUNNER.attestation.digest,
 ) -> LoadedHarborJobResult:
     environment_digest_by_task = dict(zip(_TASK_IDS, task_environment_digests, strict=True))
     selected_rewards = rewards or {
@@ -200,6 +203,7 @@ def _loaded_result(
                         task_id,
                         "sha256:" + "e" * 64,
                     ),
+                    runner_environment_digest=runner_environment_digest,
                     status=status,
                     rewards=trial_rewards,
                     error=error,
@@ -250,7 +254,8 @@ def _loaded_result(
                     if spec.environment_backend is HarborEnvironmentBackend.E2B
                     else BenchmarkTaskEnvironment.DOCKER
                 ),
-                runner_image=PI_CONTAINER_IMAGE,
+                runner_config_digest=_RUNNER.config_digest,
+                runner_environment_digest=_RUNNER.attestation.digest,
                 run_config_digest=_RUN_DIGEST,
             ),
             expected_cells=expected,
@@ -266,8 +271,8 @@ def _install_fake_evaluator(
     tmp_path: Path,
     *,
     result_options: _ResultOptions | None = None,
-) -> list[tuple[HarborJobSpec, ProviderConfig, str, float]]:
-    captured: list[tuple[HarborJobSpec, ProviderConfig, str, float]] = []
+) -> list[tuple[HarborJobSpec, ProviderConfig, PiRunnerBackendSpec, float]]:
+    captured: list[tuple[HarborJobSpec, ProviderConfig, PiRunnerBackendSpec, float]] = []
     options = result_options or _ResultOptions()
 
     class FakeEvaluator:
@@ -276,10 +281,10 @@ def _install_fake_evaluator(
             spec: HarborJobSpec,
             provider_config: ProviderConfig,
             *,
-            runner_image: str,
+            runner_spec: PiRunnerBackendSpec,
             turn_timeout_s: float,
         ) -> None:
-            captured.append((spec, provider_config, runner_image, turn_timeout_s))
+            captured.append((spec, provider_config, runner_spec, turn_timeout_s))
             self._spec = spec
 
         async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
@@ -298,6 +303,7 @@ def _install_fake_evaluator(
                 run_health=options.run_health,
                 candidate_damage_error=options.candidate_damage_error,
                 failure_kind=options.failure_kind,
+                runner_environment_digest=options.runner_environment_digest,
             )
 
     monkeypatch.setattr(mod, "HarborEvaluator", FakeEvaluator)
@@ -314,7 +320,7 @@ def _scorer(
     task_keys: tuple[str, ...] = _TASK_KEYS,
     task_environment_digests: tuple[str, ...] = _TASK_ENVIRONMENT_DIGESTS,
     reward_key: str = "reward",
-    runner_image: str = PI_CONTAINER_IMAGE,
+    runner_spec: PiRunnerBackendSpec = _RUNNER,
     turn_timeout_s: float = 300.0,
 ) -> mod.HarborHarnessScorer:
     return mod.HarborHarnessScorer(
@@ -325,7 +331,7 @@ def _scorer(
         task_keys=task_keys,
         task_environment_digests=task_environment_digests,
         reward_key=reward_key,
-        runner_image=runner_image,
+        runner_spec=runner_spec,
         turn_timeout_s=turn_timeout_s,
     )
 
@@ -429,7 +435,7 @@ def test_score_job_identity_binds_full_candidate_route_and_qualification(
     assert captured[0][0].job_name.startswith("wmh-score-")
     assert len(captured[0][0].job_name) == len("wmh-score-") + 64
     assert captured[0][1] == _provider()
-    assert captured[0][2] == PI_CONTAINER_IMAGE
+    assert captured[0][2] == _RUNNER
     assert captured[0][3] == 300.0
 
 
@@ -466,6 +472,29 @@ def test_rejects_missing_or_extra_task_identity(
     )
 
     with _scorer(tmp_path) as scorer, pytest.raises(ValueError, match="task identities"):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
+@pytest.mark.parametrize(
+    ("digest", "message"),
+    [
+        (None, "omits trusted runner environment identity"),
+        ("sha256:" + "f" * 64, "runner identity differs from plan"),
+    ],
+)
+def test_rejects_missing_or_drifted_runner_environment_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    digest: str | None,
+    message: str,
+) -> None:
+    _install_fake_evaluator(
+        monkeypatch,
+        tmp_path,
+        result_options=_ResultOptions(runner_environment_digest=digest),
+    )
+
+    with _scorer(tmp_path) as scorer, pytest.raises(ValueError, match=message):
         scorer.score(pi_node_baseline("candidate"), request=_full_request())
 
 
@@ -1066,14 +1095,14 @@ def test_candidate_compute_envelope_is_frozen_while_source_may_change(tmp_path: 
     scorer.close()
 
 
-def test_e2b_scoring_is_gated_until_harbor_exposes_immutable_spawn_identity(
+def test_e2b_task_scoring_uses_the_trusted_exact_build_environment_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_evaluator(monkeypatch, tmp_path)
     spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
-    with pytest.raises(ValueError, match="immutable build ID"):
-        _scorer(tmp_path, job_spec=spec)
+    with _scorer(tmp_path, job_spec=spec) as scorer:
+        assert scorer.environment_backend is HarborEnvironmentBackend.E2B
 
 
 def test_runner_cleanup_on_success_error_and_construction_failure(

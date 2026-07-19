@@ -12,11 +12,17 @@ optional extra (`uv sync --extra e2b`).
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections.abc import Callable, Iterator, Sequence
-from typing import Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from e2b import Sandbox as E2BSandbox
+    from e2b import SandboxQuery
+    from e2b.sandbox.sandbox_api import SandboxLifecycle
 
 
 class SandboxUsage(BaseModel):
@@ -45,6 +51,10 @@ _CREATE_DELAYS = (1.0, 3.0, 9.0)
 # be proved.
 _KILL_DELAYS = (0.1, 0.5)
 _KILL_REQUEST_TIMEOUT_S = 5.0
+_ORPHAN_LIST_LIMIT = 100
+_ORPHAN_LIST_MAX_PAGES = 10
+_ORPHAN_RECONCILE_DELAYS = (0.0, 0.1, 0.5, 1.5)
+_LEASE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
 
 
 class SandboxCleanupError(RuntimeError):
@@ -60,6 +70,13 @@ class SandboxCleanupError(RuntimeError):
         super().__init__(message)
         self.resource = resource
         self.sandbox_usage = sandbox_usage
+
+
+class SandboxLifecyclePolicy(TypedDict):
+    """Create-time lifecycle controls that E2B must report back unchanged."""
+
+    on_timeout: Literal["pause", "kill"]
+    auto_resume: bool
 
 
 @runtime_checkable
@@ -167,6 +184,8 @@ def default_sandbox_factory(
     template: str | None = None,
     timeout: float = DEFAULT_SANDBOX_TIMEOUT_S,
     metadata: dict[str, str] | None = None,
+    allow_internet_access: bool = True,
+    lifecycle: SandboxLifecyclePolicy | None = None,
 ) -> SandboxFactory:
     """A factory creating real E2B sandboxes (lazy SDK import; key from arg or $E2B_API_KEY).
 
@@ -187,17 +206,116 @@ def default_sandbox_factory(
         if not key:
             raise RuntimeError(f"set ${E2B_API_KEY_ENV} to run the harness in E2B sandboxes")
         chosen = template or os.environ.get(E2B_TEMPLATE_ENV) or None
-        if metadata:
+        if lifecycle is not None:
+            sandbox = Sandbox.create(
+                template=chosen,
+                timeout=int(timeout),
+                api_key=key,
+                metadata=metadata,
+                allow_internet_access=allow_internet_access,
+                lifecycle=cast("SandboxLifecycle", dict(lifecycle)),
+            )
+        elif metadata and allow_internet_access:
             sandbox = Sandbox.create(
                 template=chosen, timeout=int(timeout), api_key=key, metadata=metadata
             )
-        else:
+        elif metadata:
+            sandbox = Sandbox.create(
+                template=chosen,
+                timeout=int(timeout),
+                api_key=key,
+                metadata=metadata,
+                allow_internet_access=allow_internet_access,
+            )
+        elif allow_internet_access:
             sandbox = Sandbox.create(template=chosen, timeout=int(timeout), api_key=key)
+        else:
+            sandbox = Sandbox.create(
+                template=chosen,
+                timeout=int(timeout),
+                api_key=key,
+                allow_internet_access=allow_internet_access,
+            )
         # The SDK object satisfies the protocol slice structurally; cast rather than pin the
         # SDK's full (much wider) signatures into the protocol.
         return cast("SandboxHandle", sandbox)
 
     return make
+
+
+def reap_e2b_runner_lease(
+    lease_id: str,
+    *,
+    api_key: str | None = None,
+) -> tuple[str, ...]:
+    """Kill and prove absence of every E2B sandbox carrying one runner lease ID."""
+    if _LEASE_ID.fullmatch(lease_id) is None:
+        raise ValueError("E2B runner lease identity is invalid")
+    try:
+        from e2b import Sandbox, SandboxQuery
+    except ImportError as exc:  # pragma: no cover, reached only without the optional extra
+        raise ImportError("the e2b SDK is required to reap E2B runner leases") from exc
+    key = api_key or os.environ.get(E2B_API_KEY_ENV)
+    if not key:
+        raise RuntimeError(f"set ${E2B_API_KEY_ENV} to reap E2B runner leases")
+    query = SandboxQuery(metadata={"wmh_runner_lease": lease_id})
+    retired_ids: list[str] = []
+    consecutive_empty = 0
+    for delay in _ORPHAN_RECONCILE_DELAYS:
+        if delay:
+            time.sleep(delay)
+        resource_ids = _list_e2b_sandbox_ids(Sandbox, query=query, api_key=key)
+        if not resource_ids:
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                return tuple(dict.fromkeys(retired_ids))
+            continue
+        consecutive_empty = 0
+        for resource_id in resource_ids:
+            try:
+                sandbox = Sandbox.connect(resource_id, api_key=key)
+            except Exception as error:  # noqa: BLE001 - optional SDK error hierarchy
+                if _is_already_gone_error(error):
+                    continue
+                raise
+            kill_sandbox(cast("SandboxHandle", sandbox))
+            retired_ids.append(resource_id)
+    raise SandboxCleanupError(
+        "E2B runner orphan cleanup could not prove resource absence",
+        resource="e2b_runner_lease",
+    )
+
+
+def _list_e2b_sandbox_ids(
+    sandbox_sdk: type[E2BSandbox],
+    *,
+    query: SandboxQuery,
+    api_key: str,
+) -> tuple[str, ...]:
+    """Return one bounded, validated snapshot of sandbox IDs for an SDK query."""
+    paginator = sandbox_sdk.list(
+        query=query,
+        limit=_ORPHAN_LIST_LIMIT,
+        api_key=api_key,
+    )
+    resource_ids: list[str] = []
+    pages = 0
+    while paginator.has_next:
+        pages += 1
+        if pages > _ORPHAN_LIST_MAX_PAGES:
+            raise SandboxCleanupError(
+                "E2B runner orphan query exceeded its bounded page limit",
+                resource="e2b_runner_lease",
+            )
+        for info in paginator.next_items(api_key=api_key):
+            resource_id = getattr(info, "sandbox_id", None)
+            if not isinstance(resource_id, str) or _LEASE_ID.fullmatch(resource_id) is None:
+                raise SandboxCleanupError(
+                    "E2B returned an invalid orphan sandbox identity",
+                    resource="e2b_runner_lease",
+                )
+            resource_ids.append(resource_id)
+    return tuple(resource_ids)
 
 
 def create_sandbox(factory: SandboxFactory) -> SandboxHandle:

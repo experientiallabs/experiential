@@ -447,17 +447,11 @@ def _channel(
     fake: FakeSandbox,
     handle: _ScriptedHandle,
     *,
-    sandbox_timeout_s: int | None = None,
-    timeout_refresh_interval_s: float = 300.0,
-    max_episode_lifetime_s: float = 3_600.0,
     reconnect_while_idle: bool = False,
 ) -> E2BStdioChannel:
     return E2BStdioChannel(
         fake,
         handle,
-        sandbox_timeout_s=sandbox_timeout_s,
-        timeout_refresh_interval_s=timeout_refresh_interval_s,
-        max_episode_lifetime_s=max_episode_lifetime_s,
         reconnect_while_idle=reconnect_while_idle,
     )
 
@@ -594,88 +588,24 @@ def test_non_frame_stdout_noise_becomes_a_diagnostic_not_a_frame() -> None:
     assert "stray print!!" in channel.stderr_tail()
 
 
-def test_transport_keepalive_renews_a_pooled_lease_without_becoming_a_frame(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Active runner heartbeats keep E2B alive but stay below RunnerLink's protocol."""
-    now = [100.0]
-    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
+def test_transport_keepalive_is_filtered_without_extending_provider_ttl() -> None:
+    """A runner heartbeat is transport-only and cannot increase admitted E2B spend."""
+
+    class NonExtendableSandbox(FakeSandbox):
+        def set_timeout(self, timeout: int) -> None:
+            raise AssertionError(f"sandbox TTL extension was attempted: {timeout}")
+
     keepalive: JsonObject = {"type": TRANSPORT_KEEPALIVE_TYPE}
     hello: JsonObject = {"type": "hello"}
     handle = _ScriptedHandle([], hold_open=True)
-    fake = FakeSandbox(handle)
-    channel = _channel(fake, handle, sandbox_timeout_s=900)
+    fake = NonExtendableSandbox(handle)
+    channel = _channel(fake, handle)
 
     channel.send({"type": "episode_start"})
     channel._decode_line(_line(keepalive))  # noqa: SLF001 - exercise the reader's exact decoder
-    assert fake.timeouts == []  # the pool's initial reset covers the first refresh window
-    now[0] += 300
-    channel._decode_line(_line(keepalive))  # noqa: SLF001
-    channel._decode_line(_line(keepalive))  # noqa: SLF001 - throttled at the same timestamp
     channel._decode_line(_line(hello))  # noqa: SLF001
+
     assert channel.recv(timeout=2.0) == hello
-    assert fake.timeouts == [900]
-
-
-def test_transport_keepalive_stops_renewing_at_the_episode_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A yielding bad candidate cannot turn lease renewal into an unbounded sandbox leak."""
-    now = [100.0]
-    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
-    keepalive: JsonObject = {"type": TRANSPORT_KEEPALIVE_TYPE}
-    handle = _ScriptedHandle([], hold_open=True)
-    fake = FakeSandbox(handle)
-    channel = _channel(
-        fake,
-        handle,
-        sandbox_timeout_s=900,
-        timeout_refresh_interval_s=300,
-        max_episode_lifetime_s=600,
-    )
-
-    channel.send({"type": "episode_start"})
-    now[0] += 300
-    channel._decode_line(_line(keepalive))  # noqa: SLF001
-    now[0] += 300
-    channel._decode_line(_line(keepalive))  # noqa: SLF001
-
-    assert fake.timeouts == [300]  # the final refresh expires exactly at the hard deadline
-
-
-def test_transport_keepalive_refresh_failure_is_nonfatal_and_retried(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A control-plane blip cannot poison the frame stream; the next heartbeat retries."""
-
-    class FlakyTimeoutSandbox(FakeSandbox):
-        def __init__(self, handle: _ScriptedHandle) -> None:
-            super().__init__(handle)
-            self.refresh_attempts = 0
-
-        def set_timeout(self, timeout: int) -> None:
-            self.refresh_attempts += 1
-            if self.refresh_attempts == 1:
-                raise RuntimeError("temporary control-plane failure")
-            super().set_timeout(timeout)
-
-    now = [100.0]
-    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
-    keepalive: JsonObject = {"type": TRANSPORT_KEEPALIVE_TYPE}
-    hello: JsonObject = {"type": "hello"}
-    handle = _ScriptedHandle([], hold_open=True)
-    fake = FlakyTimeoutSandbox(handle)
-    channel = _channel(fake, handle, sandbox_timeout_s=900)
-
-    channel.send({"type": "episode_start"})
-    now[0] += 300
-    channel._decode_line(_line(keepalive))  # noqa: SLF001
-    channel._decode_line(_line(keepalive))  # noqa: SLF001
-    channel._decode_line(_line(hello))  # noqa: SLF001
-    assert channel.recv(timeout=2.0) == hello
-    assert fake.refresh_attempts == 2
-    assert fake.timeouts == [900]
-    assert "sandbox timeout refresh failed" in channel.stderr_tail()
 
 
 def test_recv_after_process_exit_raises_with_recent_stderr() -> None:
@@ -871,7 +801,15 @@ def test_pool_default_factory_tags_initial_and_replacement_sandboxes(
 
     assert replacement is made[1]
     assert len(made) == 2
-    assert factory_calls == [{"api_key": "key", "template": "tmpl", "metadata": metadata}]
+    assert factory_calls == [
+        {
+            "api_key": "key",
+            "template": "tmpl",
+            "metadata": metadata,
+            "timeout": 900.0,
+            "lifecycle": {"on_timeout": "kill", "auto_resume": False},
+        }
+    ]
     pool.close()
 
 
@@ -900,7 +838,7 @@ def test_pool_failed_kill_stays_live_in_usage_and_a_later_close_retries(
     now = [10.0]
     monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
     factory, made = _factory_for([[{"type": "hello"}]])
-    pool = E2BSandboxPool(sandbox_factory=factory)
+    pool = E2BSandboxPool(sandbox_factory=factory, max_billing_seconds=5)
     pool.acquire()
     fake = made[0]
     attempts = 0
@@ -921,7 +859,7 @@ def test_pool_failed_kill_stays_live_in_usage_and_a_later_close_retries(
     assert pool.usage() == SandboxUsage(count=1, seconds=4.0)
 
     now[0] = 16.0
-    assert pool.usage() == SandboxUsage(count=1, seconds=6.0)
+    assert pool.usage() == SandboxUsage(count=1, seconds=5.0)
 
     def successful_kill(request_timeout: float | None = None) -> bool:
         nonlocal attempts
@@ -932,7 +870,7 @@ def test_pool_failed_kill_stays_live_in_usage_and_a_later_close_retries(
     monkeypatch.setattr(fake, "kill", successful_kill)
     pool.close()
     assert attempts == 4
-    assert pool.usage() == SandboxUsage(count=1, seconds=6.0)
+    assert pool.usage() == SandboxUsage(count=1, seconds=5.0)
     pool.close()  # proved cleanup remains idempotent
 
 
@@ -1259,39 +1197,73 @@ def test_close_kills_a_private_pool_but_never_a_shared_one(
     assert made2[0].kills == 1
 
 
-def test_acquire_extends_the_lifetime_of_a_reused_sandbox(
+def test_acquire_reuses_within_original_lease_without_extending_provider_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reuse restarts E2B's lifetime countdown so long searches outlive the creation cap."""
+    """Warm reuse never resets E2B's create-time billing deadline."""
     monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
     factory, made = _factory_for([[{"type": "hello"}]])
     pool = E2BSandboxPool(sandbox_factory=factory)
     sandbox, channel = pool.acquire()
     [fake] = made
-    assert fake.timeouts == [900]  # reset after bootstrap, immediately before the runner starts
+    assert fake.timeouts == []
     pool.release(sandbox, channel, healthy=True)
     again, _ = pool.acquire()
     assert again is sandbox
-    assert fake.timeouts == [900, 900]  # the reuse extended the countdown again
+    assert fake.timeouts == []
     pool.close()
 
 
-def test_acquire_replaces_a_dead_idle_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An idle sandbox past its lifetime fails the extension: retired, fresh one created."""
+def test_acquire_replaces_an_idle_sandbox_at_its_absolute_lease_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host reuse cannot cross the exact billing horizon admitted at create time."""
     monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    now = [100.0]
+    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
     factory, made = _factory_for([[{"type": "hello"}], [{"type": "hello"}]])
-    pool = E2BSandboxPool(sandbox_factory=factory)
+    pool = E2BSandboxPool(sandbox_factory=factory, max_billing_seconds=900)
     sandbox, channel = pool.acquire()
     pool.release(sandbox, channel, healthy=True)
-    made[0].dead = True  # E2B killed it while idle
+    now[0] = 1_000.0
 
     fresh, _ = pool.acquire()
 
     assert fresh is not sandbox
-    assert made[0].kills == 1  # the dead one was retired
+    assert made[0].kills == 1
+    assert made[0].timeouts == []
     assert len(made) == 2
     assert pool.usage().count == 2
     pool.close()
+
+
+@pytest.mark.parametrize("invalid", [True, 0, -1, 0.5])
+def test_pool_rejects_an_invalid_fixed_billing_horizon(invalid: object) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        E2BSandboxPool(
+            sandbox_factory=lambda: pytest.fail("invalid horizon must fail before create"),
+            max_billing_seconds=cast("int", invalid),
+        )
+
+
+def test_pool_issues_only_one_external_create_per_admission() -> None:
+    """An ambiguous create cannot trigger extra resources outside the reserved horizon."""
+    attempts = 0
+
+    def ambiguous_create() -> FakeSandbox:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("ambiguous provider create")
+
+    pool = E2BSandboxPool(sandbox_factory=ambiguous_create)
+
+    with pytest.raises(RuntimeError, match="ambiguous provider create"):
+        pool.acquire()
+
+    assert attempts == 1
+    assert pool.usage() == SandboxUsage(count=1, seconds=900.0)
+    pool.close()
+    assert pool.usage() == SandboxUsage(count=1, seconds=900.0)
 
 
 def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(

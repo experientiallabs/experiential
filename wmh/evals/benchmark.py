@@ -19,6 +19,8 @@ from typing import Self, TypeGuard
 from llm_waterfall import ReasoningEffort
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from wmh.core.types import JsonObject
+
 RewardValue = float | int
 Rewards = dict[str, RewardValue]
 _SHA256_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
@@ -283,7 +285,14 @@ class BenchmarkRunIdentity(BaseModel):
     model_name: str = Field(min_length=1)
     reasoning_effort: ReasoningEffort | None = None
     task_environment: BenchmarkTaskEnvironment
-    runner_image: str = Field(min_length=1)
+    runner_config_digest: str = Field(
+        pattern=_SHA256_DIGEST_PATTERN,
+        description="Canonical configuration identity for the isolated agent runner",
+    )
+    runner_environment_digest: str = Field(
+        pattern=_SHA256_DIGEST_PATTERN,
+        description="Stable attestation expected from every successfully opened runner",
+    )
     run_config_digest: str = Field(
         pattern=_SHA256_DIGEST_PATTERN,
         description="Opaque digest of replay-critical configuration shared by the run",
@@ -304,6 +313,27 @@ class BenchmarkTrialResult(BaseModel):
         description=(
             "Opaque digest of the immutable executed task-environment definition and bytes"
         ),
+    )
+    task_environment_attestation: JsonObject | None = Field(
+        default=None,
+        description="Bounded stable evidence for the task environment that actually ran",
+    )
+    task_environment_lease_receipt: JsonObject | None = Field(
+        default=None,
+        description="Terminal task-environment resource lifecycle receipt retained for audit",
+    )
+    runner_environment_digest: str | None = Field(
+        default=None,
+        pattern=_SHA256_DIGEST_PATTERN,
+        description="Stable attestation digest for the isolated agent runner actually opened",
+    )
+    runner_environment_attestation: JsonObject | None = Field(
+        default=None,
+        description="Bounded stable evidence for the exact runner environment",
+    )
+    runner_lease_receipts: list[JsonObject] = Field(
+        default_factory=list,
+        description="Terminal per-resource lifecycle receipts retained for audit",
     )
     status: BenchmarkTrialStatus
     rewards: Rewards | None = None

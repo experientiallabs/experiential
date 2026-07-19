@@ -31,6 +31,7 @@ from wmh.evals.benchmark import (
     BenchmarkTrialStatus,
     BenchmarkUsageStatus,
 )
+from wmh.evals.harbor.e2b_environment import TASK_E2B_LEASE_FILE
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
     HarborTrialManifestEntry,
@@ -39,6 +40,7 @@ from wmh.evals.harbor.results import (
     load_harbor_job_result,
 )
 from wmh.harness.pi_runner import pi_node_baseline
+from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, runner_owner_id
 
 _NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 _TASK_CHECKSUM = "sha256:" + "b" * 64
@@ -67,6 +69,70 @@ _TASK_ENVIRONMENT_DIGEST = (
         ).encode()
     ).hexdigest()
 )
+_E2B_LAUNCH_CONFIG_DIGEST = "sha256:" + "d" * 64
+_E2B_TASK_ENVIRONMENT_ATTESTATION = {
+    "schema_version": 2,
+    "backend": "e2b",
+    "environment_id": "environment-immutable",
+    "build_config_digest": "sha256:" + "e" * 64,
+    "launch_config_digest": _E2B_LAUNCH_CONFIG_DIGEST,
+    "template_id": "template-immutable",
+    "build_id": "build-immutable",
+    "platform": "linux/x86_64",
+    "cpu_count": 2,
+    "memory_mb": 1024,
+    "envd_version": "1.2.3",
+    "network_mode": "no_network",
+    "allowed_hosts": [],
+    "internet_access": False,
+    "network_allow_out": [],
+    "network_deny_out": ["0.0.0.0/0"],
+    "lease_timeout_s": 3600,
+    "timeout_action": "kill",
+    "auto_resume": False,
+    "volume_mounts": False,
+}
+_E2B_TASK_ENVIRONMENT_DIGEST = (
+    "sha256:"
+    + hashlib.sha256(
+        json.dumps(
+            _E2B_TASK_ENVIRONMENT_ATTESTATION,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+)
+_RUNNER = LocalPiRunnerSpec()
+
+
+def _runner_lease_receipt(trial_name: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "backend": "local",
+        "lease_id": f"lease-{trial_name}",
+        "owner_id": runner_owner_id(trial_name),
+        "config_digest": _RUNNER.config_digest,
+        "state": "retired",
+        "resource_id": f"container-{trial_name}",
+        "created_at": "2026-07-18T11:59:00Z",
+        "expected_end_at": None,
+        "retired_at": "2026-07-18T12:00:00Z",
+    }
+
+
+def _task_environment_lease_receipt(trial_name: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "backend": "e2b",
+        "lease_id": f"task-environment-{trial_name}",
+        "owner_id": runner_owner_id(trial_name),
+        "config_digest": _E2B_LAUNCH_CONFIG_DIGEST,
+        "state": "retired",
+        "resource_id": f"sandbox-{trial_name}",
+        "created_at": "2026-07-18T11:59:00Z",
+        "expected_end_at": "2026-07-18T12:59:00Z",
+        "retired_at": "2026-07-18T12:00:00Z",
+    }
 
 
 def _agent_config() -> AgentConfig:
@@ -76,7 +142,7 @@ def _agent_config() -> AgentConfig:
         kwargs={
             "harness": _HARNESS.model_dump(mode="json"),
             "provider_config": {"kind": "bedrock", "model": "model"},
-            "runner_image": "runner-image",
+            "runner_spec": _RUNNER.model_dump(mode="json"),
         },
     )
 
@@ -89,7 +155,8 @@ _RUN_IDENTITY = BenchmarkRunIdentity(
     provider="bedrock",
     model_name="model",
     task_environment=BenchmarkTaskEnvironment.DOCKER,
-    runner_image="runner-image",
+    runner_config_digest=_RUNNER.config_digest,
+    runner_environment_digest=_RUNNER.attestation.digest,
     run_config_digest=_AGENT_CONFIG_DIGEST,
 )
 
@@ -163,7 +230,10 @@ def _trial(
             cost_usd=0.05,
             metadata={
                 "harness_hash": _HARNESS.execution_hash,
-                "runner_image": "runner-image",
+                "runner_config_digest": _RUNNER.config_digest,
+                "runner_environment_digest": _RUNNER.attestation.digest,
+                "runner_environment_attestation": _RUNNER.attestation.evidence,
+                "runner_lease_receipt": _runner_lease_receipt(config.trial_name),
                 "model_calls": 1,
                 "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
                 "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
@@ -292,6 +362,8 @@ def test_load_uses_exact_manifest_and_preserves_rewards_usage_and_missing_cells(
     trials = {trial.cell.task_name: trial for trial in result.trials}
     assert trials["scored"].task_instruction == "Score this task."
     assert trials["scored"].task_environment_digest == _TASK_ENVIRONMENT_DIGEST
+    assert trials["scored"].runner_environment_attestation == _RUNNER.attestation.evidence
+    assert trials["scored"].runner_lease_receipts == [_runner_lease_receipt(scored.trial_name)]
     assert trials["failed"].task_environment_digest == _TASK_ENVIRONMENT_DIGEST
     assert trials["missing"].task_environment_digest is None
     manifest_config_digests = {
@@ -850,11 +922,205 @@ def test_task_environment_attestation_must_be_complete_bound_and_backend_correct
         load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
 
 
+def _write_e2b_job(
+    tmp_path: Path,
+    *,
+    receipt: dict[str, object] | None,
+) -> tuple[Path, HarborTrialManifest, TrialResult]:
+    trial = _trial(tmp_path, "task", rewards={"reward": 1})
+    trial.config.environment.type = EnvironmentType.E2B
+    assert trial.agent_result is not None
+    assert trial.agent_result.metadata is not None
+    trial.agent_result.metadata.update(
+        {
+            "task_environment_digest": _E2B_TASK_ENVIRONMENT_DIGEST,
+            "task_environment_attestation": _E2B_TASK_ENVIRONMENT_ATTESTATION,
+        }
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+    if receipt is not None:
+        (job_dir / trial.trial_name / TASK_E2B_LEASE_FILE).write_text(
+            json.dumps(receipt),
+            encoding="utf-8",
+        )
+    lock_digest = harbor_trial_lock_digest(_trial_lock(trial.task_name, trial.config))
+    manifest = _manifest(
+        "job",
+        ("task", 1, trial.trial_name),
+        trial_lock_digest=lock_digest,
+    )
+    manifest = manifest.model_copy(
+        update={
+            "identity": manifest.identity.model_copy(
+                update={"task_environment": BenchmarkTaskEnvironment.E2B}
+            )
+        }
+    )
+    return job_dir, manifest, trial
+
+
+def test_e2b_task_environment_retains_full_attestation_and_cleanup_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt = _task_environment_lease_receipt("task__harbor")
+    job_dir, manifest, _trial_result = _write_e2b_job(tmp_path, receipt=receipt)
+
+    loaded = load_harbor_job_result(job_dir, manifest)
+
+    trial = loaded.result.trials[0]
+    assert trial.task_environment_digest == _E2B_TASK_ENVIRONMENT_DIGEST
+    assert trial.task_environment_attestation == _E2B_TASK_ENVIRONMENT_ATTESTATION
+    assert trial.task_environment_lease_receipt == receipt
+
+
+@pytest.mark.parametrize(
+    ("receipt", "message"),
+    [
+        (None, "omits the task environment cleanup receipt"),
+        (
+            {
+                **_task_environment_lease_receipt("task__harbor"),
+                "state": "active",
+                "retired_at": None,
+            },
+            "does not prove terminal cleanup",
+        ),
+        (
+            {
+                **_task_environment_lease_receipt("task__harbor"),
+                "resource_id": None,
+            },
+            "does not prove terminal cleanup",
+        ),
+        (
+            {
+                **_task_environment_lease_receipt("task__harbor"),
+                "config_digest": "sha256:" + "f" * 64,
+            },
+            "does not match its launch configuration",
+        ),
+        (
+            {
+                **_task_environment_lease_receipt("task__harbor"),
+                "owner_id": "sha256:" + "f" * 64,
+            },
+            "wrong trial owner",
+        ),
+        (
+            {
+                **_task_environment_lease_receipt("task__harbor"),
+                "backend": "local",
+            },
+            "wrong backend",
+        ),
+    ],
+)
+def test_valid_e2b_task_requires_bound_terminal_cleanup_receipt(
+    tmp_path: Path,
+    receipt: dict[str, object] | None,
+    message: str,
+) -> None:
+    job_dir, manifest, _trial_result = _write_e2b_job(tmp_path, receipt=receipt)
+
+    with pytest.raises(ValueError, match=message):
+        load_harbor_job_result(job_dir, manifest)
+
+
+@pytest.mark.parametrize(
+    ("candidate_metadata", "message"),
+    [
+        (
+            {
+                "runner_environment_digest": None,
+                "runner_environment_attestation": None,
+            },
+            "valid runner environment digest",
+        ),
+        (
+            {"runner_environment_digest": "sha256:" + "f" * 64},
+            "does not match the frozen run",
+        ),
+        (
+            {
+                "runner_environment_attestation": {
+                    **_RUNNER.attestation.evidence,
+                    "backend": "e2b",
+                }
+            },
+            "does not match its digest",
+        ),
+        (
+            {"runner_config_digest": "sha256:" + "f" * 64},
+            "runner configuration digest",
+        ),
+    ],
+)
+def test_runner_attestation_must_be_complete_and_bound_to_the_frozen_spec(
+    tmp_path: Path,
+    candidate_metadata: dict[str, object],
+    message: str,
+) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        rewards={"reward": 1},
+        candidate_metadata=candidate_metadata,
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    with pytest.raises(ValueError, match=message):
+        load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
+
+
+@pytest.mark.parametrize(
+    ("receipt", "message"),
+    [
+        (None, "omits the runner lease cleanup receipt"),
+        (
+            {**_runner_lease_receipt("task__harbor"), "state": "active", "retired_at": None},
+            "terminal",
+        ),
+        (
+            {
+                **_runner_lease_receipt("task__harbor"),
+                "config_digest": "sha256:" + "f" * 64,
+            },
+            "frozen configuration",
+        ),
+        ({**_runner_lease_receipt("task__harbor"), "backend": "e2b"}, "wrong backend"),
+        (
+            {**_runner_lease_receipt("task__harbor"), "owner_id": "sha256:" + "f" * 64},
+            "trial owner",
+        ),
+    ],
+)
+def test_valid_runner_requires_a_bound_terminal_lease_receipt(
+    tmp_path: Path,
+    receipt: dict[str, object] | None,
+    message: str,
+) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        rewards={"reward": 1},
+        candidate_metadata={"runner_lease_receipt": receipt},
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    with pytest.raises(ValueError, match=message):
+        load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
+
+
 def test_inconsistent_step_candidate_outcomes_are_rejected(tmp_path: Path) -> None:
     trial = _trial(tmp_path, "task", rewards={"reward": 1})
     identity = {
         "harness_hash": _HARNESS.execution_hash,
-        "runner_image": "runner-image",
+        "runner_config_digest": _RUNNER.config_digest,
+        "runner_environment_digest": _RUNNER.attestation.digest,
+        "runner_environment_attestation": _RUNNER.attestation.evidence,
         "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
         "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
     }
@@ -1041,7 +1307,7 @@ def test_trial_config_cannot_be_grafted_from_another_job(
         ("agent_config_model", "expected trial lock digest"),
         ("agent_kwargs", "expected trial lock digest"),
         ("candidate_hash", "expected candidate hash"),
-        ("runner_image", "expected runner image"),
+        ("runner_config", "expected runner configuration digest"),
     ],
 )
 def test_run_identity_mismatch_is_rejected(
@@ -1074,10 +1340,10 @@ def test_run_identity_mismatch_is_rejected(
         assert trial.agent_result is not None
         assert trial.agent_result.metadata is not None
         trial.agent_result.metadata["harness_hash"] = "wrong-hash"
-    elif mismatch == "runner_image":
+    elif mismatch == "runner_config":
         assert trial.agent_result is not None
         assert trial.agent_result.metadata is not None
-        trial.agent_result.metadata["runner_image"] = "wrong-image"
+        trial.agent_result.metadata["runner_config_digest"] = "sha256:" + "f" * 64
     else:  # pragma: no cover - keeps additions to the parameter table fail-closed
         raise AssertionError(f"unknown mismatch: {mismatch}")
 
@@ -1114,7 +1380,7 @@ def test_task_source_mismatch_is_rejected(tmp_path: Path, location: str) -> None
     ("mismatch", "message"),
     [
         ("candidate_hash", "expected candidate hash"),
-        ("runner_image", "expected runner image"),
+        ("runner_spec", "invalid runner spec"),
         ("provider_config", "expected configured provider/model"),
         ("harbor_model", "expected Harbor agent model"),
     ],
@@ -1129,8 +1395,11 @@ def test_agent_config_identity_is_validated_beyond_its_digest(
         other_harness = _HARNESS.model_copy(deep=True)
         other_harness.surfaces[0].content += "\nchanged"
         trial.config.agent.kwargs["harness"] = other_harness.model_dump(mode="json")
-    elif mismatch == "runner_image":
-        trial.config.agent.kwargs["runner_image"] = "wrong-image"
+    elif mismatch == "runner_spec":
+        trial.config.agent.kwargs["runner_spec"] = {
+            "backend": "local",
+            "image": "node:22@sha256:" + "d" * 64,
+        }
     elif mismatch == "provider_config":
         trial.config.agent.kwargs["provider_config"] = {"kind": "azure", "model": "model"}
     elif mismatch == "harbor_model":

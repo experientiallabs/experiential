@@ -36,9 +36,10 @@ from harbor.models.trial.result import TrialResult
 from harbor.registry.client.factory import RegistryClientFactory
 from harbor.registry.client.package import PackageDatasetClient
 from harbor.tasks.client import TaskIdType
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from wmh.core.text import normalize_durable_text
+from wmh.core.types import JsonObject
 from wmh.evals.benchmark import (
     MAX_BENCHMARK_TASK_INSTRUCTION_CHARS,
     BenchmarkCell,
@@ -69,10 +70,12 @@ from wmh.evals.harbor.task_security import (
     validate_task_credential_boundary,
 )
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.pi_local import (
-    PI_CONTAINER_IMAGE,
-    validate_pi_container_image,
-    verify_container_pi_runner_ready,
+from wmh.harness.e2b_sandbox import E2B_API_KEY_ENV
+from wmh.harness.pi_local import PI_CONTAINER_IMAGE, verify_container_pi_runner_ready
+from wmh.harness.pi_runner_backend import (
+    E2BPiRunnerSpec,
+    LocalPiRunnerSpec,
+    PiRunnerBackendSpec,
 )
 from wmh.providers.base import ProviderConfig
 from wmh.tracking.budget import (
@@ -124,18 +127,52 @@ class HarborRunExpectation(BaseModel):
     identity: BenchmarkRunIdentity
 
 
+def _coerce_runner_spec(
+    *,
+    runner_spec: PiRunnerBackendSpec | JsonObject | None,
+    runner_image: str | None,
+) -> PiRunnerBackendSpec:
+    """Normalize the legacy local-image input and the backend-neutral runner contract."""
+    if runner_spec is not None and runner_image is not None:
+        raise ValueError("runner_spec and runner_image are mutually exclusive")
+    payload: PiRunnerBackendSpec | JsonObject
+    if runner_spec is not None:
+        payload = runner_spec
+    elif runner_image is not None:
+        payload = LocalPiRunnerSpec(image=runner_image)
+    else:
+        payload = LocalPiRunnerSpec()
+    return TypeAdapter(PiRunnerBackendSpec).validate_python(payload)
+
+
+async def _verify_runner_ready(runner_spec: PiRunnerBackendSpec) -> None:
+    """Probe only prerequisites for one exact local or E2B runner configuration."""
+    if isinstance(runner_spec, LocalPiRunnerSpec):
+        await asyncio.to_thread(
+            verify_container_pi_runner_ready,
+            image=runner_spec.image,
+            platform=runner_spec.platform,
+        )
+        return
+    if find_spec("e2b") is None:
+        raise RuntimeError("the e2b SDK is not installed; install the e2b extra for this runner")
+    if not os.environ.get(E2B_API_KEY_ENV):
+        raise RuntimeError(f"set ${E2B_API_KEY_ENV} to use the E2B Pi runner")
+
+
 def harbor_run_expectation(
     *,
     candidate: HarnessDoc,
     spec: HarborJobSpec,
     provider_config: ProviderConfig,
-    runner_image: str,
+    runner_image: str | None = None,
+    runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
     turn_timeout_s: float,
     require_provider_receipts: bool = True,
     budget_policy_digest: str | None = None,
 ) -> HarborRunExpectation:
     """Build the path-independent identity expected from one exact Harbor run."""
-    validate_pi_container_image(runner_image)
+    validated_runner = _coerce_runner_spec(runner_spec=runner_spec, runner_image=runner_image)
     if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
         raise ValueError("turn_timeout_s must be finite and positive")
     frozen_spec = HarborJobSpec.model_validate(spec.model_dump())
@@ -143,7 +180,7 @@ def harbor_run_expectation(
     agent = _build_harbor_agent_config(
         candidate=candidate,
         provider_config=frozen_provider,
-        runner_image=runner_image,
+        runner_spec=validated_runner,
         turn_timeout_s=turn_timeout_s,
         agent_n_concurrent=frozen_spec.agent_n_concurrent,
         require_provider_receipts=require_provider_receipts,
@@ -168,7 +205,8 @@ def harbor_run_expectation(
             provider=frozen_provider.kind.value,
             model_name=frozen_provider.model,
             task_environment=environment,
-            runner_image=runner_image,
+            runner_config_digest=validated_runner.config_digest,
+            runner_environment_digest=validated_runner.attestation.digest,
             run_config_digest=run_config_digest,
         ),
     )
@@ -178,7 +216,7 @@ def _build_harbor_agent_config(
     *,
     candidate: HarnessDoc,
     provider_config: ProviderConfig,
-    runner_image: str,
+    runner_spec: PiRunnerBackendSpec,
     turn_timeout_s: float,
     agent_n_concurrent: int | None,
     require_provider_receipts: bool,
@@ -191,7 +229,7 @@ def _build_harbor_agent_config(
     kwargs = {
         "harness": candidate.model_dump(mode="json"),
         "provider_config": provider_config.model_dump(mode="json"),
-        "runner_image": runner_image,
+        "runner_spec": runner_spec.model_dump(mode="json"),
         "turn_timeout_s": turn_timeout_s,
         "require_provider_receipts": require_provider_receipts,
     }
@@ -210,25 +248,29 @@ def _build_harbor_agent_config(
 class HarborEvaluatorSession:
     """Share one trusted runner-readiness probe across concurrent exact Harbor jobs."""
 
-    def __init__(self, *, runner_image: str = PI_CONTAINER_IMAGE) -> None:
-        validate_pi_container_image(runner_image)
-        self._runner_image = runner_image
+    def __init__(
+        self,
+        *,
+        runner_image: str | None = None,
+        runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
+    ) -> None:
+        self._runner_spec = _coerce_runner_spec(
+            runner_spec=runner_spec,
+            runner_image=runner_image,
+        )
         self._ready = False
         self._lock = asyncio.Lock()
 
-    async def ensure_runner_ready(self, *, runner_image: str) -> None:
-        """Probe the immutable runner image once for this event-loop-scoped session."""
-        if runner_image != self._runner_image:
-            raise ValueError("Harbor evaluator session runner image differs from evaluator")
+    async def ensure_runner_ready(self, *, runner_spec: PiRunnerBackendSpec) -> None:
+        """Probe one immutable runner configuration for this event-loop-scoped session."""
+        if runner_spec.config_digest != self._runner_spec.config_digest:
+            raise ValueError("Harbor evaluator session runner differs from evaluator")
         if self._ready:
             return
         async with self._lock:
             if self._ready:
                 return
-            await asyncio.to_thread(
-                verify_container_pi_runner_ready,
-                image=self._runner_image,
-            )
+            await _verify_runner_ready(self._runner_spec)
             self._ready = True
 
 
@@ -293,24 +335,30 @@ class HarborEvaluator:
         spec: HarborJobSpec,
         provider_config: ProviderConfig,
         *,
-        runner_image: str = PI_CONTAINER_IMAGE,
+        runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = True,
         session: HarborEvaluatorSession | None = None,
         budget_account: BudgetAccount | None = None,
     ) -> None:
-        validate_pi_container_image(runner_image)
+        validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
+            runner_spec if runner_spec is not None else LocalPiRunnerSpec().model_dump(mode="json")
+        )
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
         if not isinstance(require_provider_receipts, bool):
             raise ValueError("require_provider_receipts must be a boolean")
+        if isinstance(validated_runner, E2BPiRunnerSpec) and (
+            validated_runner.lease_timeout_s < math.ceil(turn_timeout_s) + 60
+        ):
+            raise ValueError("E2B runner lease_timeout_s must cover turn_timeout_s plus 60 seconds")
         validated_spec = HarborJobSpec.model_validate(spec.model_dump())
         _validate_job_name(validated_spec.job_name)
         self._spec = validated_spec.model_copy(
             update={"jobs_dir": validated_spec.jobs_dir.expanduser().resolve()}, deep=True
         )
         self._provider_config = provider_config.model_copy(deep=True)
-        self._runner_image = runner_image
+        self._runner_spec = validated_runner
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
         self._session = session
@@ -416,23 +464,20 @@ class HarborEvaluator:
         return load_harbor_job_result(job_dir, manifest)
 
     async def _ensure_runner_ready(self) -> None:
-        """Probe the trusted local runner once before Harbor can create a job."""
+        """Probe the selected runner prerequisites once before Harbor creates a job."""
         if self._session is not None:
-            await self._session.ensure_runner_ready(runner_image=self._runner_image)
+            await self._session.ensure_runner_ready(runner_spec=self._runner_spec)
             return
         if self._runner_ready:
             return
-        await asyncio.to_thread(
-            verify_container_pi_runner_ready,
-            image=self._runner_image,
-        )
+        await _verify_runner_ready(self._runner_spec)
         self._runner_ready = True
 
     def _build_agent(self, candidate: HarnessDoc) -> AgentConfig:
         return _build_harbor_agent_config(
             candidate=candidate,
             provider_config=self._provider_config,
-            runner_image=self._runner_image,
+            runner_spec=self._runner_spec,
             turn_timeout_s=self._turn_timeout_s,
             agent_n_concurrent=self._spec.agent_n_concurrent,
             require_provider_receipts=self._require_provider_receipts,
@@ -458,7 +503,8 @@ class HarborEvaluator:
             model_name=self._provider_config.model,
             reasoning_effort=self._provider_config.reasoning_effort,
             task_environment=environment,
-            runner_image=self._runner_image,
+            runner_config_digest=self._runner_spec.config_digest,
+            runner_environment_digest=self._runner_spec.attestation.digest,
             run_config_digest=run_config_digest,
         )
 

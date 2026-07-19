@@ -9,7 +9,6 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -33,6 +32,11 @@ from wmh.harness.pi_runner import (
     PiRunHealth,
     PiTurnResult,
     pi_node_baseline,
+)
+from wmh.harness.pi_runner_backend import (
+    E2BPiRunnerSpec,
+    LocalPiRunnerSpec,
+    runner_owner_id,
 )
 from wmh.harness.runner_link import TokenUsage
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -76,6 +80,31 @@ _TASK_ENVIRONMENT_DIGEST = (
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
+)
+_E2B_TASK_ENVIRONMENT_ATTESTATION = cast(
+    "JsonObject",
+    {
+        "schema_version": 2,
+        "backend": "e2b",
+        "environment_id": "environment-immutable",
+        "build_config_digest": "sha256:" + "8" * 64,
+        "launch_config_digest": "sha256:" + "9" * 64,
+        "template_id": "template-immutable",
+        "build_id": "build-immutable",
+        "platform": "linux/x86_64",
+        "cpu_count": 4,
+        "memory_mb": 8192,
+        "envd_version": "1.2.3",
+        "network_mode": "no_network",
+        "allowed_hosts": [],
+        "internet_access": False,
+        "network_allow_out": [],
+        "network_deny_out": ["0.0.0.0/0"],
+        "lease_timeout_s": 3600,
+        "timeout_action": "kill",
+        "auto_resume": False,
+        "volume_mounts": False,
+    },
 )
 
 
@@ -285,7 +314,7 @@ def test_agent_rejects_non_finite_turn_timeout(
         )
 
 
-def test_agent_rejects_mutable_runner_image(
+def test_agent_rejects_mutable_runner_spec(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -297,7 +326,7 @@ def test_agent_rejects_mutable_runner_image(
             model_name="bedrock/model",
             harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
             provider_config=cast("JsonObject", config.model_dump(mode="json")),
-            runner_image="node:latest",
+            runner_spec=cast("JsonObject", {"backend": "local", "image": "node:latest"}),
         )
 
 
@@ -463,89 +492,39 @@ def test_setup_attests_e2b_template_build_resources_and_platform(
 ) -> None:
     agent = _agent(tmp_path, monkeypatch)
 
-    class Sandbox:
-        async def get_info(self) -> SimpleNamespace:
-            return SimpleNamespace(
-                template_id="template-immutable",
-                cpu_count=4,
-                memory_mb=8192,
-                started_at=datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
-            )
-
     class E2BEnvironment(_Environment):
-        _sandbox = Sandbox()
-        _template_name = "mutable-alias-not-hashed"
+        @property
+        def wmh_environment_attestation(self) -> JsonObject:
+            return cast("JsonObject", dict(_E2B_TASK_ENVIRONMENT_ATTESTATION))
 
         @staticmethod
         def type() -> EnvironmentType:
             return EnvironmentType.E2B
 
-        async def exec(
-            self,
-            command: str,
-            cwd: str | None = None,
-            env: dict[str, str] | None = None,
-            timeout_sec: int | None = None,
-            user: str | int | None = None,
-        ) -> ExecResult:
-            _ = cwd, env, user
-            assert command == "/bin/uname -s && /bin/uname -m"
-            assert timeout_sec == mod._ENVIRONMENT_ATTESTATION_TIMEOUT_S
-            return ExecResult(stdout="Linux\nx86_64\n", return_code=0)
-
-    async def tags(_template_id: str) -> tuple[tuple[str, str, datetime], ...]:
-        return (
-            (
-                "default",
-                "build-immutable",
-                datetime(2026, 7, 18, 11, 59, tzinfo=UTC),
-            ),
-        )
-
-    monkeypatch.setattr(mod, "_get_e2b_template_tags", tags)
     asyncio.run(agent.setup(cast("BaseEnvironment", E2BEnvironment())))
 
     attestation = agent._task_environment_attestation
     assert attestation is not None
-    assert attestation.evidence == {
-        "schema_version": 1,
-        "backend": "e2b",
-        "template_id": "template-immutable",
-        "build_id": "build-immutable",
-        "platform": "linux/x86_64",
-        "cpu_count": 4,
-        "memory_mb": 8192,
-    }
-    assert "mutable-alias-not-hashed" not in json.dumps(attestation.evidence)
+    assert attestation.evidence == _E2B_TASK_ENVIRONMENT_ATTESTATION
 
 
-def test_setup_rejects_e2b_default_tag_repointed_after_sandbox_start(
+def test_setup_rejects_e2b_adapter_evidence_without_fail_closed_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent = _agent(tmp_path, monkeypatch)
-    started_at = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
-
-    class Sandbox:
-        async def get_info(self) -> SimpleNamespace:
-            return SimpleNamespace(
-                template_id="template-immutable",
-                cpu_count=2,
-                memory_mb=4096,
-                started_at=started_at,
-            )
 
     class E2BEnvironment(_Environment):
-        _sandbox = Sandbox()
+        @property
+        def wmh_environment_attestation(self) -> JsonObject:
+            return cast(
+                "JsonObject",
+                {**_E2B_TASK_ENVIRONMENT_ATTESTATION, "auto_resume": True},
+            )
 
         @staticmethod
         def type() -> EnvironmentType:
             return EnvironmentType.E2B
-
-    async def tags(_template_id: str) -> tuple[tuple[str, str, datetime], ...]:
-        return (("default", "repointed-build", started_at + timedelta(seconds=1)),)
-
-    monkeypatch.setattr(mod, "_get_e2b_template_tags", tags)
 
     with pytest.raises(mod.WmhPiEnvironmentError, match="attestation failed"):
         asyncio.run(agent.setup(cast("BaseEnvironment", E2BEnvironment())))
@@ -1115,6 +1094,33 @@ def test_success_populates_usage_and_backend_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     agent = _agent(tmp_path, monkeypatch)
+    runner_spec = LocalPiRunnerSpec()
+
+    class Factory:
+        config_digest = runner_spec.config_digest
+        attestation = runner_spec.attestation
+        lease_receipt = cast(
+            "JsonObject",
+            {
+                "schema_version": 1,
+                "backend": "local",
+                "lease_id": "lease-immutable",
+                "owner_id": runner_owner_id(tmp_path.name),
+                "config_digest": runner_spec.config_digest,
+                "state": "retired",
+                "resource_id": "container-immutable",
+                "created_at": "2026-07-18T00:00:00Z",
+                "expected_end_at": None,
+                "retired_at": "2026-07-18T00:01:00Z",
+            },
+        )
+
+    factory = Factory()
+    monkeypatch.setattr(
+        mod,
+        "build_pi_runner_factory",
+        lambda _spec, *, ledger_path, owner_id: factory,
+    )
     result = PiTurnResult(
         answer="done",
         terminal_reason="completed",
@@ -1130,7 +1136,10 @@ def test_success_populates_usage_and_backend_identity(
     assert context.n_output_tokens == 5
     assert context.metadata is not None
     assert context.metadata["candidate_failure"] is False
-    assert context.metadata["runner_image"] == mod.PI_CONTAINER_IMAGE
+    assert context.metadata["runner_config_digest"] == runner_spec.config_digest
+    assert context.metadata["runner_environment_digest"] == runner_spec.attestation.digest
+    assert context.metadata["runner_environment_attestation"] == runner_spec.attestation.evidence
+    assert context.metadata["runner_lease_receipt"] == factory.lease_receipt
     assert context.metadata["harness_hash"] == agent._harness.execution_hash
     assert context.metadata["task_environment_digest"] == _TASK_ENVIRONMENT_DIGEST
     assert context.metadata["task_environment_attestation"] == _TASK_ENVIRONMENT_ATTESTATION
@@ -1315,6 +1324,82 @@ def test_confirmation_receipt_trace_rejects_altered_request_controls(
     assert caught.value.kind is mod.PiInfrastructureFailureKind.PROVIDER_RECEIPT
 
 
+def test_agent_selects_e2b_runner_and_persists_actual_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "ProviderProcessWorker", _ProviderWorker)
+    runner_spec = E2BPiRunnerSpec(
+        template_id="template-immutable",
+        build_id="build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        platform="linux/x86_64",
+        envd_version="0.2.1",
+        lease_timeout_s=420,
+    )
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    agent = mod.WmhPiAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="bedrock/model",
+        harness=cast("JsonObject", pi_node_baseline("candidate").model_dump(mode="json")),
+        provider_config=cast("JsonObject", config.model_dump(mode="json")),
+        runner_spec=cast("JsonObject", runner_spec.model_dump(mode="json")),
+    )
+    agent._task_environment_attestation = mod._TaskEnvironmentAttestation(
+        digest=_TASK_ENVIRONMENT_DIGEST,
+        evidence=_TASK_ENVIRONMENT_ATTESTATION,
+    )
+
+    class Factory:
+        config_digest = runner_spec.config_digest
+        attestation = runner_spec.attestation
+        lease_receipt = cast(
+            "JsonObject",
+            {
+                "schema_version": 1,
+                "backend": "e2b",
+                "lease_id": "lease-immutable",
+                "owner_id": runner_owner_id(tmp_path.name),
+                "config_digest": runner_spec.config_digest,
+                "state": "retired",
+                "resource_id": "sandbox-immutable",
+                "created_at": "2026-07-18T00:00:00Z",
+                "expected_end_at": "2026-07-18T00:07:00Z",
+                "retired_at": "2026-07-18T00:01:00Z",
+            },
+        )
+
+    factory = Factory()
+
+    def build(observed: object, *, ledger_path: Path, owner_id: str) -> Factory:
+        assert observed == runner_spec
+        assert ledger_path == tmp_path / "wmh-runner-lease.json"
+        assert owner_id == runner_owner_id(tmp_path.name)
+        return factory
+
+    monkeypatch.setattr(mod, "build_pi_runner_factory", build)
+    monkeypatch.setattr(
+        mod,
+        "run_pi_turn",
+        lambda *_args, **_kwargs: PiTurnResult(
+            answer="done",
+            terminal_reason="completed",
+            events=(),
+            worker_usage=TokenUsage(),
+        ),
+    )
+    context = AgentContext()
+
+    asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), context))
+
+    assert context.metadata is not None
+    assert context.metadata["runner_config_digest"] == runner_spec.config_digest
+    assert context.metadata["runner_environment_digest"] == runner_spec.attestation.digest
+    assert context.metadata["runner_environment_attestation"] == runner_spec.attestation.evidence
+    assert context.metadata["runner_lease_receipt"] == factory.lease_receipt
+
+
 def test_infrastructure_error_does_not_persist_raw_provider_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1339,7 +1424,7 @@ def test_infrastructure_error_does_not_persist_raw_provider_secret(
     assert secret not in str(caught.value)
     assert context.metadata is not None
     assert context.metadata["harness_hash"] == agent._harness.execution_hash
-    assert context.metadata["runner_image"] == mod.PI_CONTAINER_IMAGE
+    assert context.metadata["runner_config_digest"] == LocalPiRunnerSpec().config_digest
     assert context.metadata["run_health"] == "infrastructure_failure"
 
 
@@ -1672,8 +1757,9 @@ def test_trace_failure_cannot_skip_or_replace_runner_cleanup_proof(
         cancel_calls = 0
         wait_calls = 0
 
-        def __init__(self, *, image: str) -> None:
-            _ = image
+        config_digest = LocalPiRunnerSpec().config_digest
+        attestation = LocalPiRunnerSpec().attestation
+        lease_receipt = None
 
         def cancel(self) -> None:
             self.cancel_calls += 1
@@ -1683,8 +1769,12 @@ def test_trace_failure_cannot_skip_or_replace_runner_cleanup_proof(
             self.wait_calls += 1
             return False
 
-    factory = UnprovedCleanupFactory(image=mod.PI_CONTAINER_IMAGE)
-    monkeypatch.setattr(mod, "LocalContainerRunnerFactory", lambda **_kwargs: factory)
+    factory = UnprovedCleanupFactory()
+    monkeypatch.setattr(
+        mod,
+        "build_pi_runner_factory",
+        lambda _spec, *, ledger_path, owner_id: factory,
+    )
 
     def fail_turn(*_args: object, **_kwargs: object) -> PiTurnResult:
         raise failure
@@ -1730,8 +1820,9 @@ def test_all_failure_branches_sanitize_cancel_and_wait_cleanup_failures(
         cancel_calls = 0
         wait_calls = 0
 
-        def __init__(self, *, image: str) -> None:
-            _ = image
+        config_digest = LocalPiRunnerSpec().config_digest
+        attestation = LocalPiRunnerSpec().attestation
+        lease_receipt = None
 
         def cancel(self) -> None:
             self.cancel_calls += 1
@@ -1745,8 +1836,12 @@ def test_all_failure_branches_sanitize_cancel_and_wait_cleanup_failures(
             self.wait_calls += 1
             return cleanup_failure != "wait_timeout"
 
-    factory = FailingCleanupFactory(image=mod.PI_CONTAINER_IMAGE)
-    monkeypatch.setattr(mod, "LocalContainerRunnerFactory", lambda **_kwargs: factory)
+    factory = FailingCleanupFactory()
+    monkeypatch.setattr(
+        mod,
+        "build_pi_runner_factory",
+        lambda _spec, *, ledger_path, owner_id: factory,
+    )
     monkeypatch.setattr(mod, "_EXECUTION_CLEANUP_TIMEOUT_S", 0.005)
 
     def fail(*_args: object, **_kwargs: object) -> PiTurnResult:

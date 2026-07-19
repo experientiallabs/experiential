@@ -19,6 +19,7 @@ from wmh.harness.e2b_sandbox import (
     create_sandbox,
     default_sandbox_factory,
     kill_sandbox,
+    reap_e2b_runner_lease,
 )
 
 
@@ -280,6 +281,58 @@ def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
             "metadata": metadata,
         }
     ]
+
+
+def test_orphan_reaper_catches_a_sandbox_that_appears_after_an_empty_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = [[], ["late-sandbox"], [], []]
+    killed: list[str] = []
+    sleeps: list[float] = []
+
+    class _Info:
+        def __init__(self, sandbox_id: str) -> None:
+            self.sandbox_id = sandbox_id
+
+    class _Paginator:
+        def __init__(self, ids: list[str]) -> None:
+            self.has_next = True
+            self._ids = ids
+
+        def next_items(self, **_kwargs: object) -> list[_Info]:
+            self.has_next = False
+            return [_Info(item) for item in self._ids]
+
+    class _Connected(FakeSandbox):
+        def __init__(self, sandbox_id: str) -> None:
+            super().__init__()
+            self.sandbox_id = sandbox_id
+
+        def kill(self, request_timeout: float | None = None) -> bool:
+            killed.append(self.sandbox_id)
+            return super().kill(request_timeout=request_timeout)
+
+    class _SandboxSdk:
+        @staticmethod
+        def list(**_kwargs: object) -> _Paginator:
+            return _Paginator(snapshots.pop(0))
+
+        @staticmethod
+        def connect(sandbox_id: str, **_kwargs: object) -> _Connected:
+            return _Connected(sandbox_id)
+
+    class _Query:
+        def __init__(self, *, metadata: dict[str, str]) -> None:
+            self.metadata = metadata
+
+    e2b = ModuleType("e2b")
+    e2b.__dict__.update(Sandbox=_SandboxSdk, SandboxQuery=_Query)
+    monkeypatch.setitem(sys.modules, "e2b", e2b)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    assert reap_e2b_runner_lease("lease-1", api_key="key") == ("late-sandbox",)
+    assert killed == ["late-sandbox"]
+    assert sleeps == [0.1, 0.5, 1.5]
 
 
 def test_fake_sandbox_satisfies_the_sandbox_handle_protocol() -> None:

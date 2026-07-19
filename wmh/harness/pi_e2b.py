@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
-import math
 import os
 import queue
 import re
@@ -47,8 +47,8 @@ from wmh.harness.e2b_sandbox import (
     SandboxCleanupError,
     SandboxFactory,
     SandboxHandle,
+    SandboxLifecyclePolicy,
     SandboxUsage,
-    create_sandbox,
     default_sandbox_factory,
     kill_sandbox,
 )
@@ -117,16 +117,12 @@ _DURABLE_CLOSE_REQUEST_TIMEOUT_S = 0.25
 _DURABLE_STDOUT_SILENCE_GRACE_S = 45.0
 
 # A runner-originated heartbeat keeps the background command stream active while the host is
-# synchronously waiting on a slow provider call. Pooled evaluation channels also use the same
-# heartbeat to renew the sandbox lease; live-session callers own their own idle/suspend lifecycle
-# and therefore leave renewal disabled.
+# synchronously waiting on a slow provider call. It is transport-only: sandbox lifetime is fixed
+# once at provider create time, so receiving a heartbeat can never increase admitted spend.
 TRANSPORT_KEEPALIVE_TYPE = "transport_keepalive"
-_SANDBOX_TIMEOUT_REFRESH_S = 300.0
-# Renewal must not turn mutated agent code into an unbounded cost leak. A legitimate slow episode
-# may cross the base 15-minute lease, but one cell still gets a hard one-hour sandbox lifetime.
-MAX_EVAL_EPISODE_LIFETIME_S = 3_600.0
-# A score cell must finish much sooner than the E2B lease-renewal safety cap. This wall budget is
-# host-enforced by RunnerLink and may be exceeded only by one already-running provider/tool call.
+# A score cell must finish within the provider-enforced sandbox lease. This wall budget is
+# host-enforced by RunnerLink and may be exceeded only by one already-running provider/tool call;
+# the sandbox itself still dies at the original, non-extendable create-time deadline.
 DEFAULT_EVAL_EPISODE_TIMEOUT_S = 300.0
 _MAX_RETIRE_WORKERS = 16
 
@@ -163,9 +159,6 @@ class E2BStdioChannel:
         handle: CommandHandle,
         *,
         stderr_lines: int = _STDERR_LINES,
-        sandbox_timeout_s: int | None = None,
-        timeout_refresh_interval_s: float = _SANDBOX_TIMEOUT_REFRESH_S,
-        max_episode_lifetime_s: float = MAX_EVAL_EPISODE_LIFETIME_S,
         reconnect_while_idle: bool = False,
     ) -> None:
         self._sandbox = sandbox
@@ -173,11 +166,6 @@ class E2BStdioChannel:
         self._pid = handle.pid
         self._frames: queue.Queue[JsonObject | _Eof] = queue.Queue()
         self._stderr: deque[str] = deque(maxlen=stderr_lines)
-        self._sandbox_timeout_s = sandbox_timeout_s
-        self._timeout_refresh_interval_s = timeout_refresh_interval_s
-        self._max_episode_lifetime_s = max_episode_lifetime_s
-        self._next_timeout_refresh_at = 0.0
-        self._episode_renewal_deadline_at: float | None = None
         self._reconnect_while_idle = reconnect_while_idle
         # Guards the definitely-idle proof and the same-PID reconnect. A user message clears the
         # proof while holding this lock *before* stdin delivery, so the reader cannot reconnect
@@ -192,12 +180,6 @@ class E2BStdioChannel:
 
     def send(self, frame: JsonObject) -> None:
         kind = frame.get("type")
-        if kind == "episode_start" and self._sandbox_timeout_s is not None:
-            now = time.monotonic()
-            self._episode_renewal_deadline_at = now + self._max_episode_lifetime_s
-            # The pool reset the lease immediately before this episode. Wait until the normal
-            # refresh cadence instead of bursting one set_timeout call per sandbox at 30 seconds.
-            self._next_timeout_refresh_at = now + self._timeout_refresh_interval_s
         line = base64.b64encode(json.dumps(frame).encode("utf-8")).decode("ascii") + "\n"
         with self._transport_lock:
             if kind in {"session_start", "user_message"}:
@@ -240,7 +222,6 @@ class E2BStdioChannel:
                 return
             self._closed = True
             self._session_idle = False
-            self._episode_renewal_deadline_at = None
         try:
             self.send({"type": "shutdown"})
         except Exception:  # noqa: BLE001 - the process/sandbox may already be gone; close is best-effort
@@ -328,7 +309,6 @@ class E2BStdioChannel:
             return
         if isinstance(frame, dict):
             if frame.get("type") == TRANSPORT_KEEPALIVE_TYPE:
-                self._refresh_sandbox_timeout()
                 return
             if frame.get("type") == "state":
                 status = frame.get("status")
@@ -336,35 +316,9 @@ class E2BStdioChannel:
                     # Only an exact idle acknowledgement is a replay-safety proof. Any new or
                     # malformed state value conservatively disables transparent reconnect.
                     self._session_idle = status == "idle"
-            if frame.get("type") in {"done", "episode_error"}:
-                self._episode_renewal_deadline_at = None
             self._frames.put(cast("JsonObject", frame))
         else:
             self._stderr.append(f"[stdout] {text}")
-
-    def _refresh_sandbox_timeout(self) -> None:
-        """Renew a pooled eval sandbox lease without surfacing the heartbeat as a protocol frame.
-
-        A provider call can keep one episode active longer than E2B's 900-second sandbox timeout.
-        The runner remains responsive during that host-side wait and emits transport heartbeats;
-        refreshing here prevents E2B from killing an otherwise healthy in-flight episode. A
-        transient refresh failure stays diagnostic-only and the next heartbeat retries it.
-        """
-        timeout = self._sandbox_timeout_s
-        deadline = self._episode_renewal_deadline_at
-        if timeout is None or deadline is None:
-            return
-        now = time.monotonic()
-        if now < self._next_timeout_refresh_at or now >= deadline:
-            return
-        # Shorten the final lease so the sandbox still dies at the absolute episode deadline.
-        refreshed_timeout = min(timeout, max(1, math.ceil(deadline - now)))
-        try:
-            self._sandbox.set_timeout(refreshed_timeout)
-        except Exception as exc:  # noqa: BLE001 - retry on the next heartbeat; I/O remains authoritative
-            self._stderr.append(f"[channel] sandbox timeout refresh failed: {exc}")
-            return
-        self._next_timeout_refresh_at = now + self._timeout_refresh_interval_s
 
 
 class E2BDurableChannel:
@@ -1112,7 +1066,7 @@ class E2BDurableChannel:
 
 
 class E2BSandboxPool:
-    """Bootstrapped sandboxes with a running pi runner, reused within a proposal batch.
+    """Fixed-lifetime bootstrapped sandboxes reused within one proposal batch.
 
     The bootstrap (runner files + node 22 + pi's npm deps unless a template prebakes them) is
     doc-independent — a mutated harness's code surfaces travel per-episode in
@@ -1120,11 +1074,13 @@ class E2BSandboxPool:
     pool at each iteration boundary before the proposer runs, preventing long
     proposer/evaluation gaps from leaving stale E2B command streams alive; score waves for
     sibling proposals in that iteration
-    still reuse warm sandboxes instead of re-paying installs. Concurrent episodes acquire distinct
-    sandboxes; a sandbox whose episode raised is discarded (the runner process is in an unknown
-    state — reuse could cross frames between episodes). `close()` kills everything; the pool lock
-    guards only the free lists, so parallel bootstraps never serialize behind one sandbox's
-    multi-minute npm install.
+    still reuse warm sandboxes within their original provider-enforced lease instead of re-paying
+    installs. The lease is set exactly once by ``Sandbox.create`` and is never extended: neither
+    acquisition nor runner heartbeats may call ``set_timeout``. Concurrent episodes acquire
+    distinct sandboxes; a sandbox whose episode raised is discarded (the runner process is in an
+    unknown state — reuse could cross frames between episodes). `close()` kills everything; the
+    pool lock guards only the free lists, so parallel bootstraps never serialize behind one
+    sandbox's multi-minute npm install.
     """
 
     def __init__(
@@ -1135,21 +1091,31 @@ class E2BSandboxPool:
         metadata: dict[str, str] | None = None,
         sandbox_factory: SandboxFactory | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
+        max_billing_seconds: int = int(DEFAULT_SANDBOX_TIMEOUT_S),
     ) -> None:
+        if not isinstance(max_billing_seconds, int) or isinstance(max_billing_seconds, bool):
+            raise ValueError("max_billing_seconds must be a positive integer")
+        if max_billing_seconds < 1:
+            raise ValueError("max_billing_seconds must be a positive integer")
         self._template = template
+        self._max_billing_seconds = max_billing_seconds
+        lifecycle = SandboxLifecyclePolicy(on_timeout="kill", auto_resume=False)
         self._factory = sandbox_factory or default_sandbox_factory(
             api_key=api_key,
             template=template,
             metadata=metadata,
+            timeout=float(max_billing_seconds),
+            lifecycle=lifecycle,
         )
         self._hello_timeout = hello_timeout
         self._lock = threading.Lock()
         self._idle: list[tuple[SandboxHandle, E2BStdioChannel]] = []
         self._all: list[SandboxHandle] = []
         self._closed = False
-        # Usage meter: lifetime seconds accumulate into _retired_seconds when a sandbox dies;
-        # live sandboxes are counted from their _started stamp. Keyed by id() — SandboxHandle is
-        # a protocol, not hashable-by-contract.
+        # Usage meter: lifetime seconds accumulate into _retired_seconds when a sandbox dies; an
+        # ambiguous create contributes its full fixed horizon immediately. Live sandboxes are
+        # counted from their _started stamp. Keyed by id() — SandboxHandle is a protocol, not
+        # hashable-by-contract.
         self._started: dict[int, float] = {}
         # An exact lease can be reached concurrently by pool.close() and an in-flight episode's
         # release(). The event makes one caller own each kill attempt while every other caller
@@ -1161,11 +1127,10 @@ class E2BSandboxPool:
     def acquire(self) -> tuple[SandboxHandle, E2BStdioChannel]:
         """An idle (bootstrapped, hello-verified) sandbox+channel; creates one when none is free.
 
-        Reused sandboxes get their lifetime EXTENDED first (`set_timeout` restarts E2B's
-        countdown): sandboxes created at a search's first wave must survive every later wave,
-        and a long search otherwise outlives the fixed creation-time cap — the runner stream
-        drops mid-episode ("Server disconnected"). A reused sandbox whose extension fails is
-        already dead (idle past its cap); it is retired and the next one is tried.
+        Reuse is allowed only before the conservative host-side deadline derived from the exact
+        create-time timeout. No operation here extends provider TTL. An expired idle lease is
+        retired and replaced, while an earlier provider death is handled by the runtime's normal
+        fresh-sandbox transport retry.
         """
         while True:
             with self._lock:
@@ -1174,16 +1139,27 @@ class E2BSandboxPool:
                 if not self._idle:
                     break
                 sandbox, channel = self._idle.pop()
-            try:
-                sandbox.set_timeout(int(DEFAULT_SANDBOX_TIMEOUT_S))
-            except Exception:  # noqa: BLE001 - a dead idle sandbox is expected after long gaps
+                started = self._started.get(id(sandbox))
+            if started is None or time.monotonic() - started >= float(self._max_billing_seconds):
                 self._retire(sandbox)
                 continue
             return sandbox, channel
-        sandbox = create_sandbox(self._factory)
+        # Record the admission horizon before the one and only external create attempt. This is
+        # conservative when the control-plane request itself is slow and prevents host bookkeeping
+        # from placing the lease deadline after the provider's own fixed timeout. If create is
+        # ambiguous, retain the entire admitted lifetime as exposure: no later close/reconcile can
+        # incorrectly return budget that the provider may still consume before its fixed timeout.
+        started_at = time.monotonic()
         with self._lock:
             self._created += 1
-            self._started[id(sandbox)] = time.monotonic()
+        try:
+            sandbox = self._factory()
+        except BaseException:
+            with self._lock:
+                self._retired_seconds += float(self._max_billing_seconds)
+            raise
+        with self._lock:
+            self._started[id(sandbox)] = started_at
             if not self._closed:
                 # Register before bootstrap so cancellation can kill cold-start sandboxes that
                 # are still installing dependencies or waiting for the runner hello.
@@ -1241,10 +1217,17 @@ class E2BSandboxPool:
         self._retire_many(sandboxes)
 
     def usage(self) -> SandboxUsage:
-        """The pool's spend meter so far: sandbox count and total lifetime seconds."""
+        """Conservative exposure: create admissions and known-or-fully-reserved lifetime seconds.
+
+        An ambiguous create contributes its complete fixed lifetime immediately and permanently.
+        Successful resources use observed wall time until cleanup is proved.
+        """
         now = time.monotonic()
         with self._lock:
-            live = sum(now - started for started in self._started.values())
+            live = sum(
+                min(max(0.0, now - started), float(self._max_billing_seconds))
+                for started in self._started.values()
+            )
             return SandboxUsage(count=self._created, seconds=self._retired_seconds + live)
 
     def _retire(self, sandbox: SandboxHandle) -> None:
@@ -1270,7 +1253,10 @@ class E2BSandboxPool:
             with self._lock:
                 started = self._started.pop(sandbox_id)
                 self._all = [item for item in self._all if item is not sandbox]
-                self._retired_seconds += retired_at - started
+                self._retired_seconds += min(
+                    max(0.0, retired_at - started),
+                    float(self._max_billing_seconds),
+                )
         finally:
             with self._lock:
                 self._retiring.pop(sandbox_id, None)
@@ -1323,19 +1309,13 @@ class E2BSandboxPool:
         )
 
     def _start_runner(self, sandbox: SandboxHandle) -> E2BStdioChannel:
-        # Bootstrap can consume much of the creation-time lease on a template-less sandbox. Reset
-        # it immediately before the long-lived runner starts; subsequent in-flight heartbeats keep
-        # extending it while an episode is active.
-        timeout = int(DEFAULT_SANDBOX_TIMEOUT_S)
-        sandbox.set_timeout(timeout)
         # timeout=0 = no command-connection limit (SDK-documented): the runner must outlive every
-        # episode on this sandbox; the sandbox's own lifetime is the real bound.
+        # episode on this sandbox; the original provider-enforced sandbox lease is the real bound.
         handle = sandbox.commands.run(START_CMD, background=True, stdin=True, timeout=0)
         # background=True always yields a handle; the union return type is the protocol's.
         channel = E2BStdioChannel(
             sandbox,
             cast("CommandHandle", handle),
-            sandbox_timeout_s=timeout,
         )
         self._await_hello(channel)
         return channel
@@ -1512,6 +1492,17 @@ def session_entry_files() -> dict[str, str]:
     from the installed wmh package and writes them into the sandbox at start).
     """
     return {name: _read_entry(name) for name in _LIVE_RUNNER_FILES}
+
+
+def session_entry_bundle_digest() -> str:
+    """Return the canonical digest of the Pi source uploaded for a live runner."""
+    manifest = json.dumps(
+        {"entry_files": dict(sorted(session_entry_files().items()))},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return "sha256:" + hashlib.sha256(manifest).hexdigest()
 
 
 @overload

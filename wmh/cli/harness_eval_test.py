@@ -30,6 +30,7 @@ from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.results import LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner import pi_node_baseline
+from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
@@ -45,6 +46,8 @@ harness_eval_module = importlib.import_module("wmh.cli.harness_eval")
 runner = CliRunner()
 _RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
 _CELL_CONFIG_DIGEST = "sha256:" + "b" * 64
+_RUNNER_CONFIG_DIGEST = "sha256:" + "c" * 64
+_RUNNER_ENVIRONMENT_DIGEST = "sha256:" + "d" * 64
 
 
 def _save_harness(root: Path) -> HarnessDoc:
@@ -59,7 +62,8 @@ def _loaded_result(tmp_path: Path) -> LoadedHarborJobResult:
         provider="bedrock",
         model_name="model",
         task_environment=BenchmarkTaskEnvironment.DOCKER,
-        runner_image="runner-image",
+        runner_config_digest=_RUNNER_CONFIG_DIGEST,
+        runner_environment_digest=_RUNNER_ENVIRONMENT_DIGEST,
         run_config_digest=_RUN_CONFIG_DIGEST,
     )
     cells = [
@@ -229,14 +233,14 @@ def _patch_evaluator(
             spec: HarborJobSpec,
             provider_config: ProviderConfig,
             *,
-            runner_image: str,
+            runner_spec: PiRunnerBackendSpec,
             turn_timeout_s: float,
             budget_account: BudgetAccount | None = None,
         ) -> None:
             self._call: dict[str, object] = {
                 "spec": spec,
                 "provider_config": provider_config,
-                "runner_image": runner_image,
+                "runner_spec": runner_spec,
                 "turn_timeout_s": turn_timeout_s,
                 "budget_account": budget_account,
             }
@@ -373,6 +377,11 @@ def test_local_bedrock_eval_wires_exact_inputs_and_writes_only_canonical_result(
     out.parent.mkdir()
     out.write_text("old", encoding="utf-8")
     calls = _patch_evaluator(monkeypatch, _all_scored_result(tmp_path))
+    runner_spec_path = tmp_path / "runner.json"
+    runner_spec_path.write_text(
+        LocalPiRunnerSpec().model_dump_json(),
+        encoding="utf-8",
+    )
 
     result = runner.invoke(
         app,
@@ -396,8 +405,8 @@ def test_local_bedrock_eval_wires_exact_inputs_and_writes_only_canonical_result(
             str(tmp_path / "jobs"),
             "--turn-timeout",
             "42",
-            "--runner-image",
-            "runner@sha256:" + "a" * 64,
+            "--runner-spec",
+            str(runner_spec_path),
             "--yes",
         ],
     )
@@ -423,7 +432,7 @@ def test_local_bedrock_eval_wires_exact_inputs_and_writes_only_canonical_result(
     assert provider.endpoint is None
     assert provider.deployment is None
     assert call["turn_timeout_s"] == 42.0
-    assert call["runner_image"] == "runner@sha256:" + "a" * 64
+    assert call["runner_spec"] == LocalPiRunnerSpec()
 
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert payload["identity"]["run_config_digest"] == _RUN_CONFIG_DIGEST
@@ -761,8 +770,8 @@ def test_help_exposes_no_credential_flags() -> None:
     assert "--task" in result.output
     assert "--exclude-task" in result.output
     flat = " ".join(result.output.replace("│", " ").split())
-    assert "The pi runner always uses local Docker" in flat
-    assert "local Docker pi runner on every task backend" in flat
+    assert "Pi runner backend spec" in flat
+    assert "Local Docker is the default" in flat
 
 
 @pytest.mark.parametrize(

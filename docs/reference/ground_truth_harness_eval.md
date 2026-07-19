@@ -222,7 +222,9 @@ Harbor supports two task-environment backends in this protocol:
 - **e2b**, an explicit acceleration option for high-concurrency task execution.
 
 These choices move only Harbor's task environment. The isolated pi runner remains in local Docker
-for both, so the evaluator host requires Docker even when `--task-backend e2b` is selected.
+by default, but its backend is configured independently with an exact runner specification.
+Docker is required whenever either selected backend is local; a fully E2B task and runner route
+does not require a Docker daemon on the evaluator host.
 
 Before any scored E2B run, replay one frozen scripted or golden action sequence against identical
 task locks on local and E2B. Compare normalized command outcomes, verifier rewards, final task
@@ -257,11 +259,14 @@ daemon platform plus every Compose service's immutable image ID and image platfo
 container, trial, and project identities are deliberately excluded. Every scored attempt must
 reproduce the per-task qualification digest.
 
-Harbor 0.18 does not expose the immutable E2B build ID that `Sandbox.create` actually resolved.
-Looking up the mutable `default` tag after sandbox creation cannot close the alias race, even when
-the current tag and sandbox timestamps are retained. The evaluator therefore keeps E2B selectable
-for acceleration and parity diagnostics, but `HarborHarnessScorer` rejects E2B scored search until
-the integration creates sandboxes from an immutable build reference and surfaces that identity.
+WMH does not use Harbor 0.18's alias-based E2B create path for scored runs. Its trusted adapter
+serializes a content-and-resource-keyed build registry, records `BuildInfo.template_id` and
+`BuildInfo.build_id` only after a completed build, and creates each sandbox with the exact
+`<template_id>:<build_id>` reference. It verifies the returned template, resources, platform,
+network and lifecycle policy, excludes ephemeral sandbox identity from the stable environment
+digest, and writes an owner-bound resource receipt after metadata reconciliation proves the
+sandbox absent. Valid and candidate-damaged E2B cells are rejected unless that receipt is terminal
+and bound to the attested launch configuration.
 
 ```python
 from harbor.models.job.config import DatasetConfig
@@ -994,8 +999,6 @@ The following remain required work before experiment launch:
 - classify candidate-caused task-container destruction or resource exhaustion as candidate zero,
   with separate run-health evidence for ambiguous failures, instead of treating every task-tool
   transport exception as infrastructure;
-- create E2B sandboxes from an immutable build reference and surface the exact resolved build ID
-  before admitting E2B scores; keep E2B acceleration diagnostic-only until that boundary lands;
 - make remote, registry, and package task acquisition preserve symlinks for pre-read validation,
   or keep all ground-truth evaluation restricted to preflighted local dataset paths;
 - add and fund a generic Claude Code control only if making a matched headline-uplift claim;
