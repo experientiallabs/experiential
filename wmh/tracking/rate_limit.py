@@ -321,6 +321,13 @@ class ExternalDispatchRateAuthority:
                             last_admitted_at_unix_ns=now_ns,
                         )
                         _persist_state(self._path, next_state)
+                        if deadline_ns is not None and self._wait_now_ns() >= deadline_ns:
+                            # The durable sequence is intentionally consumed. Returning it after
+                            # the caller's deadline could admit a provider effect outside its
+                            # separately budgeted host horizon.
+                            raise ExternalDispatchRateAdmissionTimeout(
+                                "dispatch rate admission timed out"
+                            )
                         return ExternalDispatchPermit(
                             policy_digest=self._policy.digest,
                             ledger_identity=self._ledger_identity,

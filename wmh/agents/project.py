@@ -171,6 +171,15 @@ def _validate_project_create_rate_authority(
     return authority
 
 
+def _project_rate_gate_timeout(create_deadline_s: float) -> float:
+    """Return bounded admission time while reserving one full provider request horizon."""
+    remaining_s = create_deadline_s - time.monotonic()
+    admission_s = remaining_s - E2B_CREATE_REQUEST_TIMEOUT_S
+    if not math.isfinite(admission_s) or admission_s <= 0:
+        raise TimeoutError("project sandbox create horizon expired before provider dispatch")
+    return min(_PROJECT_RATE_GATE_TIMEOUT_S, admission_s)
+
+
 class _BudgetedProjectSandboxFactory:
     """Create each proposer-project lease once under the shared experiment hard cap."""
 
@@ -222,6 +231,7 @@ class _BudgetedProjectSandboxFactory:
 
     def __call__(self) -> SandboxHandle:
         self._reconcile_orphans()
+        create_deadline_s = time.monotonic() + _PROJECT_CREATE_HORIZON_S
         lease_id = uuid.uuid4().hex
         ledger = RunnerLeaseLedger(self._ledger_dir / f"{lease_id}.json")
         ledger.begin(
@@ -260,7 +270,11 @@ class _BudgetedProjectSandboxFactory:
                 request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
             )
             for attempt in range(_PROJECT_CREATE_ATTEMPTS):
-                self._create_rate_authority.acquire(timeout_seconds=_PROJECT_RATE_GATE_TIMEOUT_S)
+                gate_timeout_s = _project_rate_gate_timeout(create_deadline_s)
+                self._create_rate_authority.acquire(timeout_seconds=gate_timeout_s)
+                # Admission can consume nearly its whole bound. Recheck before every initial or
+                # retry dispatch so the SDK retains its complete request-timeout allowance.
+                _project_rate_gate_timeout(create_deadline_s)
                 create_outcome = "unknown"
                 try:
                     sandbox = factory()

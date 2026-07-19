@@ -1467,6 +1467,17 @@ class _ProjectRateClock:
         self.now_ns += int(seconds * 1_000_000_000)
 
 
+class _ProjectCreateClock:
+    def __init__(self) -> None:
+        self.now_s = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now_s
+
+    def elapse(self, seconds: float) -> None:
+        self.now_s += seconds
+
+
 def _project_rate_authority(
     tmp_path: Path,
     *,
@@ -1948,6 +1959,72 @@ def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
     assert create_calls == 4
     assert sleeps == [1.0, 3.0, 9.0]
     assert json.loads((tmp_path / "project-create-rate.json").read_text())["sequence"] == 4
+    assert reaped == []
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "CreateRejected"
+    [lease_path] = (tmp_path / "leases").glob("*.json")
+    assert json.loads(lease_path.read_text())["state"] == "retired"
+
+
+def test_budgeted_project_never_dispatches_a_retry_past_the_absolute_create_horizon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    authority = _project_rate_authority(tmp_path)
+    clock = _ProjectCreateClock()
+    gate_calls = 0
+    create_calls = 0
+    reaped: list[str] = []
+
+    def acquire(*, timeout_seconds: float | None = None) -> ExternalDispatchPermit:
+        nonlocal gate_calls
+        gate_calls += 1
+        assert timeout_seconds == project_module._PROJECT_RATE_GATE_TIMEOUT_S
+        return ExternalDispatchPermit(
+            policy_digest=authority.policy.digest,
+            ledger_identity=authority.binding.ledger_identity,
+            sequence=gate_calls,
+            admitted_at_unix_ns=10_000_000_000 + gate_calls,
+        )
+
+    def delayed_refusal_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        def create() -> _Sandbox:
+            nonlocal create_calls
+            create_calls += 1
+            if create_calls > 1:
+                raise AssertionError("expired retry must not reach the provider")
+            clock.elapse(
+                project_module._PROJECT_CREATE_HORIZON_S
+                - project_module.E2B_CREATE_REQUEST_TIMEOUT_S
+            )
+            raise RateLimitException("429: Rate limit exceeded, please try again later.")
+
+        return create
+
+    monkeypatch.setattr(authority, "acquire", acquire)
+    monkeypatch.setattr(project_module, "default_sandbox_factory", delayed_refusal_factory)
+    monkeypatch.setattr(project_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(project_module.time, "sleep", clock.elapse)
+    monkeypatch.setattr(
+        project_module,
+        "reap_e2b_runner_lease",
+        lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
+    )
+
+    with pytest.raises(TimeoutError, match="create horizon"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=authority,
+        )
+
+    assert gate_calls == create_calls == 1
     assert reaped == []
     [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
     assert reservation.status is ReservationStatus.FORFEITED

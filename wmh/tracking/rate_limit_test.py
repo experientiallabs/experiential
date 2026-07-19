@@ -155,6 +155,39 @@ def test_rate_authority_bounds_policy_spacing_wait(tmp_path: Path) -> None:
     assert json.loads((tmp_path / "rate.json").read_text())["sequence"] == 1
 
 
+def test_rate_authority_consumes_permit_but_times_out_after_delayed_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    path = (tmp_path / "rate.json").resolve()
+    authority = ExternalDispatchRateAuthority.bootstrap(
+        path,
+        _policy(),
+        clock_ns=clock.time_ns,
+        wait_clock_ns=clock.time_ns,
+        sleeper=clock.sleep,
+    )
+    persist_state = rate_limit._persist_state  # noqa: SLF001
+
+    def delayed_persist(
+        state_path: Path,
+        state: rate_limit._ExternalDispatchRateState,  # noqa: SLF001
+    ) -> None:
+        persist_state(state_path, state)
+        if state.sequence == 1:
+            clock.now_ns += 200_000_000
+
+    monkeypatch.setattr(rate_limit, "_persist_state", delayed_persist)
+
+    with pytest.raises(ExternalDispatchRateAdmissionTimeout, match="timed out"):
+        authority.acquire(timeout_seconds=0.1)
+
+    state = json.loads(path.read_text())
+    assert state["sequence"] == 1
+    assert state["last_admitted_at_unix_ns"] == 10_000_000_000
+
+
 @pytest.mark.skipif(os.name != "posix", reason="rate leases require POSIX file locking")
 def test_rate_authority_waits_for_a_cross_process_ledger_lease(tmp_path: Path) -> None:
     path = (tmp_path / "rate.json").resolve()
