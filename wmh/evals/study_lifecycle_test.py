@@ -23,6 +23,7 @@ from wmh.evals.study_lifecycle import (
     ProtocolPublishedPayload,
     RosterQualifiedPayload,
     StoppedPayload,
+    StudyArtifactPublication,
     StudyLifecycleController,
     StudyStopReason,
 )
@@ -68,6 +69,22 @@ class _Publisher:
     ) -> None:
         del genesis, records, pending
 
+    def verify_artifact(self, publication: StudyArtifactPublication) -> None:
+        expected = _artifact_publication(publication.artifact_digest)
+        if publication != expected:
+            raise ValueError("missing external artifact")
+
+
+def _artifact_publication(artifact_digest: str) -> StudyArtifactPublication:
+    return StudyArtifactPublication.create(
+        artifact_digest=artifact_digest,
+        publisher="test-artifacts",
+        publication_id=f"artifact-{artifact_digest}",
+        immutable_locator=f"test://artifacts/{artifact_digest}",
+        published_at=datetime(2026, 7, 19, 11, 0, tzinfo=UTC),
+        evidence={},
+    )
+
 
 def _controller(tmp_path: Path) -> StudyLifecycleController:
     publisher = _Publisher()
@@ -76,7 +93,11 @@ def _controller(tmp_path: Path) -> StudyLifecycleController:
         study_id="study-1",
         publisher_configuration_digest=publisher.configuration_digest,
     )
-    return StudyLifecycleController(store=store, publisher=publisher)
+    return StudyLifecycleController(
+        store=store,
+        publisher=publisher,
+        artifact_verifier=publisher,
+    )
 
 
 def _preparation() -> PreparationPlannedPayload:
@@ -153,10 +174,24 @@ def test_controller_publishes_typed_chronology_and_guards_the_active_phase(
         search_run_id="discovery-run-1",
     )
 
-    for payload in (preparation, roster, protocol, discovery):
+    for payload in (preparation, roster):
         record = controller.publish(payload)
         assert record.commitment.phase is payload.phase
         assert record.commitment.payload_digest == payload.digest
+    protocol = protocol.model_copy(
+        update={
+            "protocol_artifact_publication_digest": _artifact_publication(
+                protocol.protocol_digest
+            ).digest
+        }
+    )
+    record = controller.publish_protocol(
+        protocol,
+        publication=_artifact_publication(protocol.protocol_digest),
+    )
+    assert record.commitment.payload_digest == protocol.digest
+    record = controller.publish(discovery)
+    assert record.commitment.payload_digest == discovery.digest
 
     calls: list[str] = []
     result = controller.call_in_phase(
@@ -191,8 +226,20 @@ def test_run_claim_rejects_a_second_fresh_start_but_allows_exact_resume(
         search_configuration_digest=_digest("search-configuration"),
         search_run_id="discovery-run-1",
     )
-    for payload in (preparation, roster, protocol, discovery):
-        controller.publish(payload)
+    controller.publish(preparation)
+    controller.publish(roster)
+    protocol = protocol.model_copy(
+        update={
+            "protocol_artifact_publication_digest": _artifact_publication(
+                protocol.protocol_digest
+            ).digest
+        }
+    )
+    controller.publish_protocol(
+        protocol,
+        publication=_artifact_publication(protocol.protocol_digest),
+    )
+    controller.publish(discovery)
 
     claim = controller.claim_run(
         StudyPhase.DISCOVERY_RUNNING,
@@ -265,6 +312,7 @@ def test_candidate_freeze_payload_binds_completed_search_and_cost_evidence() -> 
         search_configuration_digest=_digest("search-configuration"),
         search_cost_binding_digest=_digest("search-cost-binding"),
         search_cost_report_digest=_digest("search-cost-report"),
+        search_cost_report_publication_digest=_digest("search-cost-report-publication"),
         champion_reconstruction_digest=_digest("champion-reconstruction"),
         candidate_freeze_record_digest=_digest("freeze-record"),
         completed_iterations=10,
@@ -274,6 +322,37 @@ def test_candidate_freeze_payload_binds_completed_search_and_cost_evidence() -> 
     with pytest.raises(ValueError, match="completed_iterations"):
         CandidateFrozenPayload.model_validate(
             {**payload.model_dump(mode="json"), "completed_iterations": 0}
+        )
+
+
+def test_protected_evidence_phases_reject_unverified_generic_publication(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    controller.publish(_preparation())
+    controller.publish(
+        RosterQualifiedPayload(
+            qualified_roster_digest=_digest("roster"),
+            qualification_report_digest=_digest("qualification"),
+            execution_plan_digest=_digest("execution-plan"),
+            qualified_task_count=89,
+        )
+    )
+    protocol = ProtocolPublishedPayload(
+        protocol_digest=_digest("protocol"),
+        protocol_artifact_publication_digest=_digest("invented-publication"),
+        partition_manifest_digest=_digest("partition"),
+        qualified_roster_digest=_digest("roster"),
+        search_cost_binding_digest=_digest("search-cost-binding"),
+        confirmation_budget_binding_digest=_digest("confirmation-budget-binding"),
+    )
+
+    with pytest.raises(ValueError, match="publish_protocol"):
+        controller.publish(protocol)
+    with pytest.raises(ValueError, match="exact protocol"):
+        controller.publish_protocol(
+            protocol,
+            publication=_artifact_publication(_digest("different-protocol")),
         )
 
 

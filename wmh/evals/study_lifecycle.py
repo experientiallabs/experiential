@@ -5,19 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, TypeVar
+from typing import Annotated, Literal, Protocol, TypeVar
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     StrictInt,
     TypeAdapter,
     field_validator,
+    model_validator,
 )
 
 from wmh.core.text import validate_durable_text
+from wmh.evals.partition import CandidateFreezeRecord
 from wmh.evals.study_journal import (
     ExternalCommitmentPublisher,
     StudyJournalStore,
@@ -29,6 +33,8 @@ from wmh.evals.study_journal import (
     claim_study_run,
     load_study_journal,
 )
+from wmh.harness.create import SearchCheckpoint
+from wmh.harness.doc import HarnessDoc
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _ResultT = TypeVar("_ResultT")
@@ -50,6 +56,73 @@ class _StudyPayload(BaseModel):
             allow_nan=False,
         ).encode()
         return "sha256:" + hashlib.sha256(serialized).hexdigest()
+
+
+class StudyArtifactPublication(BaseModel):
+    """Self-validating receipt for one immutable externally retrievable artifact."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    publication_version: Literal["1"] = "1"
+    artifact_digest: str = Field(pattern=_DIGEST_PATTERN)
+    publisher: str = Field(min_length=1, max_length=256)
+    publication_id: str = Field(min_length=1, max_length=2_048)
+    immutable_locator: str = Field(min_length=1, max_length=4_096)
+    published_at: datetime
+    evidence: dict[str, JsonValue]
+    receipt_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        artifact_digest: str,
+        publisher: str,
+        publication_id: str,
+        immutable_locator: str,
+        published_at: datetime,
+        evidence: dict[str, JsonValue],
+    ) -> StudyArtifactPublication:
+        """Create a receipt whose digest covers every retrieval and evidence field."""
+        draft = cls.model_construct(
+            publication_version="1",
+            artifact_digest=artifact_digest,
+            publisher=publisher,
+            publication_id=publication_id,
+            immutable_locator=immutable_locator,
+            published_at=published_at,
+            evidence=evidence,
+            receipt_digest="sha256:" + "0" * 64,
+        )
+        payload = draft.model_dump(mode="json", exclude={"receipt_digest"})
+        return cls(**payload, receipt_digest=_canonical_digest(payload))
+
+    @model_validator(mode="after")
+    def _validate_receipt(self) -> StudyArtifactPublication:
+        for field in ("publisher", "publication_id", "immutable_locator"):
+            value = getattr(self, field)
+            if value != value.strip():
+                raise ValueError(f"artifact publication {field} cannot have surrounding whitespace")
+            validate_durable_text(value, field=f"artifact publication {field}")
+        if self.published_at.tzinfo is None or self.published_at.utcoffset() is None:
+            raise ValueError("artifact publication timestamp must be timezone-aware")
+        payload = self.model_dump(mode="json", exclude={"receipt_digest"})
+        if self.receipt_digest != _canonical_digest(payload):
+            raise ValueError("artifact publication receipt digest is inconsistent")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return the canonical receipt identity committed by a study phase."""
+        return self.receipt_digest
+
+
+class ExternalArtifactVerifier(Protocol):
+    """Verify an immutable artifact receipt against its external publication channel."""
+
+    def verify_artifact(self, publication: StudyArtifactPublication) -> None:
+        """Raise unless the receipt still resolves to its exact artifact digest."""
+        ...
 
 
 class PreparationPlannedPayload(_StudyPayload):
@@ -111,6 +184,7 @@ class CandidateFrozenPayload(_StudyPayload):
     search_configuration_digest: str = Field(pattern=_DIGEST_PATTERN)
     search_cost_binding_digest: str = Field(pattern=_DIGEST_PATTERN)
     search_cost_report_digest: str = Field(pattern=_DIGEST_PATTERN)
+    search_cost_report_publication_digest: str = Field(pattern=_DIGEST_PATTERN)
     champion_reconstruction_digest: str = Field(pattern=_DIGEST_PATTERN)
     candidate_freeze_record_digest: str = Field(pattern=_DIGEST_PATTERN)
     completed_iterations: StrictInt = Field(ge=1)
@@ -234,9 +308,11 @@ class StudyLifecycleController:
         *,
         store: StudyJournalStore,
         publisher: ExternalCommitmentPublisher,
+        artifact_verifier: ExternalArtifactVerifier | None = None,
     ) -> None:
         self._store = store
         self._publisher = publisher
+        self._artifact_verifier = artifact_verifier
 
     @property
     def records(self) -> tuple[StudyPhaseRecord, ...]:
@@ -251,6 +327,109 @@ class StudyLifecycleController:
 
     def publish(self, payload: StudyPhasePayload) -> StudyPhaseRecord:
         """Validate and externally witness one exact typed phase payload."""
+        frozen = _PAYLOAD_ADAPTER.validate_python(payload.model_dump(mode="json"))
+        protected = {
+            StudyPhase.PROTOCOL_PUBLISHED: "publish_protocol",
+            StudyPhase.CANDIDATE_FROZEN: "publish_candidate_frozen",
+            StudyPhase.CANDIDATE_PUBLISHED: "publish_candidate_source",
+        }
+        required_method = protected.get(frozen.phase)
+        if required_method is not None:
+            raise ValueError(
+                f"{frozen.phase.value} requires verified artifacts; use {required_method}"
+            )
+        return self._publish(frozen)
+
+    def publish_protocol(
+        self,
+        payload: ProtocolPublishedPayload,
+        *,
+        publication: StudyArtifactPublication,
+    ) -> StudyPhaseRecord:
+        """Publish a preregistration only after verifying its exact public artifact."""
+        frozen = ProtocolPublishedPayload.model_validate(payload.model_dump(mode="json"))
+        receipt = self._verify_artifact(publication)
+        if receipt.artifact_digest != frozen.protocol_digest:
+            raise ValueError("protocol publication does not contain the exact protocol")
+        if receipt.digest != frozen.protocol_artifact_publication_digest:
+            raise ValueError("protocol payload differs from its publication receipt")
+        return self._publish(frozen)
+
+    def publish_candidate_frozen(
+        self,
+        *,
+        protocol_digest: str,
+        candidate: HarnessDoc,
+        checkpoint: SearchCheckpoint,
+        search_configuration_digest: str,
+        search_cost_binding_digest: str,
+        search_cost_report_publication: StudyArtifactPublication,
+        freeze_record: CandidateFreezeRecord,
+        completed_iterations: int,
+    ) -> CandidateFrozenPayload:
+        """Derive and publish candidate selection evidence from validated source artifacts."""
+        selected = HarnessDoc.model_validate(candidate.model_dump(mode="json"))
+        state = SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
+        frozen_record = CandidateFreezeRecord.model_validate(freeze_record.model_dump(mode="json"))
+        if state.completed_iteration != completed_iterations:
+            raise ValueError("search checkpoint does not complete the declared iteration count")
+        reconstructed = state.archive.reconstruct(state.champion_doc_hash)
+        if reconstructed.execution_digest != selected.execution_digest:
+            raise ValueError("candidate source differs from the reconstructed search champion")
+        if (
+            frozen_record.candidate_execution_digest != selected.execution_digest
+            or frozen_record.selection_evidence_digest != "sha256:" + state.payload_sha256
+        ):
+            raise ValueError("candidate freeze record differs from the completed search")
+        cost_publication = self._verify_artifact(search_cost_report_publication)
+        payload = CandidateFrozenPayload(
+            protocol_digest=protocol_digest,
+            candidate_execution_digest=selected.execution_digest,
+            search_checkpoint_digest="sha256:" + state.payload_sha256,
+            search_configuration_digest=search_configuration_digest,
+            search_cost_binding_digest=search_cost_binding_digest,
+            search_cost_report_digest=cost_publication.artifact_digest,
+            search_cost_report_publication_digest=cost_publication.digest,
+            champion_reconstruction_digest=_canonical_digest(selected.model_dump(mode="json")),
+            candidate_freeze_record_digest=frozen_record.digest,
+            completed_iterations=completed_iterations,
+        )
+        self._publish(payload)
+        return payload
+
+    def publish_candidate_source(
+        self,
+        *,
+        protocol_digest: str,
+        candidate: HarnessDoc,
+        publication: StudyArtifactPublication,
+    ) -> CandidatePublishedPayload:
+        """Publish candidate source only when the external artifact is byte-for-byte exact."""
+        selected = HarnessDoc.model_validate(candidate.model_dump(mode="json"))
+        source_digest = _canonical_digest(selected.model_dump(mode="json"))
+        receipt = self._verify_artifact(publication)
+        if receipt.artifact_digest != source_digest:
+            raise ValueError("candidate publication does not contain the exact candidate source")
+        payload = CandidatePublishedPayload(
+            protocol_digest=protocol_digest,
+            candidate_execution_digest=selected.execution_digest,
+            candidate_source_artifact_digest=source_digest,
+            candidate_artifact_publication_digest=receipt.digest,
+        )
+        self._publish(payload)
+        return payload
+
+    def _verify_artifact(
+        self,
+        publication: StudyArtifactPublication,
+    ) -> StudyArtifactPublication:
+        receipt = StudyArtifactPublication.model_validate(publication.model_dump(mode="json"))
+        if self._artifact_verifier is None:
+            raise ValueError("study lifecycle has no external artifact verifier")
+        self._artifact_verifier.verify_artifact(receipt)
+        return receipt
+
+    def _publish(self, payload: StudyPhasePayload) -> StudyPhaseRecord:
         frozen = _PAYLOAD_ADAPTER.validate_python(payload.model_dump(mode="json"))
         return append_study_phase(
             self._store,
@@ -310,3 +489,14 @@ class StudyLifecycleController:
             publisher=self._publisher,
             operation=operation,
         )
+
+
+def _canonical_digest(value: object) -> str:
+    serialized = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    return "sha256:" + hashlib.sha256(serialized).hexdigest()
