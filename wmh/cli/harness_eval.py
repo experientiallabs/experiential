@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+from contextlib import AbstractContextManager
 from pathlib import Path
 
 import typer
@@ -13,6 +14,7 @@ from harbor.models.job.config import DatasetConfig
 from rich.console import Console
 
 from wmh.config import ARTIFACT_DIR
+from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.evaluator import HarborEvaluator, harbor_job_lease_path
 from wmh.harness.doc import HarnessDoc
@@ -21,6 +23,11 @@ from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 _console = Console()
+_OUTPUT_LEASE_SUFFIX = ".wmh-eval-output.lock"
+
+
+class ConcurrentHarnessOutputError(RuntimeError):
+    """Another process already holds the exclusive lease for a canonical output."""
 
 
 def register(app: typer.Typer) -> None:
@@ -80,7 +87,10 @@ def eval_harness(
     task_backend: str = typer.Option(
         "local",
         "--task-backend",
-        help="Ground-truth task environment: local or e2b.",
+        help=(
+            "Harbor task environment: local Docker or E2B. The pi runner always uses local "
+            "Docker, so Docker is required for both."
+        ),
     ),
     attempts: int = typer.Option(1, "--attempts", min=1, help="Attempts per task."),
     concurrency: int = typer.Option(
@@ -108,7 +118,7 @@ def eval_harness(
     runner_image: str = typer.Option(
         PI_CONTAINER_IMAGE,
         "--runner-image",
-        help="Digest-pinned image used for the isolated pi runner.",
+        help="Digest-pinned image used by the local Docker pi runner on every task backend.",
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project artifact directory."),
     out: str = typer.Option(..., "--out", help="Canonical benchmark result JSON output."),
@@ -160,6 +170,7 @@ def eval_harness(
         raise typer.BadParameter(str(exc)) from exc
     output_path = _validate_output_path(
         out,
+        jobs_dir=resolved_jobs_dir,
         active_job_dir=resolved_jobs_dir / job_name,
         active_lease_path=harbor_job_lease_path(resolved_jobs_dir, job_name),
     )
@@ -174,8 +185,9 @@ def eval_harness(
         raise typer.Exit(1)
 
     try:
-        loaded = asyncio.run(evaluator.evaluate(candidate))
-        _atomic_write(output_path, loaded.result.model_dump_json(indent=2) + "\n")
+        with _exclusive_output_lease(output_path):
+            loaded = asyncio.run(evaluator.evaluate(candidate))
+            _atomic_write(output_path, loaded.result.model_dump_json(indent=2) + "\n")
     except (OSError, RuntimeError, ValueError) as exc:
         raise ClickException(str(exc)) from exc
 
@@ -184,7 +196,12 @@ def eval_harness(
     state = "[green]complete[/green]" if all_scored else "[red]not fully scored[/red]"
     _console.print(
         f"{state} scored={result.n_scored} "
-        f"timeout={result.n_task_timeouts} "
+        f"task_timeout={result.n_task_timeouts} "
+        f"candidate_failed={result.n_candidate_failures} "
+        f"candidate_timeout={result.n_candidate_timeouts} "
+        f"candidate_resource_limit={result.n_candidate_resource_limits} "
+        f"candidate_runtime_error={result.n_candidate_runtime_errors} "
+        f"candidate_unclassified={result.n_candidate_unclassified_failures} "
         f"infra={result.n_infrastructure_errors} "
         f"cancelled={result.n_cancelled} "
         f"incomplete={result.n_incomplete} "
@@ -376,6 +393,7 @@ def _parse_task_backend(value: str) -> HarborEnvironmentBackend:
 def _validate_output_path(
     path: str,
     *,
+    jobs_dir: Path,
     active_job_dir: Path,
     active_lease_path: Path,
 ) -> Path:
@@ -386,6 +404,11 @@ def _validate_output_path(
     if requested.exists() and not requested.is_file():
         raise typer.BadParameter(
             "output path must be a regular file location",
+            param_hint="--out",
+        )
+    if requested.name.endswith(_OUTPUT_LEASE_SUFFIX):
+        raise typer.BadParameter(
+            "output path uses a reserved WMH evaluation lease name",
             param_hint="--out",
         )
     target = requested.resolve()
@@ -401,7 +424,36 @@ def _validate_output_path(
             "output path cannot replace the active Harbor job lease",
             param_hint="--out",
         )
+    jobs_root = jobs_dir.expanduser().resolve()
+    if target == jobs_root or target.is_relative_to(jobs_root):
+        raise typer.BadParameter(
+            "output path cannot be inside another Harbor job or the Harbor jobs directory",
+            param_hint="--out",
+        )
     return target
+
+
+def _output_lease_path(output_path: Path) -> Path:
+    target = output_path.expanduser().resolve()
+    return target.parent / f".{target.name}{_OUTPUT_LEASE_SUFFIX}"
+
+
+def _exclusive_output_lease(output_path: Path) -> AbstractContextManager[None]:
+    """Prevent duplicate paid work and last-writer-wins publication for one output."""
+    target = output_path.expanduser().resolve()
+    lock_path = _output_lease_path(target)
+    return exclusive_posix_file_lease(
+        lock_path,
+        unsupported_error=RuntimeError(
+            "harness evaluation output leases require POSIX file locking"
+        ),
+        irregular_file_error=OSError(
+            f"harness evaluation output lock is not a regular file: {lock_path}"
+        ),
+        contention_error=ConcurrentHarnessOutputError(
+            f"another process is already publishing harness evaluation output {target}"
+        ),
+    )
 
 
 def _atomic_write(path: Path, payload: str) -> None:

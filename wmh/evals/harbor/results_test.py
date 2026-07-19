@@ -17,6 +17,7 @@ from harbor.models.verifier.result import VerifierResult
 from pydantic import ValidationError
 
 from wmh.evals.benchmark import (
+    BenchmarkCandidateFailureReason,
     BenchmarkCandidateStage,
     BenchmarkCandidateStatus,
     BenchmarkCandidateTerminalReason,
@@ -25,6 +26,7 @@ from wmh.evals.benchmark import (
     BenchmarkRunIdentity,
     BenchmarkTaskEnvironment,
     BenchmarkTrialStatus,
+    BenchmarkUsageStatus,
 )
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
@@ -148,8 +150,12 @@ def _trial(
 
 def _write_job(job_dir: Path, trials: list[TrialResult], *, expected: int) -> None:
     job_dir.mkdir(parents=True)
+    job_id = uuid4()
+    for trial in trials:
+        trial.config.job_id = job_id
+        trial.config.trials_dir = job_dir.resolve()
     result = JobResult(
-        id=uuid4(),
+        id=job_id,
         started_at=_NOW,
         finished_at=_NOW,
         n_total_trials=expected,
@@ -275,10 +281,14 @@ def test_load_uses_exact_manifest_and_preserves_rewards_usage_and_missing_cells(
     )
     assert trials["missing"].source == _TASK_SOURCE
     assert trials["missing"].status is BenchmarkTrialStatus.INCOMPLETE
-    assert result.usage.input_tokens is None
-    assert result.usage.cache_tokens is None
-    assert result.usage.output_tokens is None
-    assert result.usage.cost_usd is None
+    assert result.usage.input_tokens == 20
+    assert result.usage.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.usage.cache_tokens == 4
+    assert result.usage.cache_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.usage.output_tokens == 8
+    assert result.usage.output_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.usage.cost_usd == 0.1
+    assert result.usage.cost_usd_status is BenchmarkUsageStatus.LOWER_BOUND
 
     locators = {locator.cell.task_name: locator for locator in loaded.locators}
     scored_locator = locators["scored"]
@@ -353,9 +363,40 @@ def test_usage_total_is_reported_only_when_every_cell_is_metered(tmp_path: Path)
     ).result
 
     assert result.usage.input_tokens == 20
+    assert result.usage.input_tokens_status is BenchmarkUsageStatus.EXACT
     assert result.usage.cache_tokens == 4
+    assert result.usage.cache_tokens_status is BenchmarkUsageStatus.EXACT
     assert result.usage.output_tokens == 8
+    assert result.usage.output_tokens_status is BenchmarkUsageStatus.EXACT
     assert result.usage.cost_usd == 0.1
+    assert result.usage.cost_usd_status is BenchmarkUsageStatus.EXACT
+
+
+@pytest.mark.parametrize(
+    "exception_type",
+    ["WmhPiProviderError", "AgentTimeoutError", "CancelledError"],
+)
+def test_interrupted_usage_is_a_known_lower_bound_not_an_exact_total(
+    tmp_path: Path,
+    exception_type: str,
+) -> None:
+    trial = _trial(tmp_path, "task", exception_type=exception_type)
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    result = load_harbor_job_result(
+        job_dir,
+        _manifest("job", ("task", 1, trial.trial_name)),
+    ).result
+
+    assert result.trials[0].usage.input_tokens == 10
+    assert result.trials[0].usage.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.trials[0].usage.output_tokens == 4
+    assert result.trials[0].usage.output_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.usage.input_tokens == 10
+    assert result.usage.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.usage.output_tokens == 4
+    assert result.usage.output_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
 
 
 @pytest.mark.parametrize(
@@ -538,6 +579,7 @@ def test_scored_candidate_failure_is_retained_without_arbitrary_metadata(tmp_pat
         candidate_metadata={
             "candidate_failure": True,
             "candidate_failure_stage": "turn",
+            "candidate_failure_reason": "timeout",
             "untrusted_extra": secret,
         },
     )
@@ -551,6 +593,7 @@ def test_scored_candidate_failure_is_retained_without_arbitrary_metadata(tmp_pat
     assert result.status is BenchmarkTrialStatus.SCORED
     assert result.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
     assert result.candidate_outcome.stage is BenchmarkCandidateStage.EXECUTION
+    assert result.candidate_outcome.failure_reason is BenchmarkCandidateFailureReason.TIMEOUT
     assert result.candidate_outcome.terminal_reason is None
     assert secret not in result.model_dump_json()
 
@@ -562,6 +605,11 @@ def test_scored_candidate_failure_is_retained_without_arbitrary_metadata(tmp_pat
         {"candidate_failure": False, "candidate_failure_stage": "turn"},
         {"candidate_failure": True, "terminal_reason": "completed"},
         {"candidate_failure": True, "candidate_failure_stage": "unknown-stage"},
+        {
+            "candidate_failure": True,
+            "candidate_failure_stage": "turn",
+            "candidate_failure_reason": "unknown-reason",
+        },
         {"candidate_failure": False, "terminal_reason": "unknown-reason"},
         {"candidate_failure_stage": "turn"},
     ],
@@ -608,6 +656,7 @@ def test_inconsistent_step_candidate_outcomes_are_rejected(tmp_path: Path) -> No
                     **identity,
                     "candidate_failure": True,
                     "candidate_failure_stage": "materialization",
+                    "candidate_failure_reason": "runtime_error",
                 }
             ),
         ),
@@ -675,6 +724,44 @@ def test_wrong_task_for_manifest_cell_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="expected task identity 'planned'.*found 'actual'"):
         load_harbor_job_result(job_dir, _manifest("job", ("planned", 1, "planned__harbor")))
+
+
+@pytest.mark.parametrize("completed", [True, False], ids=["completed", "incomplete"])
+@pytest.mark.parametrize(
+    ("mismatch", "message"),
+    [
+        ("job_id", "job_id does not match its root job result"),
+        ("trials_dir", "trials_dir does not resolve to its root job"),
+    ],
+)
+def test_trial_config_cannot_be_grafted_from_another_job(
+    tmp_path: Path,
+    completed: bool,
+    mismatch: str,
+    message: str,
+) -> None:
+    trial = _trial(tmp_path, "task", rewards={"reward": 1})
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+    trial_dir = job_dir / trial.trial_name
+
+    if mismatch == "job_id":
+        trial.config.job_id = uuid4()
+    else:
+        foreign_job_dir = tmp_path / "foreign-job"
+        foreign_job_dir.mkdir()
+        trial.config.trials_dir = foreign_job_dir
+
+    if completed:
+        (trial_dir / "result.json").write_text(trial.model_dump_json(indent=2), encoding="utf-8")
+    else:
+        (trial_dir / "result.json").unlink()
+        (trial_dir / "config.json").write_text(
+            trial.config.model_dump_json(indent=2), encoding="utf-8"
+        )
+
+    with pytest.raises(ValueError, match=message):
+        load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
 
 
 @pytest.mark.parametrize(

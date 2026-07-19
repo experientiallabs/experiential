@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
+from uuid import UUID
 
 from harbor.models.job.lock import TrialLock
 from harbor.models.job.result import JobResult
@@ -15,6 +17,7 @@ from harbor.models.trial.result import ExceptionInfo, TrialResult
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from wmh.evals.benchmark import (
+    BenchmarkCandidateFailureReason,
     BenchmarkCandidateOutcome,
     BenchmarkCandidateStage,
     BenchmarkCandidateStatus,
@@ -27,6 +30,7 @@ from wmh.evals.benchmark import (
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
     BenchmarkUsage,
+    BenchmarkUsageStatus,
     aggregate_benchmark_usage,
 )
 from wmh.evals.harbor.config import _require_supported_harbor_version
@@ -92,6 +96,11 @@ _CANDIDATE_STAGE_MAP = {
     "turn": BenchmarkCandidateStage.EXECUTION,
     "execution": BenchmarkCandidateStage.EXECUTION,
 }
+_CANDIDATE_FAILURE_REASON_MAP = {
+    "timeout": BenchmarkCandidateFailureReason.TIMEOUT,
+    "resource_limit": BenchmarkCandidateFailureReason.RESOURCE_LIMIT,
+    "runtime_error": BenchmarkCandidateFailureReason.RUNTIME_ERROR,
+}
 _CANDIDATE_TERMINAL_REASON_MAP = {
     "completed": BenchmarkCandidateTerminalReason.COMPLETED,
     "turn_limit": BenchmarkCandidateTerminalReason.LIMIT_REACHED,
@@ -99,7 +108,12 @@ _CANDIDATE_TERMINAL_REASON_MAP = {
     "aborted": BenchmarkCandidateTerminalReason.ABORTED,
 }
 _CANDIDATE_OUTCOME_METADATA_KEYS = frozenset(
-    {"candidate_failure", "candidate_failure_stage", "terminal_reason"}
+    {
+        "candidate_failure",
+        "candidate_failure_stage",
+        "candidate_failure_reason",
+        "terminal_reason",
+    }
 )
 
 
@@ -148,11 +162,11 @@ class HarborTrialManifest(BaseModel):
     @model_validator(mode="after")
     def _reject_duplicates(self) -> Self:
         cells = [(entry.cell.task_key, entry.cell.attempt) for entry in self.entries]
-        duplicate_cells = sorted({cell for cell in cells if cells.count(cell) > 1})
+        duplicate_cells = sorted(cell for cell, count in Counter(cells).items() if count > 1)
         if duplicate_cells:
             raise ValueError(f"duplicate manifest benchmark cell(s): {duplicate_cells}")
         trial_names = [entry.trial_name for entry in self.entries]
-        duplicate_names = sorted({name for name in trial_names if trial_names.count(name) > 1})
+        duplicate_names = sorted(name for name, count in Counter(trial_names).items() if count > 1)
         if duplicate_names:
             raise ValueError(f"duplicate manifest trial_name(s): {duplicate_names}")
         return self
@@ -227,7 +241,12 @@ def load_harbor_job_result(
     trials: list[BenchmarkTrialResult] = []
     locators: list[HarborTrialLocator] = []
     for entry in manifest.entries:
-        trial, locator = _load_manifest_entry(root, entry, manifest)
+        trial, locator = _load_manifest_entry(
+            root,
+            entry,
+            manifest,
+            job_id=job_result.id,
+        )
         trials.append(trial)
         locators.append(locator)
 
@@ -248,6 +267,8 @@ def _load_manifest_entry(
     root: Path,
     entry: HarborTrialManifestEntry,
     manifest: HarborTrialManifest,
+    *,
+    job_id: UUID,
 ) -> tuple[BenchmarkTrialResult, HarborTrialLocator]:
     trial_rel = Path(entry.trial_name)
     trial_dir = _resolve_contained(root, trial_rel)
@@ -282,7 +303,7 @@ def _load_manifest_entry(
         artifacts_dir=artifacts_rel,
     )
     if not result_path.exists():
-        return _load_incomplete_trial(root, trial_rel, entry), locator
+        return _load_incomplete_trial(root, trial_rel, entry, job_id=job_id), locator
     if not result_path.is_file():
         return _malformed_trial(entry, "InvalidTrialResultError"), locator
 
@@ -293,6 +314,7 @@ def _load_manifest_entry(
 
     trial_lock = _load_and_validate_trial_lock(root, trial_rel, entry)
     _validate_locked_config(result.config, trial_lock)
+    _validate_trial_job_provenance(result.config, root=root, job_id=job_id)
     _validate_trial_identity(result, entry)
     candidate_outcome = _validate_run_identity(
         result,
@@ -306,6 +328,8 @@ def _load_incomplete_trial(
     root: Path,
     trial_rel: Path,
     entry: HarborTrialManifestEntry,
+    *,
+    job_id: UUID,
 ) -> BenchmarkTrialResult:
     config_path = _resolve_contained(root, trial_rel / "config.json")
     if not config_path.exists():
@@ -322,6 +346,7 @@ def _load_incomplete_trial(
         config = TrialConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValidationError):
         return _malformed_trial(entry, "InvalidTrialConfigError")
+    _validate_trial_job_provenance(config, root=root, job_id=job_id)
     task_name = config.task.get_task_id().get_name()
     if (
         config.trial_name != entry.trial_name
@@ -340,6 +365,28 @@ def _load_incomplete_trial(
         source=entry.task_source,
         status=BenchmarkTrialStatus.INCOMPLETE,
     )
+
+
+def _validate_trial_job_provenance(
+    config: TrialConfig,
+    *,
+    root: Path,
+    job_id: UUID,
+) -> None:
+    if config.job_id != job_id:
+        raise ValueError(
+            f"Harbor trial {config.trial_name!r} job_id does not match its root job result"
+        )
+    try:
+        trials_root = config.trials_dir.expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"Harbor trial {config.trial_name!r} trials_dir cannot be resolved safely"
+        ) from exc
+    if trials_root != root:
+        raise ValueError(
+            f"Harbor trial {config.trial_name!r} trials_dir does not resolve to its root job"
+        )
 
 
 def _validate_trial_identity(
@@ -458,13 +505,17 @@ def _parse_candidate_outcome(metadata: dict[str, object]) -> BenchmarkCandidateO
             stage = _CANDIDATE_STAGE_MAP[raw_stage]
         else:
             stage = None
+        raw_reason = metadata.get("candidate_failure_reason")
+        if not isinstance(raw_reason, str) or raw_reason not in _CANDIDATE_FAILURE_REASON_MAP:
+            raise ValueError("candidate outcome metadata has an unknown failure reason")
         return BenchmarkCandidateOutcome(
             status=BenchmarkCandidateStatus.FAILED,
             stage=stage,
+            failure_reason=_CANDIDATE_FAILURE_REASON_MAP[raw_reason],
         )
 
-    if "candidate_failure_stage" in metadata:
-        raise ValueError("completed candidate outcome metadata cannot carry a failure stage")
+    if "candidate_failure_stage" in metadata or "candidate_failure_reason" in metadata:
+        raise ValueError("completed candidate outcome metadata cannot carry failure details")
     raw_reason = metadata.get("terminal_reason")
     if raw_reason is None and "terminal_reason" in metadata:
         raise ValueError("candidate outcome metadata terminal reason cannot be null")
@@ -532,6 +583,11 @@ def _convert_trial(
         status = BenchmarkTrialStatus.INCOMPLETE
 
     n_input, n_cache, n_output, cost = result.compute_token_cost_totals()
+    usage_may_be_incomplete = error is not None and error.kind in {
+        BenchmarkFailureKind.CANCELLED,
+        BenchmarkFailureKind.TASK_TIMEOUT,
+        BenchmarkFailureKind.PROVIDER,
+    }
     rewards = None
     if status is BenchmarkTrialStatus.SCORED:
         assert result.verifier_result is not None
@@ -548,11 +604,39 @@ def _convert_trial(
         candidate_outcome=candidate_outcome,
         usage=BenchmarkUsage(
             input_tokens=n_input,
+            input_tokens_status=_usage_status(
+                n_input,
+                incomplete=usage_may_be_incomplete,
+            ),
             cache_tokens=n_cache,
+            cache_tokens_status=_usage_status(
+                n_cache,
+                incomplete=usage_may_be_incomplete,
+            ),
             output_tokens=n_output,
+            output_tokens_status=_usage_status(
+                n_output,
+                incomplete=usage_may_be_incomplete,
+            ),
             cost_usd=cost,
+            cost_usd_status=_usage_status(
+                cost,
+                incomplete=usage_may_be_incomplete,
+            ),
         ),
     )
+
+
+def _usage_status(
+    value: int | float | None,
+    *,
+    incomplete: bool,
+) -> BenchmarkUsageStatus:
+    if value is None:
+        return BenchmarkUsageStatus.UNAVAILABLE
+    if incomplete:
+        return BenchmarkUsageStatus.LOWER_BOUND
+    return BenchmarkUsageStatus.EXACT
 
 
 def _convert_exception(exception: ExceptionInfo | None) -> BenchmarkError | None:

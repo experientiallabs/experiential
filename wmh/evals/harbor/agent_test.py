@@ -18,6 +18,7 @@ from wmh.core.types import JsonObject
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.pi_runner import (
     PiCandidateError,
+    PiCandidateFailureReason,
     PiCandidateFailureStage,
     PiTurnResult,
     pi_node_baseline,
@@ -413,6 +414,7 @@ def test_candidate_failure_returns_for_native_verification(
     failure = PiCandidateError(
         "candidate failed",
         stage=PiCandidateFailureStage.MATERIALIZATION,
+        reason=PiCandidateFailureReason.TIMEOUT,
         events=(SessionEvent(kind="error", payload={"message": "candidate failed"}),),
         worker_usage=TokenUsage(input_tokens=3, output_tokens=2, calls=1),
     )
@@ -431,6 +433,7 @@ def test_candidate_failure_returns_for_native_verification(
     assert context.metadata is not None
     assert context.metadata["candidate_failure"] is True
     assert context.metadata["candidate_failure_stage"] == "materialization"
+    assert context.metadata["candidate_failure_reason"] == "timeout"
     trace = (tmp_path / "wmh-events.jsonl").read_text(encoding="utf-8")
     assert "candidate failed" in trace
 

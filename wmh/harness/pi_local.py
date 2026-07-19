@@ -805,21 +805,34 @@ def ensure_container_pi_runtime(
     image: str = PI_CONTAINER_IMAGE,
     run_command: Callable[..., _CompletedCommand] = subprocess.run,
 ) -> Path:
-    """Publish one deterministic pi runtime under an interprocess bootstrap lock."""
+    """Atomically publish one immutable, content-addressed pi runtime namespace."""
     validate_pi_container_image(image)
-    runtime_dir = runtime_dir.expanduser().resolve()
-    lock_path = runtime_dir.with_name(f".{runtime_dir.name}.lock")
+    cache_root = runtime_dir.expanduser().resolve()
     package_lock = _container_package_lock()
     entry_files = session_entry_files()
-    fingerprint = hashlib.sha256()
-    fingerprint.update(_PACKAGE_JSON.encode())
-    fingerprint.update(package_lock.encode())
-    for name, content in sorted(entry_files.items()):
-        fingerprint.update(name.encode())
-        fingerprint.update(b"\0")
-        fingerprint.update(content.encode())
-        fingerprint.update(b"\0")
-    expected = f"{image}\n{fingerprint.hexdigest()}\n"
+    source_manifest = json.dumps(
+        {
+            "entry_files": dict(sorted(entry_files.items())),
+            "package_json": _PACKAGE_JSON,
+            "package_lock": package_lock,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    source_fingerprint = hashlib.sha256(source_manifest.encode()).hexdigest()
+    image_identity = "sha256:" + image.rsplit("@sha256:", 1)[1].lower()
+    namespace_input = json.dumps(
+        {
+            "image": image_identity,
+            "source": f"sha256:{source_fingerprint}",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    namespace = hashlib.sha256(namespace_input.encode()).hexdigest()
+    published_runtime = cache_root / namespace
+    lock_path = cache_root / f".{namespace}.lock"
+    expected = f"{image_identity}\nsha256:{source_fingerprint}\n"
     published_files = {
         "package.json": _PACKAGE_JSON,
         "package-lock.json": package_lock,
@@ -827,55 +840,80 @@ def ensure_container_pi_runtime(
     }
 
     with _exclusive_runtime_lock(lock_path):
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        marker = runtime_dir / _INSTALL_MARKER
+        if published_runtime.is_symlink() or (
+            published_runtime.exists() and not published_runtime.is_dir()
+        ):
+            raise RuntimeError(f"immutable pi runtime namespace is unsafe: {published_runtime}")
+        marker = published_runtime / _INSTALL_MARKER
         try:
             current = marker.is_file() and marker.read_text(encoding="utf-8") == expected
-            current = current and (runtime_dir / "node_modules").is_dir()
+            current = current and (published_runtime / "node_modules").is_dir()
             current = current and all(
-                (runtime_dir / name).is_file()
-                and (runtime_dir / name).read_text(encoding="utf-8") == content
+                (published_runtime / name).is_file()
+                and (published_runtime / name).read_text(encoding="utf-8") == content
                 for name, content in published_files.items()
             )
         except OSError:
             current = False
         if current:
-            return runtime_dir
-        for name, content in published_files.items():
-            (runtime_dir / name).write_text(content, encoding="utf-8")
-        run_command(
-            [
-                docker,
-                "run",
-                "--rm",
-                "--log-driver",
-                "none",
-                "--network",
-                "bridge",
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--mount",
-                f"type=bind,src={runtime_dir},dst={_CONTAINER_RUNTIME_DIR}",
-                "--workdir",
-                _CONTAINER_RUNTIME_DIR,
-                image,
-                "npm",
-                "ci",
-                "--no-audit",
-                "--no-fund",
-                "--ignore-scripts",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if not (runtime_dir / "node_modules").is_dir():
-            raise RuntimeError("pi container dependency install did not publish node_modules")
-        marker.write_text(expected, encoding="utf-8")
-    return runtime_dir
+            return published_runtime
+        if published_runtime.exists():
+            raise RuntimeError(
+                f"immutable pi runtime namespace is incomplete or corrupted: {published_runtime}"
+            )
+
+        staging_prefix = f".{namespace}.staging-"
+        for orphan in cache_root.glob(f"{staging_prefix}*"):
+            if orphan.is_symlink() or not orphan.is_dir():
+                raise RuntimeError(f"immutable pi runtime staging path is unsafe: {orphan}")
+            shutil.rmtree(orphan)
+
+        staging_dir = Path(tempfile.mkdtemp(prefix=staging_prefix, dir=cache_root))
+        try:
+            for name, content in published_files.items():
+                destination = staging_dir / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(content, encoding="utf-8")
+            run_command(
+                [
+                    docker,
+                    "run",
+                    "--rm",
+                    "--log-driver",
+                    "none",
+                    "--network",
+                    "bridge",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--mount",
+                    f"type=bind,src={staging_dir},dst={_CONTAINER_RUNTIME_DIR}",
+                    "--workdir",
+                    _CONTAINER_RUNTIME_DIR,
+                    image,
+                    "npm",
+                    "ci",
+                    "--no-audit",
+                    "--no-fund",
+                    "--ignore-scripts",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            if not (staging_dir / "node_modules").is_dir():
+                raise RuntimeError("pi container dependency install did not publish node_modules")
+            marker = staging_dir / _INSTALL_MARKER
+            with marker.open("w", encoding="utf-8") as handle:
+                handle.write(expected)
+                handle.flush()
+                os.fsync(handle.fileno())
+            staging_dir.rename(published_runtime)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+    return published_runtime
 
 
 def start_container_live_runner(

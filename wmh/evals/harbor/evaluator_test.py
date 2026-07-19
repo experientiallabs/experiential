@@ -3,23 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 from harbor.job import Job
+from harbor.metrics.uv_script import UvScript
 from harbor.models.agent.context import AgentContext
 from harbor.models.environment_type import EnvironmentType
-from harbor.models.job.config import DatasetConfig
+from harbor.models.job.config import DatasetConfig, JobConfig
 from harbor.models.job.lock import JobLock
 from harbor.models.job.result import JobResult, JobStats
+from harbor.models.metric.config import MetricConfig
+from harbor.models.metric.type import MetricType
+from harbor.models.registry import DatasetFileInfo, DatasetMetadata
 from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import AgentInfo, ExceptionInfo, ModelInfo, TrialResult
 from harbor.models.verifier.result import VerifierResult
+from harbor.utils.logger import logger as harbor_logger
 
 import wmh.evals.harbor.evaluator as mod
 from wmh.evals.benchmark import BenchmarkCell, BenchmarkTaskEnvironment
+from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
@@ -76,6 +83,8 @@ def _provider() -> ProviderConfig:
 @pytest.fixture(autouse=True)
 def _stub_runner_readiness_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", lambda **_kwargs: None)
+    monkeypatch.setattr(mod, "find_spec", lambda _name: object())
+    monkeypatch.setattr(mod.EnvironmentFactory, "run_preflight", lambda **_kwargs: None)
 
 
 @pytest.mark.parametrize("runner_image", ["node:latest", ""])
@@ -102,6 +111,182 @@ def test_evaluator_rejects_non_finite_turn_timeout(
             _provider(),
             turn_timeout_s=turn_timeout_s,
         )
+
+
+def test_direct_executable_metric_is_rejected_without_constructing_harbor_job(
+    tmp_path: Path,
+) -> None:
+    config = JobConfig(
+        job_name="evaluation",
+        jobs_dir=tmp_path / "jobs",
+        datasets=[DatasetConfig(path=tmp_path / "dataset")],
+        metrics=[
+            MetricConfig(
+                type=MetricType.UV_SCRIPT,
+                kwargs={"script_path": str(tmp_path / "malicious.py")},
+            )
+        ],
+    )
+
+    with pytest.raises(
+        mod.UnsupportedHarborMetricError,
+        match="credential-bearing host",
+    ):
+        asyncio.run(mod._reject_executable_harbor_metrics(config))
+
+    assert not (tmp_path / "jobs" / "evaluation").exists()
+
+
+@pytest.mark.parametrize(
+    ("dataset", "expected_name"),
+    [
+        (DatasetConfig(name="benchmark", version="v1"), "benchmark@v1"),
+        (DatasetConfig(repo="owner/repository", path=Path("datasets/benchmark")), ""),
+        (
+            DatasetConfig(
+                repo="owner/repository",
+                name="benchmark",
+                version="v1",
+                registry_path=Path("registry.json"),
+            ),
+            "benchmark@v1",
+        ),
+    ],
+)
+def test_remote_dataset_executable_metric_is_rejected_from_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dataset: DatasetConfig,
+    expected_name: str,
+) -> None:
+    names: list[str] = []
+    metadata = DatasetMetadata(
+        name="benchmark",
+        task_ids=[],
+        metrics=[MetricConfig(type=MetricType.UV_SCRIPT)],
+    )
+
+    class FakeRegistryClient:
+        async def get_dataset_metadata(self, name: str) -> DatasetMetadata:
+            names.append(name)
+            return metadata
+
+    monkeypatch.setattr(
+        mod.RegistryClientFactory,
+        "create",
+        lambda **_kwargs: FakeRegistryClient(),
+    )
+    config = JobConfig(
+        job_name="evaluation",
+        jobs_dir=tmp_path / "jobs",
+        datasets=[dataset],
+    )
+
+    with pytest.raises(mod.UnsupportedHarborMetricError, match="'uv-script'"):
+        asyncio.run(mod._reject_executable_harbor_metrics(config))
+
+    assert names == [expected_name]
+
+
+def test_package_metric_file_cannot_run_or_reach_provider_or_e2b_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    leaked_values: list[str] = []
+    metadata = DatasetMetadata(
+        name="owner/benchmark",
+        version="sha256:dataset",
+        task_ids=[],
+        files=[
+            DatasetFileInfo(
+                path="metric.py",
+                storage_path="datasets/metric.py",
+                content_hash="sha256:metric",
+            )
+        ],
+    )
+
+    class FakePackageClient:
+        async def get_dataset_metadata(self, name: str) -> DatasetMetadata:
+            events.append(f"metadata:{name}")
+            return metadata
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        events.append("job-create")
+        leaked_values.extend([os.environ["AZURE_OPENAI_API_KEY"], os.environ["E2B_API_KEY"]])
+        raise AssertionError("executable dataset metrics must fail before Harbor job creation")
+
+    def unexpected_task_environment(_config: JobConfig) -> None:
+        events.append("task-environment")
+        raise AssertionError("metric rejection must precede task-environment setup")
+
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-provider-secret")
+    monkeypatch.setenv("E2B_API_KEY", "e2b-secret")
+    monkeypatch.setattr(mod, "PackageDatasetClient", FakePackageClient)
+    monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
+    monkeypatch.setattr(mod, "_preflight_task_environment", unexpected_task_environment)
+    spec = _spec(tmp_path, tmp_path / "unused").model_copy(
+        update={
+            "datasets": [DatasetConfig(name="owner/benchmark", ref="sha256:dataset")],
+            "environment_backend": HarborEnvironmentBackend.E2B,
+        },
+        deep=True,
+    )
+
+    with pytest.raises(mod.UnsupportedHarborMetricError, match="'metric.py'"):
+        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+
+    assert events == ["metadata:owner/benchmark@sha256:dataset"]
+    assert leaked_values == []
+    assert not (tmp_path / "jobs" / "evaluation").exists()
+
+
+def test_resolved_metric_recheck_closes_remote_metadata_mutation_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    safe_metadata = DatasetMetadata(
+        name="owner/benchmark",
+        version="sha256:safe",
+        task_ids=[],
+    )
+    metric_path = tmp_path / "mutated-metric.py"
+    metric_path.write_text("raise AssertionError('must never execute')\n", encoding="utf-8")
+
+    class FakePackageClient:
+        async def get_dataset_metadata(self, name: str) -> DatasetMetadata:
+            events.append(f"audit:{name}")
+            return safe_metadata
+
+    class MutatedJob:
+        _metrics = {"owner/benchmark": [UvScript(metric_path)]}
+
+        async def run(self) -> None:
+            events.append("run")
+            raise AssertionError("resolved executable metric must fail before Harbor runs")
+
+        def _close_logger_handlers(self) -> None:
+            events.append("closed")
+
+    async def create_mutated_job(_cls: type[Job], _config: JobConfig) -> Job:
+        events.append("create:mutated")
+        return cast("Job", MutatedJob())
+
+    monkeypatch.setattr(mod, "PackageDatasetClient", FakePackageClient)
+    monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(create_mutated_job))
+    spec = _spec(tmp_path, tmp_path / "unused").model_copy(
+        update={
+            "datasets": [DatasetConfig(name="owner/benchmark", ref="latest")],
+        },
+        deep=True,
+    )
+
+    with pytest.raises(mod.UnsupportedHarborMetricError, match="resolved executable"):
+        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+
+    assert events == ["audit:owner/benchmark@latest", "create:mutated", "closed"]
 
 
 def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_keys(
@@ -218,6 +403,72 @@ def test_runner_readiness_failure_precedes_harbor_job_and_task_work(
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
     assert events == ["runner-probe"]
+    assert not (tmp_path / "jobs" / "evaluation").exists()
+
+
+@pytest.mark.parametrize("missing_module", ["e2b", "dockerfile_parse"])
+def test_e2b_missing_extra_fails_before_runner_or_harbor_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_module: str,
+) -> None:
+    events: list[str] = []
+
+    def unexpected_probe(**_kwargs: object) -> None:
+        events.append("runner-probe")
+
+    async def unexpected_create(_cls: type[Job], _config: object) -> Job:
+        events.append("job-create")
+        raise AssertionError("Harbor job creation must follow task-backend preflight")
+
+    monkeypatch.setattr(
+        mod,
+        "find_spec",
+        lambda name: None if name == missing_module else object(),
+    )
+    monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
+    monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
+    spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
+        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        deep=True,
+    )
+
+    with pytest.raises(RuntimeError, match=f"require the WMH e2b extra.*{missing_module}"):
+        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+
+    assert events == []
+    assert not (tmp_path / "jobs" / "evaluation").exists()
+
+
+def test_e2b_missing_api_key_fails_before_runner_or_harbor_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def fail_preflight(**_kwargs: object) -> None:
+        events.append("task-preflight")
+        raise SystemExit("E2B requires E2B_API_KEY to be set")
+
+    def unexpected_probe(**_kwargs: object) -> None:
+        events.append("runner-probe")
+
+    async def unexpected_create(_cls: type[Job], _config: object) -> Job:
+        events.append("job-create")
+        raise AssertionError("Harbor job creation must follow task-backend preflight")
+
+    monkeypatch.setattr(mod.EnvironmentFactory, "run_preflight", fail_preflight)
+    monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
+    monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
+    spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
+        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        deep=True,
+    )
+
+    with pytest.raises(RuntimeError, match="preflight failed: E2B requires E2B_API_KEY"):
+        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+
+    assert events == ["task-preflight"]
     assert not (tmp_path / "jobs" / "evaluation").exists()
 
 
@@ -504,6 +755,45 @@ def test_complete_matching_job_is_reused_without_rerunning_completed_trials(
     assert readiness_images == [mod.PI_CONTAINER_IMAGE]
 
 
+@pytest.mark.parametrize("tamper", ["malformed", "mismatched"])
+def test_invalid_existing_job_config_is_rejected_without_leaking_harbor_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    candidate = pi_node_baseline("candidate")
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+
+    async def first_run(job: Job) -> None:
+        _materialize_completed_job(job, candidate.execution_hash)
+
+    monkeypatch.setattr(Job, "run", first_run)
+    first = asyncio.run(evaluator.evaluate(candidate))
+    config_path = first.job_dir / "config.json"
+    if tamper == "malformed":
+        config_path.write_text("{", encoding="utf-8")
+    else:
+        existing = JobConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+        mismatched = existing.model_copy(update={"debug": not existing.debug})
+        config_path.write_text(
+            mismatched.model_dump_json(indent=2, exclude_defaults=True),
+            encoding="utf-8",
+        )
+
+    handlers_before = tuple(harbor_logger.handlers)
+    try:
+        with pytest.raises(mod.StaleHarborJobError, match="config"):
+            asyncio.run(evaluator.evaluate(candidate))
+        assert tuple(harbor_logger.handlers) == handlers_before
+    finally:
+        for handler in tuple(harbor_logger.handlers):
+            if handler not in handlers_before:
+                harbor_logger.removeHandler(handler)
+                handler.close()
+
+
 def test_sibling_atomic_result_orphan_does_not_block_safe_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -737,6 +1027,7 @@ def test_zero_resolved_trials_are_rejected_before_manifest_or_run(
 
     class EmptyJob:
         _trial_configs: list[TrialConfig] = []
+        _metrics: dict[str, list[UvScript]] = {}
 
         def _close_logger_handlers(self) -> None:
             pass
@@ -773,6 +1064,20 @@ def test_concurrent_process_cannot_start_the_same_paid_harbor_job(
             asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
     assert lease_path.is_file()
+
+
+def test_job_run_lease_rejects_platform_without_posix_locking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_file_lease, "fcntl", None)
+    jobs_dir = tmp_path / "jobs"
+
+    with pytest.raises(RuntimeError, match="require POSIX file locking"):
+        with mod._exclusive_job_run_lock(jobs_dir, "evaluation"):
+            raise AssertionError("unsupported platform must not acquire the job lease")
+
+    assert not jobs_dir.exists()
 
 
 def test_existing_job_directory_without_trusted_manifest_is_rejected(
@@ -846,6 +1151,10 @@ def test_existing_trial_evidence_must_be_regular_files(
             job_dir,
             expected_identity=identity,
             expected_agent_digest=agent_digest,
+            expected_job_config=mod.build_harbor_job_config(
+                evaluator._spec,
+                agent=evaluator._build_agent(candidate),
+            ),
         )
 
 
@@ -913,15 +1222,20 @@ def test_multi_step_task_is_rejected_before_manifest_or_run(
     assert not (tmp_path / "jobs" / "evaluation" / mod._MANIFEST_FILENAME).exists()
 
 
-def test_e2b_rejects_compose_only_task_before_manifest_or_run(
+@pytest.mark.parametrize("keep_dockerfile", [False, True])
+@pytest.mark.parametrize("compose_filename", ["docker-compose.yaml", "docker-compose.yml"])
+def test_e2b_rejects_every_task_authored_compose_source_before_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    keep_dockerfile: bool,
+    compose_filename: str,
 ) -> None:
     dataset = tmp_path / "dataset"
     task_dir = _write_task(dataset)
-    (task_dir / "environment" / "Dockerfile").unlink()
-    (task_dir / "environment" / "docker-compose.yaml").write_text(
-        "services:\n  main:\n    image: alpine:3.20\n",
+    if not keep_dockerfile:
+        (task_dir / "environment" / "Dockerfile").unlink()
+    (task_dir / "environment" / compose_filename).write_text(
+        "services:\n  main:\n    image: alpine:3.20\n    environment: {MODE: compose}\n",
         encoding="utf-8",
     )
 
@@ -935,7 +1249,7 @@ def test_e2b_rejects_compose_only_task_before_manifest_or_run(
     )
     evaluator = mod.HarborEvaluator(spec, _provider())
 
-    with pytest.raises(mod.UnsupportedHarborTaskError, match="Compose-only"):
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="ignores Compose semantics"):
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
     assert not (tmp_path / "jobs" / "evaluation" / mod._MANIFEST_FILENAME).exists()

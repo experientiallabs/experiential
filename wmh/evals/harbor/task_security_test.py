@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 from harbor.models.task.task import Task
 
 from wmh.evals.harbor.task_security import (
@@ -181,6 +182,95 @@ services:
             variable="AZURE_OPENAI_API_KEY",
         ),
     )
+
+
+def test_task_audit_follows_nested_service_env_files_with_arbitrary_names(
+    tmp_path: Path,
+) -> None:
+    task = _write_task(tmp_path)
+    environment_dir = task.paths.environment_dir
+    (environment_dir / "docker-compose.yaml").write_text(
+        """
+include:
+  - path: compose-parts/feature.fragment
+    project_directory: compose-parts
+""",
+        encoding="utf-8",
+    )
+    compose_parts = environment_dir / "compose-parts"
+    (compose_parts / "nested").mkdir(parents=True)
+    (compose_parts / "feature.fragment").write_text(
+        """
+services:
+  worker:
+    env_file:
+      - nested/provider-credentials.list
+      - path: nested/session-values.conf
+        required: true
+""",
+        encoding="utf-8",
+    )
+    (compose_parts / "nested" / "provider-credentials.list").write_text(
+        "PROVIDER_AUTH=${AZURE_OPENAI_API_KEY}\n",
+        encoding="utf-8",
+    )
+    (compose_parts / "nested" / "session-values.conf").write_text(
+        "SESSION_AUTH=$AWS_SESSION_TOKEN\n",
+        encoding="utf-8",
+    )
+
+    assert find_protected_host_environment_references(task) == (
+        ProtectedHostEnvironmentReference(
+            source="environment/compose-parts/nested/provider-credentials.list",
+            variable="AZURE_OPENAI_API_KEY",
+        ),
+        ProtectedHostEnvironmentReference(
+            source="environment/compose-parts/nested/session-values.conf",
+            variable="AWS_SESSION_TOKEN",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_file", "expected_reason"),
+    [
+        ("../../outside.values", "escapes the task environment directory"),
+        ("missing.values", "cannot be resolved to a local file"),
+        ("${TASK_ENV_FILE}", "dynamic Compose service env_file path"),
+    ],
+)
+def test_task_audit_rejects_unresolvable_service_env_files(
+    tmp_path: Path,
+    env_file: str,
+    expected_reason: str,
+) -> None:
+    task = _write_task(tmp_path)
+    (tmp_path / "outside.values").write_text("SAFE=value\n", encoding="utf-8")
+    (task.paths.environment_dir / "docker-compose.yaml").write_text(
+        f"services:\n  worker:\n    env_file: {env_file!r}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCredentialBoundaryError, match=expected_reason):
+        validate_task_credential_boundary(task)
+
+
+@pytest.mark.parametrize("env_file", [42, {"path": "values.env"}, [None]])
+def test_task_audit_rejects_unsupported_service_env_file_declarations(
+    tmp_path: Path,
+    env_file: object,
+) -> None:
+    task = _write_task(tmp_path)
+    (task.paths.environment_dir / "docker-compose.yaml").write_text(
+        yaml.safe_dump({"services": {"worker": {"env_file": env_file}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        TaskCredentialBoundaryError,
+        match="unsupported Compose service env_file declaration",
+    ):
+        validate_task_credential_boundary(task)
 
 
 def test_task_audit_rejects_compose_reference_cycles(tmp_path: Path) -> None:

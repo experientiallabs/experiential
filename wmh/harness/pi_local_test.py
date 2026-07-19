@@ -42,6 +42,14 @@ class _FakeResult:
         self.returncode = returncode
 
 
+def _container_bootstrap_mount(command: list[str]) -> Path:
+    mount = command[command.index("--mount") + 1]
+    fields = dict(field.split("=", 1) for field in mount.split(","))
+    assert fields["type"] == "bind"
+    assert fields["dst"] == "/opt/wmh-pi"
+    return Path(fields["src"])
+
+
 def _node_22() -> str:
     node = shutil.which("node")
     if node is None:
@@ -154,10 +162,13 @@ def test_runtime_bootstrap_rejects_old_node(tmp_path: Path) -> None:
 def test_container_runtime_bootstrap_is_pinned_and_installs_once(tmp_path: Path) -> None:
     """Container dependencies install from the embedded lock and a content marker."""
     calls: list[list[str]] = []
+    staging_dirs: list[Path] = []
 
     def run(command: list[str], **_kwargs: object) -> _FakeResult:
         calls.append(command)
-        (tmp_path / "node_modules").mkdir(exist_ok=True)
+        staging_dir = _container_bootstrap_mount(command)
+        staging_dirs.append(staging_dir)
+        (staging_dir / "node_modules").mkdir(exist_ok=True)
         return _FakeResult("")
 
     runtime = ensure_container_pi_runtime(
@@ -167,14 +178,17 @@ def test_container_runtime_bootstrap_is_pinned_and_installs_once(tmp_path: Path)
         run_command=run,
     )
 
-    assert runtime == tmp_path.resolve()
+    assert runtime.parent == tmp_path.resolve()
+    assert runtime != tmp_path.resolve()
+    assert staging_dirs[0] != runtime
+    assert not staging_dirs[0].exists()
     assert len(calls) == 1
     command = calls[0]
     assert command[:3] == ["docker", "run", "--rm"]
     assert command[-5:-3] == ["npm", "ci"]
     assert "--ignore-scripts" in command
     assert _TEST_IMAGE in command
-    package_lock = json.loads((tmp_path / "package-lock.json").read_text())
+    package_lock = json.loads((runtime / "package-lock.json").read_text())
     assert package_lock["lockfileVersion"] == 3
     assert package_lock["packages"][""]["dependencies"] == {
         "@earendil-works/pi-ai": "0.80.3",
@@ -192,14 +206,15 @@ def test_container_runtime_bootstrap_is_pinned_and_installs_once(tmp_path: Path)
     )
     assert calls == []
 
-    (tmp_path / "node_modules").rmdir()
-    ensure_container_pi_runtime(
-        tmp_path,
-        docker="docker",
-        image=_TEST_IMAGE,
-        run_command=run,
-    )
-    assert len(calls) == 1
+    (runtime / "node_modules").rmdir()
+    with pytest.raises(RuntimeError, match="immutable pi runtime namespace"):
+        ensure_container_pi_runtime(
+            tmp_path,
+            docker="docker",
+            image=_TEST_IMAGE,
+            run_command=run,
+        )
+    assert calls == []
 
 
 def test_container_image_is_multi_platform_and_mutable_refs_are_rejected(tmp_path: Path) -> None:
@@ -249,7 +264,8 @@ def test_container_runtime_does_not_publish_marker_without_dependencies(tmp_path
             run_command=lambda *_args, **_kwargs: _FakeResult(""),
         )
 
-    assert not (tmp_path / ".wmh-pi-dependencies").exists()
+    assert not any(tmp_path.rglob(".wmh-pi-dependencies"))
+    assert not list(tmp_path.glob(".*.staging-*"))
 
 
 def test_container_runtime_bootstrap_is_serialized_across_threads(tmp_path: Path) -> None:
@@ -262,7 +278,10 @@ def test_container_runtime_bootstrap_is_serialized_across_threads(tmp_path: Path
         calls.append(command)
         bootstrap_started.set()
         assert release_bootstrap.wait(timeout=5)
-        (tmp_path / "runtime" / "node_modules").mkdir(parents=True, exist_ok=True)
+        (_container_bootstrap_mount(command) / "node_modules").mkdir(
+            parents=True,
+            exist_ok=True,
+        )
         return _FakeResult("")
 
     def ensure() -> Path:
@@ -278,10 +297,76 @@ def test_container_runtime_bootstrap_is_serialized_across_threads(tmp_path: Path
         assert bootstrap_started.wait(timeout=5)
         second = pool.submit(ensure)
         release_bootstrap.set()
-        assert first.result(timeout=5) == (tmp_path / "runtime").resolve()
-        assert second.result(timeout=5) == (tmp_path / "runtime").resolve()
+        first_runtime = first.result(timeout=5)
+        second_runtime = second.result(timeout=5)
+
+    assert first_runtime == second_runtime
+    assert first_runtime.parent == (tmp_path / "runtime").resolve()
 
     assert len(calls) == 1
+
+
+def test_container_runtime_namespaces_different_images_and_sources_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct immutable inputs populate without mutating another runner's cache."""
+    image_a = "node:test-a@sha256:" + "a" * 64
+    image_b = "node:test-b@sha256:" + "b" * 64
+    source_context = threading.local()
+    first_started = threading.Event()
+    image_changed_started = threading.Event()
+    source_changed_started = threading.Event()
+    release_first = threading.Event()
+
+    def entry_files() -> dict[str, str]:
+        return {"runner_live.ts": cast("str", source_context.runner_source)}
+
+    monkeypatch.setattr(mod, "session_entry_files", entry_files)
+
+    def run(command: list[str], **_kwargs: object) -> _FakeResult:
+        staging_dir = _container_bootstrap_mount(command)
+        runner_source = (staging_dir / "runner_live.ts").read_text(encoding="utf-8")
+        if image_a in command and runner_source == "source-a":
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        elif image_b in command and runner_source == "source-a":
+            image_changed_started.set()
+        else:
+            assert image_a in command and runner_source == "source-b"
+            source_changed_started.set()
+        (staging_dir / "node_modules").mkdir()
+        return _FakeResult("")
+
+    def ensure(image: str, runner_source: str) -> Path:
+        source_context.runner_source = runner_source
+        return ensure_container_pi_runtime(
+            tmp_path / "runtime-cache",
+            docker="docker",
+            image=image,
+            run_command=run,
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(ensure, image_a, "source-a")
+        assert first_started.wait(timeout=5)
+        image_changed = pool.submit(ensure, image_b, "source-a")
+        source_changed = pool.submit(ensure, image_a, "source-b")
+        try:
+            assert image_changed_started.wait(timeout=1)
+            assert source_changed_started.wait(timeout=1)
+        finally:
+            release_first.set()
+        first_runtime = first.result(timeout=5)
+        image_changed_runtime = image_changed.result(timeout=5)
+        source_changed_runtime = source_changed.result(timeout=5)
+
+    assert len({first_runtime, image_changed_runtime, source_changed_runtime}) == 3
+    assert first_runtime.parent == image_changed_runtime.parent == source_changed_runtime.parent
+    assert first_runtime.parent == (tmp_path / "runtime-cache").resolve()
+    assert (first_runtime / "runner_live.ts").read_text(encoding="utf-8") == "source-a"
+    assert (image_changed_runtime / "runner_live.ts").read_text(encoding="utf-8") == "source-a"
+    assert (source_changed_runtime / "runner_live.ts").read_text(encoding="utf-8") == "source-b"
 
 
 def test_live_runner_default_output_keeps_the_legacy_frame_shape() -> None:

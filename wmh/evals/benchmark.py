@@ -67,6 +67,14 @@ class BenchmarkCandidateStage(StrEnum):
     EXECUTION = "execution"
 
 
+class BenchmarkCandidateFailureReason(StrEnum):
+    """Portable reason a candidate-controlled execution failed."""
+
+    TIMEOUT = "timeout"
+    RESOURCE_LIMIT = "resource_limit"
+    RUNTIME_ERROR = "runtime_error"
+
+
 class BenchmarkCandidateTerminalReason(StrEnum):
     """Bounded reason a candidate execution reached its ordinary terminal boundary."""
 
@@ -75,21 +83,34 @@ class BenchmarkCandidateTerminalReason(StrEnum):
     ABORTED = "aborted"
 
 
+class BenchmarkUsageStatus(StrEnum):
+    """Whether one usage value is exact, a known lower bound, or unavailable."""
+
+    EXACT = "exact"
+    LOWER_BOUND = "lower_bound"
+    UNAVAILABLE = "unavailable"
+
+
 class BenchmarkCandidateOutcome(BaseModel):
     """Typed candidate outcome retained without copying arbitrary backend metadata."""
 
     status: BenchmarkCandidateStatus = BenchmarkCandidateStatus.UNKNOWN
     stage: BenchmarkCandidateStage | None = None
+    failure_reason: BenchmarkCandidateFailureReason | None = None
     terminal_reason: BenchmarkCandidateTerminalReason | None = None
 
     @model_validator(mode="after")
     def _validate_details(self) -> Self:
         if self.status is BenchmarkCandidateStatus.UNKNOWN:
-            if self.stage is not None or self.terminal_reason is not None:
+            if (
+                self.stage is not None
+                or self.failure_reason is not None
+                or self.terminal_reason is not None
+            ):
                 raise ValueError("unknown candidate outcome cannot carry details")
         elif self.status is BenchmarkCandidateStatus.COMPLETED:
-            if self.stage is not None:
-                raise ValueError("completed candidate outcome cannot carry a failure stage")
+            if self.stage is not None or self.failure_reason is not None:
+                raise ValueError("completed candidate outcome cannot carry failure details")
         elif self.terminal_reason is not None:
             raise ValueError("failed candidate outcome cannot carry a terminal reason")
         return self
@@ -122,12 +143,16 @@ class BenchmarkError(BaseModel):
 
 
 class BenchmarkUsage(BaseModel):
-    """Token and cost totals, with missing metering kept distinct from a measured zero."""
+    """Token and cost evidence without conflating exact, partial, and missing metering."""
 
     input_tokens: int | None = Field(default=None, ge=0)
+    input_tokens_status: BenchmarkUsageStatus = BenchmarkUsageStatus.UNAVAILABLE
     cache_tokens: int | None = Field(default=None, ge=0)
+    cache_tokens_status: BenchmarkUsageStatus = BenchmarkUsageStatus.UNAVAILABLE
     output_tokens: int | None = Field(default=None, ge=0)
+    output_tokens_status: BenchmarkUsageStatus = BenchmarkUsageStatus.UNAVAILABLE
     cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cost_usd_status: BenchmarkUsageStatus = BenchmarkUsageStatus.UNAVAILABLE
 
     @field_validator("input_tokens", "cache_tokens", "output_tokens", "cost_usd", mode="before")
     @classmethod
@@ -136,15 +161,75 @@ class BenchmarkUsage(BaseModel):
             raise ValueError("usage measurements cannot be boolean")
         return value
 
+    @model_validator(mode="after")
+    def _validate_measurement_statuses(self) -> Self:
+        self.input_tokens_status = _resolve_usage_status(
+            "input_tokens",
+            self.input_tokens,
+            self.input_tokens_status,
+            explicit="input_tokens_status" in self.model_fields_set,
+        )
+        self.cache_tokens_status = _resolve_usage_status(
+            "cache_tokens",
+            self.cache_tokens,
+            self.cache_tokens_status,
+            explicit="cache_tokens_status" in self.model_fields_set,
+        )
+        self.output_tokens_status = _resolve_usage_status(
+            "output_tokens",
+            self.output_tokens,
+            self.output_tokens_status,
+            explicit="output_tokens_status" in self.model_fields_set,
+        )
+        self.cost_usd_status = _resolve_usage_status(
+            "cost_usd",
+            self.cost_usd,
+            self.cost_usd_status,
+            explicit="cost_usd_status" in self.model_fields_set,
+        )
+        return self
+
+
+def _resolve_usage_status(
+    field: str,
+    value: int | float | None,
+    status: BenchmarkUsageStatus,
+    *,
+    explicit: bool,
+) -> BenchmarkUsageStatus:
+    if not explicit:
+        return BenchmarkUsageStatus.EXACT if value is not None else BenchmarkUsageStatus.UNAVAILABLE
+    if value is None and status is not BenchmarkUsageStatus.UNAVAILABLE:
+        raise ValueError(f"{field} without a value must be unavailable")
+    if value is not None and status is BenchmarkUsageStatus.UNAVAILABLE:
+        raise ValueError(f"{field} with a value cannot be unavailable")
+    return status
+
 
 def aggregate_benchmark_usage(usages: Iterable[BenchmarkUsage]) -> BenchmarkUsage:
-    """Aggregate exact trial usage while preserving unknown metering as missing."""
+    """Aggregate usage while retaining observed lower bounds from incomplete metering."""
     collected = list(usages)
+    input_tokens, input_status = _aggregate_int_measurements(
+        (usage.input_tokens, usage.input_tokens_status) for usage in collected
+    )
+    cache_tokens, cache_status = _aggregate_int_measurements(
+        (usage.cache_tokens, usage.cache_tokens_status) for usage in collected
+    )
+    output_tokens, output_status = _aggregate_int_measurements(
+        (usage.output_tokens, usage.output_tokens_status) for usage in collected
+    )
+    cost_usd, cost_status = _aggregate_float_measurements(
+        (usage.cost_usd, usage.cost_usd_status) for usage in collected
+    )
     return BenchmarkUsage(
-        input_tokens=_sum_optional_int(usage.input_tokens for usage in collected),
-        cache_tokens=_sum_optional_int(usage.cache_tokens for usage in collected),
-        output_tokens=_sum_optional_int(usage.output_tokens for usage in collected),
-        cost_usd=_sum_optional_float(usage.cost_usd for usage in collected),
+        input_tokens=input_tokens,
+        input_tokens_status=input_status,
+        cache_tokens=cache_tokens,
+        cache_tokens_status=cache_status,
+        output_tokens=output_tokens,
+        output_tokens_status=output_status,
+        cost_usd=cost_usd,
+        cost_usd_status=cost_status,
     )
 
 
@@ -321,6 +406,47 @@ class BenchmarkRunResult(BaseModel):
         )
 
     @property
+    def n_candidate_failures(self) -> int:
+        """Return candidate executions that failed while leaving gradeable task state."""
+        return sum(
+            trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+            for trial in self.trials
+        )
+
+    @property
+    def n_candidate_timeouts(self) -> int:
+        """Return candidate executions stopped by the evaluator-owned runtime deadline."""
+        return sum(
+            trial.candidate_outcome.failure_reason is BenchmarkCandidateFailureReason.TIMEOUT
+            for trial in self.trials
+        )
+
+    @property
+    def n_candidate_resource_limits(self) -> int:
+        """Return candidate executions stopped by a bounded evaluator resource limit."""
+        return sum(
+            trial.candidate_outcome.failure_reason is BenchmarkCandidateFailureReason.RESOURCE_LIMIT
+            for trial in self.trials
+        )
+
+    @property
+    def n_candidate_runtime_errors(self) -> int:
+        """Return candidate executions stopped by a candidate-controlled runtime error."""
+        return sum(
+            trial.candidate_outcome.failure_reason is BenchmarkCandidateFailureReason.RUNTIME_ERROR
+            for trial in self.trials
+        )
+
+    @property
+    def n_candidate_unclassified_failures(self) -> int:
+        """Return failed candidate executions without a portable reason."""
+        return sum(
+            trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+            and trial.candidate_outcome.failure_reason is None
+            for trial in self.trials
+        )
+
+    @property
     def n_unclassified_errors(self) -> int:
         """Return errors that were retained without being mislabeled as infrastructure."""
         return sum(trial.status is BenchmarkTrialStatus.UNCLASSIFIED_ERROR for trial in self.trials)
@@ -362,15 +488,29 @@ class BenchmarkRunResult(BaseModel):
         return fmean(values)
 
 
-def _sum_optional_int(values: Iterable[int | None]) -> int | None:
-    collected = list(values)
-    if not collected or any(value is None for value in collected):
-        return None
-    return sum(value for value in collected if value is not None)
+def _aggregate_int_measurements(
+    measurements: Iterable[tuple[int | None, BenchmarkUsageStatus]],
+) -> tuple[int | None, BenchmarkUsageStatus]:
+    collected = list(measurements)
+    observed = [value for value, _status in collected if value is not None]
+    if not observed:
+        return None, BenchmarkUsageStatus.UNAVAILABLE
+    if all(
+        value is not None and status is BenchmarkUsageStatus.EXACT for value, status in collected
+    ):
+        return sum(observed), BenchmarkUsageStatus.EXACT
+    return sum(observed), BenchmarkUsageStatus.LOWER_BOUND
 
 
-def _sum_optional_float(values: Iterable[float | None]) -> float | None:
-    collected = list(values)
-    if not collected or any(value is None for value in collected):
-        return None
-    return sum(value for value in collected if value is not None)
+def _aggregate_float_measurements(
+    measurements: Iterable[tuple[float | None, BenchmarkUsageStatus]],
+) -> tuple[float | None, BenchmarkUsageStatus]:
+    collected = list(measurements)
+    observed = [value for value, _status in collected if value is not None]
+    if not observed:
+        return None, BenchmarkUsageStatus.UNAVAILABLE
+    if all(
+        value is not None and status is BenchmarkUsageStatus.EXACT for value, status in collected
+    ):
+        return sum(observed), BenchmarkUsageStatus.EXACT
+    return sum(observed), BenchmarkUsageStatus.LOWER_BOUND

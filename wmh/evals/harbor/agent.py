@@ -411,6 +411,7 @@ class WmhPiAgent(BaseAgent):
                     **identity_metadata,
                     "candidate_failure": True,
                     "candidate_failure_stage": candidate_error.stage.value,
+                    "candidate_failure_reason": candidate_error.reason.value,
                 },
             )
         _populate_context(context, usage, metadata)

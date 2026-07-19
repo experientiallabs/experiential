@@ -15,6 +15,7 @@ from wmh.harness.live_session import ToolOutcome
 from wmh.harness.pi_runner import (
     PiCandidateChannelError,
     PiCandidateError,
+    PiCandidateFailureReason,
     PiCandidateFailureStage,
     PiInfrastructureError,
     PiInfrastructureFailureKind,
@@ -197,6 +198,7 @@ def test_run_pi_turn_types_candidate_runner_failures(
         )
 
     assert caught.value.stage is stage
+    assert caught.value.reason is PiCandidateFailureReason.RUNTIME_ERROR
     assert caught.value.events[-1].kind == "error"
 
 
@@ -225,6 +227,7 @@ def test_silent_candidate_materialization_timeout_is_gradeable_after_handoff() -
         )
 
     assert caught.value.stage is PiCandidateFailureStage.MATERIALIZATION
+    assert caught.value.reason is PiCandidateFailureReason.TIMEOUT
     assert any(frame.get("type") == "session_start" for frame in channel.sent)
 
 
@@ -278,6 +281,7 @@ def test_candidate_error_text_cannot_spoof_provider_infrastructure() -> None:
         )
 
     assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.RUNTIME_ERROR
 
 
 def test_run_pi_turn_keeps_worker_failures_infrastructure_typed() -> None:
@@ -473,6 +477,7 @@ def test_tool_deadline_exhaustion_is_a_gradeable_candidate_timeout() -> None:
         )
 
     assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.TIMEOUT
 
 
 def test_run_pi_turn_keeps_transport_failures_infrastructure_typed() -> None:
@@ -528,6 +533,7 @@ def test_run_pi_turn_types_candidate_process_exit_as_gradeable() -> None:
         )
 
     assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.RUNTIME_ERROR
 
 
 def test_oversized_candidate_materialization_is_gradeable() -> None:
@@ -553,6 +559,7 @@ def test_oversized_candidate_materialization_is_gradeable() -> None:
         )
 
     assert caught.value.stage is PiCandidateFailureStage.MATERIALIZATION
+    assert caught.value.reason is PiCandidateFailureReason.RESOURCE_LIMIT
 
 
 def test_oversized_benchmark_instruction_remains_infrastructure() -> None:
@@ -609,6 +616,7 @@ def test_run_pi_turn_types_candidate_timeout_as_gradeable() -> None:
         )
 
     assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.TIMEOUT
 
 
 @pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf")])
@@ -663,6 +671,7 @@ def test_run_pi_turn_bounds_a_flood_of_individually_valid_events(
         )
 
     assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.RESOURCE_LIMIT
     assert len(caught.value.events) == 5
 
 
@@ -703,6 +712,7 @@ def test_run_pi_turn_bounds_cumulative_serialized_event_bytes(
         for event in caught.value.events
     )
     assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.RESOURCE_LIMIT
     assert serialized <= byte_budget
 
 

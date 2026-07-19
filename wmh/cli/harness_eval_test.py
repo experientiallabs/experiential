@@ -12,6 +12,10 @@ from typer.testing import CliRunner, Result
 
 from wmh.cli import app
 from wmh.evals.benchmark import (
+    BenchmarkCandidateFailureReason,
+    BenchmarkCandidateOutcome,
+    BenchmarkCandidateStage,
+    BenchmarkCandidateStatus,
     BenchmarkCell,
     BenchmarkError,
     BenchmarkFailureKind,
@@ -21,6 +25,7 @@ from wmh.evals.benchmark import (
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
 )
+from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.results import LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
@@ -66,6 +71,11 @@ def _loaded_result(tmp_path: Path) -> LoadedHarborJobResult:
             source="benchmark",
             status=BenchmarkTrialStatus.SCORED,
             rewards={"custom_score": 0, "partial": 0.5},
+            candidate_outcome=BenchmarkCandidateOutcome(
+                status=BenchmarkCandidateStatus.FAILED,
+                stage=BenchmarkCandidateStage.EXECUTION,
+                failure_reason=BenchmarkCandidateFailureReason.RUNTIME_ERROR,
+            ),
         ),
         BenchmarkTrialResult(
             cell=cells[1],
@@ -327,7 +337,12 @@ def test_local_bedrock_eval_wires_exact_inputs_and_writes_only_canonical_result(
     assert "provider_config" not in payload
     flat = " ".join(result.output.split())
     assert "scored=4" in flat
-    assert "timeout=1" in flat
+    assert "task_timeout=1" in flat
+    assert "candidate_failed=0" in flat
+    assert "candidate_timeout=0" in flat
+    assert "candidate_resource_limit=0" in flat
+    assert "candidate_runtime_error=0" in flat
+    assert "candidate_unclassified=0" in flat
     assert "infra=0" in flat
     assert "incomplete=0" in flat
     assert "resolved task digests=4" in flat
@@ -442,7 +457,12 @@ def test_partial_result_is_written_but_exits_nonzero(
     flat = " ".join(result.output.split())
     assert "not fully scored" in flat
     assert "scored=1" in flat
-    assert "timeout=1" in flat
+    assert "task_timeout=1" in flat
+    assert "candidate_failed=1" in flat
+    assert "candidate_timeout=0" in flat
+    assert "candidate_resource_limit=0" in flat
+    assert "candidate_runtime_error=1" in flat
+    assert "candidate_unclassified=0" in flat
     assert "infra=1" in flat
     assert "incomplete=1" in flat
     assert "wrote canonical result" in flat
@@ -641,6 +661,9 @@ def test_help_exposes_no_credential_flags() -> None:
     assert "--bedrock-region" in result.output
     assert "--task" in result.output
     assert "--exclude-task" in result.output
+    flat = " ".join(result.output.replace("│", " ").split())
+    assert "The pi runner always uses local Docker" in flat
+    assert "local Docker pi runner on every task backend" in flat
 
 
 @pytest.mark.parametrize(
@@ -707,6 +730,75 @@ def test_output_cannot_overwrite_the_active_harbor_job_evidence(
     assert result.exit_code == 2
     assert "output path cannot be inside the active Harbor job" in " ".join(result.output.split())
     assert calls == []
+
+
+def test_output_cannot_overwrite_a_different_harbor_job_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / ".wmh"
+    _save_harness(root)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    jobs_dir = tmp_path / "jobs"
+    out = jobs_dir / "different-evaluation" / "result.json"
+    calls = _patch_evaluator(monkeypatch, _all_scored_result(tmp_path))
+
+    result = runner.invoke(
+        app,
+        [
+            *_base_args(root, out),
+            "--dataset-path",
+            str(dataset),
+            "--jobs-dir",
+            str(jobs_dir),
+            "--job-name",
+            "evaluation",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "another Harbor job" in " ".join(result.output.split())
+    assert calls == []
+
+
+def test_concurrent_writer_for_same_output_is_rejected_before_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / ".wmh"
+    _save_harness(root)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    out = tmp_path / "result.json"
+    calls = _patch_evaluator(monkeypatch, _all_scored_result(tmp_path))
+
+    with harness_eval_module._exclusive_output_lease(out.resolve()):
+        result = runner.invoke(
+            app,
+            [*_base_args(root, out), "--dataset-path", str(dataset), "--yes"],
+        )
+
+    assert result.exit_code == 1
+    assert result.exception is not None
+    assert "already publishing" in str(result.exception)
+    assert calls == []
+    assert not out.exists()
+
+
+def test_output_lease_rejects_platform_without_posix_locking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_file_lease, "fcntl", None)
+    out = tmp_path / "reports" / "result.json"
+
+    with pytest.raises(RuntimeError, match="output leases require POSIX file locking"):
+        with harness_eval_module._exclusive_output_lease(out):
+            raise AssertionError("unsupported platform must not acquire the output lease")
+
+    assert not out.parent.exists()
 
 
 def test_output_cannot_replace_the_active_harbor_job_lease(

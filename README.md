@@ -58,8 +58,9 @@ uv run wmh harness eval pi-baseline@champion \
   --attempts 1 --concurrency 1 --out result.json
 ```
 
-Local Docker task environments are the default. Install the E2B extra and select it explicitly to
-fan trials out through E2B:
+Local Docker task environments are the default. E2B changes only Harbor's task environment: the
+isolated pi runner still runs in local Docker, so Docker is required for both backend choices.
+Install the E2B extra and select it explicitly to fan task environments out through E2B:
 
 ```bash
 uv sync --extra e2b

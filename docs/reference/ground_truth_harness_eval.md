@@ -21,8 +21,11 @@ The paper reports these Terminal-Bench 2 pass rates with Claude Opus 4.6:
 | Meta-Harness | 76.4% |
 | ForgeCode | 81.8% |
 
-The headline improvement is 18.4 percentage points over Claude Code. The difference from the
-official Terminus-KIRA leaderboard comparator is only 1.7 points. Both comparisons matter. A result
+The headline improvement is 18.4 percentage points over Claude Code. That is a 31.7% relative lift
+over the 58.0% Claude Code score, so shorthand such as "+20%" is ambiguous and must not be used in a
+report. The difference from the official Terminus-KIRA leaderboard comparator is only 1.7 points.
+The paper's search trajectory instead reports a 64.4% KIRA baseline, making the discovered 76.4%
+harness 12.0 points higher in that search context. These are three different contrasts. A result
 from a WMH pi seed must be reported against its own matched pi baseline and must not be described as
 an 18.4 point reproduction unless the Claude Code control is also reproduced under the same task,
 model, and trial locks.
@@ -38,25 +41,38 @@ harness-improvement study, not a bit-for-bit reproduction of the published servi
 
 The paper's Terminal-Bench 2 discovery experiment searched and evaluated on the same 89 tasks. Its
 released final evaluation uses five trials per task, but that method does not test held-out
-generalization. The primary WMH lane instead freezes task-family-balanced discovery and
-confirmation partitions before search. It scores candidates only on discovery tasks, selects one
-winner, and evaluates that winner once on the untouched confirmation partition.
+generalization. The primary WMH lane instead freezes family-stratified discovery and confirmation
+partitions before search. It scores candidates only on discovery tasks, selects one winner, and
+evaluates that winner once on the untouched confirmation partition.
 
 After selection, the primary winner may also be compared descriptively with pi on all 89 tasks at
 five trials per task. That full-suite score is useful for locating the candidate relative to 76.4%,
 but it is not a reproduction of the paper's adaptive all-89 method because confirmation tasks did
 not participate in selecting that candidate.
 
-An optional all-89 adaptive lane requires a separate search over all 89 tasks and a separately
-selected candidate, followed by its own locked five-trial all-89 final. It qualifies as a
-paper-method lane only if it starts from a parity-passed reference-strength seed corresponding to
-the released KIRA-derived scaffold and its locked final includes that same seed as the control. If
-that seed is unavailable, the lane may proceed only as a generic all-89 adaptive study and must not
-be described as reproducing the paper's method. Its scores, proposer history, candidate identity,
-and budget ledger must remain distinct from the confirmation-valid primary lane. Confidence
-intervals from this optional lane describe repeated-trial variability after selection on the same
-tasks; they do not establish generalization to unseen tasks. Freeze the primary lane's task IDs,
-family strata, random seed, and powered minimum detectable effect before the first
+A separate all-89 adaptive lane would require its own search over all 89 tasks, separately selected
+candidate, and locked five-trial all-89 final. It is deferred from the $15,000 protocol below. A
+future lane qualifies as a paper-method reproduction only after all of these parity gates pass:
+
+- the released initial population is behaviorally represented, including the Terminus 2 and
+  KIRA-derived scaffolds, and the locked final contains its declared reference seed as a control;
+- the proposer matches the paper's coding-agent, model, reasoning, skill, tool, and iteration
+  configuration, or a behavioral parity suite establishes an explicitly documented substitute;
+- every prior candidate's complete captured source, scores, and raw execution traces remain
+  selectively readable through the proposer filesystem, without replacing them with summaries or
+  a bounded recent-history window;
+- the proposer can perform full program rewrites within the frozen agent interface, rather than
+  choosing only from a predefined prompt or parameter mutation template;
+- the all-89 two-attempt search matrix, ten-iteration schedule, candidate count, stopping rule, and
+  finalist-selection procedure match the released run or independently frozen provenance.
+
+If any gate is unavailable, the lane may proceed only as a method-inspired all-89 adaptive study
+and must not be described as reproducing the paper's method. Its scores, proposer workspace,
+candidate identity, and budget ledger must remain distinct from the confirmation-valid primary
+lane. Confidence intervals from that lane describe repeated-trial variability after selection on
+the same tasks; they do not establish generalization to unseen tasks. The Bedrock serving path
+would remain a provider-shifted replication even after these gates pass. Freeze the primary lane's
+task IDs, family strata, random seed, and powered minimum detectable effect before the first
 candidate-scoring call.
 
 Primary sources are the [paper](https://arxiv.org/pdf/2603.28052), the
@@ -76,11 +92,12 @@ The primary question is:
 > harness?
 
 The primary endpoint fixes maximum agent turns, output-token budget, wall-clock deadline, command
-budget, trial concurrency, agent concurrency, and provider retry policy across arms. The run
-configuration digest binds both concurrency controls because throttling and contention can change
-timeouts and scores. If a candidate intentionally changes one of those
-resources, report it on a separate score-cost Pareto endpoint rather than attributing the entire
-gain to harness quality at matched compute.
+budget, temperature and other sampling controls, reasoning controls, trial concurrency, agent
+concurrency, and provider retry policy across arms. The run configuration digest binds both
+concurrency controls because throttling and contention can change timeouts and scores. A candidate
+that changes one of those resources is ineligible for the primary winner. It may be reported on a
+separate score-cost Pareto endpoint, but its gain must not be attributed to harness quality at
+matched compute.
 
 The most likely early improvement is a compact environment bootstrap before the first agent turn.
 The paper's winning harness primarily added an initial snapshot of the working directory, `/app`,
@@ -88,25 +105,30 @@ installed languages, tools, package managers, and memory. The paper reports two 
 exploration turns, while the released artifact README says two to five. This is a hypothesis to
 test, not a feature to hard-code.
 
-Expected outcomes, in decreasing order of confidence:
+Directional hypotheses, in decreasing order of confidence:
 
 - The optimized candidate beats stock WMH pi on the matched Bedrock lane.
-- The environment-bootstrap ablation accounts for a material share of the improvement.
-- A useful fraction of the gain transfers to the Azure lane, but the absolute score differs because
-  Azure and Bedrock do not provide the same model family.
+- On discovery data, the environment-bootstrap ablation accounts for a material share of the
+  improvement. This is a descriptive mechanism hypothesis unless a third locked confirmation arm
+  is separately funded before search.
+- The candidate retains a positive paired delta over pi on the common-task Azure lane, but the
+  absolute score differs because Azure and Bedrock do not provide the same model family.
 - Matching 76.4% from a stock pi seed is possible but not the planning assumption. The winning
   harness builds on Terminus-KIRA. The paper's documented search run evaluates its KIRA baseline at
   64.4%, while 74.7% is the separate official-leaderboard KIRA comparator used in the final table.
   A result near the headline likely requires adapting that seed or independently recovering
   comparable capabilities first.
 
+A null or negative matched result remains plausible. None of these directional hypotheses is a
+stop rule, candidate-selection rule, or substitute for the locked confirmation interval.
+
 Before seeing final results, use these interpretation bands:
 
 | Matched improvement over stock pi | Interpretation |
 |---|---|
 | less than 1 point | no actionable improvement |
-| 1 to 3 points | promising, but require a confidence interval excluding zero |
-| 3 to 5 points | practically meaningful harness improvement |
+| at least 1 and less than 3 points | promising, but require a confidence interval excluding zero |
+| at least 3 and at most 5 points | practically meaningful harness improvement |
 | more than 5 points | strong result, requiring leakage and infrastructure audits |
 
 A paper-level claim additionally requires the paper-comparable controls, not just a large delta over
@@ -172,7 +194,7 @@ Use two provider lanes:
 
 - **Bedrock:** Claude Opus 4.6, the paper's fixed worker model. The recommended US profile is
   `us.anthropic.claude-opus-4-6-v1`; freeze that profile and its source region. This is the primary
-  model-matched reproduction and search lane. Confirm account access and quota before freezing the
+  model-matched, provider-shifted search lane. Confirm account access and quota before freezing the
   run, and never substitute a newer model mid-run.
 - **Azure OpenAI:** one frozen GPT-5.5 deployment, if the subscription has quota, used as a transfer
   lane. It measures whether the harness improvement generalizes across model families. It is not an
@@ -187,10 +209,18 @@ Harbor supports two task-environment backends in this protocol:
   when capacity permits;
 - **e2b**, an explicit acceleration option for high-concurrency task execution.
 
-Before any scored E2B run, run a backend parity canary with the same candidate and task locks.
-Compare verifier rewards, final task state, timeout classification, and environment fingerprints.
-Provider calls remain on the trusted host in both modes. Provider credentials must not enter task
-containers, E2B sandboxes, candidate prompts, traces, or canonical result JSON. Before Harbor
+These choices move only Harbor's task environment. The isolated pi runner remains in local Docker
+for both, so the evaluator host requires Docker even when `--task-backend e2b` is selected.
+
+Before any scored E2B run, replay one frozen scripted or golden action sequence against identical
+task locks on local and E2B. Compare normalized command outcomes, verifier rewards, final task
+state, timeout classification, and environment fingerprints. This deterministic replay, not exact
+reward equality from a stochastic model run, is the backend parity gate. If live pi samples are
+also used to claim backend equivalence, freeze a separate paired design, equivalence margin,
+sample size, and task-clustered analysis with adequate power. Otherwise report those live samples
+as descriptive route evidence only. Provider calls remain on the trusted host in both modes.
+Provider credentials must not enter task containers, E2B sandboxes, candidate prompts, traces, or
+canonical result JSON. Before Harbor
 constructs a task environment, WMH audits each resolved task source and rejects credential-like
 host variable references in task and verifier environment maps, Docker Compose sources, and
 Compose environment files. The audit reports variable names and source locations only. It never
@@ -201,6 +231,12 @@ A malicious Dockerfile, Compose mount, image, script, or verifier can attack the
 channels. Every scored dataset must therefore be frozen by content, reviewed as executable code,
 and limited to audited task sources and image digests before credentials are loaded or a paid run
 is approved.
+
+Harbor job metrics and remote dataset metadata can also declare `uv-script` metrics, while package
+datasets can provide a dataset-level `metric.py`. Harbor runs those scripts as host subprocesses
+with the evaluator environment. WMH rejects all three executable-metric entry points from metadata
+before Harbor job creation and accepts only Harbor's non-executable built-in aggregate metrics.
+Canonical per-trial rewards remain the input to trusted statistical analysis.
 
 ### Harbor 0.18 command-execution limit
 
@@ -250,6 +286,17 @@ job ID, task lock, or score, and it performs no automatic reconstruction. Before
 those Harbor writes atomic upstream or prove a write-ahead snapshot and restore procedure with
 kill-injection tests. The spend ledger must count any orphaned provider call against the phase cap.
 
+Normal backend teardown is not crash recovery. Harbor's delete-on-stop setting cleans up task
+environments when the owning trial reaches its teardown path, but a process or host interruption can
+release the WMH job lease while leaving local Compose projects or remote sandboxes alive. Before paid
+concurrent work, add an evaluator-owned external-resource ledger that records the backend, opaque
+resource ID, benchmark cell, creation time, and teardown state without credentials. Startup must
+reconcile every pending resource ID with its backend, remove confirmed orphans, and refuse new paid
+work when absence cannot be proved. Exercise interruption after environment creation and before
+result publication in local and remote kill-injection tests. Attribute both observed orphan charges
+and the conservative cost of any unproved resource to the active phase envelope and hard spend
+ledger.
+
 ### Provider failure and deadline limits
 
 The current worker-provider interface is synchronous and does not accept a per-request deadline.
@@ -269,10 +316,14 @@ ledger and a typed adapter-level taxonomy validated by live probes on the frozen
 routes. Only exact deterministic context or policy signals may become gradeable candidate outcomes;
 ambiguous errors must stay infrastructure failures.
 
-Current agent evidence records input and output tokens, but not cache-token detail or authoritative
-provider cost. The canonical result therefore keeps `cache_tokens` and `cost_usd` missing rather
-than estimating them from a static price table. The spend ledger must reconcile provider usage and
-contracted billing outside the task environment before it admits the next paid block.
+Current agent evidence records input and output tokens for completed calls, but not cache-token
+detail or authoritative provider cost. Each canonical usage field carries an `exact`,
+`lower_bound`, or `unavailable` status. When a provider call fails without authoritative failed-call
+metering, already observed totals remain as lower bounds rather than being mislabeled as exact zero
+or exact partial totals. The canonical result keeps unavailable cache tokens and provider cost
+missing rather than estimating them from a static price table. The spend ledger must reconcile
+provider usage and contracted billing outside the task environment before it admits the next paid
+block.
 
 ### Time-budget parity
 
@@ -325,27 +376,69 @@ plus Microsoft's [Azure model catalog](https://learn.microsoft.com/en-us/azure/f
 4. Complete the power and partition gate below, then freeze the discovery and confirmation split
    without inspecting benchmark rewards or candidate scores.
 5. Select one reward key, expected to be `reward` for Terminal-Bench 2, in experiment analysis only.
-6. Register the $15,000 hard ceiling and per-phase stop limits.
+6. Register the $15,000 hard ceiling, initial phase caps, and the finite cost-only reallocation rule
+   that will freeze immutable final caps after qualification and before search.
+
+#### Sealed confirmation boundary
+
+The split manifest is a control-plane artifact, not proposer context. Before materializing any
+search workspace, create a discovery-only view and prove that the proposer cannot read or fetch:
+
+- confirmation task IDs or names, instructions, checksums, source trees, Dockerfiles, tests,
+  verifiers, solutions, images, locks, manifests, Harbor jobs, results, or traces;
+- the unsplit benchmark checkout, Harbor registry cache, package cache, or object store from which
+  confirmation content can be reconstructed;
+- task-level historical outcomes or difficulty labels used to infer confirmation membership.
+
+Run the proposer in a dedicated workspace containing only candidate source, its frozen
+domain-general instructions, and discovery artifacts. Deny network access or allowlist only
+services that cannot retrieve the public benchmark or its mirrors. Restricting writes is not a read
+boundary. Before and after every proposer turn, validate a content allowlist and a workspace digest;
+any unexpected file, path, task marker, or network capability invalidates the search before more
+candidate calls are admitted. Keep the split seed, confirmation IDs, and family assignment in a
+separate operator-owned location that is never mounted into that workspace.
+
+Family metadata used by the split generator must have frozen provenance and must be independent of
+WMH, candidate, and task-level leaderboard rewards. Only the sealed control plane assigns tasks to
+strata and partitions. Aggregate discovery stratum counts may be published to the proposer when
+needed, but confirmation membership may not. Public availability and possible model pretraining on
+Terminal-Bench remain limitations; this boundary prevents experiment-time access and must not be
+misrepresented as decontaminating model weights.
+
+The final evaluator may of course expose one confirmation task instruction and environment to the
+frozen worker candidate while that task is running. It must not expose confirmation content to the
+search proposer or return final evidence until candidate identity is frozen. The post-run string
+and source audit is defense in depth, not a replacement for this access boundary.
 
 #### Power and partition gate
 
 Before any benchmark reward or candidate score is observed, write and freeze a power-design
 manifest. It must predeclare the baseline pass rate, within-task intraclass correlation, any paired
 arm correlation used by the data-generating model, the target effect, test direction, alpha, power,
-attempt count, family strata, and minimum discovery-set constraints. Use a 3 percentage-point
+attempt count, family strata, stratum population sizes, task inclusion probabilities, estimator,
+confidence-interval algorithm, bootstrap resample count and seed, and minimum discovery-set
+constraints. The target estimand is the task-uniform mean paired delta over the 89 frozen tasks,
+with each task weighted equally regardless of family size or attempt count. Use a 3 percentage-point
 paired effect as the target, a two-sided alpha of 0.05, power of at least 0.80, and five attempts per
 task for the locked primary confirmation. Derive nuisance assumptions from published or otherwise
 external evidence, and run sensitivity cases over a predeclared plausible range rather than fitting
 them to WMH candidate outcomes.
 
 Use task-clustered simulation that generates complete tasks with attempts nested inside each task,
-applies the exact planned missing-cell rule, and runs the same task-clustered paired analysis that
-will produce the final interval. Enumerate integer, family-balanced discovery and confirmation
-allocations across the 89 frozen tasks. Select task counts before scoring: choose a confirmation
-count that reaches at least 0.80 power throughout the predeclared nuisance range while preserving
-the declared minimum discovery matrix, then assign task IDs using only frozen, score-independent
-family metadata and the predeclared seed. Record the simulation code, inputs, output, selected task
-counts, task IDs, and matrix digest in the manifest.
+applies the exact planned missing-cell rule, and runs the same paired analysis that will produce the
+final interval. Sample tasks within each frozen family stratum. Estimate the task-uniform benchmark
+mean with inverse-inclusion weights, which is equivalent to weighting each stratum mean by its share
+of the 89 tasks under fixed within-stratum sample counts. Resample complete tasks only within their
+strata for the bootstrap. The simulation must verify both at least 0.80 power at the target effect
+and empirical two-sided type-I error no greater than 0.05 and interval coverage of at least 0.95,
+within a predeclared Monte Carlo tolerance, throughout the nuisance range.
+
+Enumerate integer, family-stratified discovery and confirmation allocations across the 89 frozen
+tasks. Select task counts before scoring: choose a confirmation count that passes every power,
+type-I, and coverage gate while preserving the declared minimum discovery matrix, then assign task
+IDs using only frozen, score-independent family metadata and the predeclared seed. Record the
+simulation code, inputs, output, selected task counts, inclusion probabilities, analysis seed, task
+IDs, and matrix digest in the manifest.
 
 The same manifest must freeze the Azure transfer task and attempt matrix, or a finite conditional
 ladder of matrices selected only by measured per-cell cost and quota. If a ladder is used, record
@@ -355,37 +448,47 @@ transfer matrix.
 
 If no valid allocation of the 89 tasks reaches 0.80 power for a 3 point effect, the 3 point
 confirmation gate fails before spending. Choose and record exactly one route before scoring: stop
-and add independent compatible tasks; retain a held-out confirmation lane with the larger minimum
-detectable effect supported by the same simulation and treat 3 points as descriptive only; or use a
-locked all-89 paired estimate as a benchmark-descriptive endpoint and abandon the unseen-task
-generalization claim. Do not lower the power target, choose the route after seeing scores, or present
-an underpowered interval as confirmation of a 3 point effect.
+and add independent compatible tasks under a separately defined broader estimand; retain a held-out
+confirmation lane with the larger minimum detectable effect supported by the same simulation and
+treat 3 points as descriptive only; or use a locked all-89 paired estimate as a
+benchmark-descriptive endpoint and abandon the unseen-task generalization claim. Do not lower the
+power target, choose the route after seeing scores, or present an underpowered interval as
+confirmation of a 3 point effect.
 
 ### Phase 1: zero-cost and low-cost qualification
 
 Run schema, manifest, resume, candidate-failure, timeout, verifier, and credential-isolation tests.
-Then run a frozen cross-family task canary with one attempt per task:
+Then freeze a cross-family qualification matrix containing only discovery tasks or purpose-built
+non-benchmark fixtures. Confirmation tasks may not appear in qualification. Run:
 
-- pi baseline on local;
-- pi baseline on E2B;
-- bootstrap ablation on local;
-- one Azure and one Bedrock route.
+- the same deterministic scripted or golden action replay on local and E2B with identical task
+  locks;
+- the bootstrap ablation on local;
+- pi on one Azure and one Bedrock route, using local by default.
 
-Freeze the task IDs and an absolute allowed-failure count before scoring. Stop if canonical results
-contain unclassified failures, if local and E2B disagree on successful task state, or if
-infrastructure failures exceed that count after allowlisted retries. Report the percentage too, but
-do not use a percentage alone as the stopping rule for a small sample.
+One live model attempt per selected task is a route-reachability and failure-classification canary,
+not evidence of reward parity. Freeze the task IDs and an absolute allowed-failure count before
+running the matrix. Stop if canonical results contain unclassified failures, if deterministic local
+and E2B replay differs in a predeclared normalized command outcome, final task state, verifier
+reward, timeout classification, or environment fingerprint, or if infrastructure failures exceed
+the allowed count after any retries admitted by the atomic attempt ledger. Without that ledger, do
+not retry and count the first-attempt failure. Report the live-sample percentage too, but do not
+use it as the backend equality rule. A backend-equivalence claim from live pi requires the
+separately powered distributional design above.
 
-Use pi, not a mutable candidate, for the Azure route canary. If its cost or quota evidence resolves
-a predeclared transfer-matrix ladder, quarantine its reward until the matrix and primary Bedrock
-winner are frozen.
+Use pi, not a mutable candidate, for the Azure route canary. Expose only provider identity, quota,
+latency, cost, and typed infrastructure evidence needed to resolve a predeclared transfer-matrix
+ladder. Seal every task instruction, reward, trace, tool transcript, verifier outcome, and
+task-level usage value from both the proposer and candidate-selection process until the transfer
+matrix and primary Bedrock winner are frozen. If the canary system cannot separate those views,
+defer the Azure canary until after winner freeze.
 
 ### Phase 2: establish matched baselines
 
-Run the stock pi baseline on the frozen discovery matrix with two attempts per task in each provider
-lane. Run the reference-strength control in the primary Bedrock lane only after the runtime and tool
-parity gate passes, and require it if the study will make a paper-result claim. Freeze these results
-before search. Do not run or reveal baseline scores, traces, or verifier outcomes on confirmation
+Run the stock pi baseline on the frozen discovery matrix with two attempts per task in the primary
+Bedrock lane. Run the reference-strength control there only after the runtime and tool parity gate
+passes. Freeze these results before search. Do not run the scored Azure baseline until the Bedrock
+winner is frozen. Do not run or reveal baseline scores, traces, or verifier outcomes on confirmation
 tasks before the primary candidate is selected; those cells belong to the blocked final.
 
 This phase calibrates stock WMH pi on discovery tasks relative to the published Claude Code,
@@ -409,6 +512,16 @@ Freeze the proposer implementation, provider route, model revision, prompt, reas
 tool access, history policy, maximum proposals, and cost accounting before search. Proposer calls
 consume the same $15,000 ceiling as worker calls.
 
+Also freeze one deterministic primary-winner rule. First reject candidates that violate the exact
+matched-compute envelope, omit planned cells, exceed a predeclared infrastructure or candidate-
+failure ceiling, or fail the leakage audit. Among the remaining candidates, choose the highest
+discovery mean reward. Break an exact score tie by lower total input-plus-output tokens, then lower
+canonical serialized harness bytes, then lexicographically smaller execution hash. If token
+metering is incomplete for any tied candidate, skip the token tie-break for every member of that
+tie. The Pareto archive remains useful for secondary analysis, but an operator may not manually
+choose another frontier point after seeing scores. A different tradeoff requires a separately
+declared exploratory winner and cannot replace the primary winner.
+
 Run candidates concurrently through Harbor, subject to provider quotas and the dollar gate. Do not
 run multiple statistical attempts for the same task concurrently if provider or environment rate
 limits could create candidate-dependent throttling.
@@ -417,13 +530,11 @@ The official released search configuration uses all 89 tasks, two trials per tas
 and reports roughly $500 and four to six hours per iteration with Opus 4.6. Treat those figures as a
 planning reference only. Recalculate from live Azure, Bedrock, Harbor, and E2B prices before launch.
 
-At the primary search limit, select and freeze its winner without opening confirmation evidence. If
-the optional all-89 adaptive lane is activated, start it only after that freeze, use a separate
-search history from a declared seed, score its candidates on all 89 tasks, and select its winner
-independently. Call it a paper-method lane only when the seed is the parity-passed
-reference-strength control corresponding to the released scaffold. Otherwise label it a generic
-all-89 adaptive lane and prohibit a paper-method reproduction claim. The primary winner cannot be
-relabeled as the all-89 winner, even if it later receives an all-89 descriptive score.
+At the primary search limit, apply the frozen winner rule and freeze its winner without opening
+confirmation evidence. The $15,000 protocol does not start an all-89 adaptive search. A future,
+separately funded lane must use a fresh workspace and budget ledger, meet every paper-method parity
+gate above, and select its winner independently. The primary winner cannot be relabeled as an
+all-89 winner, even if it later receives an all-89 descriptive score.
 
 The primary winner must be frozen before any Azure candidate comparison used for the transfer
 endpoint. Do not select, revise, or rank it using Azure results. An Azure-guided iteration belongs in
@@ -436,20 +547,30 @@ locked results.
 
 - Primary confirmation: pi baseline and the primary winner on the frozen confirmation partition,
   five attempts per task.
-- Full-suite descriptive comparison: pi baseline and the same primary winner on all 89 tasks, five
-  attempts per task, using the fixed primary model. This comparison is not an adaptive-method
-  reproduction. Add the reference-strength control only if the final-evaluation envelope still
-  covers every paired primary cell.
-- Optional all-89 adaptive comparison: the lane's frozen seed/control and its separately selected
-  winner on all 89 tasks, five attempts per task. It is a paper-method comparison only when that
-  seed is the parity-passed reference-strength control corresponding to the released scaffold.
-  Otherwise report it as generic all-89 adaptive search. Add pi as another locked control only if
-  every resulting pair is fully funded. Omit the lane unless its search and paired final are fully
-  funded before the first candidate call.
+- Full-suite descriptive comparison: if it is fully funded, extend that same blocked final matrix
+  to the discovery tasks so pi and the frozen primary winner each receive five attempts on all 89
+  tasks with the fixed primary model. Compute the primary endpoint from only the prespecified
+  confirmation subset and the descriptive score from all 89 tasks. Do not rerun confirmation cells
+  in a second full-suite job. This comparison is not an adaptive-method reproduction. Add the
+  reference-strength control only if the final-evaluation envelope still covers every paired
+  primary cell. If all 89 tasks do not fit, run the confirmation matrix and omit the full-suite
+  descriptive score.
+- All-89 adaptive comparison: deferred and unfunded in this protocol. It requires a new budget that
+  covers the complete frozen search plus a separate five-attempt paired final before its first
+  candidate call.
 - Transfer lane: the already-frozen Bedrock winner and its matching pi baseline on the frozen Azure
   deployment. Before search, bind the exact task IDs and attempt count to a score-independent
   power-and-cost design and its matrix digest. Use at least three attempts per selected task, and do
-  not change the matrix after observing any Azure candidate comparison.
+  not change the matrix after observing any Azure candidate comparison. Use the same confirmation
+  tasks as Bedrock, or a predeclared score-independent subset of them, so task mix does not masquerade
+  as provider transfer. Treat transfer as secondary unless its manifest also freezes a powered
+  criterion. Report the Azure paired delta and the Azure-minus-Bedrock delta on the common tasks;
+  do not claim that a fraction transferred without a predeclared retention threshold and interval.
+
+The bootstrap mechanism contrast remains discovery-only and descriptive under this budget. Do not
+claim a confirmed fraction of improvement attributable to bootstrap unless a third pi, bootstrap,
+winner confirmation arm and its share estimand are fully funded and frozen before search. That
+addition must not reduce or unpair any primary pi-versus-winner cell.
 
 The current runnable matrix has no Claude Code arm. The paper's 18.4 point contrast is therefore
 external calibration only. A matched claim against Claude Code requires a generic external-agent
@@ -477,17 +598,31 @@ Before claiming an improvement:
 
 ## Analysis contract
 
-The primary metric is the arithmetic mean of the selected binary reward over the exact planned
-matrix. A mean is valid only if every planned cell is scored and carries that reward key.
+For a cell that finishes without a candidate-owned task timeout, its analysis outcome is the
+selected binary verifier reward. A candidate-owned agent or task timeout has primary outcome zero,
+even if Harbor later obtains a valid verifier reward from the final task state. Preserve that reward
+and the timeout failure kind as diagnostic evidence. A verifier, provider, environment, runner, or
+unclassified infrastructure failure is not a zero and invalidates the planned matrix until an
+allowlisted, fully ledgered recovery fills that cell. The timeout sensitivity analysis substitutes
+Harbor's valid post-timeout verifier reward for the primary zero; it may not replace the primary
+result after scores are observed.
+
+First average the planned analysis outcomes within each task and arm: five for primary confirmation
+and the separately frozen count for Azure transfer. The primary metric is the paired difference of
+inverse-inclusion-weighted task means over the exact confirmation matrix, targeting the task-uniform
+mean over the 89 frozen tasks. Use frozen family population shares and resample complete paired
+tasks within family strata using the predeclared bootstrap algorithm, resample count, and seed. The
+metric is valid only if every planned cell has a primary analysis outcome and the frozen inclusion
+weight.
 
 For each provider lane, report:
 
 - pi baseline score, candidate score, and paired percentage-point delta;
-- a task-clustered bootstrap confidence interval over the paired delta;
+- the frozen family-stratified task bootstrap confidence interval over the paired delta;
 - per-task win, tie, and loss counts;
 - timeout and infrastructure rates;
 - total input tokens, output tokens, provider cost, environment cost, and wall time;
-- sensitivity to treating valid verifier scores after task timeout as scored timeouts.
+- the post-timeout-verifier-reward sensitivity defined above.
 
 Do not enable Harbor retries until the atomic attempt ledger records every failed and final attempt,
 including usage and exception type. Once that prerequisite exists, retry only explicitly
@@ -501,50 +636,74 @@ The main success criteria are conditional on passing the power and partition gat
 2. at least a 3 point practical improvement when the frozen design has at least 0.80 power for that
    effect, or the larger predeclared minimum detectable effect selected by the fail route; a smaller
    improvement that holds across both providers remains useful but is not a powered 3 point result;
-3. no material regression in cost, timeout rate, or candidate-failure rate that erases the score
-   benefit;
-4. for a primary candidate described as statistically compatible with 76.4%, a locked all-89
-   descriptive run whose point estimate and uncertainty meet a predeclared equivalence criterion
-   centered on 76.4%, and whose matched controls behave consistently with the published ordering.
-   Merely producing a wide confidence interval that includes 76.4% is not evidence of reproduction.
-   Claiming reproduction of the adaptive method additionally requires the separately searched and
-   selected optional all-89 lane to use the parity-passed reference-strength seed and locked
-   control. An exact serving-path reproduction remains out of scope while direct Anthropic is
-   excluded.
+3. cost, timeout rate, and candidate-failure rate remain inside their predeclared noninferiority
+   margins, with the score-cost decision rule and all margins frozen before search.
+
+Do not make an inferential compatibility or equivalence claim against 76.4% from the mixed all-89
+score. That score includes discovery task identities and outcomes used to select the harness, so
+report only its signed descriptive distance from 76.4% and the external leaderboard context. State
+any scoring-rule difference, including post-timeout reward treatment, alongside that distance. A
+future independent suite or a predeclared selection-adjusted design is required for an inferential
+equivalence statement. Claiming reproduction of the adaptive method additionally requires a future
+separately funded all-89 lane to pass every initial-population, proposer, history, code-search,
+schedule, and finalist-selection parity gate above. That lane is not part of this $15,000 study. An
+exact serving-path reproduction remains out of scope while direct Anthropic is excluded.
+
+The bootstrap ablation, cross-provider transfer, full-suite location relative to 76.4%, and any
+future adaptive lane are secondary endpoints. Freeze a testing hierarchy or label them descriptive;
+do not promote whichever secondary interval happens to exclude zero into a new primary claim.
 
 ## Budget and stop gates
 
 The hard experiment budget is $15,000 across model calls, E2B, and recoverable reruns. Local compute
 already available to the project is tracked but does not consume this ceiling.
 
-| Envelope | Maximum | Purpose |
+| Envelope | Initial planning cap | Purpose |
 |---|---:|---|
 | qualification and backend parity | $500 | canaries, failure-path checks, local/E2B parity |
 | matched baseline calibration | $2,000 | discovery pi baselines and optional control calibration |
-| primary Bedrock search | $5,000 | up to ten paper-sized iterations, capped by measured cost |
+| primary Bedrock search | $5,000 | up to ten frozen discovery iterations, capped by measured cost |
 | Azure transfer evaluation | $1,000 | frozen Bedrock winner versus pi on the predeclared transfer matrix |
-| locked final evaluations | $4,000 | paired pi/winner matrices, plus control only if fully funded |
-| optional all-89 adaptive search | $1,500 | separate reference-seeded or generic candidate, only if the predeclared minimum search fits |
+| locked final evaluations | $5,500 | paired pi/winner matrix, extending to all 89 tasks only if fully funded |
 | audited retries and variance resolution | $500 | allowlisted infrastructure-only recovery |
-| reserve | $500 | price drift, quota inefficiency, or one predeclared decisive rerun |
+| reserve | $500 | price drift, quota inefficiency, or completion of a predeclared blocked matrix |
 | **total** | **$15,000** | hard ceiling |
 
-These envelopes sum to the hard ceiling, but they are not yet proof that every listed cell is
-funded. Price the exact confirmation split, 890 paired Bedrock full-suite cells, the frozen Azure
-transfer matrix, proposer calls, parity canaries, and any reference or Claude Code control from
-measured canary cost before search. The optional all-89 envelope is reserved but not automatically
-spendable: activate it only if measured cost shows that its predeclared minimum number of search
-iterations and its separate paired final both fit. Otherwise omit that lane or explicitly reallocate
-funds before either search
-begins. Reserve the locked primary final matrix first. If the $4,000 final envelope is insufficient,
-reduce search or transfer scope before spending rather than weakening the paired primary comparison
-after candidate selection.
+These initial caps sum to the hard ceiling, but they are not yet proof that every listed cell is
+funded. Phase 0 must freeze a finite, cost-only reallocation rule before qualification. After route
+canaries, but before any qualification reward or trace is unsealed and before any Phase 2 baseline
+or Phase 3 candidate is run, use only measured cost, quota, and infrastructure evidence to price the
+exact confirmation split, the at-most-890-cell paired Bedrock final, the frozen Azure transfer
+matrix, proposer calls, parity canaries, and any reference or Claude Code control. Apply the frozen
+rule once, record the resulting phase caps and matrix, and verify that they sum to no more than
+$15,000. Those revised caps are then immutable. No score, trace, or candidate outcome may trigger a
+transfer between phases.
 
-Use cumulative approval gates at $500, $2,500, $7,500, $12,500, and $15,000. At each gate, stop and
-record score, uncertainty, failures, actual cost per cell, remaining matrix, and the value of the
-next spend. The reserve is not automatically available to search. No process may start a paid phase
-without an explicit operator confirmation, and no job may exceed its remaining envelope through
-automatic retry.
+The confirmation cells are part of the 890-cell all-89 matrix, not an additional matrix. Reserve
+the locked primary confirmation cells first. Extend the same final to discovery tasks only when all
+890 cells fit. If the initially planned $5,500 final cap is insufficient, the predeclared rule may
+move budget from search or transfer to the final before the immutable freeze. After that freeze,
+omit the descriptive extension rather than weakening the paired primary comparison or reallocating
+money after candidate selection.
+
+No all-89 adaptive search is funded here. At the paper's planning estimate of roughly $500 for one
+89-task, two-attempt iteration, its ten-iteration search alone would consume about $5,000 before a
+separate 890-cell paired final. That lane needs a new measured budget and operator approval after
+the primary study. Moving unused money into it mid-search would create an underpowered, shortened
+lane that cannot carry a paper-method label.
+
+The initial caps imply cumulative approval gates at $500, $2,500, $7,500, $8,500, $14,000, and
+$15,000. When the one-time cost-only reallocation freezes revised phase caps, recompute the
+cumulative gates as their running sums in execution order, retain $15,000 as the hard final stop,
+and store both the caps and gates in the budget manifest. They are immutable from that point. At
+each frozen gate, stop and record score, uncertainty, failures, actual cost per cell, remaining
+matrix, and the value of the next spend. Discovery scores may support a predeclared primary-search
+futility stop, but they may not expand the frozen proposal count or unlock a paper-method label.
+Confirmation or Azure scores may never trigger a replacement run. Any predeclared sequential
+extension must retain and analyze every valid attempt under a frozen combination rule; it may not
+replace an inconvenient result. The reserve is not automatically available to search. No process
+may start a paid phase without an explicit operator confirmation, and no job may exceed its
+remaining envelope through automatic retry.
 
 ## Current WMH readiness and remaining gaps
 
@@ -569,11 +728,16 @@ The following remain required work before experiment launch:
 - create the pi baseline and bootstrap ablation;
 - generalize persistent execution, bounded output, multimodal observation, completion, caching,
   retry, and summarization surfaces enough to parity-test a reference-strength control;
-- add the proposer and Pareto search loop on top of existing harness deltas, including immutable
-  proposer identity and cost evidence;
+- add the proposer and Pareto search loop on top of existing harness deltas, including a sealed
+  discovery-only workspace, immutable proposer identity, complete-history evidence, the matched-
+  compute eligibility gate, deterministic winner selection, and cost evidence;
 - implement a persistent spend ledger and phase-budget admission check;
-- implement the paired statistical report, powered and immutable split generator, fixed canary
-  manifest, and blocked two-arm final scheduler;
+- implement an atomic attempt ledger that retains every attempt's usage, failure type, and terminal
+  result before enabling retry or search ranking;
+- implement an external-resource ledger that reconciles local Compose and E2B resource creation and
+  teardown after process or host interruption;
+- implement the paired statistical report, powered and immutable split generator, fixed
+  deterministic action-replay canary manifest, and blocked two-arm final scheduler;
 - add served-model attestation to canonical evidence, including the response-reported Azure model
   revision and a pre/post deployment snapshot; the current run digest binds the declared endpoint,
   deployment, model, API version, and Bedrock region, but cannot detect an Azure deployment repoint;
@@ -584,13 +748,18 @@ The following remain required work before experiment launch:
 - bind the resolved pi-runner platform and child-manifest digest after cross-platform qualification;
 - make Harbor's remaining root and per-trial config, lock, and result writes crash-safe, or validate
   a fail-closed snapshot recovery procedure;
+- implement a fail-closed local Compose host policy from compatibility data, with an audited
+  allowlist for bind mounts and build contexts and unconditional rejection of privileged mode,
+  host devices, Docker socket access, build SSH forwarding, and any `HOST_*_PATH` or equivalent
+  evidence-path escape; apply it before provider or E2B credentials are loaded and before any paid
+  local task starts;
 - add deadline-aware provider calls, an explicitly frozen paper-strength timeout stack, and a
   probed Azure/Bedrock failure taxonomy;
 - add and fund a generic Claude Code control only if making a matched headline-uplift claim;
 - perform real local/E2B parity canaries on a machine with Docker and valid E2B credentials;
 - run leakage audits and the paid Azure/Bedrock matrices.
 
-These gaps must close before a paid reproduction run begins. They should be implemented as generic
+These gaps must close before a paid experiment run begins. They should be implemented as generic
 search, budgeting, and analysis components driven by experiment configuration, not as paper-named
 branches in the WMH core.
 

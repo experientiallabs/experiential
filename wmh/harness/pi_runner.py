@@ -104,6 +104,14 @@ class PiCandidateFailureStage(StrEnum):
     TURN = "turn"
 
 
+class PiCandidateFailureReason(StrEnum):
+    """Bounded reason a candidate-controlled pi execution failed."""
+
+    TIMEOUT = "timeout"
+    RESOURCE_LIMIT = "resource_limit"
+    RUNTIME_ERROR = "runtime_error"
+
+
 class PiInfrastructureFailureKind(StrEnum):
     """Trusted failure sources that must invalidate an evaluation trial."""
 
@@ -139,11 +147,13 @@ class PiCandidateError(RuntimeError):
         message: str,
         *,
         stage: PiCandidateFailureStage,
+        reason: PiCandidateFailureReason,
         events: tuple[SessionEvent, ...],
         worker_usage: TokenUsage,
     ) -> None:
         super().__init__(message)
         self.stage = stage
+        self.reason = reason
         self.events = events
         self.worker_usage = worker_usage
 
@@ -353,6 +363,7 @@ def run_pi_turn(
                 raise PiCandidateError(
                     "pi candidate materialization failed: event budget exceeded",
                     stage=PiCandidateFailureStage.MATERIALIZATION,
+                    reason=PiCandidateFailureReason.RESOURCE_LIMIT,
                     events=tuple(events),
                     worker_usage=session.worker_usage.model_copy(),
                 ) from exc
@@ -362,6 +373,7 @@ def run_pi_turn(
                     raise PiCandidateError(
                         f"pi candidate materialization failed: {candidate_message}",
                         stage=PiCandidateFailureStage.MATERIALIZATION,
+                        reason=PiCandidateFailureReason.RESOURCE_LIMIT,
                         events=tuple(events),
                         worker_usage=session.worker_usage.model_copy(),
                     ) from exc
@@ -377,6 +389,7 @@ def run_pi_turn(
                     raise PiCandidateError(
                         f"pi candidate materialization failed: {candidate_message}",
                         stage=PiCandidateFailureStage.MATERIALIZATION,
+                        reason=PiCandidateFailureReason.RUNTIME_ERROR,
                         events=tuple(events),
                         worker_usage=session.worker_usage.model_copy(),
                     ) from exc
@@ -384,6 +397,7 @@ def run_pi_turn(
                     raise PiCandidateError(
                         "pi candidate materialization failed: runner did not become ready",
                         stage=PiCandidateFailureStage.MATERIALIZATION,
+                        reason=PiCandidateFailureReason.TIMEOUT,
                         events=tuple(events),
                         worker_usage=session.worker_usage.model_copy(),
                     ) from exc
@@ -401,6 +415,7 @@ def run_pi_turn(
                         raise PiCandidateError(
                             f"pi candidate turn failed: did not finish within {timeout_s:g}s",
                             stage=PiCandidateFailureStage.TURN,
+                            reason=PiCandidateFailureReason.TIMEOUT,
                             events=tuple(events),
                             worker_usage=session.worker_usage.model_copy(),
                         )
@@ -413,6 +428,7 @@ def run_pi_turn(
                         raise PiCandidateError(
                             f"pi candidate turn failed: did not finish within {timeout_s:g}s",
                             stage=PiCandidateFailureStage.TURN,
+                            reason=PiCandidateFailureReason.TIMEOUT,
                             events=tuple(events),
                             worker_usage=session.worker_usage.model_copy(),
                         )
@@ -420,6 +436,7 @@ def run_pi_turn(
                 raise PiCandidateError(
                     "pi candidate turn failed: event budget exceeded",
                     stage=PiCandidateFailureStage.TURN,
+                    reason=PiCandidateFailureReason.RESOURCE_LIMIT,
                     events=tuple(events),
                     worker_usage=session.worker_usage.model_copy(),
                 ) from exc
@@ -432,6 +449,7 @@ def run_pi_turn(
                     raise PiCandidateError(
                         f"pi candidate turn failed: {candidate_message}",
                         stage=PiCandidateFailureStage.TURN,
+                        reason=PiCandidateFailureReason.RUNTIME_ERROR,
                         events=tuple(events),
                         worker_usage=session.worker_usage.model_copy(),
                     )

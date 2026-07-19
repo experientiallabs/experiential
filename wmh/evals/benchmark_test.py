@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmh.evals.benchmark import (
+    BenchmarkCandidateFailureReason,
     BenchmarkCandidateOutcome,
     BenchmarkCandidateStage,
     BenchmarkCandidateStatus,
@@ -19,6 +20,7 @@ from wmh.evals.benchmark import (
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
     BenchmarkUsage,
+    BenchmarkUsageStatus,
 )
 
 _RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
@@ -89,6 +91,24 @@ def test_rewards_reject_non_finite_and_boolean_values(reward: float | bool) -> N
 def test_usage_rejects_non_finite_and_boolean_costs(cost: float | bool) -> None:
     with pytest.raises(ValidationError):
         BenchmarkUsage(cost_usd=cost)
+
+
+def test_usage_requires_explicit_lower_bounds_instead_of_exact_unknown_totals() -> None:
+    exact = BenchmarkUsage(input_tokens=0)
+    lower_bound = BenchmarkUsage(
+        input_tokens=7,
+        input_tokens_status=BenchmarkUsageStatus.LOWER_BOUND,
+    )
+
+    assert exact.input_tokens_status is BenchmarkUsageStatus.EXACT
+    assert lower_bound.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    with pytest.raises(ValidationError, match="without a value must be unavailable"):
+        BenchmarkUsage(input_tokens_status=BenchmarkUsageStatus.LOWER_BOUND)
+    with pytest.raises(ValidationError, match="with a value cannot be unavailable"):
+        BenchmarkUsage(
+            input_tokens=0,
+            input_tokens_status=BenchmarkUsageStatus.UNAVAILABLE,
+        )
 
 
 def test_run_counts_incomplete_and_infrastructure_cells_separately() -> None:
@@ -174,6 +194,44 @@ def test_run_usage_is_derived_from_trials_and_rejects_a_conflicting_total() -> N
             trials=trials,
             usage=BenchmarkUsage(input_tokens=999),
         )
+
+
+def test_run_usage_retains_known_lower_bound_when_one_trial_is_incompletely_metered() -> None:
+    cells = [_cell("task-a"), _cell("task-b")]
+    result = BenchmarkRunResult(
+        job_name="partially-metered",
+        identity=_IDENTITY,
+        expected_cells=cells,
+        trials=[
+            _trial(
+                cells[0],
+                BenchmarkTrialStatus.SCORED,
+                rewards={"reward": 1},
+                usage=BenchmarkUsage(input_tokens=10, output_tokens=4),
+            ),
+            _trial(
+                cells[1],
+                BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+                error=BenchmarkError(
+                    kind=BenchmarkFailureKind.PROVIDER,
+                    type="WmhPiProviderError",
+                ),
+                usage=BenchmarkUsage(
+                    input_tokens=7,
+                    input_tokens_status=BenchmarkUsageStatus.LOWER_BOUND,
+                    output_tokens=2,
+                    output_tokens_status=BenchmarkUsageStatus.LOWER_BOUND,
+                ),
+            ),
+        ],
+    )
+
+    assert result.usage.input_tokens == 17
+    assert result.usage.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.usage.output_tokens == 6
+    assert result.usage.output_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+    assert result.usage.cost_usd is None
+    assert result.usage.cost_usd_status is BenchmarkUsageStatus.UNAVAILABLE
 
 
 def test_scored_trial_requires_a_reward_mapping_even_when_empty() -> None:
@@ -333,6 +391,7 @@ def test_candidate_outcome_is_typed_independently_from_verifier_score() -> None:
         candidate_outcome=BenchmarkCandidateOutcome(
             status=BenchmarkCandidateStatus.FAILED,
             stage=BenchmarkCandidateStage.EXECUTION,
+            failure_reason=BenchmarkCandidateFailureReason.TIMEOUT,
         ),
     )
     completed = _trial(
@@ -347,6 +406,10 @@ def test_candidate_outcome_is_typed_independently_from_verifier_score() -> None:
 
     assert failed_but_scored.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
     assert failed_but_scored.candidate_outcome.stage is BenchmarkCandidateStage.EXECUTION
+    assert (
+        failed_but_scored.candidate_outcome.failure_reason
+        is BenchmarkCandidateFailureReason.TIMEOUT
+    )
     assert completed.candidate_outcome.terminal_reason is (
         BenchmarkCandidateTerminalReason.COMPLETED
     )
@@ -364,6 +427,9 @@ def test_candidate_outcome_is_typed_independently_from_verifier_score() -> None:
         BenchmarkCandidateOutcome(
             status=BenchmarkCandidateStatus.FAILED,
         ).model_copy(update={"terminal_reason": BenchmarkCandidateTerminalReason.ABORTED}),
+        BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.COMPLETED,
+        ).model_copy(update={"failure_reason": BenchmarkCandidateFailureReason.TIMEOUT}),
     ],
 )
 def test_candidate_outcome_rejects_contradictory_details(
@@ -371,6 +437,80 @@ def test_candidate_outcome_rejects_contradictory_details(
 ) -> None:
     with pytest.raises(ValidationError, match="candidate outcome"):
         BenchmarkCandidateOutcome.model_validate(outcome.model_dump())
+
+
+def test_candidate_timeout_count_is_distinct_from_harbor_task_timeout() -> None:
+    candidate_timeout = _trial(
+        _cell("candidate-timeout"),
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 0},
+        candidate_outcome=BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.FAILED,
+            stage=BenchmarkCandidateStage.EXECUTION,
+            failure_reason=BenchmarkCandidateFailureReason.TIMEOUT,
+        ),
+    )
+    task_timeout = _trial(
+        _cell("task-timeout"),
+        BenchmarkTrialStatus.TASK_TIMEOUT,
+        error=BenchmarkError(
+            kind=BenchmarkFailureKind.TASK_TIMEOUT,
+            type="AgentTimeoutError",
+        ),
+    )
+    result = BenchmarkRunResult(
+        job_name="timeout-accounting",
+        identity=_IDENTITY,
+        expected_cells=[candidate_timeout.cell, task_timeout.cell],
+        trials=[candidate_timeout, task_timeout],
+    )
+
+    assert result.n_candidate_timeouts == 1
+    assert result.n_task_timeouts == 1
+
+
+def test_candidate_failure_counts_cover_each_reason_and_unclassified_evidence() -> None:
+    reasons = [
+        BenchmarkCandidateFailureReason.TIMEOUT,
+        BenchmarkCandidateFailureReason.RESOURCE_LIMIT,
+        BenchmarkCandidateFailureReason.RUNTIME_ERROR,
+        None,
+    ]
+    failures = [
+        _trial(
+            _cell(f"candidate-failure-{index}"),
+            BenchmarkTrialStatus.SCORED,
+            rewards={"reward": 0},
+            candidate_outcome=BenchmarkCandidateOutcome(
+                status=BenchmarkCandidateStatus.FAILED,
+                stage=BenchmarkCandidateStage.EXECUTION,
+                failure_reason=reason,
+            ),
+        )
+        for index, reason in enumerate(reasons)
+    ]
+    completed = _trial(
+        _cell("candidate-completed"),
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 1},
+        candidate_outcome=BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.COMPLETED,
+            terminal_reason=BenchmarkCandidateTerminalReason.COMPLETED,
+        ),
+    )
+    trials = [*failures, completed]
+    result = BenchmarkRunResult(
+        job_name="candidate-failure-accounting",
+        identity=_IDENTITY,
+        expected_cells=[trial.cell for trial in trials],
+        trials=trials,
+    )
+
+    assert result.n_candidate_failures == 4
+    assert result.n_candidate_timeouts == 1
+    assert result.n_candidate_resource_limits == 1
+    assert result.n_candidate_runtime_errors == 1
+    assert result.n_candidate_unclassified_failures == 1
 
 
 @pytest.mark.parametrize(

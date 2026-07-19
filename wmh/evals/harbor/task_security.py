@@ -309,6 +309,15 @@ def _audit_compose_file(
         return
     for name in _compose_inherited_environment_names(document):
         _record_protected_reference(source, name, references)
+    _audit_compose_service_env_files(
+        document,
+        project_dir=project_dir,
+        compose_path=path,
+        environment_dir=environment_dir,
+        task_dir=task_dir,
+        references=references,
+        failures=failures,
+    )
 
     next_active = (*active, path)
     _audit_compose_includes(
@@ -332,6 +341,70 @@ def _audit_compose_file(
         visited=visited,
         active=next_active,
     )
+
+
+def _audit_compose_service_env_files(
+    document: dict[str, JsonValue],
+    *,
+    project_dir: Path,
+    compose_path: Path,
+    environment_dir: Path,
+    task_dir: Path,
+    references: set[ProtectedHostEnvironmentReference],
+    failures: set[TaskCredentialAuditFailure],
+) -> None:
+    """Audit every service env file that Compose can read from the host."""
+    services = document.get("services")
+    if not isinstance(services, dict):
+        return
+    compose_source = _task_source(compose_path, task_dir)
+    for service_name, service in services.items():
+        if not isinstance(service, dict) or (env_file := service.get("env_file")) is None:
+            continue
+        declaration_source = f"{compose_source} [services.{service_name}.env_file]"
+        if isinstance(env_file, str):
+            entries = [env_file]
+        elif isinstance(env_file, list):
+            entries = env_file
+        else:
+            failures.add(
+                TaskCredentialAuditFailure(
+                    source=declaration_source,
+                    reason="unsupported Compose service env_file declaration",
+                )
+            )
+            continue
+
+        for index, entry in enumerate(entries):
+            entry_source = f"{declaration_source}[{index}]"
+            if isinstance(entry, str):
+                path_value = entry
+            elif isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                path_value = entry["path"]
+            else:
+                failures.add(
+                    TaskCredentialAuditFailure(
+                        source=entry_source,
+                        reason="unsupported Compose service env_file declaration",
+                    )
+                )
+                continue
+            env_path = _resolve_compose_reference(
+                path_value,
+                base_dir=project_dir,
+                environment_dir=environment_dir,
+                source=entry_source,
+                relation="Compose service env_file",
+                failures=failures,
+                expect_directory=False,
+            )
+            if env_path is not None:
+                _audit_interpolation_file(
+                    env_path,
+                    source=_task_source(env_path, task_dir),
+                    references=references,
+                    failures=failures,
+                )
 
 
 def _audit_compose_includes(

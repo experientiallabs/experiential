@@ -7,23 +7,32 @@ import hashlib
 import json
 import math
 import os
-import stat
 import tempfile
 from collections import defaultdict
-from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from typing import override
 from uuid import UUID
 
+from harbor.environments.factory import EnvironmentFactory
 from harbor.job import Job
+from harbor.metrics.uv_script import UvScript
+from harbor.models.dataset.paths import DatasetPaths
+from harbor.models.environment_type import EnvironmentType
+from harbor.models.job.config import DatasetConfig, JobConfig
 from harbor.models.job.lock import JobLock, TrialLock, build_job_lock
 from harbor.models.job.result import JobResult
+from harbor.models.metric.config import MetricConfig
+from harbor.models.metric.type import MetricType
+from harbor.models.registry import DatasetMetadata
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import task_has_any_separate_verifier
 from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import TrialResult
+from harbor.registry.client.factory import RegistryClientFactory
+from harbor.registry.client.package import PackageDatasetClient
 from harbor.tasks.client import TaskIdType
 from pydantic import ValidationError
 
@@ -32,6 +41,7 @@ from wmh.evals.benchmark import (
     BenchmarkRunIdentity,
     BenchmarkTaskEnvironment,
 )
+from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION, WmhPiAgent
 from wmh.evals.harbor.config import (
     SUPPORTED_HARBOR_VERSION,
@@ -75,6 +85,10 @@ class ConcurrentHarborJobError(RuntimeError):
 
 class UnsupportedHarborTaskError(ValueError):
     """A task uses Harbor behavior whose failures cannot yet be observed safely."""
+
+
+class UnsupportedHarborMetricError(ValueError):
+    """A Harbor metric could execute untrusted code on the credential-bearing host."""
 
 
 class _AtomicHarborJob(Job):
@@ -159,11 +173,14 @@ class HarborEvaluator:
         )
         job_config = build_harbor_job_config(self._spec, agent=agent)
         job_dir = job_config.jobs_dir / job_config.job_name
+        await _reject_executable_harbor_metrics(job_config)
         existing_manifest = _inspect_existing_job(
             job_dir,
             expected_identity=identity,
             expected_agent_digest=agent_digest,
+            expected_job_config=job_config,
         )
+        await asyncio.to_thread(_preflight_task_environment, job_config)
         await self._ensure_runner_ready()
 
         try:
@@ -176,6 +193,7 @@ class HarborEvaluator:
             raise
 
         try:
+            _reject_resolved_executable_harbor_metrics(job)
             if not job._trial_configs:
                 raise ValueError(
                     "Harbor resolved zero trials; refusing to publish an empty evaluation"
@@ -252,6 +270,113 @@ class HarborEvaluator:
             runner_image=self._runner_image,
             run_config_digest=run_config_digest,
         )
+
+
+async def _reject_executable_harbor_metrics(config: JobConfig) -> None:
+    """Reject every Harbor metric source that can run code in the host process."""
+    _reject_uv_script_metrics(config.metrics, source="the Harbor job configuration")
+    for dataset in config.datasets:
+        metadata = await _load_dataset_metadata_for_metric_audit(dataset)
+        if metadata is None:
+            continue
+        source = f"Harbor dataset {metadata.name!r}"
+        _reject_uv_script_metrics(metadata.metrics, source=source)
+        if dataset.is_package() and any(
+            file.path == DatasetPaths.METRIC_FILENAME for file in metadata.files
+        ):
+            raise UnsupportedHarborMetricError(
+                f"{source} includes executable {DatasetPaths.METRIC_FILENAME!r}; "
+                "WMH ground-truth evaluation accepts only non-executable built-in aggregate "
+                "metrics because Harbor dataset scripts run on the credential-bearing host. "
+                "Remove the executable metric and compute trusted analysis from canonical "
+                "per-trial rewards."
+            )
+
+
+def _reject_uv_script_metrics(metrics: list[MetricConfig], *, source: str) -> None:
+    """Reject Harbor's configured host-side script metric without constructing it."""
+    if any(metric.type is MetricType.UV_SCRIPT for metric in metrics):
+        raise UnsupportedHarborMetricError(
+            f"{source} declares an executable {MetricType.UV_SCRIPT.value!r} metric; "
+            "WMH ground-truth evaluation accepts only non-executable built-in aggregate metrics "
+            "because Harbor metric scripts run on the credential-bearing host. Remove the "
+            "executable metric and compute trusted analysis from canonical per-trial rewards."
+        )
+
+
+def _reject_resolved_executable_harbor_metrics(job: Job) -> None:
+    """Reject executable metrics from Harbor's actual post-resolution metric set."""
+    executable_sources = sorted(
+        source
+        for source, metrics in job._metrics.items()
+        if any(isinstance(metric, UvScript) for metric in metrics)
+    )
+    if executable_sources:
+        raise UnsupportedHarborMetricError(
+            "Harbor resolved executable host-side metrics for "
+            f"{executable_sources}; WMH ground-truth evaluation accepts only non-executable "
+            "built-in aggregate metrics because Harbor metric scripts run on the "
+            "credential-bearing host. Pin a dataset without executable metrics and compute "
+            "trusted analysis from canonical per-trial rewards."
+        )
+
+
+async def _load_dataset_metadata_for_metric_audit(
+    dataset: DatasetConfig,
+) -> DatasetMetadata | None:
+    """Load remote metadata without downloading tasks or dataset-level executable files."""
+    if dataset.is_local():
+        return None
+    if dataset.is_repo():
+        client = RegistryClientFactory.create(
+            repo=dataset.repo,
+            path=dataset.path,
+            registry_path=dataset.registry_path,
+        )
+        if dataset.name is None:
+            name = ""
+        else:
+            name = f"{dataset.name}@{dataset.version}" if dataset.version else dataset.name
+        return await client.get_dataset_metadata(name)
+    if dataset.is_package():
+        if dataset.name is None:
+            raise RuntimeError("Package dataset config is missing name")
+        name = f"{dataset.name}@{dataset.ref or 'latest'}"
+        return await PackageDatasetClient().get_dataset_metadata(name)
+    if dataset.is_registry():
+        if dataset.name is None:
+            raise RuntimeError("Registry dataset config is missing name")
+        client = RegistryClientFactory.create(
+            registry_url=dataset.registry_url,
+            registry_path=dataset.registry_path,
+        )
+        name = f"{dataset.name}@{dataset.version}" if dataset.version else dataset.name
+        return await client.get_dataset_metadata(name)
+    raise RuntimeError("Harbor dataset config has no supported source")
+
+
+def _preflight_task_environment(config: JobConfig) -> None:
+    """Fail before runner or job creation when Harbor's task backend is unavailable."""
+    environment = config.environment
+    missing_e2b_modules = [
+        module
+        for module in ("e2b", "dockerfile_parse")
+        if environment.type is EnvironmentType.E2B and find_spec(module) is None
+    ]
+    if missing_e2b_modules:
+        raise RuntimeError(
+            "Harbor E2B task environments require the WMH e2b extra; install "
+            "world-model-harness[e2b] or run `uv sync --extra e2b` "
+            f"(missing modules: {', '.join(missing_e2b_modules)})"
+        )
+    try:
+        EnvironmentFactory.run_preflight(
+            type=environment.type,
+            import_path=environment.import_path,
+        )
+    except SystemExit as exc:
+        detail = str(exc).strip() or "task environment is unavailable"
+        raise RuntimeError(f"Harbor task-environment preflight failed: {detail}") from None
 
 
 def _build_prepared_job_lock(job: Job) -> JobLock:
@@ -338,6 +463,20 @@ def _load_and_validate_tasks(
                 "verifier environment; Harbor 0.18 suppresses verifier-environment stop "
                 "failures, so this evaluator refuses to produce ambiguous scores"
             )
+        compose_sources = tuple(
+            path
+            for path in (
+                task.paths.environment_dir / "docker-compose.yaml",
+                task.paths.environment_dir / "docker-compose.yml",
+            )
+            if path.exists() or path.is_symlink()
+        )
+        if environment_backend is HarborEnvironmentBackend.E2B and compose_sources:
+            raise UnsupportedHarborTaskError(
+                f"task {trial_config.task.source!r}/{task_id.get_name()!r} uses task-authored "
+                "Docker Compose; Harbor 0.18 E2B ignores Compose semantics, so this evaluator "
+                "requires a Dockerfile/image-only task for E2B"
+            )
         docker_image = task.config.environment.docker_image
         dockerfile = task.paths.environment_dir / "Dockerfile"
         if (
@@ -348,7 +487,7 @@ def _load_and_validate_tasks(
             raise UnsupportedHarborTaskError(
                 f"task {trial_config.task.source!r}/{task_id.get_name()!r} has no "
                 "[environment].docker_image or environment/Dockerfile; Harbor 0.18 E2B "
-                "cannot run Compose-only task definitions"
+                "requires one immutable environment definition"
             )
         tasks[task_id] = task
     return tasks
@@ -550,6 +689,7 @@ def _inspect_existing_job(
     *,
     expected_identity: BenchmarkRunIdentity,
     expected_agent_digest: str,
+    expected_job_config: JobConfig,
 ) -> HarborTrialManifest | None:
     if job_dir.is_symlink():
         raise StaleHarborJobError(f"Harbor job directory cannot be a symlink: {job_dir}")
@@ -609,12 +749,17 @@ def _inspect_existing_job(
 
     result_path = job_dir / "result.json"
     try:
+        existing_job_config = JobConfig.model_validate_json(
+            (job_dir / "config.json").read_text(encoding="utf-8")
+        )
         job_result = JobResult.model_validate_json(result_path.read_text(encoding="utf-8"))
         JobLock.model_validate_json((job_dir / "lock.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValidationError) as exc:
         raise StaleHarborJobError(
-            f"Harbor job result or lock is unreadable or invalid: {job_dir}"
+            f"Harbor job config, result, or lock is unreadable or invalid: {job_dir}"
         ) from exc
+    if existing_job_config.model_dump(mode="json") != expected_job_config.model_dump(mode="json"):
+        raise StaleHarborJobError(f"Harbor job config does not match this evaluation: {job_dir}")
 
     for trial_dir, entry in trial_dirs:
         trial_result_path = trial_dir / "result.json"
@@ -816,35 +961,22 @@ def _atomic_replace_job_result(path: Path, payload: str) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-@contextmanager
-def _exclusive_job_run_lock(jobs_dir: Path, job_name: str) -> Iterator[None]:
+def _exclusive_job_run_lock(
+    jobs_dir: Path,
+    job_name: str,
+) -> AbstractContextManager[None]:
     """Hold a crash-safe nonblocking lease that prevents duplicate paid job execution."""
-    if os.name != "posix":
-        raise RuntimeError("Harbor evaluation job leases currently require POSIX file locking")
-    import fcntl
-
-    jobs_dir.mkdir(parents=True, exist_ok=True)
     lock_path = harbor_job_lease_path(jobs_dir, job_name)
-    descriptor = os.open(
+    return exclusive_posix_file_lease(
         lock_path,
-        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
+        unsupported_error=RuntimeError(
+            "Harbor evaluation job leases currently require POSIX file locking"
+        ),
+        irregular_file_error=OSError(f"Harbor evaluation lock is not a regular file: {lock_path}"),
+        contention_error=ConcurrentHarborJobError(
+            f"another process is already evaluating Harbor job {job_name!r} in {jobs_dir}"
+        ),
     )
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise OSError(f"Harbor evaluation lock is not a regular file: {lock_path}")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ConcurrentHarborJobError(
-                f"another process is already evaluating Harbor job {job_name!r} in {jobs_dir}"
-            ) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
 
 
 def harbor_job_lease_path(jobs_dir: Path, job_name: str) -> Path:
