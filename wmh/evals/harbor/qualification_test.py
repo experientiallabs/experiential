@@ -1095,6 +1095,35 @@ def test_e2b_partial_resume_reuses_completed_task_without_second_launch(
     assert stops == starts
     failures.clear()
 
+    prepared = mod._read_model(
+        qualifier.roster_path.parent / "prepared.json",
+        mod._PreparedRosterCommitment,
+    )
+    assert prepared is not None
+    prepared_task = next(task for task in prepared.tasks if task.task_id == "task-a")
+    evidence_path = qualifier._evidence_path(prepared_task)
+    evidence = mod._read_model(evidence_path, mod._QualifiedTaskEvidence)
+    assert evidence is not None
+    nonterminal = evidence.model_dump(mode="json")
+    cleanup_receipt = nonterminal["cleanup_receipt"]
+    assert isinstance(cleanup_receipt, dict)
+    cleanup_receipt["state"] = "cleanup_failed"
+    cleanup_receipt["retired_at"] = None
+    nonterminal["evidence_digest"] = mod._canonical_digest(
+        {key: value for key, value in nonterminal.items() if key != "evidence_digest"}
+    )
+    evidence_path.write_text(json.dumps(nonterminal), encoding="utf-8")
+
+    with pytest.raises(
+        mod.HarborRosterQualificationDriftError,
+        match="unreadable or invalid",
+    ):
+        asyncio.run(qualifier.qualify())
+
+    assert len(build_calls) == 1
+    assert starts == ["task-a", "task-b"]
+    mod._atomic_write_model(evidence_path, evidence)
+
     with pytest.raises(
         mod.HarborRosterQualificationDriftError,
         match="terminal exact build",
