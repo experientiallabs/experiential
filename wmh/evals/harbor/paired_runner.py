@@ -681,6 +681,51 @@ class HarborExecutionPlan(BaseModel):
         )
 
 
+def _validate_paired_harbor_budget_runtime(
+    *,
+    budget_runtime: PairedHarborBudgetRuntime,
+    panel_routes: tuple[PairedHarborPanelRoute, ...],
+    qualification_roster: PrequalifiedHarborRoster,
+    execution_plan: HarborExecutionPlan,
+) -> None:
+    """Preflight exact provider and resource meters against all frozen execution inputs."""
+    route_by_member = {route.panel_member: route for route in panel_routes}
+    if not route_by_member:
+        raise ValueError("paired budget preflight requires at least one panel route")
+    if set(budget_runtime.provider_meter_by_panel_member) != set(route_by_member):
+        raise ValueError("paired budget runtime routes differ from the frozen panel")
+    for member, route in route_by_member.items():
+        meter_id = budget_runtime.provider_meter_by_panel_member[member]
+        meter = budget_runtime.policy.meters[meter_id]
+        if (
+            not isinstance(meter, ProviderCostMeter)
+            or meter.provider_config.model_dump() != route.provider_config.model_dump()
+        ):
+            raise ValueError(f"paired budget meter for {member!r} differs from its provider route")
+
+    qualified_task_classes = {
+        task.task_resource_class_digest
+        for task in qualification_roster.tasks
+        if task.task_resource_class_digest is not None
+    }
+    if set(budget_runtime.task_resource_meter_by_class_digest) != qualified_task_classes:
+        raise ValueError(
+            "paired task resource meters differ from full-roster E2B qualification classes"
+        )
+
+    runner_spec = execution_plan.runner_spec
+    if isinstance(runner_spec, LocalPiRunnerSpec):
+        if budget_runtime.runner_resource_meter_id is not None:
+            raise ValueError("local Pi runner cannot carry an E2B resource meter")
+        return
+    budget_runtime.runner_resource_account_for(
+        runner_spec=runner_spec,
+        panel_member=next(iter(route_by_member)),
+        arm=PairedArm.BASELINE,
+        run_id="paired-runner-meter-preflight",
+    )
+
+
 class HarborExecutionRuntime(BaseModel):
     """Host-only dataset, artifact-root, and budget coordinates for scored execution."""
 
@@ -895,9 +940,7 @@ class HarborConfirmationExecutionCommitment(BaseModel):
         qualification_roster: PrequalifiedHarborRoster,
         max_concurrent_blocks: int,
         retry_policy_digest: str,
-        budget_policy_digest: str,
-        budget_ledger_identity: str,
-        budget_binding_digest: str,
+        budget_runtime: PairedHarborBudgetRuntime,
     ) -> HarborConfirmationExecutionCommitment:
         """Freeze every held-out execution choice before identities open to the optimizer."""
         frozen_discovery = DiscoveryPartition.model_validate(discovery.model_dump())
@@ -906,6 +949,7 @@ class HarborConfirmationExecutionCommitment(BaseModel):
         )
         frozen_plan = HarborExecutionPlan.model_validate(execution_plan.model_dump())
         frozen_roster = PrequalifiedHarborRoster.model_validate(qualification_roster.model_dump())
+        frozen_budget = PairedHarborBudgetRuntime.model_validate(budget_runtime.model_dump())
         routes = tuple(
             sorted(
                 (
@@ -914,6 +958,12 @@ class HarborConfirmationExecutionCommitment(BaseModel):
                 ),
                 key=lambda route: route.panel_member,
             )
+        )
+        _validate_paired_harbor_budget_runtime(
+            budget_runtime=frozen_budget,
+            panel_routes=routes,
+            qualification_roster=frozen_roster,
+            execution_plan=frozen_plan,
         )
         baseline_envelope = harbor_agent_compute_envelope(
             baseline,
@@ -948,9 +998,9 @@ class HarborConfirmationExecutionCommitment(BaseModel):
             qualification_roster_digest=frozen_roster.digest,
             max_concurrent_blocks=max_concurrent_blocks,
             retry_policy_digest=retry_policy_digest,
-            budget_policy_digest=budget_policy_digest,
-            budget_ledger_identity=budget_ledger_identity,
-            budget_binding_digest=budget_binding_digest,
+            budget_policy_digest=frozen_budget.policy.policy_digest,
+            budget_ledger_identity=frozen_budget.ledger_identity,
+            budget_binding_digest=frozen_budget.binding_digest,
         )
 
     def derive_design(self, confirmation: ConfirmationPartition) -> PairedEvaluationDesign:
@@ -1014,6 +1064,7 @@ def freeze_harbor_confirmation_candidate(
         or manifest.discovery_view() != frozen.discovery
     ):
         raise ValueError("partition manifest differs from the pre-open Harbor commitment")
+    _validate_manifest_qualification_roster(manifest=manifest, commitment=frozen)
     record = freeze_confirmation_candidate(
         control_store,
         manifest=manifest,
@@ -1039,6 +1090,7 @@ def open_harbor_confirmation_once(
         or manifest.discovery_view() != frozen.discovery
     ):
         raise ValueError("partition manifest differs from the pre-open Harbor commitment")
+    _validate_manifest_qualification_roster(manifest=manifest, commitment=frozen)
     confirmation = open_confirmation_once(
         control_store,
         manifest=manifest,
@@ -1046,6 +1098,20 @@ def open_harbor_confirmation_once(
     )
     frozen.derive_design(confirmation)
     return confirmation
+
+
+def _validate_manifest_qualification_roster(
+    *,
+    manifest: BenchmarkPartitionManifest,
+    commitment: HarborConfirmationExecutionCommitment,
+) -> None:
+    """Bind every private manifest task to the qualified pre-open roster."""
+    manifest_tasks = {task.task_id: task.content_digest for task in manifest.tasks}
+    roster_tasks = {
+        task.task_id: task.content_digest for task in commitment.qualification_roster.tasks
+    }
+    if roster_tasks != manifest_tasks:
+        raise ValueError("full qualification roster differs from the private partition manifest")
 
 
 class PairedHarborProtocol(BaseModel):
@@ -1231,9 +1297,6 @@ class PairedHarborProtocol(BaseModel):
         opened_selection: OpenedHarborExecutionSelection,
         max_concurrent_blocks: int = 1,
         retry_policy_digest: str,
-        budget_policy_digest: str,
-        budget_ledger_identity: str,
-        budget_binding_digest: str,
     ) -> PairedHarborProtocol:
         """Freeze paired evidence semantics after deterministic confirmation opening."""
         if (
@@ -1313,7 +1376,7 @@ class PairedHarborProtocol(BaseModel):
                     provider_config=route.provider_config,
                     runner_spec=frozen_plan.runner_spec,
                     turn_timeout_s=frozen_plan.turn_timeout_s,
-                    budget_policy_digest=budget_policy_digest,
+                    budget_policy_digest=frozen_commitment.budget_policy_digest,
                 )
                 route_expectations.append(
                     PairedHarborArmRouteExpectation(
@@ -1347,9 +1410,9 @@ class PairedHarborProtocol(BaseModel):
             max_concurrent_blocks=max_concurrent_blocks,
             arm_route_expectations=tuple(route_expectations),
             retry_policy_digest=retry_policy_digest,
-            budget_policy_digest=budget_policy_digest,
-            budget_ledger_identity=budget_ledger_identity,
-            budget_binding_digest=budget_binding_digest,
+            budget_policy_digest=frozen_commitment.budget_policy_digest,
+            budget_ledger_identity=frozen_commitment.budget_ledger_identity,
+            budget_binding_digest=frozen_commitment.budget_binding_digest,
         )
 
 
@@ -1906,38 +1969,12 @@ class PairedHarborRunner:
         self._qualifications = {
             task.task_id: task for task in self._protocol.opened_selection.tasks
         }
-        if set(self._budget_runtime.provider_meter_by_panel_member) != set(self._routes):
-            raise ValueError("paired budget runtime routes differ from the frozen panel")
-        for member, route in self._routes.items():
-            meter_id = self._budget_runtime.provider_meter_by_panel_member[member]
-            meter = self._budget_runtime.policy.meters[meter_id]
-            if (
-                not isinstance(meter, ProviderCostMeter)
-                or meter.provider_config.model_dump() != route.provider_config.model_dump()
-            ):
-                raise ValueError(
-                    f"paired budget meter for {member!r} differs from its provider route"
-                )
-        qualified_task_classes = {
-            task.task_resource_class_digest
-            for task in self._protocol.qualification_roster.tasks
-            if task.task_resource_class_digest is not None
-        }
-        if set(self._budget_runtime.task_resource_meter_by_class_digest) != qualified_task_classes:
-            raise ValueError(
-                "paired task resource meters differ from full-roster E2B qualification classes"
-            )
-        runner_spec = self._protocol.execution_plan.runner_spec
-        if isinstance(runner_spec, LocalPiRunnerSpec):
-            if self._budget_runtime.runner_resource_meter_id is not None:
-                raise ValueError("local Pi runner cannot carry an E2B resource meter")
-        else:
-            self._budget_runtime.runner_resource_account_for(
-                runner_spec=runner_spec,
-                panel_member=self._protocol.design.panel_members[0],
-                arm=PairedArm.BASELINE,
-                run_id="paired-runner-meter-preflight",
-            )
+        _validate_paired_harbor_budget_runtime(
+            budget_runtime=self._budget_runtime,
+            panel_routes=self._protocol.panel_routes,
+            qualification_roster=self._protocol.qualification_roster,
+            execution_plan=self._protocol.execution_plan,
+        )
 
     async def run(
         self,
@@ -1958,9 +1995,6 @@ class PairedHarborRunner:
             opened_selection=self._protocol.opened_selection,
             max_concurrent_blocks=self._protocol.max_concurrent_blocks,
             retry_policy_digest=self._protocol.retry_policy_digest,
-            budget_policy_digest=self._protocol.budget_policy_digest,
-            budget_ledger_identity=self._protocol.budget_ledger_identity,
-            budget_binding_digest=self._protocol.budget_binding_digest,
         )
         if reconstructed != self._protocol:
             raise ValueError("runtime inputs do not reconstruct the frozen paired Harbor protocol")
