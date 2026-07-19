@@ -176,18 +176,21 @@ _MODELS: tuple[ProviderModel, ...] = (
         model_type="gpt-5.5",
         model_id="gpt-5.5",
         forward_temperature=False,
+        reasoning_efforts=_OPENAI_GPT_54_55_REASONING_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.AZURE_OPENAI,
         model_type="gpt-5.4",
         model_id="gpt-5.4",
         forward_temperature=False,
+        reasoning_efforts=_OPENAI_GPT_54_55_REASONING_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.AZURE_OPENAI,
         model_type="gpt-5.4-mini",
         model_id="gpt-5.4-mini",
         forward_temperature=False,
+        reasoning_efforts=_OPENAI_GPT_54_55_REASONING_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.AZURE_OPENAI,

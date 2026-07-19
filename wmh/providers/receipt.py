@@ -181,11 +181,15 @@ def validate_chat_provider_receipt(
     expected_temperature = (
         requested_temperature if provider_config.resolved_chat_forward_temperature() else None
     )
-    expected_max_tokens_field = (
-        "inferenceConfig.maxTokens"
-        if provider_config.kind is ProviderKind.BEDROCK
-        else provider_config.resolved_chat_max_tokens_field()
-    )
+    if provider_config.kind is ProviderKind.BEDROCK:
+        expected_max_tokens_field = "inferenceConfig.maxTokens"
+    elif (
+        provider_config.kind is ProviderKind.AZURE_OPENAI
+        and provider_config.reasoning_effort is not None
+    ):
+        expected_max_tokens_field = "max_output_tokens"
+    else:
+        expected_max_tokens_field = provider_config.resolved_chat_max_tokens_field()
     if receipt.provider != provider_config.kind.value:
         raise ValueError("provider receipt disagrees with the frozen provider")
     if receipt.requested_model != requested_chat_model(provider_config):

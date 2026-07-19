@@ -172,6 +172,43 @@ def test_meta_role_resolves_canonical_bedrock_model_and_reasoning_effort(
     assert config.reasoning_effort == "max"
 
 
+def test_meta_role_resolves_azure_reasoning_to_explicit_v1_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / ".wmh"
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                meta=ModelRole(
+                    provider="azure",
+                    model="gpt-5.5",
+                    endpoint="https://example.openai.azure.com",
+                    deployment="gpt55-deploy",
+                    api_version="2024-10-21",
+                    reasoning_effort="high",
+                )
+            )
+        ),
+        root,
+    )
+    configs: list[ProviderConfig] = []
+
+    def fake_get_provider(config: ProviderConfig) -> _Provider:
+        configs.append(config)
+        return _Provider()
+
+    monkeypatch.setattr(model_roles_module, "get_provider", fake_get_provider)
+
+    _, configured_model = resolve_opt_in_model_provider(str(root), "meta", _Provider())
+
+    assert configured_model == "gpt-5.5"
+    [config] = configs
+    assert config.reasoning_effort == "high"
+    assert config.api_version == "2024-10-21"
+    assert config.responses_api_version == "v1"
+    assert config.model_dump(mode="json")["responses_api_version"] == "v1"
+
+
 def test_proposer_reasoning_setting_does_not_mutate_unset_agent_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, cast
 
 from llm_waterfall import ChatReasoningDetail, ChatRequest, ChatResponse
 from pydantic import JsonValue
+
+from wmh.providers.receipt import ProviderRequestPayload, build_chat_provider_receipt
 
 _RESPONSES_REASONING_ENVELOPE_FORMAT = "openai.responses.output.v1"
 
@@ -158,7 +161,12 @@ def responses_response(
         message["tool_calls"] = tool_calls
     if has_reasoning and tool_calls:
         response_model = raw.get("model")
-        origin_model = response_model if isinstance(response_model, str) else requested_model
+        # Bind opaque state to the provider-controlled requested route. A service may report a
+        # dated snapshot (OpenAI) or a base model family behind a deployment alias (Azure); both
+        # must replay through the same requested route, not be rejected as a foreign model.
+        origin_model = requested_model or (
+            response_model if isinstance(response_model, str) else None
+        )
         if not isinstance(origin_model, str) or not origin_model:
             raise ValueError("Responses reasoning output is missing its originating model")
         first_call_id = cast("str", tool_calls[0]["id"])
@@ -184,6 +192,12 @@ def responses_response(
     model = raw.get("model")
     if isinstance(model, str):
         response["model"] = model
+    response_id = raw.get("id")
+    if isinstance(response_id, str):
+        response["id"] = response_id
+    system_fingerprint = raw.get("system_fingerprint")
+    if isinstance(system_fingerprint, str):
+        response["system_fingerprint"] = system_fingerprint
 
     usage = _object_dict(raw.get("usage"))
     if usage is not None:
@@ -206,6 +220,8 @@ def complete_chat(
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
     allow_sampling: bool = True,
+    receipt_provider: str | None = None,
+    provider_request_id_headers: tuple[str, ...] = (),
 ) -> ChatResponse:
     """Run a structured chat turn against an OpenAI SDK Responses resource.
 
@@ -216,6 +232,10 @@ def complete_chat(
         reasoning_effort: Provider-controlled reasoning effort.
         service_tier: Provider-controlled service tier.
         allow_sampling: Whether compatible non-reasoning models may receive sampling fields.
+        receipt_provider: Provider identity for a sanitized receipt. When set, the adapter uses
+            the SDK raw-response surface and attaches a receipt if required metadata is present.
+        provider_request_id_headers: Ordered response-header names that may carry the provider's
+            request identity.
 
     Returns:
         Provider-neutral structured chat response.
@@ -224,17 +244,70 @@ def complete_chat(
     # releases. The payload is validated by the narrow translation above, so keep that churn at
     # this one SDK boundary instead of leaking Any through the runtime contract.
     resource = cast("Any", responses)
-    sdk_response = resource.create(
-        **responses_request(
-            request,
-            model,
-            reasoning_effort=reasoning_effort,
-            service_tier=service_tier,
-            allow_sampling=allow_sampling,
-        )
+    payload = responses_request(
+        request,
+        model,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
+        allow_sampling=allow_sampling,
     )
+    if receipt_provider is None:
+        sdk_response = resource.create(**payload)
+        raw = cast("dict[str, object]", sdk_response.model_dump(mode="json"))
+        return responses_response(raw, model)
+    if not provider_request_id_headers:
+        raise ValueError("Responses receipt requires at least one provider request id header")
+
+    started_at = time.time()
+    raw_api_response = resource.with_raw_response.create(**payload)
+    sdk_response = raw_api_response.parse()
+    finished_at = time.time()
     raw = cast("dict[str, object]", sdk_response.model_dump(mode="json"))
-    return responses_response(raw, model)
+    response = responses_response(raw, model).model_copy(update={"provider_receipt": None})
+    provider_request_id = next(
+        (
+            value
+            for header in provider_request_id_headers
+            if isinstance((value := raw_api_response.headers.get(header)), str) and value
+        ),
+        None,
+    )
+    response_id = raw.get("id")
+    response_model = raw.get("model")
+    system_fingerprint = raw.get("system_fingerprint")
+    max_output_tokens = payload.get("max_output_tokens")
+    temperature = payload.get("temperature")
+    if (
+        provider_request_id is None
+        or not isinstance(response_id, str)
+        or not response_id
+        or not isinstance(response_model, str)
+        or not response_model
+        or (system_fingerprint is not None and not isinstance(system_fingerprint, str))
+        or isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or max_output_tokens < 1
+        or (
+            temperature is not None
+            and (isinstance(temperature, bool) or not isinstance(temperature, (int, float)))
+        )
+    ):
+        return response
+    receipt = build_chat_provider_receipt(
+        provider=receipt_provider,
+        provider_request_id=provider_request_id,
+        response_id=response_id,
+        requested_model=model,
+        response_model=response_model,
+        system_fingerprint=system_fingerprint,
+        request_payload=cast("ProviderRequestPayload", payload),
+        temperature=float(temperature) if temperature is not None else None,
+        max_tokens=max_output_tokens,
+        max_tokens_field="max_output_tokens",
+        started_at_unix_s=started_at,
+        finished_at_unix_s=finished_at,
+    )
+    return response.model_copy(update={"provider_receipt": receipt})
 
 
 def _responses_input(request: ChatRequest, model: str) -> list[dict[str, object]]:

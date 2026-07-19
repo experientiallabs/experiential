@@ -16,6 +16,7 @@ OptInModelRole = Literal["agent", "meta"]
 # Azure OpenAI chat completions need an API version on every call. When an opt-in role does not
 # pin one in settings, this shared default API version applies.
 _DEFAULT_AZURE_API_VERSION = "2024-05-01-preview"
+_AZURE_REASONING_RESPONSES_API_VERSION = "v1"
 
 
 def resolve_opt_in_model_provider(
@@ -50,6 +51,11 @@ def resolve_opt_in_model_provider(
     api_version = configured.api_version
     if api_version is None and kind is ProviderKind.AZURE_OPENAI:
         api_version = _DEFAULT_AZURE_API_VERSION
+    responses_api_version = (
+        _AZURE_REASONING_RESPONSES_API_VERSION
+        if kind is ProviderKind.AZURE_OPENAI and configured.reasoning_effort is not None
+        else None
+    )
     model = resolve_provider_model(kind, configured.model)
     config = ProviderConfig(
         kind=kind,
@@ -60,5 +66,6 @@ def resolve_opt_in_model_provider(
         deployment=configured.deployment,
         api_version=api_version,
         reasoning_effort=configured.reasoning_effort,
+        responses_api_version=responses_api_version,
     )
     return get_provider(config), configured.model

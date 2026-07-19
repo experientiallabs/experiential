@@ -137,6 +137,21 @@ def test_to_backend_preserves_reasoning_effort() -> None:
     assert to_backend(config).reasoning_effort == "max"
 
 
+def test_to_backend_rejects_azure_reasoning_profile_instead_of_dropping_it() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        endpoint="https://example.openai.azure.com",
+        deployment="gpt55-deploy",
+        api_version="2024-10-21",
+        reasoning_effort="high",
+        responses_api_version="v1",
+    )
+
+    with pytest.raises(ValueError, match="native AzureOpenAIProvider Responses route"):
+        to_backend(config)
+
+
 def test_to_backend_rejects_kinds_without_real_adapters() -> None:
     # openai_responses has no package equivalent (the package speaks chat-completions).
     with pytest.raises(ValueError, match="no llm-waterfall backend"):

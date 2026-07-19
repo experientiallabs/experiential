@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Literal, Protocol, Self, runtime_checkable
 
@@ -91,6 +92,12 @@ class ProviderConfig(BaseModel):
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
     reasoning_effort: ReasoningEffort | None = None
+    # Azure reasoning/tool calls use the native Responses route alongside the dated Chat API.
+    # Omit this field from unrelated persisted configs so existing identities remain stable.
+    responses_api_version: Literal["v1"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     # The serialized default stays stable for persisted configs. When callers do not explicitly
     # set this field, built-in models resolve it from the canonical ProviderModel catalog.
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
@@ -98,6 +105,18 @@ class ProviderConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_reasoning_effort(self) -> Self:
         """Reject settings that the selected provider and model cannot honor."""
+        if self.responses_api_version is not None and (
+            self.kind is not ProviderKind.AZURE_OPENAI or self.reasoning_effort is None
+        ):
+            raise ValueError(
+                "responses_api_version is supported only by Azure reasoning configuration"
+            )
+        if (
+            self.kind is ProviderKind.AZURE_OPENAI
+            and self.reasoning_effort is not None
+            and self.responses_api_version != "v1"
+        ):
+            raise ValueError("Azure reasoning configuration requires responses_api_version='v1'")
         if self.reasoning_effort is None:
             return self
         from wmh.providers.models import resolve_provider_model
@@ -222,9 +241,33 @@ _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 
 # Ping output budget. Reasoning models (GPT-5.x) spend output tokens on reasoning before any
 # visible text, and OpenAI 400s ("max_tokens or model output limit was reached") when the budget
-# can't cover it — which reads like bad credentials. Non-reasoning models stop after a token or
-# two regardless, so the headroom costs nothing there.
+# can't cover it. Non-reasoning models stop after a token or two regardless, so the headroom costs
+# nothing there.
 PING_MAX_TOKENS = 2048
+
+_STRUCTURED_TOOL_PING = ChatRequest.model_validate(
+    {
+        "messages": [{"role": "user", "content": "Call health_check exactly once."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "health_check",
+                    "description": "Verify structured tool-call availability.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                },
+            }
+        ],
+        "tool_choice": "required",
+        "max_completion_tokens": PING_MAX_TOKENS,
+        "store": False,
+    }
+)
 
 # Belt-and-suspenders for the above: if a reasoning model spends even the larger ping budget on
 # reasoning before emitting output, the resulting error still PROVES the model is reachable (auth
@@ -243,16 +286,48 @@ def verify_via_ping(provider: Provider) -> VerifyResult:
     Every backend's verify() is identical apart from its kind/model (both on the config), so they
     all delegate here. Never raises — `verify_all` relies on that to not crash startup.
     """
-    cfg = provider.config
+    return _verify_call(
+        provider.config,
+        lambda: provider.complete("", _PING_MESSAGES, max_tokens=PING_MAX_TOKENS),
+        accept_output_limit_reachability=True,
+    )
+
+
+def verify_via_structured_tool_ping(provider: SingleDispatchProvider) -> VerifyResult:
+    """Verify the operative structured tool route with exactly one bounded dispatch."""
+
+    def call() -> object:
+        response = provider.complete_chat(_STRUCTURED_TOOL_PING)
+        if not response.choices:
+            raise ValueError("structured provider verification returned no choices")
+        calls = response.choices[0].message.tool_calls or []
+        if not any(call.function.name == "health_check" for call in calls):
+            raise ValueError("structured provider verification returned no health_check call")
+        if response.provider_receipt is None:
+            raise ValueError("structured provider verification returned no provider receipt")
+        return response
+
+    return _verify_call(provider.config, call, accept_output_limit_reachability=False)
+
+
+def _verify_call(
+    config: ProviderConfig,
+    call: Callable[[], object],
+    *,
+    accept_output_limit_reachability: bool,
+) -> VerifyResult:
+    """Run one verification dispatch with shared reasoning-limit semantics."""
     try:
-        provider.complete("", _PING_MESSAGES, max_tokens=PING_MAX_TOKENS)
+        call()
     except Exception as exc:  # noqa: BLE001 - verify reports failure, never raises
         # A max-tokens/output-limit error confirms reachability: the request reached the model
         # (auth + model id are valid) and only failed because a reasoning model consumed the 1-token
         # ping budget before producing output. Anything else (auth, missing model, network) is a
         # real failure.
         msg = str(exc).lower()
-        if any(marker in msg for marker in _REACHABLE_ERROR_MARKERS):
-            return VerifyResult(ok=True, kind=cfg.kind, model=cfg.model)
-        return VerifyResult(ok=False, kind=cfg.kind, model=cfg.model, detail=str(exc))
-    return VerifyResult(ok=True, kind=cfg.kind, model=cfg.model)
+        if accept_output_limit_reachability and any(
+            marker in msg for marker in _REACHABLE_ERROR_MARKERS
+        ):
+            return VerifyResult(ok=True, kind=config.kind, model=config.model)
+        return VerifyResult(ok=False, kind=config.kind, model=config.model, detail=str(exc))
+    return VerifyResult(ok=True, kind=config.kind, model=config.model)

@@ -53,6 +53,7 @@ def complete(
     messages: list[Message],
     max_tokens: int,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
 ) -> Completion:
     """Run one chat completion and map it onto our `Completion`.
 
@@ -60,31 +61,27 @@ def complete(
     `temperature` is sent ONLY when given: GPT 5.5's reasoning models reject non-default sampling
     params (callers pass None), while OpenAI-compatible servers (vLLM policies) need it.
     """
-    if temperature is None:
-        response = chat_completions.create(
-            model=model,
-            messages=to_messages(system, messages),
-            max_completion_tokens=max_tokens,
-        )
-    else:
-        try:
-            response = chat_completions.create(
-                model=model,
-                messages=to_messages(system, messages),
-                max_completion_tokens=max_tokens,
-                temperature=temperature,
-            )
-        except BadRequestError as exc:
-            # Reasoning-model deployments (GPT-5.x behind Azure/custom endpoints) reject any
-            # non-default temperature with a 400 unsupported_value. The caller can't know which
-            # models sample; degrade to the model's default rather than failing the request.
-            if "temperature" not in str(exc):
-                raise
-            response = chat_completions.create(
-                model=model,
-                messages=to_messages(system, messages),
-                max_completion_tokens=max_tokens,
-            )
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": to_messages(system, messages),
+        "max_completion_tokens": max_tokens,
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if reasoning_effort is not None:
+        # This is provider-owned configuration, never a caller-controlled request extra.
+        payload["reasoning_effort"] = reasoning_effort
+    resource = cast("Any", chat_completions)
+    try:
+        response = resource.create(**payload)
+    except BadRequestError as exc:
+        # Reasoning-model deployments (GPT-5.x behind Azure/custom endpoints) reject any
+        # non-default temperature with a 400 unsupported_value. The caller can't know which
+        # models sample; degrade to the model's default rather than failing the request.
+        if temperature is None or "temperature" not in str(exc):
+            raise
+        payload.pop("temperature")
+        response = resource.create(**payload)
     if not response.choices:
         # Content filtering (and some error modes) can return zero choices; surface it clearly
         # rather than letting choices[0] raise a bare IndexError.

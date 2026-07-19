@@ -75,6 +75,11 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
             f"provider kind {config.kind.value!r} has no llm-waterfall backend; supported: "
             f"{', '.join(sorted(k.value for k in _SUPPORTED_KINDS))}"
         )
+    if config.kind is ProviderKind.AZURE_OPENAI and config.reasoning_effort is not None:
+        raise ValueError(
+            "Azure reasoning profiles require the native AzureOpenAIProvider Responses route; "
+            "llm-waterfall Azure backends use Chat Completions and cannot preserve this profile"
+        )
     return Backend(
         provider,
         config.model,

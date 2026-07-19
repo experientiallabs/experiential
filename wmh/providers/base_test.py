@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from wmh.providers.base import (
     PING_MAX_TOKENS,
     Completion,
@@ -86,3 +88,28 @@ def test_verify_reports_real_failures() -> None:
     result = verify_via_ping(_RaisingProvider(exc))
     assert not result.ok
     assert "401" in (result.detail or "")
+
+
+def test_responses_api_version_is_omitted_from_unrelated_config_identity() -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="zai.glm-5")
+
+    assert "responses_api_version" not in config.model_dump(mode="json")
+
+
+def test_responses_api_version_is_rejected_outside_azure() -> None:
+    with pytest.raises(ValueError, match="only by Azure reasoning"):
+        ProviderConfig(
+            kind=ProviderKind.OPENAI_RESPONSES,
+            model="gpt-5.5",
+            reasoning_effort="high",
+            responses_api_version="v1",
+        )
+
+
+def test_responses_api_version_is_rejected_for_unprofiled_azure() -> None:
+    with pytest.raises(ValueError, match="only by Azure reasoning"):
+        ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="gpt-5.5",
+            responses_api_version="v1",
+        )
