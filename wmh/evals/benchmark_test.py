@@ -21,6 +21,7 @@ from wmh.evals.benchmark import (
     BenchmarkTrialStatus,
     BenchmarkUsage,
     BenchmarkUsageStatus,
+    is_sha256_digest,
 )
 
 _RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
@@ -35,6 +36,20 @@ _IDENTITY = BenchmarkRunIdentity(
     runner_image="runner-image",
     run_config_digest=_RUN_CONFIG_DIGEST,
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("sha256:" + "a" * 64, True),
+        ("sha256:" + "A" * 64, False),
+        ("sha256:" + "a" * 63, False),
+        ("md5:" + "a" * 64, False),
+        (None, False),
+    ],
+)
+def test_sha256_digest_validation(value: object, expected: bool) -> None:
+    assert is_sha256_digest(value) is expected
 
 
 def _cell(task_name: str, attempt: int = 1, *, task_key: str | None = None) -> BenchmarkCell:

@@ -115,6 +115,11 @@ class _TaskEnvironmentAttestation:
     evidence: JsonObject
 
 
+# Harbor 0.18 exposes no public API for the exact Docker Compose project or the E2B sandbox that
+# actually ran. WMH pins Harbor to that exact version and centralizes the two private members in
+# these protocol views. Missing members fail agent setup, before any provider request is admitted,
+# rather than silently producing an unattested score. Replace these views when Harbor adds a public
+# immutable environment-identity API.
 class _DockerEnvironmentView(Protocol):
     async def _run_docker_compose_command(
         self,

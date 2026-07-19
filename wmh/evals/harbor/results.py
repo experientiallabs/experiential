@@ -33,6 +33,7 @@ from wmh.evals.benchmark import (
     BenchmarkUsage,
     BenchmarkUsageStatus,
     aggregate_benchmark_usage,
+    is_sha256_digest,
 )
 from wmh.evals.harbor.config import _require_supported_harbor_version
 from wmh.harness.doc import HarnessDoc
@@ -519,7 +520,7 @@ def _parse_task_environment_attestation(
 ) -> str:
     digest = metadata.get(_TASK_ENVIRONMENT_DIGEST_KEY)
     attestation = metadata.get(_TASK_ENVIRONMENT_ATTESTATION_KEY)
-    if not isinstance(digest, str) or not _is_sha256_digest(digest):
+    if not is_sha256_digest(digest):
         raise ValueError("Harbor agent metadata omits a valid task environment digest")
     if not isinstance(attestation, dict):
         raise ValueError("Harbor agent metadata omits task environment attestation evidence")
@@ -541,15 +542,6 @@ def _parse_task_environment_attestation(
     if actual != digest:
         raise ValueError("Harbor task environment attestation does not match its digest")
     return digest
-
-
-def _is_sha256_digest(value: str) -> bool:
-    encoded = value.removeprefix("sha256:")
-    return (
-        value.startswith("sha256:")
-        and len(encoded) == 64
-        and all(character in "0123456789abcdef" for character in encoded)
-    )
 
 
 def _parse_candidate_outcome(metadata: dict[str, object]) -> BenchmarkCandidateOutcome:

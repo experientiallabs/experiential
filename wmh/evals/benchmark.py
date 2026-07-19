@@ -9,11 +9,12 @@ benchmark-specific headline key.
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from collections.abc import Iterable
 from enum import StrEnum
 from statistics import fmean
-from typing import Self
+from typing import Self, TypeGuard
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -21,6 +22,11 @@ RewardValue = float | int
 Rewards = dict[str, RewardValue]
 _SHA256_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 MAX_BENCHMARK_TASK_INSTRUCTION_CHARS = 8_000
+
+
+def is_sha256_digest(value: object) -> TypeGuard[str]:
+    """Return whether ``value`` is one canonical lowercase sha256 digest."""
+    return isinstance(value, str) and re.fullmatch(_SHA256_DIGEST_PATTERN, value) is not None
 
 
 class BenchmarkTaskEnvironment(StrEnum):

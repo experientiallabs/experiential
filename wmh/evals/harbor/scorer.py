@@ -28,6 +28,7 @@ from wmh.evals.benchmark import (
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
     Rewards,
+    is_sha256_digest,
 )
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
@@ -152,7 +153,7 @@ class HarborHarnessScorer:
         if len(set(frozen_task_keys)) != len(frozen_task_keys):
             raise ValueError("task_keys must be unique")
         for task_key in frozen_task_keys:
-            if not _is_sha256_digest(task_key):
+            if not is_sha256_digest(task_key):
                 raise ValueError(
                     "each task_key must be a sha256 digest from a Harbor qualification manifest"
                 )
@@ -160,7 +161,7 @@ class HarborHarnessScorer:
         if len(frozen_environment_digests) != len(frozen_task_ids):
             raise ValueError("task_environment_digests must contain exactly one digest per task_id")
         for environment_digest in frozen_environment_digests:
-            if not _is_sha256_digest(environment_digest):
+            if not is_sha256_digest(environment_digest):
                 raise ValueError(
                     "each task_environment_digest must be a sha256 digest from a Harbor "
                     "qualification run"
@@ -735,6 +736,7 @@ def _read_trace(
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
+                allow_nan=False,
             )
         )
     canonical = "\n".join(canonical_lines)
@@ -896,13 +898,3 @@ def _rewards_digest(rewards: Rewards | None) -> str:
         allow_nan=False,
     )
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def _is_sha256_digest(value: str) -> bool:
-    prefix = "sha256:"
-    digest = value.removeprefix(prefix)
-    return (
-        value.startswith(prefix)
-        and len(digest) == 64
-        and all(character in "0123456789abcdef" for character in digest)
-    )
