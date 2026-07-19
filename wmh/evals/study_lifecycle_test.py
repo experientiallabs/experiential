@@ -167,6 +167,96 @@ def test_controller_publishes_typed_chronology_and_guards_the_active_phase(
     assert calls == ["provider-call"]
 
 
+def test_run_claim_rejects_a_second_fresh_start_but_allows_exact_resume(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    preparation = _preparation()
+    roster = RosterQualifiedPayload(
+        qualified_roster_digest=_digest("roster"),
+        qualification_report_digest=_digest("qualification"),
+        execution_plan_digest=_digest("execution-plan"),
+        qualified_task_count=89,
+    )
+    protocol = ProtocolPublishedPayload(
+        protocol_digest=_digest("protocol"),
+        protocol_artifact_publication_digest=_digest("protocol-publication"),
+        partition_manifest_digest=_digest("partition"),
+        qualified_roster_digest=roster.qualified_roster_digest,
+        search_cost_binding_digest=_digest("search-cost-binding"),
+        confirmation_budget_binding_digest=_digest("confirmation-budget-binding"),
+    )
+    discovery = DiscoveryRunningPayload(
+        protocol_digest=protocol.protocol_digest,
+        search_configuration_digest=_digest("search-configuration"),
+        search_run_id="discovery-run-1",
+    )
+    for payload in (preparation, roster, protocol, discovery):
+        controller.publish(payload)
+
+    claim = controller.claim_run(
+        StudyPhase.DISCOVERY_RUNNING,
+        discovery.search_run_id,
+        payload_digest=discovery.digest,
+        resume=False,
+    )
+
+    assert claim.run_id == discovery.search_run_id
+    with pytest.raises(ValueError, match="already started"):
+        controller.claim_run(
+            StudyPhase.DISCOVERY_RUNNING,
+            discovery.search_run_id,
+            payload_digest=discovery.digest,
+            resume=False,
+        )
+    assert (
+        controller.claim_run(
+            StudyPhase.DISCOVERY_RUNNING,
+            discovery.search_run_id,
+            payload_digest=discovery.digest,
+            resume=True,
+        )
+        == claim
+    )
+
+
+def test_guard_holds_operation_lease_against_a_concurrent_terminal_transition(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    controller.publish(_preparation())
+    stop = StoppedPayload(
+        reason=StudyStopReason.OPERATOR_STOPPED,
+        last_evidence_digest=_digest("preparation-evidence"),
+        spend_ledger_digest=_digest("spend-ledger"),
+        cumulative_paid_cost_microusd=0,
+        detail="Operator requested a stop.",
+    )
+    transition_errors: list[RuntimeError] = []
+
+    def operation() -> str:
+        try:
+            controller.publish(stop)
+        except RuntimeError as error:
+            transition_errors.append(error)
+        return "completed"
+
+    assert (
+        controller.call_in_phase(
+            StudyPhase.PREPARATION_PLANNED,
+            operation,
+            payload_digest=_preparation().digest,
+        )
+        == "completed"
+    )
+    assert len(transition_errors) == 1
+    assert "locked" in str(transition_errors[0])
+    assert controller.current_phase is StudyPhase.PREPARATION_PLANNED
+
+    controller.publish(stop)
+    assert controller.current_phase is StudyPhase.STOPPED
+
+
 def test_candidate_freeze_payload_binds_completed_search_and_cost_evidence() -> None:
     payload = CandidateFrozenPayload(
         protocol_digest=_digest("protocol"),

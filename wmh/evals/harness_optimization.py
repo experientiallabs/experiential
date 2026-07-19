@@ -540,6 +540,12 @@ def run_harness_optimization_search(
         raise ValueError("discovery authorization differs from the optimization protocol")
     _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
     plan = study.protocol.search
+    lifecycle.claim_run(
+        StudyPhase.DISCOVERY_RUNNING,
+        authorization.search_run_id,
+        payload_digest=authorization.digest,
+        resume=resume_from is not None,
+    )
     return lifecycle.call_in_phase(
         StudyPhase.DISCOVERY_RUNNING,
         lambda: search_harness(
