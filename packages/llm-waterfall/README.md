@@ -105,16 +105,22 @@ fails over instead of hanging forever.
 
 ## Cost
 
-A built-in USD-per-Mtok table covers current Claude, GPT-5.x, and embedding models, keyed by
-normalized model id (Bedrock region prefixes and version suffixes are stripped, so
-`us.anthropic.claude-opus-4-8-20260101-v1:0` prices as `claude-opus-4-8`). Unknown models cost
-`0.0`; use `price_for(model)` (returns `None`) to detect unpriced models. Override or extend per
-instance — no global mutation:
+A built-in USD-per-Mtok table covers current direct-provider Claude and GPT-5.x models, embeddings,
+and separately audited Bedrock routes. Waterfall scopes each lookup to the provider that actually
+served. In particular, an Azure deployment never inherits a same-named direct OpenAI rate. Unknown
+routes cost `0.0`; use `price_for(model, provider="openai")` (returns `None`) to detect unpriced
+models. Override or extend per instance with the exact provider route or deployment name; there is
+no global mutation:
 
 ```python
 from llm_waterfall import ModelPrice
 
-wf = Waterfall(backends, prices={"my-azure-deployment": ModelPrice(input_per_mtok=2.5, output_per_mtok=15.0)})
+wf = Waterfall(
+    backends,
+    prices={
+        "my-azure-deployment": ModelPrice(input_per_mtok=2.5, output_per_mtok=15.0)
+    },
+)
 ```
 
 ## Embeddings

@@ -4,7 +4,7 @@ A `RunTracker` collects `UsageEvent`s (one per LLM call, tagged by phase) and ro
 `UsageTotals` (tokens, USD, calls) plus a wall-clock duration measured off an injectable `Clock`.
 `RunRecord` is the persisted artifact (`.wmh/runs/<run_id>.json`).
 
-The tracker is provider-agnostic: it records `(model, TokenUsage)` and prices via
+The tracker records the serving `(provider, model, TokenUsage)` route and prices via
 `wmh.tracking.pricing`. It's fed at the provider boundary by `MeteredProvider` (so GEPA, the judge,
 and the world model are all captured without touching the optimizer), and directly by the world
 model's serve `step`.
@@ -41,6 +41,7 @@ class UsageEvent(BaseModel):
 
     phase: Phase
     model: str
+    provider: str | None = Field(default=None, exclude_if=lambda value: value is None)
     usage: TokenUsage = Field(default_factory=TokenUsage)
     cost_usd: float = 0.0
 
@@ -107,12 +108,25 @@ class RunTracker:
         finally:
             self.stop()
 
-    def record(self, phase: Phase, model: str, usage: TokenUsage) -> UsageEvent:
-        """Record one metered LLM call, pricing it via the model pricing table.
+    def record(
+        self,
+        phase: Phase,
+        model: str,
+        usage: TokenUsage,
+        *,
+        provider: str | None = None,
+    ) -> UsageEvent:
+        """Record one metered LLM call, pricing its serving provider/model route.
 
         Thread-safe: GEPA evaluates batches concurrently, so metered calls land in parallel.
         """
-        event = UsageEvent(phase=phase, model=model, usage=usage, cost_usd=cost_usd(model, usage))
+        event = UsageEvent(
+            phase=phase,
+            model=model,
+            provider=provider,
+            usage=usage,
+            cost_usd=cost_usd(model, usage, provider=provider),
+        )
         with self._lock:
             self._events.append(event)
         return event

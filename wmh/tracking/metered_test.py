@@ -128,3 +128,22 @@ def test_cost_attributed_to_serving_model_not_primary() -> None:
     (event,) = tracker._events
     assert event.model == "claude-haiku-4-5"
     assert event.cost_usd == (100 * 1.0 + 20 * 5.0) / 1_000_000
+
+
+def test_azure_model_name_cannot_inherit_direct_openai_cost() -> None:
+    azure = FakeProvider()
+    azure.config = ProviderConfig(kind=ProviderKind.AZURE_OPENAI, model="gpt-5.5")
+    direct = FakeProvider()
+    direct.config = ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5")
+    azure_tracker = RunTracker(run_id="azure", kind="serve")
+    direct_tracker = RunTracker(run_id="direct", kind="serve")
+
+    MeteredProvider(azure, azure_tracker, base_phase=Phase.SERVE).complete(
+        "anything", [Message(role="user", content="hi")]
+    )
+    MeteredProvider(direct, direct_tracker, base_phase=Phase.SERVE).complete(
+        "anything", [Message(role="user", content="hi")]
+    )
+
+    assert azure_tracker.totals().cost_usd == 0.0
+    assert direct_tracker.totals().cost_usd == (100 * 5.0 + 20 * 30.0) / 1_000_000

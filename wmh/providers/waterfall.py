@@ -6,9 +6,9 @@ aborting when the preferred model throttles. Capacity errors (throttling / trans
 timeouts) spill down the chain; real errors (bad request, auth) propagate immediately.
 
 `config` reports the *primary* config (the model we intend to use); per-call metering is still
-attributed to the model that actually served, via `Completion.model`. The full attempt trail and
-`provider_used` stay on the underlying package result — use `llm_waterfall.Waterfall` directly
-when a caller needs failover observability beyond cost attribution.
+attributed to the route that actually served, via `Completion.model` and `Completion.provider`.
+The full attempt trail stays on the underlying package result; use `llm_waterfall.Waterfall`
+directly when a caller needs failover observability beyond cost attribution.
 
 Note on `embed`: the Provider protocol returns bare vectors, so embed usage/attribution is not
 carried through. Failover also assumes the chain shares one embedding space — keep `embed_model`
@@ -165,6 +165,7 @@ class WaterfallProvider:
                 output_tokens=result.usage.output_tokens,
             ),
             model=result.model_used,  # true attribution even when a fallback served
+            provider=result.provider_used,
         )
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:

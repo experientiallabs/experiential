@@ -62,6 +62,12 @@ class Completion(BaseModel):
     # the call. None (the norm) means "the configured model" — metering falls back to config.
     # min_length=1 keeps "" impossible, so `completion.model or config.model` is exact.
     model: str | None = Field(default=None, min_length=1)
+    # The provider that actually served a failover call. None means the configured provider.
+    provider: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     # OpenAI-compatible providers can report a backend fingerprint independently of the served
     # model. Preserve explicit absence so a frozen scored route can distinguish it from a value.
     system_fingerprint: str | None = Field(default=None, min_length=1, max_length=512)

@@ -142,6 +142,17 @@ def test_step_meters_usage_per_session() -> None:
     assert usage.total.cost_usd == pytest.approx(0.0027)
 
 
+def test_step_does_not_price_azure_as_direct_openai() -> None:
+    provider = _UsageProvider('{"output": "ok", "is_error": false}')
+    provider.config = ProviderConfig(kind=ProviderKind.AZURE_OPENAI, model="gpt-5.5")
+    wm = WorldModel(provider, _retriever_with([]), top_k=1)
+    session = wm.new_session(task="t")
+
+    wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="f", arguments={}))
+
+    assert wm.session_usage(session.id).total.cost_usd == 0.0
+
+
 class _SequenceProvider(FakeProvider):
     """Returns queued replies in order (for the grounding two-completion flow)."""
 

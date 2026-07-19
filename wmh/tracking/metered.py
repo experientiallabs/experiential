@@ -80,7 +80,8 @@ class MeteredProvider:
         # configured model otherwise (Completion.model validates non-empty, so `or` is exact).
         # Pricing a failed-over call at the primary's rate would silently mis-report cost.
         model = completion.model or self._provider.config.model
-        self._tracker.record(phase, model, completion.usage)
+        provider = completion.provider or self._provider.config.kind.value
+        self._tracker.record(phase, model, completion.usage, provider=provider)
         return completion
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -89,7 +90,12 @@ class MeteredProvider:
         # (`embed_model`), not the completion model, so any future embed pricing is keyed right.
         vectors = self._provider.embed(texts)
         embed_model = self._provider.config.embed_model or self._provider.config.model
-        self._tracker.record(Phase.EMBED, embed_model, TokenUsage())
+        self._tracker.record(
+            Phase.EMBED,
+            embed_model,
+            TokenUsage(),
+            provider=self._provider.config.kind.value,
+        )
         return vectors
 
     def verify(self) -> VerifyResult:

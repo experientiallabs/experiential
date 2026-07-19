@@ -45,7 +45,42 @@ def test_overrides_win_and_do_not_mutate_table() -> None:
 def test_override_adds_unknown_model() -> None:
     override = {"my-azure-deployment": ModelPrice(input_per_mtok=2.5, output_per_mtok=15.0)}
     usage = TokenUsage(input_tokens=2_000_000, output_tokens=0)
-    assert cost_usd("my-azure-deployment", usage, prices=override) == 5.0
+    assert (
+        cost_usd(
+            "my-azure-deployment",
+            usage,
+            prices=override,
+            provider="azure_openai",
+        )
+        == 5.0
+    )
+
+
+def test_azure_cannot_inherit_a_direct_openai_price() -> None:
+    direct = price_for("gpt-5.5", provider="openai")
+
+    assert direct == ModelPrice(input_per_mtok=5.0, output_per_mtok=30.0)
+    assert price_for("gpt-5.5", provider="azure_openai") is None
+    # WMH spells the same provider kind "azure"; accepting that alias keeps its adapter exact.
+    assert price_for("gpt-5.5", provider="azure") is None
+    assert price_for("gpt-5.5", provider="anthropic") is None
+    assert price_for("claude-opus-4-8", provider="openai") is None
+    assert price_for("gpt-5.5", provider="unknown") is None
+
+
+def test_azure_override_is_scoped_to_the_exact_deployment() -> None:
+    override = {"azure-gpt-production": ModelPrice(input_per_mtok=1.25, output_per_mtok=9.75)}
+
+    assert price_for(
+        "azure-gpt-production",
+        prices=override,
+        provider="azure_openai",
+    ) == ModelPrice(input_per_mtok=1.25, output_per_mtok=9.75)
+    assert price_for("gpt-5.5", prices=override, provider="azure_openai") is None
+    assert price_for("gpt-5.5", prices=override, provider="openai") == ModelPrice(
+        input_per_mtok=5.0,
+        output_per_mtok=30.0,
+    )
 
 
 def test_other_unaudited_inference_profile_prefixes_are_unpriced() -> None:

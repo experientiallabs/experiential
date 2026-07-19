@@ -50,6 +50,13 @@ _DEFAULT_RETRY = RetryPolicy()
 _PING_MESSAGES = [Message(role="user", content="ping")]
 
 
+def _completion_price_model(backend: Backend) -> str:
+    """Return the exact billing identity for a completion request."""
+    if backend.provider == "azure_openai":
+        return backend.deployment or backend.model
+    return backend.model
+
+
 class Waterfall:
     """An immutable, thread-safe failover chain over `Backend`s."""
 
@@ -98,7 +105,12 @@ class Waterfall:
             model_used=backend.model,
             provider_used=backend.provider,
             usage=usage,
-            cost_usd=cost_usd(backend.model, usage, self._prices),
+            cost_usd=cost_usd(
+                _completion_price_model(backend),
+                usage,
+                self._prices,
+                provider=backend.provider,
+            ),
             attempts=attempts,
         )
 
@@ -117,7 +129,12 @@ class Waterfall:
             model_used=backend.model,
             provider_used=backend.provider,
             usage=usage,
-            cost_usd=cost_usd(backend.model, usage, self._prices),
+            cost_usd=cost_usd(
+                _completion_price_model(backend),
+                usage,
+                self._prices,
+                provider=backend.provider,
+            ),
             attempts=attempts,
         )
 
@@ -145,7 +162,12 @@ class Waterfall:
             model_used=embed_model,
             provider_used=backend.provider,
             usage=usage,
-            cost_usd=cost_usd(embed_model, usage, self._prices),
+            cost_usd=cost_usd(
+                embed_model,
+                usage,
+                self._prices,
+                provider=backend.provider,
+            ),
             attempts=attempts,
         )
 

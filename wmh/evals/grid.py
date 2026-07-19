@@ -247,9 +247,9 @@ def _make_target(spec: ModelSpec, factory) -> Provider:  # noqa: ANN001 - factor
     return factory(ProviderConfig(kind=kind, model=spec.model, region=spec.region))
 
 
-def _target_cost(model: str, tracker: RunTracker) -> float | None:
+def _target_cost(provider: str, model: str, tracker: RunTracker) -> float | None:
     """Target-side USD from the metered tracker, or None when the model has no pricing row."""
-    if price_for(model) is None:
+    if price_for(model, provider=provider) is None:
         return None
     return tracker.totals().cost_usd
 
@@ -388,7 +388,7 @@ def run_grid(
                     fidelity=fidelity,
                     error_flag_acc=err,
                     n_steps=steps,
-                    cost_usd=_target_cost(spec.model, tracker),
+                    cost_usd=_target_cost(spec.provider, spec.model, tracker),
                 )
             )
     return result

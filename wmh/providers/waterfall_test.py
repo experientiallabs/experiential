@@ -166,6 +166,7 @@ def test_complete_maps_to_wmh_completion() -> None:
     assert completion.usage.input_tokens == 5 and completion.usage.output_tokens == 2
     # The served model (sonnet fallback), not the configured primary (opus).
     assert completion.model == "us.anthropic.claude-sonnet-4-6"
+    assert completion.provider == "bedrock"
     call = fake.complete_calls[0]
     assert call["system"] == "sys" and call["max_tokens"] == 64
     # Temperature is intentionally not forwarded (current models reject sampling params).

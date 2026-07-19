@@ -44,9 +44,17 @@ def test_bedrock_glm_5_uses_the_verified_nominal_price() -> None:
 
 def test_gpt_5_5_output_is_30_per_mtok() -> None:
     # Verified 2026-06-25 against OpenAI's live pricing page: gpt-5.5 is $5 in / $30 out.
-    price = price_for("gpt-5.5")
+    price = price_for("gpt-5.5", provider="openai")
     assert price is not None
     assert (price.input_per_mtok, price.output_per_mtok) == (5.0, 30.0)
+
+
+def test_azure_gpt_does_not_reuse_the_direct_openai_rate() -> None:
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+
+    assert cost_usd("gpt-5.5", usage, provider="openai") == pytest.approx(35.0)
+    assert price_for("gpt-5.5", provider="azure") is None
+    assert cost_usd("gpt-5.5", usage, provider="azure") == 0.0
 
 
 def test_fable_5_is_10_in_50_out() -> None:

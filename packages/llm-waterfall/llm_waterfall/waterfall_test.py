@@ -161,6 +161,35 @@ def test_failover_attributes_cost_to_serving_backend() -> None:
     assert r.cost_usd == pytest.approx((100 * 3.0 + 10 * 15.0) / 1_000_000)
 
 
+def test_azure_does_not_reuse_direct_openai_price_for_the_same_model() -> None:
+    direct = Backend("openai", "gpt-5.5")
+    azure = Backend("azure_openai", "gpt-5.5", deployment="gpt-5.5-production")
+
+    direct_result = Waterfall(
+        [direct], adapter_factory=lambda backend: FakeAdapter(backend, [])
+    ).complete(messages=MSGS)
+    azure_result = Waterfall(
+        [azure], adapter_factory=lambda backend: FakeAdapter(backend, [])
+    ).complete(messages=MSGS)
+
+    assert direct_result.cost_usd == pytest.approx((100 * 5.0 + 10 * 30.0) / 1_000_000)
+    assert azure_result.cost_usd == 0.0
+
+
+def test_azure_prices_an_explicit_override_by_deployment() -> None:
+    backend = Backend("azure_openai", "gpt-5.5", deployment="azure-gpt-production")
+    override = {"azure-gpt-production": ModelPrice(input_per_mtok=1.25, output_per_mtok=9.75)}
+
+    result = Waterfall(
+        [backend],
+        prices=override,
+        adapter_factory=lambda candidate: FakeAdapter(candidate, []),
+    ).complete(messages=MSGS)
+
+    assert result.model_used == "gpt-5.5"
+    assert result.cost_usd == pytest.approx((100 * 1.25 + 10 * 9.75) / 1_000_000)
+
+
 def test_structured_chat_uses_the_same_failover_and_attribution() -> None:
     wf, _ = _waterfall({"primary": [_Throttle()], "fallback": []})
 

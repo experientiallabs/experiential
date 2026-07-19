@@ -11,8 +11,15 @@ from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 class _StubProvider:
     """Returns `text`, or raises `raises` on complete()."""
 
-    def __init__(self, name: str, *, text: str = "", raises: Exception | None = None) -> None:
-        self.config = ProviderConfig(kind=ProviderKind.BEDROCK, model=name)
+    def __init__(
+        self,
+        name: str,
+        *,
+        kind: ProviderKind = ProviderKind.BEDROCK,
+        text: str = "",
+        raises: Exception | None = None,
+    ) -> None:
+        self.config = ProviderConfig(kind=kind, model=name)
         self._text = text
         self._raises = raises
         self.calls = 0
@@ -51,9 +58,16 @@ def test_uses_primary_when_healthy() -> None:
 
 def test_fails_over_on_capacity_error() -> None:
     primary = _StubProvider("opus-4-8", raises=RuntimeError("ThrottlingException: slow down"))
-    backup = _StubProvider("opus-4-8-direct", text="from-backup")
+    backup = _StubProvider(
+        "opus-4-8-direct",
+        kind=ProviderKind.ANTHROPIC,
+        text="from-backup",
+    )
     fo = SameModelFailover([primary, backup])
-    assert fo.complete("s", _msg()).text == "from-backup"
+    completion = fo.complete("s", _msg())
+    assert completion.text == "from-backup"
+    assert completion.model == "opus-4-8-direct"
+    assert completion.provider == "anthropic"
     assert primary.calls == 1 and backup.calls == 1
 
 

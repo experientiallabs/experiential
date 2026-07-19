@@ -456,7 +456,13 @@ class WorldModel:
         if tracker is not None:
             # Prefer the model that actually served (failover chains set completion.model).
             served = completion.model or self._provider.config.model
-            event = tracker.record(Phase.SERVE, served, completion.usage)
+            provider = completion.provider or self._provider.config.kind.value
+            event = tracker.record(
+                Phase.SERVE,
+                served,
+                completion.usage,
+                provider=provider,
+            )
             if event.cost_usd is not None:
                 usage.cost_usd = (usage.cost_usd or 0.0) + event.cost_usd
         return parse_observation(completion.text)
@@ -490,7 +496,13 @@ class WorldModel:
         if tracker is not None:
             # Prefer the model that actually served (failover chains set completion.model).
             served = completion.model or self._provider.config.model
-            event = tracker.record(Phase.SERVE, served, completion.usage)
+            provider = completion.provider or self._provider.config.kind.value
+            event = tracker.record(
+                Phase.SERVE,
+                served,
+                completion.usage,
+                provider=provider,
+            )
             if event.cost_usd is not None:
                 usage.cost_usd = (usage.cost_usd or 0.0) + event.cost_usd
         return parse_observation(completion.text)

@@ -151,6 +151,8 @@ def test_grid_cost_is_none_for_unpriced_model(tmp_path) -> None:  # noqa: ANN001
         models=[
             ModelSpec("Opus 4.8", "bedrock", "us.anthropic.claude-opus-4-8"),
             ModelSpec("Qwen", "openai", "qwen-mystery-model-no-price"),
+            ModelSpec("Direct GPT", "openai", "gpt-5.5"),
+            ModelSpec("Azure GPT", "azure", "gpt-5.5"),
         ],
         gepa_prompts=None,
         base_prompt="BASE PROMPT",
@@ -166,9 +168,13 @@ def test_grid_cost_is_none_for_unpriced_model(tmp_path) -> None:  # noqa: ANN001
     )
     opus = next(c for c in result.cells if c.model_label == "Opus 4.8")
     qwen = next(c for c in result.cells if c.model_label == "Qwen")
+    direct_gpt = next(c for c in result.cells if c.model_label == "Direct GPT")
+    azure_gpt = next(c for c in result.cells if c.model_label == "Azure GPT")
     # Priced model -> real (maybe 0.0) target cost; unpriced -> None (omit label), not a fake 0.
     assert opus.cost_usd is not None
     assert qwen.cost_usd is None
+    assert direct_gpt.cost_usd is not None
+    assert azure_gpt.cost_usd is None
     # Every cell yields a fidelity in [0, 1] and scores the (fallback) held-out step.
     assert 0.0 <= opus.fidelity <= 1.0
     assert opus.n_steps == 1

@@ -9,7 +9,7 @@ from llm_waterfall.pricing import cost_usd as waterfall_cost_usd
 from wmh.providers.base import TokenUsage
 
 
-def cost_usd(model: str, usage: TokenUsage) -> float:
+def cost_usd(model: str, usage: TokenUsage, *, provider: str | None = None) -> float:
     """Price WMH usage through the shared descriptive pricing authority."""
     return waterfall_cost_usd(
         model,
@@ -17,6 +17,7 @@ def cost_usd(model: str, usage: TokenUsage) -> float:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
         ),
+        provider=provider,
     )
 
 

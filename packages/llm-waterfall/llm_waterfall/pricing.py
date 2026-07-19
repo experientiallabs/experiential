@@ -1,10 +1,10 @@
 """Per-model token pricing → USD cost.
 
-Direct-provider prices are keyed by a normalized model id. Cost-driving Bedrock geographic
-inference-profile prefixes remain part of the route and resolve only through an audited exact row.
-Prices are USD per 1M tokens; an unknown model costs 0.0 and `price_for` returns None so callers can
-surface "cost unavailable" rather than silently under-reporting. Per-call overrides are passed
-explicitly. There is no global mutable registry.
+Static prices are scoped to the provider that publishes them and keyed by a normalized model id.
+Cost-driving Bedrock geographic inference-profile prefixes remain part of the route and resolve
+only through an audited exact row. Prices are USD per 1M tokens; an unknown model costs 0.0 and
+`price_for` returns None so callers can surface "cost unavailable" rather than silently
+under-reporting. Per-call overrides are passed explicitly. There is no global mutable registry.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ _PRICES: dict[str, ModelPrice] = {
     "claude-sonnet-4-6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0),
     "zai.glm-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=3.2),
-    # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
+    # --- OpenAI direct (GPT-5.x Standard tier) ---
     "gpt-5.5": ModelPrice(input_per_mtok=5.0, output_per_mtok=30.0),
     "gpt-5.5-pro": ModelPrice(input_per_mtok=30.0, output_per_mtok=180.0),
     "gpt-5.4": ModelPrice(input_per_mtok=2.5, output_per_mtok=15.0),
@@ -69,6 +69,26 @@ _ROUTE_PRICES: dict[str, ModelPrice] = {
     "us.anthropic.claude-haiku-4-5": ModelPrice(input_per_mtok=1.1, output_per_mtok=5.5),
     "us.anthropic.claude-opus-4-8": ModelPrice(input_per_mtok=5.5, output_per_mtok=27.5),
 }
+
+_OPENAI_MODEL_PREFIXES = ("gpt-", "text-embedding-")
+_ANTHROPIC_MODEL_PREFIXES = ("claude-",)
+_BEDROCK_MODEL_PREFIXES = ("claude-", "amazon.", "zai.")
+
+
+def _provider_publishes_static_price(provider: str, key: str) -> bool:
+    """Whether `key` belongs to `provider`'s built-in price namespace.
+
+    Azure prices are intentionally absent: a deployment can have a different meter, region, or
+    negotiated rate from a same-named direct OpenAI model. Callers may still provide an exact
+    deployment override. Unknown providers and aws_mantle also fail closed.
+    """
+    if provider in {"openai", "openai_responses"}:
+        return key.startswith(_OPENAI_MODEL_PREFIXES)
+    if provider == "anthropic":
+        return key.startswith(_ANTHROPIC_MODEL_PREFIXES)
+    if provider == "bedrock":
+        return key.startswith(_BEDROCK_MODEL_PREFIXES)
+    return False
 
 
 def _normalize(model: str) -> str:
@@ -101,11 +121,20 @@ def _route_key(model: str) -> str:
     return route
 
 
-def price_for(model: str, prices: Mapping[str, ModelPrice] | None = None) -> ModelPrice | None:
-    """The price row for `model` (after normalization), or None if unknown.
+def price_for(
+    model: str,
+    prices: Mapping[str, ModelPrice] | None = None,
+    *,
+    provider: str | None = None,
+) -> ModelPrice | None:
+    """The price row for a provider/model route, or None if unknown.
 
     `prices` are per-caller overrides consulted before the static table; they are never merged
     into it, so one Waterfall's overrides can't leak into another's.
+
+    Pass `provider` whenever it is known. Omitting it retains the legacy model-only lookup for
+    callers that have no provider context; internal Waterfall calls always pass it. In particular,
+    Azure never inherits a same-named direct OpenAI price.
     """
     route_key = _route_key(model)
     if route_key.startswith(_BEDROCK_GEO_PREFIXES):
@@ -113,6 +142,8 @@ def price_for(model: str, prices: Mapping[str, ModelPrice] | None = None) -> Mod
             override = prices.get(model) or prices.get(route_key)
             if override is not None:
                 return override
+        if provider is not None and provider != "bedrock":
+            return None
         return _ROUTE_PRICES.get(route_key)
 
     key = _normalize(route_key)
@@ -120,14 +151,20 @@ def price_for(model: str, prices: Mapping[str, ModelPrice] | None = None) -> Mod
         override = prices.get(key) or prices.get(model)
         if override is not None:
             return override
+    if provider is not None and not _provider_publishes_static_price(provider, key):
+        return None
     return _PRICES.get(key)
 
 
 def cost_usd(
-    model: str, usage: TokenUsage, prices: Mapping[str, ModelPrice] | None = None
+    model: str,
+    usage: TokenUsage,
+    prices: Mapping[str, ModelPrice] | None = None,
+    *,
+    provider: str | None = None,
 ) -> float:
-    """USD cost of `usage` on `model`. Unknown models cost 0.0 (`price_for` detects that)."""
-    price = price_for(model, prices)
+    """USD cost of `usage` on a provider/model route; unknown routes cost 0.0."""
+    price = price_for(model, prices, provider=provider)
     if price is None:
         return 0.0
     return (

@@ -70,8 +70,14 @@ class SameModelFailover:
         last: Exception | None = None
         for provider in self._chain:
             try:
-                return provider.complete(
+                completion = provider.complete(
                     system, messages, temperature=temperature, max_tokens=max_tokens
+                )
+                return completion.model_copy(
+                    update={
+                        "model": completion.model or provider.config.model,
+                        "provider": completion.provider or provider.config.kind.value,
+                    }
                 )
             except Exception as exc:  # noqa: BLE001 - classify, then re-raise or fall over
                 if not is_capacity_error(exc):
