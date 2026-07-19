@@ -2,8 +2,9 @@
 
 A bundle is one pull's replayable artifact: `manifest.json` (what was pulled, when, from where)
 plus `items.jsonl` (one normalized `ContextItem` per line). "Filesystem as DB", like the model
-store: loading a bundle is just reading its folder. `render_markdown` turns a bundle into the
-deterministic markdown document that `wmh context attach` writes into a model's knowledge dir.
+store: loading a bundle is just reading its folder. `ContextStore.save`/`load` persist and read
+bundles, and `render_markdown` turns a bundle into a deterministic markdown document callers can
+write into a model's knowledge dir.
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ class ContextStore:
         if not manifest_path.exists():
             raise FileNotFoundError(
                 f"no context bundle named {name!r} under {self.context_dir}; "
-                "run `wmh context pull <service>` first"
+                "pull a bundle and persist it with ContextStore.save first"
             )
         manifest = BundleManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
         items_text = (directory / _ITEMS_FILENAME).read_text(encoding="utf-8")

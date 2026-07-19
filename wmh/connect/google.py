@@ -116,7 +116,7 @@ class _GoogleConnector:
 
         Raises:
             ConnectError: When the provider rejects the refresh (e.g. `invalid_grant` after
-                the user revoked access); the message names this connector's reconnect command.
+                the user revoked access); the message says the connection must be reauthorized.
         """
         if not auth.refresh_token or not auth.expires_at:
             return auth
@@ -125,7 +125,7 @@ class _GoogleConnector:
         except ConnectError as exc:
             raise ConnectError(
                 f"could not refresh the {self.label} credential ({exc}); "
-                f"run `wmh connect {self.name}` to re-authorize"
+                "the token is invalid or expired and the connection must be reauthorized"
             ) from exc
 
     def _client(self) -> httpx.Client:
@@ -148,7 +148,7 @@ class _GoogleConnector:
         if response.status_code == 401:
             raise ConnectError(
                 f"{self.label} rejected the stored credential (HTTP 401); "
-                f"run `wmh connect {self.name}` to re-authorize"
+                "the token is invalid or expired and the connection must be reauthorized"
             )
         return response
 

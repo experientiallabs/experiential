@@ -79,7 +79,7 @@ def test_list_bundles_sorted_and_delete(tmp_path: Path) -> None:
 
 
 def test_load_missing_bundle_is_actionable(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="wmh context pull"):
+    with pytest.raises(FileNotFoundError, match="ContextStore.save"):
         ContextStore(tmp_path).load("nope")
 
 

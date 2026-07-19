@@ -161,5 +161,5 @@ def test_save_refuses_a_symlinked_file(tmp_path: Path) -> None:
 
 def test_corrupt_entry_raises_an_actionable_connect_error() -> None:
     connectors_path().write_text('[github]\nkind = "oauth"\n', encoding="utf-8")
-    with pytest.raises(ConnectError, match="wmh connect github"):
+    with pytest.raises(ConnectError, match="the stored credential for github is malformed"):
         load_connector_auth("github")

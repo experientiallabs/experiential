@@ -216,7 +216,7 @@ def test_connect_paste_path_prompts_validates_and_captures_identity(monkeypatch)
     auth = _connector(handler).connect(ui)
 
     assert calls["prompt"], "connect must prompt for the pasted token"
-    assert "docs/connectors.md" in calls["prompt"][0]
+    assert "docs/reference/connect-library.md" in calls["prompt"][0]
     assert auth.kind == "token"
     assert auth.access_token == "xoxp-pasted"
     assert auth.account == "grace @ Acme Corp"
@@ -227,7 +227,7 @@ def test_connect_paste_path_prompts_validates_and_captures_identity(monkeypatch)
 def test_connect_paste_path_requires_a_token(monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.delenv("WMH_SLACK_CLIENT_ID", raising=False)
     ui, _ = _ui("   ")
-    with pytest.raises(ConnectError, match="docs/connectors.md"):
+    with pytest.raises(ConnectError, match="docs/reference/connect-library.md"):
         _connector(_unused_handler).connect(ui)
 
 
@@ -326,7 +326,7 @@ def test_verify_invalid_auth_says_reconnect() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": False, "error": "invalid_auth"})
 
-    with pytest.raises(ConnectError, match=r"wmh connect slack"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         _connector(handler).verify(_token_auth())
 
 
@@ -343,7 +343,7 @@ def test_verify_http_401_says_reconnect() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, text="unauthorized")
 
-    with pytest.raises(ConnectError, match=r"wmh connect slack"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         _connector(handler).verify(_token_auth())
 
 
@@ -527,7 +527,7 @@ def test_pull_invalid_auth_says_reconnect() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": False, "error": "invalid_auth"})
 
-    with pytest.raises(ConnectError, match=r"wmh connect slack"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         _connector(handler).pull(_token_auth(), PullQuery(target="#general", limit=5))
 
 

@@ -313,7 +313,7 @@ def refresh_auth(
     """
     if not auth.refresh_token:
         raise ConnectError(
-            f"no refresh token stored for {app.name}; run `wmh connect {app.name}` to re-authorize"
+            f"no refresh token stored for {app.name}; the connection must be reauthorized"
         )
     data = {
         "grant_type": "refresh_token",
@@ -396,7 +396,7 @@ def _raise_on_token_error(
     if error:
         raise ConnectError(
             f"{app.name} {doing} failed: {_describe_oauth_error(payload)}; "
-            f"re-run `wmh connect {app.name}` (check the OAuth app's client id/secret if it "
+            "the connection must be reauthorized (check the OAuth app's client id/secret if it "
             "keeps failing)"
         )
     if response.status_code != 200:

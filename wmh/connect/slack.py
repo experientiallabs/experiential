@@ -1,7 +1,7 @@
 """Slack context connector: paste-token auth (default) or BYO OAuth, channel history pulls.
 
-The default connect path prompts for a pasted user token (xoxp-...) created by installing the
-app manifest documented in docs/connectors.md. When `WMH_SLACK_CLIENT_ID` and
+The default connect path prompts for a pasted user token (xoxp-...) created by installing a
+workspace app; the caller supplies that user token. When `WMH_SLACK_CLIENT_ID` and
 `WMH_SLACK_CLIENT_SECRET` resolve a complete OAuth app, connect runs the browser loopback flow
 instead (advanced: Slack only accepts HTTPS redirect URLs, so a plain localhost callback needs
 extra setup on the app side). Pulls read one channel's history, fold each thread (parent plus
@@ -64,9 +64,9 @@ class SlackConnector:
     """Pulls Slack channel history (threads folded into single items) as context.
 
     Auth paths, in order of preference at connect time:
-      1. Pasted user token (default): the user creates a workspace-internal app from the
-         manifest in docs/connectors.md, installs it, and pastes the xoxp- token (or injects it
-         via `WMH_SLACK_TOKEN` without ever running connect).
+      1. Pasted user token (default): the caller supplies a user (xoxp-) token from a
+         workspace-internal app (or injects it via `WMH_SLACK_TOKEN`); see
+         docs/reference/connect-library.md.
       2. BYO OAuth app (advanced): when `WMH_SLACK_CLIENT_ID` and `WMH_SLACK_CLIENT_SECRET`
          are both set, connect runs the browser loopback flow requesting `USER_SCOPES` via
          Slack's `user_scope` parameter.
@@ -122,13 +122,13 @@ class SlackConnector:
     def _connect_paste(self, ui: ConnectUI) -> ConnectorAuth:
         """Prompt for a pasted user token (the default path)."""
         token = ui.prompt_secret(
-            "Slack user token (xoxp-...): create a workspace app from the manifest in "
-            "docs/connectors.md, install it, then paste its User OAuth Token"
+            "Slack user token (xoxp-...): create and install a workspace app, then paste its "
+            "User OAuth Token (see docs/reference/connect-library.md)"
         ).strip()
         if not token:
             raise ConnectError(
-                "no Slack token entered; create and install the app described in "
-                "docs/connectors.md, then re-run `wmh connect slack`"
+                "no Slack token entered; a user OAuth token must be supplied by the caller "
+                "(see docs/reference/connect-library.md)"
             )
         return ConnectorAuth(kind="token", access_token=token)
 
@@ -143,7 +143,7 @@ class SlackConnector:
         ui.info(
             "Using your Slack OAuth app (WMH_SLACK_CLIENT_ID is set). Slack only accepts "
             "HTTPS redirect URLs, so this browser flow is advanced setup; the pasted-token "
-            "path in docs/connectors.md is the supported default."
+            "path in docs/reference/connect-library.md is the supported default."
         )
         flow_app = app.model_copy(
             update={
@@ -426,7 +426,7 @@ def _payload_or_raise(method: str, response: httpx.Response) -> JsonObject:
     if response.status_code in (401, 403):
         raise ConnectError(
             f"slack rejected the credential on {method} (HTTP {response.status_code}); "
-            "run `wmh connect slack` to re-connect"
+            "the token is invalid or expired and the connection must be reauthorized"
         )
     if response.status_code != 200:
         raise ConnectError(
@@ -454,13 +454,13 @@ def _slack_error(method: str, payload: JsonObject) -> ConnectError:
     if error in _AUTH_ERRORS:
         return ConnectError(
             f"slack rejected the credential on {method} ({error}); "
-            "run `wmh connect slack` to re-connect"
+            "the token is invalid or expired and the connection must be reauthorized"
         )
     if error == "missing_scope":
         needed = _as_str(payload.get("needed")) or "an additional"
         return ConnectError(
             f"slack {method} is missing the {needed!r} scope; add it to the app's user scopes, "
-            "re-install the app to the workspace, then run `wmh connect slack` again"
+            "re-install the app to the workspace, then supply a token with that scope"
         )
     if error == "not_in_channel":
         return ConnectError(

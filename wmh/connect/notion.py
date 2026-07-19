@@ -70,7 +70,7 @@ _MCP_INSTALL_HINT = (
     "the mcp SDK is not installed; run `uv sync --extra connectors` (or "
     "pip install 'world-model-harness[connectors]') to use the Notion MCP connector"
 )
-_RECONNECT_HINT = f"re-run `wmh connect {_NAME}`"
+_RECONNECT_HINT = "the connection must be reauthorized"
 
 
 # -- small shared helpers -------------------------------------------------------------------

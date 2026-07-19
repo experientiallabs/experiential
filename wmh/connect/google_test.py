@@ -108,7 +108,7 @@ def test_verify_401_tells_the_user_to_reconnect(connector_cls: type[_GoogleConne
         return httpx.Response(401, json={"error": {"code": 401, "message": "Invalid Credentials"}})
 
     connector = connector_cls(transport=httpx.MockTransport(handler))
-    with pytest.raises(ConnectError, match=f"wmh connect {connector.name}"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         connector.verify(_auth())
 
 
@@ -609,7 +609,7 @@ def test_refresh_invalid_grant_tells_the_user_to_reconnect(
         connector.pull(_expired_auth(), PullQuery(limit=5))
     message = str(excinfo.value)
     assert "invalid_grant" in message
-    assert "wmh connect gmail" in message
+    assert "the connection must be reauthorized" in message
 
 
 def test_pull_with_a_plain_token_needs_no_oauth_app(monkeypatch: pytest.MonkeyPatch) -> None:

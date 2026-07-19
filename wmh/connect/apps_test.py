@@ -44,7 +44,7 @@ def test_get_app_without_a_client_id_points_at_the_env_var(name: str) -> None:
         get_app(name)
     message = str(excinfo.value)
     assert f"WMH_{name.upper()}_CLIENT_ID" in message
-    assert "docs/connectors.md" in message
+    assert "docs/reference/connect-library.md" in message
 
 
 def test_get_app_layers_env_overrides_over_embedded_defaults(

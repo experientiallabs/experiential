@@ -59,7 +59,7 @@ def _raise_for_response(response: httpx.Response, *, doing: str) -> None:
         raise ConnectError(
             f"brave search rejected the API key during {doing} (HTTP {status}); check "
             f"$BRAVE_SEARCH_API_KEY (or the stored key) against your subscription at "
-            f"{_DASHBOARD_URL} and re-run `wmh connect brave`"
+            f"{_DASHBOARD_URL}; the key is invalid or expired and a valid key must be supplied"
         )
     if status == 429:
         wait = response.headers.get("Retry-After", "1")
@@ -171,7 +171,7 @@ class BraveConnector:
         if not key:
             raise ConnectError(
                 f"no Brave Search API key entered; create a free key at {_DASHBOARD_URL} "
-                "and re-run `wmh connect brave`"
+                "and supply it as the connection credential"
             )
         auth = ConnectorAuth(kind="token", access_token=key)
         account = self.verify(auth)

@@ -73,6 +73,6 @@ def get_app(name: str) -> OAuthApp:
         raise ConnectError(
             f"no OAuth client id available for {name!r}: set ${prefix}_CLIENT_ID (and "
             f"${prefix}_CLIENT_SECRET if the provider requires one) to use your own OAuth "
-            "app; see docs/connectors.md"
+            "app; see docs/reference/connect-library.md"
         )
     return app

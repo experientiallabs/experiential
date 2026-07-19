@@ -79,7 +79,7 @@ def _raise_for_response(response: httpx.Response, *, doing: str, repo: str | Non
     if status == 401:
         raise ConnectError(
             f"github rejected the stored credential during {doing} (HTTP 401); "
-            "run `wmh connect github` to re-authorize"
+            "the token is invalid or expired and the connection must be reauthorized"
         )
     if status == 403 and response.headers.get("X-RateLimit-Remaining") == "0":
         reset = response.headers.get("X-RateLimit-Reset", "unknown")
@@ -92,8 +92,8 @@ def _raise_for_response(response: httpx.Response, *, doing: str, repo: str | Non
             f"github repository {repo!r} was not found during {doing} (HTTP 404): it does not "
             "exist, the connected account cannot see it, or (GitHub App auth) the app is not "
             "installed on it; check the owner/repo spelling, install your app on the repo "
-            "(https://github.com/settings/apps > your app > Install App), or re-run "
-            "`wmh connect github` with an account that has access"
+            "(https://github.com/settings/apps > your app > Install App), or reauthorize the "
+            "connection with an account that has access"
         )
     raise ConnectError(
         f"github {doing} failed (HTTP {status}): {response.text[:200]}; "
@@ -218,7 +218,7 @@ class GitHubConnector:
         if login is None:
             raise ConnectError(
                 "github's /user endpoint returned no login for the stored credential; "
-                "run `wmh connect github` to re-authorize"
+                "the token is invalid or expired and the connection must be reauthorized"
             )
         name = opt_str(payload.get("name"))
         return f"{login} ({name})" if name else login

@@ -325,7 +325,7 @@ def test_rest_pull_401_tells_the_user_to_reconnect() -> None:
 
     connector = NotionConnector(transport=httpx.MockTransport(handler))
     auth = ConnectorAuth(kind="token", access_token="stale")
-    with pytest.raises(ConnectError, match="wmh connect notion"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         connector.pull(auth, PullQuery(limit=5))
 
 
@@ -368,7 +368,7 @@ def test_verify_rest_401_raises_connect_error() -> None:
 
     connector = NotionConnector(transport=httpx.MockTransport(handler))
     auth = ConnectorAuth(kind="token", access_token="stale")
-    with pytest.raises(ConnectError, match="wmh connect notion"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         connector.verify(auth)
 
 

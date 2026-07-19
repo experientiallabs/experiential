@@ -137,7 +137,8 @@ def _validate_section(name: str, section: JsonObject) -> ConnectorAuth:
     except ValidationError as exc:
         raise ConnectError(
             f"invalid [{name}] entry in {connectors_path()}: {exc}; "
-            f"fix the fields or reconnect with `wmh connect {name}`"
+            f"the stored credential for {name} is malformed; provide a valid token or "
+            "reauthorize the connection"
         ) from exc
 
 

@@ -324,7 +324,7 @@ def test_refresh_auth_keeps_the_old_refresh_token_and_identity() -> None:
 
 
 def test_refresh_auth_without_a_refresh_token_is_actionable() -> None:
-    with pytest.raises(ConnectError, match="wmh connect"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         refresh_auth(
             APP,
             ConnectorAuth(kind="oauth", access_token="x"),

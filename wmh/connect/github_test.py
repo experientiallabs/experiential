@@ -153,7 +153,7 @@ def test_verify_maps_401_to_a_reconnect_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"message": "Bad credentials"})
 
-    with pytest.raises(ConnectError, match="wmh connect github"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         _connector(handler).verify(_AUTH)
 
 
@@ -293,7 +293,7 @@ def test_pull_maps_401_to_a_reconnect_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"message": "Bad credentials"})
 
-    with pytest.raises(ConnectError, match="wmh connect github"):
+    with pytest.raises(ConnectError, match="the connection must be reauthorized"):
         _connector(handler).pull(_AUTH, PullQuery(target="octocat/Hello-World"))
 
 
