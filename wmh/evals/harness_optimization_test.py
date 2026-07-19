@@ -5,13 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from wmh.agents import default_agent
 from wmh.evals.harbor.config import HarborEnvironmentBackend
-from wmh.evals.harbor.paired_runner import PairedHarborPanelRoute
+from wmh.evals.harbor.paired_runner import (
+    HarborExecutionPlan,
+    PairedHarborBudgetRuntime,
+    PairedHarborPanelRoute,
+    PrequalifiedHarborRoster,
+    QualifiedHarborTask,
+)
 from wmh.evals.harness_optimization import (
     BenchmarkProvenance,
     CandidateChangePolicy,
@@ -20,6 +27,7 @@ from wmh.evals.harness_optimization import (
     HarnessOptimizationMemberOutcome,
     HarnessOptimizationOutcome,
     HarnessOptimizationProtocol,
+    PreparedHarnessOptimizationStudy,
     freeze_harness_optimization_candidate,
     open_harness_optimization_confirmation,
     prepare_harness_optimization_study,
@@ -32,6 +40,22 @@ from wmh.evals.partition import (
     PartitionControlStore,
     PartitionTask,
     initialize_partition_genesis,
+)
+from wmh.evals.study_journal import (
+    ExternalPublicationReceipt,
+    StudyJournalGenesis,
+    StudyJournalStore,
+    StudyPhaseCommitment,
+    StudyPhaseRecord,
+)
+from wmh.evals.study_lifecycle import (
+    CandidateFrozenPayload,
+    CandidatePublishedPayload,
+    DiscoveryRunningPayload,
+    PreparationPlannedPayload,
+    ProtocolPublishedPayload,
+    RosterQualifiedPayload,
+    StudyLifecycleController,
 )
 from wmh.harness.create import SearchCheckpoint
 from wmh.harness.delta import (
@@ -50,15 +74,69 @@ from wmh.harness.scoring import (
     TaskScore,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import (
+    BudgetPolicy,
+    ProviderCostMeter,
+    TokenPriceCeiling,
+    bootstrap_budget_ledger,
+)
 
 
 def _digest(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 
 
+class _Publisher:
+    configuration_digest = _digest("optimizer-lifecycle-publisher")
+
+    def __init__(self) -> None:
+        self.receipts: dict[str, ExternalPublicationReceipt] = {}
+
+    def publish(self, commitment: StudyPhaseCommitment) -> ExternalPublicationReceipt:
+        receipt = self.receipts.get(commitment.digest)
+        if receipt is None:
+            receipt = ExternalPublicationReceipt(
+                commitment_digest=commitment.digest,
+                publisher="test-log",
+                publication_id=f"entry-{commitment.sequence}",
+                immutable_locator=f"test://log/{commitment.digest}",
+                published_at=datetime(2026, 7, 19, 12, 0, tzinfo=UTC),
+                evidence={},
+            )
+            self.receipts[commitment.digest] = receipt
+        return receipt
+
+    def verify(
+        self,
+        commitment: StudyPhaseCommitment,
+        receipt: ExternalPublicationReceipt,
+    ) -> None:
+        if self.receipts.get(commitment.digest) != receipt:
+            raise ValueError("missing publication")
+
+    def verify_chain_head(
+        self,
+        genesis: StudyJournalGenesis,
+        records: tuple[StudyPhaseRecord, ...],
+        pending: StudyPhaseCommitment | None,
+    ) -> None:
+        del genesis, records, pending
+
+
 def _roster_digest(manifest: BenchmarkPartitionManifest) -> str:
     payload = json.dumps(
         [task.model_dump(mode="json") for task in manifest.tasks],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _canonical_digest(value: object) -> str:
+    payload = json.dumps(
+        value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -103,6 +181,7 @@ class _Scorer:
 
     def __init__(self, task_ids: tuple[str, ...]) -> None:
         self.task_ids = task_ids
+        self.score_calls = 0
 
     def validate_candidate(self, candidate: HarnessDoc) -> str | None:
         return None
@@ -111,6 +190,7 @@ class _Scorer:
         return None
 
     def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+        self.score_calls += 1
         improved = any("wmh-test-improvement" in item.content for item in candidate.code_files())
         score = float(improved)
         per_task = {
@@ -204,12 +284,13 @@ class _PromptProposer(_CodeProposer):
 
 
 def _protocol(
+    tmp_path: Path,
     manifest: BenchmarkPartitionManifest,
     baseline: HarnessDoc,
     *,
     proposer_configuration_id: str = "proposer-config",
     roster_digest: str | None = None,
-) -> HarnessOptimizationProtocol:
+) -> tuple[HarnessOptimizationProtocol, PrequalifiedHarborRoster, PairedHarborBudgetRuntime]:
     panel = tuple(
         PairedPanelPlan(panel_member=member, attempts=15) for member in ("glm", "haiku", "opus")
     )
@@ -224,7 +305,55 @@ def _protocol(
         )
         for member in ("glm", "haiku", "opus")
     )
-    return HarnessOptimizationProtocol.create(
+    execution_plan = HarborExecutionPlan.freeze(
+        reference_harness=baseline,
+        reward_key="reward",
+    )
+    qualification_roster = PrequalifiedHarborRoster(
+        execution_plan_digest=execution_plan.digest,
+        tasks=tuple(
+            QualifiedHarborTask(
+                task_id=task.task_id,
+                dataset_id="synthetic",
+                content_digest=task.content_digest,
+                task_key=_digest(f"task-key:{task.task_id}"),
+                task_environment_digest=_digest(f"environment:{task.task_id}"),
+                environment_backend=HarborEnvironmentBackend.LOCAL,
+            )
+            for task in manifest.tasks
+        ),
+    )
+    meter_by_member: dict[str, str] = {
+        member: f"worker-{member}" for member in ("glm", "haiku", "opus")
+    }
+    budget_policy = BudgetPolicy(
+        study_id="optimizer-study",
+        manifest_digest=manifest.digest,
+        hard_limit_nano_usd=15_000_000_000_000,
+        phase_limits_nano_usd={"confirmation": 15_000_000_000_000},
+        meters={
+            meter_by_member[route.panel_member]: ProviderCostMeter(
+                provider_config=route.provider_config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            )
+            for route in routes
+        },
+    )
+    ledger = bootstrap_budget_ledger(
+        (tmp_path / f"budget-{proposer_configuration_id}.sqlite3").resolve(),
+        budget_policy,
+    )
+    budget = PairedHarborBudgetRuntime(
+        ledger_path=ledger.ledger_path,
+        ledger_identity=ledger.ledger_identity,
+        policy=budget_policy,
+        phase="confirmation",
+        provider_meter_by_panel_member=meter_by_member,
+    )
+    protocol = HarnessOptimizationProtocol.create(
         experiment_id="optimizer-study",
         protocol_id="protocol-v1",
         provenance=BenchmarkProvenance(
@@ -246,24 +375,97 @@ def _protocol(
         candidate_policy=CandidateChangePolicy(minimum_changed_code_surfaces=1),
         confirmation=ConfirmationDecisionRule(
             panel=panel,
-            bounded_mean_bets=(BoundedMeanBet(fraction=0.5, weight=1.0),),
+            primary_e_value_bets=(BoundedMeanBet(fraction=0.5, weight=1.0),),
             schedule_seed="schedule-seed",
             analysis_seed="analysis-seed",
             randomization_samples=999,
             alpha=0.05,
-            minimum_panel_delta=0.03,
-            minimum_member_delta=0.03,
+            minimum_equal_task_member_delta=0.03,
             noninferiority_margin=0.0,
         ),
         panel_routes=routes,
-        environment_backend=HarborEnvironmentBackend.LOCAL,
-        runner_image="ghcr.io/experientiallabs/pi-runner@sha256:" + "1" * 64,
-        reward_key="reward",
-        turn_timeout_s=300.0,
+        execution_plan=execution_plan,
+        qualification_roster=qualification_roster,
         max_concurrent_blocks=3,
         retry_policy_digest=_digest("no-retries"),
-        budget_policy_digest=_digest("hard-budget"),
+        search_cost_binding_digest=_digest("search-cost-binding"),
+        confirmation_budget=budget,
+        create_rate_policy_digest=_digest("create-rate-policy"),
+        confirmation_slice_policy_digest=_digest("slice-policy"),
     )
+    return protocol, qualification_roster, budget
+
+
+def _prepare(
+    tmp_path: Path,
+    manifest: BenchmarkPartitionManifest,
+    baseline: HarnessDoc,
+    *,
+    proposer_configuration_id: str = "proposer-config",
+) -> tuple[PreparedHarnessOptimizationStudy, HarnessOptimizationProtocol]:
+    protocol, roster, budget = _protocol(
+        tmp_path,
+        manifest,
+        baseline,
+        proposer_configuration_id=proposer_configuration_id,
+    )
+    prepared = prepare_harness_optimization_study(
+        protocol=protocol,
+        partition=manifest,
+        baseline=baseline,
+        qualification_roster=roster,
+        confirmation_budget=budget,
+    )
+    return prepared, protocol
+
+
+def _discovery_lifecycle(
+    tmp_path: Path,
+    protocol: HarnessOptimizationProtocol,
+    *,
+    start_discovery: bool = True,
+) -> tuple[StudyLifecycleController, DiscoveryRunningPayload]:
+    publisher = _Publisher()
+    store = StudyJournalStore.create(
+        tmp_path / "study-journal",
+        study_id=protocol.experiment_id,
+        publisher_configuration_digest=publisher.configuration_digest,
+    )
+    controller = StudyLifecycleController(store=store, publisher=publisher)
+    controller.publish(
+        PreparationPlannedPayload(
+            study_plan_digest=_digest("study-plan"),
+            budget_policy_digest=protocol.confirmation_budget_policy_digest,
+            budget_binding_digest=protocol.confirmation_budget_binding_digest,
+            maximum_paid_cost_microusd=15_000_000_000,
+        )
+    )
+    controller.publish(
+        RosterQualifiedPayload(
+            qualified_roster_digest=protocol.qualification_roster_digest,
+            qualification_report_digest=_digest("qualification-report"),
+            execution_plan_digest=protocol.execution_plan.digest,
+            qualified_task_count=4,
+        )
+    )
+    controller.publish(
+        ProtocolPublishedPayload(
+            protocol_digest=protocol.digest,
+            protocol_artifact_publication_digest=_digest("protocol-publication"),
+            partition_manifest_digest=protocol.partition_manifest_digest,
+            qualified_roster_digest=protocol.qualification_roster_digest,
+            search_cost_binding_digest=protocol.search_cost_binding_digest,
+            confirmation_budget_binding_digest=protocol.confirmation_budget_binding_digest,
+        )
+    )
+    authorization = DiscoveryRunningPayload(
+        protocol_digest=protocol.digest,
+        search_configuration_digest=_canonical_digest(protocol.search.model_dump(mode="json")),
+        search_run_id="discovery-run",
+    )
+    if start_discovery:
+        controller.publish(authorization)
+    return controller, authorization
 
 
 def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
@@ -273,12 +475,8 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
     baseline = default_agent("baseline")
     scorer = _Scorer(manifest.discovery_task_ids)
     proposer = _CodeProposer()
-    protocol = _protocol(manifest, baseline)
-    prepared = prepare_harness_optimization_study(
-        protocol=protocol,
-        partition=manifest,
-        baseline=baseline,
-    )
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
 
     public_json = prepared.discovery_contract().model_dump_json()
     assert all(task_id in public_json for task_id in manifest.discovery_task_ids)
@@ -290,6 +488,8 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
         prepared.discovery_contract(),
         scorer=scorer,
         proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=discovery_authorization,
         on_checkpoint=checkpoints.append,
     )
     assert result.best.execution_digest != baseline.execution_digest
@@ -299,9 +499,13 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
         control_store,
         prepared=prepared,
         checkpoint=checkpoints[-1],
+        lifecycle=lifecycle,
+        authorization=discovery_authorization,
     )
     assert frozen.candidate == result.best
-    assert frozen.freeze_record.confirmation_protocol_digest == protocol.digest
+    assert (
+        frozen.freeze_record.confirmation_protocol_digest == frozen.confirmation_commitment.digest
+    )
     assert frozen.freeze_record.selection_evidence_digest == frozen.checkpoint_payload_digest
     with pytest.raises(ValueError, match="selection checkpoint"):
         type(frozen).model_validate(
@@ -311,17 +515,41 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
             }
         )
 
+    lifecycle.publish(
+        CandidateFrozenPayload(
+            protocol_digest=protocol.digest,
+            candidate_execution_digest=frozen.candidate.execution_digest,
+            search_checkpoint_digest=frozen.checkpoint_payload_digest,
+            search_configuration_digest=discovery_authorization.search_configuration_digest,
+            search_cost_binding_digest=protocol.search_cost_binding_digest,
+            search_cost_report_digest=_digest("search-cost-report"),
+            champion_reconstruction_digest=frozen.candidate.execution_digest,
+            candidate_freeze_record_digest=frozen.freeze_record.digest,
+            completed_iterations=checkpoints[-1].completed_iteration,
+        )
+    )
+    candidate_publication = CandidatePublishedPayload(
+        protocol_digest=protocol.digest,
+        candidate_execution_digest=frozen.candidate.execution_digest,
+        candidate_source_artifact_digest=_canonical_digest(
+            frozen.candidate.model_dump(mode="json")
+        ),
+        candidate_artifact_publication_digest=_digest("candidate-publication"),
+    )
+    lifecycle.publish(candidate_publication)
     opened = open_harness_optimization_confirmation(
         control_store,
         prepared=prepared,
         frozen=frozen,
+        lifecycle=lifecycle,
+        authorization=candidate_publication,
     )
     assert tuple(task.task_id for task in opened.confirmation.tasks) == tuple(
         sorted(manifest.confirmation_task_ids)
     )
     assert opened.design.panel_members == ("glm", "haiku", "opus")
     assert opened.design.attempts_by_member == {"glm": 15, "haiku": 15, "opus": 15}
-    assert opened.confirmation.confirmation_protocol_digest == protocol.digest
+    assert opened.confirmation.confirmation_protocol_digest == frozen.confirmation_commitment.digest
 
 
 def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
@@ -331,21 +559,20 @@ def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
     baseline = default_agent("baseline")
     scorer = _Scorer(manifest.discovery_task_ids)
     proposer = _PromptProposer()
-    protocol = _protocol(
+    prepared, protocol = _prepare(
+        tmp_path,
         manifest,
         baseline,
         proposer_configuration_id=proposer.configuration_id,
     )
-    prepared = prepare_harness_optimization_study(
-        protocol=protocol,
-        partition=manifest,
-        baseline=baseline,
-    )
+    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
     checkpoints: list[SearchCheckpoint] = []
     run_harness_optimization_search(
         prepared.discovery_contract(),
         scorer=scorer,
         proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=discovery_authorization,
         on_checkpoint=checkpoints.append,
     )
 
@@ -354,17 +581,16 @@ def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
             control_store,
             prepared=prepared,
             checkpoint=checkpoints[-1],
+            lifecycle=lifecycle,
+            authorization=discovery_authorization,
         )
 
 
 def test_search_rejects_runtime_component_drift_before_scoring(tmp_path: Path) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared = prepare_harness_optimization_study(
-        protocol=_protocol(manifest, baseline),
-        partition=manifest,
-        baseline=baseline,
-    )
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(tuple(reversed(manifest.discovery_task_ids)))
 
     with pytest.raises(ValueError, match="task matrix"):
@@ -372,8 +598,36 @@ def test_search_rejects_runtime_component_drift_before_scoring(tmp_path: Path) -
             prepared.discovery_contract(),
             scorer=scorer,
             proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=discovery_authorization,
             on_checkpoint=lambda _checkpoint: None,
         )
+
+
+def test_search_phase_guard_rejects_before_the_scorer_or_proposer_can_run(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, discovery_authorization = _discovery_lifecycle(
+        tmp_path,
+        protocol,
+        start_discovery=False,
+    )
+    scorer = _Scorer(manifest.discovery_task_ids)
+
+    with pytest.raises(ValueError, match="current study phase"):
+        run_harness_optimization_search(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=discovery_authorization,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert scorer.score_calls == 0
 
 
 def test_protocol_rejects_a_caller_asserted_roster_digest(tmp_path: Path) -> None:
@@ -381,6 +635,7 @@ def test_protocol_rejects_a_caller_asserted_roster_digest(tmp_path: Path) -> Non
     baseline = default_agent("baseline")
     with pytest.raises(ValueError, match="roster_digest"):
         _protocol(
+            tmp_path,
             manifest,
             baseline,
             roster_digest=_digest("caller-asserted-roster"),
@@ -391,8 +646,8 @@ def test_compact_outcome_requires_every_predeclared_lane_to_pass() -> None:
     members = tuple(
         HarnessOptimizationMemberOutcome(
             panel_member=member,
-            delta=0.04,
-            simultaneous_lower_bound=0.001,
+            equal_task_delta=0.04,
+            primary_lower_bound=0.001,
             minimum_required_delta=0.03,
             passed=True,
         )
@@ -404,9 +659,7 @@ def test_compact_outcome_requires_every_predeclared_lane_to_pass() -> None:
         paired_report_digest=_digest("paired-report"),
         baseline_execution_digest=_digest("baseline"),
         candidate_execution_digest=_digest("candidate"),
-        panel_delta=0.04,
-        minimum_required_panel_delta=0.03,
-        panel_passed=True,
+        equal_task_panel_delta=0.04,
         members=members,
         passed=True,
     )
@@ -417,17 +670,23 @@ def test_compact_outcome_requires_every_predeclared_lane_to_pass() -> None:
             {**outcome.model_dump(mode="json"), "passed": False}
         )
 
-    panel_failure = HarnessOptimizationOutcome.model_validate(
+    member_failure = HarnessOptimizationOutcome.model_validate(
         {
             **outcome.model_dump(mode="json"),
-            "panel_delta": 0.02,
-            "panel_passed": False,
+            "members": [
+                {
+                    **members[0].model_dump(mode="json"),
+                    "equal_task_delta": 0.02,
+                    "passed": False,
+                },
+                *(item.model_dump(mode="json") for item in members[1:]),
+            ],
             "passed": False,
         }
     )
-    assert not panel_failure.passed
+    assert not member_failure.passed
 
     with pytest.raises(ValueError, match="frozen decisions"):
         HarnessOptimizationOutcome.model_validate(
-            {**panel_failure.model_dump(mode="json"), "passed": True}
+            {**member_failure.model_dump(mode="json"), "passed": True}
         )

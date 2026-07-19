@@ -44,9 +44,23 @@ class StudyPhase(StrEnum):
     CONFIRMATION_FROZEN = "confirmation_frozen"
     CONFIRMATION_RUNNING = "confirmation_running"
     COMPLETE = "complete"
+    STOPPED = "stopped"
 
 
 STUDY_PHASES: tuple[StudyPhase, ...] = tuple(StudyPhase)
+SUCCESSFUL_STUDY_PHASES: tuple[StudyPhase, ...] = (
+    StudyPhase.PREPARATION_PLANNED,
+    StudyPhase.ROSTER_QUALIFIED,
+    StudyPhase.PROTOCOL_PUBLISHED,
+    StudyPhase.DISCOVERY_RUNNING,
+    StudyPhase.CANDIDATE_FROZEN,
+    StudyPhase.CANDIDATE_PUBLISHED,
+    StudyPhase.CONFIRMATION_OPENED,
+    StudyPhase.CONFIRMATION_FROZEN,
+    StudyPhase.CONFIRMATION_RUNNING,
+    StudyPhase.COMPLETE,
+)
+_TERMINAL_STUDY_PHASES = frozenset({StudyPhase.COMPLETE, StudyPhase.STOPPED})
 
 
 class StudyJournalGenesis(BaseModel):
@@ -88,9 +102,6 @@ class StudyPhaseCommitment(BaseModel):
         if self.study_id != self.study_id.strip():
             raise ValueError("study_id cannot have surrounding whitespace")
         validate_durable_text(self.study_id, field="study journal id")
-        expected_sequence = STUDY_PHASES.index(self.phase)
-        if self.sequence != expected_sequence:
-            raise ValueError("study phase sequence differs from the fixed chronology")
         if self.sequence == 0 and self.previous_record_digest is not None:
             raise ValueError("first study phase cannot name a previous record")
         if self.sequence > 0 and self.previous_record_digest is None:
@@ -352,7 +363,6 @@ def append_study_phase(
     if not _is_digest(payload_digest):
         raise ValueError("study phase payload_digest must be a canonical SHA-256 digest")
     _validate_publisher(store, publisher)
-    requested_index = STUDY_PHASES.index(requested_phase)
     with store.locked() as directory_descriptor:
         records = _load_records_locked(store, directory_descriptor)
         pending, pending_is_complete = _load_pending_locked(
@@ -364,8 +374,11 @@ def append_study_phase(
             _remove_file_durably_at(directory_descriptor, _PENDING_FILE)
             pending = None
             pending_is_complete = False
-        if requested_index < len(records):
-            existing = records[requested_index]
+        existing = next(
+            (record for record in records if record.commitment.phase is requested_phase),
+            None,
+        )
+        if existing is not None:
             if existing.commitment.payload_digest != payload_digest:
                 raise ValueError("study phase is already committed with a different payload")
             _verify_external_chain_locked(
@@ -376,9 +389,12 @@ def append_study_phase(
                 (pending, pending_is_complete),
             )
             return existing
-        if requested_index != len(records):
-            expected = STUDY_PHASES[len(records)] if len(records) < len(STUDY_PHASES) else None
-            raise ValueError(f"next study phase must be {expected.value if expected else 'none'}")
+        allowed = _allowed_next_phases(records)
+        if requested_phase not in allowed:
+            if not allowed:
+                raise ValueError("study journal is terminal and cannot accept another phase")
+            expected = ", ".join(phase.value for phase in allowed)
+            raise ValueError(f"next study phase must be one of: {expected}")
 
         _verify_external_chain_locked(
             store,
@@ -391,7 +407,7 @@ def append_study_phase(
         commitment = StudyPhaseCommitment(
             journal_genesis_digest=store.genesis.digest,
             study_id=store.genesis.study_id,
-            sequence=requested_index,
+            sequence=len(records),
             phase=requested_phase,
             previous_record_digest=records[-1].digest if records else None,
             payload_digest=payload_digest,
@@ -421,7 +437,7 @@ def append_study_phase(
         _require_store_binding(store, directory_descriptor)
         _publish_regular_file_once_at(
             directory_descriptor,
-            _record_name(requested_index, requested_phase),
+            _record_name(len(records), requested_phase),
             _canonical_json_bytes(record.model_dump(mode="json")),
         )
         persisted = _load_records_locked(store, directory_descriptor)
@@ -461,11 +477,7 @@ def _load_records_locked(
 
     records: list[StudyPhaseRecord] = []
     for expected_sequence, (sequence, phase, name) in enumerate(record_names):
-        if (
-            expected_sequence >= len(STUDY_PHASES)
-            or sequence != expected_sequence
-            or phase is not STUDY_PHASES[expected_sequence]
-        ):
+        if sequence != expected_sequence:
             raise ValueError("study journal phase files are missing, duplicated, or out of order")
         if name != _record_name(sequence, phase):
             raise ValueError("study journal phase filename is not canonical")
@@ -474,6 +486,8 @@ def _load_records_locked(
         if record_payload != _canonical_json_bytes(record.model_dump(mode="json")):
             raise ValueError("study journal record is not canonical")
         expected_previous = records[-1].digest if records else None
+        if phase not in _allowed_next_phases(tuple(records)):
+            raise ValueError("study journal contains an illegal phase transition")
         if (
             record.commitment.journal_genesis_digest != store.genesis.digest
             or record.commitment.study_id != store.genesis.study_id
@@ -511,12 +525,13 @@ def _load_pending_locked(
     if records and pending == records[-1].commitment:
         return pending, True
     expected_sequence = len(records)
-    if expected_sequence >= len(STUDY_PHASES):
+    allowed = _allowed_next_phases(records)
+    if not allowed:
         raise ValueError("completed study journal cannot contain a pending commitment")
     expected_previous = records[-1].digest if records else None
     if (
         pending.sequence != expected_sequence
-        or pending.phase is not STUDY_PHASES[expected_sequence]
+        or pending.phase not in allowed
         or pending.previous_record_digest != expected_previous
     ):
         raise ValueError("study journal pending commitment differs from its chain position")
@@ -544,6 +559,19 @@ def _verify_external_chain_locked(
 
 def _record_name(sequence: int, phase: StudyPhase) -> str:
     return f"{sequence:03d}-{phase.value}.json"
+
+
+def _allowed_next_phases(
+    records: tuple[StudyPhaseRecord, ...],
+) -> tuple[StudyPhase, ...]:
+    """Return the exact legal successors for a validated journal prefix."""
+    if not records:
+        return (StudyPhase.PREPARATION_PLANNED,)
+    current = records[-1].commitment.phase
+    if current in _TERMINAL_STUDY_PHASES:
+        return ()
+    successful_index = SUCCESSFUL_STUDY_PHASES.index(current)
+    return (SUCCESSFUL_STUDY_PHASES[successful_index + 1], StudyPhase.STOPPED)
 
 
 def _validate_publisher(
@@ -828,11 +856,11 @@ def _is_valid_temporary_name(name: str) -> bool:
     except ValueError:
         return False
     sequence = int(record_match.group("sequence"))
-    return (
-        sequence < len(STUDY_PHASES)
-        and phase is STUDY_PHASES[sequence]
-        and target == _record_name(sequence, phase)
-    )
+    if phase is StudyPhase.STOPPED:
+        position_is_possible = 1 <= sequence < len(SUCCESSFUL_STUDY_PHASES)
+    else:
+        position_is_possible = sequence == SUCCESSFUL_STUDY_PHASES.index(phase)
+    return position_is_possible and target == _record_name(sequence, phase)
 
 
 def _validate_leaf_name(name: str) -> None:

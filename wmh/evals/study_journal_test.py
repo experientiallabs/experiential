@@ -13,6 +13,7 @@ import pytest
 import wmh.evals.study_journal as mod
 from wmh.evals.study_journal import (
     STUDY_PHASES,
+    SUCCESSFUL_STUDY_PHASES,
     ExternalPublicationReceipt,
     StudyJournalStore,
     StudyPhase,
@@ -102,7 +103,7 @@ def test_journal_requires_exact_phase_order_and_chains_external_commitments(
     publisher = _Publisher()
 
     records = []
-    for index, phase in enumerate(STUDY_PHASES):
+    for index, phase in enumerate(SUCCESSFUL_STUDY_PHASES):
         record = append_study_phase(
             store,
             phase=phase,
@@ -111,7 +112,7 @@ def test_journal_requires_exact_phase_order_and_chains_external_commitments(
         )
         records.append(record)
 
-    assert tuple(record.commitment.phase for record in records) == STUDY_PHASES
+    assert tuple(record.commitment.phase for record in records) == SUCCESSFUL_STUDY_PHASES
     assert records[0].commitment.previous_record_digest is None
     assert tuple(record.commitment.sequence for record in records) == tuple(range(len(records)))
     for previous, current in zip(records, records[1:], strict=False):
@@ -131,6 +132,42 @@ def test_journal_requires_exact_phase_order_and_chains_external_commitments(
     loaded = load_study_journal(restarted, publisher=publisher)
     assert loaded == tuple(records)
     assert publisher.verified[-len(records) :] == [record.commitment.digest for record in records]
+
+
+def test_stopped_is_an_honest_terminal_transition_from_an_incomplete_study(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    for index, phase in enumerate(SUCCESSFUL_STUDY_PHASES[:4]):
+        append_study_phase(
+            store,
+            phase=phase,
+            payload_digest=_digest(f"payload-{index}"),
+            publisher=publisher,
+        )
+
+    stopped = append_study_phase(
+        store,
+        phase=StudyPhase.STOPPED,
+        payload_digest=_digest("budget-exhausted"),
+        publisher=publisher,
+    )
+
+    assert stopped.commitment.sequence == 4
+    assert stopped.commitment.phase is StudyPhase.STOPPED
+    with pytest.raises(ValueError, match="terminal"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.CANDIDATE_FROZEN,
+            payload_digest=_digest("candidate"),
+            publisher=publisher,
+        )
+
+
+def test_stopped_is_not_part_of_the_success_chronology() -> None:
+    assert StudyPhase.STOPPED in STUDY_PHASES
+    assert StudyPhase.STOPPED not in SUCCESSFUL_STUDY_PHASES
 
 
 def test_append_is_idempotent_without_republishing(tmp_path: Path) -> None:
