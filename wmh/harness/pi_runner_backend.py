@@ -352,14 +352,14 @@ class RunnerLeaseLedger:
         if orphan_budget_reconciler is not None:
             requires_reap = orphan_budget_reconciler(previous.lease_id)
         if requires_reap and orphan_expiry_horizon_s is not None:
-            expiry_candidates = [previous.created_at + timedelta(seconds=orphan_expiry_horizon_s)]
-            if previous.provider_expiry_at is not None:
-                expiry_candidates.append(previous.provider_expiry_at)
+            # Prefer the attested provider endpoint, then the durable unknown-create bound.
+            # The current spec horizon is only a fallback for legacy receipts.
             if previous.expected_end_at is not None:
-                expiry_candidates.append(
-                    previous.expected_end_at + timedelta(seconds=_PROVIDER_CLOCK_SKEW_S)
-                )
-            safe_expiry = max(expiry_candidates)
+                safe_expiry = previous.expected_end_at + timedelta(seconds=_PROVIDER_CLOCK_SKEW_S)
+            elif previous.provider_expiry_at is not None:
+                safe_expiry = previous.provider_expiry_at
+            else:
+                safe_expiry = previous.created_at + timedelta(seconds=orphan_expiry_horizon_s)
             requires_reap = datetime.now(UTC) < safe_expiry
         if requires_reap:
             orphan_reaper(previous.lease_id)

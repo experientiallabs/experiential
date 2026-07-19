@@ -257,7 +257,10 @@ def test_attestation_evidence_is_defensively_immutable() -> None:
     assert attestation.digest == LocalPiRunnerSpec().attestation.digest
 
 
-@pytest.mark.parametrize("field", ["expected_end_at", "retired_at"])
+@pytest.mark.parametrize(
+    "field",
+    ["provider_expiry_at", "expected_end_at", "retired_at"],
+)
 def test_runner_lease_receipt_rejects_impossible_timestamp_order(field: str) -> None:
     created_at = datetime.now(UTC)
     payload: dict[str, object] = {
@@ -288,6 +291,45 @@ def test_runner_lease_omits_an_absent_provider_expiry_from_legacy_receipts() -> 
     )
 
     assert "provider_expiry_at" not in record.model_dump(mode="json")
+
+
+def test_e2b_lease_preserves_provider_expiry_across_every_lifecycle_state(
+    tmp_path: Path,
+) -> None:
+    ledger = backend_mod.RunnerLeaseLedger(tmp_path / "runner-lease.json")
+    ledger.begin(
+        backend="e2b",
+        lease_id="lease-immutable",
+        owner_id="sha256:" + "a" * 64,
+        config_digest="sha256:" + "b" * 64,
+        provider_expiry_horizon_s=90,
+    )
+    creating = ledger.record
+    assert creating is not None
+    provider_expiry_at = creating.provider_expiry_at
+    assert provider_expiry_at is not None
+    assert provider_expiry_at - creating.created_at == timedelta(seconds=90)
+
+    ledger.activate("sandbox-immutable")
+    active = ledger.record
+    assert active is not None
+    ledger.cleanup_failed()
+    cleanup_failed = ledger.record
+    assert cleanup_failed is not None
+    ledger.retire()
+    retired = ledger.record
+    assert retired is not None
+
+    assert [record.state for record in (creating, active, cleanup_failed, retired)] == [
+        "creating",
+        "active",
+        "cleanup_failed",
+        "retired",
+    ]
+    assert all(
+        record.provider_expiry_at == provider_expiry_at
+        for record in (creating, active, cleanup_failed, retired)
+    )
 
 
 def test_e2b_reconciliation_uses_the_prior_lease_expiry_when_specs_shrink(
@@ -325,6 +367,41 @@ def test_e2b_reconciliation_uses_the_prior_lease_expiry_when_specs_shrink(
     assert json.loads(ledger_path.read_text())["state"] == "retired"
 
 
+def test_e2b_reconciliation_skips_reap_after_the_prior_provider_expiry(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "runner-lease.json"
+    now = datetime.now(UTC)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "backend": "e2b",
+                "lease_id": "prior-short-lease",
+                "owner_id": "sha256:" + "a" * 64,
+                "config_digest": "sha256:" + "b" * 64,
+                "state": "cleanup_failed",
+                "resource_id": "prior-sandbox",
+                "created_at": (now - timedelta(hours=1)).isoformat(),
+                "provider_expiry_at": (now - timedelta(minutes=1)).isoformat(),
+                "expected_end_at": None,
+                "retired_at": None,
+            }
+        )
+    )
+    reaped: list[str] = []
+
+    backend_mod.RunnerLeaseLedger(ledger_path).reconcile(
+        backend="e2b",
+        orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+        orphan_budget_reconciler=lambda _lease_id: True,
+        orphan_expiry_horizon_s=86_400,
+    )
+
+    assert reaped == []
+    assert json.loads(ledger_path.read_text())["state"] == "retired"
+
+
 def test_e2b_reconciliation_honors_a_legacy_observed_provider_endpoint(
     tmp_path: Path,
 ) -> None:
@@ -356,6 +433,47 @@ def test_e2b_reconciliation_honors_a_legacy_observed_provider_endpoint(
     )
 
     assert reaped == ["prior-active-lease"]
+
+
+@pytest.mark.parametrize(
+    ("seconds_since_provider_end", "expected_reaps"),
+    [(10, ["prior-active-lease"]), (60, [])],
+)
+def test_e2b_reconciliation_allows_provider_clock_skew_before_skipping_reap(
+    tmp_path: Path,
+    seconds_since_provider_end: int,
+    expected_reaps: list[str],
+) -> None:
+    ledger_path = tmp_path / "runner-lease.json"
+    now = datetime.now(UTC)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "backend": "e2b",
+                "lease_id": "prior-active-lease",
+                "owner_id": "sha256:" + "a" * 64,
+                "config_digest": "sha256:" + "b" * 64,
+                "state": "active",
+                "resource_id": "prior-sandbox",
+                "created_at": (now - timedelta(minutes=5)).isoformat(),
+                "expected_end_at": (
+                    now - timedelta(seconds=seconds_since_provider_end)
+                ).isoformat(),
+                "retired_at": None,
+            }
+        )
+    )
+    reaped: list[str] = []
+
+    backend_mod.RunnerLeaseLedger(ledger_path).reconcile(
+        backend="e2b",
+        orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+        orphan_budget_reconciler=lambda _lease_id: True,
+        orphan_expiry_horizon_s=86_400,
+    )
+
+    assert reaped == expected_reaps
 
 
 def test_local_attestation_binds_exact_platform_manifest_and_bundle() -> None:
@@ -838,6 +956,7 @@ def test_local_runner_is_one_shot_and_publishes_attestation_only_after_open(
         with factory():
             pytest.fail("a second local runner must never be created")
     assert creates == 1
+    assert "provider_expiry_at" not in json.loads((tmp_path / "runner-lease.json").read_text())
 
 
 def test_stale_lease_is_reaped_before_a_new_resource_is_created(
