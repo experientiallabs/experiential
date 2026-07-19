@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Protocol, override
 from uuid import UUID
 
-from harbor.environments.base import environment_content_hash
 from harbor.environments.factory import EnvironmentFactory
 from harbor.job import Job
 from harbor.metrics.uv_script import UvScript
@@ -59,6 +58,7 @@ from wmh.evals.harbor.config import (
 )
 from wmh.evals.harbor.e2b_environment import (
     ExactE2BEnvironment,
+    freeze_exact_e2b_build_spec,
     require_exact_e2b_build_record,
 )
 from wmh.evals.harbor.results import (
@@ -240,8 +240,7 @@ def _build_harbor_agent_config(
     if budget_binding is not None and budget_binding.policy_digest != budget_policy_digest:
         raise ValueError("budget binding differs from the frozen policy digest")
     if runner_budget_binding is not None and (
-        budget_binding is None
-        or runner_budget_binding.policy_digest != budget_policy_digest
+        budget_binding is None or runner_budget_binding.policy_digest != budget_policy_digest
     ):
         raise ValueError("runner resource budget differs from the provider budget policy")
     model_name = f"{provider_config.kind.value}/{provider_config.model}"
@@ -449,8 +448,7 @@ class HarborEvaluator:
         self._task_resource_budget_accounts = resource_accounts
         self._runner_resource_budget_account = runner_account
         self._task_resource_budget_bindings = tuple(
-            bind_timed_resource_account(resource_account)
-            for resource_account in resource_accounts
+            bind_timed_resource_account(resource_account) for resource_account in resource_accounts
         )
         if runner_account is not None:
             self._runner_resource_budget_binding = bind_timed_resource_account(runner_account)
@@ -746,17 +744,20 @@ def _preflight_exact_e2b_builds(
                     "Dockerfile/image-only task for E2B"
                 )
             docker_image = task_config.environment.docker_image
-            if not (docker_image and docker_image.strip()) and not (
-                environment_dir / "Dockerfile"
-            ).is_file():
+            if (
+                not (docker_image and docker_image.strip())
+                and not (environment_dir / "Dockerfile").is_file()
+            ):
                 raise UnsupportedHarborTaskError(
                     f"task {task_dir.name!r} has no [environment].docker_image or "
                     "environment/Dockerfile; Harbor 0.18 E2B requires one immutable "
                     "environment definition"
                 )
-            environment_id = environment_content_hash(
-                environment_dir,
+            build_spec = freeze_exact_e2b_build_spec(
+                environment_dir=environment_dir,
                 docker_image=docker_image,
+                cpu_count=task_config.environment.cpus or 2,
+                memory_mb=task_config.environment.memory_mb or 1024,
             )
             resource_class = ExactE2BEnvironment._task_resource_class(
                 cpu_count=task_config.environment.cpus or 2,
@@ -778,11 +779,15 @@ def _preflight_exact_e2b_builds(
             admitted_account_ids.add(matched_index)
             require_exact_e2b_build_record(
                 jobs_dir=config.jobs_dir,
-                environment_id=environment_id,
-                docker_image=docker_image,
+                environment_id=build_spec.environment_id,
+                build_context_digest=build_spec.build_context_digest,
+                docker_image=build_spec.docker_image,
                 cpu_count=resource_class.cpu_count,
                 memory_mb=resource_class.memory_mb,
                 expected_budget_authority=matched_account,
+                allow_preexisting_outside_study=bool(
+                    config.environment.kwargs.get("allow_preexisting_e2b_builds", False)
+                ),
             )
     if admitted_account_ids != set(range(len(resource_accounts))):
         raise ValueError("E2B task resource accounts must exactly cover the frozen task classes")

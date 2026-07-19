@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -14,6 +16,8 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self, cast
 
@@ -28,7 +32,7 @@ from harbor.models.task.config import (
 )
 from harbor.models.trial.config import ResourceMode, ServiceVolumeConfig
 from harbor.models.trial.paths import TrialPaths
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from wmh.core.types import JsonObject
 from wmh.harness.e2b_sandbox import (
@@ -45,8 +49,10 @@ from wmh.tracking.budget import (
     BudgetAccountBinding,
     BudgetExceededError,
     BudgetIntegrityError,
+    BudgetReservation,
     BudgetScope,
     ReservationStatus,
+    SpendLedger,
     TimedResourceBudget,
     TimedResourceBudgetAccount,
     TimedResourceClass,
@@ -74,9 +80,18 @@ _PROVIDER_CLOCK_SKEW_S = 30
 _TEMPLATE_BUILD_WAIT_TIMEOUT_S = 3_600
 _TEMPLATE_BUILD_REQUEST_TIMEOUT_S = 3_600
 _TEMPLATE_BUILD_CLEANUP_HORIZON_S = 60
+_EXACT_BUILD_SDK_VERSION = "2.31.0"
+_SPEND_LIMIT_MAX_VALIDITY = timedelta(minutes=15)
+_SPEND_LIMIT_CLOCK_SKEW = timedelta(seconds=30)
+_SPEND_LIMIT_SIGNATURE_DOMAIN = b"wmh-e2b-spend-limit-v1\0"
+_E2B_CREDENTIAL_FINGERPRINT_DOMAIN = b"wmh-e2b-credential-v1\0"
+_E2B_API_KEY_ENV = "E2B_API_KEY"
+_E2B_BUILD_STATUS_POLL_INTERVAL_S = 2.0
+_E2B_RECONCILIATION_REQUEST_TIMEOUT_S = 30
 _ASYNC_KILL_DELAYS_S = (0.0, 0.1, 0.5)
 _COMPONENT_IDENTITY = re.compile(r"[A-Za-z0-9_.-]{1,512}\Z")
 _RESOURCE_IDENTITY = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
+_JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
 
 def _digest(value: JsonObject) -> str:
@@ -90,13 +105,47 @@ def _digest(value: JsonObject) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def _canonical_json_bytes(value: JsonObject) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+
+
+def _decode_base64(value: str, *, expected_length: int, label: str) -> bytes:
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError):
+        raise ValueError(f"{label} must be canonical base64") from None
+    if len(decoded) != expected_length or base64.b64encode(decoded).decode() != value:
+        raise ValueError(f"{label} has the wrong canonical length")
+    return decoded
+
+
+def _e2b_credential_fingerprint(api_key: str) -> str:
+    return (
+        "sha256:"
+        + hashlib.sha256(_E2B_CREDENTIAL_FINGERPRINT_DOMAIN + api_key.encode()).hexdigest()
+    )
+
+
+def _e2b_spend_limit_statement_bytes(statement: E2BSpendLimitStatement) -> bytes:
+    return _SPEND_LIMIT_SIGNATURE_DOMAIN + _canonical_json_bytes(
+        cast("JsonObject", statement.model_dump(mode="json"))
+    )
+
+
 class ExactE2BBuildSpec(BaseModel):
     """Task-independent immutable environment build semantics frozen before selection."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     environment_id: str = Field(min_length=1, max_length=512)
+    build_context_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     docker_image: str | None = Field(default=None, min_length=1, max_length=2_048)
     cpu_count: int = Field(ge=1)
     memory_mb: int = Field(ge=1)
@@ -106,6 +155,7 @@ class ExactE2BBuildSpec(BaseModel):
         return _digest(
             _exact_build_input(
                 environment_id=self.environment_id,
+                build_context_digest=self.build_context_digest,
                 docker_image=self.docker_image,
                 cpu_count=self.cpu_count,
                 memory_mb=self.memory_mb,
@@ -121,33 +171,162 @@ class PreexistingE2BBuildAttribution(BaseModel):
     kind: Literal["preexisting_outside_study"] = "preexisting_outside_study"
 
 
-class E2BSpendLimitAttestation(BaseModel):
-    """Frozen operator evidence for the provider-enforced E2B account spending ceiling."""
+class E2BSpendLimitTrust(BaseModel):
+    """Pinned public verification key for one independently managed operator signer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[2] = 2
+    algorithm: Literal["ed25519"] = "ed25519"
+    key_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")
+    account_identity: str = Field(pattern=r"^[A-Za-z0-9_.:@/-]{1,256}$")
+    public_key_base64: str = Field(min_length=44, max_length=44)
+
+    @field_validator("public_key_base64")
+    @classmethod
+    def _validate_public_key(cls, value: str) -> str:
+        _decode_base64(value, expected_length=32, label="E2B spend-limit public key")
+        return value
+
+    @property
+    def digest(self) -> str:
+        return _digest(cast("JsonObject", self.model_dump(mode="json")))
+
+
+class E2BSpendLimitStatement(BaseModel):
+    """Fresh signed observation of the active E2B account's external spend ceiling."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[1] = 1
     provider: Literal["e2b"] = "e2b"
-    account_identity_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    account_identity: str = Field(pattern=r"^[A-Za-z0-9_.:@/-]{1,256}$")
+    credential_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     policy_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     ledger_identity: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     account_spend_nano_usd: int = Field(ge=0, le=(1 << 63) - 1)
     account_limit_nano_usd: int = Field(gt=0, le=(1 << 63) - 1)
-    evidence_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    observed_at: datetime
+    expires_at: datetime
+    dashboard_evidence_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
     @model_validator(mode="after")
-    def _require_remaining_provider_limit(self) -> Self:
+    def _require_fresh_bounded_limit(self) -> Self:
         if self.account_spend_nano_usd >= self.account_limit_nano_usd:
-            raise ValueError("E2B spending-limit attestation has no remaining provider capacity")
+            raise ValueError("E2B spend-limit statement has no remaining provider capacity")
+        if (
+            self.observed_at.tzinfo is None
+            or self.expires_at.tzinfo is None
+            or self.observed_at.utcoffset() != timedelta(0)
+            or self.expires_at.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("E2B spend-limit timestamps must be UTC")
+        if self.dashboard_evidence_digest == "sha256:" + "0" * 64:
+            raise ValueError("E2B dashboard evidence digest cannot be the zero digest")
+        validity = self.expires_at - self.observed_at
+        if validity <= timedelta(0) or validity > _SPEND_LIMIT_MAX_VALIDITY:
+            raise ValueError("E2B spend-limit statement validity must be positive and at most 15m")
         return self
 
     @property
     def remaining_nano_usd(self) -> int:
         return self.account_limit_nano_usd - self.account_spend_nano_usd
 
+
+class E2BSpendLimitAttestation(BaseModel):
+    """Detached Ed25519 operator attestation over one fresh provider-cap statement."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[2] = 2
+    statement: E2BSpendLimitStatement
+    key_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")
+    signature_base64: str = Field(min_length=88, max_length=88)
+
+    @field_validator("signature_base64")
+    @classmethod
+    def _validate_signature(cls, value: str) -> str:
+        _decode_base64(value, expected_length=64, label="E2B spend-limit signature")
+        return value
+
     @property
     def digest(self) -> str:
         return _digest(cast("JsonObject", self.model_dump(mode="json")))
+
+
+def _verify_e2b_spend_limit_signature(
+    attestation: E2BSpendLimitAttestation,
+    trust: E2BSpendLimitTrust,
+) -> E2BSpendLimitStatement:
+    """Verify one detached statement against its separately supplied Ed25519 trust root."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    frozen_attestation = E2BSpendLimitAttestation.model_validate(attestation.model_dump())
+    frozen_trust = E2BSpendLimitTrust.model_validate(trust.model_dump())
+    if frozen_attestation.key_id != frozen_trust.key_id:
+        raise BudgetIntegrityError("E2B spend-limit signer differs from pinned trust")
+    statement = frozen_attestation.statement
+    if statement.account_identity != frozen_trust.account_identity:
+        raise BudgetIntegrityError("E2B spend-limit account differs from pinned trust")
+    try:
+        Ed25519PublicKey.from_public_bytes(
+            _decode_base64(
+                frozen_trust.public_key_base64,
+                expected_length=32,
+                label="E2B spend-limit public key",
+            )
+        ).verify(
+            _decode_base64(
+                frozen_attestation.signature_base64,
+                expected_length=64,
+                label="E2B spend-limit signature",
+            ),
+            _e2b_spend_limit_statement_bytes(statement),
+        )
+    except (InvalidSignature, ValueError):
+        raise BudgetIntegrityError("E2B spend-limit signature is invalid") from None
+    return statement
+
+
+def _verify_e2b_spend_limit(
+    attestation: E2BSpendLimitAttestation,
+    trust: E2BSpendLimitTrust,
+    *,
+    account: TimedResourceBudgetAccount,
+    required_build_ceiling_nano_usd: int,
+    experiment_remaining_nano_usd: int,
+    now: datetime | None = None,
+) -> None:
+    """Verify signer, freshness, active credential, and both independent hard ceilings."""
+    statement = _verify_e2b_spend_limit_signature(attestation, trust)
+    observed_now = (now or datetime.now(UTC)).astimezone(UTC)
+    observed_at = statement.observed_at.astimezone(UTC)
+    expires_at = statement.expires_at.astimezone(UTC)
+    if observed_at > observed_now + _SPEND_LIMIT_CLOCK_SKEW or observed_now >= expires_at:
+        raise BudgetIntegrityError("E2B spend-limit evidence is stale or not yet valid")
+    if (
+        statement.policy_digest != account.policy.policy_digest
+        or statement.ledger_identity != account.ledger_identity
+    ):
+        raise BudgetIntegrityError("E2B spend-limit evidence differs from budget authority")
+    api_key = os.environ.get(_E2B_API_KEY_ENV)
+    if not api_key:
+        raise BudgetIntegrityError("active E2B credential is required for spend-limit verification")
+    if not hmac.compare_digest(
+        statement.credential_fingerprint,
+        _e2b_credential_fingerprint(api_key),
+    ):
+        raise BudgetIntegrityError("E2B spend-limit evidence names a different active credential")
+    provider_remaining = statement.remaining_nano_usd
+    if provider_remaining < required_build_ceiling_nano_usd:
+        raise BudgetExceededError(
+            "E2B provider remaining limit cannot cover the build's full reserved ceiling"
+        )
+    if provider_remaining > experiment_remaining_nano_usd:
+        raise BudgetIntegrityError(
+            "E2B provider remaining limit exceeds the frozen remaining experiment cap"
+        )
 
 
 class BudgetedE2BBuildAttribution(BaseModel):
@@ -162,6 +341,16 @@ class BudgetedE2BBuildAttribution(BaseModel):
     reservation_id: str = Field(min_length=1)
     scope: BudgetScope
     provider_spend_limit: E2BSpendLimitAttestation
+    provider_spend_limit_trust: E2BSpendLimitTrust
+    provider_spend_limit_trust_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _bind_trust_digest(self) -> Self:
+        if self.provider_spend_limit_trust.digest != self.provider_spend_limit_trust_digest:
+            raise ValueError("E2B spend-limit trust digest does not match its trust artifact")
+        if self.provider_spend_limit.key_id != self.provider_spend_limit_trust.key_id:
+            raise ValueError("E2B spend-limit attestation does not match its trust artifact")
+        return self
 
 
 _ExactE2BBuildAttribution = Annotated[
@@ -175,9 +364,10 @@ class ExactE2BBuildRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[4] = 4
     build_config_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     environment_id: str = Field(min_length=1, max_length=512)
+    build_context_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     template_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
     build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
     cpu_count: int = Field(ge=1)
@@ -195,14 +385,41 @@ class ExactE2BBuildRecord(BaseModel):
         return f"{self.template_id}:{self.build_id}"
 
 
-class _ExactE2BBuildAttempt(BaseModel):
-    """Durable pre-dispatch claim that blocks automatic retry after any crash ambiguity."""
+class _E2BBuildRef(BaseModel):
+    """Immutable provider identifiers returned after background build dispatch."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    template_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
+    build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
+
+
+class _ExactE2BBuildAttempt(BaseModel):
+    """Crash-safe build journal used to resume polling without redispatch."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[2] = 2
     build_config_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    state: Literal["claimed", "dispatching", "identified"]
+    alias: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
+    dispatch_started_at: datetime | None = None
+    provider_build: _E2BBuildRef | None = None
     cost_attribution: BudgetedE2BBuildAttribution
+
+    @model_validator(mode="after")
+    def _bind_state(self) -> Self:
+        if self.dispatch_started_at is not None and self.dispatch_started_at.tzinfo is None:
+            raise ValueError("E2B build dispatch timestamp must be timezone-aware")
+        if self.state == "claimed":
+            if self.dispatch_started_at is not None or self.provider_build is not None:
+                raise ValueError("claimed E2B build cannot have dispatch evidence")
+        elif self.state == "dispatching":
+            if self.dispatch_started_at is None or self.provider_build is not None:
+                raise ValueError("dispatching E2B build requires only a dispatch timestamp")
+        elif self.dispatch_started_at is None or self.provider_build is None:
+            raise ValueError("identified E2B build requires timestamp and immutable IDs")
+        return self
 
 
 class ExactE2BEnvironment(E2BEnvironment):
@@ -229,6 +446,7 @@ class ExactE2BEnvironment(E2BEnvironment):
         phase_network_policies: Sequence[NetworkPolicy] | None = None,
         extra_docker_compose: Sequence[Path | str] | None = None,
         resource_budget_bindings: list[JsonObject] | None = None,
+        allow_preexisting_e2b_builds: bool = False,
     ) -> None:
         super().__init__(
             environment_dir=environment_dir,
@@ -256,12 +474,12 @@ class ExactE2BEnvironment(E2BEnvironment):
         self._wmh_owner_id = runner_owner_id(self.trial_paths.trial_dir.name)
         self._wmh_ledger = RunnerLeaseLedger(self.trial_paths.trial_dir / TASK_E2B_LEASE_FILE)
         bindings = tuple(
-            BudgetAccountBinding.model_validate(value)
-            for value in (resource_budget_bindings or ())
+            BudgetAccountBinding.model_validate(value) for value in (resource_budget_bindings or ())
         )
         self._wmh_resource_budget_accounts = tuple(
             resolve_timed_resource_account(binding) for binding in bindings
         )
+        self._wmh_allow_preexisting_e2b_builds = allow_preexisting_e2b_builds
         self._wmh_resource_budget_account: TimedResourceBudgetAccount | None = None
         self._wmh_resource_budget: TimedResourceBudget | None = None
         self._wmh_resource_reservation: TimedResourceReservation | None = None
@@ -299,9 +517,7 @@ class ExactE2BEnvironment(E2BEnvironment):
             orphan_expiry_horizon_s=(
                 None
                 if self._wmh_resource_budget_account is None
-                else E2B_CREATE_REQUEST_TIMEOUT_S
-                + _TASK_LEASE_TIMEOUT_S
-                + _PROVIDER_CLOCK_SKEW_S
+                else E2B_CREATE_REQUEST_TIMEOUT_S + _TASK_LEASE_TIMEOUT_S + _PROVIDER_CLOCK_SKEW_S
             ),
         )
         if self._wmh_resource_budget_account is not None:
@@ -405,13 +621,23 @@ class ExactE2BEnvironment(E2BEnvironment):
 
     async def _load_or_build_exact_template(self) -> ExactE2BBuildRecord:
         """Load a prebuilt exact ID; scored execution never dispatches a template build."""
-        return require_exact_e2b_build_record(
-            jobs_dir=self.trial_paths.trial_dir.parent.parent,
-            environment_id=self.environment_id,
+        spec = freeze_exact_e2b_build_spec(
+            environment_dir=self.environment_dir,
             docker_image=self.task_env_config.docker_image,
             cpu_count=self._effective_cpus or 2,
             memory_mb=self._effective_memory_mb or 1024,
+        )
+        if spec.environment_id != self.environment_id:
+            raise RuntimeError("E2B task environment changed after Harbor identity resolution")
+        return require_exact_e2b_build_record(
+            jobs_dir=self.trial_paths.trial_dir.parent.parent,
+            environment_id=spec.environment_id,
+            build_context_digest=spec.build_context_digest,
+            docker_image=spec.docker_image,
+            cpu_count=spec.cpu_count,
+            memory_mb=spec.memory_mb,
             expected_budget_authority=self._wmh_resource_budget_account,
+            allow_preexisting_outside_study=self._wmh_allow_preexisting_e2b_builds,
         )
 
     async def _create_exact_sandbox(
@@ -692,8 +918,17 @@ def freeze_exact_e2b_build_spec(
     if docker_image is not None and not image:
         raise ValueError("E2B build docker_image cannot be blank")
     require_agent_environment_definition(source, docker_image=image)
+    with tempfile.TemporaryDirectory(prefix=".wmh-e2b-spec-") as temporary:
+        if image is None:
+            build_source = Path(temporary) / "environment"
+            _copy_exact_build_source(source, build_source)
+        else:
+            build_source = source
+        template = _exact_template_definition(build_source, docker_image=image)
+        build_context_digest = _exact_e2b_sdk_build_context_digest(template)
     return ExactE2BBuildSpec(
         environment_id=environment_content_hash(source, docker_image=image),
+        build_context_digest=build_context_digest,
         docker_image=image,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
@@ -707,6 +942,7 @@ async def prepare_exact_e2b_build(
     spec: ExactE2BBuildSpec,
     budget_account: TimedResourceBudgetAccount,
     provider_spend_limit: E2BSpendLimitAttestation,
+    provider_spend_limit_trust: E2BSpendLimitTrust,
 ) -> ExactE2BBuildRecord:
     """Build and publish one immutable template through the study's timed budget authority.
 
@@ -729,11 +965,7 @@ async def prepare_exact_e2b_build(
     account = TimedResourceBudgetAccount.model_validate(budget_account.model_dump())
     validate_timed_resource_class(account, resource_class)
     spend_limit = E2BSpendLimitAttestation.model_validate(provider_spend_limit.model_dump())
-    if (
-        spend_limit.policy_digest != account.policy.policy_digest
-        or spend_limit.ledger_identity != account.ledger_identity
-    ):
-        raise BudgetIntegrityError("E2B spending-limit attestation differs from budget authority")
+    spend_limit_trust = E2BSpendLimitTrust.model_validate(provider_spend_limit_trust.model_dump())
     registry = _exact_build_registry(jobs_dir)
     snapshot_context = tempfile.TemporaryDirectory(prefix=".wmh-e2b-source-", dir=registry)
     snapshot_root = Path(snapshot_context.name)
@@ -758,6 +990,8 @@ async def prepare_exact_e2b_build(
             build_source,
             docker_image=frozen.docker_image,
         )
+        if _exact_e2b_sdk_build_context_digest(template) != frozen.build_context_digest:
+            raise RuntimeError("E2B SDK build context differs from its frozen specification")
         return await _prepare_exact_e2b_build_locked(
             registry=registry,
             spec=frozen,
@@ -766,6 +1000,7 @@ async def prepare_exact_e2b_build(
             resource_class=resource_class,
             account=account,
             provider_spend_limit=spend_limit,
+            provider_spend_limit_trust=spend_limit_trust,
         )
     finally:
         snapshot_context.cleanup()
@@ -780,8 +1015,9 @@ async def _prepare_exact_e2b_build_locked(
     resource_class: TimedResourceClass,
     account: TimedResourceBudgetAccount,
     provider_spend_limit: E2BSpendLimitAttestation,
+    provider_spend_limit_trust: E2BSpendLimitTrust,
 ) -> ExactE2BBuildRecord:
-    """Serialize one prepared build and retain durable ambiguity across process crashes."""
+    """Serialize one build while journaling enough provider identity for safe resume."""
     record_path = registry / f"{config_digest.removeprefix('sha256:')}.json"
     attempt_path = registry / f"{config_digest.removeprefix('sha256:')}.attempt.json"
     lock_path = registry / f"{config_digest.removeprefix('sha256:')}.lock"
@@ -790,75 +1026,172 @@ async def _prepare_exact_e2b_build_locked(
     try:
         existing = _read_build_record(record_path)
         if existing is not None:
-            _require_record_key(existing, config_digest=config_digest)
+            _require_record_key(
+                existing,
+                config_digest=config_digest,
+                environment_id=spec.environment_id,
+                build_context_digest=spec.build_context_digest,
+                cpu_count=spec.cpu_count,
+                memory_mb=spec.memory_mb,
+            )
             _verify_build_budget_attribution(existing, expected_authority=account)
             return existing
-        if _read_build_attempt(attempt_path) is not None:
-            raise RuntimeError(
-                "E2B exact build has an incomplete or ambiguous prior dispatch; automatic retry "
-                "is forbidden"
-            )
         ledger = open_shared_spend_ledger(
             account.ledger_path,
             account.policy,
             expected_ledger_identity=account.ledger_identity,
         )
-        if provider_spend_limit.account_limit_nano_usd > ledger.snapshot().remaining_nano_usd:
-            raise BudgetIntegrityError(
-                "E2B provider spending limit exceeds the frozen remaining experiment cap"
+        meter = account.policy.meters[account.meter_id]
+        if not isinstance(meter, TimedResourceCostMeter):
+            raise BudgetIntegrityError("E2B build account does not name a timed resource meter")
+        attempt = _read_build_attempt(attempt_path)
+        if attempt is None:
+            _verify_e2b_spend_limit(
+                provider_spend_limit,
+                provider_spend_limit_trust,
+                account=account,
+                required_build_ceiling_nano_usd=meter.maximum_charge_nano_usd(),
+                experiment_remaining_nano_usd=ledger.snapshot().remaining_nano_usd,
             )
-        attribution = BudgetedE2BBuildAttribution(
-            policy_digest=account.policy.policy_digest,
-            ledger_identity=account.ledger_identity,
-            meter_id=account.meter_id,
-            reservation_id="e2b-build-" + uuid.uuid4().hex,
-            scope=account.scope,
-            provider_spend_limit=provider_spend_limit,
-        )
-        _write_build_attempt(
-            attempt_path,
-            _ExactE2BBuildAttempt(
+            reservation_id = "e2b-build-" + uuid.uuid4().hex
+            attribution = BudgetedE2BBuildAttribution(
+                policy_digest=account.policy.policy_digest,
+                ledger_identity=account.ledger_identity,
+                meter_id=account.meter_id,
+                reservation_id=reservation_id,
+                scope=account.scope,
+                provider_spend_limit=provider_spend_limit,
+                provider_spend_limit_trust=provider_spend_limit_trust,
+                provider_spend_limit_trust_digest=provider_spend_limit_trust.digest,
+            )
+            attempt = _ExactE2BBuildAttempt(
                 build_config_digest=config_digest,
+                state="claimed",
+                alias=(
+                    "wmh-"
+                    + config_digest.removeprefix("sha256:")
+                    + "-"
+                    + reservation_id.removeprefix("e2b-build-")[:16]
+                ),
                 cost_attribution=attribution,
-            ),
-        )
-        budget = TimedResourceBudget(
-            account,
-            resource_class=resource_class,
-            id_factory=lambda: attribution.reservation_id,
-        )
-        try:
-            reservation = budget.reserve()
-        except BudgetExceededError:
-            # Hard-cap denial is transactionally proved to have created no reservation and occurs
-            # before provider dispatch, so this one non-ambiguous failure may release its claim.
-            attempt_path.unlink()
-            raise
-        try:
-            async with asyncio.timeout(resource_class.max_host_observation_seconds):
-                info = await _build_exact_template_once(
+            )
+            _write_build_attempt(attempt_path, attempt)
+            budget = TimedResourceBudget(
+                account,
+                resource_class=resource_class,
+                id_factory=lambda: attribution.reservation_id,
+            )
+            try:
+                budget.reserve()
+            except BudgetExceededError:
+                # Admission denial created no reservation and happened before the dispatch marker.
+                _unlink_registry_path(attempt_path)
+                raise
+            dispatching = attempt.model_copy(
+                update={"state": "dispatching", "dispatch_started_at": datetime.now(UTC)}
+            )
+            _replace_build_attempt(attempt_path, expected=attempt, updated=dispatching)
+            attempt = dispatching
+            try:
+                info = await _start_exact_template_build(
                     template=template,
-                    alias="wmh-" + config_digest.removeprefix("sha256:")[:32],
+                    alias=attempt.alias,
                     cpu_count=spec.cpu_count,
                     memory_mb=spec.memory_mb,
                 )
-            record = _record_completed_build(
-                info,
+                provider_build = _build_ref_from_info(info)
+            except (Exception, asyncio.CancelledError) as dispatch_error:  # noqa: BLE001
+                try:
+                    attempt = await _reconcile_dispatching_build(
+                        attempt_path=attempt_path,
+                        attempt=attempt,
+                        cpu_count=spec.cpu_count,
+                        memory_mb=spec.memory_mb,
+                    )
+                except (Exception, asyncio.CancelledError) as reconciliation_error:  # noqa: BLE001
+                    _forfeit_build_reservation(
+                        account,
+                        attempt,
+                        failure_type="E2BBuildDispatchUnknown",
+                    )
+                    raise reconciliation_error from dispatch_error
+                if isinstance(dispatch_error, asyncio.CancelledError):
+                    raise
+            else:
+                identified = attempt.model_copy(
+                    update={"state": "identified", "provider_build": provider_build}
+                )
+                _replace_build_attempt(attempt_path, expected=attempt, updated=identified)
+                attempt = identified
+        else:
+            _require_resumable_build_attempt(
+                attempt,
                 config_digest=config_digest,
-                environment_id=spec.environment_id,
-                cpu_count=spec.cpu_count,
-                memory_mb=spec.memory_mb,
-                cost_attribution=attribution,
+                account=account,
+                meter=meter,
+                ledger=ledger,
             )
-        except BaseException as error:
-            try:
-                reservation.forfeit(failure_type="E2BBuildUnknown")
-            except Exception as ledger_error:
-                raise ledger_error from error
+            if attempt.state == "claimed":
+                matches = _build_reservations(ledger, attempt)
+                if not matches:
+                    _unlink_registry_path(attempt_path)
+                    raise RuntimeError(
+                        "E2B build claim was safely cleared before dispatch; rerun preparation"
+                    )
+                _forfeit_build_reservation(
+                    account,
+                    attempt,
+                    failure_type="E2BBuildPredispatchUnknown",
+                )
+                raise RuntimeError(
+                    "E2B build crashed between budget admission and its dispatch marker; "
+                    "automatic dispatch is forbidden"
+                )
+            if attempt.state == "dispatching":
+                try:
+                    attempt = await _reconcile_dispatching_build(
+                        attempt_path=attempt_path,
+                        attempt=attempt,
+                        cpu_count=spec.cpu_count,
+                        memory_mb=spec.memory_mb,
+                    )
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                    _forfeit_build_reservation(
+                        account,
+                        attempt,
+                        failure_type="E2BBuildDispatchUnknown",
+                    )
+                    raise
+        assert attempt.provider_build is not None
+        try:
+            remaining_s = _remaining_build_observation_seconds(attempt, resource_class)
+            async with asyncio.timeout(remaining_s):
+                await _wait_for_exact_template_build(attempt.provider_build)
+        except _E2BBuildTerminalError:
+            _forfeit_build_reservation(account, attempt, failure_type="E2BBuildFailed")
             raise
-        reservation.settle()
+        except TimeoutError:
+            _forfeit_build_reservation(account, attempt, failure_type="E2BBuildTimeout")
+            raise RuntimeError(
+                "E2B build exceeded its local observation horizon; provider builds cannot be "
+                "cancelled through the SDK, so the external signed cap remains authoritative"
+            ) from None
+        # Transport/cancellation failures intentionally leave an IDENTIFIED journal and RESERVED
+        # ledger entry. A later invocation resumes status polling by immutable IDs without another
+        # upload or build trigger.
+        _settle_build_reservation(account, attempt)
+        record = ExactE2BBuildRecord(
+            build_config_digest=config_digest,
+            environment_id=spec.environment_id,
+            build_context_digest=spec.build_context_digest,
+            template_id=attempt.provider_build.template_id,
+            build_id=attempt.provider_build.build_id,
+            cpu_count=spec.cpu_count,
+            memory_mb=spec.memory_mb,
+            cost_attribution=attempt.cost_attribution,
+        )
         _write_build_record(record_path, record)
-        attempt_path.unlink()
+        _unlink_registry_path(attempt_path)
         return record
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -877,6 +1210,38 @@ def _exact_template_definition(
         return Template().from_image(image=docker_image)
     return Template(file_context_path=str(environment_dir)).from_dockerfile(
         dockerfile_content_or_path=str(environment_dir / "Dockerfile")
+    )
+
+
+def _exact_e2b_sdk_build_context_digest(template: TemplateBuilder) -> str:
+    """Bind the pinned SDK plan and exact COPY hashes used for provider upload/build."""
+    try:
+        installed_version = distribution_version("e2b")
+    except PackageNotFoundError:
+        raise RuntimeError("exact E2B builds require the pinned E2B SDK") from None
+    if installed_version != _EXACT_BUILD_SDK_VERSION:
+        raise RuntimeError(
+            "exact E2B build context hashing requires SDK "
+            f"{_EXACT_BUILD_SDK_VERSION}, found {installed_version}"
+        )
+    state = getattr(template, "_template", None)
+    instructions_with_hashes = getattr(state, "_instructions_with_hashes", None)
+    serialize = getattr(state, "_serialize", None)
+    if not callable(instructions_with_hashes) or not callable(serialize):
+        raise RuntimeError("pinned E2B SDK no longer exposes its normalized build plan")
+    try:
+        instructions = instructions_with_hashes()
+        serialized = _JSON_OBJECT_ADAPTER.validate_python(serialize(instructions))
+    except (OSError, TypeError, ValueError):
+        raise RuntimeError("E2B SDK build context could not be normalized safely") from None
+    return _digest(
+        {
+            "schema_version": 1,
+            "sdk": "e2b",
+            "sdk_version": _EXACT_BUILD_SDK_VERSION,
+            "symlink_policy": "reject",
+            "normalized_build_plan": serialized,
+        }
     )
 
 
@@ -1028,17 +1393,21 @@ def _build_source_metadata_changed(before: os.stat_result, after: os.stat_result
     return any(getattr(before, field) != getattr(after, field) for field in fields)
 
 
-async def _build_exact_template_once(
+class _E2BBuildTerminalError(RuntimeError):
+    """The provider proved that an identified build reached a terminal failure."""
+
+
+async def _start_exact_template_build(
     *,
     template: TemplateBuilder,
     alias: str,
     cpu_count: int,
     memory_mb: int,
 ) -> BuildInfo:
-    """Dispatch exactly one provider build and wait for its immutable completed identity."""
+    """Upload and trigger exactly once, returning immutable IDs before completion polling."""
     from e2b import AsyncTemplate
 
-    return await AsyncTemplate.build(
+    return await AsyncTemplate.build_in_background(
         template=template,
         alias=alias,
         cpu_count=cpu_count,
@@ -1047,11 +1416,300 @@ async def _build_exact_template_once(
     )
 
 
+def _build_ref_from_info(info: BuildInfo) -> _E2BBuildRef:
+    template_id = getattr(info, "template_id", None)
+    build_id = getattr(info, "build_id", None)
+    if not isinstance(template_id, str) or not isinstance(build_id, str):
+        raise RuntimeError("E2B background build did not return immutable template/build IDs")
+    try:
+        return _E2BBuildRef(template_id=template_id, build_id=build_id)
+    except ValueError:
+        raise RuntimeError(
+            "E2B background build did not return immutable template/build IDs"
+        ) from None
+
+
+def _build_info_from_ref(build: _E2BBuildRef) -> BuildInfo:
+    from e2b.template.types import BuildInfo
+
+    return BuildInfo(
+        template_id=build.template_id,
+        build_id=build.build_id,
+        name="wmh-resumed-build",
+        alias="wmh-resumed-build",
+    )
+
+
+async def _wait_for_exact_template_build(build: _E2BBuildRef) -> None:
+    """Poll an immutable build ID; transport failure is resumable and never redispatches."""
+    from e2b import AsyncTemplate
+
+    info = _build_info_from_ref(build)
+    while True:
+        response = await AsyncTemplate.get_build_status(
+            info,
+            request_timeout=_E2B_RECONCILIATION_REQUEST_TIMEOUT_S,
+        )
+        status = _normalized_e2b_build_status(getattr(response, "status", None))
+        if status == "ready":
+            return
+        if status == "error":
+            raise _E2BBuildTerminalError("E2B identified build failed")
+        if status not in {"building", "waiting"}:
+            raise _E2BBuildTerminalError("E2B identified build returned an unknown status")
+        await asyncio.sleep(_E2B_BUILD_STATUS_POLL_INTERVAL_S)
+
+
+async def _reconcile_dispatching_build(
+    *,
+    attempt_path: Path,
+    attempt: _ExactE2BBuildAttempt,
+    cpu_count: int,
+    memory_mb: int,
+) -> _ExactE2BBuildAttempt:
+    """Recover one pre-handle dispatch by its unique alias without triggering a second build."""
+    if attempt.state != "dispatching" or attempt.dispatch_started_at is None:
+        raise BudgetIntegrityError("E2B build reconciliation requires a dispatching journal")
+    provider_build, status = await _reconcile_exact_template_build(
+        alias=attempt.alias,
+        dispatch_started_at=attempt.dispatch_started_at,
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+    )
+    if status == "error":
+        raise _E2BBuildTerminalError("E2B reconciled build failed")
+    # The documented list endpoint can expose queue/upload states that the pinned SDK's direct
+    # status API cannot safely resume from. Only an already-building or ready build is adopted.
+    if status not in {"building", "ready"}:
+        raise RuntimeError("E2B pre-handle build state cannot be resumed safely")
+    identified = attempt.model_copy(
+        update={"state": "identified", "provider_build": provider_build}
+    )
+    _replace_build_attempt(attempt_path, expected=attempt, updated=identified)
+    return identified
+
+
+async def _reconcile_exact_template_build(
+    *,
+    alias: str,
+    dispatch_started_at: datetime,
+    cpu_count: int,
+    memory_mb: int,
+) -> tuple[_E2BBuildRef, str]:
+    """Use documented E2B alias/template endpoints to recover one unique post-dispatch build."""
+    from e2b.api.client.api.templates import (
+        get_templates_aliases_alias,
+        get_templates_template_id,
+    )
+    from e2b.api.client_async import get_api_client
+    from e2b.connection_config import ConnectionConfig
+
+    client = get_api_client(ConnectionConfig(request_timeout=_E2B_RECONCILIATION_REQUEST_TIMEOUT_S))
+    alias_response = await get_templates_aliases_alias.asyncio_detailed(alias, client=client)
+    if int(alias_response.status_code) != 200:
+        raise RuntimeError("E2B build alias could not be reconciled")
+    template_id = getattr(alias_response.parsed, "template_id", None)
+    if not isinstance(template_id, str) or _COMPONENT_IDENTITY.fullmatch(template_id) is None:
+        raise RuntimeError("E2B build alias reconciliation returned an invalid template ID")
+    template_response = await get_templates_template_id.asyncio_detailed(
+        template_id,
+        client=client,
+        limit=100,
+    )
+    if int(template_response.status_code) != 200:
+        raise RuntimeError("E2B template builds could not be reconciled")
+    builds = getattr(template_response.parsed, "builds", None)
+    aliases = getattr(template_response.parsed, "aliases", None)
+    names = getattr(template_response.parsed, "names", None)
+    if not isinstance(builds, list):
+        raise RuntimeError("E2B template reconciliation returned an invalid build list")
+    if not (
+        isinstance(aliases, list)
+        and all(isinstance(value, str) for value in aliases)
+        and isinstance(names, list)
+        and all(isinstance(value, str) for value in names)
+        and (alias in aliases or alias in names)
+    ):
+        raise RuntimeError("E2B template reconciliation did not preserve the exact build alias")
+    earliest = dispatch_started_at.astimezone(UTC) - _SPEND_LIMIT_CLOCK_SKEW
+    latest = datetime.now(UTC) + _SPEND_LIMIT_CLOCK_SKEW
+    candidates: list[tuple[_E2BBuildRef, str]] = []
+    for build in builds:
+        created_at = getattr(build, "created_at", None)
+        if not isinstance(created_at, datetime) or created_at.tzinfo is None:
+            continue
+        if (
+            not earliest <= created_at.astimezone(UTC) <= latest
+            or getattr(build, "cpu_count", None) != cpu_count
+            or getattr(build, "memory_mb", None) != memory_mb
+        ):
+            continue
+        build_id = str(getattr(build, "build_id", ""))
+        try:
+            provider_build = _E2BBuildRef(template_id=template_id, build_id=build_id)
+        except ValueError:
+            continue
+        candidates.append(
+            (provider_build, _normalized_e2b_build_status(getattr(build, "status", None)))
+        )
+    if len(candidates) != 1:
+        raise RuntimeError("E2B build reconciliation did not prove exactly one matching build")
+    return candidates[0]
+
+
+def _normalized_e2b_build_status(value: object) -> str:
+    normalized = getattr(value, "value", value)
+    return normalized if isinstance(normalized, str) else "unknown"
+
+
+def _build_reservations(
+    ledger: SpendLedger,
+    attempt: _ExactE2BBuildAttempt,
+) -> list[BudgetReservation]:
+    return [
+        reservation
+        for reservation in ledger.reservations()
+        if reservation.reservation_id == attempt.cost_attribution.reservation_id
+    ]
+
+
+def _require_resumable_build_attempt(
+    attempt: _ExactE2BBuildAttempt,
+    *,
+    config_digest: str,
+    account: TimedResourceBudgetAccount,
+    meter: TimedResourceCostMeter,
+    ledger: SpendLedger,
+) -> None:
+    attribution = attempt.cost_attribution
+    statement = _verify_e2b_spend_limit_signature(
+        attribution.provider_spend_limit,
+        attribution.provider_spend_limit_trust,
+    )
+    api_key = os.environ.get(_E2B_API_KEY_ENV)
+    if (
+        attempt.build_config_digest != config_digest
+        or attribution.policy_digest != account.policy.policy_digest
+        or attribution.ledger_identity != account.ledger_identity
+        or attribution.meter_id != account.meter_id
+        or attribution.scope != account.scope
+        or attribution.provider_spend_limit.statement.policy_digest != attribution.policy_digest
+        or attribution.provider_spend_limit.statement.ledger_identity != attribution.ledger_identity
+        or not api_key
+        or not hmac.compare_digest(
+            statement.credential_fingerprint,
+            _e2b_credential_fingerprint(api_key),
+        )
+    ):
+        raise BudgetIntegrityError("E2B build attempt differs from its study budget authority")
+    matches = _build_reservations(ledger, attempt)
+    if len(matches) > 1:
+        raise BudgetIntegrityError("E2B build attempt has duplicate ledger reservations")
+    if matches:
+        reservation = matches[0]
+        if (
+            getattr(reservation, "meter_id", None) != attribution.meter_id
+            or getattr(reservation, "scope", None) != attribution.scope
+            or getattr(reservation, "max_nano_usd", None) != meter.maximum_charge_nano_usd()
+            or getattr(reservation, "status", None)
+            not in {ReservationStatus.RESERVED, ReservationStatus.SETTLED}
+        ):
+            raise BudgetIntegrityError("E2B build attempt ledger reservation is not resumable")
+    elif attempt.state != "claimed":
+        raise BudgetIntegrityError("dispatched E2B build attempt has no ledger reservation")
+
+
+def _forfeit_build_reservation(
+    account: TimedResourceBudgetAccount,
+    attempt: _ExactE2BBuildAttempt,
+    *,
+    failure_type: str,
+) -> None:
+    ledger = open_shared_spend_ledger(
+        account.ledger_path,
+        account.policy,
+        expected_ledger_identity=account.ledger_identity,
+    )
+    matches = _build_reservations(ledger, attempt)
+    if len(matches) != 1:
+        raise BudgetIntegrityError("E2B build attempt has no unique ledger reservation")
+    reservation = matches[0]
+    status = getattr(reservation, "status", None)
+    if status is ReservationStatus.RESERVED:
+        ledger.forfeit(attempt.cost_attribution.reservation_id, failure_type=failure_type)
+    elif status is not ReservationStatus.FORFEITED:
+        raise BudgetIntegrityError("E2B build reservation cannot be forfeited from its state")
+
+
+def _settle_build_reservation(
+    account: TimedResourceBudgetAccount,
+    attempt: _ExactE2BBuildAttempt,
+) -> None:
+    if attempt.dispatch_started_at is None:
+        raise BudgetIntegrityError("E2B identified build has no dispatch timestamp")
+    meter = account.policy.meters[account.meter_id]
+    if not isinstance(meter, TimedResourceCostMeter):
+        raise BudgetIntegrityError("E2B build account does not name a timed resource meter")
+    ledger = open_shared_spend_ledger(
+        account.ledger_path,
+        account.policy,
+        expected_ledger_identity=account.ledger_identity,
+    )
+    matches = _build_reservations(ledger, attempt)
+    if len(matches) != 1:
+        raise BudgetIntegrityError("E2B build attempt has no unique ledger reservation")
+    reservation = matches[0]
+    if getattr(reservation, "status", None) is ReservationStatus.SETTLED:
+        if (
+            reservation.meter_id != account.meter_id
+            or reservation.scope != account.scope
+            or reservation.max_nano_usd != meter.maximum_charge_nano_usd()
+            or reservation.usage_unit != "billing_second"
+            or not isinstance(reservation.usage_quantity, int)
+        ):
+            raise BudgetIntegrityError("settled E2B build reservation evidence is inconsistent")
+        return
+    if getattr(reservation, "status", None) is not ReservationStatus.RESERVED:
+        raise BudgetIntegrityError("E2B build reservation is not open for settlement")
+    elapsed_s = max(
+        (datetime.now(UTC) - attempt.dispatch_started_at.astimezone(UTC)).total_seconds(), 0
+    )
+    billed_seconds = meter.billed_seconds(elapsed_s)
+    if billed_seconds > meter.max_billing_seconds:
+        ledger.forfeit(
+            attempt.cost_attribution.reservation_id,
+            failure_type="E2BBuildObservationExceeded",
+        )
+        raise BudgetIntegrityError("E2B build completion exceeded its reserved billing horizon")
+    ledger.settle(
+        attempt.cost_attribution.reservation_id,
+        charged_nano_usd=meter.charge_nano_usd(billed_seconds=billed_seconds),
+        usage_quantity=billed_seconds,
+        usage_unit="billing_second",
+    )
+
+
+def _remaining_build_observation_seconds(
+    attempt: _ExactE2BBuildAttempt,
+    resource_class: TimedResourceClass,
+) -> float:
+    if attempt.dispatch_started_at is None:
+        raise BudgetIntegrityError("E2B identified build has no dispatch timestamp")
+    elapsed_s = max(
+        (datetime.now(UTC) - attempt.dispatch_started_at.astimezone(UTC)).total_seconds(), 0
+    )
+    remaining_s = resource_class.max_host_observation_seconds - elapsed_s
+    if remaining_s <= 0:
+        raise TimeoutError
+    return remaining_s
+
+
 def _record_completed_build(
     info: BuildInfo,
     *,
     config_digest: str,
     environment_id: str,
+    build_context_digest: str,
     cpu_count: int,
     memory_mb: int,
     cost_attribution: BudgetedE2BBuildAttribution,
@@ -1068,6 +1726,7 @@ def _record_completed_build(
     return ExactE2BBuildRecord(
         build_config_digest=config_digest,
         environment_id=environment_id,
+        build_context_digest=build_context_digest,
         template_id=template_id,
         build_id=build_id,
         cpu_count=cpu_count,
@@ -1080,6 +1739,7 @@ def register_exact_e2b_build_record(
     *,
     jobs_dir: Path,
     environment_id: str,
+    build_context_digest: str,
     docker_image: str | None,
     template_id: str,
     build_id: str,
@@ -1094,6 +1754,7 @@ def register_exact_e2b_build_record(
         )
     build_input = _exact_build_input(
         environment_id=environment_id,
+        build_context_digest=build_context_digest,
         docker_image=docker_image,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
@@ -1101,6 +1762,7 @@ def register_exact_e2b_build_record(
     record = ExactE2BBuildRecord(
         build_config_digest=_digest(build_input),
         environment_id=environment_id,
+        build_context_digest=build_context_digest,
         template_id=template_id,
         build_id=build_id,
         cpu_count=cpu_count,
@@ -1116,9 +1778,7 @@ def register_exact_e2b_build_record(
         existing = _read_build_record(record_path)
         if existing is not None:
             if existing != record:
-                raise RuntimeError(
-                    "E2B exact-build registry already contains a different record"
-                )
+                raise RuntimeError("E2B exact-build registry already contains a different record")
             return existing
         _write_build_record(record_path, record)
         return record
@@ -1131,14 +1791,17 @@ def require_exact_e2b_build_record(
     *,
     jobs_dir: Path,
     environment_id: str,
+    build_context_digest: str,
     docker_image: str | None,
     cpu_count: int,
     memory_mb: int,
     expected_budget_authority: TimedResourceBudgetAccount | None = None,
+    allow_preexisting_outside_study: bool = False,
 ) -> ExactE2BBuildRecord:
     """Load one immutable build record before Harbor publishes a scored job directory."""
     build_input = _exact_build_input(
         environment_id=environment_id,
+        build_context_digest=build_context_digest,
         docker_image=docker_image,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
@@ -1151,10 +1814,18 @@ def require_exact_e2b_build_record(
     record = _read_build_record(record_path)
     if record is None:
         raise RuntimeError("scored E2B task environments require a prebuilt exact template record")
-    _require_record_key(record, config_digest=config_digest)
+    _require_record_key(
+        record,
+        config_digest=config_digest,
+        environment_id=environment_id,
+        build_context_digest=build_context_digest,
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+    )
     _verify_build_budget_attribution(
         record,
         expected_authority=expected_budget_authority,
+        allow_preexisting_outside_study=allow_preexisting_outside_study,
     )
     return record
 
@@ -1170,8 +1841,22 @@ def _exact_build_registry(jobs_dir: Path) -> Path:
     return registry
 
 
-def _require_record_key(record: ExactE2BBuildRecord, *, config_digest: str) -> None:
-    if record.build_config_digest != config_digest:
+def _require_record_key(
+    record: ExactE2BBuildRecord,
+    *,
+    config_digest: str,
+    environment_id: str,
+    build_context_digest: str,
+    cpu_count: int,
+    memory_mb: int,
+) -> None:
+    if (
+        record.build_config_digest != config_digest
+        or record.environment_id != environment_id
+        or record.build_context_digest != build_context_digest
+        or record.cpu_count != cpu_count
+        or record.memory_mb != memory_mb
+    ):
         raise RuntimeError("E2B exact-build registry key does not match its record")
 
 
@@ -1179,9 +1864,14 @@ def _verify_build_budget_attribution(
     record: ExactE2BBuildRecord,
     *,
     expected_authority: TimedResourceBudgetAccount | None,
+    allow_preexisting_outside_study: bool = False,
 ) -> None:
     attribution = record.cost_attribution
     if isinstance(attribution, PreexistingE2BBuildAttribution):
+        if not allow_preexisting_outside_study:
+            raise BudgetIntegrityError(
+                "preexisting E2B build is excluded from scored study protocols by default"
+            )
         return
     if expected_authority is None:
         raise BudgetIntegrityError("budgeted E2B build record requires the study budget authority")
@@ -1191,11 +1881,21 @@ def _verify_build_budget_attribution(
         or attribution.ledger_identity != account.ledger_identity
     ):
         raise BudgetIntegrityError("E2B build cost attribution differs from study authority")
-    spend_limit = attribution.provider_spend_limit
+    statement = attribution.provider_spend_limit.statement
+    _verify_e2b_spend_limit_signature(
+        attribution.provider_spend_limit,
+        attribution.provider_spend_limit_trust,
+    )
+    api_key = os.environ.get(_E2B_API_KEY_ENV)
+    if not api_key or not hmac.compare_digest(
+        statement.credential_fingerprint,
+        _e2b_credential_fingerprint(api_key),
+    ):
+        raise BudgetIntegrityError("E2B build record differs from the active account credential")
     if (
-        spend_limit.policy_digest != attribution.policy_digest
-        or spend_limit.ledger_identity != attribution.ledger_identity
-        or spend_limit.account_limit_nano_usd > account.policy.hard_limit_nano_usd
+        statement.policy_digest != attribution.policy_digest
+        or statement.ledger_identity != attribution.ledger_identity
+        or statement.remaining_nano_usd > account.policy.hard_limit_nano_usd
     ):
         raise BudgetIntegrityError("E2B build provider spending-limit evidence is inconsistent")
     meter = account.policy.meters.get(attribution.meter_id)
@@ -1269,6 +1969,7 @@ async def _kill_async_sandbox(sandbox: AsyncSandbox) -> None:
 def _exact_build_input(
     *,
     environment_id: str,
+    build_context_digest: str,
     docker_image: str | None,
     cpu_count: int,
     memory_mb: int,
@@ -1276,8 +1977,9 @@ def _exact_build_input(
     return cast(
         "JsonObject",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "environment_id": environment_id,
+            "build_context_digest": build_context_digest,
             "definition_kind": "docker_image" if docker_image is not None else "dockerfile_context",
             "docker_image": docker_image,
             "cpu_count": cpu_count,
@@ -1324,6 +2026,41 @@ def _write_build_attempt(path: Path, attempt: _ExactE2BBuildAttempt) -> None:
     _write_registry_model(path, attempt)
 
 
+def _replace_build_attempt(
+    path: Path,
+    *,
+    expected: _ExactE2BBuildAttempt,
+    updated: _ExactE2BBuildAttempt,
+) -> None:
+    current = _read_build_attempt(path)
+    if current != expected:
+        raise RuntimeError("E2B exact-build attempt changed during journal transition")
+    descriptor, temporary = tempfile.mkstemp(prefix=".wmh-e2b-attempt-", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(updated.model_dump_json().encode())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        _fsync_registry_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _unlink_registry_path(path: Path) -> None:
+    path.unlink()
+    _fsync_registry_directory(path.parent)
+
+
+def _fsync_registry_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_registry_model(path: Path, value: BaseModel) -> None:
     if path.exists() or path.is_symlink():
         raise RuntimeError("E2B exact-build registry record changed during publication")
@@ -1335,10 +2072,6 @@ def _write_registry_model(path: Path, value: BaseModel) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_registry_directory(path.parent)
     finally:
         temporary_path.unlink(missing_ok=True)

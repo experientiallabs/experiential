@@ -33,6 +33,7 @@ from wmh.tracking.budget import (
     TimedResourceClass,
     TimedResourceCostMeter,
     TimedResourceRole,
+    bootstrap_budget_ledger,
 )
 
 
@@ -1461,22 +1462,18 @@ def _project_resource_account(
         nano_usd_per_second=1,
         max_billing_seconds=resource_class.max_host_observation_seconds,
     )
-    limit = (
-        meter.maximum_charge_nano_usd() * 3
-        if hard_limit is None
-        else hard_limit
-    )
+    limit = meter.maximum_charge_nano_usd() * 3 if hard_limit is None else hard_limit
     policy = BudgetPolicy(
         study_id="project-resource-test",
-        manifest_digest=(
-            "sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest()
-        ),
+        manifest_digest=("sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest()),
         hard_limit_nano_usd=limit,
         phase_limits_nano_usd={"search": limit},
         meters={"project": meter},
     )
+    ledger_path = (tmp_path / "budget.sqlite3").resolve()
     return TimedResourceBudgetAccount(
-        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        ledger_path=ledger_path,
+        ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
         policy=policy,
         scope=BudgetScope(phase="search", category="proposer", run_id="test-run"),
         meter_id="project",
@@ -1522,8 +1519,7 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     assert len(create_calls) == len(sandboxes) == 2
     assert all(call["allow_internet_access"] is False for call in create_calls)
     assert all(
-        call["lifecycle"] == {"on_timeout": "kill", "auto_resume": False}
-        for call in create_calls
+        call["lifecycle"] == {"on_timeout": "kill", "auto_resume": False} for call in create_calls
     )
     assert all(call["request_timeout"] == 30 for call in create_calls)
     assert all(sandbox.killed for sandbox in sandboxes)

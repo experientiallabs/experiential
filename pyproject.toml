@@ -47,7 +47,7 @@ viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # E2B execution is opt-in for both world-model harness processes (`--harness-backend e2b`) and
 # Harbor ground-truth task environments (`wmh harness eval --task-backend e2b`). Local
 # ground-truth evaluation uses Docker and does not need the E2B SDK.
-e2b = ["e2b>=2.25.0", "harbor[e2b]==0.18.0"]
+e2b = ["cryptography>=44.0", "e2b==2.31.0", "harbor[e2b]==0.18.0"]
 # dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
 # project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
 dev = [

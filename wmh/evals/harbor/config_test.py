@@ -78,6 +78,25 @@ def test_e2b_is_an_explicit_environment_with_no_docker_fallback(tmp_path: Path) 
 
     assert config.environment.type is EnvironmentType.E2B
     assert config.environment.import_path == EXACT_E2B_ENVIRONMENT_IMPORT_PATH
+    assert config.environment.kwargs == {
+        "allow_preexisting_e2b_builds": False,
+        "resource_budget_bindings": [],
+    }
+
+
+def test_preexisting_e2b_build_admission_is_explicit_and_frozen(tmp_path: Path) -> None:
+    config = build_harbor_job_config(
+        _spec(
+            tmp_path,
+            environment_backend=HarborEnvironmentBackend.E2B,
+            allow_preexisting_e2b_builds=True,
+        ),
+        agent=_agent(),
+    )
+
+    assert config.environment.kwargs["allow_preexisting_e2b_builds"] is True
+    with pytest.raises(ValidationError, match="only with the E2B backend"):
+        _spec(tmp_path, allow_preexisting_e2b_builds=True)
 
 
 def test_native_local_and_git_dataset_sources_are_preserved(tmp_path: Path) -> None:

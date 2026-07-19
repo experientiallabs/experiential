@@ -194,14 +194,10 @@ class ProjectDeltaProposer:
         project_policy = getattr(project, "budget_policy_digest", None)
         provider_policy = getattr(provider, "budget_policy_digest", None)
         if (project_policy is None) != (provider_policy is None):
-            raise ValueError(
-                "proposer project and provider must both use one hard-budget policy"
-            )
+            raise ValueError("proposer project and provider must both use one hard-budget policy")
         if project_policy is not None:
             if provider_policy != project_policy:
-                raise ValueError(
-                    "proposer project and provider must share one hard-budget policy"
-                )
+                raise ValueError("proposer project and provider must share one hard-budget policy")
             project_ledger = getattr(project, "budget_ledger_path", None)
             provider_ledger = getattr(provider, "budget_ledger_path", None)
             if (
@@ -210,9 +206,7 @@ class ProjectDeltaProposer:
                 or Path(project_ledger).expanduser().resolve()
                 != Path(provider_ledger).expanduser().resolve()
             ):
-                raise ValueError(
-                    "proposer project and provider must share one hard-budget ledger"
-                )
+                raise ValueError("proposer project and provider must share one hard-budget ledger")
 
     @property
     def configuration_id(self) -> str:

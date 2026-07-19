@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 import pytest
-from harbor.environments.base import environment_content_hash
 from harbor.job import Job
 from harbor.metrics.uv_script import UvScript
 from harbor.models.agent.context import AgentContext
@@ -34,6 +33,7 @@ from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.e2b_environment import (
     ExactE2BEnvironment,
+    freeze_exact_e2b_build_spec,
     register_exact_e2b_build_record,
 )
 from wmh.evals.harbor.results import (
@@ -59,6 +59,7 @@ from wmh.tracking.budget import (
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
+    bootstrap_budget_ledger,
 )
 
 _TASK_ENVIRONMENT_ATTESTATION = {
@@ -209,9 +210,11 @@ def _e2b_budget_kwargs(
     )
     scope = BudgetScope(phase="test", category="test", run_id="test-run")
     ledger_path = (tmp_path / "budget.sqlite3").resolve()
+    ledger_identity = bootstrap_budget_ledger(ledger_path, policy).ledger_identity
     kwargs: _E2BBudgetKwargs = {
         "budget_account": BudgetAccount(
             ledger_path=ledger_path,
+            ledger_identity=ledger_identity,
             policy=policy,
             scope=scope,
             meter_id="worker",
@@ -221,6 +224,7 @@ def _e2b_budget_kwargs(
         kwargs["task_resource_budget_accounts"] = (
             TimedResourceBudgetAccount(
                 ledger_path=ledger_path,
+                ledger_identity=ledger_identity,
                 policy=policy,
                 scope=scope,
                 meter_id="task",
@@ -229,6 +233,7 @@ def _e2b_budget_kwargs(
     if runner_spec is not None:
         kwargs["runner_resource_budget_account"] = TimedResourceBudgetAccount(
             ledger_path=ledger_path,
+            ledger_identity=ledger_identity,
             policy=policy,
             scope=scope,
             meter_id="runner",
@@ -237,10 +242,17 @@ def _e2b_budget_kwargs(
 
 
 def _register_e2b_task_build(tmp_path: Path, task_dir: Path) -> None:
+    spec = freeze_exact_e2b_build_spec(
+        environment_dir=task_dir / "environment",
+        docker_image=f"example.invalid/{task_dir.name}:frozen",
+        cpu_count=2,
+        memory_mb=1024,
+    )
     register_exact_e2b_build_record(
         jobs_dir=tmp_path / "jobs",
-        environment_id=environment_content_hash(task_dir / "environment"),
-        docker_image=f"example.invalid/{task_dir.name}:frozen",
+        environment_id=spec.environment_id,
+        build_context_digest=spec.build_context_digest,
+        docker_image=spec.docker_image,
         template_id="task-template",
         build_id="task-build",
         cpu_count=2,
@@ -981,7 +993,10 @@ def test_e2b_backend_is_bound_into_harbor_config_and_run_identity(
     monkeypatch.setattr(Job, "run", fake_run)
     monkeypatch.setattr(mod, "load_harbor_job_result", lambda *_args: sentinel)
     spec = _spec(tmp_path, dataset).model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B}
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "allow_preexisting_e2b_builds": True,
+        }
     )
 
     result = asyncio.run(

@@ -27,7 +27,11 @@ from wmh.evals.benchmark import (
 )
 from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
-from wmh.evals.harbor.e2b_environment import ExactE2BEnvironment, require_exact_e2b_build_record
+from wmh.evals.harbor.e2b_environment import (
+    ExactE2BEnvironment,
+    freeze_exact_e2b_build_spec,
+    require_exact_e2b_build_record,
+)
 from wmh.evals.harbor.results import LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner import pi_node_baseline
@@ -57,8 +61,22 @@ def _save_harness(root: Path) -> HarnessDoc:
     return HarnessStore(root).save_version(pi_node_baseline("agent"), alias="champion")
 
 
+def _write_e2b_environment(root: Path) -> Path:
+    environment = root / "environment"
+    environment.mkdir()
+    (environment / "Dockerfile").write_text("FROM alpine:3.20\n", encoding="utf-8")
+    return environment
+
+
 def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: Path) -> None:
     jobs_dir = tmp_path / "jobs"
+    environment = _write_e2b_environment(tmp_path)
+    spec = freeze_exact_e2b_build_spec(
+        environment_dir=environment,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
     result = runner.invoke(
         app,
         [
@@ -66,8 +84,8 @@ def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: P
             "register-e2b-build",
             "--jobs-dir",
             str(jobs_dir),
-            "--environment-id",
-            "environment-immutable",
+            "--environment-dir",
+            str(environment),
             "--template-id",
             "template-immutable",
             "--build-id",
@@ -83,18 +101,21 @@ def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: P
     assert result.exit_code == 0, result.output
     record = require_exact_e2b_build_record(
         jobs_dir=jobs_dir,
-        environment_id="environment-immutable",
+        environment_id=spec.environment_id,
+        build_context_digest=spec.build_context_digest,
         docker_image=None,
         cpu_count=2,
         memory_mb=1024,
+        allow_preexisting_outside_study=True,
     )
     assert record.exact_template_ref == "template-immutable:build-immutable"
-    assert "environment-immutable" not in result.output
+    assert spec.environment_id not in result.output
 
 
 def test_register_e2b_build_cli_requires_outside_study_acknowledgment(
     tmp_path: Path,
 ) -> None:
+    environment = _write_e2b_environment(tmp_path)
     result = runner.invoke(
         app,
         [
@@ -102,8 +123,8 @@ def test_register_e2b_build_cli_requires_outside_study_acknowledgment(
             "register-e2b-build",
             "--jobs-dir",
             str(tmp_path / "jobs"),
-            "--environment-id",
-            "environment-immutable",
+            "--environment-dir",
+            str(environment),
             "--template-id",
             "template-immutable",
             "--build-id",
@@ -137,6 +158,8 @@ def test_prepare_e2b_build_cli_requires_explicit_paid_call_approval(tmp_path: Pa
             str(tmp_path / "account.json"),
             "--e2b-spend-limit-attestation",
             str(tmp_path / "spend-limit.json"),
+            "--e2b-spend-limit-trust",
+            str(tmp_path / "spend-limit-trust.json"),
         ],
     )
 
@@ -440,14 +463,17 @@ def _write_e2b_task_budget_accounts(
         run_id="cli-run",
     )
     ledger_path = (provider_path.parent / "spend.sqlite3").resolve()
+    ledger_identity = bootstrap_budget_ledger(ledger_path, policy).ledger_identity
     provider_account = BudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
         policy=policy,
         scope=scope,
         meter_id="worker",
     )
     resource_account = TimedResourceBudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
         policy=policy,
         scope=scope,
         meter_id="task",

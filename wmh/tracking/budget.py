@@ -1653,10 +1653,12 @@ def reconcile_orphaned_timed_resource(
     monotonic start time, so reconciliation forfeits its full ceiling rather than inventing usage.
     """
     validated = TimedResourceBudgetAccount.model_validate(account.model_dump())
-    ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
-    matches = [
-        item for item in ledger.reservations() if item.reservation_id == reservation_id
-    ]
+    ledger = open_shared_spend_ledger(
+        validated.ledger_path,
+        validated.policy,
+        expected_ledger_identity=validated.ledger_identity,
+    )
+    matches = [item for item in ledger.reservations() if item.reservation_id == reservation_id]
     if not matches:
         # Resource ownership is durably claimed before budget admission. A crash in that narrow
         # pre-reservation window cannot have dispatched create, and provider absence was proved by

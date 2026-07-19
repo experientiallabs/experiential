@@ -19,6 +19,7 @@ from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.e2b_environment import (
     E2BSpendLimitAttestation,
+    E2BSpendLimitTrust,
     freeze_exact_e2b_build_spec,
     prepare_exact_e2b_build,
     register_exact_e2b_build_record,
@@ -48,7 +49,7 @@ def register(app: typer.Typer) -> None:
 
 def register_e2b_build(
     jobs_dir: str = typer.Option(..., "--jobs-dir"),
-    environment_id: str = typer.Option(..., "--environment-id"),
+    environment_dir: str = typer.Option(..., "--environment-dir"),
     docker_image: str | None = typer.Option(None, "--docker-image"),
     template_id: str = typer.Option(..., "--template-id"),
     build_id: str = typer.Option(..., "--build-id"),
@@ -62,10 +63,17 @@ def register_e2b_build(
 ) -> None:
     """Register already-built exact E2B IDs; this command never calls E2B."""
     try:
+        spec = freeze_exact_e2b_build_spec(
+            environment_dir=Path(environment_dir),
+            docker_image=docker_image,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+        )
         record = register_exact_e2b_build_record(
             jobs_dir=Path(jobs_dir),
-            environment_id=environment_id,
-            docker_image=docker_image,
+            environment_id=spec.environment_id,
+            build_context_digest=spec.build_context_digest,
+            docker_image=spec.docker_image,
             template_id=template_id,
             build_id=build_id,
             cpu_count=cpu_count,
@@ -75,8 +83,7 @@ def register_e2b_build(
     except (OSError, ValueError, RuntimeError) as exc:
         raise ClickException(str(exc)) from exc
     _console.print(
-        "registered exact E2B build "
-        f"{record.exact_template_ref} for {record.build_config_digest}"
+        f"registered exact E2B build {record.exact_template_ref} for {record.build_config_digest}"
     )
 
 
@@ -87,7 +94,16 @@ def prepare_e2b_build(
     cpu_count: int = typer.Option(..., "--cpu-count", min=1),
     memory_mb: int = typer.Option(..., "--memory-mb", min=1),
     resource_budget_account_path: str = typer.Option(..., "--resource-budget-account"),
-    spend_limit_attestation_path: str = typer.Option(..., "--e2b-spend-limit-attestation"),
+    spend_limit_attestation_path: str = typer.Option(
+        ...,
+        "--e2b-spend-limit-attestation",
+        help="Fresh signed operator statement for the active E2B account and remaining cap.",
+    ),
+    spend_limit_trust_path: str = typer.Option(
+        ...,
+        "--e2b-spend-limit-trust",
+        help="Pinned Ed25519 public key and E2B team/account identity for that statement.",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -110,6 +126,7 @@ def prepare_e2b_build(
             param_hint="--resource-budget-account",
         )
         spend_limit = _load_e2b_spend_limit_attestation(spend_limit_attestation_path)
+        spend_limit_trust = _load_e2b_spend_limit_trust(spend_limit_trust_path)
         record = asyncio.run(
             prepare_exact_e2b_build(
                 jobs_dir=Path(jobs_dir),
@@ -117,6 +134,7 @@ def prepare_e2b_build(
                 spec=spec,
                 budget_account=account,
                 provider_spend_limit=spend_limit,
+                provider_spend_limit_trust=spend_limit_trust,
             )
         )
     except (OSError, ValueError, RuntimeError) as exc:
@@ -183,6 +201,11 @@ def eval_harness(
             "Harbor task environment: local Docker or E2B. This is independent of the Pi "
             "runner backend."
         ),
+    ),
+    allow_preexisting_e2b_builds: bool = typer.Option(
+        False,
+        "--allow-preexisting-e2b-builds",
+        help="Explicitly admit E2B builds paid outside this scored study. Disabled by default.",
     ),
     attempts: int = typer.Option(1, "--attempts", min=1, help="Attempts per task."),
     concurrency: int = typer.Option(
@@ -275,6 +298,11 @@ def eval_harness(
         _load_budget_account(budget_account_path) if budget_account_path is not None else None
     )
     backend = _parse_task_backend(task_backend)
+    if allow_preexisting_e2b_builds and backend is not HarborEnvironmentBackend.E2B:
+        raise typer.BadParameter(
+            "--allow-preexisting-e2b-builds requires --task-backend e2b",
+            param_hint="--allow-preexisting-e2b-builds",
+        )
     try:
         runner_spec = _load_runner_spec(runner_spec_path)
     except (OSError, ValueError) as exc:
@@ -309,6 +337,7 @@ def eval_harness(
         n_attempts=attempts,
         n_concurrent_trials=concurrency,
         environment_backend=backend,
+        allow_preexisting_e2b_builds=allow_preexisting_e2b_builds,
     )
     try:
         evaluator = HarborEvaluator(
@@ -448,6 +477,27 @@ def _load_e2b_spend_limit_attestation(path: str) -> E2BSpendLimitAttestation:
         raise typer.BadParameter(
             str(exc),
             param_hint="--e2b-spend-limit-attestation",
+        ) from exc
+
+
+def _load_e2b_spend_limit_trust(path: str) -> E2BSpendLimitTrust:
+    trust_path = Path(path).expanduser()
+    if trust_path.is_symlink():
+        raise typer.BadParameter(
+            "E2B spend-limit trust cannot be a symlink",
+            param_hint="--e2b-spend-limit-trust",
+        )
+    try:
+        if not trust_path.is_file():
+            raise ValueError("E2B spend-limit trust must be a regular file")
+        payload = trust_path.read_bytes()
+        if len(payload) > 64 * 1024:
+            raise ValueError("E2B spend-limit trust exceeds 64 KiB")
+        return E2BSpendLimitTrust.model_validate_json(payload)
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(
+            str(exc),
+            param_hint="--e2b-spend-limit-trust",
         ) from exc
 
 

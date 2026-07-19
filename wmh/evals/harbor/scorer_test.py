@@ -47,6 +47,7 @@ from wmh.tracking.budget import (
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
+    bootstrap_budget_ledger,
 )
 
 _TASK_IDS = ("alpha", "beta")
@@ -406,6 +407,7 @@ def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Pat
         != baseline
     )
 
+
 def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -454,20 +456,24 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
     )
     scope = BudgetScope(phase="search", category="scorer", run_id="test-run")
     ledger_path = (tmp_path / "budget.sqlite3").resolve()
+    ledger_identity = bootstrap_budget_ledger(ledger_path, policy).ledger_identity
     provider_account = BudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
         policy=policy,
         scope=scope,
         meter_id="worker",
     )
     task_account = TimedResourceBudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
         policy=policy,
         scope=scope,
         meter_id="task",
     )
     runner_account = TimedResourceBudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
         policy=policy,
         scope=scope,
         meter_id="runner",
@@ -518,6 +524,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
         task_account.ledger_path,
         runner_account.ledger_path,
     } == {ledger_path}
+
 
 def test_score_job_identity_binds_full_candidate_route_and_qualification(
     tmp_path: Path,

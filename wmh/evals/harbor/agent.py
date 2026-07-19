@@ -550,9 +550,7 @@ class WmhPiAgent(BaseAgent):
         )
         if runner_binding is not None:
             if binding is None or runner_binding.policy_digest != budget_policy_digest:
-                raise ValueError(
-                    "runner resource budget must share the provider budget policy"
-                )
+                raise ValueError("runner resource budget must share the provider budget policy")
             if not isinstance(validated_runner, E2BPiRunnerSpec):
                 raise ValueError("local Pi runners cannot consume an external resource meter")
             runner_budget_account = resolve_timed_resource_account(runner_binding)

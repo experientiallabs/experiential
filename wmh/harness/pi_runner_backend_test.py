@@ -34,6 +34,7 @@ from wmh.tracking.budget import (
     SpendLedger,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
+    bootstrap_budget_ledger,
 )
 
 
@@ -173,8 +174,10 @@ def _resource_account(
         phase_limits_nano_usd={"search": limit},
         meters={"runner": meter},
     )
+    ledger_path = (tmp_path / "budget.sqlite3").resolve()
     return TimedResourceBudgetAccount(
-        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        ledger_path=ledger_path,
+        ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
         policy=policy,
         scope=BudgetScope(phase="search", category="runner", run_id="test-run"),
         meter_id="runner",

@@ -2926,6 +2926,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "cryptography" },
     { name = "e2b" },
     { name = "harbor", extra = ["e2b"] },
     { name = "matplotlib" },
@@ -2937,6 +2938,7 @@ dev = [
     { name = "ty" },
 ]
 e2b = [
+    { name = "cryptography" },
     { name = "e2b" },
     { name = "harbor", extra = ["e2b"] },
 ]
@@ -2960,7 +2962,8 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.39" },
     { name = "boto3", specifier = ">=1.34" },
     { name = "click", specifier = ">=8.2" },
-    { name = "e2b", marker = "extra == 'e2b'", specifier = ">=2.25.0" },
+    { name = "cryptography", marker = "extra == 'e2b'", specifier = ">=44.0" },
+    { name = "e2b", marker = "extra == 'e2b'", specifier = "==2.31.0" },
     { name = "environment-capture", editable = "packages/environment-capture" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "gepa", specifier = ">=0.1.1" },

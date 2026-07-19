@@ -36,6 +36,7 @@ class HarborJobSpec(BaseModel):
     n_concurrent_trials: int = Field(default=1, ge=1)
     agent_n_concurrent: int | None = Field(default=None, ge=1)
     environment_backend: HarborEnvironmentBackend = HarborEnvironmentBackend.LOCAL
+    allow_preexisting_e2b_builds: bool = False
     max_retries: int = Field(
         default=0,
         ge=0,
@@ -68,6 +69,11 @@ class HarborJobSpec(BaseModel):
             )
         if self.retry_exceptions:
             raise ValueError("retry_exceptions are unsupported while Harbor retries are disabled")
+        if (
+            self.allow_preexisting_e2b_builds
+            and self.environment_backend is not HarborEnvironmentBackend.E2B
+        ):
+            raise ValueError("preexisting E2B builds can be admitted only with the E2B backend")
         return self
 
 
@@ -119,11 +125,12 @@ def build_harbor_job_config(
             env={},
             kwargs=(
                 {}
-                if not frozen_bindings
+                if local_environment
                 else {
+                    "allow_preexisting_e2b_builds": spec.allow_preexisting_e2b_builds,
                     "resource_budget_bindings": [
                         binding.model_dump(mode="json") for binding in frozen_bindings
-                    ]
+                    ],
                 }
             ),
             extra_allowed_hosts=[],
@@ -171,16 +178,19 @@ def validate_controlled_harbor_environment(
         raise ValueError("Harbor environment host variables are unsupported")
     if environment.kwargs:
         if environment.type is not EnvironmentType.E2B or set(environment.kwargs) != {
-            "resource_budget_bindings"
+            "allow_preexisting_e2b_builds",
+            "resource_budget_bindings",
         }:
             raise ValueError("Harbor environment backend kwargs are unsupported")
+        if not isinstance(environment.kwargs["allow_preexisting_e2b_builds"], bool):
+            raise ValueError("Harbor preexisting E2B build policy must be boolean")
         raw_bindings = environment.kwargs["resource_budget_bindings"]
-        if not isinstance(raw_bindings, list) or not raw_bindings:
-            raise ValueError("Harbor task resource budget bindings must be a nonempty list")
+        if not isinstance(raw_bindings, list):
+            raise ValueError("Harbor task resource budget bindings must be a list")
         bindings = [BudgetAccountBinding.model_validate(value) for value in raw_bindings]
         if len({(item.policy_digest, item.meter_id) for item in bindings}) != len(bindings):
             raise ValueError("Harbor task resource budget bindings must be unique")
-        if len({item.policy_digest for item in bindings}) != 1:
+        if bindings and len({item.policy_digest for item in bindings}) != 1:
             raise ValueError("Harbor task resource budgets must share one policy")
     if environment.extra_allowed_hosts:
         raise ValueError("Harbor run-level extra allowed hosts are unsupported")

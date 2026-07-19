@@ -541,6 +541,7 @@ def test_timed_resource_class_binds_role_resources_ttl_and_host_horizon(
     )
     account = TimedResourceBudgetAccount(
         ledger_path=(tmp_path / "class.sqlite3").resolve(),
+        ledger_identity=_ledger_identity(tmp_path / "class.sqlite3", policy),
         policy=policy,
         scope=_scope(),
         meter_id="runner",
@@ -579,6 +580,7 @@ def test_orphaned_timed_resource_join_is_exact_and_conservative(tmp_path: Path) 
     )
     account = TimedResourceBudgetAccount(
         ledger_path=(tmp_path / "orphan.sqlite3").resolve(),
+        ledger_identity=_ledger_identity(tmp_path / "orphan.sqlite3", policy),
         policy=policy,
         scope=_scope(),
         meter_id="runner",

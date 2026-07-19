@@ -226,9 +226,7 @@ class HarborHarnessScorer:
             for account in task_resource_budget_accounts
         )
         self._runner_resource_budget_account = (
-            TimedResourceBudgetAccount.model_validate(
-                runner_resource_budget_account.model_dump()
-            )
+            TimedResourceBudgetAccount.model_validate(runner_resource_budget_account.model_dump())
             if runner_resource_budget_account is not None
             else None
         )
@@ -244,7 +242,7 @@ class HarborHarnessScorer:
     def configuration_id(self) -> str:
         """Return an opaque digest of the exact scorer and task-matrix configuration."""
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "implementation": f"{type(self).__module__}.{type(self).__qualname__}",
             "job_spec": self._job_spec.model_dump(mode="json"),
             "provider_config": self._provider_config.model_dump(mode="json"),
@@ -252,7 +250,7 @@ class HarborHarnessScorer:
             "task_keys": list(self._task_keys),
             "task_environment_digests": list(self._task_environment_digests),
             "reward_key": self._reward_key,
-            "runner_image": self._runner_image,
+            "runner_spec": self._runner_spec.model_dump(mode="json"),
             "compute_envelope": self._compute_envelope.model_dump(mode="json"),
             "agent_version": WMH_PI_AGENT_VERSION,
         }

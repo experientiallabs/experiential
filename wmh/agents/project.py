@@ -21,9 +21,9 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
-    CommandOutput,
     E2B_CLEANUP_HORIZON_S,
     E2B_CREATE_REQUEST_TIMEOUT_S,
+    CommandOutput,
     SandboxCleanupError,
     SandboxFactory,
     SandboxHandle,
@@ -74,9 +74,7 @@ _RECOVERABLE_SESSION_MARKERS = (
     "live session runner did not become ready",
     "channel send failed",
 )
-_EXACT_E2B_TEMPLATE = re.compile(
-    r"[A-Za-z0-9_.-]{1,512}:[A-Za-z0-9_.-]{1,512}\Z"
-)
+_EXACT_E2B_TEMPLATE = re.compile(r"[A-Za-z0-9_.-]{1,512}:[A-Za-z0-9_.-]{1,512}\Z")
 _PROJECT_LEASE_FILE = re.compile(r"[0-9a-f]{32}\.json\Z")
 _MAX_PROJECT_LEASE_FILES = 4096
 
@@ -250,9 +248,7 @@ class _BudgetedProjectSandboxFactory:
             kill_sandbox(sandbox)
         except BaseException:
             self._forfeit(lease, "CleanupUnknown")
-            lease.ledger.cleanup_failed(
-                resource_id if isinstance(resource_id, str) else None
-            )
+            lease.ledger.cleanup_failed(resource_id if isinstance(resource_id, str) else None)
             raise
         try:
             if lease.reservation is not None:
@@ -260,9 +256,7 @@ class _BudgetedProjectSandboxFactory:
                 lease.reservation = None
             lease.ledger.retire()
         except BaseException:
-            lease.ledger.cleanup_failed(
-                resource_id if isinstance(resource_id, str) else None
-            )
+            lease.ledger.cleanup_failed(resource_id if isinstance(resource_id, str) else None)
             raise
         self._live.pop(id(sandbox), None)
 
@@ -293,9 +287,7 @@ class _BudgetedProjectSandboxFactory:
                     )
                 ),
                 orphan_expiry_horizon_s=(
-                    E2B_CREATE_REQUEST_TIMEOUT_S
-                    + self._provider_ttl_seconds
-                    + 30
+                    E2B_CREATE_REQUEST_TIMEOUT_S + self._provider_ttl_seconds + 30
                 ),
             )
 
