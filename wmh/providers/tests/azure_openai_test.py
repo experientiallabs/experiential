@@ -249,6 +249,18 @@ def test_trusted_env_endpoint_uses_the_real_azure_key(monkeypatch: pytest.Monkey
     # config.endpoint matching the trusted env endpoint is still trusted.
     client = AzureOpenAIProvider(_endpoint_config("https://trusted.openai.azure.com"))._get_client()
     assert client.api_key == "az-real-secret"
+    assert client.max_retries == 0
+
+
+def test_config_endpoint_also_disables_hidden_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "endpoint-token")
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+
+    client = AzureOpenAIProvider(_endpoint_config("https://proxy.example.com"))._get_client()
+
+    assert client.max_retries == 0
 
 
 def test_trusted_endpoint_matches_despite_trailing_slash_and_case(

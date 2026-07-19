@@ -15,12 +15,14 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
+from wmh.agents import default_agent
 from wmh.cli import app
 from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.create import CreateResult, DeltaArchive
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.proposer import ProviderDeltaProposer
+from wmh.harness.store import HarnessStore
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 # The Typer object `harness_app` shadows the submodule name on plain attribute access; go
@@ -29,6 +31,44 @@ harness_app_module = importlib.import_module("wmh.cli.harness_app")
 model_roles_module = importlib.import_module("wmh.cli.model_roles")
 
 runner = CliRunner()
+
+
+def test_init_can_store_the_canonical_pi_baseline(tmp_path: Path) -> None:
+    root = tmp_path / ".wmh"
+
+    result = runner.invoke(
+        app,
+        ["harness", "init", "pi-seed", "--runtime", "pi-node", "--root", str(root)],
+    )
+
+    assert result.exit_code == 0, result.output
+    stored = HarnessStore(root).load("pi-seed", "champion")
+    assert stored.runtime_kind() == "pi-node"
+    assert stored.execution_hash == default_agent("pi-seed").execution_hash
+    assert "wmh harness eval pi-seed@champion --help" in result.output
+
+
+def test_init_keeps_kit_python_as_the_compatible_default(tmp_path: Path) -> None:
+    root = tmp_path / ".wmh"
+
+    result = runner.invoke(app, ["harness", "init", "kit-seed", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert HarnessStore(root).load("kit-seed").runtime_kind() == "kit-python"
+
+
+def test_init_rejects_unknown_runtime_without_writing_a_harness(tmp_path: Path) -> None:
+    root = tmp_path / ".wmh"
+
+    result = runner.invoke(
+        app,
+        ["harness", "init", "bad-seed", "--runtime", "unknown", "--root", str(root)],
+    )
+
+    assert result.exit_code == 2
+    assert "choose kit-python" in result.output
+    assert "or pi-node" in result.output
+    assert not HarnessStore(root).exists("bad-seed")
 
 
 class _Provider:

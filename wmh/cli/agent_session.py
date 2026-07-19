@@ -55,11 +55,10 @@ from wmh.cli.workspace_sync import (
     snapshot_workspace,
 )
 from wmh.engine.play import parse_action
-from wmh.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
+from wmh.harness.doc import HarnessDoc
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_local import LocalStdioChannel, start_local_live_runner
-from wmh.harness.pi_vendor import pi_agent_code_surfaces
-from wmh.harness.tools import READ_SKILL, resolve_tools
+from wmh.harness.pi_runner import assemble_pi_harness, pi_node_baseline
 from wmh.harness.workspace_patch import WorkspacePatchError
 from wmh.platform.client import PlatformClient, PlatformError, RemoteAgentSession
 from wmh.platform.credentials import PlatformCredentials, load_credentials
@@ -99,40 +98,6 @@ def _capped(content: str, *, is_error: bool = False) -> ToolOutcome:
     dropped = len(content) - _TOOL_OUTPUT_CAP
     capped = f"{content[:half]}\n... [{dropped} chars truncated] ...\n{content[-half:]}"
     return ToolOutcome(content=capped, is_error=is_error, truncated=True)
-
-
-def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str]]:
-    """Derive the LiveSession inputs from a HarnessDoc (mirrors the hosted driver).
-
-    Returns the assembled system prompt (prompt + rendered tools + skills index),
-    the resolved tool specs, the code surfaces as {path: content} (the agent's own
-    code, materialized into the local runner), and skill bodies answered host-side.
-    """
-    tool_names = doc.tools()
-    if doc.skills() and READ_SKILL.name not in tool_names:
-        tool_names.append(READ_SKILL.name)
-    tool_specs = resolve_tools(tool_names)
-    system = doc.assembled_prompt()
-    files = {surface.path: surface.content for surface in doc.code_files() if surface.path}
-    skill_bodies = {skill.name: skill.body for skill in doc.skills()}
-    return system, tool_specs, files, skill_bodies
-
-
-def _pi_node_baseline() -> HarnessDoc:
-    """A pi-node baseline: the default prompt/tools plus the vendored pi agent code.
-
-    ``HarnessDoc.baseline`` is the in-process loop, which the live pi runner
-    cannot host (it needs the pi agent's src/agent.ts). This grafts the vendored
-    pi code surfaces on and pins ``param:runtime-kind = pi-node`` so a not-logged-in
-    session has a runnable agent without fetching a champion.
-    """
-    base = HarnessDoc.baseline("local-session")
-    surfaces = [
-        *base.surfaces,
-        *pi_agent_code_surfaces(),
-        Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
-    ]
-    return HarnessDoc(name="local-session", surfaces=surfaces)
 
 
 class LocalToolExecutor:
@@ -341,7 +306,7 @@ class LocalLiveDriver:
 
     def run(self) -> None:
         """Boot the local runner, drive the session, and always tear down."""
-        system, tool_specs, files, skill_bodies = _assemble(self._doc)
+        system, tool_specs, files, skill_bodies = assemble_pi_harness(self._doc)
         _console.print("[dim]starting the built-in pi harness locally...[/dim]")
         session: LiveSession | None = None
         reason = "user_ended"
@@ -1012,7 +977,7 @@ def _build_driver(
             )
             return LocalLiveDriver(
                 jail_root=jail_root,
-                doc=_pi_node_baseline(),
+                doc=pi_node_baseline(),
                 provider=_local_worker_provider(provider, model),
                 worker_fn=None,
                 recorder=None,
@@ -1042,7 +1007,7 @@ def _build_driver(
 
         return LocalLiveDriver(
             jail_root=jail_root,
-            doc=_pi_node_baseline(),
+            doc=pi_node_baseline(),
             provider=None,
             worker_fn=built_in_worker,
             recorder=recorder,

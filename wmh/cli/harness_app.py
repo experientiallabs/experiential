@@ -20,6 +20,8 @@ from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
+from wmh.agents import default_agent
+from wmh.cli.harness_eval import register as register_harness_eval
 from wmh.cli.model_roles import resolve_opt_in_model_provider
 from wmh.config import ARTIFACT_DIR, WorldModelStore
 from wmh.config.store import validate_name
@@ -38,6 +40,7 @@ harness_app = typer.Typer(
     help="Named, versioned agent harnesses (.wmh/harnesses): create, init, list, show.",
     no_args_is_help=True,
 )
+register_harness_eval(harness_app)
 _console = Console()
 
 
@@ -346,8 +349,22 @@ def _load_world_model(name: str | None, root: str) -> tuple[WorldModel, Provider
 def init_harness(
     name: str = typer.Argument("baseline", help="Name for the new harness."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    runtime: str = typer.Option(
+        "kit-python",
+        "--runtime",
+        help="Initial runtime: kit-python or pi-node.",
+    ),
 ) -> None:
-    """Write the baseline harness as v1 and point `champion` at it."""
+    """Write a baseline harness as v1 and point `champion` at it."""
+    if runtime == "kit-python":
+        baseline = HarnessDoc.baseline(name)
+    elif runtime == "pi-node":
+        baseline = default_agent(name)
+    else:
+        raise typer.BadParameter(
+            f"unknown --runtime {runtime!r}; choose kit-python or pi-node",
+            param_hint="--runtime",
+        )
     store = HarnessStore(root)
     try:
         if store.exists(name):
@@ -355,12 +372,15 @@ def init_harness(
                 f"harness {name!r} already exists; new versions are appended by "
                 "`wmh harness create`, and aliases move with `set_alias`"
             )
-        doc = store.save_version(HarnessDoc.baseline(name), alias=CHAMPION_ALIAS)
+        doc = store.save_version(baseline, alias=CHAMPION_ALIAS)
     except ValueError as exc:  # invalid name -> usage error, not a traceback
         raise typer.BadParameter(str(exc)) from exc
     _console.print(
         f"[green]wrote[/green] {name} v{doc.version} (champion) -> {store.dir_for(name)}"
     )
-    _console.print(
-        f"run it: [bold]wmh eval <tasks.jsonl> --mode closed-loop --harness {name}[/bold]"
-    )
+    if runtime == "pi-node":
+        _console.print(f"ground-truth eval: [bold]wmh harness eval {name}@champion --help[/bold]")
+    else:
+        _console.print(
+            f"run it: [bold]wmh eval <tasks.jsonl> --mode closed-loop --harness {name}[/bold]"
+        )

@@ -24,6 +24,7 @@ updates work.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from collections.abc import Callable
@@ -185,6 +186,13 @@ class HarnessDoc(BaseModel):
         """Content identity of the whole document (order-independent via canonical sort)."""
         joined = "\n".join(f"{s.id}\x00{s.content_hash}" for s in self.surfaces)
         return _digest(joined)
+
+    @property
+    def execution_hash(self) -> str:
+        """Identity of every surface field that can change materialization or execution."""
+        payload = [surface.model_dump(mode="json") for surface in self.surfaces]
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return _digest(canonical)
 
     # -- derived, validated views ------------------------------------------------------------
 

@@ -72,6 +72,7 @@ class AzureOpenAIProvider:
                     api_version=self.config.api_version,
                     azure_endpoint=endpoint,
                     api_key=os.environ.get("WMH_ENDPOINT_API_KEY") or "not-needed",
+                    max_retries=0,
                 )
             else:
                 # Trusted endpoint (operator-supplied AZURE_OPENAI_ENDPOINT): the SDK reads the
@@ -79,6 +80,7 @@ class AzureOpenAIProvider:
                 self._client = AzureOpenAI(
                     api_version=self.config.api_version,
                     azure_endpoint=endpoint,
+                    max_retries=0,
                 )
         return self._client
 

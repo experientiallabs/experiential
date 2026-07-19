@@ -14,6 +14,20 @@ def test_same_model_type_resolves_to_provider_specific_ids() -> None:
     assert bedrock.model_id == "us.anthropic.claude-opus-4-8"
 
 
+def test_opus_4_6_resolves_to_exact_bedrock_inference_profile() -> None:
+    """Opus 4.6 keeps one identity while Bedrock requires its versioned profile id."""
+    direct = resolve_provider_model(ProviderKind.ANTHROPIC, "claude-opus-4-6")
+    bedrock = resolve_provider_model(ProviderKind.BEDROCK, "claude-opus-4-6")
+    bedrock_runtime_id = resolve_provider_model(
+        ProviderKind.BEDROCK, "us.anthropic.claude-opus-4-6-v1"
+    )
+
+    assert direct.model_type == bedrock.model_type == "claude-opus-4-6"
+    assert direct.model_id == "claude-opus-4-6"
+    assert bedrock.model_id == "us.anthropic.claude-opus-4-6-v1"
+    assert bedrock_runtime_id == bedrock
+
+
 def test_model_catalog_owns_temperature_compatibility() -> None:
     """Sampling compatibility follows the canonical model across callers."""
     opus = resolve_provider_model(ProviderKind.BEDROCK, "claude-opus-4-8")
@@ -45,9 +59,10 @@ def test_runtime_id_resolves_back_to_canonical_model_type() -> None:
 
 
 def test_provider_catalog_exposes_only_canonical_model_types() -> None:
-    assert model_types_for_provider(ProviderKind.BEDROCK)[:4] == (
+    assert model_types_for_provider(ProviderKind.BEDROCK)[:5] == (
         "claude-opus-4-8",
         "claude-opus-4-7",
+        "claude-opus-4-6",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
     )

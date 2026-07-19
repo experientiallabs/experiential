@@ -90,6 +90,11 @@ _MODELS: tuple[ProviderModel, ...] = (
     ),
     ProviderModel(
         provider=ProviderKind.ANTHROPIC,
+        model_type="claude-opus-4-6",
+        model_id="claude-opus-4-6",
+    ),
+    ProviderModel(
+        provider=ProviderKind.ANTHROPIC,
         model_type="claude-sonnet-4-6",
         model_id="claude-sonnet-4-6",
     ),
@@ -110,6 +115,11 @@ _MODELS: tuple[ProviderModel, ...] = (
         provider=ProviderKind.BEDROCK,
         model_type="claude-opus-4-7",
         model_id="us.anthropic.claude-opus-4-7",
+    ),
+    ProviderModel(
+        provider=ProviderKind.BEDROCK,
+        model_type="claude-opus-4-6",
+        model_id="us.anthropic.claude-opus-4-6-v1",
     ),
     ProviderModel(
         provider=ProviderKind.BEDROCK,

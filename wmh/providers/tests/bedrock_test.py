@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import io
 import json
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
+from botocore.config import Config
 
 from wmh.providers.base import DEFAULT_MAX_TOKENS, Message, ProviderConfig, ProviderKind
 from wmh.providers.bedrock import BedrockProvider
@@ -30,6 +31,15 @@ class _FakeClient:
         return {"body": _FakeBody(self.payload)}
 
 
+class _PinnedRouteConfig(Protocol):
+    """Botocore options asserted despite its dynamic, incomplete type surface."""
+
+    retries: dict[str, str | int]
+    ignore_configured_endpoint_urls: bool
+    use_fips_endpoint: bool
+    use_dualstack_endpoint: bool
+
+
 def _config() -> ProviderConfig:
     return ProviderConfig(
         kind=ProviderKind.BEDROCK, model="anthropic.claude-opus-4-8", region="us-east-1"
@@ -41,6 +51,34 @@ def _payload() -> dict[str, object]:
         "content": [{"type": "text", "text": "ok"}],
         "usage": {"input_tokens": 5, "output_tokens": 3},
     }
+
+
+def test_get_client_pins_bedrock_route_and_disables_hidden_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    fake = _FakeClient(_payload())
+
+    def fake_client(service: str, **kwargs: object) -> _FakeClient:
+        captured["service"] = service
+        captured.update(kwargs)
+        return fake
+
+    monkeypatch.setattr("boto3.client", fake_client)
+
+    client = BedrockProvider(_config())._get_client()
+
+    assert client is fake
+    assert captured["service"] == "bedrock-runtime"
+    assert isinstance(captured["config"], Config)
+    config = cast("_PinnedRouteConfig", captured["config"])
+    assert config.retries == {
+        "total_max_attempts": 1,
+        "mode": "standard",
+    }
+    assert config.ignore_configured_endpoint_urls is True
+    assert config.use_fips_endpoint is False
+    assert config.use_dualstack_endpoint is False
 
 
 def test_complete_builds_anthropic_body_and_parses(monkeypatch: pytest.MonkeyPatch) -> None:

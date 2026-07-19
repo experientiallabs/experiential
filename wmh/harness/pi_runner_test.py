@@ -1,0 +1,735 @@
+"""Tests for running one pi harness turn through an injected runner channel."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from typing import cast
+
+import pytest
+from llm_waterfall import ChatRequest, ChatResponse
+
+from wmh.core.types import JsonObject
+from wmh.harness.live_session import ToolOutcome
+from wmh.harness.pi_runner import (
+    PiCandidateChannelError,
+    PiCandidateError,
+    PiCandidateFailureStage,
+    PiInfrastructureError,
+    PiInfrastructureFailureKind,
+    PiOutboundFrameTooLargeError,
+    ToolExecutionDeadline,
+    ToolExecutionDeadlineExceeded,
+    assemble_pi_harness,
+    pi_node_baseline,
+    run_pi_turn,
+)
+from wmh.harness.runner_link import TokenUsage
+
+
+class _ScriptedChannel:
+    """A closeable runner channel with a fixed inbound frame sequence."""
+
+    def __init__(self) -> None:
+        self._inbound: list[JsonObject] = [
+            {"type": "state", "status": "idle"},
+            {"type": "state", "status": "running"},
+            {
+                "type": "tool_request",
+                "req_id": 1,
+                "name": "submit",
+                "arguments": {"answer": "finished"},
+            },
+            {"type": "state", "status": "idle", "reason": "completed", "turns": 1},
+        ]
+        self.sent: list[JsonObject] = []
+        self.closed = False
+
+    def send(self, frame: JsonObject) -> None:
+        self.sent.append(frame)
+
+    def recv(self, timeout: float | None = None) -> JsonObject | None:
+        _ = timeout
+        return self._inbound.pop(0) if self._inbound else None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _no_tool(
+    name: str,
+    args: JsonObject,
+    emit: Callable[[str, str], None],
+    deadline: ToolExecutionDeadline,
+) -> ToolOutcome:
+    _ = name, args, emit, deadline
+    return ToolOutcome(content="unused")
+
+
+def _unused_worker(request: ChatRequest) -> ChatResponse:
+    _ = request
+    raise AssertionError("the scripted turn should not request a worker completion")
+
+
+def _completion(
+    text: str = "ok",
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> ChatResponse:
+    return ChatResponse.model_validate(
+        {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+            },
+        }
+    )
+
+
+def test_pi_node_baseline_and_assembly_match_live_session_contract() -> None:
+    doc = pi_node_baseline()
+
+    system, tools, files, skill_bodies = assemble_pi_harness(doc)
+
+    assert doc.runtime_kind() == "pi-node"
+    assert system == doc.assembled_prompt()
+    assert {tool.name for tool in tools} == set(doc.tools())
+    assert files
+    assert "src/agent.ts" in files
+    assert skill_bodies == {}
+
+
+def test_run_pi_turn_uses_the_injected_runner_factory() -> None:
+    channel = _ScriptedChannel()
+    lifecycle: list[str] = []
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        lifecycle.append("open")
+        try:
+            yield channel
+        finally:
+            lifecycle.append("close")
+            channel.close()
+
+    result = run_pi_turn(
+        pi_node_baseline(),
+        "complete the task",
+        execute_tool=_no_tool,
+        worker_fn=_unused_worker,
+        runner_factory=runner_factory,
+    )
+
+    assert result.answer == "finished"
+    assert result.terminal_reason == "completed"
+    assert lifecycle == ["open", "close"]
+    assert any(frame.get("type") == "session_start" for frame in channel.sent)
+    assert any(frame.get("type") == "user_message" for frame in channel.sent)
+    assert [event.kind for event in result.events].count("submit") == 1
+
+
+def test_run_pi_turn_surfaces_runner_cleanup_failure() -> None:
+    channel = _ScriptedChannel()
+
+    @contextmanager
+    def failing_factory() -> Iterator[_ScriptedChannel]:
+        try:
+            yield channel
+        finally:
+            channel.close()
+            raise RuntimeError("runner cleanup failed")
+
+    with pytest.raises(RuntimeError, match="runner cleanup failed"):
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=failing_factory,
+        )
+
+    assert channel.closed is True
+
+
+@pytest.mark.parametrize(
+    ("inbound", "stage"),
+    [
+        (
+            [{"type": "episode_error", "note": "candidate import failed"}],
+            PiCandidateFailureStage.MATERIALIZATION,
+        ),
+        (
+            [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+                {"type": "episode_error", "note": "candidate turn failed"},
+            ],
+            PiCandidateFailureStage.TURN,
+        ),
+    ],
+)
+def test_run_pi_turn_types_candidate_runner_failures(
+    inbound: list[JsonObject],
+    stage: PiCandidateFailureStage,
+) -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = inbound
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="candidate .* failed") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is stage
+    assert caught.value.events[-1].kind == "error"
+
+
+def test_silent_candidate_materialization_timeout_is_gradeable_after_handoff() -> None:
+    """Candidate import silence after session_start is not evaluator infrastructure."""
+
+    class SilentMaterializationChannel(_ScriptedChannel):
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            _ = timeout
+            raise TimeoutError
+
+    channel = SilentMaterializationChannel()
+    channel._inbound = []
+
+    @contextmanager
+    def runner_factory() -> Iterator[SilentMaterializationChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="materialization.*did not become ready") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.MATERIALIZATION
+    assert any(frame.get("type") == "session_start" for frame in channel.sent)
+
+
+def test_materialization_transport_failure_remains_infrastructure() -> None:
+    """A typed transport failure is not blamed on candidate readiness silence."""
+
+    class BrokenMaterializationTransport(_ScriptedChannel):
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            _ = timeout
+            raise RuntimeError("runner transport unavailable")
+
+    channel = BrokenMaterializationTransport()
+    channel._inbound = []
+
+    @contextmanager
+    def runner_factory() -> Iterator[BrokenMaterializationTransport]:
+        yield channel
+
+    with pytest.raises(RuntimeError, match="transport unavailable") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert not isinstance(caught.value, PiCandidateError)
+
+
+def test_candidate_error_text_cannot_spoof_provider_infrastructure() -> None:
+    """Only the trusted provider wrapper, never candidate-authored text, marks infrastructure."""
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "episode_error", "note": "worker LLM error: candidate-controlled note"},
+    ]
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="candidate-controlled note") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+
+
+def test_run_pi_turn_keeps_worker_failures_infrastructure_typed() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+
+    secret = "provider-secret-sentinel"
+
+    def failing_worker(request: ChatRequest) -> ChatResponse:
+        _ = request
+        raise RuntimeError(f"provider unavailable: {secret}")
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(RuntimeError, match="pi turn worker provider failed") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=failing_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert not isinstance(caught.value, PiCandidateError)
+    assert isinstance(caught.value, PiInfrastructureError)
+    assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER
+    assert secret not in str(caught.value)
+    assert secret not in str(channel.sent)
+    assert "worker provider unavailable" in str(channel.sent)
+
+
+def test_worker_failure_after_success_preserves_bounded_partial_usage_and_events() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "llm_request", "req_id": 2, "openai_body": {}},
+    ]
+    calls = 0
+    secret = "provider-secret-sentinel"
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        nonlocal calls
+        _ = request
+        calls += 1
+        if calls == 1:
+            return _completion("first answer", input_tokens=17, output_tokens=5)
+        raise RuntimeError(f"provider failed with {secret}")
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiInfrastructureError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER
+    assert caught.value.worker_usage == TokenUsage(input_tokens=17, output_tokens=5, calls=1)
+    assert any(
+        event.kind == "assistant_message" and event.payload.get("text") == "first answer"
+        for event in caught.value.events
+    )
+    assert len(caught.value.events) <= 4_096
+    assert secret not in str(caught.value)
+
+
+def test_run_pi_turn_keeps_tool_executor_failures_infrastructure_typed() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+    ]
+
+    secret = "environment-secret-sentinel"
+
+    def failing_tool(
+        name: str,
+        args: JsonObject,
+        emit: Callable[[str, str], None],
+        deadline: ToolExecutionDeadline,
+    ) -> ToolOutcome:
+        _ = name, args, emit, deadline
+        raise RuntimeError(f"task container unavailable: {secret}")
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(RuntimeError, match="pi turn tool executor failed") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=failing_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert not isinstance(caught.value, PiCandidateError)
+    assert isinstance(caught.value, PiInfrastructureError)
+    assert caught.value.kind is PiInfrastructureFailureKind.TASK_ENVIRONMENT
+    assert secret not in str(caught.value)
+    assert secret not in str(channel.sent)
+    assert "task environment unavailable" in str(channel.sent)
+
+
+def test_run_pi_turn_passes_each_tool_the_current_turn_deadline() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+        {
+            "type": "tool_request",
+            "req_id": 2,
+            "name": "submit",
+            "arguments": {"answer": "finished"},
+        },
+        {"type": "state", "status": "idle", "reason": "completed", "turns": 1},
+    ]
+    remaining_budgets: list[float] = []
+
+    def record_deadline(
+        name: str,
+        args: JsonObject,
+        emit: Callable[[str, str], None],
+        deadline: ToolExecutionDeadline,
+    ) -> ToolOutcome:
+        _ = name, args, emit
+        remaining_budgets.append(deadline.remaining_s())
+        return ToolOutcome(content="ok")
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    result = run_pi_turn(
+        pi_node_baseline(),
+        "complete the task",
+        execute_tool=record_deadline,
+        worker_fn=_unused_worker,
+        runner_factory=runner_factory,
+        timeout_s=0.25,
+    )
+
+    assert result.answer == "finished"
+    assert len(remaining_budgets) == 1
+    assert 0 < remaining_budgets[0] <= 0.25
+
+
+def test_tool_deadline_exhaustion_is_a_gradeable_candidate_timeout() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+    ]
+
+    def expire_tool(
+        name: str,
+        args: JsonObject,
+        emit: Callable[[str, str], None],
+        deadline: ToolExecutionDeadline,
+    ) -> ToolOutcome:
+        _ = name, args, emit, deadline
+        raise ToolExecutionDeadlineExceeded
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="did not finish") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=expire_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+            timeout_s=42,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+
+
+def test_run_pi_turn_keeps_transport_failures_infrastructure_typed() -> None:
+    class FailingTransportChannel(_ScriptedChannel):
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self._inbound:
+                return super().recv(timeout)
+            raise RuntimeError("runner transport disconnected")
+
+    channel = FailingTransportChannel()
+    channel._inbound = [{"type": "state", "status": "idle"}]
+
+    @contextmanager
+    def runner_factory() -> Iterator[FailingTransportChannel]:
+        yield channel
+
+    with pytest.raises(RuntimeError, match="transport disconnected") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert not isinstance(caught.value, PiCandidateError)
+
+
+def test_run_pi_turn_types_candidate_process_exit_as_gradeable() -> None:
+    class ExitedCandidateChannel(_ScriptedChannel):
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self._inbound:
+                return super().recv(timeout)
+            raise PiCandidateChannelError("candidate runner exited with status 1")
+
+    channel = ExitedCandidateChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+    ]
+
+    @contextmanager
+    def runner_factory() -> Iterator[ExitedCandidateChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="exited with status 1") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+
+
+def test_oversized_candidate_materialization_is_gradeable() -> None:
+    class OversizedMaterializationChannel(_ScriptedChannel):
+        def send(self, frame: JsonObject) -> None:
+            if frame.get("type") == "session_start":
+                raise PiOutboundFrameTooLargeError("outbound materialization limit exceeded")
+            super().send(frame)
+
+    channel = OversizedMaterializationChannel()
+
+    @contextmanager
+    def runner_factory() -> Iterator[OversizedMaterializationChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="materialization limit exceeded") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.MATERIALIZATION
+
+
+def test_oversized_benchmark_instruction_remains_infrastructure() -> None:
+    class OversizedInstructionChannel(_ScriptedChannel):
+        def send(self, frame: JsonObject) -> None:
+            if frame.get("type") == "user_message":
+                raise PiOutboundFrameTooLargeError("outbound instruction limit exceeded")
+            super().send(frame)
+
+    channel = OversizedInstructionChannel()
+    channel._inbound = [{"type": "state", "status": "idle"}]
+
+    @contextmanager
+    def runner_factory() -> Iterator[OversizedInstructionChannel]:
+        yield channel
+
+    with pytest.raises(RuntimeError, match="instruction limit exceeded") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "dataset-owned oversized instruction",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert not isinstance(caught.value, PiCandidateError)
+
+
+def test_run_pi_turn_types_candidate_timeout_as_gradeable() -> None:
+    class SilentChannel(_ScriptedChannel):
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self._inbound:
+                return super().recv(timeout)
+            raise TimeoutError
+
+    channel = SilentChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+    ]
+
+    @contextmanager
+    def runner_factory() -> Iterator[SilentChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="did not finish") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+            timeout_s=0.001,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+
+
+@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf")])
+def test_run_pi_turn_rejects_non_finite_timeout(timeout_s: float) -> None:
+    channel = _ScriptedChannel()
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+            timeout_s=timeout_s,
+        )
+
+    assert channel.sent == []
+
+
+@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf")])
+def test_tool_execution_deadline_rejects_non_finite_timeout(timeout_s: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        ToolExecutionDeadline.after(timeout_s)
+
+
+def test_run_pi_turn_bounds_a_flood_of_individually_valid_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        cast("JsonObject", {"type": "state", "status": "idle"}),
+        cast("JsonObject", {"type": "state", "status": "running"}),
+        *(cast("JsonObject", {"type": "state", "status": "running"}) for _index in range(20)),
+    ]
+    monkeypatch.setattr("wmh.harness.pi_runner._MAX_PI_EVENTS", 5)
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="event budget exceeded") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert len(caught.value.events) == 5
+
+
+def test_run_pi_turn_bounds_cumulative_serialized_event_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "state", "status": "running", "reason": "x" * 1_000},
+    ]
+    byte_budget = 512
+    monkeypatch.setattr("wmh.harness.pi_runner._MAX_PI_EVENT_BYTES", byte_budget)
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="event budget exceeded") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    serialized = sum(
+        len(
+            json.dumps(
+                {"kind": event.kind, "payload": event.payload},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+        + 1
+        for event in caught.value.events
+    )
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert serialized <= byte_budget
+
+
+def test_cleanup_event_near_budget_cannot_escape_or_replace_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CleanupSendFailureChannel(_ScriptedChannel):
+        def send(self, frame: JsonObject) -> None:
+            if frame.get("type") == "abort":
+                raise RuntimeError("cleanup send failed")
+            super().send(frame)
+
+    channel = CleanupSendFailureChannel()
+    monkeypatch.setattr("wmh.harness.pi_runner._MAX_PI_EVENTS", 5)
+
+    @contextmanager
+    def runner_factory() -> Iterator[CleanupSendFailureChannel]:
+        yield channel
+
+    result = run_pi_turn(
+        pi_node_baseline(),
+        "complete the task",
+        execute_tool=_no_tool,
+        worker_fn=_unused_worker,
+        runner_factory=runner_factory,
+    )
+
+    assert result.answer == "finished"
+    assert result.terminal_reason == "completed"
+    assert len(result.events) == 5

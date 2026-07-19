@@ -65,6 +65,24 @@ def test_doc_hash_is_content_and_order_independent() -> None:
     assert doc3.doc_hash != doc1.doc_hash
 
 
+def test_execution_hash_includes_code_materialization_path() -> None:
+    prompt = Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p")
+    code = Surface(
+        id="code:agent",
+        kind=SurfaceKind.CODE,
+        content="export const value = 1;",
+        path="src/agent.ts",
+    )
+    original = HarnessDoc(name="candidate", surfaces=[prompt, code])
+    renamed = HarnessDoc(
+        name="candidate",
+        surfaces=[prompt, code.model_copy(update={"path": "src/not-agent.ts"})],
+    )
+
+    assert original.doc_hash == renamed.doc_hash
+    assert original.execution_hash != renamed.execution_hash
+
+
 def test_duplicate_surface_ids_rejected() -> None:
     a = Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="A")
     with pytest.raises(ValidationError, match="duplicate surface id"):

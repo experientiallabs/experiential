@@ -13,6 +13,8 @@ uv sync
 uv run wmh build
 ```
 
+The root `wmh` package requires Python 3.12 or newer.
+
 The `build` command opens a wizard that walks you through creating your own world model from your traces.
 
 Below is a comparison running 8 SWE-bench tasks: real sandboxes on the left, a world model acting as the sandbox on the right.
@@ -40,6 +42,44 @@ uv run wmh serve                  # local HTTP backend on :8000
 ```
 
 Example-local prebuilt models live under `examples/<task>/models/`; pass `--root examples/<task>` to `wmh list`, `wmh demo`, `wmh play`, or `wmh serve` to use one without rebuilding.
+
+## Evaluate a harness against ground-truth tasks
+
+Ground-truth harness evaluation does not use a world model. Harbor is the task, environment, and
+verifier boundary; WMH supplies the immutable harness, host-side model provider, isolated pi
+runner, and strict result contract. Create the stock pi seed, then evaluate it against any local
+Harbor dataset:
+
+```bash
+uv run wmh harness init pi-baseline --runtime pi-node
+uv run wmh harness eval pi-baseline@champion \
+  --dataset-path ./benchmark-tasks \
+  --provider bedrock --model "$BEDROCK_MODEL_ID" --bedrock-region "$AWS_REGION" \
+  --attempts 1 --concurrency 1 --out result.json
+```
+
+Local Docker task environments are the default. Install the E2B extra and select it explicitly to
+fan trials out through E2B:
+
+```bash
+uv sync --extra e2b
+uv run wmh harness eval pi-baseline@champion \
+  --dataset-path ./benchmark-tasks \
+  --provider azure --model "$AZURE_MODEL_ID" \
+  --azure-endpoint "$AZURE_OPENAI_ENDPOINT" \
+  --azure-deployment "$AZURE_OPENAI_DEPLOYMENT" \
+  --azure-api-version "$AZURE_OPENAI_API_VERSION" \
+  --task-backend e2b --concurrency 50 --out result-e2b.json
+```
+
+WMH does not inject provider credentials into the task or pi-runner environment. Before Harbor
+constructs an environment, WMH rejects credential-like host variable references in task
+environment maps and task-owned Compose sources. This is a credential boundary, not a sandbox for
+malicious task definitions: use only a frozen dataset whose Dockerfiles, Compose files, mounts,
+images, scripts, and verifier inputs have been audited. Every paid run asks for confirmation unless
+`--yes` is supplied. See the
+[ground-truth harness evaluation protocol](./docs/reference/ground_truth_harness_eval.md) for run
+identity, backend parity, analysis, and budget gates.
 
 ## Use it as an API
 

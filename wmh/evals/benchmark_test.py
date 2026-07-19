@@ -1,0 +1,412 @@
+"""Tests for benchmark-neutral result contracts."""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from wmh.evals.benchmark import (
+    BenchmarkCandidateOutcome,
+    BenchmarkCandidateStage,
+    BenchmarkCandidateStatus,
+    BenchmarkCandidateTerminalReason,
+    BenchmarkCell,
+    BenchmarkError,
+    BenchmarkFailureKind,
+    BenchmarkRunIdentity,
+    BenchmarkRunResult,
+    BenchmarkTaskEnvironment,
+    BenchmarkTrialResult,
+    BenchmarkTrialStatus,
+    BenchmarkUsage,
+)
+
+_RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
+_CELL_CONFIG_DIGEST = "sha256:" + "b" * 64
+_IDENTITY = BenchmarkRunIdentity(
+    candidate_hash="candidate-hash",
+    agent_name="wmh-pi",
+    agent_version="0.1.0",
+    provider="bedrock",
+    model_name="model",
+    task_environment=BenchmarkTaskEnvironment.DOCKER,
+    runner_image="runner-image",
+    run_config_digest=_RUN_CONFIG_DIGEST,
+)
+
+
+def _cell(task_name: str, attempt: int = 1, *, task_key: str | None = None) -> BenchmarkCell:
+    return BenchmarkCell(
+        task_key=task_key or f"dataset/{task_name}@checksum",
+        task_name=task_name,
+        attempt=attempt,
+        config_digest=_CELL_CONFIG_DIGEST,
+    )
+
+
+def _trial(
+    cell: BenchmarkCell,
+    status: BenchmarkTrialStatus,
+    *,
+    rewards: dict[str, float | int] | None = None,
+    error: BenchmarkError | None = None,
+    candidate_outcome: BenchmarkCandidateOutcome | None = None,
+    usage: BenchmarkUsage | None = None,
+) -> BenchmarkTrialResult:
+    return BenchmarkTrialResult(
+        cell=cell,
+        task_identity=cell.task_name,
+        task_checksum="task-checksum",
+        status=status,
+        rewards=rewards,
+        error=error,
+        candidate_outcome=candidate_outcome or BenchmarkCandidateOutcome(),
+        usage=usage or BenchmarkUsage(),
+    )
+
+
+def test_zero_and_arbitrary_reward_keys_are_scored_data() -> None:
+    trial = _trial(
+        _cell("task-a"),
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 0, "partial_credit": 0.25, "tests_passed": 3},
+    )
+
+    assert trial.rewards == {"reward": 0, "partial_credit": 0.25, "tests_passed": 3}
+
+
+@pytest.mark.parametrize("reward", [float("nan"), float("inf"), float("-inf"), True, False])
+def test_rewards_reject_non_finite_and_boolean_values(reward: float | bool) -> None:
+    with pytest.raises(ValidationError, match="reward .* (finite|boolean)"):
+        _trial(
+            _cell("task-a"),
+            BenchmarkTrialStatus.SCORED,
+            rewards={"reward": reward},
+        )
+
+
+@pytest.mark.parametrize("cost", [float("nan"), float("inf"), float("-inf"), True])
+def test_usage_rejects_non_finite_and_boolean_costs(cost: float | bool) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkUsage(cost_usd=cost)
+
+
+def test_run_counts_incomplete_and_infrastructure_cells_separately() -> None:
+    cells = [
+        _cell("task-a"),
+        _cell("task-b"),
+        _cell("task-c"),
+    ]
+    result = BenchmarkRunResult(
+        job_name="ground-truth-evaluation",
+        identity=_IDENTITY,
+        expected_cells=cells,
+        trials=[
+            _trial(
+                cells[0],
+                BenchmarkTrialStatus.SCORED,
+                rewards={"reward": 0},
+            ),
+            _trial(
+                cells[1],
+                BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+                error=BenchmarkError(
+                    kind=BenchmarkFailureKind.ENVIRONMENT,
+                    type="EnvironmentStartTimeoutError",
+                    message="timed out",
+                ),
+            ),
+            _trial(cells[2], BenchmarkTrialStatus.INCOMPLETE),
+        ],
+    )
+
+    assert result.n_scored == 1
+    assert result.n_infrastructure_errors == 1
+    assert result.n_incomplete == 1
+    assert not result.is_complete
+
+
+def test_run_usage_is_derived_from_trials_and_rejects_a_conflicting_total() -> None:
+    cells = [_cell("task-a"), _cell("task-b")]
+    trials = [
+        _trial(
+            cells[0],
+            BenchmarkTrialStatus.SCORED,
+            rewards={"reward": 1},
+            usage=BenchmarkUsage(
+                input_tokens=10,
+                cache_tokens=3,
+                output_tokens=4,
+                cost_usd=0.25,
+            ),
+        ),
+        _trial(
+            cells[1],
+            BenchmarkTrialStatus.SCORED,
+            rewards={"reward": 0},
+            usage=BenchmarkUsage(
+                input_tokens=20,
+                cache_tokens=5,
+                output_tokens=6,
+                cost_usd=0.5,
+            ),
+        ),
+    ]
+
+    result = BenchmarkRunResult(
+        job_name="metered",
+        identity=_IDENTITY,
+        expected_cells=cells,
+        trials=trials,
+    )
+
+    assert result.usage == BenchmarkUsage(
+        input_tokens=30,
+        cache_tokens=8,
+        output_tokens=10,
+        cost_usd=0.75,
+    )
+    with pytest.raises(ValidationError, match="aggregate of trial usage"):
+        BenchmarkRunResult(
+            job_name="metered",
+            identity=_IDENTITY,
+            expected_cells=cells,
+            trials=trials,
+            usage=BenchmarkUsage(input_tokens=999),
+        )
+
+
+def test_scored_trial_requires_a_reward_mapping_even_when_empty() -> None:
+    with pytest.raises(ValidationError, match="scored trial must carry rewards"):
+        _trial(
+            _cell("task-a"),
+            BenchmarkTrialStatus.SCORED,
+        )
+
+
+def test_infrastructure_trial_requires_error_evidence() -> None:
+    with pytest.raises(ValidationError, match="infrastructure_error trial must carry an error"):
+        _trial(
+            _cell("task-a"),
+            BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "kind", "rewards", "message"),
+    [
+        (
+            BenchmarkTrialStatus.SCORED,
+            BenchmarkFailureKind.PROVIDER,
+            {"reward": 1},
+            "scored trial only permits task-timeout",
+        ),
+        (
+            BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+            BenchmarkFailureKind.PROVIDER,
+            {"reward": 0},
+            "non-scored trial cannot carry verifier rewards",
+        ),
+        (
+            BenchmarkTrialStatus.INCOMPLETE,
+            BenchmarkFailureKind.PROVIDER,
+            None,
+            "incomplete trial cannot carry error evidence",
+        ),
+        (
+            BenchmarkTrialStatus.TASK_TIMEOUT,
+            BenchmarkFailureKind.PROVIDER,
+            None,
+            "task_timeout trial cannot carry provider",
+        ),
+        (
+            BenchmarkTrialStatus.UNCLASSIFIED_ERROR,
+            BenchmarkFailureKind.ENVIRONMENT,
+            None,
+            "unclassified_error trial cannot carry environment",
+        ),
+    ],
+)
+def test_contradictory_trial_evidence_is_rejected(
+    status: BenchmarkTrialStatus,
+    kind: BenchmarkFailureKind,
+    rewards: dict[str, float | int] | None,
+    message: str,
+) -> None:
+    error = BenchmarkError(kind=kind, type="ExampleError")
+
+    with pytest.raises(ValidationError, match=message):
+        _trial(_cell("task-a"), status, rewards=rewards, error=error)
+
+
+def test_scored_timeout_is_counted_as_both_scored_and_timed_out() -> None:
+    cell = _cell("task-a")
+    trial = _trial(
+        cell,
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 0},
+        error=BenchmarkError(
+            kind=BenchmarkFailureKind.TASK_TIMEOUT,
+            type="AgentTimeoutError",
+        ),
+    )
+    result = BenchmarkRunResult(
+        job_name="timeout-with-score",
+        identity=_IDENTITY,
+        expected_cells=[cell],
+        trials=[trial],
+    )
+
+    assert result.n_scored == 1
+    assert result.n_task_timeouts == 1
+
+
+def test_mean_reward_requires_every_planned_cell_and_requested_key() -> None:
+    cells = [_cell("task-a"), _cell("task-b")]
+    complete = BenchmarkRunResult(
+        job_name="complete",
+        identity=_IDENTITY,
+        expected_cells=cells,
+        trials=[
+            _trial(cells[0], BenchmarkTrialStatus.SCORED, rewards={"score": 0}),
+            _trial(cells[1], BenchmarkTrialStatus.SCORED, rewards={"score": 0.5}),
+        ],
+    )
+
+    assert complete.mean_reward("score") == 0.25
+    with pytest.raises(ValueError, match="omit that key"):
+        complete.mean_reward("other")
+
+    invalid = complete.model_copy(deep=True)
+    invalid.trials[1] = _trial(
+        cells[1],
+        BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+        error=BenchmarkError(
+            kind=BenchmarkFailureKind.PROVIDER,
+            type="WmhPiProviderError",
+        ),
+    )
+    with pytest.raises(ValueError, match="planned cells are not scored"):
+        invalid.mean_reward("score")
+
+
+def test_duplicate_cells_are_rejected() -> None:
+    cell = _cell("task-a")
+    trial = _trial(cell, BenchmarkTrialStatus.INCOMPLETE)
+
+    with pytest.raises(ValidationError, match="duplicate expected benchmark cell"):
+        BenchmarkRunResult(
+            job_name="ground-truth-evaluation",
+            identity=_IDENTITY,
+            expected_cells=[cell, cell],
+            trials=[trial],
+        )
+
+
+def test_cancelled_is_terminal_and_distinct_from_missing_evidence() -> None:
+    cancelled = _trial(
+        _cell("cancelled"),
+        BenchmarkTrialStatus.CANCELLED,
+        error=BenchmarkError(
+            kind=BenchmarkFailureKind.CANCELLED,
+            type="CancelledError",
+        ),
+    )
+    missing = _trial(_cell("missing"), BenchmarkTrialStatus.INCOMPLETE)
+    result = BenchmarkRunResult(
+        job_name="ground-truth-evaluation",
+        identity=_IDENTITY,
+        expected_cells=[cancelled.cell, missing.cell],
+        trials=[cancelled, missing],
+    )
+
+    assert result.n_cancelled == 1
+    assert result.n_incomplete == 1
+    assert result.is_complete is False
+
+
+def test_candidate_outcome_is_typed_independently_from_verifier_score() -> None:
+    failed_but_scored = _trial(
+        _cell("task-a"),
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 0.5},
+        candidate_outcome=BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.FAILED,
+            stage=BenchmarkCandidateStage.EXECUTION,
+        ),
+    )
+    completed = _trial(
+        _cell("task-b"),
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 1},
+        candidate_outcome=BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.COMPLETED,
+            terminal_reason=BenchmarkCandidateTerminalReason.COMPLETED,
+        ),
+    )
+
+    assert failed_but_scored.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+    assert failed_but_scored.candidate_outcome.stage is BenchmarkCandidateStage.EXECUTION
+    assert completed.candidate_outcome.terminal_reason is (
+        BenchmarkCandidateTerminalReason.COMPLETED
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.UNKNOWN,
+        ).model_copy(update={"stage": BenchmarkCandidateStage.SETUP}),
+        BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.COMPLETED,
+        ).model_copy(update={"stage": BenchmarkCandidateStage.EXECUTION}),
+        BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.FAILED,
+        ).model_copy(update={"terminal_reason": BenchmarkCandidateTerminalReason.ABORTED}),
+    ],
+)
+def test_candidate_outcome_rejects_contradictory_details(
+    outcome: BenchmarkCandidateOutcome,
+) -> None:
+    with pytest.raises(ValidationError, match="candidate outcome"):
+        BenchmarkCandidateOutcome.model_validate(outcome.model_dump())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_name", "tampered-name"),
+        ("config_digest", "sha256:" + "c" * 64),
+    ],
+)
+def test_observed_cell_must_match_full_expected_identity(field: str, value: str) -> None:
+    expected = _cell("task-a")
+    observed = expected.model_copy(update={field: value})
+
+    with pytest.raises(ValidationError, match="cell identity differs from manifest"):
+        BenchmarkRunResult(
+            job_name="tampered-cell",
+            identity=_IDENTITY,
+            expected_cells=[expected],
+            trials=[_trial(observed, BenchmarkTrialStatus.INCOMPLETE)],
+        )
+
+
+def test_same_display_name_from_different_datasets_is_not_a_cell_collision() -> None:
+    cells = [
+        _cell("shared-name", task_key="dataset-a/shared-name@checksum-a"),
+        _cell("shared-name", task_key="dataset-b/shared-name@checksum-b"),
+    ]
+
+    result = BenchmarkRunResult(
+        job_name="multi-dataset",
+        identity=_IDENTITY,
+        expected_cells=cells,
+        trials=[
+            _trial(cells[0], BenchmarkTrialStatus.INCOMPLETE),
+            _trial(cells[1], BenchmarkTrialStatus.INCOMPLETE),
+        ],
+    )
+
+    assert len(result.trials) == 2
