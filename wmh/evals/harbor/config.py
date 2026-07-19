@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from wmh.evals.harbor.docker_environment import REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
 from wmh.evals.harbor.e2b_environment import EXACT_E2B_ENVIRONMENT_IMPORT_PATH
+from wmh.tracking.budget import BudgetAccountBinding
 
 SUPPORTED_HARBOR_VERSION = "0.18.0"
 
@@ -70,7 +71,12 @@ class HarborJobSpec(BaseModel):
         return self
 
 
-def build_harbor_job_config(spec: HarborJobSpec, *, agent: AgentConfig) -> JobConfig:
+def build_harbor_job_config(
+    spec: HarborJobSpec,
+    *,
+    agent: AgentConfig,
+    task_resource_budget_bindings: tuple[BudgetAccountBinding, ...] = (),
+) -> JobConfig:
     """Translate a stable WMH job spec to Harbor 0.18's programmatic ``JobConfig``.
 
     Docker is the explicit local task environment. Selecting E2B constructs an E2B environment
@@ -82,6 +88,12 @@ def build_harbor_job_config(spec: HarborJobSpec, *, agent: AgentConfig) -> JobCo
     _require_supported_harbor_version()
     spec = HarborJobSpec.model_validate(spec.model_dump())
     local_environment = spec.environment_backend is HarborEnvironmentBackend.LOCAL
+    if local_environment and task_resource_budget_bindings:
+        raise ValueError("local Harbor task environments cannot consume a resource meter")
+    frozen_bindings = tuple(
+        BudgetAccountBinding.model_validate(binding.model_dump())
+        for binding in task_resource_budget_bindings
+    )
     environment_type = EnvironmentType.DOCKER if local_environment else EnvironmentType.E2B
     if agent.n_concurrent != spec.agent_n_concurrent:
         raise ValueError("agent n_concurrent must already match HarborJobSpec.agent_n_concurrent")
@@ -105,7 +117,15 @@ def build_harbor_job_config(spec: HarborJobSpec, *, agent: AgentConfig) -> JobCo
             mounts=None,
             extra_docker_compose=[],
             env={},
-            kwargs={},
+            kwargs=(
+                {}
+                if not frozen_bindings
+                else {
+                    "resource_budget_bindings": [
+                        binding.model_dump(mode="json") for binding in frozen_bindings
+                    ]
+                }
+            ),
             extra_allowed_hosts=[],
         ),
         retry=retry,
@@ -150,7 +170,18 @@ def validate_controlled_harbor_environment(
     if environment.env:
         raise ValueError("Harbor environment host variables are unsupported")
     if environment.kwargs:
-        raise ValueError("Harbor environment backend kwargs are unsupported")
+        if environment.type is not EnvironmentType.E2B or set(environment.kwargs) != {
+            "resource_budget_bindings"
+        }:
+            raise ValueError("Harbor environment backend kwargs are unsupported")
+        raw_bindings = environment.kwargs["resource_budget_bindings"]
+        if not isinstance(raw_bindings, list) or not raw_bindings:
+            raise ValueError("Harbor task resource budget bindings must be a nonempty list")
+        bindings = [BudgetAccountBinding.model_validate(value) for value in raw_bindings]
+        if len({(item.policy_digest, item.meter_id) for item in bindings}) != len(bindings):
+            raise ValueError("Harbor task resource budget bindings must be unique")
+        if len({item.policy_digest for item in bindings}) != 1:
+            raise ValueError("Harbor task resource budgets must share one policy")
     if environment.extra_allowed_hosts:
         raise ValueError("Harbor run-level extra allowed hosts are unsupported")
 

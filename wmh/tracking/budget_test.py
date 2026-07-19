@@ -47,15 +47,20 @@ from wmh.tracking.budget import (
     SpendLedger,
     TimedResourceBudget,
     TimedResourceBudgetAccount,
+    TimedResourceClass,
     TimedResourceCostMeter,
+    TimedResourceRole,
     TokenPriceCeiling,
     bind_budget_account,
     bind_timed_resource_account,
     bootstrap_budget_ledger,
     nano_usd_from_usd,
     open_shared_spend_ledger,
+    orphaned_timed_resource_requires_reap,
+    reconcile_orphaned_timed_resource,
     resolve_budget_account,
     resolve_timed_resource_account,
+    validate_timed_resource_class,
 )
 
 
@@ -508,6 +513,90 @@ def test_timed_resource_budget_reserves_ceiling_and_settles_billing_quantum(
     assert settled.input_tokens is None
     assert settled.output_tokens is None
     assert resource.billed_seconds(0) == 60
+
+
+def test_timed_resource_class_binds_role_resources_ttl_and_host_horizon(
+    tmp_path: Path,
+) -> None:
+    resource_class = TimedResourceClass(
+        role=TimedResourceRole.AGENT_RUNNER,
+        cpu_count=2,
+        memory_mb=2048,
+        provider_ttl_seconds=420,
+        create_request_timeout_seconds=30,
+        cleanup_horizon_seconds=600,
+    )
+    meter = TimedResourceCostMeter(
+        resource_type=resource_class.role.value,
+        resource_class_digest=resource_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=resource_class.max_host_observation_seconds,
+    )
+    policy = BudgetPolicy(
+        study_id="resource-class",
+        manifest_digest="sha256:" + "7" * 64,
+        hard_limit_nano_usd=2_000,
+        phase_limits_nano_usd={"search": 2_000},
+        meters={"runner": meter},
+    )
+    account = TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "class.sqlite3").resolve(),
+        policy=policy,
+        scope=_scope(),
+        meter_id="runner",
+    )
+
+    assert resource_class.max_host_observation_seconds == 1_050
+    assert validate_timed_resource_class(account, resource_class) == meter
+    for drift in (
+        resource_class.model_copy(update={"role": TimedResourceRole.TASK_ENVIRONMENT}),
+        resource_class.model_copy(update={"memory_mb": 4096}),
+        resource_class.model_copy(update={"provider_ttl_seconds": 421}),
+    ):
+        with pytest.raises(BudgetIntegrityError, match="role differs|class differs"):
+            validate_timed_resource_class(account, drift)
+
+    short_meter = meter.model_copy(update={"max_billing_seconds": 1_049})
+    short_policy = policy.model_copy(update={"meters": {"runner": short_meter}}, deep=True)
+    short_account = account.model_copy(update={"policy": short_policy}, deep=True)
+    with pytest.raises(BudgetIntegrityError, match="horizon"):
+        validate_timed_resource_class(short_account, resource_class)
+
+
+def test_orphaned_timed_resource_join_is_exact_and_conservative(tmp_path: Path) -> None:
+    resource = TimedResourceCostMeter(
+        resource_type="agent_runner",
+        resource_class_digest="sha256:" + "8" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=30,
+    )
+    policy = BudgetPolicy(
+        study_id="orphan-join",
+        manifest_digest="sha256:" + "9" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={"runner": resource},
+    )
+    account = TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "orphan.sqlite3").resolve(),
+        policy=policy,
+        scope=_scope(),
+        meter_id="runner",
+    )
+
+    assert reconcile_orphaned_timed_resource(account, reservation_id="pre-admission") is None
+    assert not orphaned_timed_resource_requires_reap(
+        account,
+        reservation_id="pre-admission",
+    )
+
+    TimedResourceBudget(account, id_factory=lambda: "orphaned").reserve()
+    joined = reconcile_orphaned_timed_resource(account, reservation_id="orphaned")
+    assert joined is not None
+    assert joined.status is ReservationStatus.FORFEITED
+    assert joined.failure_type == "OrphanedLease"
+    assert joined.charged_nano_usd == resource.maximum_charge_nano_usd()
+    assert orphaned_timed_resource_requires_reap(account, reservation_id="orphaned")
 
 
 def test_provider_and_timed_resources_share_one_hard_cap(tmp_path: Path) -> None:

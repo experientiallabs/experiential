@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +23,16 @@ from pydantic import ValidationError
 
 import wmh.evals.harbor.e2b_environment as mod
 from wmh.harness.pi_runner_backend import RunnerLeaseRecord
+from wmh.tracking.budget import (
+    BudgetExceededError,
+    BudgetPolicy,
+    BudgetScope,
+    ReservationStatus,
+    SpendLedger,
+    TimedResourceBudgetAccount,
+    TimedResourceCostMeter,
+    bind_timed_resource_account,
+)
 
 
 def _environment(
@@ -28,6 +40,7 @@ def _environment(
     *,
     trial_name: str = "trial-a",
     network_mode: NetworkMode = NetworkMode.ALLOWLIST,
+    resource_budget_account: TimedResourceBudgetAccount | None = None,
 ) -> mod.ExactE2BEnvironment:
     environment_dir = tmp_path / "environment"
     environment_dir.mkdir(exist_ok=True)
@@ -48,6 +61,46 @@ def _environment(
             network_mode=network_mode,
             allowed_hosts=allowed_hosts,
         ),
+        resource_budget_bindings=(
+            None
+            if resource_budget_account is None
+            else [bind_timed_resource_account(resource_budget_account).model_dump(mode="json")]
+        ),
+    )
+
+
+def _resource_account(
+    tmp_path: Path,
+    *,
+    hard_limit: int | None = None,
+) -> TimedResourceBudgetAccount:
+    resource_class = mod.ExactE2BEnvironment._task_resource_class(
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    meter = TimedResourceCostMeter(
+        resource_type=resource_class.role.value,
+        resource_class_digest=resource_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=resource_class.max_host_observation_seconds,
+    )
+    limit = (
+        meter.maximum_charge_nano_usd() * 3
+        if hard_limit is None
+        else hard_limit
+    )
+    policy = BudgetPolicy(
+        study_id="task-resource-test",
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
+        hard_limit_nano_usd=limit,
+        phase_limits_nano_usd={"search": limit},
+        meters={"task": meter},
+    )
+    return TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=policy,
+        scope=BudgetScope(phase="search", category="task", run_id="test-run"),
+        meter_id="task",
     )
 
 
@@ -179,7 +232,7 @@ def test_content_keyed_build_registry_reuses_only_completed_exact_ids(
     monkeypatch.setattr(first, "_build_template_once", build_once)
     monkeypatch.setattr(second, "_build_template_once", unexpected_build)
 
-    first_record = asyncio.run(first._load_or_build_exact_template())
+    first_record = asyncio.run(first._load_or_build_exact_template(allow_build=True))
     second_record = asyncio.run(second._load_or_build_exact_template())
 
     assert calls == [(2, 1024)]
@@ -218,7 +271,9 @@ def test_concurrent_build_registry_serializes_before_publishing_exact_ids(
 
         monkeypatch.setattr(first, "_build_template_once", build_once)
         monkeypatch.setattr(second, "_build_template_once", duplicate_build)
-        first_task = asyncio.create_task(first._load_or_build_exact_template())
+        first_task = asyncio.create_task(
+            first._load_or_build_exact_template(allow_build=True)
+        )
         await asyncio.wait_for(build_started.wait(), timeout=1)
         second_task = asyncio.create_task(second._load_or_build_exact_template())
         await asyncio.sleep(0.05)
@@ -231,6 +286,60 @@ def test_concurrent_build_registry_serializes_before_publishing_exact_ids(
         assert second_record == first_record
 
     asyncio.run(scenario())
+
+
+def test_concurrent_exact_build_registration_allows_one_conflicting_record(
+    tmp_path: Path,
+) -> None:
+    def register(build_id: str) -> mod.ExactE2BBuildRecord:
+        return mod.register_exact_e2b_build_record(
+            jobs_dir=tmp_path / "jobs",
+            environment_id="environment-immutable",
+            template_id="template-immutable",
+            build_id=build_id,
+            cpu_count=2,
+            memory_mb=1024,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(register, "build-a"),
+            executor.submit(register, "build-b"),
+        ]
+    outcomes: list[mod.ExactE2BBuildRecord] = []
+    errors: list[BaseException] = []
+    for future in futures:
+        try:
+            outcomes.append(future.result())
+        except BaseException as error:  # noqa: BLE001 - assert exact concurrent outcome below
+            errors.append(error)
+
+    assert len(outcomes) == 1
+    assert len(errors) == 1
+    assert "different record" in str(errors[0])
+    loaded = mod.require_exact_e2b_build_record(
+        jobs_dir=tmp_path / "jobs",
+        environment_id="environment-immutable",
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    assert loaded == outcomes[0]
+
+
+def test_scored_runtime_rejects_an_unprepared_billable_template_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+
+    async def forbidden_build(*, cpu_count: int, memory_mb: int) -> BuildInfo:
+        del cpu_count, memory_mb
+        raise AssertionError("scored runtime must not dispatch a template build")
+
+    monkeypatch.setattr(environment, "_build_template_once", forbidden_build)
+
+    with pytest.raises(RuntimeError, match="prebuilt exact template"):
+        asyncio.run(environment._load_or_build_exact_template())
 
 
 def test_exact_create_binds_build_policy_and_terminal_cleanup_receipt(
@@ -267,6 +376,7 @@ def test_exact_create_binds_build_policy_and_terminal_cleanup_receipt(
     assert create_call["template"] == "template-immutable:build-immutable"
     assert create_call["secure"] is True
     assert create_call["timeout"] == 3600
+    assert create_call["request_timeout"] == 30
     assert create_call["lifecycle"] == {"on_timeout": "kill", "auto_resume": False}
     assert create_call["volume_mounts"] is None
     assert create_call["network"] == {
@@ -292,7 +402,7 @@ def test_exact_create_binds_build_policy_and_terminal_cleanup_receipt(
     asyncio.run(environment.stop(delete=True))
 
     assert sandbox.kills == 1
-    assert reaped == [environment._wmh_lease_id]
+    assert reaped == []
     receipt = RunnerLeaseRecord.model_validate_json(
         (environment.trial_paths.trial_dir / mod.TASK_E2B_LEASE_FILE).read_bytes()
     )
@@ -300,6 +410,55 @@ def test_exact_create_binds_build_policy_and_terminal_cleanup_receipt(
     assert receipt.resource_id == "sandbox-immutable"
     assert receipt.owner_id == environment._wmh_owner_id
     assert receipt.config_digest == launch_digest
+
+
+def test_task_cleanup_retries_a_transient_direct_kill_before_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs)
+        original_kill = sandbox.kill
+        attempts = 0
+
+        async def transient_kill(**kill_kwargs: object) -> bool:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("connection reset")
+            return await original_kill(**kill_kwargs)
+
+        sandbox.kill = transient_kill  # ty: ignore[invalid-assignment]
+        return sandbox
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    reaped: list[str] = []
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        mod,
+        "reap_e2b_runner_lease",
+        lambda lease_id: (reaped.append(lease_id), ())[1],
+    )
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+    sandbox = cast("_Sandbox", environment._sandbox)
+
+    asyncio.run(environment.stop(delete=True))
+
+    assert sandbox.kills == 1
+    assert reaped == []
 
 
 def test_start_reaps_ambiguous_create_before_recording_retirement(
@@ -334,6 +493,77 @@ def test_start_reaps_ambiguous_create_before_recording_retirement(
     assert receipt.state == "retired"
     assert receipt.resource_id is None
     assert environment.wmh_environment_attestation is None
+
+
+def test_task_budget_denial_never_dispatches_or_reaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _resource_account(tmp_path, hard_limit=1)
+    environment = _environment(tmp_path, resource_budget_account=account)
+    build = _build()
+    creates = 0
+    reaped: list[str] = []
+
+    async def load_build() -> mod.ExactE2BBuildRecord:
+        return build
+
+    async def unexpected_create(**_kwargs: object) -> _Sandbox:
+        nonlocal creates
+        creates += 1
+        raise AssertionError("budget denial must precede provider create")
+
+    monkeypatch.setattr(environment, "_load_or_build_exact_template", load_build)
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(unexpected_create))
+    monkeypatch.setattr(
+        mod,
+        "reap_e2b_runner_lease",
+        lambda lease_id: (reaped.append(lease_id), ())[1],
+    )
+
+    with pytest.raises(BudgetExceededError, match="hard budget"):
+        asyncio.run(environment.start(force_build=False))
+
+    assert creates == 0
+    assert reaped == []
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+    receipt = RunnerLeaseRecord.model_validate_json(
+        (environment.trial_paths.trial_dir / mod.TASK_E2B_LEASE_FILE).read_bytes()
+    )
+    assert receipt.state == "retired"
+
+
+def test_task_ambiguous_create_forfeits_full_resource_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _resource_account(tmp_path)
+    environment = _environment(tmp_path, resource_budget_account=account)
+    build = _build()
+    reaped: list[str] = []
+
+    async def load_build() -> mod.ExactE2BBuildRecord:
+        return build
+
+    async def fail_create(**_kwargs: object) -> _Sandbox:
+        raise RuntimeError("ambiguous create")
+
+    monkeypatch.setattr(environment, "_load_or_build_exact_template", load_build)
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(fail_create))
+    monkeypatch.setattr(
+        mod,
+        "reap_e2b_runner_lease",
+        lambda lease_id: (reaped.append(lease_id), ())[1],
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous create"):
+        asyncio.run(environment.start(force_build=False))
+
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.reservation_id == environment._wmh_lease_id
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+    assert reaped == [environment._wmh_lease_id]
 
 
 def test_startup_reaps_a_process_death_lease_before_any_new_create(
@@ -386,7 +616,7 @@ def test_startup_reaps_a_process_death_lease_before_any_new_create(
     asyncio.run(environment.stop(delete=True))
 
 
-def test_exact_create_rejects_returned_template_drift_and_still_reaps(
+def test_exact_create_rejects_returned_template_drift_and_kills_known_resource(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,7 +641,7 @@ def test_exact_create_rejects_returned_template_drift_and_still_reaps(
     with pytest.raises(RuntimeError, match="template differs"):
         asyncio.run(environment.start(force_build=False))
 
-    assert reaped == [environment._wmh_lease_id]
+    assert reaped == []
     receipt = RunnerLeaseRecord.model_validate_json(
         (environment.trial_paths.trial_dir / mod.TASK_E2B_LEASE_FILE).read_bytes()
     )
@@ -419,7 +649,7 @@ def test_exact_create_rejects_returned_template_drift_and_still_reaps(
     assert receipt.resource_id == "sandbox-immutable"
 
 
-def test_exact_create_rejects_an_expired_fixed_lease_and_still_reaps(
+def test_exact_create_rejects_an_expired_fixed_lease_and_kills_known_resource(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -447,7 +677,7 @@ def test_exact_create_rejects_an_expired_fixed_lease_and_still_reaps(
     with pytest.raises(RuntimeError, match="not active"):
         asyncio.run(environment.start(force_build=False))
 
-    assert reaped == [environment._wmh_lease_id]
+    assert reaped == []
 
 
 def test_cancellation_during_post_create_setup_kills_reaps_and_then_propagates(
@@ -493,7 +723,7 @@ def test_cancellation_during_post_create_setup_kills_reaps_and_then_propagates(
 
     assert len(created) == 1
     assert created[0].kills == 1
-    assert reaped == [environment._wmh_lease_id]
+    assert reaped == []
     receipt = RunnerLeaseRecord.model_validate_json(
         (environment.trial_paths.trial_dir / mod.TASK_E2B_LEASE_FILE).read_bytes()
     )
@@ -510,7 +740,13 @@ def test_unknown_task_sandbox_cleanup_remains_nonterminal(
     launch_digest = environment._launch_config_digest(build)
 
     async def create(**kwargs: object) -> _Sandbox:
-        return _sandbox_for_create(kwargs)
+        sandbox = _sandbox_for_create(kwargs)
+
+        async def fail_kill(**_kwargs: object) -> bool:
+            raise RuntimeError("direct cleanup unknown")
+
+        sandbox.kill = fail_kill  # ty: ignore[invalid-assignment]
+        return sandbox
 
     def unknown_cleanup(_lease_id: str) -> tuple[str, ...]:
         raise RuntimeError("provider absence was not proved")

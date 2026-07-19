@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
+import math
+import re
 import shlex
 import time
+import uuid
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -16,6 +22,8 @@ from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
     CommandOutput,
+    E2B_CLEANUP_HORIZON_S,
+    E2B_CREATE_REQUEST_TIMEOUT_S,
     SandboxCleanupError,
     SandboxFactory,
     SandboxHandle,
@@ -23,6 +31,7 @@ from wmh.harness.e2b_sandbox import (
     create_sandbox,
     default_sandbox_factory,
     kill_sandbox,
+    reap_e2b_runner_lease,
 )
 from wmh.harness.live_session import (
     DEFAULT_ACTIONS_PER_TURN,
@@ -31,10 +40,19 @@ from wmh.harness.live_session import (
     ToolOutcome,
 )
 from wmh.harness.pi_e2b import start_live_runner
+from wmh.harness.pi_runner_backend import RunnerLeaseLedger, runner_owner_id
 from wmh.harness.runner_link import Channel, TokenUsage
 from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.harness.tools import resolve_tools
 from wmh.providers.base import ToolCallingProvider
+from wmh.tracking.budget import (
+    TimedResourceBudget,
+    TimedResourceBudgetAccount,
+    TimedResourceClass,
+    TimedResourceReservation,
+    TimedResourceRole,
+    orphaned_timed_resource_requires_reap,
+)
 
 PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
@@ -56,6 +74,11 @@ _RECOVERABLE_SESSION_MARKERS = (
     "live session runner did not become ready",
     "channel send failed",
 )
+_EXACT_E2B_TEMPLATE = re.compile(
+    r"[A-Za-z0-9_.-]{1,512}:[A-Za-z0-9_.-]{1,512}\Z"
+)
+_PROJECT_LEASE_FILE = re.compile(r"[0-9a-f]{32}\.json\Z")
+_MAX_PROJECT_LEASE_FILES = 4096
 
 
 class ChannelFactory(Protocol):
@@ -101,6 +124,284 @@ class _ProjectAgentTurnError(RuntimeError):
     """A worker/provider error reported by a live agent turn, not its transport."""
 
 
+@dataclass
+class _ProjectResourceLease:
+    ledger: RunnerLeaseLedger
+    lease_id: str
+    reservation: TimedResourceReservation | None
+
+
+class _BudgetedProjectSandboxFactory:
+    """Create each proposer-project lease once under the shared experiment hard cap."""
+
+    def __init__(
+        self,
+        *,
+        account: TimedResourceBudgetAccount,
+        ledger_dir: Path,
+        timeout: float,
+        template: str,
+        api_key: str | None,
+        cpu_count: int,
+        memory_mb: int,
+        orphan_reaper: Callable[[str], tuple[str, ...]] | None = None,
+    ) -> None:
+        if not math.isfinite(timeout) or timeout <= 0 or not timeout.is_integer():
+            raise ValueError("project sandbox timeout must be a positive whole number of seconds")
+        if _EXACT_E2B_TEMPLATE.fullmatch(template) is None:
+            raise ValueError("project sandbox template must pin an exact template and build ID")
+        if not ledger_dir.is_absolute():
+            raise ValueError("project resource lease ledger directory must be absolute")
+        self._account = TimedResourceBudgetAccount.model_validate(account.model_dump())
+        self._ledger_dir = ledger_dir
+        self._provider_ttl_seconds = int(timeout)
+        self._template = template
+        self._template_id = template.split(":", 1)[0]
+        self._api_key = api_key
+        self._orphan_reaper = orphan_reaper or (
+            lambda lease_id: reap_e2b_runner_lease(lease_id, api_key=self._api_key)
+        )
+        self._resource_class = TimedResourceClass(
+            role=TimedResourceRole.PROPOSER_PROJECT,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            provider_ttl_seconds=self._provider_ttl_seconds,
+            create_request_timeout_seconds=E2B_CREATE_REQUEST_TIMEOUT_S,
+            cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
+        )
+        # Construction validates the meter role, class digest, and full host horizon before any
+        # filesystem or provider side effect.
+        TimedResourceBudget(self._account, resource_class=self._resource_class)
+        self._config_digest = self._digest_config()
+        self._owner_id = runner_owner_id(uuid.uuid4().hex)
+        self._live: dict[int, _ProjectResourceLease] = {}
+
+    def __call__(self) -> SandboxHandle:
+        self._reconcile_orphans()
+        lease_id = uuid.uuid4().hex
+        ledger = RunnerLeaseLedger(self._ledger_dir / f"{lease_id}.json")
+        ledger.begin(
+            backend="e2b",
+            lease_id=lease_id,
+            owner_id=self._owner_id,
+            config_digest=self._config_digest,
+        )
+        reservation: TimedResourceReservation | None = None
+        create_dispatched = False
+        try:
+            reservation = TimedResourceBudget(
+                self._account,
+                resource_class=self._resource_class,
+                id_factory=lambda: lease_id,
+            ).reserve()
+            if reservation.reservation_id != lease_id:
+                raise RuntimeError("project budget reservation differs from its lease")
+            factory = default_sandbox_factory(
+                timeout=float(self._provider_ttl_seconds),
+                template=self._template,
+                api_key=self._api_key,
+                metadata={
+                    "wmh_runner_config": self._config_digest,
+                    "wmh_runner_lease": lease_id,
+                    "wmh_runner_owner": self._owner_id,
+                    "wmh_resource_kind": TimedResourceRole.PROPOSER_PROJECT.value,
+                },
+                allow_internet_access=False,
+                lifecycle={"on_timeout": "kill", "auto_resume": False},
+                request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
+            )
+            create_dispatched = True
+            sandbox = factory()
+        except BaseException:
+            self._retire_failed_creation(
+                ledger,
+                lease_id=lease_id,
+                reservation=reservation,
+                create_dispatched=create_dispatched,
+            )
+            raise
+        resource_id = getattr(sandbox, "sandbox_id", None)
+        lease = _ProjectResourceLease(
+            ledger=ledger,
+            lease_id=lease_id,
+            reservation=reservation,
+        )
+        self._live[id(sandbox)] = lease
+        if not isinstance(resource_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{1,512}", resource_id
+        ):
+            self.retire(sandbox)
+            raise RuntimeError("project sandbox did not expose a valid resource identity")
+        ledger.activate(resource_id)
+        try:
+            expected_end_at = self._attest(sandbox, lease_id=lease_id, resource_id=resource_id)
+        except BaseException:
+            self.retire(sandbox)
+            raise
+        ledger.activate(resource_id, expected_end_at=expected_end_at)
+        return sandbox
+
+    def retire(self, sandbox: SandboxHandle) -> None:
+        lease = self._live.get(id(sandbox))
+        if lease is None:
+            return
+        resource_id = getattr(sandbox, "sandbox_id", None)
+        try:
+            kill_sandbox(sandbox)
+        except BaseException:
+            self._forfeit(lease, "CleanupUnknown")
+            lease.ledger.cleanup_failed(
+                resource_id if isinstance(resource_id, str) else None
+            )
+            raise
+        try:
+            if lease.reservation is not None:
+                lease.reservation.settle()
+                lease.reservation = None
+            lease.ledger.retire()
+        except BaseException:
+            lease.ledger.cleanup_failed(
+                resource_id if isinstance(resource_id, str) else None
+            )
+            raise
+        self._live.pop(id(sandbox), None)
+
+    def _reconcile_orphans(self) -> None:
+        if self._ledger_dir.is_symlink():
+            raise RuntimeError("project resource lease directory cannot be a symbolic link")
+        self._ledger_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        entries = sorted(self._ledger_dir.iterdir(), key=lambda item: item.name)
+        if len(entries) > _MAX_PROJECT_LEASE_FILES:
+            raise RuntimeError("project resource lease directory exceeds its bounded file count")
+        live_lease_ids = {lease.lease_id for lease in self._live.values()}
+        for path in entries:
+            if (
+                _PROJECT_LEASE_FILE.fullmatch(path.name) is None
+                or path.is_symlink()
+                or not path.is_file()
+            ):
+                raise RuntimeError("project resource lease directory contains an invalid entry")
+            if path.stem in live_lease_ids:
+                continue
+            RunnerLeaseLedger(path).reconcile(
+                backend="e2b",
+                orphan_reaper=self._orphan_reaper,
+                orphan_budget_reconciler=lambda reservation_id: (
+                    orphaned_timed_resource_requires_reap(
+                        self._account,
+                        reservation_id=reservation_id,
+                    )
+                ),
+                orphan_expiry_horizon_s=(
+                    E2B_CREATE_REQUEST_TIMEOUT_S
+                    + self._provider_ttl_seconds
+                    + 30
+                ),
+            )
+
+    def _attest(
+        self,
+        sandbox: SandboxHandle,
+        *,
+        lease_id: str,
+        resource_id: str,
+    ) -> datetime:
+        get_info = getattr(sandbox, "get_info", None)
+        if not callable(get_info):
+            raise RuntimeError("project sandbox cannot attest its immutable resource class")
+        info = get_info()
+        if (
+            getattr(info, "sandbox_id", None) != resource_id
+            or getattr(info, "template_id", None) != self._template_id
+            or getattr(info, "cpu_count", None) != self._resource_class.cpu_count
+            or getattr(info, "memory_mb", None) != self._resource_class.memory_mb
+            or getattr(info, "allow_internet_access", None) is not False
+            or bool(getattr(info, "volume_mounts", ()))
+        ):
+            raise RuntimeError("project sandbox identity or isolation differs from admission")
+        metadata = getattr(info, "metadata", None)
+        expected_metadata = {
+            "wmh_runner_config": self._config_digest,
+            "wmh_runner_lease": lease_id,
+            "wmh_runner_owner": self._owner_id,
+            "wmh_resource_kind": TimedResourceRole.PROPOSER_PROJECT.value,
+        }
+        if not isinstance(metadata, dict) or any(
+            metadata.get(key) != value for key, value in expected_metadata.items()
+        ):
+            raise RuntimeError("project sandbox metadata does not bind its opaque lease")
+        lifecycle = getattr(info, "lifecycle", None)
+        if (
+            lifecycle is None
+            or getattr(lifecycle, "on_timeout", None) != "kill"
+            or getattr(lifecycle, "auto_resume", None) is not False
+        ):
+            raise RuntimeError("project sandbox lifecycle can extend its immutable TTL")
+        started_at = getattr(info, "started_at", None)
+        end_at = getattr(info, "end_at", None)
+        if (
+            not isinstance(started_at, datetime)
+            or not isinstance(end_at, datetime)
+            or started_at.tzinfo is None
+            or end_at.tzinfo is None
+            or abs((end_at - started_at).total_seconds() - self._provider_ttl_seconds) > 5
+            or started_at > datetime.now(UTC) + timedelta(seconds=30)
+            or end_at <= datetime.now(UTC)
+        ):
+            raise RuntimeError("project sandbox did not prove its immutable provider TTL")
+        return end_at
+
+    def _retire_failed_creation(
+        self,
+        ledger: RunnerLeaseLedger,
+        *,
+        lease_id: str,
+        reservation: TimedResourceReservation | None,
+        create_dispatched: bool,
+    ) -> None:
+        budget_error: Exception | None = None
+        if reservation is not None:
+            try:
+                reservation.forfeit(
+                    failure_type=("CreateUnknown" if create_dispatched else "PreDispatchFailure")
+                )
+            except Exception as error:  # noqa: BLE001 - cleanup still runs after ledger failure
+                budget_error = error
+        if create_dispatched:
+            try:
+                self._orphan_reaper(lease_id)
+            except BaseException:
+                ledger.cleanup_failed()
+                raise
+        if budget_error is not None:
+            ledger.cleanup_failed()
+            raise budget_error
+        ledger.retire()
+
+    @staticmethod
+    def _forfeit(lease: _ProjectResourceLease, failure_type: str) -> None:
+        reservation = lease.reservation
+        if reservation is None:
+            return
+        try:
+            reservation.forfeit(failure_type=failure_type)
+        finally:
+            lease.reservation = None
+
+    def _digest_config(self) -> str:
+        payload = {
+            "schema_version": 1,
+            "template": self._template,
+            "resource_class": self._resource_class.model_dump(mode="json"),
+            "internet_access_at_create": False,
+            "timeout_action": "kill",
+            "auto_resume": False,
+            "volume_mounts": False,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
 class AgentProject:
     """A persistent filesystem that can run project-scoped pi agents.
 
@@ -118,6 +419,10 @@ class AgentProject:
         workspace: str = PROJECT_WORKSPACE,
         channel_factory: ChannelFactory | None = None,
         sandbox_factory: SandboxFactory | None = None,
+        sandbox_opener: Callable[[SandboxFactory], SandboxHandle] = create_sandbox,
+        sandbox_retirer: Callable[[SandboxHandle], None] = kill_sandbox,
+        budget_policy_digest: str | None = None,
+        budget_ledger_path: Path | None = None,
         owns_sandbox: bool = True,
     ) -> None:
         self._sandbox = sandbox
@@ -130,6 +435,10 @@ class AgentProject:
         # Replacing a caller-owned sandbox would exceed this object's authority. Injected test or
         # application sandboxes still get the bounded fresh-session retry in the same filesystem.
         self._sandbox_factory = sandbox_factory if owns_sandbox else None
+        self._sandbox_opener = sandbox_opener
+        self._sandbox_retirer = sandbox_retirer
+        self._budget_policy_digest = budget_policy_digest
+        self._budget_ledger_path = budget_ledger_path
         self._owns_sandbox = owns_sandbox
         self._active_sandbox_started_at = time.monotonic()
         self._retired_sandbox_seconds = 0.0
@@ -171,19 +480,45 @@ class AgentProject:
         cls,
         *,
         timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
-        template: str | None = None,
+        template: str,
+        cpu_count: int,
+        memory_mb: int,
+        resource_budget_account: TimedResourceBudgetAccount,
+        lease_ledger_dir: Path,
         api_key: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> AgentProject:
-        """Create one owned E2B project sandbox."""
-        factory = default_sandbox_factory(
+        """Create one hard-budgeted owned E2B project from an immutable template build."""
+        if metadata:
+            raise ValueError("project sandbox provider metadata is controlled by WMH")
+        factory = _BudgetedProjectSandboxFactory(
+            account=resource_budget_account,
+            ledger_dir=lease_ledger_dir,
             timeout=timeout,
             template=template,
             api_key=api_key,
-            metadata=metadata,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
         )
-        sandbox = create_sandbox(factory)
-        return cls(sandbox, sandbox_factory=factory)
+        sandbox = factory()
+        return cls(
+            sandbox,
+            sandbox_factory=factory,
+            sandbox_opener=lambda opener: opener(),
+            sandbox_retirer=factory.retire,
+            budget_policy_digest=resource_budget_account.policy.policy_digest,
+            budget_ledger_path=resource_budget_account.ledger_path.expanduser().resolve(),
+        )
+
+    @property
+    def budget_policy_digest(self) -> str | None:
+        """Return the hard-budget policy covering every owned project replacement."""
+        return self._budget_policy_digest
+
+    @property
+    def budget_ledger_path(self) -> Path | None:
+        """Return the trusted host-only ledger join for the proposer provider."""
+        return self._budget_ledger_path
 
     def write_text(self, path: str, content: str) -> None:
         """Write one project-relative file without allowing path traversal."""
@@ -673,7 +1008,7 @@ class AgentProject:
         # Required durable files are synchronously mirrored by write_text/write_file. Bash is
         # explicitly scratch-only, so recovery never scans or replays an unbounded agent-created
         # tree before honoring cancellation or replacing a poisoned transport.
-        replacement = create_sandbox(factory)
+        replacement = self._sandbox_opener(factory)
         replacement_started_at = time.monotonic()
         self._sandbox_count += 1
         self._live_sandboxes[id(replacement)] = (replacement, replacement_started_at)
@@ -699,7 +1034,7 @@ class AgentProject:
         lease = self._live_sandboxes.get(id(sandbox))
         if lease is None:
             return
-        kill_sandbox(sandbox)
+        self._sandbox_retirer(sandbox)
         retired_at = time.monotonic()
         _handle, started_at = self._live_sandboxes.pop(id(sandbox))
         self._retired_sandbox_seconds += max(0.0, retired_at - started_at)

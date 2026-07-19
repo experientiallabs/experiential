@@ -1083,6 +1083,14 @@ def test_runner_attestation_must_be_complete_and_bound_to_the_frozen_spec(
             "terminal",
         ),
         (
+            {**_runner_lease_receipt("task__harbor"), "resource_id": None},
+            "terminal",
+        ),
+        (
+            {**_runner_lease_receipt("task__harbor"), "resource_id": ""},
+            "invalid",
+        ),
+        (
             {
                 **_runner_lease_receipt("task__harbor"),
                 "config_digest": "sha256:" + "f" * 64,
@@ -1159,7 +1167,10 @@ def test_inconsistent_step_model_call_counts_are_rejected(tmp_path: Path) -> Non
     trial = _trial(tmp_path, "task", rewards={"reward": 1})
     identity = {
         "harness_hash": _HARNESS.execution_hash,
-        "runner_image": "runner-image",
+        "runner_config_digest": _RUNNER.config_digest,
+        "runner_environment_digest": _RUNNER.attestation.digest,
+        "runner_environment_attestation": _RUNNER.attestation.evidence,
+        "runner_lease_receipt": _runner_lease_receipt(trial.trial_name),
         "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
         "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
         "candidate_failure": False,

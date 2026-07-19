@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+
 import pytest
 from llm_waterfall import ChatResponse
 
@@ -15,6 +23,17 @@ from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import (
+    BudgetExceededError,
+    BudgetPolicy,
+    BudgetScope,
+    ReservationStatus,
+    SpendLedger,
+    TimedResourceBudgetAccount,
+    TimedResourceClass,
+    TimedResourceCostMeter,
+    TimedResourceRole,
+)
 
 
 class _Files:
@@ -1384,3 +1403,250 @@ def test_project_rejects_agents_with_uncontained_tools(tool: str) -> None:
 
     with pytest.raises(ValueError, match=f"uncontained tools: {tool}"):
         project.run(uncontained, _Provider(), "escape", timeout=1)
+
+
+class _AttestedProjectSandbox(_Sandbox):
+    def __init__(
+        self,
+        create_kwargs: dict[str, object],
+        *,
+        sandbox_id: str,
+        network_drift: bool = False,
+        volume_drift: bool = False,
+    ) -> None:
+        super().__init__()
+        self.sandbox_id = sandbox_id
+        started_at = datetime.now(UTC)
+        timeout = int(cast("float", create_kwargs["timeout"]))
+        lifecycle = cast("dict[str, object]", create_kwargs["lifecycle"])
+        self.info = SimpleNamespace(
+            sandbox_id=sandbox_id,
+            template_id=str(create_kwargs["template"]).split(":", 1)[0],
+            cpu_count=2,
+            memory_mb=2048,
+            metadata=create_kwargs["metadata"],
+            allow_internet_access=(
+                True if network_drift else create_kwargs["allow_internet_access"]
+            ),
+            volume_mounts=([{"name": "unexpected"}] if volume_drift else []),
+            lifecycle=SimpleNamespace(
+                on_timeout=lifecycle["on_timeout"],
+                auto_resume=lifecycle["auto_resume"],
+            ),
+            started_at=started_at,
+            end_at=started_at + timedelta(seconds=timeout),
+        )
+
+    def get_info(self) -> SimpleNamespace:
+        return self.info
+
+
+def _project_resource_account(
+    tmp_path: Path,
+    *,
+    timeout: int = 60,
+    hard_limit: int | None = None,
+) -> TimedResourceBudgetAccount:
+    resource_class = TimedResourceClass(
+        role=TimedResourceRole.PROPOSER_PROJECT,
+        cpu_count=2,
+        memory_mb=2048,
+        provider_ttl_seconds=timeout,
+        create_request_timeout_seconds=project_module.E2B_CREATE_REQUEST_TIMEOUT_S,
+        cleanup_horizon_seconds=project_module.E2B_CLEANUP_HORIZON_S,
+    )
+    meter = TimedResourceCostMeter(
+        resource_type=resource_class.role.value,
+        resource_class_digest=resource_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=resource_class.max_host_observation_seconds,
+    )
+    limit = (
+        meter.maximum_charge_nano_usd() * 3
+        if hard_limit is None
+        else hard_limit
+    )
+    policy = BudgetPolicy(
+        study_id="project-resource-test",
+        manifest_digest=(
+            "sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest()
+        ),
+        hard_limit_nano_usd=limit,
+        phase_limits_nano_usd={"search": limit},
+        meters={"project": meter},
+    )
+    return TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=policy,
+        scope=BudgetScope(phase="search", category="proposer", run_id="test-run"),
+        meter_id="project",
+    )
+
+
+def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_metered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    create_calls: list[dict[str, object]] = []
+    sandboxes: list[_AttestedProjectSandbox] = []
+
+    def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        frozen = dict(kwargs)
+        create_calls.append(frozen)
+
+        def create() -> _AttestedProjectSandbox:
+            sandbox = _AttestedProjectSandbox(
+                frozen,
+                sandbox_id=f"project-{len(sandboxes) + 1}",
+            )
+            sandboxes.append(sandbox)
+            return sandbox
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        resource_budget_account=account,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        api_key="explicit-secret-key",
+    )
+
+    project._replace_sandbox()  # noqa: SLF001 - verify the owned replacement contract
+    project.close()
+
+    assert len(create_calls) == len(sandboxes) == 2
+    assert all(call["allow_internet_access"] is False for call in create_calls)
+    assert all(
+        call["lifecycle"] == {"on_timeout": "kill", "auto_resume": False}
+        for call in create_calls
+    )
+    assert all(call["request_timeout"] == 30 for call in create_calls)
+    assert all(sandbox.killed for sandbox in sandboxes)
+    metadata = [cast("dict[str, str]", call["metadata"]) for call in create_calls]
+    assert metadata[0]["wmh_runner_config"] == metadata[1]["wmh_runner_config"]
+    assert metadata[0]["wmh_runner_lease"] != metadata[1]["wmh_runner_lease"]
+    assert "explicit-secret-key" not in json.dumps(metadata)
+    reservations = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert len(reservations) == 2
+    assert all(item.status is ReservationStatus.SETTLED for item in reservations)
+
+
+def test_project_budget_denial_never_dispatches_or_reaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path, hard_limit=1)
+    creates = 0
+    reaped: list[tuple[str, str | None]] = []
+
+    def unexpected_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        nonlocal creates
+        creates += 1
+        raise AssertionError("budget denial must precede provider create")
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", unexpected_factory)
+    monkeypatch.setattr(
+        project_module,
+        "reap_e2b_runner_lease",
+        lambda lease_id, *, api_key=None: (reaped.append((lease_id, api_key)), ())[1],
+    )
+
+    with pytest.raises(BudgetExceededError, match="hard budget"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+            api_key="explicit-key",
+        )
+
+    assert creates == 0
+    assert reaped == []
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+    [lease_path] = (tmp_path / "leases").glob("*.json")
+    assert json.loads(lease_path.read_text())["state"] == "retired"
+
+
+def test_project_ambiguous_create_uses_explicit_key_and_forfeits_full_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    reaped: list[tuple[str, str | None]] = []
+
+    def ambiguous_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        def create() -> _Sandbox:
+            raise RuntimeError("ambiguous create")
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", ambiguous_factory)
+    monkeypatch.setattr(
+        project_module,
+        "reap_e2b_runner_lease",
+        lambda lease_id, *, api_key=None: (reaped.append((lease_id, api_key)), ())[1],
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous create"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+            api_key="explicit-key",
+        )
+
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+    assert reaped == [(reservation.reservation_id, "explicit-key")]
+
+
+@pytest.mark.parametrize(("network_drift", "volume_drift"), [(True, False), (False, True)])
+def test_project_creation_fails_closed_on_network_or_volume_attestation_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_drift: bool,
+    volume_drift: bool,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    created: list[_AttestedProjectSandbox] = []
+
+    def drifted_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        frozen = dict(kwargs)
+
+        def create() -> _AttestedProjectSandbox:
+            sandbox = _AttestedProjectSandbox(
+                frozen,
+                sandbox_id="drifted-project",
+                network_drift=network_drift,
+                volume_drift=volume_drift,
+            )
+            created.append(sandbox)
+            return sandbox
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", drifted_factory)
+
+    with pytest.raises(RuntimeError, match="isolation differs"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+        )
+
+    assert len(created) == 1
+    assert created[0].killed is True

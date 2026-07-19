@@ -16,7 +16,6 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime
 from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, cast
@@ -44,6 +43,7 @@ from wmh.harness.pi_runner import (
     run_pi_turn,
 )
 from wmh.harness.pi_runner_backend import (
+    E2BPiRunnerSpec,
     LocalPiRunnerSpec,
     ManagedPiRunnerFactory,
     PiRunnerBackendSpec,
@@ -64,6 +64,7 @@ from wmh.tracking.budget import (
     BudgetAccountBinding,
     ProviderCostMeter,
     resolve_budget_account,
+    resolve_timed_resource_account,
 )
 
 _TOOL_OUTPUT_CHARS = 16_000
@@ -499,6 +500,7 @@ class WmhPiAgent(BaseAgent):
         provider_config: JsonObject,
         budget_policy_digest: str | None = None,
         budget_binding: JsonObject | None = None,
+        runner_budget_binding: JsonObject | None = None,
         runner_spec: JsonObject | None = None,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = False,
@@ -541,12 +543,35 @@ class WmhPiAgent(BaseAgent):
         validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
             runner_spec if runner_spec is not None else LocalPiRunnerSpec().model_dump(mode="json")
         )
+        runner_binding = (
+            BudgetAccountBinding.model_validate(runner_budget_binding)
+            if runner_budget_binding is not None
+            else None
+        )
+        if runner_binding is not None:
+            if binding is None or runner_binding.policy_digest != budget_policy_digest:
+                raise ValueError(
+                    "runner resource budget must share the provider budget policy"
+                )
+            if not isinstance(validated_runner, E2BPiRunnerSpec):
+                raise ValueError("local Pi runners cannot consume an external resource meter")
+            runner_budget_account = resolve_timed_resource_account(runner_binding)
+        else:
+            runner_budget_account = None
+        if isinstance(validated_runner, E2BPiRunnerSpec) and binding is not None:
+            if runner_budget_account is None:
+                raise ValueError("budgeted E2B runners require a timed resource budget")
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
         if not isinstance(require_provider_receipts, bool):
             raise ValueError("require_provider_receipts must be a boolean")
         self._provider_config = config.model_copy(deep=True)
         self._budget_account = account.model_copy(deep=True) if account is not None else None
+        self._runner_budget_account = (
+            runner_budget_account.model_copy(deep=True)
+            if runner_budget_account is not None
+            else None
+        )
         self._runner_spec = validated_runner
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
@@ -578,11 +603,21 @@ class WmhPiAgent(BaseAgent):
         attestation = self._task_environment_attestation
         if attestation is None:
             raise WmhPiEnvironmentError("task environment attestation is unavailable")
-        runner_factory = build_pi_runner_factory(
-            self._runner_spec,
-            ledger_path=self.logs_dir.parent / _RUNNER_LEASE_FILE,
-            owner_id=runner_owner_id(self.logs_dir.parent.name),
-        )
+        ledger_path = self.logs_dir.parent / _RUNNER_LEASE_FILE
+        owner_id = runner_owner_id(self.logs_dir.parent.name)
+        if self._runner_budget_account is None:
+            runner_factory = build_pi_runner_factory(
+                self._runner_spec,
+                ledger_path=ledger_path,
+                owner_id=owner_id,
+            )
+        else:
+            runner_factory = build_pi_runner_factory(
+                self._runner_spec,
+                ledger_path=ledger_path,
+                owner_id=owner_id,
+                resource_budget_account=self._runner_budget_account,
+            )
 
         def identity_metadata() -> JsonObject:
             runner_attestation = runner_factory.attestation

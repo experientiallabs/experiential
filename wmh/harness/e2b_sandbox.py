@@ -43,6 +43,11 @@ E2B_TEMPLATE_ENV = "WMH_E2B_TEMPLATE"
 # Sandbox lifetime. The sandbox only hosts the harness process (tool calls are answered by the
 # environment host-side), so the bound is episode wall-time, not command time.
 DEFAULT_SANDBOX_TIMEOUT_S = 900.0
+E2B_CREATE_REQUEST_TIMEOUT_S = 30
+# Bounds the direct kill retries plus metadata list/connect/kill reconciliation. The resource
+# meter includes this horizon in addition to provider TTL so host-clock settlement stays within
+# its admitted ceiling even when cleanup uses the full bounded control-plane path.
+E2B_CLEANUP_HORIZON_S = 600
 
 # Fixed delays before each retry of sandbox creation (RetryingProvider precedent: 1s, 3s, 9s).
 _CREATE_DELAYS = (1.0, 3.0, 9.0)
@@ -51,6 +56,7 @@ _CREATE_DELAYS = (1.0, 3.0, 9.0)
 # be proved.
 _KILL_DELAYS = (0.1, 0.5)
 _KILL_REQUEST_TIMEOUT_S = 5.0
+_RECONCILE_REQUEST_TIMEOUT_S = 5.0
 _ORPHAN_LIST_LIMIT = 100
 _ORPHAN_LIST_MAX_PAGES = 10
 _ORPHAN_RECONCILE_DELAYS = (0.0, 0.1, 0.5, 1.5)
@@ -186,6 +192,7 @@ def default_sandbox_factory(
     metadata: dict[str, str] | None = None,
     allow_internet_access: bool = True,
     lifecycle: SandboxLifecyclePolicy | None = None,
+    request_timeout: int | None = None,
 ) -> SandboxFactory:
     """A factory creating real E2B sandboxes (lazy SDK import; key from arg or $E2B_API_KEY).
 
@@ -214,10 +221,15 @@ def default_sandbox_factory(
                 metadata=metadata,
                 allow_internet_access=allow_internet_access,
                 lifecycle=cast("SandboxLifecycle", dict(lifecycle)),
+                request_timeout=request_timeout,
             )
         elif metadata and allow_internet_access:
             sandbox = Sandbox.create(
-                template=chosen, timeout=int(timeout), api_key=key, metadata=metadata
+                template=chosen,
+                timeout=int(timeout),
+                api_key=key,
+                metadata=metadata,
+                request_timeout=request_timeout,
             )
         elif metadata:
             sandbox = Sandbox.create(
@@ -226,15 +238,22 @@ def default_sandbox_factory(
                 api_key=key,
                 metadata=metadata,
                 allow_internet_access=allow_internet_access,
+                request_timeout=request_timeout,
             )
         elif allow_internet_access:
-            sandbox = Sandbox.create(template=chosen, timeout=int(timeout), api_key=key)
+            sandbox = Sandbox.create(
+                template=chosen,
+                timeout=int(timeout),
+                api_key=key,
+                request_timeout=request_timeout,
+            )
         else:
             sandbox = Sandbox.create(
                 template=chosen,
                 timeout=int(timeout),
                 api_key=key,
                 allow_internet_access=allow_internet_access,
+                request_timeout=request_timeout,
             )
         # The SDK object satisfies the protocol slice structurally; cast rather than pin the
         # SDK's full (much wider) signatures into the protocol.
@@ -260,28 +279,36 @@ def reap_e2b_runner_lease(
         raise RuntimeError(f"set ${E2B_API_KEY_ENV} to reap E2B runner leases")
     query = SandboxQuery(metadata={"wmh_runner_lease": lease_id})
     retired_ids: list[str] = []
-    consecutive_empty = 0
+    observed_resource = False
     for delay in _ORPHAN_RECONCILE_DELAYS:
         if delay:
             time.sleep(delay)
-        resource_ids = _list_e2b_sandbox_ids(Sandbox, query=query, api_key=key)
+        resource_ids = _list_e2b_sandbox_ids(
+            Sandbox,
+            query=query,
+            api_key=key,
+            expected_lease_id=lease_id,
+        )
         if not resource_ids:
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
-                return tuple(dict.fromkeys(retired_ids))
             continue
-        consecutive_empty = 0
+        observed_resource = True
         for resource_id in resource_ids:
             try:
-                sandbox = Sandbox.connect(resource_id, api_key=key)
+                sandbox = Sandbox.connect(
+                    resource_id,
+                    api_key=key,
+                    request_timeout=_RECONCILE_REQUEST_TIMEOUT_S,
+                )
             except Exception as error:  # noqa: BLE001 - optional SDK error hierarchy
                 if _is_already_gone_error(error):
                     continue
                 raise
             kill_sandbox(cast("SandboxHandle", sandbox))
             retired_ids.append(resource_id)
+    if observed_resource:
+        return tuple(dict.fromkeys(retired_ids))
     raise SandboxCleanupError(
-        "E2B runner orphan cleanup could not prove resource absence",
+        "E2B runner orphan cleanup found no authoritative resource to kill",
         resource="e2b_runner_lease",
     )
 
@@ -291,12 +318,14 @@ def _list_e2b_sandbox_ids(
     *,
     query: SandboxQuery,
     api_key: str,
+    expected_lease_id: str,
 ) -> tuple[str, ...]:
     """Return one bounded, validated snapshot of sandbox IDs for an SDK query."""
     paginator = sandbox_sdk.list(
         query=query,
         limit=_ORPHAN_LIST_LIMIT,
         api_key=api_key,
+        request_timeout=_RECONCILE_REQUEST_TIMEOUT_S,
     )
     resource_ids: list[str] = []
     pages = 0
@@ -308,6 +337,15 @@ def _list_e2b_sandbox_ids(
                 resource="e2b_runner_lease",
             )
         for info in paginator.next_items(api_key=api_key):
+            metadata = getattr(info, "metadata", None)
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("wmh_runner_lease") != expected_lease_id
+            ):
+                raise SandboxCleanupError(
+                    "E2B orphan query returned a sandbox owned by a different lease",
+                    resource="e2b_runner_lease",
+                )
             resource_id = getattr(info, "sandbox_id", None)
             if not isinstance(resource_id, str) or _LEASE_ID.fullmatch(resource_id) is None:
                 raise SandboxCleanupError(

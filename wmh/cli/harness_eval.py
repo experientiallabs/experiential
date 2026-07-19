@@ -17,12 +17,13 @@ from rich.console import Console
 from wmh.config import ARTIFACT_DIR
 from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.e2b_environment import register_exact_e2b_build_record
 from wmh.evals.harbor.evaluator import HarborEvaluator, harbor_job_lease_path
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.tracking.budget import BudgetAccount
+from wmh.tracking.budget import BudgetAccount, TimedResourceBudgetAccount
 
 _console = Console()
 _OUTPUT_LEASE_SUFFIX = ".wmh-eval-output.lock"
@@ -36,6 +37,33 @@ class ConcurrentHarnessOutputError(RuntimeError):
 def register(app: typer.Typer) -> None:
     """Register ground-truth harness evaluation on the harness command group."""
     app.command("eval")(eval_harness)
+    app.command("register-e2b-build")(register_e2b_build)
+
+
+def register_e2b_build(
+    jobs_dir: str = typer.Option(..., "--jobs-dir"),
+    environment_id: str = typer.Option(..., "--environment-id"),
+    template_id: str = typer.Option(..., "--template-id"),
+    build_id: str = typer.Option(..., "--build-id"),
+    cpu_count: int = typer.Option(..., "--cpu-count", min=1),
+    memory_mb: int = typer.Option(..., "--memory-mb", min=1),
+) -> None:
+    """Register already-built exact E2B IDs; this command never calls E2B."""
+    try:
+        record = register_exact_e2b_build_record(
+            jobs_dir=Path(jobs_dir),
+            environment_id=environment_id,
+            template_id=template_id,
+            build_id=build_id,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ClickException(str(exc)) from exc
+    _console.print(
+        "registered exact E2B build "
+        f"{record.exact_template_ref} for {record.build_config_digest}"
+    )
 
 
 def eval_harness(
@@ -130,6 +158,16 @@ def eval_harness(
         "--budget-account",
         help="Frozen BudgetAccount JSON. Required unless development bypass is explicit.",
     ),
+    task_resource_budget_account_paths: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        "--task-resource-budget-account",
+        help="TimedResourceBudgetAccount JSON for an E2B task class. Repeat per class.",
+    ),
+    runner_resource_budget_account_path: str | None = typer.Option(
+        None,
+        "--runner-resource-budget-account",
+        help="TimedResourceBudgetAccount JSON for the exact E2B Pi runner class.",
+    ),
     allow_unbudgeted_development: bool = typer.Option(
         False,
         "--allow-unbudgeted-development",
@@ -158,9 +196,14 @@ def eval_harness(
         azure_api_version=azure_api_version,
         bedrock_region=bedrock_region,
     )
-    if budget_account_path is not None and allow_unbudgeted_development:
+    resource_account_paths = tuple(task_resource_budget_account_paths or ())
+    if allow_unbudgeted_development and (
+        budget_account_path is not None
+        or resource_account_paths
+        or runner_resource_budget_account_path is not None
+    ):
         raise typer.BadParameter(
-            "--budget-account and --allow-unbudgeted-development are mutually exclusive"
+            "budget accounts and --allow-unbudgeted-development are mutually exclusive"
         )
     if budget_account_path is None and not allow_unbudgeted_development:
         raise typer.BadParameter(
@@ -175,6 +218,24 @@ def eval_harness(
         runner_spec = _load_runner_spec(runner_spec_path)
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--runner-spec") from exc
+    if allow_unbudgeted_development and (
+        backend is HarborEnvironmentBackend.E2B or runner_spec.backend == "e2b"
+    ):
+        raise typer.BadParameter(
+            "--allow-unbudgeted-development is restricted to local task and runner backends"
+        )
+    task_resource_budget_accounts = tuple(
+        _load_timed_resource_budget_account(path, param_hint="--task-resource-budget-account")
+        for path in resource_account_paths
+    )
+    runner_resource_budget_account = (
+        _load_timed_resource_budget_account(
+            runner_resource_budget_account_path,
+            param_hint="--runner-resource-budget-account",
+        )
+        if runner_resource_budget_account_path is not None
+        else None
+    )
     resolved_jobs_dir = (
         Path(jobs_dir).expanduser().resolve()
         if jobs_dir is not None
@@ -195,6 +256,8 @@ def eval_harness(
             runner_spec=runner_spec,
             turn_timeout_s=turn_timeout_s,
             budget_account=budget_account,
+            task_resource_budget_accounts=task_resource_budget_accounts,
+            runner_resource_budget_account=runner_resource_budget_account,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -283,6 +346,27 @@ def _load_budget_account(path: str) -> BudgetAccount:
         return BudgetAccount.model_validate_json(account_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--budget-account") from exc
+
+
+def _load_timed_resource_budget_account(
+    path: str,
+    *,
+    param_hint: str,
+) -> TimedResourceBudgetAccount:
+    account_path = Path(path).expanduser()
+    if account_path.is_symlink():
+        raise typer.BadParameter(
+            "resource budget account file cannot be a symlink",
+            param_hint=param_hint,
+        )
+    try:
+        if not account_path.is_file():
+            raise ValueError("resource budget account path must be a regular file")
+        return TimedResourceBudgetAccount.model_validate_json(
+            account_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
 
 
 def _build_dataset_config(

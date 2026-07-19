@@ -9,9 +9,10 @@ import os
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 import pytest
+from harbor.environments.base import environment_content_hash
 from harbor.job import Job
 from harbor.metrics.uv_script import UvScript
 from harbor.models.agent.context import AgentContext
@@ -31,6 +32,10 @@ import wmh.evals.harbor.evaluator as mod
 from wmh.evals.benchmark import BenchmarkCell, BenchmarkTaskEnvironment
 from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.e2b_environment import (
+    ExactE2BEnvironment,
+    register_exact_e2b_build_record,
+)
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
     HarborTrialManifestEntry,
@@ -46,6 +51,15 @@ from wmh.harness.pi_runner_backend import (
     runner_owner_id,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    TimedResourceBudgetAccount,
+    TimedResourceCostMeter,
+    TokenPriceCeiling,
+)
 
 _TASK_ENVIRONMENT_ATTESTATION = {
     "schema_version": 1,
@@ -71,6 +85,12 @@ _TASK_ENVIRONMENT_DIGEST = (
     ).hexdigest()
 )
 _LOCAL_RUNNER = LocalPiRunnerSpec()
+
+
+class _E2BBudgetKwargs(TypedDict):
+    budget_account: BudgetAccount
+    task_resource_budget_accounts: NotRequired[tuple[TimedResourceBudgetAccount, ...]]
+    runner_resource_budget_account: NotRequired[TimedResourceBudgetAccount]
 
 
 def _runner_lease_receipt(trial_name: str) -> dict[str, object]:
@@ -143,6 +163,90 @@ def _provider() -> ProviderConfig:
     return ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
 
 
+def _e2b_budget_kwargs(
+    tmp_path: Path,
+    *,
+    task_environment: bool = False,
+    runner_spec: E2BPiRunnerSpec | None = None,
+) -> _E2BBudgetKwargs:
+    from wmh.harness.pi_runner_backend import e2b_runner_resource_class
+
+    provider = _provider()
+    meters: dict[str, ProviderCostMeter | TimedResourceCostMeter] = {
+        "worker": ProviderCostMeter(
+            provider_config=provider,
+            price=TokenPriceCeiling(
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=1,
+            ),
+        )
+    }
+    if task_environment:
+        task_class = ExactE2BEnvironment._task_resource_class(
+            cpu_count=2,
+            memory_mb=1024,
+        )
+        meters["task"] = TimedResourceCostMeter(
+            resource_type=task_class.role.value,
+            resource_class_digest=task_class.digest,
+            nano_usd_per_second=1,
+            max_billing_seconds=task_class.max_host_observation_seconds,
+        )
+    if runner_spec is not None:
+        runner_class = e2b_runner_resource_class(runner_spec)
+        meters["runner"] = TimedResourceCostMeter(
+            resource_type=runner_class.role.value,
+            resource_class_digest=runner_class.digest,
+            nano_usd_per_second=1,
+            max_billing_seconds=runner_class.max_host_observation_seconds,
+        )
+    policy = BudgetPolicy(
+        study_id="test-study",
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
+        hard_limit_nano_usd=10_000_000,
+        phase_limits_nano_usd={"test": 10_000_000},
+        meters=meters,
+    )
+    scope = BudgetScope(phase="test", category="test", run_id="test-run")
+    ledger_path = (tmp_path / "budget.sqlite3").resolve()
+    kwargs: _E2BBudgetKwargs = {
+        "budget_account": BudgetAccount(
+            ledger_path=ledger_path,
+            policy=policy,
+            scope=scope,
+            meter_id="worker",
+        )
+    }
+    if task_environment:
+        kwargs["task_resource_budget_accounts"] = (
+            TimedResourceBudgetAccount(
+                ledger_path=ledger_path,
+                policy=policy,
+                scope=scope,
+                meter_id="task",
+            ),
+        )
+    if runner_spec is not None:
+        kwargs["runner_resource_budget_account"] = TimedResourceBudgetAccount(
+            ledger_path=ledger_path,
+            policy=policy,
+            scope=scope,
+            meter_id="runner",
+        )
+    return kwargs
+
+
+def _register_e2b_task_build(tmp_path: Path, task_dir: Path) -> None:
+    register_exact_e2b_build_record(
+        jobs_dir=tmp_path / "jobs",
+        environment_id=environment_content_hash(task_dir / "environment"),
+        template_id="task-template",
+        build_id="task-build",
+        cpu_count=2,
+        memory_mb=1024,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _stub_runner_readiness_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", lambda **_kwargs: None)
@@ -201,6 +305,7 @@ def test_e2b_runner_readiness_checks_only_local_prerequisites(
         _spec(tmp_path, tmp_path / "dataset"),
         _provider(),
         runner_spec=_e2b_runner(),
+        **_e2b_budget_kwargs(tmp_path, runner_spec=_e2b_runner()),
     )
 
     asyncio.run(evaluator._ensure_runner_ready())
@@ -217,10 +322,60 @@ def test_e2b_runner_missing_host_credential_fails_before_job_creation(
         _spec(tmp_path, tmp_path / "dataset"),
         _provider(),
         runner_spec=_e2b_runner(),
+        **_e2b_budget_kwargs(tmp_path, runner_spec=_e2b_runner()),
     )
 
     with pytest.raises(RuntimeError, match=E2B_API_KEY_ENV):
         asyncio.run(evaluator._ensure_runner_ready())
+
+
+def test_e2b_task_and_runner_backends_reject_unbudgeted_programmatic_entry(
+    tmp_path: Path,
+) -> None:
+    task_spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
+        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        deep=True,
+    )
+    with pytest.raises(ValueError, match="E2B task environments require"):
+        mod.HarborEvaluator(task_spec, _provider())
+
+    with pytest.raises(ValueError, match="E2B Pi runners require"):
+        mod.HarborEvaluator(
+            _spec(tmp_path, tmp_path / "dataset"),
+            _provider(),
+            runner_spec=_e2b_runner(),
+        )
+
+
+def test_exact_e2b_build_preflight_fails_before_atomic_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    spec = _spec(tmp_path, dataset).model_copy(
+        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        deep=True,
+    )
+    creates = 0
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        nonlocal creates
+        creates += 1
+        raise AssertionError("exact build admission must precede Harbor job creation")
+
+    monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
+    evaluator = mod.HarborEvaluator(
+        spec,
+        _provider(),
+        **_e2b_budget_kwargs(tmp_path, task_environment=True),
+    )
+
+    with pytest.raises(RuntimeError, match="prebuilt exact template record"):
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
+    assert creates == 0
+    assert not (tmp_path / "jobs" / "evaluation").exists()
 
 
 def test_direct_executable_metric_is_rejected_without_constructing_harbor_job(
@@ -333,7 +488,13 @@ def test_remote_package_dataset_cannot_reach_metadata_provider_or_e2b_environmen
     )
 
     with pytest.raises(mod.UnsupportedHarborTaskError, match="local dataset paths"):
-        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+        asyncio.run(
+            mod.HarborEvaluator(
+                spec,
+                _provider(),
+                **_e2b_budget_kwargs(tmp_path, task_environment=True),
+            ).evaluate(pi_node_baseline("candidate"))
+        )
 
     assert events == []
     assert leaked_values == []
@@ -525,7 +686,13 @@ def test_e2b_missing_extra_fails_before_runner_or_harbor_job_creation(
     )
 
     with pytest.raises(RuntimeError, match=f"require the WMH e2b extra.*{missing_module}"):
-        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+        asyncio.run(
+            mod.HarborEvaluator(
+                spec,
+                _provider(),
+                **_e2b_budget_kwargs(tmp_path, task_environment=True),
+            ).evaluate(pi_node_baseline("candidate"))
+        )
 
     assert events == []
     assert not (tmp_path / "jobs" / "evaluation").exists()
@@ -559,7 +726,13 @@ def test_e2b_missing_api_key_fails_before_runner_or_harbor_job_creation(
     )
 
     with pytest.raises(RuntimeError, match="preflight failed: E2B requires E2B_API_KEY"):
-        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+        asyncio.run(
+            mod.HarborEvaluator(
+                spec,
+                _provider(),
+                **_e2b_budget_kwargs(tmp_path, task_environment=True),
+            ).evaluate(pi_node_baseline("candidate"))
+        )
 
     assert events == ["task-preflight"]
     assert not (tmp_path / "jobs" / "evaluation").exists()
@@ -790,7 +963,8 @@ def test_e2b_backend_is_bound_into_harbor_config_and_run_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dataset = tmp_path / "dataset"
-    _write_task(dataset)
+    task_dir = _write_task(dataset)
+    _register_e2b_task_build(tmp_path, task_dir)
     candidate = pi_node_baseline("candidate")
     captured: dict[str, object] = {}
     sentinel = cast("LoadedHarborJobResult", object())
@@ -808,7 +982,13 @@ def test_e2b_backend_is_bound_into_harbor_config_and_run_identity(
         update={"environment_backend": HarborEnvironmentBackend.E2B}
     )
 
-    result = asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(candidate))
+    result = asyncio.run(
+        mod.HarborEvaluator(
+            spec,
+            _provider(),
+            **_e2b_budget_kwargs(tmp_path, task_environment=True),
+        ).evaluate(candidate)
+    )
 
     assert result is sentinel
     assert captured["environment"] is EnvironmentType.E2B
@@ -961,7 +1141,7 @@ def test_evaluator_session_shares_one_concurrent_runner_probe(
 ) -> None:
     dataset = tmp_path / "dataset"
     _write_task(dataset)
-    session = mod.HarborEvaluatorSession(runner_image=mod.PI_CONTAINER_IMAGE)
+    session = mod.HarborEvaluatorSession(runner_image=_LOCAL_RUNNER.image)
     evaluators = [
         mod.HarborEvaluator(
             _spec(tmp_path, dataset, job_name=f"evaluation-{index}"),
@@ -970,10 +1150,10 @@ def test_evaluator_session_shares_one_concurrent_runner_probe(
         )
         for index in range(4)
     ]
-    readiness_images: list[str] = []
+    readiness_configs: list[tuple[str, str]] = []
 
-    def record_readiness(*, image: str) -> None:
-        readiness_images.append(image)
+    def record_readiness(*, image: str, platform: str) -> None:
+        readiness_configs.append((image, platform))
 
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", record_readiness)
 
@@ -982,7 +1162,7 @@ def test_evaluator_session_shares_one_concurrent_runner_probe(
 
     asyncio.run(exercise())
 
-    assert readiness_images == [mod.PI_CONTAINER_IMAGE]
+    assert readiness_configs == [(_LOCAL_RUNNER.image, _LOCAL_RUNNER.platform)]
 
 
 def test_agent_runtime_version_change_rejects_stale_completed_job(
@@ -2004,7 +2184,11 @@ def test_e2b_rejects_every_task_authored_compose_source_before_run(
         update={"environment_backend": HarborEnvironmentBackend.E2B},
         deep=True,
     )
-    evaluator = mod.HarborEvaluator(spec, _provider())
+    evaluator = mod.HarborEvaluator(
+        spec,
+        _provider(),
+        **_e2b_budget_kwargs(tmp_path, task_environment=True),
+    )
 
     with pytest.raises(mod.UnsupportedHarborTaskError, match="ignores Compose semantics"):
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))

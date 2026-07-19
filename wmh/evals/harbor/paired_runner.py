@@ -73,6 +73,7 @@ from wmh.evals.paired import (
 from wmh.evals.partition import ConfirmationPartition
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE, validate_pi_container_image
+from wmh.harness.pi_runner_backend import LocalPiRunnerSpec
 from wmh.providers.base import ProviderConfig
 from wmh.providers.receipt import validate_chat_provider_receipt
 from wmh.tracking.budget import (
@@ -473,6 +474,7 @@ class PairedHarborProtocol(BaseModel):
         if actual_keys != expected_keys:
             raise ValueError("paired Harbor arm-route expectations are incomplete or unordered")
         route_by_member = {route.panel_member: route for route in self.panel_routes}
+        frozen_runner = LocalPiRunnerSpec(image=self.runner_image)
         for item in self.arm_route_expectations:
             expected_hash, expected_digest = self.harness_identity(item.arm)
             if (
@@ -485,7 +487,8 @@ class PairedHarborProtocol(BaseModel):
             if (
                 identity.provider != route.provider_config.kind.value
                 or identity.model_name != route.provider_config.model
-                or identity.runner_image != self.runner_image
+                or identity.runner_config_digest != frozen_runner.config_digest
+                or identity.runner_environment_digest != frozen_runner.attestation.digest
                 or identity.agent_name != "wmh-pi"
                 or identity.agent_version != self.agent_version
                 or identity.task_environment.value != "docker"

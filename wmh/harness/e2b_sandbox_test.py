@@ -279,6 +279,7 @@ def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
             "timeout": 61,
             "api_key": "key",
             "metadata": metadata,
+            "request_timeout": None,
         }
     ]
 
@@ -293,6 +294,7 @@ def test_orphan_reaper_catches_a_sandbox_that_appears_after_an_empty_snapshot(
     class _Info:
         def __init__(self, sandbox_id: str) -> None:
             self.sandbox_id = sandbox_id
+            self.metadata = {"wmh_runner_lease": "lease-1"}
 
     class _Paginator:
         def __init__(self, ids: list[str]) -> None:
@@ -333,6 +335,46 @@ def test_orphan_reaper_catches_a_sandbox_that_appears_after_an_empty_snapshot(
     assert reap_e2b_runner_lease("lease-1", api_key="key") == ("late-sandbox",)
     assert killed == ["late-sandbox"]
     assert sleeps == [0.1, 0.5, 1.5]
+
+
+def test_orphan_reaper_rejects_server_filter_drift_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connected: list[str] = []
+
+    class _Info:
+        sandbox_id = "unrelated-sandbox"
+        metadata = {"wmh_runner_lease": "different-lease"}
+
+    class _Paginator:
+        has_next = True
+
+        def next_items(self, **_kwargs: object) -> list[_Info]:
+            self.has_next = False
+            return [_Info()]
+
+    class _SandboxSdk:
+        @staticmethod
+        def list(**_kwargs: object) -> _Paginator:
+            return _Paginator()
+
+        @staticmethod
+        def connect(sandbox_id: str, **_kwargs: object) -> FakeSandbox:
+            connected.append(sandbox_id)
+            return FakeSandbox()
+
+    class _Query:
+        def __init__(self, *, metadata: dict[str, str]) -> None:
+            self.metadata = metadata
+
+    e2b = ModuleType("e2b")
+    e2b.__dict__.update(Sandbox=_SandboxSdk, SandboxQuery=_Query)
+    monkeypatch.setitem(sys.modules, "e2b", e2b)
+
+    with pytest.raises(SandboxCleanupError, match="different lease"):
+        reap_e2b_runner_lease("lease-1", api_key="key")
+
+    assert connected == []
 
 
 def test_fake_sandbox_satisfies_the_sandbox_handle_protocol() -> None:

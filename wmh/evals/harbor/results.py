@@ -835,7 +835,7 @@ def _parse_runner_lease_receipt(
         raise ValueError("Harbor runner lease receipt does not match its trial owner")
     if expected_backend is not None and record.backend != expected_backend:
         raise ValueError("Harbor runner lease receipt names the wrong backend")
-    if required and record.state != "retired":
+    if required and (record.state != "retired" or record.resource_id is None):
         raise ValueError("Harbor runner lease receipt does not prove terminal cleanup")
     return cast("JsonObject", record.model_dump(mode="json"))
 
@@ -1129,6 +1129,7 @@ def harbor_agent_config_digest(config: AgentConfig) -> str:
     kwargs = payload.get("kwargs")
     if isinstance(kwargs, dict):
         kwargs.pop("budget_binding", None)
+        kwargs.pop("runner_budget_binding", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
 

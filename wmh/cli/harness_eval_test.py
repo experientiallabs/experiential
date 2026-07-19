@@ -27,6 +27,7 @@ from wmh.evals.benchmark import (
 )
 from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.e2b_environment import ExactE2BEnvironment, require_exact_e2b_build_record
 from wmh.evals.harbor.results import LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner import pi_node_baseline
@@ -38,6 +39,8 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    TimedResourceBudgetAccount,
+    TimedResourceCostMeter,
     TokenPriceCeiling,
     bootstrap_budget_ledger,
 )
@@ -52,6 +55,39 @@ _RUNNER_ENVIRONMENT_DIGEST = "sha256:" + "d" * 64
 
 def _save_harness(root: Path) -> HarnessDoc:
     return HarnessStore(root).save_version(pi_node_baseline("agent"), alias="champion")
+
+
+def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: Path) -> None:
+    jobs_dir = tmp_path / "jobs"
+    result = runner.invoke(
+        app,
+        [
+            "harness",
+            "register-e2b-build",
+            "--jobs-dir",
+            str(jobs_dir),
+            "--environment-id",
+            "environment-immutable",
+            "--template-id",
+            "template-immutable",
+            "--build-id",
+            "build-immutable",
+            "--cpu-count",
+            "2",
+            "--memory-mb",
+            "1024",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    record = require_exact_e2b_build_record(
+        jobs_dir=jobs_dir,
+        environment_id="environment-immutable",
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    assert record.exact_template_ref == "template-immutable:build-immutable"
+    assert "environment-immutable" not in result.output
 
 
 def _loaded_result(tmp_path: Path) -> LoadedHarborJobResult:
@@ -236,6 +272,8 @@ def _patch_evaluator(
             runner_spec: PiRunnerBackendSpec,
             turn_timeout_s: float,
             budget_account: BudgetAccount | None = None,
+            task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
+            runner_resource_budget_account: TimedResourceBudgetAccount | None = None,
         ) -> None:
             self._call: dict[str, object] = {
                 "spec": spec,
@@ -243,6 +281,8 @@ def _patch_evaluator(
                 "runner_spec": runner_spec,
                 "turn_timeout_s": turn_timeout_s,
                 "budget_account": budget_account,
+                "task_resource_budget_accounts": task_resource_budget_accounts,
+                "runner_resource_budget_account": runner_resource_budget_account,
             }
 
         async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
@@ -308,6 +348,59 @@ def _write_budget_account(path: Path, provider_config: ProviderConfig) -> Budget
     )
     path.write_text(account.model_dump_json(indent=2), encoding="utf-8")
     return account
+
+
+def _write_e2b_task_budget_accounts(
+    provider_path: Path,
+    resource_path: Path,
+    provider_config: ProviderConfig,
+) -> tuple[BudgetAccount, TimedResourceBudgetAccount]:
+    resource_class = ExactE2BEnvironment._task_resource_class(
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    policy = BudgetPolicy(
+        study_id="cli-e2b-study",
+        manifest_digest="sha256:" + "d" * 64,
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"qualification": 1_000_000},
+        meters={
+            "worker": ProviderCostMeter(
+                provider_config=provider_config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            ),
+            "task": TimedResourceCostMeter(
+                resource_type=resource_class.role.value,
+                resource_class_digest=resource_class.digest,
+                nano_usd_per_second=1,
+                max_billing_seconds=resource_class.max_host_observation_seconds,
+            ),
+        },
+    )
+    scope = BudgetScope(
+        phase="qualification",
+        category="worker",
+        run_id="cli-run",
+    )
+    ledger_path = (provider_path.parent / "spend.sqlite3").resolve()
+    provider_account = BudgetAccount(
+        ledger_path=ledger_path,
+        policy=policy,
+        scope=scope,
+        meter_id="worker",
+    )
+    resource_account = TimedResourceBudgetAccount(
+        ledger_path=ledger_path,
+        policy=policy,
+        scope=scope,
+        meter_id="task",
+    )
+    provider_path.write_text(provider_account.model_dump_json(indent=2), encoding="utf-8")
+    resource_path.write_text(resource_account.model_dump_json(indent=2), encoding="utf-8")
+    return provider_account, resource_account
 
 
 def test_paid_eval_requires_budget_or_explicit_development_bypass(tmp_path: Path) -> None:
@@ -464,6 +557,20 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
     out = tmp_path / "result.json"
     calls = _patch_evaluator(monkeypatch, _all_scored_result(tmp_path))
     dataset_ref = "sha256:" + "b" * 64
+    provider_config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-model",
+        endpoint="https://example.openai.azure.com",
+        deployment="deployment-a",
+        api_version="2026-01-01-preview",
+    )
+    provider_account_path = tmp_path / "provider-budget.json"
+    task_account_path = tmp_path / "task-budget.json"
+    provider_account, task_account = _write_e2b_task_budget_accounts(
+        provider_account_path,
+        task_account_path,
+        provider_config,
+    )
 
     result = runner.invoke(
         app,
@@ -495,7 +602,10 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
             str(root),
             "--out",
             str(out),
-            "--allow-unbudgeted-development",
+            "--budget-account",
+            str(provider_account_path),
+            "--task-resource-budget-account",
+            str(task_account_path),
             "--yes",
         ],
     )
@@ -514,6 +624,8 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
     assert provider.endpoint == "https://example.openai.azure.com"
     assert provider.deployment == "deployment-a"
     assert provider.api_version == "2026-01-01-preview"
+    assert call["budget_account"] == provider_account
+    assert call["task_resource_budget_accounts"] == (task_account,)
     assert provider.region is None
 
 

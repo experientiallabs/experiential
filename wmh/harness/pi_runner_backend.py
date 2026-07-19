@@ -20,6 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from wmh.core.types import JsonObject
 from wmh.harness.e2b_sandbox import (
+    E2B_CLEANUP_HORIZON_S,
+    E2B_CREATE_REQUEST_TIMEOUT_S,
     CommandOutput,
     SandboxHandle,
     SandboxLifecyclePolicy,
@@ -38,6 +40,14 @@ from wmh.harness.pi_local import (
     validate_pi_container_platform,
 )
 from wmh.harness.runner_link import Channel
+from wmh.tracking.budget import (
+    TimedResourceBudget,
+    TimedResourceBudgetAccount,
+    TimedResourceClass,
+    TimedResourceReservation,
+    TimedResourceRole,
+    orphaned_timed_resource_requires_reap,
+)
 
 _IDENTITY = re.compile(r"[A-Za-z0-9_.-]{1,512}\Z")
 _RESOURCE_IDENTITY = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
@@ -65,6 +75,18 @@ def _canonical_digest(value: JsonObject) -> str:
 def runner_owner_id(trial_name: str) -> str:
     """Return a bounded opaque owner identity for one Harbor trial directory."""
     return "sha256:" + hashlib.sha256(trial_name.encode()).hexdigest()
+
+
+def e2b_runner_resource_class(spec: E2BPiRunnerSpec) -> TimedResourceClass:
+    """Return the exact cost-driving class for one immutable E2B agent runner."""
+    return TimedResourceClass(
+        role=TimedResourceRole.AGENT_RUNNER,
+        cpu_count=spec.cpu_count,
+        memory_mb=spec.memory_mb,
+        provider_ttl_seconds=spec.lease_timeout_s,
+        create_request_timeout_seconds=E2B_CREATE_REQUEST_TIMEOUT_S,
+        cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
+    )
 
 
 class LocalPiRunnerSpec(BaseModel):
@@ -242,7 +264,10 @@ class RunnerLeaseRecord(BaseModel):
     owner_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     config_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     state: Literal["creating", "active", "cleanup_failed", "retired"]
-    resource_id: str | None = Field(default=None, max_length=512)
+    resource_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_.:-]{1,512}$",
+    )
     created_at: datetime
     expected_end_at: datetime | None = None
     retired_at: datetime | None = None
@@ -286,6 +311,8 @@ class RunnerLeaseLedger:
         *,
         backend: Literal["local", "e2b"],
         orphan_reaper: Callable[[str], tuple[str, ...]],
+        orphan_budget_reconciler: Callable[[str], bool] | None = None,
+        orphan_expiry_horizon_s: int | None = None,
     ) -> None:
         """Reap any nonterminal prior owner before a new create is permitted."""
         previous = self._read()
@@ -293,7 +320,14 @@ class RunnerLeaseLedger:
             return
         if previous.backend != backend:
             raise RuntimeError("runner lease ledger backend does not match this runner")
-        orphan_reaper(previous.lease_id)
+        requires_reap = True
+        if orphan_budget_reconciler is not None:
+            requires_reap = orphan_budget_reconciler(previous.lease_id)
+        if requires_reap and orphan_expiry_horizon_s is not None:
+            safe_expiry = previous.created_at + timedelta(seconds=orphan_expiry_horizon_s)
+            requires_reap = datetime.now(UTC) < safe_expiry
+        if requires_reap:
+            orphan_reaper(previous.lease_id)
         self._persist(
             previous.model_copy(update={"state": "retired", "retired_at": datetime.now(UTC)})
         )
@@ -643,6 +677,7 @@ class E2BOneShotRunnerFactory:
         *,
         ledger_path: Path,
         owner_id: str | None = None,
+        resource_budget_account: TimedResourceBudgetAccount | None = None,
         sandbox_factory: Callable[[], SandboxHandle] | None = None,
         runner_starter: _RunnerStarter = start_live_runner,
         orphan_reaper: Callable[[str], tuple[str, ...]] = reap_e2b_runner_lease,
@@ -655,6 +690,21 @@ class E2BOneShotRunnerFactory:
         if _SHA256_DIGEST.fullmatch(self._owner_id) is None:
             raise ValueError("runner owner identity must be a sha256 digest")
         lifecycle = SandboxLifecyclePolicy(on_timeout="kill", auto_resume=False)
+        self._resource_budget_account = (
+            TimedResourceBudgetAccount.model_validate(resource_budget_account.model_dump())
+            if resource_budget_account is not None
+            else None
+        )
+        self._resource_budget = (
+            TimedResourceBudget(
+                self._resource_budget_account,
+                resource_class=e2b_runner_resource_class(spec),
+                id_factory=lambda: self._lease_id,
+            )
+            if self._resource_budget_account is not None
+            else None
+        )
+        self._resource_reservation: TimedResourceReservation | None = None
         self._sandbox_factory = sandbox_factory or default_sandbox_factory(
             template=spec.exact_template_ref,
             timeout=float(spec.lease_timeout_s),
@@ -665,6 +715,7 @@ class E2BOneShotRunnerFactory:
             },
             allow_internet_access=False,
             lifecycle=lifecycle,
+            request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
         )
         self._runner_starter = runner_starter
         self._lock = threading.Lock()
@@ -718,8 +769,29 @@ class E2BOneShotRunnerFactory:
             self._opened = True
             self._opening = True
         lease_claimed = False
+        create_dispatched = False
         try:
-            self._ledger.reconcile(backend="e2b", orphan_reaper=self._orphan_reaper)
+            resource_account = self._resource_budget_account
+            budget_reconciler = (
+                None
+                if resource_account is None
+                else lambda reservation_id: orphaned_timed_resource_requires_reap(
+                    resource_account,
+                    reservation_id=reservation_id,
+                )
+            )
+            self._ledger.reconcile(
+                backend="e2b",
+                orphan_reaper=self._orphan_reaper,
+                orphan_budget_reconciler=budget_reconciler,
+                orphan_expiry_horizon_s=(
+                    None
+                    if self._resource_budget_account is None
+                    else E2B_CREATE_REQUEST_TIMEOUT_S
+                    + self._spec.lease_timeout_s
+                    + int(_PROVIDER_CLOCK_SKEW_S)
+                ),
+            )
             self._ledger.begin(
                 backend="e2b",
                 lease_id=self._lease_id,
@@ -727,12 +799,20 @@ class E2BOneShotRunnerFactory:
                 config_digest=self._spec.config_digest,
             )
             lease_claimed = True
+            if self._resource_budget is not None:
+                self._resource_reservation = self._resource_budget.reserve()
+                if self._resource_reservation.reservation_id != self._lease_id:
+                    raise RuntimeError("E2B runner budget reservation differs from its lease")
+            create_dispatched = True
             sandbox = self._sandbox_factory()
         except BaseException:
             with self._lock:
                 self._opening = False
             if lease_claimed:
-                self._retire_ambiguous_creation()
+                if create_dispatched:
+                    self._retire_ambiguous_creation()
+                else:
+                    self._retire_predispatch_failure()
             raise
         with self._lock:
             self._sandbox = sandbox
@@ -870,8 +950,29 @@ class E2BOneShotRunnerFactory:
         if self._ledger.record is None:
             self._closed.set()
             return
+        budget_error: Exception | None = None
+        try:
+            self._forfeit_resource_budget("CreateUnknown")
+        except Exception as error:  # noqa: BLE001 - cleanup still runs after ledger failure
+            budget_error = error
         try:
             self._orphan_reaper(self._lease_id)
+        except BaseException:
+            self._ledger.cleanup_failed()
+            raise
+        if budget_error is not None:
+            self._ledger.cleanup_failed()
+            raise budget_error
+        self._ledger.retire()
+        self._closed.set()
+
+    def _retire_predispatch_failure(self) -> None:
+        """Retire a lease when provider create was provably never dispatched."""
+        if self._ledger.record is None:
+            self._closed.set()
+            return
+        try:
+            self._forfeit_resource_budget("PreDispatchFailure")
             self._ledger.retire()
         except BaseException:
             self._ledger.cleanup_failed()
@@ -892,13 +993,20 @@ class E2BOneShotRunnerFactory:
         resource_id = getattr(sandbox, "sandbox_id", None) or getattr(sandbox, "id", None)
         try:
             kill_sandbox(sandbox)
-            self._orphan_reaper(self._lease_id)
+        except BaseException:
+            try:
+                self._forfeit_resource_budget("CleanupUnknown")
+            except Exception:  # noqa: BLE001 - the open reservation still consumes the cap
+                pass
+            self._ledger.cleanup_failed(resource_id if isinstance(resource_id, str) else None)
+            self._release_failed_retirement(retiring)
+            raise
+        try:
+            self._settle_resource_budget()
             self._ledger.retire()
         except BaseException:
             self._ledger.cleanup_failed(resource_id if isinstance(resource_id, str) else None)
-            with self._lock:
-                self._retiring = None
-                retiring.set()
+            self._release_failed_retirement(retiring)
             raise
         with self._lock:
             self._retired = True
@@ -907,14 +1015,42 @@ class E2BOneShotRunnerFactory:
             retiring.set()
         self._closed.set()
 
+    def _release_failed_retirement(self, retiring: threading.Event) -> None:
+        with self._lock:
+            self._retiring = None
+            retiring.set()
+
+    def _settle_resource_budget(self) -> None:
+        reservation = self._resource_reservation
+        if reservation is not None:
+            reservation.settle()
+            self._resource_reservation = None
+
+    def _forfeit_resource_budget(self, failure_type: str) -> None:
+        reservation = self._resource_reservation
+        if reservation is None:
+            return
+        try:
+            reservation.forfeit(failure_type=failure_type)
+        finally:
+            self._resource_reservation = None
+
 
 def build_pi_runner_factory(
     spec: PiRunnerBackendSpec,
     *,
     ledger_path: Path,
     owner_id: str,
+    resource_budget_account: TimedResourceBudgetAccount | None = None,
 ) -> ManagedPiRunnerFactory:
     """Construct the one managed implementation named by a strict runner spec."""
     if isinstance(spec, LocalPiRunnerSpec):
+        if resource_budget_account is not None:
+            raise ValueError("local Pi runners cannot consume an external resource meter")
         return LocalContainerRunnerFactory(spec, ledger_path=ledger_path, owner_id=owner_id)
-    return E2BOneShotRunnerFactory(spec, ledger_path=ledger_path, owner_id=owner_id)
+    return E2BOneShotRunnerFactory(
+        spec,
+        ledger_path=ledger_path,
+        owner_id=owner_id,
+        resource_budget_account=resource_budget_account,
+    )

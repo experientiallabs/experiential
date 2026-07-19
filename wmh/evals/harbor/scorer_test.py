@@ -21,26 +21,38 @@ from wmh.evals.benchmark import (
     BenchmarkError,
     BenchmarkFailureKind,
     BenchmarkRunHealth,
-    BenchmarkRunIdentity,
     BenchmarkRunResult,
-    BenchmarkTaskEnvironment,
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
     BenchmarkUsage,
 )
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.e2b_environment import ExactE2BEnvironment
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.pi_runner import pi_node_baseline
-from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
+from wmh.harness.pi_runner_backend import (
+    E2BPiRunnerSpec,
+    LocalPiRunnerSpec,
+    PiRunnerBackendSpec,
+    e2b_runner_resource_class,
+)
 from wmh.harness.scoring import ScoreRequest, ScoreRunHealth
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    TimedResourceBudgetAccount,
+    TimedResourceCostMeter,
+    TokenPriceCeiling,
+)
 
 _TASK_IDS = ("alpha", "beta")
 _TASK_KEYS = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
 _TASK_ENVIRONMENT_DIGESTS = ("sha256:" + "c" * 64, "sha256:" + "d" * 64)
 _CONFIG_DIGEST = "sha256:" + "1" * 64
-_RUN_DIGEST = "sha256:" + "2" * 64
 _RUNNER = LocalPiRunnerSpec()
 
 
@@ -148,6 +160,9 @@ def _loaded_result(
     candidate_damage_error: bool = False,
     failure_kind: BenchmarkFailureKind = BenchmarkFailureKind.ENVIRONMENT,
     runner_environment_digest: str | None = _RUNNER.attestation.digest,
+    provider_config: ProviderConfig | None = None,
+    runner_spec: PiRunnerBackendSpec = _RUNNER,
+    turn_timeout_s: float = 300.0,
 ) -> LoadedHarborJobResult:
     environment_digest_by_task = dict(zip(_TASK_IDS, task_environment_digests, strict=True))
     selected_rewards = rewards or {
@@ -243,21 +258,13 @@ def _loaded_result(
     return LoadedHarborJobResult(
         result=BenchmarkRunResult(
             job_name=spec.job_name,
-            identity=BenchmarkRunIdentity(
-                candidate_hash=candidate.execution_hash,
-                agent_name="wmh-pi",
-                agent_version=mod.WMH_PI_AGENT_VERSION,
-                provider="bedrock",
-                model_name="worker-model",
-                task_environment=(
-                    BenchmarkTaskEnvironment.E2B
-                    if spec.environment_backend is HarborEnvironmentBackend.E2B
-                    else BenchmarkTaskEnvironment.DOCKER
-                ),
-                runner_config_digest=_RUNNER.config_digest,
-                runner_environment_digest=_RUNNER.attestation.digest,
-                run_config_digest=_RUN_DIGEST,
-            ),
+            identity=mod.harbor_run_expectation(
+                candidate=candidate,
+                spec=spec,
+                provider_config=provider_config or _provider(),
+                runner_spec=runner_spec,
+                turn_timeout_s=turn_timeout_s,
+            ).identity,
             expected_cells=expected,
             trials=trials,
         ),
@@ -286,6 +293,9 @@ def _install_fake_evaluator(
         ) -> None:
             captured.append((spec, provider_config, runner_spec, turn_timeout_s))
             self._spec = spec
+            self._provider_config = provider_config
+            self._runner_spec = runner_spec
+            self._turn_timeout_s = turn_timeout_s
 
         async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
             return _loaded_result(
@@ -304,6 +314,9 @@ def _install_fake_evaluator(
                 candidate_damage_error=options.candidate_damage_error,
                 failure_kind=options.failure_kind,
                 runner_environment_digest=options.runner_environment_digest,
+                provider_config=self._provider_config,
+                runner_spec=self._runner_spec,
+                turn_timeout_s=self._turn_timeout_s,
             )
 
     monkeypatch.setattr(mod, "HarborEvaluator", FakeEvaluator)
@@ -393,6 +406,118 @@ def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Pat
         != baseline
     )
 
+def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_spec = E2BPiRunnerSpec(
+        template_id="runner-template",
+        build_id="runner-build",
+        cpu_count=2,
+        memory_mb=2048,
+        platform="linux/x86_64",
+        envd_version="0.2.1",
+        lease_timeout_s=420,
+    )
+    task_class = ExactE2BEnvironment._task_resource_class(
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    runner_class = e2b_runner_resource_class(runner_spec)
+    provider_config = _provider()
+    policy = BudgetPolicy(
+        study_id="scorer-e2b",
+        manifest_digest="sha256:" + "7" * 64,
+        hard_limit_nano_usd=100_000,
+        phase_limits_nano_usd={"search": 100_000},
+        meters={
+            "worker": ProviderCostMeter(
+                provider_config=provider_config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=1,
+                ),
+            ),
+            "task": TimedResourceCostMeter(
+                resource_type=task_class.role.value,
+                resource_class_digest=task_class.digest,
+                nano_usd_per_second=1,
+                max_billing_seconds=task_class.max_host_observation_seconds,
+            ),
+            "runner": TimedResourceCostMeter(
+                resource_type=runner_class.role.value,
+                resource_class_digest=runner_class.digest,
+                nano_usd_per_second=1,
+                max_billing_seconds=runner_class.max_host_observation_seconds,
+            ),
+        },
+    )
+    scope = BudgetScope(phase="search", category="scorer", run_id="test-run")
+    ledger_path = (tmp_path / "budget.sqlite3").resolve()
+    provider_account = BudgetAccount(
+        ledger_path=ledger_path,
+        policy=policy,
+        scope=scope,
+        meter_id="worker",
+    )
+    task_account = TimedResourceBudgetAccount(
+        ledger_path=ledger_path,
+        policy=policy,
+        scope=scope,
+        meter_id="task",
+    )
+    runner_account = TimedResourceBudgetAccount(
+        ledger_path=ledger_path,
+        policy=policy,
+        scope=scope,
+        meter_id="runner",
+    )
+    captured: dict[str, object] = {}
+
+    class CapturingEvaluator:
+        def __init__(
+            self,
+            _spec: HarborJobSpec,
+            _provider: ProviderConfig,
+            **kwargs: object,
+        ) -> None:
+            captured.update(kwargs)
+
+        async def evaluate(self, _candidate: HarnessDoc) -> LoadedHarborJobResult:
+            raise RuntimeError("captured")
+
+    monkeypatch.setattr(mod, "HarborEvaluator", CapturingEvaluator)
+    e2b_spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
+    scorer = mod.HarborHarnessScorer(
+        job_spec=e2b_spec,
+        provider_config=provider_config,
+        reference_harness=pi_node_baseline("baseline"),
+        task_ids=_TASK_IDS,
+        task_keys=_TASK_KEYS,
+        task_environment_digests=_TASK_ENVIRONMENT_DIGESTS,
+        reward_key="reward",
+        runner_spec=runner_spec,
+        budget_account=provider_account,
+        task_resource_budget_accounts=(task_account,),
+        runner_resource_budget_account=runner_account,
+    )
+
+    with scorer, pytest.raises(RuntimeError, match="captured"):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+    assert captured["budget_account"] == provider_account
+    assert captured["task_resource_budget_accounts"] == (task_account,)
+    assert captured["runner_resource_budget_account"] == runner_account
+    assert {
+        provider_account.policy.policy_digest,
+        task_account.policy.policy_digest,
+        runner_account.policy.policy_digest,
+    } == {policy.policy_digest}
+    assert {
+        provider_account.ledger_path,
+        task_account.ledger_path,
+        runner_account.ledger_path,
+    } == {ledger_path}
 
 def test_score_job_identity_binds_full_candidate_route_and_qualification(
     tmp_path: Path,

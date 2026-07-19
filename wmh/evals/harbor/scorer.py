@@ -56,6 +56,7 @@ from wmh.harness.scoring import (
 )
 from wmh.harness.tools import READ_SKILL
 from wmh.providers.base import ProviderConfig
+from wmh.tracking.budget import BudgetAccount, TimedResourceBudgetAccount
 
 MAX_HARBOR_TASK_EVIDENCE_CHARS = MAX_TASK_EVIDENCE_CHARS
 _MAX_TRACE_FILE_BYTES = 16 * 1024 * 1024
@@ -147,6 +148,9 @@ class HarborHarnessScorer:
         reward_key: str,
         runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
         turn_timeout_s: float = 300.0,
+        budget_account: BudgetAccount | None = None,
+        task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
+        runner_resource_budget_account: TimedResourceBudgetAccount | None = None,
     ) -> None:
         """Freeze task selection, provider route, backend, runner, and agent compute."""
         validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
@@ -212,6 +216,22 @@ class HarborHarnessScorer:
         self._reward_key = reward_key
         self._runner_spec = validated_runner
         self._compute_envelope = envelope
+        self._budget_account = (
+            BudgetAccount.model_validate(budget_account.model_dump())
+            if budget_account is not None
+            else None
+        )
+        self._task_resource_budget_accounts = tuple(
+            TimedResourceBudgetAccount.model_validate(account.model_dump())
+            for account in task_resource_budget_accounts
+        )
+        self._runner_resource_budget_account = (
+            TimedResourceBudgetAccount.model_validate(
+                runner_resource_budget_account.model_dump()
+            )
+            if runner_resource_budget_account is not None
+            else None
+        )
         self._runner: asyncio.Runner | None = None
         self._closed = False
 
@@ -304,12 +324,28 @@ class HarborHarnessScorer:
 
         job_name = self._job_name(candidate)
         spec = self._job_spec.model_copy(update={"job_name": job_name}, deep=True)
-        evaluator = HarborEvaluator(
-            spec,
-            self._provider_config.model_copy(deep=True),
-            runner_spec=self._runner_spec,
-            turn_timeout_s=self._compute_envelope.turn_timeout_s,
-        )
+        provider_config = self._provider_config.model_copy(deep=True)
+        if (
+            self._budget_account is None
+            and not self._task_resource_budget_accounts
+            and self._runner_resource_budget_account is None
+        ):
+            evaluator = HarborEvaluator(
+                spec,
+                provider_config,
+                runner_spec=self._runner_spec,
+                turn_timeout_s=self._compute_envelope.turn_timeout_s,
+            )
+        else:
+            evaluator = HarborEvaluator(
+                spec,
+                provider_config,
+                runner_spec=self._runner_spec,
+                turn_timeout_s=self._compute_envelope.turn_timeout_s,
+                budget_account=self._budget_account,
+                task_resource_budget_accounts=self._task_resource_budget_accounts,
+                runner_resource_budget_account=self._runner_resource_budget_account,
+            )
         try:
             loaded = self._run_evaluation(evaluator, candidate)
             return self._project(candidate, spec, loaded, request=request)
@@ -369,6 +405,12 @@ class HarborHarnessScorer:
             provider_config=self._provider_config,
             runner_spec=self._runner_spec,
             turn_timeout_s=self._compute_envelope.turn_timeout_s,
+            budget_policy_digest=(
+                self._budget_account.policy.policy_digest
+                if self._budget_account is not None
+                else None
+            ),
+            require_exact_run_config=True,
         )
         ordered = admit_harbor_matrix(
             loaded,
@@ -562,7 +604,11 @@ def validate_harbor_run_identity(
     validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
         runner_spec
         if runner_spec is not None
-        else LocalPiRunnerSpec(image=runner_image) if runner_image is not None else LocalPiRunnerSpec()
+        else (
+            LocalPiRunnerSpec(image=runner_image)
+            if runner_image is not None
+            else LocalPiRunnerSpec()
+        )
     )
     if result.job_name != spec.job_name:
         raise ValueError(

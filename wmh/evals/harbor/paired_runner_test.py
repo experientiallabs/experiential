@@ -44,6 +44,7 @@ from wmh.evals.partition import ConfirmationPartition, PartitionTask
 from wmh.harness.doc import HarnessDoc, Surface
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE
 from wmh.harness.pi_runner import pi_node_baseline
+from wmh.harness.pi_runner_backend import LocalPiRunnerSpec
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
     BudgetAccount,
@@ -325,6 +326,7 @@ def _loaded_result(
         source="test-dataset",
         task_instruction=f"Solve {task_id}.",
         task_environment_digest=_ENVIRONMENT_DIGESTS[task_id],
+        runner_environment_digest=LocalPiRunnerSpec().attestation.digest,
         status=BenchmarkTrialStatus.SCORED,
         rewards={"reward": reward},
         candidate_outcome=BenchmarkCandidateOutcome(

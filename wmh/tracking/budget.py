@@ -206,6 +206,51 @@ class TimedResourceCostMeter(BaseModel):
         return self.charge_nano_usd(billed_seconds=billed)
 
 
+class TimedResourceRole(StrEnum):
+    """Stable backend roles whose independently billed leases share one hard cap."""
+
+    TASK_ENVIRONMENT = "task_environment"
+    AGENT_RUNNER = "agent_runner"
+    PROPOSER_PROJECT = "proposer_project"
+
+
+class TimedResourceClass(BaseModel):
+    """Canonical cost-driving identity for one immutable external resource class.
+
+    The host-observation horizon deliberately includes bounded create and cleanup request time
+    around the provider-side TTL. This lets settlement use a conservative host monotonic clock
+    without treating expected control-plane latency as an apparent reservation breach.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    backend: Literal["e2b"] = "e2b"
+    role: TimedResourceRole
+    cpu_count: int = Field(ge=1, le=_SQLITE_INTEGER_MAX)
+    memory_mb: int = Field(ge=1, le=_SQLITE_INTEGER_MAX)
+    provider_ttl_seconds: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+    create_request_timeout_seconds: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+    cleanup_horizon_seconds: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+
+    @property
+    def digest(self) -> str:
+        """Bind every cost-driving field without exposing credentials or host paths."""
+        return _digest_json(self.model_dump(mode="json"))
+
+    @property
+    def max_host_observation_seconds(self) -> int:
+        """Return the longest admitted reserve-to-cleanup-proof observation."""
+        horizon = (
+            self.create_request_timeout_seconds
+            + self.provider_ttl_seconds
+            + self.cleanup_horizon_seconds
+        )
+        if horizon > _SQLITE_INTEGER_MAX:
+            raise OverflowError("timed resource observation horizon does not fit SQLite")
+        return horizon
+
+
 _CostMeter = Annotated[
     ProviderCostMeter | TimedResourceCostMeter,
     Field(discriminator="kind"),
@@ -1574,6 +1619,77 @@ def resolve_timed_resource_account(
     )
 
 
+def validate_timed_resource_class(
+    account: TimedResourceBudgetAccount,
+    resource_class: TimedResourceClass,
+) -> TimedResourceCostMeter:
+    """Require one timed meter to name the exact class and cover its host horizon."""
+    validated = TimedResourceBudgetAccount.model_validate(account.model_dump())
+    frozen_class = TimedResourceClass.model_validate(resource_class.model_dump())
+    meter = validated.policy.meters[validated.meter_id]
+    if not isinstance(meter, TimedResourceCostMeter):  # account validation is defense in depth
+        raise BudgetIntegrityError("timed resource account does not name a timed meter")
+    if meter.resource_type != frozen_class.role.value:
+        raise BudgetIntegrityError("timed resource meter role differs from the external resource")
+    if meter.resource_class_digest != frozen_class.digest:
+        raise BudgetIntegrityError("timed resource meter class differs from the external resource")
+    if meter.max_billing_seconds < frozen_class.max_host_observation_seconds:
+        raise BudgetIntegrityError(
+            "timed resource meter horizon does not cover provider TTL and request cleanup"
+        )
+    return meter
+
+
+def reconcile_orphaned_timed_resource(
+    account: TimedResourceBudgetAccount,
+    *,
+    reservation_id: str,
+) -> BudgetReservation | None:
+    """Conservatively terminalize one prior lease reservation after absence is proved.
+
+    A process can die after cleanup proof or after a full-ceiling forfeit but before its resource
+    ledger is retired. Those terminal states are safe to replay. An open reservation has lost its
+    monotonic start time, so reconciliation forfeits its full ceiling rather than inventing usage.
+    """
+    validated = TimedResourceBudgetAccount.model_validate(account.model_dump())
+    ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
+    matches = [
+        item for item in ledger.reservations() if item.reservation_id == reservation_id
+    ]
+    if not matches:
+        # Resource ownership is durably claimed before budget admission. A crash in that narrow
+        # pre-reservation window cannot have dispatched create, and provider absence was proved by
+        # the caller before reaching this join.
+        return None
+    if len(matches) != 1:
+        raise BudgetIntegrityError(
+            "resource lease does not have exactly one matching budget reservation"
+        )
+    reservation = matches[0]
+    if reservation.scope != validated.scope or reservation.meter_id != validated.meter_id:
+        raise BudgetIntegrityError("resource lease budget reservation has the wrong account")
+    if reservation.status is ReservationStatus.RESERVED:
+        return ledger.forfeit(reservation_id, failure_type="OrphanedLease")
+    return reservation
+
+
+def orphaned_timed_resource_requires_reap(
+    account: TimedResourceBudgetAccount,
+    *,
+    reservation_id: str,
+) -> bool:
+    """Join an orphan reservation and report whether provider cleanup remains unproved."""
+    reservation = reconcile_orphaned_timed_resource(
+        account,
+        reservation_id=reservation_id,
+    )
+    if reservation is None:
+        return False
+    # Settlement and breach are written only after known-resource cleanup proof. A forfeit is
+    # intentionally ambiguous and must still be reaped or reach its immutable provider TTL.
+    return reservation.status is ReservationStatus.FORFEITED
+
+
 class BudgetedProvider:
     """Reserve a conservative ceiling around every provider completion call."""
 
@@ -1616,6 +1732,16 @@ class BudgetedProvider:
     def budget_ledger_identity(self) -> str:
         """Return the durable authority shared by every paid surface in one experiment."""
         return self._ledger.ledger_identity
+
+    @property
+    def budget_policy_digest(self) -> str:
+        """Return the nonsecret policy identity shared with resource budgets."""
+        return self._account.policy.policy_digest
+
+    @property
+    def budget_ledger_path(self) -> Path:
+        """Return the host-private canonical ledger path for trusted in-process joins."""
+        return self._ledger.path
 
     def complete(
         self,
@@ -1769,6 +1895,7 @@ class TimedResourceBudget:
         self,
         account: TimedResourceBudgetAccount,
         *,
+        resource_class: TimedResourceClass | None = None,
         id_factory: Callable[[], str] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -1776,6 +1903,8 @@ class TimedResourceBudget:
         meter = validated.policy.meters[validated.meter_id]
         if not isinstance(meter, TimedResourceCostMeter):
             raise TypeError("TimedResourceBudget requires a timed resource meter")
+        if resource_class is not None:
+            validate_timed_resource_class(validated, resource_class)
         self._account = validated
         self._meter = meter
         self._ledger = open_shared_spend_ledger(

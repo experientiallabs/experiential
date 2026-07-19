@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import stat
 import tempfile
 import uuid
 from collections.abc import Sequence
@@ -28,11 +29,26 @@ from harbor.models.trial.paths import TrialPaths
 from pydantic import BaseModel, ConfigDict, Field
 
 from wmh.core.types import JsonObject
-from wmh.harness.e2b_sandbox import reap_e2b_runner_lease
+from wmh.harness.e2b_sandbox import (
+    E2B_CLEANUP_HORIZON_S,
+    E2B_CREATE_REQUEST_TIMEOUT_S,
+    reap_e2b_runner_lease,
+)
 from wmh.harness.pi_runner_backend import (
     PiRunnerAttestation,
     RunnerLeaseLedger,
     runner_owner_id,
+)
+from wmh.tracking.budget import (
+    BudgetAccountBinding,
+    TimedResourceBudget,
+    TimedResourceBudgetAccount,
+    TimedResourceClass,
+    TimedResourceReservation,
+    TimedResourceRole,
+    orphaned_timed_resource_requires_reap,
+    resolve_timed_resource_account,
+    validate_timed_resource_class,
 )
 
 if TYPE_CHECKING:
@@ -46,6 +62,7 @@ _BUILD_REGISTRY_DIR = ".wmh-e2b-builds"
 _TASK_LEASE_TIMEOUT_S = 3_600
 _PLATFORM_PROBE_TIMEOUT_S = 10
 _PROVIDER_CLOCK_SKEW_S = 30
+_ASYNC_KILL_DELAYS_S = (0.0, 0.1, 0.5)
 _COMPONENT_IDENTITY = re.compile(r"[A-Za-z0-9_.-]{1,512}\Z")
 _RESOURCE_IDENTITY = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
 
@@ -103,6 +120,7 @@ class ExactE2BEnvironment(E2BEnvironment):
         network_policy: NetworkPolicy | None = None,
         phase_network_policies: Sequence[NetworkPolicy] | None = None,
         extra_docker_compose: Sequence[Path | str] | None = None,
+        resource_budget_bindings: list[JsonObject] | None = None,
     ) -> None:
         super().__init__(
             environment_dir=environment_dir,
@@ -129,6 +147,18 @@ class ExactE2BEnvironment(E2BEnvironment):
         self._wmh_lease_id = uuid.uuid4().hex
         self._wmh_owner_id = runner_owner_id(self.trial_paths.trial_dir.name)
         self._wmh_ledger = RunnerLeaseLedger(self.trial_paths.trial_dir / TASK_E2B_LEASE_FILE)
+        bindings = tuple(
+            BudgetAccountBinding.model_validate(value)
+            for value in (resource_budget_bindings or ())
+        )
+        self._wmh_resource_budget_accounts = tuple(
+            resolve_timed_resource_account(binding) for binding in bindings
+        )
+        self._wmh_resource_budget_account: TimedResourceBudgetAccount | None = None
+        self._wmh_resource_budget: TimedResourceBudget | None = None
+        self._wmh_resource_reservation: TimedResourceReservation | None = None
+        self._wmh_create_dispatched = False
+        self._wmh_create_completed = False
 
     @property
     def wmh_environment_attestation(self) -> JsonObject | None:
@@ -139,11 +169,39 @@ class ExactE2BEnvironment(E2BEnvironment):
         """Load or build one exact template, then create and attest one exact sandbox."""
         if force_build:
             raise RuntimeError("trusted E2B task environments require immutable build reuse")
+        resource_class = self._task_resource_class(
+            cpu_count=self._effective_cpus or 2,
+            memory_mb=self._effective_memory_mb or 1024,
+        )
+        self._wmh_resource_budget_account = self._select_resource_budget_account(resource_class)
+        resource_account = self._wmh_resource_budget_account
+        budget_reconciler = (
+            None
+            if resource_account is None
+            else lambda reservation_id: orphaned_timed_resource_requires_reap(
+                resource_account,
+                reservation_id=reservation_id,
+            )
+        )
         await asyncio.to_thread(
             self._wmh_ledger.reconcile,
             backend="e2b",
             orphan_reaper=reap_e2b_runner_lease,
+            orphan_budget_reconciler=budget_reconciler,
+            orphan_expiry_horizon_s=(
+                None
+                if self._wmh_resource_budget_account is None
+                else E2B_CREATE_REQUEST_TIMEOUT_S
+                + _TASK_LEASE_TIMEOUT_S
+                + _PROVIDER_CLOCK_SKEW_S
+            ),
         )
+        if self._wmh_resource_budget_account is not None:
+            self._wmh_resource_budget = TimedResourceBudget(
+                self._wmh_resource_budget_account,
+                resource_class=resource_class,
+                id_factory=lambda: self._wmh_lease_id,
+            )
         build = await self._load_or_build_exact_template()
         self._wmh_build = build
         launch_digest = self._launch_config_digest(build)
@@ -190,19 +248,46 @@ class ExactE2BEnvironment(E2BEnvironment):
     async def _cleanup_exact_sandbox(self) -> None:
         """Kill directly, reconcile by owner metadata, and durably retire the lease."""
         sandbox = self._sandbox
+        if not self._wmh_create_dispatched:
+            try:
+                self._forfeit_resource_budget("PreDispatchFailure")
+                self._wmh_ledger.retire()
+            except Exception:  # noqa: BLE001 - next start rejoins the nonterminal reservation
+                self._wmh_ledger.cleanup_failed()
+                raise RuntimeError("E2B task resource budget could not be finalized") from None
+            finally:
+                self._sandbox = None
+            return
         cleanup_error: Exception | None = None
+        direct_cleanup_proved = False
         if sandbox is not None:
             try:
-                await sandbox.kill(request_timeout=5)
+                await _kill_async_sandbox(sandbox)
+                direct_cleanup_proved = True
             except Exception as error:  # noqa: BLE001 - absence is proved below
                 cleanup_error = error
         try:
-            await asyncio.to_thread(reap_e2b_runner_lease, self._wmh_lease_id)
-            self._wmh_ledger.retire()
+            if not direct_cleanup_proved:
+                await asyncio.to_thread(reap_e2b_runner_lease, self._wmh_lease_id)
         except Exception:  # noqa: BLE001 - provider details must not escape this boundary
+            try:
+                self._forfeit_resource_budget("CleanupUnknown")
+            except Exception:  # noqa: BLE001 - an open reservation still consumes the cap
+                pass
             resource_id = getattr(sandbox, "sandbox_id", None)
             self._wmh_ledger.cleanup_failed(resource_id if isinstance(resource_id, str) else None)
+            self._sandbox = None
             raise RuntimeError("E2B task environment cleanup was not proved") from None
+        try:
+            if self._wmh_create_completed:
+                self._settle_resource_budget()
+            else:
+                self._forfeit_resource_budget("CreateUnknown")
+            self._wmh_ledger.retire()
+        except Exception:  # noqa: BLE001 - next start rejoins the nonterminal lease reservation
+            resource_id = getattr(sandbox, "sandbox_id", None)
+            self._wmh_ledger.cleanup_failed(resource_id if isinstance(resource_id, str) else None)
+            raise RuntimeError("E2B task resource budget could not be finalized") from None
         finally:
             self._sandbox = None
         if cleanup_error is not None:
@@ -210,23 +295,27 @@ class ExactE2BEnvironment(E2BEnvironment):
                 "E2B direct task sandbox kill failed, but metadata reconciliation proved absence"
             )
 
-    async def _load_or_build_exact_template(self) -> ExactE2BBuildRecord:
-        """Serialize a content-keyed registry lookup and persist only completed BuildInfo."""
-        build_input = cast(
-            "JsonObject",
-            {
-                "schema_version": 1,
-                "environment_id": self.environment_id,
-                "cpu_count": self._effective_cpus or 2,
-                "memory_mb": self._effective_memory_mb or 1024,
-            },
+    async def _load_or_build_exact_template(
+        self,
+        *,
+        allow_build: bool = False,
+    ) -> ExactE2BBuildRecord:
+        """Load a prebuilt exact ID; explicit preparation may opt into one serialized build."""
+        build_input = _exact_build_input(
+            environment_id=self.environment_id,
+            cpu_count=self._effective_cpus or 2,
+            memory_mb=self._effective_memory_mb or 1024,
         )
         config_digest = _digest(build_input)
         registry = self.trial_paths.trial_dir.parent.parent / _BUILD_REGISTRY_DIR
+        if registry.is_symlink():
+            raise RuntimeError("E2B exact-build registry cannot be a symbolic link")
         registry.mkdir(parents=True, exist_ok=True)
+        if not registry.is_dir():
+            raise RuntimeError("E2B exact-build registry must be a directory")
         record_path = registry / f"{config_digest.removeprefix('sha256:')}.json"
         lock_path = registry / f"{config_digest.removeprefix('sha256:')}.lock"
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        lock_fd = _open_build_lock(lock_path)
         await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
         try:
             existing = _read_build_record(record_path)
@@ -234,6 +323,10 @@ class ExactE2BEnvironment(E2BEnvironment):
                 if existing.build_config_digest != config_digest:
                     raise RuntimeError("E2B exact-build registry key does not match its record")
                 return existing
+            if not allow_build:
+                raise RuntimeError(
+                    "scored E2B task environments require a prebuilt exact template record"
+                )
             info = await self._build_template_once(
                 cpu_count=cast("int", build_input["cpu_count"]),
                 memory_mb=cast("int", build_input["memory_mb"]),
@@ -292,6 +385,11 @@ class ExactE2BEnvironment(E2BEnvironment):
             "wmh_runner_owner": self._wmh_owner_id,
             "wmh_resource_kind": "task_environment",
         }
+        if self._wmh_resource_budget is not None:
+            self._wmh_resource_reservation = self._wmh_resource_budget.reserve()
+            if self._wmh_resource_reservation.reservation_id != self._wmh_lease_id:
+                raise RuntimeError("E2B task budget reservation differs from its lease")
+        self._wmh_create_dispatched = True
         sandbox = await AsyncSandbox.create(
             template=build.exact_template_ref,
             metadata=metadata,
@@ -301,8 +399,10 @@ class ExactE2BEnvironment(E2BEnvironment):
             network=self._sandbox_create_network_options(),
             lifecycle=lifecycle,
             volume_mounts=None,
+            request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
         )
         self._sandbox = sandbox
+        self._wmh_create_completed = True
         resource_id = getattr(sandbox, "sandbox_id", None)
         if not isinstance(resource_id, str) or _RESOURCE_IDENTITY.fullmatch(resource_id) is None:
             raise RuntimeError("E2B task sandbox did not expose a valid resource identity")
@@ -465,6 +565,51 @@ class ExactE2BEnvironment(E2BEnvironment):
             )
         )
 
+    @staticmethod
+    def _task_resource_class(*, cpu_count: int, memory_mb: int) -> TimedResourceClass:
+        return TimedResourceClass(
+            role=TimedResourceRole.TASK_ENVIRONMENT,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            provider_ttl_seconds=_TASK_LEASE_TIMEOUT_S,
+            create_request_timeout_seconds=E2B_CREATE_REQUEST_TIMEOUT_S,
+            cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
+        )
+
+    def _select_resource_budget_account(
+        self,
+        resource_class: TimedResourceClass,
+    ) -> TimedResourceBudgetAccount | None:
+        if not self._wmh_resource_budget_accounts:
+            return None
+        matches: list[TimedResourceBudgetAccount] = []
+        for account in self._wmh_resource_budget_accounts:
+            try:
+                validate_timed_resource_class(account, resource_class)
+            except Exception:  # noqa: BLE001 - a different frozen class is not this task's meter
+                continue
+            matches.append(account)
+        if len(matches) != 1:
+            raise RuntimeError(
+                "E2B task resource class requires exactly one matching timed budget meter"
+            )
+        return matches[0]
+
+    def _settle_resource_budget(self) -> None:
+        reservation = self._wmh_resource_reservation
+        if reservation is not None:
+            reservation.settle()
+            self._wmh_resource_reservation = None
+
+    def _forfeit_resource_budget(self, failure_type: str) -> None:
+        reservation = self._wmh_resource_reservation
+        if reservation is None:
+            return
+        try:
+            reservation.forfeit(failure_type=failure_type)
+        finally:
+            self._wmh_resource_reservation = None
+
 
 def _record_completed_build(
     info: BuildInfo,
@@ -490,6 +635,132 @@ def _record_completed_build(
         build_id=build_id,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
+    )
+
+
+def register_exact_e2b_build_record(
+    *,
+    jobs_dir: Path,
+    environment_id: str,
+    template_id: str,
+    build_id: str,
+    cpu_count: int,
+    memory_mb: int,
+) -> ExactE2BBuildRecord:
+    """Register externally prepared immutable build IDs without dispatching a paid build."""
+    build_input = _exact_build_input(
+        environment_id=environment_id,
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+    )
+    record = ExactE2BBuildRecord(
+        build_config_digest=_digest(build_input),
+        environment_id=environment_id,
+        template_id=template_id,
+        build_id=build_id,
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+    )
+    root = jobs_dir.expanduser().resolve()
+    registry = root / _BUILD_REGISTRY_DIR
+    if registry.is_symlink():
+        raise RuntimeError("E2B exact-build registry cannot be a symbolic link")
+    registry.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not registry.is_dir():
+        raise RuntimeError("E2B exact-build registry must be a directory")
+    record_path = registry / f"{record.build_config_digest.removeprefix('sha256:')}.json"
+    lock_path = registry / f"{record.build_config_digest.removeprefix('sha256:')}.lock"
+    lock_fd = _open_build_lock(lock_path)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        existing = _read_build_record(record_path)
+        if existing is not None:
+            if existing != record:
+                raise RuntimeError(
+                    "E2B exact-build registry already contains a different record"
+                )
+            return existing
+        _write_build_record(record_path, record)
+        return record
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def require_exact_e2b_build_record(
+    *,
+    jobs_dir: Path,
+    environment_id: str,
+    cpu_count: int,
+    memory_mb: int,
+) -> ExactE2BBuildRecord:
+    """Load one immutable build record before Harbor publishes a scored job directory."""
+    build_input = _exact_build_input(
+        environment_id=environment_id,
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+    )
+    config_digest = _digest(build_input)
+    registry = jobs_dir.expanduser().resolve() / _BUILD_REGISTRY_DIR
+    if registry.is_symlink():
+        raise RuntimeError("E2B exact-build registry cannot be a symbolic link")
+    record_path = registry / f"{config_digest.removeprefix('sha256:')}.json"
+    record = _read_build_record(record_path)
+    if record is None:
+        raise RuntimeError(
+            "scored E2B task environments require a prebuilt exact template record"
+        )
+    if record.build_config_digest != config_digest:
+        raise RuntimeError("E2B exact-build registry key does not match its record")
+    return record
+
+
+def _open_build_lock(path: Path) -> int:
+    """Open a private regular per-digest lock without following a hostile symlink."""
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError:
+        raise RuntimeError("E2B exact-build registry lock is unsafe") from None
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RuntimeError("E2B exact-build registry lock is not a regular file")
+    return descriptor
+
+
+async def _kill_async_sandbox(sandbox: AsyncSandbox) -> None:
+    """Retry transient async E2B kill failures under the same bounded cleanup policy."""
+    last_error: Exception | None = None
+    for delay in _ASYNC_KILL_DELAYS_S:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            await sandbox.kill(request_timeout=5)
+            return
+        except Exception as error:  # noqa: BLE001 - optional SDK errors lack a stable base class
+            message = str(error).lower()
+            if any(marker in message for marker in ("not found", "already deleted", "404")):
+                return
+            last_error = error
+    raise RuntimeError("E2B task sandbox kill failed after bounded retries") from last_error
+
+
+def _exact_build_input(
+    *,
+    environment_id: str,
+    cpu_count: int,
+    memory_mb: int,
+) -> JsonObject:
+    return cast(
+        "JsonObject",
+        {
+            "schema_version": 1,
+            "environment_id": environment_id,
+            "cpu_count": cpu_count,
+            "memory_mb": memory_mb,
+        },
     )
 
 

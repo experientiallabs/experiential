@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Protocol, override
 from uuid import UUID
 
+from harbor.environments.base import environment_content_hash
 from harbor.environments.factory import EnvironmentFactory
 from harbor.job import Job
 from harbor.metrics.uv_script import UvScript
@@ -29,6 +30,7 @@ from harbor.models.job.result import JobResult
 from harbor.models.metric.config import MetricConfig
 from harbor.models.metric.type import MetricType
 from harbor.models.registry import DatasetMetadata
+from harbor.models.task.config import TaskConfig
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import task_has_any_separate_verifier
 from harbor.models.trial.config import AgentConfig, TrialConfig
@@ -55,6 +57,10 @@ from wmh.evals.harbor.config import (
     build_harbor_job_config,
     validate_controlled_harbor_environment,
 )
+from wmh.evals.harbor.e2b_environment import (
+    ExactE2BEnvironment,
+    require_exact_e2b_build_record,
+)
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
     HarborTrialManifestEntry,
@@ -71,18 +77,25 @@ from wmh.evals.harbor.task_security import (
 )
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_API_KEY_ENV
-from wmh.harness.pi_local import PI_CONTAINER_IMAGE, verify_container_pi_runner_ready
+from wmh.harness.pi_local import verify_container_pi_runner_ready
 from wmh.harness.pi_runner_backend import (
     E2BPiRunnerSpec,
     LocalPiRunnerSpec,
     PiRunnerBackendSpec,
+    e2b_runner_resource_class,
 )
 from wmh.providers.base import ProviderConfig
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
+    BudgetIntegrityError,
     ProviderCostMeter,
+    TimedResourceBudgetAccount,
+    TimedResourceClass,
+    TimedResourceCostMeter,
     bind_budget_account,
+    bind_timed_resource_account,
+    validate_timed_resource_class,
 )
 
 _MANIFEST_FILENAME = "wmh-manifest.json"
@@ -222,9 +235,15 @@ def _build_harbor_agent_config(
     require_provider_receipts: bool,
     budget_policy_digest: str | None = None,
     budget_binding: BudgetAccountBinding | None = None,
+    runner_budget_binding: BudgetAccountBinding | None = None,
 ) -> AgentConfig:
     if budget_binding is not None and budget_binding.policy_digest != budget_policy_digest:
         raise ValueError("budget binding differs from the frozen policy digest")
+    if runner_budget_binding is not None and (
+        budget_binding is None
+        or runner_budget_binding.policy_digest != budget_policy_digest
+    ):
+        raise ValueError("runner resource budget differs from the provider budget policy")
     model_name = f"{provider_config.kind.value}/{provider_config.model}"
     kwargs = {
         "harness": candidate.model_dump(mode="json"),
@@ -237,6 +256,8 @@ def _build_harbor_agent_config(
         kwargs["budget_policy_digest"] = budget_policy_digest
     if budget_binding is not None:
         kwargs["budget_binding"] = budget_binding.model_dump(mode="json")
+    if runner_budget_binding is not None:
+        kwargs["runner_budget_binding"] = runner_budget_binding.model_dump(mode="json")
     return AgentConfig(
         import_path=WmhPiAgent.import_path(),
         model_name=model_name,
@@ -335,14 +356,18 @@ class HarborEvaluator:
         spec: HarborJobSpec,
         provider_config: ProviderConfig,
         *,
+        runner_image: str | None = None,
         runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = True,
         session: HarborEvaluatorSession | None = None,
         budget_account: BudgetAccount | None = None,
+        task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
+        runner_resource_budget_account: TimedResourceBudgetAccount | None = None,
     ) -> None:
-        validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
-            runner_spec if runner_spec is not None else LocalPiRunnerSpec().model_dump(mode="json")
+        validated_runner = _coerce_runner_spec(
+            runner_spec=runner_spec,
+            runner_image=runner_image,
         )
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
@@ -364,6 +389,10 @@ class HarborEvaluator:
         self._session = session
         self._budget_policy_digest: str | None = None
         self._budget_binding: BudgetAccountBinding | None = None
+        self._task_resource_budget_bindings: tuple[BudgetAccountBinding, ...] = ()
+        self._runner_resource_budget_binding: BudgetAccountBinding | None = None
+        self._task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = ()
+        self._runner_resource_budget_account: TimedResourceBudgetAccount | None = None
         if budget_account is not None:
             account = BudgetAccount.model_validate(budget_account.model_dump())
             meter = account.policy.meters[account.meter_id]
@@ -376,7 +405,68 @@ class HarborEvaluator:
                 )
             self._budget_binding = bind_budget_account(account)
             self._budget_policy_digest = account.policy.policy_digest
+        resource_accounts = tuple(
+            TimedResourceBudgetAccount.model_validate(account.model_dump())
+            for account in task_resource_budget_accounts
+        )
+        if runner_resource_budget_account is not None:
+            runner_account = TimedResourceBudgetAccount.model_validate(
+                runner_resource_budget_account.model_dump()
+            )
+        else:
+            runner_account = None
+        if (resource_accounts or runner_account is not None) and budget_account is None:
+            raise ValueError("resource budgets require a provider budget account")
+        all_resource_accounts = resource_accounts + (
+            (runner_account,) if runner_account is not None else ()
+        )
+        for resource_account in all_resource_accounts:
+            if resource_account.policy.policy_digest != self._budget_policy_digest:
+                raise ValueError("resource budget must share the provider budget policy")
+            self._require_same_budget_ledger(resource_account, budget_account)
+        if self._spec.environment_backend is HarborEnvironmentBackend.LOCAL:
+            if resource_accounts:
+                raise ValueError("local Harbor task environments cannot consume a resource meter")
+        elif budget_account is None:
+            raise ValueError("E2B task environments require a provider hard-budget account")
+        elif not resource_accounts:
+            raise ValueError("budgeted E2B task environments require a timed resource budget")
+        if isinstance(self._runner_spec, LocalPiRunnerSpec):
+            if runner_account is not None:
+                raise ValueError("local Pi runners cannot consume an external resource meter")
+        elif budget_account is None:
+            raise ValueError("E2B Pi runners require a provider hard-budget account")
+        elif runner_account is None:
+            raise ValueError("budgeted E2B runners require a timed resource budget")
+        else:
+            try:
+                validate_timed_resource_class(
+                    runner_account,
+                    e2b_runner_resource_class(self._runner_spec),
+                )
+            except BudgetIntegrityError as exc:
+                raise ValueError(str(exc)) from exc
+        self._task_resource_budget_accounts = resource_accounts
+        self._runner_resource_budget_account = runner_account
+        self._task_resource_budget_bindings = tuple(
+            bind_timed_resource_account(resource_account)
+            for resource_account in resource_accounts
+        )
+        if runner_account is not None:
+            self._runner_resource_budget_binding = bind_timed_resource_account(runner_account)
         self._runner_ready = False
+
+    @staticmethod
+    def _require_same_budget_ledger(
+        resource_account: TimedResourceBudgetAccount,
+        provider_account: BudgetAccount | None,
+    ) -> None:
+        if provider_account is None:
+            raise ValueError("resource budgets require a provider budget account")
+        if resource_account.ledger_path.expanduser().resolve() != (
+            provider_account.ledger_path.expanduser().resolve()
+        ):
+            raise ValueError("resource budget must share the provider SQLite ledger")
 
     async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
         """Run or safely reuse one exact Harbor job, then strictly ingest its evidence."""
@@ -397,7 +487,11 @@ class HarborEvaluator:
             candidate,
             run_config_digest=run_config_digest,
         )
-        job_config = build_harbor_job_config(self._spec, agent=agent)
+        job_config = build_harbor_job_config(
+            self._spec,
+            agent=agent,
+            task_resource_budget_bindings=self._task_resource_budget_bindings,
+        )
         job_config = _snapshot_local_datasets(job_config)
         job_dir = job_config.jobs_dir / job_config.job_name
         await _reject_executable_harbor_metrics(job_config)
@@ -408,6 +502,11 @@ class HarborEvaluator:
             expected_job_config=job_config,
         )
         await asyncio.to_thread(_preflight_task_environment, job_config)
+        await asyncio.to_thread(
+            _preflight_exact_e2b_builds,
+            job_config,
+            self._task_resource_budget_accounts,
+        )
         await self._ensure_runner_ready()
 
         try:
@@ -483,6 +582,7 @@ class HarborEvaluator:
             require_provider_receipts=self._require_provider_receipts,
             budget_policy_digest=self._budget_policy_digest,
             budget_binding=self._budget_binding,
+            runner_budget_binding=self._runner_resource_budget_binding,
         )
 
     def _run_identity(
@@ -614,6 +714,93 @@ def _preflight_task_environment(config: JobConfig) -> None:
     except SystemExit as exc:
         detail = str(exc).strip() or "task environment is unavailable"
         raise RuntimeError(f"Harbor task-environment preflight failed: {detail}") from None
+
+
+def _preflight_exact_e2b_builds(
+    config: JobConfig,
+    resource_accounts: tuple[TimedResourceBudgetAccount, ...],
+) -> None:
+    """Require every immutable task build before Harbor can publish the job directory."""
+    if config.environment.type is not EnvironmentType.E2B:
+        return
+    admitted_account_ids: set[int] = set()
+    for dataset in config.datasets:
+        if not dataset.is_local() or dataset.path is None:
+            raise UnsupportedHarborTaskError(
+                "exact E2B build preflight requires preflightable local dataset paths"
+            )
+        root = dataset.path.expanduser()
+        for task_dir in sorted(root.iterdir(), key=lambda path: path.name):
+            config_path = task_dir / "task.toml"
+            if not task_dir.is_dir() or not config_path.is_file():
+                continue
+            task_config = TaskConfig.model_validate_toml(config_path.read_text(encoding="utf-8"))
+            environment_dir = task_dir / "environment"
+            if any(
+                (environment_dir / filename).exists()
+                for filename in ("docker-compose.yaml", "docker-compose.yml")
+            ):
+                raise UnsupportedHarborTaskError(
+                    f"task {task_dir.name!r} uses task-authored Docker Compose; Harbor 0.18 "
+                    "E2B ignores Compose semantics, so this evaluator requires a "
+                    "Dockerfile/image-only task for E2B"
+                )
+            docker_image = task_config.environment.docker_image
+            if not (docker_image and docker_image.strip()) and not (
+                environment_dir / "Dockerfile"
+            ).is_file():
+                raise UnsupportedHarborTaskError(
+                    f"task {task_dir.name!r} has no [environment].docker_image or "
+                    "environment/Dockerfile; Harbor 0.18 E2B requires one immutable "
+                    "environment definition"
+                )
+            environment_id = environment_content_hash(
+                environment_dir,
+                docker_image=docker_image,
+            )
+            resource_class = ExactE2BEnvironment._task_resource_class(
+                cpu_count=task_config.environment.cpus or 2,
+                memory_mb=task_config.environment.memory_mb or 1024,
+            )
+            matching_accounts = _matching_resource_accounts(
+                resource_accounts,
+                resource_class=resource_class,
+            )
+            if len(matching_accounts) != 1:
+                raise ValueError(
+                    "each exact E2B task resource class requires one timed resource account"
+                )
+            matched_index, matched_account = matching_accounts[0]
+            try:
+                validate_timed_resource_class(matched_account, resource_class)
+            except BudgetIntegrityError as exc:
+                raise ValueError(str(exc)) from exc
+            admitted_account_ids.add(matched_index)
+            require_exact_e2b_build_record(
+                jobs_dir=config.jobs_dir,
+                environment_id=environment_id,
+                cpu_count=resource_class.cpu_count,
+                memory_mb=resource_class.memory_mb,
+            )
+    if admitted_account_ids != set(range(len(resource_accounts))):
+        raise ValueError("E2B task resource accounts must exactly cover the frozen task classes")
+
+
+def _matching_resource_accounts(
+    accounts: tuple[TimedResourceBudgetAccount, ...],
+    *,
+    resource_class: TimedResourceClass,
+) -> list[tuple[int, TimedResourceBudgetAccount]]:
+    matches: list[tuple[int, TimedResourceBudgetAccount]] = []
+    for index, account in enumerate(accounts):
+        meter = account.policy.meters[account.meter_id]
+        if (
+            isinstance(meter, TimedResourceCostMeter)
+            and meter.resource_type == resource_class.role.value
+            and meter.resource_class_digest == resource_class.digest
+        ):
+            matches.append((index, account))
+    return matches
 
 
 def _build_prepared_job_lock(job: Job) -> JobLock:

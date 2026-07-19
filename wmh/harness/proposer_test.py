@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -182,6 +183,32 @@ class _ResumeRecord:
     delta_id: str | None
 
 
+class _BudgetProject(_Project):
+    def __init__(
+        self,
+        outputs: list[str],
+        *,
+        policy_digest: str | None,
+        ledger_path: Path | None,
+    ) -> None:
+        super().__init__(outputs)
+        self.budget_policy_digest = policy_digest
+        self.budget_ledger_path = ledger_path
+
+
+class _BudgetProvider(_Provider):
+    def __init__(
+        self,
+        reply: str,
+        *,
+        policy_digest: str | None,
+        ledger_path: Path | None,
+    ) -> None:
+        super().__init__(reply)
+        self.budget_policy_digest = policy_digest
+        self.budget_ledger_path = ledger_path
+
+
 def _manifest_content(project: _Project, path: str) -> tuple[dict[str, object], list[str]]:
     manifest = json.loads(project.files[path])
     chunks = [
@@ -259,6 +286,48 @@ def _parent_surface_manifests(project: _Project, root_path: str) -> list[dict[st
         json.loads(project.files[str(item["manifest_file"]).removeprefix(f"{project.workspace}/")])
         for item in index
     ]
+
+
+@pytest.mark.parametrize(
+    ("project_policy", "provider_policy"),
+    [("sha256:" + "a" * 64, None), (None, "sha256:" + "a" * 64)],
+)
+def test_project_proposer_requires_budget_presence_parity(
+    tmp_path: Path,
+    project_policy: str | None,
+    provider_policy: str | None,
+) -> None:
+    ledger = (tmp_path / "budget.sqlite3").resolve()
+    project = _BudgetProject(
+        [],
+        policy_digest=project_policy,
+        ledger_path=ledger if project_policy is not None else None,
+    )
+    provider = _BudgetProvider(
+        "",
+        policy_digest=provider_policy,
+        ledger_path=ledger if provider_policy is not None else None,
+    )
+
+    with pytest.raises(ValueError, match="both use one hard-budget policy"):
+        ProjectDeltaProposer(project, meta_agent(), provider)
+
+
+def test_project_proposer_requires_the_same_canonical_budget_ledger(tmp_path: Path) -> None:
+    policy = "sha256:" + "b" * 64
+    project = _BudgetProject(
+        [],
+        policy_digest=policy,
+        ledger_path=(tmp_path / "project.sqlite3").resolve(),
+    )
+    provider = _BudgetProvider(
+        "",
+        policy_digest=policy,
+        ledger_path=(tmp_path / "provider.sqlite3").resolve(),
+    )
+
+    with pytest.raises(ValueError, match="share one hard-budget ledger"):
+        ProjectDeltaProposer(project, meta_agent(), provider)
 
 
 class _InterruptedProject(_Project):

@@ -26,6 +26,15 @@ from wmh.harness.pi_runner_backend import (
     RunnerLeaseRecord,
 )
 from wmh.harness.runner_link import Channel
+from wmh.tracking.budget import (
+    BudgetExceededError,
+    BudgetPolicy,
+    BudgetScope,
+    ReservationStatus,
+    SpendLedger,
+    TimedResourceBudgetAccount,
+    TimedResourceCostMeter,
+)
 
 
 class _Channel:
@@ -140,6 +149,35 @@ def _e2b_spec() -> E2BPiRunnerSpec:
         platform="linux/x86_64",
         envd_version="0.2.1",
         lease_timeout_s=420,
+    )
+
+
+def _resource_account(
+    tmp_path: Path,
+    spec: E2BPiRunnerSpec,
+    *,
+    hard_limit: int | None = None,
+) -> TimedResourceBudgetAccount:
+    resource_class = backend_mod.e2b_runner_resource_class(spec)
+    meter = TimedResourceCostMeter(
+        resource_type=resource_class.role.value,
+        resource_class_digest=resource_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=resource_class.max_host_observation_seconds,
+    )
+    limit = hard_limit or meter.maximum_charge_nano_usd() * 3
+    policy = BudgetPolicy(
+        study_id="runner-test",
+        manifest_digest="sha256:" + "9" * 64,
+        hard_limit_nano_usd=limit,
+        phase_limits_nano_usd={"search": limit},
+        meters={"runner": meter},
+    )
+    return TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=policy,
+        scope=BudgetScope(phase="search", category="runner", run_id="test-run"),
+        meter_id="runner",
     )
 
 
@@ -306,6 +344,67 @@ def test_e2b_runner_is_one_shot_fixed_lifetime_and_attested(tmp_path: Path) -> N
     assert ledger["resource_id"] == "sandbox-immutable"
 
 
+def test_e2b_runner_budget_denial_never_dispatches_or_reaps(tmp_path: Path) -> None:
+    spec = _e2b_spec()
+    account = _resource_account(tmp_path, spec, hard_limit=1)
+    creates = 0
+    reaped: list[str] = []
+
+    def unexpected_create() -> SandboxHandle:
+        nonlocal creates
+        creates += 1
+        raise AssertionError("budget denial must precede provider create")
+
+    factory = E2BOneShotRunnerFactory(
+        spec,
+        sandbox_factory=unexpected_create,
+        runner_starter=_starter(_Channel()),
+        ledger_path=tmp_path / "runner-lease.json",
+        resource_budget_account=account,
+        orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+    )
+
+    with pytest.raises(BudgetExceededError, match="hard budget"):
+        with factory():
+            pytest.fail("a denied resource must not open")
+
+    assert creates == 0
+    assert reaped == []
+    assert factory.wait_closed(0.01)
+    assert json.loads((tmp_path / "runner-lease.json").read_text())["state"] == "retired"
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+
+
+def test_e2b_runner_ambiguous_create_forfeits_full_resource_ceiling(
+    tmp_path: Path,
+) -> None:
+    spec = _e2b_spec()
+    account = _resource_account(tmp_path, spec)
+    reaped: list[str] = []
+
+    def ambiguous_create() -> SandboxHandle:
+        raise RuntimeError("ambiguous create")
+
+    factory = E2BOneShotRunnerFactory(
+        spec,
+        sandbox_factory=ambiguous_create,
+        runner_starter=_starter(_Channel()),
+        ledger_path=tmp_path / "runner-lease.json",
+        resource_budget_account=account,
+        orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous create"):
+        with factory():
+            pytest.fail("an ambiguous resource must not open")
+
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.reservation_id == factory.lease_id
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+    assert reaped == [factory.lease_id]
+
+
 def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -320,6 +419,7 @@ def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
         metadata: dict[str, str] | None,
         allow_internet_access: bool,
         lifecycle: dict[str, object] | None,
+        request_timeout: int,
     ) -> Callable[[], SandboxHandle]:
         captured.update(
             template=template,
@@ -327,6 +427,7 @@ def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
             metadata=metadata,
             allow_internet_access=allow_internet_access,
             lifecycle=lifecycle,
+            request_timeout=request_timeout,
         )
         return lambda: _sandbox(spec)
 
@@ -348,6 +449,7 @@ def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
         },
         "allow_internet_access": False,
         "lifecycle": {"on_timeout": "kill", "auto_resume": False},
+        "request_timeout": 30,
     }
 
 
