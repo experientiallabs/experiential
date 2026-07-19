@@ -74,6 +74,7 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE, validate_pi_container_image
 from wmh.providers.base import ProviderConfig
 from wmh.providers.receipt import validate_chat_provider_receipt
+from wmh.tracking.budget import BudgetAccount, BudgetPolicy, BudgetScope
 
 PAIRED_HARBOR_PROTOCOL_VERSION: Literal["2"] = "2"
 PAIRED_HARBOR_RUN_VERSION: Literal["3"] = "3"
@@ -173,6 +174,60 @@ class PairedHarborPanelRoute(BaseModel):
                 "paired scored receipts currently support Bedrock and OpenAI-shaped routes"
             )
         return self
+
+
+class PairedHarborBudgetRuntime(BaseModel):
+    """Host-private ledger location and route meters for one frozen paired protocol."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ledger_path: Path
+    policy: BudgetPolicy
+    phase: str = Field(min_length=1)
+    meter_by_panel_member: dict[str, str] = Field(min_length=1)
+    category: str = Field(default="worker", min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_runtime(self) -> Self:
+        if not self.ledger_path.is_absolute():
+            raise ValueError("paired budget ledger path must be absolute")
+        if self.phase not in self.policy.phase_limits_nano_usd:
+            raise ValueError("paired budget phase is absent from its policy")
+        if any(
+            not key.strip() or not value.strip()
+            for key, value in self.meter_by_panel_member.items()
+        ):
+            raise ValueError("paired budget route and meter names cannot be blank")
+        missing = sorted(
+            meter
+            for meter in self.meter_by_panel_member.values()
+            if meter not in self.policy.meters
+        )
+        if missing:
+            raise ValueError(f"paired budget runtime names unknown meter(s): {missing}")
+        return self
+
+    def account_for(
+        self,
+        *,
+        panel_member: str,
+        arm: PairedArm,
+        run_id: str,
+    ) -> BudgetAccount:
+        """Build the exact per-arm attribution sharing this runtime's hard ledger."""
+        meter_id = self.meter_by_panel_member[panel_member]
+        return BudgetAccount(
+            ledger_path=self.ledger_path,
+            policy=self.policy,
+            scope=BudgetScope(
+                phase=self.phase,
+                category=self.category,
+                run_id=run_id,
+                lane=panel_member,
+                arm=arm.value,
+            ),
+            meter_id=meter_id,
+        )
 
 
 class PairedHarborJobTemplate(BaseModel):
@@ -521,6 +576,7 @@ class PairedHarborProtocol(BaseModel):
                     provider_config=route.provider_config,
                     runner_image=runner_image,
                     turn_timeout_s=turn_timeout_s,
+                    budget_policy_digest=budget_policy_digest,
                 )
                 route_expectations.append(
                     PairedHarborArmRouteExpectation(
@@ -1056,6 +1112,7 @@ class PairedHarborRunner:
         job_spec: HarborJobSpec,
         operation_id: str,
         generation_id: int,
+        budget_runtime: PairedHarborBudgetRuntime,
         multi_host: bool = False,
         durable_coordinator: PairedHarborLeaseCoordinator | None = None,
     ) -> None:
@@ -1066,6 +1123,9 @@ class PairedHarborRunner:
         if generation_id < 1:
             raise ValueError("generation_id must be a positive integer")
         self._generation_id = generation_id
+        self._budget_runtime = PairedHarborBudgetRuntime.model_validate(budget_runtime.model_dump())
+        if self._budget_runtime.policy.policy_digest != self._protocol.budget_policy_digest:
+            raise ValueError("paired budget runtime differs from the frozen policy digest")
         if not isinstance(multi_host, bool):
             raise ValueError("multi_host must be a boolean")
         if multi_host and durable_coordinator is None:
@@ -1091,6 +1151,17 @@ class PairedHarborRunner:
         )
         self._routes = {route.panel_member: route for route in self._protocol.panel_routes}
         self._qualifications = {task.task_id: task for task in self._protocol.qualified_tasks}
+        if set(self._budget_runtime.meter_by_panel_member) != set(self._routes):
+            raise ValueError("paired budget runtime routes differ from the frozen panel")
+        for member, route in self._routes.items():
+            meter_id = self._budget_runtime.meter_by_panel_member[member]
+            if (
+                self._budget_runtime.policy.meters[meter_id].provider_config.model_dump()
+                != route.provider_config.model_dump()
+            ):
+                raise ValueError(
+                    f"paired budget meter for {member!r} differs from its provider route"
+                )
 
     async def run(
         self,
@@ -1286,6 +1357,11 @@ class PairedHarborRunner:
             turn_timeout_s=self._protocol.turn_timeout_s,
             require_provider_receipts=True,
             session=evaluator_session,
+            budget_account=self._budget_runtime.account_for(
+                panel_member=block.panel_member,
+                arm=arm,
+                run_id=job_name,
+            ),
         )
         loaded = await evaluator.evaluate(harness)
         validate_harbor_run_identity(
@@ -1296,6 +1372,7 @@ class PairedHarborRunner:
             runner_image=self._protocol.runner_image,
             turn_timeout_s=self._protocol.turn_timeout_s,
             require_exact_run_config=True,
+            budget_policy_digest=self._protocol.budget_policy_digest,
         )
         admitted = admit_harbor_matrix(
             loaded,

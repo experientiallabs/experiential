@@ -12,6 +12,7 @@ cap an admission rule instead of a report generated after spend has already occu
 
 from wmh.tracking.budget import (
     BudgetAccount,
+    BudgetAccountBinding,
     BudgetBreachError,
     BudgetedProvider,
     BudgetExceededError,
@@ -21,8 +22,10 @@ from wmh.tracking.budget import (
     ProviderCostMeter,
     SpendLedger,
     TokenPriceCeiling,
+    bind_budget_account,
     nano_usd_from_usd,
     open_shared_spend_ledger,
+    resolve_budget_account,
 )
 from wmh.tracking.clock import Clock, SystemClock
 from wmh.tracking.metered import MeteredProvider, classify_build_call
@@ -38,12 +41,14 @@ from wmh.tracking.tracker import (
 
 __all__ = [
     "BudgetAccount",
+    "BudgetAccountBinding",
     "BudgetBreachError",
     "BudgetExceededError",
     "BudgetIntegrityError",
     "BudgetPolicy",
     "BudgetScope",
     "BudgetedProvider",
+    "bind_budget_account",
     "Clock",
     "SystemClock",
     "MeteredProvider",
@@ -63,4 +68,5 @@ __all__ = [
     "TokenPriceCeiling",
     "nano_usd_from_usd",
     "open_shared_spend_ledger",
+    "resolve_budget_account",
 ]

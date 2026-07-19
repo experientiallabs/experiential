@@ -215,6 +215,16 @@ class BudgetAccount(BaseModel):
         return self
 
 
+class BudgetAccountBinding(BaseModel):
+    """Path-free account reference safe to retain in durable evaluator configuration."""
+
+    model_config = ConfigDict(frozen=True)
+
+    policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    scope: BudgetScope
+    meter_id: str = Field(min_length=1)
+
+
 class BudgetReservation(BaseModel):
     """Current state reconstructed from one reservation's append-only events."""
 
@@ -816,6 +826,8 @@ class SpendLedger:
 
 _SHARED_LEDGER_LOCK = threading.Lock()
 _SHARED_LEDGERS: dict[Path, SpendLedger] = {}
+_REGISTERED_BUDGET_LOCK = threading.Lock()
+_REGISTERED_BUDGETS: dict[str, tuple[Path, BudgetPolicy]] = {}
 
 
 def open_shared_spend_ledger(path: str | Path, policy: BudgetPolicy) -> SpendLedger:
@@ -836,6 +848,54 @@ def open_shared_spend_ledger(path: str | Path, policy: BudgetPolicy) -> SpendLed
         ledger = SpendLedger(requested, policy)
         _SHARED_LEDGERS[requested] = ledger
         return ledger
+
+
+def bind_budget_account(account: BudgetAccount) -> BudgetAccountBinding:
+    """Register one trusted ledger path and return its path-free durable binding.
+
+    A policy digest may map to only one ledger path in a process. Allowing two files for the same
+    frozen cap would let concurrent evaluators fork the budget and overspend it independently.
+    """
+    validated = BudgetAccount.model_validate(account.model_dump())
+    ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
+    canonical_path = ledger.path
+    policy_digest = validated.policy.policy_digest
+    with _REGISTERED_BUDGET_LOCK:
+        existing = _REGISTERED_BUDGETS.get(policy_digest)
+        if existing is not None and existing[0] != canonical_path:
+            raise BudgetIntegrityError(
+                "budget policy digest is already registered to a different ledger path"
+            )
+        _REGISTERED_BUDGETS[policy_digest] = (
+            canonical_path,
+            validated.policy.model_copy(deep=True),
+        )
+    return BudgetAccountBinding(
+        policy_digest=policy_digest,
+        scope=validated.scope,
+        meter_id=validated.meter_id,
+    )
+
+
+def resolve_budget_account(binding: BudgetAccountBinding) -> BudgetAccount:
+    """Resolve a path-free binding only inside the trusted registered evaluator process."""
+    validated = BudgetAccountBinding.model_validate(binding.model_dump())
+    with _REGISTERED_BUDGET_LOCK:
+        registered = _REGISTERED_BUDGETS.get(validated.policy_digest)
+        if registered is None:
+            raise BudgetIntegrityError("budget policy digest is not registered in this process")
+        ledger_path, policy = registered
+        resolved_policy = policy.model_copy(deep=True)
+    if validated.scope.phase not in resolved_policy.phase_limits_nano_usd:
+        raise BudgetIntegrityError("budget binding phase is absent from its registered policy")
+    if validated.meter_id not in resolved_policy.meters:
+        raise BudgetIntegrityError("budget binding meter is absent from its registered policy")
+    return BudgetAccount(
+        ledger_path=ledger_path,
+        policy=resolved_policy,
+        scope=validated.scope,
+        meter_id=validated.meter_id,
+    )
 
 
 class BudgetedProvider:

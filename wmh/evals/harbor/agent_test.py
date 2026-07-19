@@ -47,6 +47,7 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     TokenPriceCeiling,
+    bind_budget_account,
 )
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
@@ -80,7 +81,13 @@ _TASK_ENVIRONMENT_DIGEST = (
 class _ProviderWorker:
     """Disposable worker double whose lifecycle is always proved."""
 
-    def __init__(self, _config: ProviderConfig) -> None:
+    def __init__(
+        self,
+        _config: ProviderConfig,
+        *,
+        budget_account: BudgetAccount | None = None,
+    ) -> None:
+        self.budget_account = budget_account
         self.closed = threading.Event()
 
     def start(self, _deadline: mod.TurnDeadline) -> None:
@@ -242,13 +249,15 @@ def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path
         ),
         meter_id="worker",
     )
+    binding = bind_budget_account(account)
 
     agent = mod.WmhPiAgent(
         logs_dir=tmp_path / "agent",
         model_name="bedrock/model",
         harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
         provider_config=cast("JsonObject", config.model_dump(mode="json")),
-        budget_account=cast("JsonObject", account.model_dump(mode="json")),
+        budget_policy_digest=account.policy.policy_digest,
+        budget_binding=cast("JsonObject", binding.model_dump(mode="json")),
     )
 
     assert agent._budget_account == account
@@ -1434,8 +1443,13 @@ def test_outer_cancellation_unblocks_and_joins_provider_turn_thread(
     workers: list[_ProviderWorker] = []
 
     class BlockingWorker(_ProviderWorker):
-        def __init__(self, config: ProviderConfig) -> None:
-            super().__init__(config)
+        def __init__(
+            self,
+            config: ProviderConfig,
+            *,
+            budget_account: BudgetAccount | None = None,
+        ) -> None:
+            super().__init__(config, budget_account=budget_account)
             workers.append(self)
 
         def complete_chat(

@@ -30,6 +30,7 @@ from wmh.providers.base import (
 )
 from wmh.tracking.budget import (
     BudgetAccount,
+    BudgetAccountBinding,
     BudgetBreachError,
     BudgetedProvider,
     BudgetExceededError,
@@ -40,7 +41,9 @@ from wmh.tracking.budget import (
     ReservationStatus,
     SpendLedger,
     TokenPriceCeiling,
+    bind_budget_account,
     nano_usd_from_usd,
+    resolve_budget_account,
 )
 
 
@@ -141,6 +144,35 @@ def test_currency_helpers_round_up_to_exact_nano_usd_ceiling() -> None:
             nano_usd_from_usd(value)
     with pytest.raises(OverflowError, match="SQLite integer"):
         nano_usd_from_usd("9223372037")
+
+
+def test_budget_binding_is_path_independent_and_resolves_only_registered_policy(
+    tmp_path: Path,
+) -> None:
+    policy = _policy()
+    account = BudgetAccount(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=policy,
+        scope=_scope(),
+        meter_id="worker",
+    )
+
+    binding = bind_budget_account(account)
+
+    assert binding == BudgetAccountBinding(
+        policy_digest=policy.policy_digest,
+        scope=_scope(),
+        meter_id="worker",
+    )
+    assert "ledger" not in binding.model_dump_json()
+    assert resolve_budget_account(binding) == account
+
+    fork = account.model_copy(
+        update={"ledger_path": (tmp_path / "fork.sqlite3").resolve()},
+        deep=True,
+    )
+    with pytest.raises(BudgetIntegrityError, match="different ledger path"):
+        bind_budget_account(fork)
 
 
 def test_spend_ledger_reserves_settles_and_forfeits_without_releasing_history(

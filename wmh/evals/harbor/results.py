@@ -867,6 +867,9 @@ def harbor_agent_config_digest(config: AgentConfig) -> str:
         mode="json",
         include={"import_path", "model_name", "n_concurrent", "kwargs"},
     )
+    kwargs = payload.get("kwargs")
+    if isinstance(kwargs, dict):
+        kwargs.pop("budget_binding", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
 

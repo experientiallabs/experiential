@@ -551,6 +551,7 @@ def validate_harbor_run_identity(
     runner_image: str,
     turn_timeout_s: float,
     require_exact_run_config: bool = False,
+    budget_policy_digest: str | None = None,
 ) -> None:
     """Require loaded evidence to match its frozen harness and execution route."""
     if result.job_name != spec.job_name:
@@ -584,6 +585,7 @@ def validate_harbor_run_identity(
             provider_config=provider_config,
             runner_image=runner_image,
             turn_timeout_s=turn_timeout_s,
+            budget_policy_digest=budget_policy_digest,
         )
         if identity != expectation.identity:
             mismatches.append("exact run config")

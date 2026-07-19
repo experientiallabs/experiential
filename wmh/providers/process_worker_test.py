@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatRequest
+from llm_waterfall import ChatRequest, ChatResponse
 
 import wmh.providers.process_worker as mod
 from wmh.harness.pi_runner import TurnDeadline
@@ -21,6 +21,15 @@ from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.failure_attribution import (
     ProviderFailureOwner,
     ProviderFailureReason,
+)
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    ReservationStatus,
+    SpendLedger,
+    TokenPriceCeiling,
 )
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="provider worker uses inherited sockets")
@@ -136,6 +145,72 @@ def test_production_worker_starts_without_making_a_provider_request() -> None:
     worker.close()
     assert worker.wait_closed(0)
     _assert_reaped(process)
+
+
+def test_worker_child_wraps_provider_with_registered_crash_safe_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProvider:
+        config = _CONFIG
+        paid_request_attempts = 1
+
+        def complete_chat(self, _request: ChatRequest) -> ChatResponse:
+            return ChatResponse.model_validate(_COMPLETION)
+
+    policy = BudgetPolicy(
+        study_id="worker-budget-test",
+        manifest_digest="sha256:" + "b" * 64,
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"confirmation": 1_000_000},
+        meters={
+            "worker": ProviderCostMeter(
+                provider_config=_CONFIG,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            )
+        },
+    )
+    account = BudgetAccount(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=policy,
+        scope=BudgetScope(
+            phase="confirmation",
+            category="worker",
+            run_id="arm-1",
+            lane="haiku",
+            arm="baseline",
+        ),
+        meter_id="worker",
+    )
+    monkeypatch.setattr(mod, "get_provider", lambda _config: FakeProvider())
+    server, client = socket.socketpair()
+    server_fd = server.detach()
+    exit_codes: list[int] = []
+    worker_thread = threading.Thread(target=lambda: exit_codes.append(mod._serve_worker(server_fd)))
+    worker_thread.start()
+    try:
+        mod._send_frame(
+            client,
+            mod._InitializeFrame(provider_config=_CONFIG, budget_account=account),
+        )
+        assert mod._receive_frame(client) == {"kind": "ready"}
+        mod._send_frame(client, mod._CompletionRequestFrame(request=_REQUEST))
+        response = mod._CompletionFrame.model_validate(mod._receive_frame(client)).response
+        assert response.choices[0].message.content == "done"
+    finally:
+        client.close()
+        worker_thread.join(timeout=5)
+
+    assert worker_thread.is_alive() is False
+    assert exit_codes == [0]
+    reservations = SpendLedger(account.ledger_path, policy).reservations()
+    assert len(reservations) == 1
+    assert reservations[0].status is ReservationStatus.SETTLED
+    assert reservations[0].input_tokens == 3
+    assert reservations[0].output_tokens == 2
 
 
 def test_socketpair_start_failure_is_sanitized_and_closed(

@@ -75,7 +75,11 @@ from wmh.harness.pi_local import (
     verify_container_pi_runner_ready,
 )
 from wmh.providers.base import ProviderConfig
-from wmh.tracking.budget import BudgetAccount, open_shared_spend_ledger
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetAccountBinding,
+    bind_budget_account,
+)
 
 _MANIFEST_FILENAME = "wmh-manifest.json"
 _MAX_TASK_HOST_TEXT_BYTES = 1024 * 1024
@@ -127,6 +131,7 @@ def harbor_run_expectation(
     runner_image: str,
     turn_timeout_s: float,
     require_provider_receipts: bool = True,
+    budget_policy_digest: str | None = None,
 ) -> HarborRunExpectation:
     """Build the path-independent identity expected from one exact Harbor run."""
     validate_pi_container_image(runner_image)
@@ -141,6 +146,7 @@ def harbor_run_expectation(
         turn_timeout_s=turn_timeout_s,
         agent_n_concurrent=frozen_spec.agent_n_concurrent,
         require_provider_receipts=require_provider_receipts,
+        budget_policy_digest=budget_policy_digest,
     )
     run_config_digest = harbor_run_config_digest(
         frozen_spec,
@@ -175,8 +181,11 @@ def _build_harbor_agent_config(
     turn_timeout_s: float,
     agent_n_concurrent: int | None,
     require_provider_receipts: bool,
-    budget_account: BudgetAccount | None = None,
+    budget_policy_digest: str | None = None,
+    budget_binding: BudgetAccountBinding | None = None,
 ) -> AgentConfig:
+    if budget_binding is not None and budget_binding.policy_digest != budget_policy_digest:
+        raise ValueError("budget binding differs from the frozen policy digest")
     model_name = f"{provider_config.kind.value}/{provider_config.model}"
     kwargs = {
         "harness": candidate.model_dump(mode="json"),
@@ -185,8 +194,10 @@ def _build_harbor_agent_config(
         "turn_timeout_s": turn_timeout_s,
         "require_provider_receipts": require_provider_receipts,
     }
-    if budget_account is not None:
-        kwargs["budget_account"] = budget_account.model_dump(mode="json")
+    if budget_policy_digest is not None:
+        kwargs["budget_policy_digest"] = budget_policy_digest
+    if budget_binding is not None:
+        kwargs["budget_binding"] = budget_binding.model_dump(mode="json")
     return AgentConfig(
         import_path=WmhPiAgent.import_path(),
         model_name=model_name,
@@ -302,7 +313,8 @@ class HarborEvaluator:
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
         self._session = session
-        self._budget_account: BudgetAccount | None = None
+        self._budget_policy_digest: str | None = None
+        self._budget_binding: BudgetAccountBinding | None = None
         if budget_account is not None:
             account = BudgetAccount.model_validate(budget_account.model_dump())
             meter = account.policy.meters[account.meter_id]
@@ -310,10 +322,8 @@ class HarborEvaluator:
                 raise ValueError(
                     "budget account provider config must match the Harbor evaluator provider"
                 )
-            # Fully audit once in trusted orchestration. Trial agents in this process reuse the
-            # same connectionless handle; independently started processes still full-audit first.
-            open_shared_spend_ledger(account.ledger_path, account.policy)
-            self._budget_account = account
+            self._budget_binding = bind_budget_account(account)
+            self._budget_policy_digest = account.policy.policy_digest
         self._runner_ready = False
 
     async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
@@ -422,7 +432,8 @@ class HarborEvaluator:
             turn_timeout_s=self._turn_timeout_s,
             agent_n_concurrent=self._spec.agent_n_concurrent,
             require_provider_receipts=self._require_provider_receipts,
-            budget_account=self._budget_account,
+            budget_policy_digest=self._budget_policy_digest,
+            budget_binding=self._budget_binding,
         )
 
     def _run_identity(

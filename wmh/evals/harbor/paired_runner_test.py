@@ -38,6 +38,12 @@ from wmh.harness.doc import HarnessDoc, Surface
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE
 from wmh.harness.pi_runner import pi_node_baseline
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetPolicy,
+    ProviderCostMeter,
+    TokenPriceCeiling,
+)
 
 _TASK_IDS = ("task-a", "task-b")
 _TASK_KEYS = {
@@ -203,6 +209,35 @@ def _qualifications() -> tuple[mod.QualifiedHarborTask, ...]:
     )
 
 
+def _budget_runtime(
+    tmp_path: Path,
+    routes: tuple[mod.PairedHarborPanelRoute, ...],
+) -> mod.PairedHarborBudgetRuntime:
+    meter_by_member = {route.panel_member: f"worker-{route.panel_member}" for route in routes}
+    policy = BudgetPolicy(
+        study_id="paired-test",
+        manifest_digest="sha256:" + "a" * 64,
+        hard_limit_nano_usd=1_000_000_000,
+        phase_limits_nano_usd={"confirmation": 1_000_000_000},
+        meters={
+            meter_by_member[route.panel_member]: ProviderCostMeter(
+                provider_config=route.provider_config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            )
+            for route in routes
+        },
+    )
+    return mod.PairedHarborBudgetRuntime(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=policy,
+        phase="confirmation",
+        meter_by_panel_member=meter_by_member,
+    )
+
+
 def _runner(
     tmp_path: Path,
     candidate: HarnessDoc,
@@ -215,32 +250,36 @@ def _runner(
     **updates: object,
 ) -> mod.PairedHarborRunner:
     baseline = baseline or pi_node_baseline("baseline")
+    routes = (
+        mod.PairedHarborPanelRoute(
+            panel_member="worker",
+            provider_config=_provider(),
+            max_concurrent_blocks=2,
+        ),
+    )
     protocol_values: dict[str, object] = {
         "design": _design(),
         "confirmation": _confirmation(candidate),
         "baseline": baseline,
         "candidate": candidate,
         "job_spec": _spec(tmp_path),
-        "panel_routes": (
-            mod.PairedHarborPanelRoute(
-                panel_member="worker",
-                provider_config=_provider(),
-                max_concurrent_blocks=2,
-            ),
-        ),
+        "panel_routes": routes,
         "qualified_tasks": _qualifications(),
         "reward_key": "reward",
         "max_concurrent_blocks": 4,
         "retry_policy_digest": _RETRY_POLICY_DIGEST,
-        "budget_policy_digest": _BUDGET_POLICY_DIGEST,
     }
     protocol_values.update(updates)
+    frozen_routes = cast("tuple[mod.PairedHarborPanelRoute, ...]", protocol_values["panel_routes"])
+    budget_runtime = _budget_runtime(tmp_path, frozen_routes)
+    protocol_values.setdefault("budget_policy_digest", budget_runtime.policy.policy_digest)
     protocol = mod.PairedHarborProtocol.freeze(**cast("Any", protocol_values))
     return mod.PairedHarborRunner(
         protocol=protocol,
         job_spec=protocol_values["job_spec"],  # type: ignore[arg-type]
         operation_id=operation_id,
         generation_id=generation_id,
+        budget_runtime=budget_runtime,
         multi_host=multi_host,
         durable_coordinator=durable_coordinator,
     )
@@ -252,6 +291,7 @@ def _loaded_result(
     harness: HarnessDoc,
     *,
     reward: float,
+    budget_policy_digest: str,
 ) -> LoadedHarborJobResult:
     task_names = spec.datasets[0].task_names
     assert task_names is not None
@@ -316,6 +356,7 @@ def _loaded_result(
         provider_config=provider,
         runner_image=PI_CONTAINER_IMAGE,
         turn_timeout_s=300.0,
+        budget_policy_digest=budget_policy_digest,
     ).identity
     return LoadedHarborJobResult(
         result=BenchmarkRunResult(
@@ -359,6 +400,7 @@ def _install_fake_evaluator(
             turn_timeout_s: float,
             require_provider_receipts: bool,
             session: object,
+            budget_account: BudgetAccount,
         ) -> None:
             assert runner_image == PI_CONTAINER_IMAGE
             assert turn_timeout_s == 300.0
@@ -366,6 +408,7 @@ def _install_fake_evaluator(
             assert isinstance(session, mod.HarborEvaluatorSession)
             self._spec = spec
             self._provider = provider_config
+            self._budget_policy_digest = budget_account.policy.policy_digest
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
             task_names = self._spec.datasets[0].task_names
@@ -384,6 +427,7 @@ def _install_fake_evaluator(
                     self._provider,
                     harness,
                     reward=reward,
+                    budget_policy_digest=self._budget_policy_digest,
                 )
             finally:
                 active[task_id] -= 1
@@ -576,6 +620,9 @@ def test_fatal_block_failure_cancels_other_reserved_blocks(
         ) -> None:
             self._spec = spec
             self._provider = provider_config
+            self._budget_policy_digest = cast(
+                "BudgetAccount", _kwargs["budget_account"]
+            ).policy.policy_digest
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
             calls.append(self._spec.job_name)
@@ -590,7 +637,13 @@ def test_fatal_block_failure_cancels_other_reserved_blocks(
             except asyncio.CancelledError:
                 cancelled.append(self._spec.job_name)
                 raise
-            return _loaded_result(self._spec, self._provider, harness, reward=0.0)
+            return _loaded_result(
+                self._spec,
+                self._provider,
+                harness,
+                reward=0.0,
+                budget_policy_digest=self._budget_policy_digest,
+            )
 
     monkeypatch.setattr(mod, "HarborEvaluator", CancellingEvaluator)
     with pytest.raises(mod.PairedHarborMatrixError):
@@ -915,13 +968,22 @@ def test_failed_pair_with_both_arm_directories_requires_new_generation(
         ) -> None:
             self._spec = spec
             self._provider = provider_config
+            self._budget_policy_digest = cast(
+                "BudgetAccount", _kwargs["budget_account"]
+            ).policy.policy_digest
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
             failed_calls.append(self._spec.job_name)
             if len(failed_calls) == 2:
                 (self._spec.jobs_dir / self._spec.job_name).mkdir(parents=True)
                 raise RuntimeError("synthetic incomplete second arm")
-            return _loaded_result(self._spec, self._provider, harness, reward=0.0)
+            return _loaded_result(
+                self._spec,
+                self._provider,
+                harness,
+                reward=0.0,
+                budget_policy_digest=self._budget_policy_digest,
+            )
 
     monkeypatch.setattr(mod, "HarborEvaluator", IncompleteSecondArmEvaluator)
     first_generation = _runner(
@@ -999,9 +1061,18 @@ def test_realistic_trace_without_provider_authored_receipt_fails_closed(
         ) -> None:
             self._spec = spec
             self._provider = provider_config
+            self._budget_policy_digest = cast(
+                "BudgetAccount", _kwargs["budget_account"]
+            ).policy.policy_digest
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
-            loaded = _loaded_result(self._spec, self._provider, harness, reward=1.0)
+            loaded = _loaded_result(
+                self._spec,
+                self._provider,
+                harness,
+                reward=1.0,
+                budget_policy_digest=self._budget_policy_digest,
+            )
             trace = loaded.job_dir / loaded.locators[0].trial_dir / "wmh-events.jsonl"
             trace.write_text(
                 '{"kind":"assistant_message","payload":{"text":"done"}}\n',
@@ -1236,6 +1307,9 @@ def test_same_host_operations_share_global_route_and_task_capacity(
         ) -> None:
             self._spec = spec
             self._provider = provider_config
+            self._budget_policy_digest = cast(
+                "BudgetAccount", _kwargs["budget_account"]
+            ).policy.policy_digest
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
             nonlocal active, maximum
@@ -1249,6 +1323,7 @@ def test_same_host_operations_share_global_route_and_task_capacity(
                     self._provider,
                     harness,
                     reward=reward,
+                    budget_policy_digest=self._budget_policy_digest,
                 )
             finally:
                 active -= 1
@@ -1407,6 +1482,7 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
             max_concurrent_blocks=1,
         ),
     )
+    budget_runtime = _budget_runtime(tmp_path, routes)
     protocol = mod.PairedHarborProtocol.freeze(
         design=design,
         confirmation=_confirmation(candidate),
@@ -1418,7 +1494,7 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
         reward_key="reward",
         max_concurrent_blocks=2,
         retry_policy_digest=_RETRY_POLICY_DIGEST,
-        budget_policy_digest=_BUDGET_POLICY_DIGEST,
+        budget_policy_digest=budget_runtime.policy.policy_digest,
     )
 
     active_global = 0
@@ -1438,6 +1514,9 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
         ) -> None:
             self._spec = spec
             self._provider = provider_config
+            self._budget_policy_digest = cast(
+                "BudgetAccount", _kwargs["budget_account"]
+            ).policy.policy_digest
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
             nonlocal active_global, maximum_global
@@ -1460,6 +1539,7 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
                     self._provider,
                     harness,
                     reward=reward,
+                    budget_policy_digest=self._budget_policy_digest,
                 )
             finally:
                 active_global -= 1
@@ -1473,6 +1553,7 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
             job_spec=_spec(tmp_path),
             operation_id="fair-operation",
             generation_id=1,
+            budget_runtime=budget_runtime,
         ).run(baseline=baseline, candidate=candidate)
     )
 

@@ -600,7 +600,7 @@ def test_evaluator_builds_and_hashes_the_final_agent_concurrency(tmp_path: Path)
     assert harbor_agent_config_digest(job_config.agents[0]) == harbor_agent_config_digest(agent)
 
 
-def test_evaluator_binds_serialized_budget_account_into_agent_identity(tmp_path: Path) -> None:
+def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: Path) -> None:
     from wmh.tracking.budget import (
         BudgetAccount,
         BudgetPolicy,
@@ -642,8 +642,14 @@ def test_evaluator_binds_serialized_budget_account_into_agent_identity(tmp_path:
 
     agent = evaluator._build_agent(pi_node_baseline("candidate"))
 
-    serialized_account = agent.kwargs["budget_account"]
-    assert serialized_account == account.model_dump(mode="json")
+    serialized_binding = agent.kwargs["budget_binding"]
+    assert serialized_binding == {
+        "policy_digest": account.policy.policy_digest,
+        "scope": account.scope.model_dump(mode="json"),
+        "meter_id": account.meter_id,
+    }
+    assert "ledger" not in json.dumps(serialized_binding)
+    assert agent.kwargs["budget_policy_digest"] == account.policy.policy_digest
     without_budget = mod.HarborEvaluator(
         _spec(tmp_path, tmp_path / "dataset"),
         _provider(),

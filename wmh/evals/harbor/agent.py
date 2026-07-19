@@ -59,7 +59,7 @@ from wmh.providers.process_worker import (
     ProviderWorkerUnavailable,
 )
 from wmh.providers.receipt import validate_chat_provider_receipt
-from wmh.tracking.budget import BudgetAccount
+from wmh.tracking.budget import BudgetAccountBinding, resolve_budget_account
 
 _TOOL_OUTPUT_CHARS = 16_000
 _TOOL_STREAM_CHARS = _TOOL_OUTPUT_CHARS // 2
@@ -76,7 +76,7 @@ _MIN_TASK_FREE_DISK_KIB = 128 * 1024
 _TRACE_FILE = "wmh-events.jsonl"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.5.0"
+WMH_PI_AGENT_VERSION: Final = "0.6.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -563,7 +563,8 @@ class WmhPiAgent(BaseAgent):
         extra_env: dict[str, str] | None = None,
         harness: JsonObject,
         provider_config: JsonObject,
-        budget_account: JsonObject | None = None,
+        budget_policy_digest: str | None = None,
+        budget_binding: JsonObject | None = None,
         runner_image: str = PI_CONTAINER_IMAGE,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = False,
@@ -582,13 +583,22 @@ class WmhPiAgent(BaseAgent):
         )
         self._harness = HarnessDoc.model_validate(harness)
         config = ProviderConfig.model_validate(provider_config)
-        account = (
-            BudgetAccount.model_validate(budget_account) if budget_account is not None else None
+        if (budget_policy_digest is None) != (budget_binding is None):
+            raise ValueError("budget policy digest and binding must be supplied together")
+        binding = (
+            BudgetAccountBinding.model_validate(budget_binding)
+            if budget_binding is not None
+            else None
         )
-        if account is not None:
+        if binding is not None:
+            if binding.policy_digest != budget_policy_digest:
+                raise ValueError("budget binding differs from the frozen policy digest")
+            account = resolve_budget_account(binding)
             meter = account.policy.meters[account.meter_id]
             if meter.provider_config != config:
                 raise ValueError("budget account provider config must match the Harbor agent")
+        else:
+            account = None
         if self._harness.runtime_kind() != "pi-node":
             raise ValueError(
                 "WMH pi benchmark evaluation requires runtime kind 'pi-node', got "
