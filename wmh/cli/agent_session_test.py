@@ -20,13 +20,15 @@ import wmh.cli.hosted_session as hosted_mod
 from wmh.cli import app
 from wmh.cli.session_state import DetachedSessionState, SessionStateError, SessionStateStore
 from wmh.cli.workspace_sync import snapshot_from_archive
-from wmh.harness.live_session import SessionEvent
+from wmh.harness.live_session import SessionEvent, ToolOutcome
 from wmh.harness.workspace_patch import build_workspace_patch
 from wmh.platform.client import PlatformError
 from wmh.platform.credentials import PlatformCredentials
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from wmh.core.types import JsonObject
 
 
 def _noop_emit(_stream: str, _chunk: str) -> None:
@@ -1275,3 +1277,67 @@ def test_plain_run_interrupt_around_a_patch_ack_promotes_a_fresh_cursor(
     state = store.load("sess-1")
     assert state is not None
     assert state.cursor == 1
+
+
+# -- github_search connector tool (host-answered) --------------------------------------------------
+
+
+@pytest.fixture
+def _isolated_connector_creds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate connector credential resolution so the host env decides tool availability."""
+    monkeypatch.setenv("WMH_CONNECTORS_PATH", str(tmp_path / "connectors.toml"))
+    monkeypatch.delenv("WMH_GITHUB_TOKEN", raising=False)
+
+
+def _local_driver(tmp_path: Path) -> mod.LocalLiveDriver:
+    """A minimal LocalLiveDriver for exercising tool selection and dispatch."""
+    return mod.LocalLiveDriver(
+        jail_root=tmp_path,
+        doc=mod._pi_node_baseline(),
+        provider=None,
+        worker_fn=None,
+        recorder=None,
+        instruction=None,
+    )
+
+
+@pytest.mark.usefixtures("_isolated_connector_creds")
+def test_github_search_offered_only_when_a_token_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """github_search is absent without a credential and present once one resolves host-side."""
+    driver = _local_driver(tmp_path)
+    assert [tool.name for tool in driver._connector_tools()] == []
+    monkeypatch.setenv("WMH_GITHUB_TOKEN", "gho_test")
+    assert [tool.name for tool in driver._connector_tools()] == ["github_search"]
+
+
+def test_assemble_appends_connector_tools() -> None:
+    """Injected connector tools are offered to the agent beyond the doc's closed-set tools."""
+    from wmh.harness.connector_tools import GITHUB_SEARCH
+
+    _system, tool_specs, _files, _skills = mod._assemble(
+        mod._pi_node_baseline(), extra_tools=[GITHUB_SEARCH]
+    )
+    assert "github_search" in [tool.name for tool in tool_specs]
+
+
+def test_execute_dispatches_github_search_to_the_host_side_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """github_search is answered by the host-side fetch, never the local jail executor."""
+    driver = _local_driver(tmp_path)
+    sentinel = ToolOutcome(content="rendered items")
+
+    def _fake_fetch(_args: JsonObject) -> ToolOutcome:
+        return sentinel
+
+    monkeypatch.setattr(mod, "github_search_fetch", _fake_fetch)
+
+    def _fail(*_a: object, **_k: object) -> ToolOutcome:
+        raise AssertionError("github_search must not reach the local filesystem executor")
+
+    monkeypatch.setattr(driver, "_executor", _fail)
+
+    outcome = driver._execute("github_search", {"target": "o/r", "query": "x"}, _noop_emit)
+    assert outcome is sentinel

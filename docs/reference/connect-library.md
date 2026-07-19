@@ -94,3 +94,22 @@ The Notion connector's remote-MCP path uses the `mcp` client SDK, packaged as th
 inside that path only, so `import wmh.connect` and every other connector's `pull` work without
 the extra installed. Notion also accepts a pasted integration secret, which uses the REST API and
 needs no extra.
+
+## Live agent tool: `github_search` in `wmh run`
+
+Beyond building bundles programmatically, GitHub is exposed as a live tool the built-in agent
+can call during `wmh run`. When a GitHub credential resolves on the machine running the CLI (a
+`WMH_GITHUB_TOKEN` in the environment, or a stored connector credential), `wmh run` adds a
+`github_search` tool to the agent's tool set; when none resolves it is omitted, so the agent is
+never handed a tool that would always error.
+
+```bash
+export WMH_GITHUB_TOKEN=ghp_...
+wmh run --task "summarize the open bugs in octocat/hello"
+```
+
+The tool is answered host-side: the CLI process resolves the token, runs the connector `pull`,
+and returns the rendered items as the tool observation. On `--harness-backend e2b` the executor
+still runs in the CLI process (the sandbox only carries frames), so the token never enters the
+sandbox. Arguments: `target` (`owner/repo`, required), `query`, `since`; results are capped for
+one live call.

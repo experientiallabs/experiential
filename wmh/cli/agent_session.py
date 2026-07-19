@@ -55,11 +55,16 @@ from wmh.cli.workspace_sync import (
     snapshot_workspace,
 )
 from wmh.engine.play import parse_action
+from wmh.harness.connector_tools import (
+    GITHUB_SEARCH,
+    github_search_available,
+    github_search_fetch,
+)
 from wmh.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmh.harness.pi_local import LocalStdioChannel, start_local_live_runner
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
-from wmh.harness.tools import READ_SKILL, resolve_tools
+from wmh.harness.tools import READ_SKILL, ToolSpec, resolve_tools
 from wmh.harness.workspace_patch import WorkspacePatchError
 from wmh.platform.client import PlatformClient, PlatformError, RemoteAgentSession
 from wmh.platform.credentials import PlatformCredentials, load_credentials
@@ -101,17 +106,24 @@ def _capped(content: str, *, is_error: bool = False) -> ToolOutcome:
     return ToolOutcome(content=capped, is_error=is_error, truncated=True)
 
 
-def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str]]:
+def _assemble(
+    doc: HarnessDoc, *, extra_tools: list[ToolSpec] | None = None
+) -> tuple[str, list[ToolSpec], dict[str, str], dict[str, str]]:
     """Derive the LiveSession inputs from a HarnessDoc (mirrors the hosted driver).
 
     Returns the assembled system prompt (prompt + rendered tools + skills index),
     the resolved tool specs, the code surfaces as {path: content} (the agent's own
     code, materialized into the local runner), and skill bodies answered host-side.
+
+    ``extra_tools`` are host-answered tools (e.g. ``github_search``) the driver
+    injects beyond the doc's closed-set tools; they are appended as ToolSpec
+    objects so they are offered to the agent without passing through the
+    closed-set ``resolve_tools`` gate.
     """
     tool_names = doc.tools()
     if doc.skills() and READ_SKILL.name not in tool_names:
         tool_names.append(READ_SKILL.name)
-    tool_specs = resolve_tools(tool_names)
+    tool_specs = [*resolve_tools(tool_names), *(extra_tools or [])]
     system = doc.assembled_prompt()
     files = {surface.path: surface.content for surface in doc.code_files() if surface.path}
     skill_bodies = {skill.name: skill.body for skill in doc.skills()}
@@ -341,7 +353,9 @@ class LocalLiveDriver:
 
     def run(self) -> None:
         """Boot the local runner, drive the session, and always tear down."""
-        system, tool_specs, files, skill_bodies = _assemble(self._doc)
+        system, tool_specs, files, skill_bodies = _assemble(
+            self._doc, extra_tools=self._connector_tools()
+        )
         _console.print("[dim]starting the built-in pi harness locally...[/dim]")
         session: LiveSession | None = None
         reason = "user_ended"
@@ -388,10 +402,25 @@ class LocalLiveDriver:
         if error is not None:
             raise typer.Exit(code=1)
 
+    def _connector_tools(self) -> list[ToolSpec]:
+        """Offer github_search only when a GitHub credential resolves host-side.
+
+        Availability is decided on the machine running the CLI, never in the
+        sandbox; an agent is never handed a tool that would always error.
+        """
+        return [GITHUB_SEARCH] if github_search_available() else []
+
     def _execute(
         self, name: str, args: JsonObject, emit: Callable[[str, str], None]
     ) -> ToolOutcome:
-        """Run one tool locally (each tool blocks the session pump)."""
+        """Run one tool locally (each tool blocks the session pump).
+
+        github_search is answered host-side here, with a token resolved from the
+        environment, so on the e2b backend it never enters the sandbox; every
+        other tool runs against the local jail.
+        """
+        if name == GITHUB_SEARCH.name:
+            return github_search_fetch(args)
         return self._executor(name, args, emit)
 
     def _loop(self, session: LiveSession, stdin_eof: threading.Event) -> None:
