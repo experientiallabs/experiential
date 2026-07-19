@@ -25,6 +25,12 @@ from wmh.evals.closed_loop import ClosedLoopReport, RolloutEvidence, TaskOutcome
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness import create as create_module
+from wmh.harness.cost import (
+    ProviderCostBinding,
+    SearchComponentCostBinding,
+    SearchComponentRole,
+    SearchCostBinding,
+)
 from wmh.harness.create import (
     CreateResult,
     HarnessSearchCancelled,
@@ -55,6 +61,14 @@ from wmh.harness.scoring import (
 )
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
+from wmh.tracking.budget import (
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    TokenPriceCeiling,
+    bind_budget_account,
+    bootstrap_budget_ledger,
+)
 
 _CAREFUL_PROMPT = "You are a careful agent. Verify the state of the system before submitting."
 
@@ -341,6 +355,137 @@ def _rehash_checkpoint_payload(payload: dict[str, object]) -> None:
         allow_nan=False,
     )
     payload["payload_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _search_cost_binding(tmp_path: Path, *, label: str) -> SearchCostBinding:
+    provider_config = ProviderConfig(kind=ProviderKind.BEDROCK, model="budgeted-model")
+    policy = BudgetPolicy(
+        study_id=f"search-{label}",
+        manifest_digest="sha256:" + hashlib.sha256(label.encode()).hexdigest(),
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"search": 1_000_000},
+        meters={
+            role: ProviderCostMeter(
+                provider_config=provider_config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=1,
+                ),
+            )
+            for role in ("proposer", "scorer")
+        },
+    )
+    authority = bootstrap_budget_ledger(tmp_path / f"{label}.sqlite3", policy)
+
+    def component(
+        role: SearchComponentRole,
+        configuration_id: str,
+    ) -> SearchComponentCostBinding:
+        category = role.value
+        account = authority.provider_account(
+            scope=BudgetScope(
+                phase="search",
+                category=category,
+                run_id="search-run",
+            ),
+            meter_id=category,
+        )
+        return SearchComponentCostBinding(
+            role=role,
+            configuration_id=configuration_id,
+            scope_category=category,
+            providers=(
+                ProviderCostBinding(
+                    component_configuration_id=configuration_id,
+                    provider_config=provider_config,
+                    account=bind_budget_account(account),
+                ),
+            ),
+        )
+
+    return SearchCostBinding(
+        declared_hard_limit_nano_usd=policy.hard_limit_nano_usd,
+        policy=policy,
+        ledger_identity=authority.ledger_identity,
+        phase="search",
+        run_id="search-run",
+        proposer=component(SearchComponentRole.PROPOSER, _HistoryProposer.configuration_id),
+        scorer=component(SearchComponentRole.SCORER, _NeutralScorer.configuration_id),
+    )
+
+
+class _CostBoundScorer(_NeutralScorer):
+    """Neutral scorer exposing the exact path-free paid accounts it will use."""
+
+    def __init__(self, binding: SearchComponentCostBinding) -> None:
+        super().__init__()
+        self.search_cost_binding = binding
+
+
+class _CostBoundProposer(_HistoryProposer):
+    """History proposer exposing the exact path-free paid accounts it will use."""
+
+    def __init__(self, binding: SearchComponentCostBinding) -> None:
+        super().__init__()
+        self.search_cost_binding = binding
+
+
+def test_budgeted_search_rejects_unbound_components_before_scoring(tmp_path: Path) -> None:
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match="proposer.search_cost_binding"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            cost_binding=_search_cost_binding(tmp_path, label="unbound"),
+        )
+
+    assert scorer.requests == []
+
+
+def test_search_checkpoint_binds_cost_provenance_and_rejects_drift(
+    tmp_path: Path,
+) -> None:
+    first = _search_cost_binding(tmp_path, label="first")
+    checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _CostBoundScorer(first.scorer),
+            _CostBoundProposer(first.proposer),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            cost_binding=first,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=0),
+        )
+
+    assert checkpoints[-1].configuration.search_cost_binding_digest == first.digest
+
+    second = _search_cost_binding(tmp_path, label="second")
+    scorer = _CostBoundScorer(second.scorer)
+    with pytest.raises(
+        ValueError,
+        match="search checkpoint configuration drift.*search_cost_binding_digest",
+    ):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _CostBoundProposer(second.proposer),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            cost_binding=second,
+            resume_from=checkpoints[-1],
+        )
+
+    assert scorer.requests == []
 
 
 def test_search_harness_resumes_exactly_from_a_committed_iteration() -> None:

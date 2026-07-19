@@ -41,6 +41,7 @@ from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_loop
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
+from wmh.harness.cost import SearchCostBinding, validate_search_cost_components
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
@@ -247,6 +248,10 @@ class SearchConfiguration(BaseModel):
     discovery_scorer: SearchScorerConfiguration
     holdout_scorer: SearchScorerConfiguration | None = None
     proposer: SearchProposerConfiguration
+    search_cost_binding_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
 
     @model_validator(mode="after")
     def _validate_independent_scorers(self) -> SearchConfiguration:
@@ -856,6 +861,7 @@ def _search_configuration(
     screen_proposals: bool,
     holdout_scorer: HarnessScorer | None,
     confirm_narrow_vetoes: bool,
+    search_cost_binding_digest: str | None,
 ) -> SearchConfiguration:
     return SearchConfiguration(
         name=name,
@@ -876,6 +882,7 @@ def _search_configuration(
             configuration_id=_component_configuration_id(proposer, role="proposer"),
             durable_state_required=bool(getattr(proposer, "durable_state_required", False)),
         ),
+        search_cost_binding_digest=search_cost_binding_digest,
     )
 
 
@@ -985,6 +992,7 @@ def search_harness(
     screen_proposals: bool = True,
     holdout_scorer: HarnessScorer | None = None,
     confirm_narrow_vetoes: bool = True,
+    cost_binding: SearchCostBinding | None = None,
     resume_from: SearchCheckpoint | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
@@ -1011,6 +1019,7 @@ def search_harness(
             proposer, but its accept or reject outcome affects selection, so never supply a sealed
             final confirmation split here.
         confirm_narrow_vetoes: Whether capable scorers remeasure narrow gate vetoes.
+        cost_binding: Optional frozen path-free accounts required from every paid component.
         resume_from: A validated checkpoint from a complete prior iteration.
         on_checkpoint: Durable checkpoint callback. Exceptions abort before the next batch.
 
@@ -1025,6 +1034,18 @@ def search_harness(
         raise ValueError(f"iterations must be non-negative, got {iterations}")
     if proposal_batch_size < 1:
         raise ValueError(f"proposal_batch_size must be positive, got {proposal_batch_size}")
+    frozen_cost_binding = (
+        SearchCostBinding.model_validate(cost_binding.model_dump())
+        if cost_binding is not None
+        else None
+    )
+    if frozen_cost_binding is not None:
+        validate_search_cost_components(
+            frozen_cost_binding,
+            proposer=proposer,
+            scorer=scorer,
+            holdout_scorer=holdout_scorer,
+        )
     if getattr(proposer, "score_archive_required", False) and not callable(
         getattr(proposer, "record_harness_evaluation", None)
     ):
@@ -1075,6 +1096,9 @@ def search_harness(
             screen_proposals=screen_proposals,
             holdout_scorer=holdout_scorer,
             confirm_narrow_vetoes=confirm_narrow_vetoes,
+            search_cost_binding_digest=(
+                frozen_cost_binding.digest if frozen_cost_binding is not None else None
+            ),
         )
         if checkpointing
         else None
