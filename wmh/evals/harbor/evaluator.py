@@ -217,6 +217,7 @@ def harbor_run_expectation(
             agent_version=WMH_PI_AGENT_VERSION,
             provider=frozen_provider.kind.value,
             model_name=frozen_provider.model,
+            reasoning_effort=frozen_provider.reasoning_effort,
             task_environment=environment,
             runner_config_digest=validated_runner.config_digest,
             runner_environment_digest=validated_runner.attestation.digest,

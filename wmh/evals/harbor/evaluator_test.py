@@ -827,16 +827,27 @@ def test_reasoning_effort_is_explicit_in_agent_config_and_run_identity(tmp_path:
         model="us.anthropic.claude-opus-4-6-v1",
         reasoning_effort="max",
     )
-    evaluator = mod.HarborEvaluator(_spec(tmp_path, tmp_path / "dataset"), provider)
+    spec = _spec(tmp_path, tmp_path / "dataset")
+    evaluator = mod.HarborEvaluator(spec, provider)
     candidate = pi_node_baseline("candidate")
     agent = evaluator._build_agent(candidate)
     agent_digest = harbor_agent_config_digest(agent)
-    identity = evaluator._run_identity(candidate, run_config_digest="sha256:" + "a" * 64)
+    expectation = mod.harbor_run_expectation(
+        candidate=candidate,
+        spec=spec,
+        provider_config=provider,
+        turn_timeout_s=300.0,
+    )
+    identity = evaluator._run_identity(
+        candidate,
+        run_config_digest=expectation.identity.run_config_digest,
+    )
 
     serialized_provider = agent.kwargs["provider_config"]
     assert isinstance(serialized_provider, dict)
     assert serialized_provider["reasoning_effort"] == "max"
     assert identity.reasoning_effort == "max"
+    assert expectation.identity == identity
 
     unconfigured = mod.HarborEvaluator(
         _spec(tmp_path, tmp_path / "dataset"),
