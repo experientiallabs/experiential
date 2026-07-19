@@ -33,7 +33,13 @@ from wmh.evals.benchmark import (
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
-from wmh.evals.paired import BoundedMeanBet, PairedArm, PairedEvaluationDesign, PairedPanelPlan
+from wmh.evals.paired import (
+    BoundedMeanBet,
+    PairedArm,
+    PairedEvaluationDesign,
+    PairedPanelPlan,
+    PairedTaskPlan,
+)
 from wmh.evals.partition import ConfirmationPartition, PartitionTask
 from wmh.harness.doc import HarnessDoc, Surface
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE
@@ -87,21 +93,20 @@ def _candidate() -> HarnessDoc:
 
 def _design() -> PairedEvaluationDesign:
     return PairedEvaluationDesign.create(
-        task_ids=_TASK_IDS,
+        tasks=tuple(PairedTaskPlan(task_id=task_id, group_id=task_id) for task_id in _TASK_IDS),
         panel=(PairedPanelPlan(panel_member="worker", attempts=2),),
-        bounded_mean_bets=(BoundedMeanBet(fraction=1.0, weight=1.0),),
+        primary_e_value_bets=(BoundedMeanBet(fraction=1.0, weight=1.0),),
         schedule_seed="paired-schedule-v1",
         analysis_seed="paired-analysis-v1",
         randomization_samples=1_000,
-        minimum_panel_delta=0.05,
-        minimum_member_delta=0.03,
+        minimum_equal_task_member_delta=0.03,
         noninferiority_margin=0.02,
     )
 
 
 def _confirmation(candidate: HarnessDoc) -> ConfirmationPartition:
     return ConfirmationPartition(
-        partition_version="1",
+        partition_version="2",
         partition_manifest_digest="sha256:" + "3" * 64,
         candidate_execution_digest=candidate.execution_digest,
         confirmation_protocol_digest="sha256:" + "7" * 64,
@@ -467,10 +472,12 @@ def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
     design = _design()
     assert len(calls) == 2 * len(design.blocks)
     assert len(report.evidence) == len(design.blocks)
+    assert report.run_version == "7"
+    assert report.protocol.protocol_version == "6"
     assert report.protocol.design_digest == design.digest
     assert report.protocol.baseline_execution_digest == baseline.execution_digest
     assert report.protocol.candidate_execution_digest == candidate.execution_digest
-    assert report.analysis.panel_delta == 1.0
+    assert report.analysis.equal_task_panel_delta == 1.0
     assert all(item.outcome.baseline_reward == 0.0 for item in report.evidence)
     assert all(item.outcome.candidate_reward == 1.0 for item in report.evidence)
     assert all(item.first.arm is item.block.first_arm for item in report.evidence)
@@ -562,6 +569,15 @@ def test_constructor_rejects_qualification_or_route_drift(tmp_path: Path) -> Non
             candidate,
             confirmation=confirmation.model_copy(
                 update={"tasks": tuple(reversed(confirmation.tasks))}
+            ),
+        )
+    changed_group = confirmation.tasks[0].model_copy(update={"group_id": "other-family"})
+    with pytest.raises(ValueError, match="task clusters"):
+        _runner(
+            tmp_path,
+            candidate,
+            confirmation=confirmation.model_copy(
+                update={"tasks": (changed_group, *confirmation.tasks[1:])}
             ),
         )
 
@@ -1209,7 +1225,7 @@ def test_report_json_reload_recomputes_every_binding_and_analysis(
     mutations.append(change_score)
 
     def change_analysis(payload: dict[str, Any]) -> None:
-        payload["analysis"]["panel_delta"] = 0.5
+        payload["analysis"]["equal_task_panel_delta"] = 0.5
 
     mutations.append(change_analysis)
 
@@ -1511,17 +1527,16 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
     design = PairedEvaluationDesign.create(
-        task_ids=_TASK_IDS,
+        tasks=tuple(PairedTaskPlan(task_id=task_id, group_id=task_id) for task_id in _TASK_IDS),
         panel=(
             PairedPanelPlan(panel_member="route-a", attempts=2),
             PairedPanelPlan(panel_member="route-b", attempts=2),
         ),
-        bounded_mean_bets=(BoundedMeanBet(fraction=1.0, weight=1.0),),
+        primary_e_value_bets=(BoundedMeanBet(fraction=1.0, weight=1.0),),
         schedule_seed="fair-schedule",
         analysis_seed="fair-analysis",
         randomization_samples=1_000,
-        minimum_panel_delta=0.05,
-        minimum_member_delta=0.03,
+        minimum_equal_task_member_delta=0.03,
         noninferiority_margin=0.02,
     )
     providers = {

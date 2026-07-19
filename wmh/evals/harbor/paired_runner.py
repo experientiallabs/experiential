@@ -67,6 +67,7 @@ from wmh.evals.paired import (
     PairedBlock,
     PairedBlockOutcome,
     PairedEvaluationDesign,
+    PairedTaskPlan,
     analyze_paired_outcomes,
 )
 from wmh.evals.partition import ConfirmationPartition
@@ -82,8 +83,8 @@ from wmh.tracking.budget import (
     open_shared_spend_ledger,
 )
 
-PAIRED_HARBOR_PROTOCOL_VERSION: Literal["3"] = "3"
-PAIRED_HARBOR_RUN_VERSION: Literal["4"] = "4"
+PAIRED_HARBOR_PROTOCOL_VERSION: Literal["6"] = "6"
+PAIRED_HARBOR_RUN_VERSION: Literal["7"] = "7"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -373,7 +374,7 @@ class PairedHarborProtocol(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    protocol_version: Literal["3"] = PAIRED_HARBOR_PROTOCOL_VERSION
+    protocol_version: Literal["6"] = PAIRED_HARBOR_PROTOCOL_VERSION
     design: PairedEvaluationDesign
     design_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation: ConfirmationPartition
@@ -438,9 +439,14 @@ class PairedHarborProtocol(BaseModel):
         qualified_ids = tuple(task.task_id for task in self.qualified_tasks)
         if qualified_ids != self.design.task_ids:
             raise ValueError("paired Harbor protocol qualifications differ from its design")
-        confirmation_ids = tuple(task.task_id for task in self.confirmation.tasks)
-        if confirmation_ids != self.design.task_ids:
-            raise ValueError("paired Harbor design differs from its opened confirmation tasks")
+        confirmation_tasks = tuple(
+            PairedTaskPlan(task_id=task.task_id, group_id=task.group_id)
+            for task in self.confirmation.tasks
+        )
+        if confirmation_tasks != self.design.tasks:
+            raise ValueError(
+                "paired Harbor design task clusters differ from its opened confirmation tasks"
+            )
         confirmation_by_id = {task.task_id: task for task in self.confirmation.tasks}
         mismatched_content = [
             task.task_id
@@ -740,7 +746,7 @@ class PairedHarborRunReport(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    run_version: Literal["4"]
+    run_version: Literal["7"]
     protocol: PairedHarborProtocol
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)

@@ -41,20 +41,28 @@ harness-improvement study, not a bit-for-bit reproduction of the published servi
 
 The paper's Terminal-Bench 2 discovery experiment searched and evaluated on the same 89 tasks. Its
 released final evaluation uses five trials per task, but that method does not test held-out
-generalization. The primary WMH lane instead freezes family-stratified discovery and confirmation
+generalization. The primary WMH lane instead freezes score-independent discovery and confirmation
 partitions before search. It scores candidates only on discovery tasks, selects one winner, and
-evaluates that winner once on the confirmation partition sealed from experiment-time search
-artifacts and rewards. The empirical matched delta on that realized confirmation matrix is the
-assumption-free primary observation. Interpreting it as generalization to a task population requires
-the exchangeability, sampling, and contamination assumptions defined in the power gate below.
+evaluates that winner once on the confirmation roster sealed from experiment-time search artifacts
+and rewards.
 
-After selection, the primary winner may also be compared descriptively with pi on all 89 tasks at
-five trials per task. That full-suite score is useful for locating the candidate relative to 76.4%,
-but it is not a reproduction of the paper's adaptive all-89 method because confirmation tasks did
-not participate in selecting that candidate.
+The primary estimand is the equal-task expected paired reward delta on repeated executions of those
+exact confirmation tasks, conditional on the frozen winner, pi baseline, model routes, attempt
+horizon, and execution contract. It is not a claim about future tasks, a task superpopulation, the
+discovery complement, or the finite mean over all 89 tasks. The complete planned paired-attempt mean
+for each task is one bounded primary observation. Repeated attempts may be arbitrarily dependent
+within a task; complete task outcome vectors must be mutually independent. A separately reported
+weighted semantic-cluster sensitivity allows arbitrary within-cluster dependence and is
+conservative for the same equal-task fixed-roster estimand. Sensitivity failure is inconclusive and
+does not replace the primary result.
+
+After selection, the primary winner may also be compared descriptively with pi on all 89 tasks at a
+separately frozen attempt count. That full-suite score is useful for locating the candidate relative
+to 76.4%, but it is not a reproduction of the paper's adaptive all-89 method because confirmation
+tasks did not participate in selecting that candidate.
 
 A separate all-89 adaptive lane would require its own search over all 89 tasks, separately selected
-candidate, and locked five-trial all-89 final. It is deferred from the $15,000 protocol below. A
+candidate, and locked paper-matched all-89 final. It is deferred from the $15,000 protocol below. A
 future lane qualifies as a paper-method reproduction only after all of these parity gates pass:
 
 - the released initial population is behaviorally represented, including the Terminus 2 and
@@ -76,8 +84,8 @@ lane. Confidence intervals from that lane describe repeated-trial variability af
 the same tasks; they do not establish generalization beyond the evaluated benchmark. The Bedrock
 serving path
 would remain a provider-shifted replication even after these gates pass. Freeze the primary lane's
-task IDs, family strata, random seed, and powered minimum detectable effect before the first
-candidate-scoring call.
+exact task IDs, semantic sensitivity groups, random seeds, attempts, e-value bets, observed lift
+floor, and power-gated minimum detectable effect before the first candidate-scoring call.
 
 Primary sources are the [paper](https://arxiv.org/pdf/2603.28052), the
 [project page](https://yoonholee.com/meta-harness/), the
@@ -131,7 +139,7 @@ Before seeing final results, use these interpretation bands:
 | Matched improvement over stock pi | Interpretation |
 |---|---|
 | less than 1 point | no actionable improvement |
-| at least 1 and less than 3 points | promising; conditional CI must exclude zero for a population claim |
+| at least 1 and less than 3 points | promising; the fixed-roster lower bound must exclude zero for a confirmed claim |
 | at least 3 and at most 5 points | practically meaningful harness improvement |
 | more than 5 points | strong result, requiring leakage and infrastructure audits |
 
@@ -495,7 +503,8 @@ domain-general instructions, and discovery artifacts. Deny network access or all
 services that cannot retrieve the public benchmark or its mirrors. Restricting writes is not a read
 boundary. Before and after every proposer turn, validate a content allowlist and a workspace digest;
 any unexpected file, path, task marker, or network capability invalidates the search before more
-candidate calls are admitted. Keep the split seed, confirmation IDs, and family assignment in a
+candidate calls are admitted. Keep the split seed, confirmation IDs, and score-independent group
+metadata in a
 separate operator-owned location that is never mounted into that workspace.
 
 Family metadata used by the split generator must have frozen provenance and must be independent of
@@ -506,12 +515,9 @@ Terminal-Bench remain limitations. This seal establishes only that search receiv
 artifacts or rewards through experiment-time storage, tools, or network access. It cannot show that
 confirmation content was absent from model training, prevent a proposer with a memorized public task
 roster from inferring the complement of the discovery set, or rule out consequential pretraining
-contamination. A task-population generalization interpretation therefore requires the registered
-assumption that retained training information neither lets search target confirmation content nor
-makes confirmation performance unrepresentative of the declared population. If that assumption is
-not defensible, the confirmation result remains a descriptive matched delta on the realized sealed
-matrix only. The seal cannot verify this assumption; every population claim must label it explicitly
-and accompany it with the descriptive result.
+contamination. Such leakage invalidates the held-out selection claim even though the statistical
+estimand is conditional on the exact confirmation roster. The seal cannot verify model-training
+provenance, so the report must state this limitation explicitly.
 
 The final evaluator may of course expose one confirmation task instruction and environment to the
 frozen worker candidate while that task is running. It must not expose confirmation content to the
@@ -521,48 +527,55 @@ and source audit is defense in depth, not a replacement for this access boundary
 #### Power and partition gate
 
 Before any benchmark reward or candidate score is observed, write and freeze a power-design
-manifest. It must predeclare the baseline pass rate, within-task intraclass correlation, any paired
-arm correlation used by the data-generating model, the target effect, test direction, alpha, power,
-attempt count, family strata, stratum population sizes, task inclusion probabilities, estimator,
-confidence-interval algorithm, bootstrap resample count and seed, and minimum discovery-set
-constraints. It must also state the inferential target and the assumptions that make it
-identifiable. Within each frozen family stratum, benchmark tasks must be exchangeable draws from the
-declared Terminal-Bench-regime task superpopulation, and a future task must be another such draw. The
-score-independent split must be independent of task potential outcomes, and information retained in
-proposer or worker model weights must neither let search target confirmation membership or content
-nor make confirmation outcomes unrepresentative of the declared population.
+manifest. It must predeclare the exact inferential target, confirmation roster size, per-lane attempt
+counts, one-sided alpha, fixed e-value mixture, observed equal-task lift floor, candidate-selection
+rule, weak-null and target-alternative data-generating models, nuisance ranges, target minimum
+detectable effect, requested power, Monte Carlo alpha and replication count, semantic sensitivity
+groups, analysis code identity, seeds, and minimum discovery constraints. Baseline pass rates,
+within-task attempt dependence, paired-arm dependence, cross-lane dependence, and failure processes
+must come from external evidence or a frozen plausible range, not WMH candidate outcomes.
 
-Conditional on those assumptions and on the realized discovery search, the primary inferential
-estimand is the expected paired reward delta of the frozen winner versus pi on a fresh task from
-that task population, standardized to the frozen family shares of the 89-task benchmark. The primary
-empirical statistic is the corresponding family-standardized paired delta on the realized
-confirmation matrix. Also report the unweighted, task-uniform paired delta across the realized
-confirmation tasks and planned attempts. Both empirical statistics are assumption-free descriptions
-of that realized matrix. Because the candidate is selected as a function of the discovery
-complement, neither confirmation statistic identifies the selected candidate's finite-population
-mean over all 89 tasks. Use a 3 percentage-point paired effect as the target, a two-sided alpha of
-0.05, power of at least 0.80, and five attempts per task for the locked primary confirmation. Derive
-nuisance assumptions from published or otherwise external evidence, and run sensitivity cases over
-a predeclared plausible range rather than fitting them to WMH candidate outcomes.
+The primary estimand for lane `m` is
+`N^-1 sum_t E[X_t,m | exact roster and frozen execution contract]`, where `X_t,m` is the complete
+planned paired-attempt mean delta for exact confirmation task `t`. The one-sided primary null is that
+this equal-task conditional mean is at most zero. The complete task outcome vectors must be mutually
+independent, while attempts and arms inside one task vector may be arbitrarily dependent. No
+exchangeability or future-task sampling assumption is used or claimed. Candidate selection on the
+discovery complement means this result also does not identify the selected candidate's finite mean
+over all 89 tasks.
 
-Use task-clustered simulation that generates complete tasks with attempts nested inside each task,
-applies the exact planned missing-cell rule, and runs the same paired analysis that will produce the
-final interval. Sample tasks within each frozen family stratum. Estimate the family-standardized
-task-population mean with inverse-inclusion weights, which is equivalent to weighting each
-confirmation stratum mean by its frozen share of the 89 tasks under fixed within-stratum sample
-counts. Resample complete tasks only within their strata for the bootstrap. Throughout the nuisance
-range and within a predeclared Monte Carlo tolerance, the simulation must verify at least 0.80 power
-at the target effect, empirical two-sided type-I error no greater than 0.05, and interval coverage
-of at least 0.95. Those operating characteristics are conditional on the registered task-population
-and data-generating assumptions; they are not design-based inference for the selected candidate's
-finite 89-task mean.
+Use a locked simulator that generates the complete task vectors and runs the exact production
+analysis, including the observed effect floor and all-lane intersection-union decision. It must
+produce the predeclared number of `weak-null` and `target-alternative` replicates with no optional
+stopping. The executable power gate rejects missing, duplicate, extra, or simulation-digest-drifted
+replicates. It uses preregistered one-sided exact Clopper-Pearson bounds certified outward by
+directed-rounding, high-precision binomial tail sums; SciPy quantiles are only initial guesses. The
+weak-null rejection-rate upper bound must not exceed the maximum type-I error, and the
+target-alternative rejection-rate lower bound must reach the requested power. Its durable report
+embeds the full frozen gate design, binds the complete canonical trial evidence by digest, and binds
+all counts, rates, bounds, and decisions with a report digest. Reloading must recompute and validate
+every derived value. Passing supports only that frozen MDE and data-generating assumptions.
 
-Enumerate integer, family-stratified discovery and confirmation allocations across the 89 frozen
-tasks. Select task counts before scoring: choose a confirmation count that passes every power,
-type-I, and coverage gate while preserving the declared minimum discovery matrix, then assign task
-IDs using only frozen, score-independent family metadata and the predeclared seed. Record the
-simulation code, inputs, output, selected task counts, inclusion probabilities, analysis seed, task
-IDs, and matrix digest in the manifest.
+Three percentage points and 80% power remain desired planning values, not established operating
+characteristics. Do not call the current design powered for 3 points until the locked simulation
+manifest exists and its executable gate passes. Before scoring, enumerate feasible integer
+discovery/confirmation allocations and attempt horizons, preserve the minimum discovery matrix, and
+choose exactly one score-independent route: the 3 point design if it passes; a larger predeclared MDE
+that passes; or stop and add independently funded compatible tasks. Record the simulator, manifest
+digest, inputs, outputs, chosen MDE, task counts, analysis seed, exact task IDs, semantic groups, and
+matrix digest. Never lower the requested power or change the route after observing scores.
+
+The study-profile recommendation for the forthcoming manifest is 59 confirmation tasks, 20 planned
+attempts per task, lane, and arm, a 3 point observed floor, and a 10 point powered MDE. Freeze the bet
+mixture exactly as `f=1/4, weight=1/16`; `f=1/2, weight=1/16`; and `f=1, weight=7/8`. The power gate
+must bind both the simulator digest and the exact paired-evaluation design digest containing this
+roster, attempt matrix, mixture, and floor. A 50,000-replicate calibration reported individual-lane
+power of 94.2% to 94.6%, all-three-lane power of 85.9%, and heterogeneity sensitivities from 80.4% to
+91.3% at a 10 point effect. Those figures are study-design inputs, not accepted executable evidence
+until the simulator artifact and complete digest-bound trials are committed. They depend materially
+on the declared complete-task-vector independence and near-zero residual attempt ICC: the reported
+all-lane power was 80.4% at ICC 0.01 and 58.3% at ICC 0.05. The weighted semantic-cluster sensitivity
+is expected to be underpowered and remains non-gating.
 
 The same manifest must freeze the Azure transfer task and attempt matrix, or a finite conditional
 ladder of matrices selected only by measured per-cell cost and quota. If a ladder is used, record
@@ -570,14 +583,9 @@ its thresholds before qualification, keep candidate rewards hidden, and resolve 
 infrastructure evidence only before Bedrock search begins. Azure scores must never choose the
 transfer matrix.
 
-If no valid allocation of the 89 tasks reaches 0.80 power for a 3 point effect, the 3 point
-confirmation gate fails before spending. Choose and record exactly one route before scoring: stop
-and add independent compatible tasks under a separately defined broader estimand; retain a held-out
-confirmation lane with the larger minimum detectable effect supported by the same simulation and
-treat 3 points as descriptive only; or use a locked all-89 paired estimate as a
-benchmark-descriptive endpoint and abandon the task-population generalization claim. Do not lower
-the power target, choose the route after seeing scores, or present an underpowered interval as
-confirmation of a 3 point effect.
+If no feasible roster reaches the preregistered power for 3 points, any observed 3 point lift remains
+an effect-size description and not a powered-MDE result. A locked all-89 paired estimate may be added
+only as a benchmark-descriptive endpoint; it does not change the fixed-roster primary estimand.
 
 ### Phase 1: zero-cost and low-cost qualification
 
@@ -669,23 +677,23 @@ a separately budgeted exploratory lane and cannot support the cross-provider tra
 Each lane's winner must already be frozen. Make no further harness changes after observing its
 locked results.
 
-- Primary confirmation: pi baseline and the primary winner on the frozen confirmation partition,
-  five attempts per task.
+- Primary confirmation: pi baseline and the primary winner on the frozen confirmation partition at
+  the attempt horizon selected by the locked power-and-cost design.
 - Full-suite descriptive comparison: if it is fully funded, extend that same blocked final matrix
-  to the discovery tasks so pi and the frozen primary winner each receive five attempts on all 89
-  tasks with the fixed primary model. Compute the primary endpoint from only the prespecified
+  to the discovery tasks so pi and the frozen primary winner receive the same frozen attempt horizon
+  on all 89 tasks with the fixed primary model. Compute the primary endpoint from only the prespecified
   confirmation subset and the descriptive score from all 89 tasks. Do not rerun confirmation cells
   in a second full-suite job. This comparison is not an adaptive-method reproduction. Add the
   reference-strength control only if the final-evaluation envelope still covers every paired
   primary cell. If all 89 tasks do not fit, run the confirmation matrix and omit the full-suite
   descriptive score.
 - All-89 adaptive comparison: deferred and unfunded in this protocol. It requires a new budget that
-  covers the complete frozen search plus a separate five-attempt paired final before its first
+  covers the complete frozen search plus a separate paper-matched paired final before its first
   candidate call.
 - Transfer lane: the already-frozen Bedrock winner and its matching pi baseline on the frozen Azure
   deployment. Before search, bind the exact task IDs and attempt count to a score-independent
-  power-and-cost design and its matrix digest. Use at least three attempts per selected task, and do
-  not change the matrix after observing any Azure candidate comparison. Use the same confirmation
+  power-and-cost design and its matrix digest. Do not change the matrix after observing any Azure
+  candidate comparison. Use the same confirmation
   tasks as Bedrock, or a predeclared score-independent subset of them, so task mix does not masquerade
   as provider transfer. Treat transfer as secondary unless its manifest also freezes a powered
   criterion. Report the Azure paired delta and the Azure-minus-Bedrock delta on the common tasks;
@@ -727,52 +735,74 @@ binary verifier reward. Candidate-owned invalid provider requests, agent/task ti
 task-container destruction or exhaustion have primary outcome zero. Preserve any later verifier
 reward and the candidate failure kind as diagnostic evidence. A verifier, provider, environment,
 runner, or unclassified failure with retry-required or unknown run health is not a zero and
-invalidates the planned matrix until an allowlisted, fully ledgered recovery fills that cell. The
-timeout sensitivity analysis substitutes Harbor's valid post-timeout verifier reward for the
-primary zero; it may not replace the primary result after scores are observed.
+invalidates the whole paired block. A predeclared, fully ledgered recovery must rerun both arms in
+fresh isolation without inspecting either score; it may not fill only the failed arm. The timeout
+sensitivity analysis substitutes Harbor's valid post-timeout verifier reward for the primary zero;
+it may not replace the primary result after scores are observed.
 
-First average the planned analysis outcomes within each task and arm: five for primary confirmation
-and the separately frozen count for Azure transfer. The primary empirical metric is the paired
-difference of inverse-inclusion-weighted task means over the exact confirmation matrix, standardized
-to the frozen family shares of the 89-task benchmark. Under the registered exchangeability,
-sampling, and contamination assumptions, it estimates the conditional task-population
-generalization delta of the frozen winner versus pi. Use frozen family shares and resample complete
-paired tasks within family strata using the predeclared bootstrap algorithm, resample count, and
-seed. The bootstrap interval has that population interpretation only under those assumptions. Also
-report the unweighted task-uniform matched delta on the realized confirmation matrix as an
-additional empirical quantity. Both point estimates are assumption-free descriptions of the
-realized matrix; neither confirmation metric nor its interval identifies the selected candidate's
-finite all-89 mean. The metric is valid only if every planned cell has a primary analysis outcome
-and the frozen inclusion weight.
+For lane `m`, first compute each complete task observation
+`X_t,m = A_m^-1 sum_a (R_candidate,t,m,a - R_pi,t,m,a)` over the exact planned attempts. Then report
+the observed equal-task delta `D_m = N^-1 sum_t X_t,m`. The primary inferential estimand is
+`theta_m = N^-1 sum_t E[X_t,m]`, conditional on the exact sealed roster and frozen execution
+contract. Every task has equal weight. This is repeated-execution evidence for these tasks, not
+future-task or all-89 generalization.
+
+For the one-sided null `theta_m <= u`, each preregistered bet fraction `f` uses
+`E_f(u) = product_t [1 + f (X_t,m - u)/(1+u)]`; a frozen convex mixture over bet fractions is the
+lane e-value. Complete task vectors may have different distributions. Under the weak equal-task
+null, mutual task independence factors the expectation and AM-GM bounds it by one. The reported
+primary p-value is `min(1, 1/E(0))`. Inverting `E(u) > 1/alpha` gives a conservatively rounded
+one-sided lower bound. Each lane uses the unadjusted one-sided alpha of 0.05. The all-lanes claim is
+an intersection-union test: every lane lower bound must exceed zero, so no cross-lane independence
+or alpha division is required. Every lane's observed `D_m` must also meet the separately frozen 3
+percentage-point floor.
+
+Report a dependence sensitivity using the predeclared semantic groups. For group `g`, let `X_g,m`
+be its task mean, `w_g = n_g/N`, `w_max = max_g w_g`, and `c_g = w_g/w_max`. Its bet factor is
+`1 + f c_g (X_g,m-u)/(1+u)`. Under the same equal-task null,
+`sum_g c_g(E[X_g,m]-u) <= 0`; independent groups plus AM-GM therefore give a conservative e-value
+for the same equal-task estimand while allowing arbitrary dependence inside each group. Report its
+p-value and inverted lower bound per lane. A nonpositive sensitivity lower bound is inconclusive,
+does not fail the primary result, and must never be presented as evidence that semantic independence
+was established.
+
+The primary guarantee requires the complete fixed horizon, bets, roster, and decision thresholds to
+be frozen before outcomes; no score-adaptive missingness, retry, replacement, or stopping; fresh
+isolated provider requests and sandboxes for every arm; and score-blind whole-pair handling of
+allowlisted infrastructure failures. Attempts inside a task may be dependent, but common provider
+shocks, shared mutable state, overlapping sandboxes, correlated task scheduling incidents, or other
+cross-task dependence invalidate the primary task-independence claim. Block arm order and equal
+concurrency reduce drift but do not prove independence. Jackknife Student-t, Bonferroni jackknife,
+and label swapping are model-based secondary diagnostics only and make no finite-sample alpha-control
+claim.
 
 For each provider lane, report:
 
 - pi baseline score, candidate score, and paired percentage-point delta;
-- the frozen family-stratified task bootstrap confidence interval over the paired delta, labeled as
-  conditional on the registered task-population assumptions;
+- the one-sided fixed-roster primary p-value and lower bound for every lane;
+- the weighted semantic-cluster sensitivity p-value and lower bound for every lane, clearly labeled
+  as a conservative sensitivity rather than a primary pass requirement;
 - per-task win, tie, and loss counts;
 - timeout and infrastructure rates;
 - total input tokens, output tokens, provider cost, environment cost, and wall time;
 - the post-timeout-verifier-reward sensitivity defined above.
 
-Do not enable Harbor retries until the atomic attempt ledger records every failed and final attempt,
-including usage and exception type. Once that prerequisite exists, retry only explicitly
-allowlisted infrastructure failures, reuse the same task identity with a distinct attempt identity,
-and report every attempt. Never retry a task failure, candidate failure, or low score.
+Do not enable Harbor retries until the atomic attempt ledger records every failed and final arm,
+including usage and exception type. Once that prerequisite exists, recover only explicitly
+allowlisted infrastructure failures by replaying the whole pair under a new block-attempt identity,
+and report every execution. The decision to replay must be score-blind. Never retry a task failure,
+candidate failure, or low score.
 
-The main success criteria are conditional on passing the power and partition gate. Criteria 1 and 2
-support task-population generalization only while the registered exchangeability, sampling, and
-contamination assumptions remain defensible. If an audit breaks one of those assumptions, report the
-matched confirmation delta as descriptive and do not call it confirmed generalization:
+The main success criteria are:
 
-1. a positive family-standardized paired delta over pi whose conditional task-population confidence
-   interval excludes zero on the confirmation partition sealed from experiment-time search evidence
-   in the primary provider lane;
-2. at least a 3 point conditional task-population improvement when the frozen design has at least
-   0.80 power for that effect, or the larger predeclared minimum detectable effect selected by the
-   fail route; a smaller improvement that holds across both providers remains useful but is not a
-   powered 3 point result;
-3. cost, timeout rate, and candidate-failure rate remain inside their predeclared noninferiority
+1. every lane has a positive one-sided primary lower bound on its fixed-roster conditional expected
+   rerun delta, using unadjusted alpha 0.05 through the all-lane intersection-union rule;
+2. every lane's observed equal-task delta is at least 3 percentage points; this is an effect-size
+   floor, not by itself a powered 3 point claim;
+3. the locked simulator's exact Monte Carlo gate passes at its predeclared MDE. A 3 point, 80% power
+   statement is prohibited until a design with those values passes; otherwise report the larger
+   predeclared powered MDE or state that power remains unresolved;
+4. cost, timeout rate, and candidate-failure rate remain inside their predeclared noninferiority
    margins, with the score-cost decision rule and all margins frozen before search.
 
 Do not make an inferential compatibility or equivalence claim against 76.4% from the mixed all-89
@@ -862,7 +892,9 @@ The reusable evaluation slice provides:
   interpolation, MCP/skills injection, run-level imports, mounts, overlays, and kwargs disabled;
 - fail-closed rejection of unaudited Harbor retries;
 - explicit separation of scored task failures from provider, environment, runner, and verifier
-  infrastructure failures.
+  infrastructure failures;
+- an exact-uniform, score-independent sealed partition, fixed-roster paired primary report,
+  weighted semantic-cluster sensitivity, and locked-simulation operating-characteristic gate.
 
 The following remain required work before experiment launch:
 
@@ -877,8 +909,8 @@ The following remain required work before experiment launch:
   result before enabling retry or search ranking;
 - implement an external-resource ledger that reconciles local Compose and E2B resource creation and
   teardown after process or host interruption;
-- implement the paired statistical report, powered and immutable split generator, fixed
-  deterministic action-replay canary manifest, and blocked two-arm final scheduler;
+- supply and lock the actual paired simulation design, pass its predeclared MDE gate, and add the
+  fixed deterministic action-replay canary manifest and blocked two-arm final scheduler;
 - add served-model attestation to canonical evidence, including the response-reported Azure model
   revision and a pre/post deployment snapshot; the current run digest binds the declared endpoint,
   deployment, model, API version, and Bedrock region, but cannot detect an Azure deployment repoint;

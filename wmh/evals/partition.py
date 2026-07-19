@@ -11,6 +11,9 @@ import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from fractions import Fraction
+from math import gcd
 from pathlib import Path
 from typing import Literal, Self
 
@@ -21,7 +24,10 @@ if os.name == "posix":
 else:
     fcntl = None
 
-PARTITION_MANIFEST_VERSION: Literal["1"] = "1"
+PARTITION_MANIFEST_VERSION: Literal["2"] = "2"
+PARTITION_SELECTION_ALGORITHM: Literal["uniform-feasible-subsets-v1"] = (
+    "uniform-feasible-subsets-v1"
+)
 _CANDIDATE_FREEZE_RECORD_VERSION: Literal["1"] = "1"
 _CONFIRMATION_OPENING_RECORD_VERSION: Literal["1"] = "1"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
@@ -117,7 +123,8 @@ class PartitionGenesisRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    partition_version: Literal["1"] = PARTITION_MANIFEST_VERSION
+    partition_version: Literal["2"] = PARTITION_MANIFEST_VERSION
+    selection_algorithm: Literal["uniform-feasible-subsets-v1"] = PARTITION_SELECTION_ALGORITHM
     control_scope: PartitionControlScope
     tasks_digest: str = Field(pattern=_DIGEST_PATTERN)
     discovery_strata: tuple[StratumCount, ...]
@@ -179,7 +186,7 @@ class DiscoveryPartition(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    partition_version: Literal["1"]
+    partition_version: Literal["2"]
     partition_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     tasks: tuple[DiscoveryTask, ...]
     confirmation_strata: tuple[StratumCount, ...]
@@ -196,7 +203,7 @@ class ConfirmationPartition(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    partition_version: Literal["1"]
+    partition_version: Literal["2"]
     partition_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     candidate_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation_protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -206,12 +213,38 @@ class ConfirmationPartition(BaseModel):
     opening_record_digest: str = Field(pattern=_DIGEST_PATTERN)
 
 
+class GroupInclusionProbability(BaseModel):
+    """Exact discovery inclusion probability for one score-independent group."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    group_id: str = Field(min_length=1)
+    discovery_numerator: StrictInt = Field(ge=0)
+    denominator: StrictInt = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _require_canonical_probability(self) -> Self:
+        if self.group_id != self.group_id.strip():
+            raise ValueError("group inclusion identity cannot have surrounding whitespace")
+        if self.discovery_numerator > self.denominator:
+            raise ValueError("group discovery inclusion probability cannot exceed one")
+        if gcd(self.discovery_numerator, self.denominator) != 1:
+            raise ValueError("group discovery inclusion probability must be reduced")
+        return self
+
+    @property
+    def discovery_probability(self) -> Fraction:
+        """Return the exact discovery inclusion probability."""
+        return Fraction(self.discovery_numerator, self.denominator)
+
+
 class BenchmarkPartitionManifest(BaseModel):
     """Private control-plane manifest for one grouped discovery/confirmation split."""
 
     model_config = ConfigDict(frozen=True)
 
-    partition_version: Literal["1"] = PARTITION_MANIFEST_VERSION
+    partition_version: Literal["2"] = PARTITION_MANIFEST_VERSION
+    selection_algorithm: Literal["uniform-feasible-subsets-v1"] = PARTITION_SELECTION_ALGORITHM
     genesis_digest: str = Field(pattern=_DIGEST_PATTERN)
     control_scope: PartitionControlScope
     tasks: tuple[PartitionTask, ...]
@@ -220,6 +253,9 @@ class BenchmarkPartitionManifest(BaseModel):
     seal_nonce: str = Field(min_length=16, repr=False)
     discovery_task_ids: tuple[str, ...]
     confirmation_task_ids: tuple[str, ...]
+    feasible_subset_count: StrictInt = Field(ge=1)
+    selection_rank_commitment: str = Field(pattern=_DIGEST_PATTERN)
+    group_inclusion_probabilities: tuple[GroupInclusionProbability, ...]
     confirmation_commitment: str = Field(pattern=_DIGEST_PATTERN)
 
     @classmethod
@@ -241,14 +277,14 @@ class BenchmarkPartitionManifest(BaseModel):
             tasks=canonical_tasks,
             discovery_counts=canonical_counts,
         )
-        discovery_ids, confirmation_ids = _select_partition(
+        selection = _select_partition(
             canonical_tasks,
             canonical_counts,
             seed=genesis.selection_seed,
         )
         commitment = _confirmation_commitment(
             tasks=canonical_tasks,
-            confirmation_ids=confirmation_ids,
+            confirmation_ids=selection.confirmation_task_ids,
             nonce=genesis.seal_nonce,
         )
         return cls(
@@ -261,8 +297,11 @@ class BenchmarkPartitionManifest(BaseModel):
             ),
             selection_seed=genesis.selection_seed,
             seal_nonce=genesis.seal_nonce,
-            discovery_task_ids=discovery_ids,
-            confirmation_task_ids=confirmation_ids,
+            discovery_task_ids=selection.discovery_task_ids,
+            confirmation_task_ids=selection.confirmation_task_ids,
+            feasible_subset_count=selection.feasible_subset_count,
+            selection_rank_commitment=selection.rank_commitment,
+            group_inclusion_probabilities=selection.group_inclusion_probabilities,
             confirmation_commitment=commitment,
         )
 
@@ -320,16 +359,23 @@ class BenchmarkPartitionManifest(BaseModel):
         )
         if self.genesis_digest != genesis.digest:
             raise ValueError("partition genesis digest does not match its frozen inputs")
-        expected_discovery, expected_confirmation = _select_partition(
+        selection = _select_partition(
             self.tasks,
             counts,
             seed=self.selection_seed,
         )
         if (
-            self.discovery_task_ids != expected_discovery
-            or self.confirmation_task_ids != expected_confirmation
+            self.selection_algorithm != PARTITION_SELECTION_ALGORITHM
+            or self.discovery_task_ids != selection.discovery_task_ids
+            or self.confirmation_task_ids != selection.confirmation_task_ids
+            or self.feasible_subset_count != selection.feasible_subset_count
+            or self.selection_rank_commitment != selection.rank_commitment
+            or self.group_inclusion_probabilities != selection.group_inclusion_probabilities
         ):
-            raise ValueError("partition membership does not match the frozen selection_seed")
+            raise ValueError(
+                "partition membership or selection evidence does not match the frozen "
+                "selection_seed"
+            )
         expected_commitment = _confirmation_commitment(
             tasks=self.tasks,
             confirmation_ids=self.confirmation_task_ids,
@@ -567,7 +613,7 @@ def _genesis_record_name(
     )
     key_digest = _canonical_digest(
         {
-            "domain": "wmh-partition-genesis-key-v1",
+            "domain": "wmh-partition-genesis-key-v2",
             "control_scope": scope.model_dump(mode="json"),
             "partition_inputs_digest": inputs_digest,
         }
@@ -802,52 +848,303 @@ def _canonical_counts(
     return canonical
 
 
+_CountVector = tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _PartitionGroup:
+    """Canonical group identity, task IDs, and per-stratum count vector."""
+
+    group_id: str
+    task_ids: tuple[str, ...]
+    counts: _CountVector
+
+
+@dataclass(frozen=True)
+class _PartitionSpace:
+    """Exact feasible-subset count tables for one grouped quota problem."""
+
+    groups: tuple[_PartitionGroup, ...]
+    target: _CountVector
+    suffix_counts: tuple[dict[_CountVector, int], ...]
+    inclusion_counts: tuple[int, ...]
+    feasible_count: int
+
+    def discovery_groups_for_rank(self, rank: int) -> tuple[str, ...]:
+        """Unrank one feasible group subset in canonical exclude-first order."""
+        if isinstance(rank, bool) or not isinstance(rank, int):
+            raise ValueError("partition rank must be an integer")
+        if not 0 <= rank < self.feasible_count:
+            raise ValueError("partition rank is outside the feasible subset space")
+        remainder = self.target
+        selected: list[str] = []
+        for index, group in enumerate(self.groups):
+            excluded_count = self.suffix_counts[index + 1].get(remainder, 0)
+            included_remainder = _subtract_vectors(remainder, group.counts)
+            included_count = (
+                0
+                if included_remainder is None
+                else self.suffix_counts[index + 1].get(included_remainder, 0)
+            )
+            if rank < excluded_count:
+                continue
+            if (
+                included_remainder is None
+                or included_count == 0
+                or rank >= excluded_count + included_count
+            ):
+                raise RuntimeError("partition rank cannot be resolved from its count table")
+            rank -= excluded_count
+            remainder = included_remainder
+            selected.append(group.group_id)
+        if any(remainder):
+            raise RuntimeError("partition unranking did not satisfy the frozen quota")
+        return tuple(selected)
+
+    def discovery_inclusion_probability(self, group_id: str) -> Fraction:
+        """Return one group's exact probability under uniform feasible-subset sampling."""
+        try:
+            index = next(
+                index for index, group in enumerate(self.groups) if group.group_id == group_id
+            )
+        except StopIteration as error:
+            raise KeyError(group_id) from error
+        return Fraction(self.inclusion_counts[index], self.feasible_count)
+
+
+@dataclass(frozen=True)
+class _PartitionSelection:
+    """One selected split and its persisted exact randomization evidence."""
+
+    discovery_task_ids: tuple[str, ...]
+    confirmation_task_ids: tuple[str, ...]
+    feasible_subset_count: int
+    rank_commitment: str
+    group_inclusion_probabilities: tuple[GroupInclusionProbability, ...]
+
+
 def _select_partition(
     tasks: tuple[PartitionTask, ...],
     discovery_counts: dict[str, int],
     *,
     seed: str,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> _PartitionSelection:
     if not seed or seed != seed.strip():
         raise ValueError("selection_seed must be a non-empty canonical string")
+    space = _build_partition_space(tasks, discovery_counts)
+    rank = _uniform_index(seed=seed, upper_bound=space.feasible_count)
+    selected_groups = frozenset(space.discovery_groups_for_rank(rank))
+    discovery = tuple(sorted(task.task_id for task in tasks if task.group_id in selected_groups))
+    confirmation = tuple(
+        sorted(task.task_id for task in tasks if task.group_id not in selected_groups)
+    )
+    return _PartitionSelection(
+        discovery_task_ids=discovery,
+        confirmation_task_ids=confirmation,
+        feasible_subset_count=space.feasible_count,
+        rank_commitment=_selection_rank_commitment(
+            seed=seed,
+            feasible_count=space.feasible_count,
+            rank=rank,
+        ),
+        group_inclusion_probabilities=tuple(
+            _group_inclusion_probability(space, index) for index in range(len(space.groups))
+        ),
+    )
+
+
+def _build_partition_space(
+    tasks: tuple[PartitionTask, ...],
+    discovery_counts: dict[str, int],
+) -> _PartitionSpace:
+    """Build exact count and inclusion tables for all feasible whole-group subsets."""
     strata = tuple(discovery_counts)
     target = tuple(discovery_counts[stratum] for stratum in strata)
     grouped: defaultdict[str, list[PartitionTask]] = defaultdict(list)
     for task in tasks:
         grouped[task.group_id].append(task)
-    ranked_groups = sorted(
-        grouped,
-        key=lambda group_id: (_digest_bytes(seed, "group-order", group_id), group_id),
+    groups = tuple(
+        _PartitionGroup(
+            group_id=group_id,
+            task_ids=tuple(sorted(task.task_id for task in grouped[group_id])),
+            counts=tuple(
+                sum(task.stratum == stratum for task in grouped[group_id]) for stratum in strata
+            ),
+        )
+        for group_id in sorted(grouped)
     )
-    zero = (0,) * len(strata)
-    states: dict[tuple[int, ...], tuple[int, tuple[str, ...]]] = {zero: (0, ())}
-    for group_id in ranked_groups:
-        vector_counts = Counter(task.stratum for task in grouped[group_id])
-        vector = tuple(vector_counts[stratum] for stratum in strata)
-        weight = int.from_bytes(_digest_bytes(seed, "group-weight", group_id)[:8], "big")
-        updated = dict(states)
-        for current, (score, selected) in states.items():
-            candidate_vector = tuple(
-                left + right for left, right in zip(current, vector, strict=True)
-            )
-            if any(value > limit for value, limit in zip(candidate_vector, target, strict=True)):
-                continue
-            candidate = (score + weight, tuple(sorted((*selected, group_id))))
-            incumbent = updated.get(candidate_vector)
-            if incumbent is None or candidate < incumbent:
-                updated[candidate_vector] = candidate
-        states = updated
-    solution = states.get(target)
-    if solution is None:
+    vectors = tuple(group.counts for group in groups)
+    suffix_counts = _suffix_subset_counts(vectors, target=target)
+    feasible_count = suffix_counts[0].get(target, 0)
+    if feasible_count == 0:
         raise ValueError(
             "whole-group benchmark partition cannot satisfy the exact discovery counts"
         )
-    selected_groups = frozenset(solution[1])
-    discovery = tuple(sorted(task.task_id for task in tasks if task.group_id in selected_groups))
-    confirmation = tuple(
-        sorted(task.task_id for task in tasks if task.group_id not in selected_groups)
+    prefix_counts = _prefix_subset_counts(vectors, target=target)
+    inclusion_counts = tuple(
+        _group_inclusion_count(
+            index=index,
+            group_vector=group.counts,
+            target=target,
+            prefix_counts=prefix_counts,
+            suffix_counts=suffix_counts,
+        )
+        for index, group in enumerate(groups)
     )
-    return discovery, confirmation
+    return _PartitionSpace(
+        groups=groups,
+        target=target,
+        suffix_counts=suffix_counts,
+        inclusion_counts=inclusion_counts,
+        feasible_count=feasible_count,
+    )
+
+
+def _count_feasible_subsets(
+    group_vectors: tuple[_CountVector, ...],
+    *,
+    target: _CountVector,
+) -> int:
+    """Count exact-quota subsets for a canonical sequence of group vectors."""
+    _validate_group_vectors(group_vectors, target=target)
+    return _suffix_subset_counts(group_vectors, target=target)[0].get(target, 0)
+
+
+def _suffix_subset_counts(
+    group_vectors: tuple[_CountVector, ...],
+    *,
+    target: _CountVector,
+) -> tuple[dict[_CountVector, int], ...]:
+    _validate_group_vectors(group_vectors, target=target)
+    zero = (0,) * len(target)
+    tables: list[dict[_CountVector, int]] = [{} for _ in range(len(group_vectors) + 1)]
+    tables[-1] = {zero: 1}
+    for index in range(len(group_vectors) - 1, -1, -1):
+        vector = group_vectors[index]
+        table = dict(tables[index + 1])
+        for current, count in tables[index + 1].items():
+            added = _add_vectors(current, vector)
+            if _within_target(added, target):
+                table[added] = table.get(added, 0) + count
+        tables[index] = table
+    return tuple(tables)
+
+
+def _prefix_subset_counts(
+    group_vectors: tuple[_CountVector, ...],
+    *,
+    target: _CountVector,
+) -> tuple[dict[_CountVector, int], ...]:
+    zero = (0,) * len(target)
+    tables: list[dict[_CountVector, int]] = [{zero: 1}]
+    for vector in group_vectors:
+        table = dict(tables[-1])
+        for current, count in tables[-1].items():
+            added = _add_vectors(current, vector)
+            if _within_target(added, target):
+                table[added] = table.get(added, 0) + count
+        tables.append(table)
+    return tuple(tables)
+
+
+def _group_inclusion_count(
+    *,
+    index: int,
+    group_vector: _CountVector,
+    target: _CountVector,
+    prefix_counts: tuple[dict[_CountVector, int], ...],
+    suffix_counts: tuple[dict[_CountVector, int], ...],
+) -> int:
+    count = 0
+    for prefix, prefix_count in prefix_counts[index].items():
+        remainder = _subtract_vectors(_subtract_vectors(target, group_vector), prefix)
+        if remainder is not None:
+            count += prefix_count * suffix_counts[index + 1].get(remainder, 0)
+    return count
+
+
+def _group_inclusion_probability(
+    space: _PartitionSpace,
+    index: int,
+) -> GroupInclusionProbability:
+    probability = Fraction(space.inclusion_counts[index], space.feasible_count)
+    return GroupInclusionProbability(
+        group_id=space.groups[index].group_id,
+        discovery_numerator=probability.numerator,
+        denominator=probability.denominator,
+    )
+
+
+def _validate_group_vectors(
+    group_vectors: tuple[_CountVector, ...],
+    *,
+    target: _CountVector,
+) -> None:
+    if not target or any(value < 0 for value in target):
+        raise ValueError("partition target must be a non-empty nonnegative vector")
+    if any(
+        len(vector) != len(target) or any(value < 0 for value in vector) for vector in group_vectors
+    ):
+        raise ValueError("partition group vectors must match the nonnegative target dimensions")
+
+
+def _add_vectors(left: _CountVector, right: _CountVector) -> _CountVector:
+    return tuple(a + b for a, b in zip(left, right, strict=True))
+
+
+def _subtract_vectors(
+    left: _CountVector | None,
+    right: _CountVector,
+) -> _CountVector | None:
+    if left is None:
+        return None
+    result = tuple(a - b for a, b in zip(left, right, strict=True))
+    return None if any(value < 0 for value in result) else result
+
+
+def _within_target(vector: _CountVector, target: _CountVector) -> bool:
+    return all(value <= limit for value, limit in zip(vector, target, strict=True))
+
+
+def _uniform_index(*, seed: str, upper_bound: int) -> int:
+    """Map a CSPRNG seed to an unbiased index using hash-stream rejection sampling."""
+    if isinstance(upper_bound, bool) or not isinstance(upper_bound, int) or upper_bound < 1:
+        raise ValueError("partition index upper bound must be a positive integer")
+    if upper_bound == 1:
+        return 0
+    byte_count = (upper_bound.bit_length() + 7) // 8
+    sample_space = 1 << (8 * byte_count)
+    acceptance_limit = sample_space - sample_space % upper_bound
+    attempt = 0
+    while True:
+        sample = bytearray()
+        block = 0
+        while len(sample) < byte_count:
+            sample.extend(
+                _digest_bytes(
+                    "wmh-uniform-feasible-subset-rank-v1",
+                    seed,
+                    str(attempt),
+                    str(block),
+                )
+            )
+            block += 1
+        value = int.from_bytes(sample[:byte_count], "big")
+        if value < acceptance_limit:
+            return value % upper_bound
+        attempt += 1
+
+
+def _selection_rank_commitment(*, seed: str, feasible_count: int, rank: int) -> str:
+    return _canonical_digest(
+        {
+            "domain": "wmh-uniform-feasible-subset-rank-commitment-v1",
+            "selection_algorithm": PARTITION_SELECTION_ALGORITHM,
+            "selection_seed": seed,
+            "feasible_subset_count": feasible_count,
+            "selection_rank": rank,
+        }
+    )
 
 
 def _confirmation_commitment(
@@ -860,7 +1157,7 @@ def _confirmation_commitment(
         raise ValueError("seal_nonce must be a canonical secret with at least 16 characters")
     return _canonical_digest(
         {
-            "domain": "wmh-benchmark-confirmation-v1",
+            "domain": "wmh-benchmark-confirmation-v2",
             "nonce": nonce,
             "tasks": [task.model_dump(mode="json") for task in tasks],
             "confirmation_task_ids": list(confirmation_ids),

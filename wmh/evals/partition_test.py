@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,8 @@ from wmh.evals.partition import (
     PartitionControlScope,
     PartitionControlStore,
     PartitionTask,
+    _build_partition_space,
+    _count_feasible_subsets,
     freeze_confirmation_candidate,
     initialize_partition_genesis,
     open_confirmation_once,
@@ -104,6 +108,75 @@ def test_partition_is_canonical_exact_and_never_splits_a_group(tmp_path: Path) -
         partition = "discovery" if task.task_id in manifest.discovery_task_ids else "confirmation"
         by_group.setdefault(task.group_id, set()).add(partition)
     assert all(len(partitions) == 1 for partitions in by_group.values())
+
+
+def test_uniform_partition_space_exhaustively_unranks_each_feasible_subset_once() -> None:
+    tasks = (
+        _task("easy-a", "easy", "easy-a"),
+        _task("easy-b", "easy", "easy-b"),
+        _task("medium-a", "medium", "medium-a"),
+        _task("medium-b", "medium", "medium-b"),
+        _task("mixed-easy", "easy", "mixed"),
+        _task("mixed-medium", "medium", "mixed"),
+    )
+    space = _build_partition_space(
+        tasks,
+        {"easy": 1, "medium": 1},
+    )
+
+    selected = tuple(space.discovery_groups_for_rank(rank) for rank in range(space.feasible_count))
+
+    assert space.feasible_count == 5
+    assert len(selected) == len(set(selected))
+    assert set(selected) == {
+        ("easy-a", "medium-a"),
+        ("easy-a", "medium-b"),
+        ("easy-b", "medium-a"),
+        ("easy-b", "medium-b"),
+        ("mixed",),
+    }
+    observed = Counter(group for subset in selected for group in subset)
+    assert space.discovery_inclusion_probability("mixed") == Fraction(1, 5)
+    for group_id in ("easy-a", "easy-b", "medium-a", "medium-b"):
+        assert observed[group_id] == 2
+        assert space.discovery_inclusion_probability(group_id) == Fraction(2, 5)
+
+
+def test_manifest_persists_uniform_selection_evidence_and_exact_probabilities(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(_store(tmp_path))
+
+    assert manifest.partition_version == "2"
+    assert manifest.selection_algorithm == "uniform-feasible-subsets-v1"
+    assert manifest.feasible_subset_count > 1
+    assert manifest.selection_rank_commitment.startswith("sha256:")
+    assert tuple(item.group_id for item in manifest.group_inclusion_probabilities) == tuple(
+        sorted({task.group_id for task in manifest.tasks})
+    )
+    for item in manifest.group_inclusion_probabilities:
+        probability = Fraction(item.discovery_numerator, item.denominator)
+        assert 0 <= probability <= 1
+    assert any(
+        0 < item.discovery_probability < 1 for item in manifest.group_inclusion_probabilities
+    )
+
+
+def test_large_grouped_roster_feasible_count_regression() -> None:
+    group_vectors = (
+        *((0, 0, 1),) * 44,
+        *((0, 0, 2),) * 3,
+        *((0, 1, 0),) * 19,
+        *((0, 1, 1),) * 3,
+        *((0, 2, 0),) * 3,
+        (0, 2, 1),
+        *((1, 0, 0),) * 3,
+        (1, 0, 1),
+    )
+
+    assert _count_feasible_subsets(group_vectors, target=(1, 10, 19)) == (
+        20_533_886_319_672_671_229
+    )
 
 
 def test_impossible_grouped_quota_fails_before_any_score_exists(tmp_path: Path) -> None:
@@ -366,6 +439,16 @@ def test_freeze_and_open_revalidate_copied_manifest_instances(tmp_path: Path) ->
         open_confirmation_once(
             store,
             manifest=changed_membership,
+            confirmation_protocol_digest=_protocol_digest(),
+        )
+
+    changed_selection_evidence = manifest.model_copy(
+        update={"feasible_subset_count": manifest.feasible_subset_count + 1}
+    )
+    with pytest.raises(ValidationError, match="selection evidence"):
+        open_confirmation_once(
+            store,
+            manifest=changed_selection_evidence,
             confirmation_protocol_digest=_protocol_digest(),
         )
 

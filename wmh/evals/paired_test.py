@@ -1,4 +1,4 @@
-"""Tests for deterministic paired benchmark design and task-clustered analysis."""
+"""Tests for deterministic paired benchmark design and fixed-roster analysis."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from wmh.evals.paired import (
     PairedBlockOutcome,
     PairedEvaluationDesign,
     PairedPanelPlan,
+    PairedTaskPlan,
     _bounded_mean_interval,
     _bounded_mean_log_e,
+    _bounded_mean_lower_bound,
     _bounded_mean_p,
     _divide_float_downward,
     _holm_adjust,
@@ -30,14 +32,18 @@ def _design(
     panel_members: tuple[str, ...] = ("small", "medium", "large"),
     attempts: int = 2,
     attempts_by_member: dict[str, int] | None = None,
-    bounded_mean_bets: tuple[BoundedMeanBet, ...] | None = None,
+    primary_e_value_bets: tuple[BoundedMeanBet, ...] | None = None,
     noninferiority_margin: float = 0.02,
+    grouped_tasks: tuple[PairedTaskPlan, ...] | None = None,
 ) -> PairedEvaluationDesign:
     attempt_counts = attempts_by_member or {
         panel_member: attempts for panel_member in panel_members
     }
+    tasks = grouped_tasks or tuple(
+        PairedTaskPlan(task_id=task_id, group_id=task_id) for task_id in task_ids
+    )
     return PairedEvaluationDesign.create(
-        task_ids=task_ids,
+        tasks=tasks,
         panel=tuple(
             PairedPanelPlan(
                 panel_member=panel_member,
@@ -45,12 +51,11 @@ def _design(
             )
             for panel_member in panel_members
         ),
-        bounded_mean_bets=bounded_mean_bets or (BoundedMeanBet(fraction=1.0, weight=1.0),),
+        primary_e_value_bets=primary_e_value_bets or (BoundedMeanBet(fraction=1.0, weight=1.0),),
         schedule_seed="schedule-v1",
         analysis_seed="analysis-v1",
         randomization_samples=2_000,
-        minimum_panel_delta=0.05,
-        minimum_member_delta=0.03,
+        minimum_equal_task_member_delta=0.03,
         noninferiority_margin=noninferiority_margin,
     )
 
@@ -84,6 +89,7 @@ def test_schedule_is_deterministic_complete_and_balanced_within_tasks() -> None:
     assert design == repeated
     assert design == reordered
     assert design.digest == repeated.digest
+    assert design.task_ids == tuple(sorted(task_ids))
     assert len(design.blocks) == 5 * 3 * 3
     for member in design.panel_members:
         first_arm_by_task: dict[str, Counter[PairedArm]] = {}
@@ -96,6 +102,205 @@ def test_schedule_is_deterministic_complete_and_balanced_within_tasks() -> None:
         )
         total = sum(first_arm_by_task.values(), Counter())
         assert abs(total[PairedArm.BASELINE] - total[PairedArm.CANDIDATE]) == 1
+
+
+def test_primary_bounded_mean_rejects_zero_se_five_point_counterexample() -> None:
+    # Under the independent mean-zero null X_g=.05 with probability 1/1.05
+    # and X_g=-1 otherwise. All 50 observations equal .05 with probability
+    # (1/1.05)^50, so a zero jackknife SE cannot make that event significant.
+    task_ids = tuple(f"task-{index:02d}" for index in range(50))
+    design = _design(task_ids=task_ids, attempts=20)
+    outcomes = [
+        PairedBlockOutcome(
+            block=block,
+            baseline_reward=0.0,
+            candidate_reward=float(block.attempt == 1),
+        )
+        for block in design.blocks
+    ]
+
+    report = analyze_paired_outcomes(design, outcomes)
+
+    assert report.equal_task_member_deltas == {
+        "large": pytest.approx(0.05),
+        "medium": pytest.approx(0.05),
+        "small": pytest.approx(0.05),
+    }
+    assert report.semantic_cluster_sensitivity_positive_p == report.primary_positive_p
+    null_all_positive_probability = 1 / 1.05**50
+    assert null_all_positive_probability > design.alpha
+    assert all(
+        value == pytest.approx(null_all_positive_probability)
+        for value in report.primary_positive_p.values()
+    )
+    assert all(value <= 0.0 for value in report.primary_lower_bounds.values())
+    assert all(value > 0.0 for value in report.model_based_jackknife_lower_bounds.values())
+    assert all(
+        value > 0.0 for value in report.model_based_jackknife_bonferroni_lower_bounds.values()
+    )
+    assert report.equal_task_member_lifts_passed is True
+    assert report.member_primary_bounds_passed is False
+    assert report.member_model_based_jackknife_bounds_passed is True
+    assert report.member_model_based_jackknife_bonferroni_bounds_passed is True
+    assert report.passed is False
+
+
+def test_primary_bounded_mean_passes_strong_fixed_roster_effect() -> None:
+    task_ids = tuple(f"task-{index:02d}" for index in range(50))
+    design = _design(task_ids=task_ids, attempts=20)
+    outcomes = [
+        PairedBlockOutcome(
+            block=block,
+            baseline_reward=0.0,
+            candidate_reward=float(block.attempt <= 2),
+        )
+        for block in design.blocks
+    ]
+
+    report = analyze_paired_outcomes(design, outcomes)
+
+    assert all(value == pytest.approx(1 / 1.1**50) for value in report.primary_positive_p.values())
+    assert all(value > 0.0 for value in report.primary_lower_bounds.values())
+    assert report.equal_task_member_lifts_passed is True
+    assert report.member_primary_bounds_passed is True
+    assert report.passed is True
+
+
+def test_primary_iut_uses_unadjusted_alpha_for_every_lane() -> None:
+    task_ids = tuple(f"task-{index:02d}" for index in range(59))
+    design = _design(task_ids=task_ids, attempts=1)
+    outcomes = [
+        PairedBlockOutcome(
+            block=block,
+            baseline_reward=0.0,
+            candidate_reward=float(int(block.task_id.removeprefix("task-")) < 5),
+        )
+        for block in design.blocks
+    ]
+
+    report = analyze_paired_outcomes(design, outcomes)
+
+    assert all(value == pytest.approx(1 / 32) for value in report.primary_positive_p.values())
+    assert all(value > 0.0 for value in report.primary_lower_bounds.values())
+    assert report.equal_task_member_lifts_passed is True
+    assert report.member_primary_bounds_passed is True
+    assert report.passed is True
+
+
+def test_semantic_groups_affect_only_the_conservative_sensitivity() -> None:
+    task_ids = tuple(f"task-{index:02d}" for index in range(59))
+    grouped_tasks = tuple(
+        PairedTaskPlan(
+            task_id=task_id,
+            group_id="shared-family" if index < 6 else task_id,
+        )
+        for index, task_id in enumerate(task_ids)
+    )
+    singleton = _design(task_ids=task_ids, attempts=1)
+    grouped = _design(task_ids=task_ids, attempts=1, grouped_tasks=grouped_tasks)
+
+    def outcomes(design: PairedEvaluationDesign) -> list[PairedBlockOutcome]:
+        return [
+            PairedBlockOutcome(
+                block=block,
+                baseline_reward=0.0,
+                candidate_reward=float(int(block.task_id.removeprefix("task-")) < 6),
+            )
+            for block in design.blocks
+        ]
+
+    singleton_report = analyze_paired_outcomes(singleton, outcomes(singleton))
+    grouped_report = analyze_paired_outcomes(grouped, outcomes(grouped))
+
+    assert singleton_report.passed is True
+    assert grouped_report.passed is True
+    assert singleton_report.primary_lower_bounds == grouped_report.primary_lower_bounds
+    assert singleton_report.member_semantic_cluster_sensitivity_bounds_positive is True
+    assert grouped_report.member_semantic_cluster_sensitivity_bounds_positive is False
+    assert all(
+        member.model_based_jackknife_degrees_of_freedom == 53 for member in grouped_report.members
+    )
+    assert all(
+        member.semantic_cluster_sensitivity_lower_bound < 0.0 for member in grouped_report.members
+    )
+
+
+def test_unequal_semantic_clusters_preserve_the_equal_task_estimand() -> None:
+    # A naive equal-cluster product would be .8 * 2**10 and would reject even
+    # though the observed equal-task effect is negative. The registered weights
+    # instead scale every singleton cluster by (1/100)/(90/100) = 1/90.
+    task_ids = tuple(f"task-{index:03d}" for index in range(100))
+    tasks = tuple(
+        PairedTaskPlan(
+            task_id=task_id,
+            group_id="large-family" if index < 90 else task_id,
+        )
+        for index, task_id in enumerate(task_ids)
+    )
+    design = _design(
+        task_ids=task_ids,
+        panel_members=("member",),
+        attempts=5,
+        grouped_tasks=tasks,
+    )
+    outcomes = [
+        PairedBlockOutcome(
+            block=block,
+            baseline_reward=float(
+                int(block.task_id.removeprefix("task-")) < 90 and block.attempt == 1
+            ),
+            candidate_reward=float(int(block.task_id.removeprefix("task-")) >= 90),
+        )
+        for block in design.blocks
+    ]
+
+    report = analyze_paired_outcomes(design, outcomes)
+    sensitivity_deltas = (-0.2,) + (1.0,) * 10
+    sensitivity_scales = (Fraction(1),) + (Fraction(1, 90),) * 10
+    equal_task_group_weights = (Fraction(90, 100),) + (Fraction(1, 100),) * 10
+    expected_e_value = 0.8 * (91 / 90) ** 10
+
+    assert report.equal_task_member_deltas == {"member": pytest.approx(-0.08)}
+    assert float(
+        sum(
+            weight * Fraction.from_float(delta)
+            for weight, delta in zip(equal_task_group_weights, sensitivity_deltas, strict=True)
+        )
+    ) == pytest.approx(report.equal_task_member_deltas["member"], abs=1e-15)
+    assert 0.8 * 2**10 > 1 / design.alpha
+    assert math.exp(
+        _bounded_mean_log_e(
+            sensitivity_deltas,
+            null_mean=0.0,
+            bets=design.primary_e_value_bets,
+            observation_scales=sensitivity_scales,
+        )
+    ) == pytest.approx(expected_e_value)
+    assert expected_e_value < 1.0
+    assert report.semantic_cluster_sensitivity_positive_p == {"member": 1.0}
+    assert report.semantic_cluster_sensitivity_lower_bounds["member"] < 0.0
+    assert report.member_semantic_cluster_sensitivity_bounds_positive is False
+    assert report.passed is False
+
+
+def test_design_binds_semantic_clusters_and_requires_two_sensitivity_units() -> None:
+    task_ids = ("task-a", "task-b", "task-c")
+    singleton = _design(task_ids=task_ids)
+    grouped = tuple(PairedTaskPlan(task_id=task_id, group_id="one-family") for task_id in task_ids)
+
+    with pytest.raises(ValidationError, match="at least two semantic sensitivity clusters"):
+        _design(task_ids=task_ids, grouped_tasks=grouped)
+
+    regrouped = _design(
+        task_ids=task_ids,
+        grouped_tasks=(
+            PairedTaskPlan(task_id="task-a", group_id="shared-family"),
+            PairedTaskPlan(task_id="task-b", group_id="shared-family"),
+            PairedTaskPlan(task_id="task-c", group_id="task-c"),
+        ),
+    )
+    assert regrouped.task_ids == singleton.task_ids
+    assert regrouped.digest != singleton.digest
 
 
 def test_schedule_exactly_balances_even_attempt_counts_within_each_task() -> None:
@@ -179,15 +384,15 @@ def test_design_rejects_a_schedule_that_differs_from_its_frozen_seed() -> None:
         )
 
 
-def test_bounded_mean_bets_are_frozen_canonical_and_part_of_the_digest() -> None:
+def test_primary_e_value_bets_are_frozen_canonical_and_part_of_the_digest() -> None:
     first = _design(
-        bounded_mean_bets=(
+        primary_e_value_bets=(
             BoundedMeanBet(fraction=1.0, weight=0.4),
             BoundedMeanBet(fraction=0.25, weight=0.6),
         )
     )
     reordered = _design(
-        bounded_mean_bets=(
+        primary_e_value_bets=(
             BoundedMeanBet(fraction=0.25, weight=0.6),
             BoundedMeanBet(fraction=1.0, weight=0.4),
         )
@@ -195,9 +400,9 @@ def test_bounded_mean_bets_are_frozen_canonical_and_part_of_the_digest() -> None
 
     assert first == reordered
     assert first.digest == reordered.digest
-    assert tuple(bet.fraction for bet in first.bounded_mean_bets) == (0.25, 1.0)
+    assert tuple(bet.fraction for bet in first.primary_e_value_bets) == (0.25, 1.0)
     changed = _design(
-        bounded_mean_bets=(
+        primary_e_value_bets=(
             BoundedMeanBet(fraction=0.25, weight=0.4),
             BoundedMeanBet(fraction=1.0, weight=0.6),
         )
@@ -205,24 +410,47 @@ def test_bounded_mean_bets_are_frozen_canonical_and_part_of_the_digest() -> None
     assert changed.digest != first.digest
 
 
-def test_bounded_mean_bets_reject_duplicates_and_unnormalized_weights() -> None:
+def test_calibrated_binary_fraction_bet_mixture_is_bound_exactly() -> None:
+    design = _design(
+        task_ids=tuple(f"task-{index:02d}" for index in range(59)),
+        attempts=20,
+        primary_e_value_bets=(
+            BoundedMeanBet(fraction=0.25, weight=1 / 16),
+            BoundedMeanBet(fraction=0.5, weight=1 / 16),
+            BoundedMeanBet(fraction=1.0, weight=7 / 8),
+        ),
+    )
+
+    assert tuple(
+        (Fraction.from_float(bet.fraction), Fraction.from_float(bet.weight))
+        for bet in design.primary_e_value_bets
+    ) == (
+        (Fraction(1, 4), Fraction(1, 16)),
+        (Fraction(1, 2), Fraction(1, 16)),
+        (Fraction(1), Fraction(7, 8)),
+    )
+    assert design.attempts_by_member == {"large": 20, "medium": 20, "small": 20}
+    assert design.minimum_equal_task_member_delta == 0.03
+
+
+def test_primary_e_value_bets_reject_duplicates_and_unnormalized_weights() -> None:
     with pytest.raises(ValueError, match="duplicate fractions"):
         _design(
-            bounded_mean_bets=(
+            primary_e_value_bets=(
                 BoundedMeanBet(fraction=0.5, weight=0.5),
                 BoundedMeanBet(fraction=0.5, weight=0.5),
             )
         )
     with pytest.raises(ValueError, match="sum to one"):
         _design(
-            bounded_mean_bets=(
+            primary_e_value_bets=(
                 BoundedMeanBet(fraction=0.25, weight=0.4),
                 BoundedMeanBet(fraction=1.0, weight=0.4),
             )
         )
     with pytest.raises(ValueError, match="sum to one"):
         _design(
-            bounded_mean_bets=(
+            primary_e_value_bets=(
                 BoundedMeanBet(fraction=0.1, weight=0.07),
                 BoundedMeanBet(fraction=0.5, weight=0.14),
                 BoundedMeanBet(fraction=1.0, weight=0.79),
@@ -264,35 +492,56 @@ def test_uniform_lift_passes_every_frozen_criterion() -> None:
         _outcomes(design, baseline=0.0, candidate=1.0),
     )
 
-    assert report.panel_delta == 1.0
-    assert report.analysis_version == "2"
+    assert report.equal_task_panel_delta == 1.0
+    assert report.analysis_version == "5"
+    assert (
+        report.primary_estimand
+        == "fixed-roster-equal-task-conditional-expected-paired-reward-delta"
+    )
+    assert (
+        report.primary_evidence_method
+        == "fixed-horizon-independent-task-bounded-mean-e-value-inverted-lower-bound"
+    )
+    assert (
+        report.semantic_cluster_sensitivity_method
+        == "weighted-semantic-cluster-bounded-mean-e-value-inverted-lower-bound"
+    )
+    assert (
+        report.model_based_diagnostic_method == "leave-one-semantic-cluster-out-jackknife-student-t"
+    )
+    assert report.primary_combination_rule == "intersection-union-all-lanes"
     assert report.design_digest == design.digest
     assert report.outcome_digest.startswith("sha256:")
-    assert report.member_deltas == {"large": 1.0, "medium": 1.0, "small": 1.0}
-    assert report.raw_positive_p == {
+    assert report.equal_task_member_deltas == {
+        "large": 1.0,
+        "medium": 1.0,
+        "small": 1.0,
+    }
+    assert report.semantic_cluster_sensitivity_positive_p == report.primary_positive_p
+    assert report.primary_positive_p == {
         "large": pytest.approx(2.0**-12),
         "medium": pytest.approx(2.0**-12),
         "small": pytest.approx(2.0**-12),
     }
-    assert report.label_swap_p < 0.05
-    assert report.panel_mean_p < 0.05
-    assert report.cluster_interval.lower > 0.0
-    assert report.cluster_interval.upper == 1.0
-    assert all(value < 0.05 for value in report.holm_noninferiority_p.values())
-    assert report.panel_lift_passed is True
-    assert report.member_lifts_passed is True
-    assert report.member_positive_passed is True
-    assert report.member_intervals_passed is True
-    assert all(value < 0.05 for value in report.holm_positive_p.values())
-    assert all(value > 0.0 for value in report.simultaneous_lower_bounds.values())
-    assert report.label_swap_passed is True
-    assert report.panel_mean_passed is True
-    assert report.cluster_interval_passed is True
-    assert report.noninferiority_passed is True
+    assert all(value > 0.0 for value in report.primary_lower_bounds.values())
+    assert report.model_based_label_swap_p < 0.05
+    assert all(value > 0.0 for value in report.semantic_cluster_sensitivity_lower_bounds.values())
+    assert all(value < 0.05 for value in report.secondary_holm_noninferiority_p.values())
+    assert report.equal_task_member_lifts_passed is True
+    assert report.member_primary_bounds_passed is True
+    assert report.member_semantic_cluster_sensitivity_bounds_positive is True
+    assert report.member_model_based_jackknife_bounds_passed is True
+    assert report.member_model_based_jackknife_bonferroni_bounds_passed is True
+    assert all(value > 0.0 for value in report.model_based_jackknife_lower_bounds.values())
+    assert all(
+        value > 0.0 for value in report.model_based_jackknife_bonferroni_lower_bounds.values()
+    )
+    assert report.model_based_label_swap_passed is True
+    assert report.secondary_noninferiority_passed is True
     assert report.passed is True
 
 
-def test_passed_uses_only_member_floors_and_simultaneous_lower_bounds() -> None:
+def test_passed_uses_only_member_floors_and_primary_iut_bounds() -> None:
     design = _design(task_ids=tuple(f"task-{index}" for index in range(12)))
     report = analyze_paired_outcomes(
         design,
@@ -301,20 +550,25 @@ def test_passed_uses_only_member_floors_and_simultaneous_lower_bounds() -> None:
 
     diagnostics_failed = report.model_copy(
         update={
-            "panel_lift_passed": False,
-            "member_positive_passed": False,
-            "label_swap_passed": False,
-            "panel_mean_passed": False,
-            "cluster_interval_passed": False,
-            "noninferiority_passed": False,
+            "member_semantic_cluster_sensitivity_bounds_positive": False,
+            "member_model_based_jackknife_bounds_passed": False,
+            "member_model_based_jackknife_bonferroni_bounds_passed": False,
+            "model_based_label_swap_passed": False,
+            "secondary_noninferiority_passed": False,
         }
     )
 
-    assert diagnostics_failed.member_lifts_passed is True
-    assert diagnostics_failed.member_intervals_passed is True
+    assert diagnostics_failed.equal_task_member_lifts_passed is True
+    assert diagnostics_failed.member_primary_bounds_passed is True
     assert diagnostics_failed.passed is True
-    assert diagnostics_failed.model_copy(update={"member_lifts_passed": False}).passed is False
-    assert diagnostics_failed.model_copy(update={"member_intervals_passed": False}).passed is False
+    assert (
+        diagnostics_failed.model_copy(update={"equal_task_member_lifts_passed": False}).passed
+        is False
+    )
+    assert (
+        diagnostics_failed.model_copy(update={"member_primary_bounds_passed": False}).passed
+        is False
+    )
 
 
 def test_panel_average_cannot_hide_a_member_below_the_lift_floor() -> None:
@@ -332,15 +586,16 @@ def test_panel_average_cannot_hide_a_member_below_the_lift_floor() -> None:
 
     report = analyze_paired_outcomes(design, outcomes)
 
-    assert report.panel_delta > design.minimum_panel_delta
-    assert report.member_deltas["small"] == 0.0
-    assert report.member_lifts_passed is False
-    assert report.member_positive_passed is False
-    assert report.member_intervals_passed is False
+    assert report.equal_task_panel_delta > design.minimum_equal_task_member_delta
+    assert report.equal_task_member_deltas["small"] == 0.0
+    assert report.equal_task_member_lifts_passed is False
+    assert report.member_primary_bounds_passed is False
+    assert report.member_model_based_jackknife_bounds_passed is False
+    assert report.member_model_based_jackknife_bonferroni_bounds_passed is False
     assert report.passed is False
 
 
-def test_repeated_attempts_do_not_inflate_member_primary_sample_size() -> None:
+def test_repeated_attempts_are_averaged_before_fixed_roster_inference() -> None:
     design = _design(
         task_ids=tuple(f"task-{index:02d}" for index in range(59)),
         attempts=25,
@@ -356,13 +611,13 @@ def test_repeated_attempts_do_not_inflate_member_primary_sample_size() -> None:
 
     report = analyze_paired_outcomes(design, outcomes)
 
-    assert report.panel_delta == pytest.approx(0.04)
-    assert report.panel_lift_passed is False
-    assert report.panel_mean_passed is False
-    assert report.cluster_interval_passed is False
-    assert report.member_lifts_passed is True
-    assert report.member_positive_passed is False
-    assert report.member_intervals_passed is False
+    assert report.equal_task_panel_delta == pytest.approx(0.04)
+    assert report.equal_task_member_lifts_passed is True
+    assert report.member_primary_bounds_passed is False
+    assert report.member_semantic_cluster_sensitivity_bounds_positive is False
+    assert report.member_model_based_jackknife_bounds_passed is True
+    assert report.member_model_based_jackknife_bonferroni_bounds_passed is True
+    assert all(member.model_based_jackknife_degrees_of_freedom == 58 for member in report.members)
     assert report.passed is False
 
 
@@ -373,14 +628,13 @@ def test_no_lift_fails_every_positive_evidence_gate() -> None:
         _outcomes(design, baseline=0.0, candidate=0.0),
     )
 
-    assert report.panel_delta == 0.0
-    assert report.panel_lift_passed is False
-    assert report.member_lifts_passed is False
-    assert report.member_positive_passed is False
-    assert report.member_intervals_passed is False
-    assert report.label_swap_passed is False
-    assert report.panel_mean_passed is False
-    assert report.cluster_interval_passed is False
+    assert report.equal_task_panel_delta == 0.0
+    assert report.equal_task_member_lifts_passed is False
+    assert report.member_primary_bounds_passed is False
+    assert report.member_model_based_jackknife_bounds_passed is False
+    assert report.member_model_based_jackknife_bonferroni_bounds_passed is False
+    assert report.model_based_label_swap_passed is False
+    assert report.member_semantic_cluster_sensitivity_bounds_positive is False
     assert report.passed is False
 
 
@@ -407,8 +661,8 @@ def test_exact_task_cluster_randomization_flips_all_panel_members_together() -> 
 
     report = analyze_paired_outcomes(design, outcomes)
 
-    assert report.panel_delta == 0.0
-    assert report.label_swap_p == 0.75
+    assert report.equal_task_panel_delta == 0.0
+    assert report.model_based_label_swap_p == 0.75
 
 
 def test_bounded_mean_gate_rejects_the_sign_flip_rare_tail_counterexample() -> None:
@@ -425,12 +679,10 @@ def test_bounded_mean_gate_rejects_the_sign_flip_rare_tail_counterexample() -> N
 
     report = analyze_paired_outcomes(design, outcomes)
 
-    assert report.panel_delta == pytest.approx(1 / 49)
-    assert report.label_swap_passed is True
-    assert report.panel_mean_p == pytest.approx((49 / 50) ** 59)
-    assert report.panel_mean_passed is False
-    assert report.cluster_interval.lower <= 0.0
-    assert report.cluster_interval_passed is False
+    assert report.equal_task_panel_delta == pytest.approx(1 / 49)
+    assert report.model_based_label_swap_passed is True
+    assert report.primary_positive_p["member"] == pytest.approx((49 / 50) ** 59)
+    assert report.primary_lower_bounds["member"] <= 0.0
     assert report.passed is False
 
 
@@ -442,17 +694,17 @@ def test_noninferiority_uses_the_weak_mean_null_without_sign_flipping_margin() -
     )
     expected_raw = 0.98**59
 
-    assert report.raw_noninferiority_p == {
+    assert report.secondary_noninferiority_p == {
         "large": pytest.approx(expected_raw),
         "medium": pytest.approx(expected_raw),
         "small": pytest.approx(expected_raw),
     }
-    assert report.holm_noninferiority_p == {
+    assert report.secondary_holm_noninferiority_p == {
         "large": pytest.approx(3 * expected_raw),
         "medium": pytest.approx(3 * expected_raw),
         "small": pytest.approx(3 * expected_raw),
     }
-    assert report.noninferiority_passed is False
+    assert report.secondary_noninferiority_passed is False
 
 
 def test_bounded_mean_evidence_handles_boundary_losses_and_log_space() -> None:
@@ -461,17 +713,17 @@ def test_bounded_mean_evidence_handles_boundary_losses_and_log_space() -> None:
         losing,
         _outcomes(losing, baseline=1.0, candidate=0.0),
     )
-    assert losing_report.panel_mean_p == 1.0
-    assert losing_report.cluster_interval.lower == -1.0
-    assert losing_report.cluster_interval.upper < 0.0
+    assert all(value == 1.0 for value in losing_report.primary_positive_p.values())
+    assert all(value == -1.0 for value in losing_report.primary_lower_bounds.values())
 
     winning_report = analyze_paired_outcomes(
         losing,
         _outcomes(losing, baseline=0.0, candidate=1.0),
     )
-    assert winning_report.panel_mean_p == pytest.approx(2.0**-200)
-    assert winning_report.cluster_interval.lower > 0.0
-    assert winning_report.cluster_interval.upper == 1.0
+    assert all(
+        value == pytest.approx(2.0**-200) for value in winning_report.primary_positive_p.values()
+    )
+    assert all(value > 0.0 for value in winning_report.primary_lower_bounds.values())
 
 
 def test_bounded_mean_interval_rounds_outward_at_the_analytic_boundary() -> None:
@@ -499,10 +751,10 @@ def test_noninferiority_supports_the_negative_one_boundary_null() -> None:
         _outcomes(design, baseline=0.0, candidate=0.0),
     )
 
-    assert all(value == 1.0 for value in all_losses.raw_noninferiority_p.values())
-    assert all_losses.noninferiority_passed is False
-    assert all(value == 0.0 for value in ties.raw_noninferiority_p.values())
-    assert ties.noninferiority_passed is True
+    assert all(value == 1.0 for value in all_losses.secondary_noninferiority_p.values())
+    assert all_losses.secondary_noninferiority_passed is False
+    assert all(value == 0.0 for value in ties.secondary_noninferiority_p.values())
+    assert ties.secondary_noninferiority_passed is True
 
 
 def test_bounded_mean_evidence_stays_finite_for_large_preregistered_mixtures() -> None:
@@ -516,6 +768,25 @@ def test_bounded_mean_evidence_stays_finite_for_large_preregistered_mixtures() -
     assert _bounded_mean_log_e((-1.0,) * 10_000, null_mean=0.0, bets=bets) < 0.0
     single_bet = (BoundedMeanBet(fraction=1.0, weight=1.0),)
     assert _bounded_mean_p((1.0,) * 2_000, null_mean=0.0, bets=single_bet) == math.ulp(0.0)
+
+
+def test_bounded_mean_evidence_rejects_invalid_preregistered_scales() -> None:
+    bets = (BoundedMeanBet(fraction=1.0, weight=1.0),)
+
+    with pytest.raises(ValueError, match="must match"):
+        _bounded_mean_p(
+            (0.0, 0.0),
+            null_mean=-1.0,
+            bets=bets,
+            observation_scales=(Fraction(1),),
+        )
+    with pytest.raises(ValueError, match=r"\(0, 1\]"):
+        _bounded_mean_p(
+            (0.0,),
+            null_mean=0.0,
+            bets=bets,
+            observation_scales=(Fraction(0),),
+        )
 
 
 @pytest.mark.parametrize(
@@ -585,6 +856,62 @@ def test_bounded_mean_nonidentical_null_calibration() -> None:
 
     assert rejection_probability <= 0.05 + 1e-12
     assert noncoverage_probability <= 0.05 + 1e-12
+
+
+def test_weighted_semantic_cluster_null_calibration() -> None:
+    high_probabilities = (0.99, 0.01, 0.8, 0.2, 0.99, 0.01, 0.7, 0.3)
+    scales = (
+        Fraction(1),
+        Fraction(1),
+        Fraction(1),
+        Fraction(1),
+        Fraction(1, 2),
+        Fraction(1, 2),
+        Fraction(1, 4),
+        Fraction(1, 4),
+    )
+    assert sum(
+        float(scale) * (2.0 * probability - 1.0)
+        for scale, probability in zip(scales, high_probabilities, strict=True)
+    ) == pytest.approx(0.0)
+    bets = (
+        BoundedMeanBet(fraction=0.1, weight=0.2),
+        BoundedMeanBet(fraction=0.5, weight=0.3),
+        BoundedMeanBet(fraction=1.0, weight=0.5),
+    )
+    rejection_probability = 0.0
+    lower_noncoverage_probability = 0.0
+    for mask in range(1 << len(high_probabilities)):
+        deltas: list[float] = []
+        probability = 1.0
+        for index, high_probability in enumerate(high_probabilities):
+            high = bool(mask & (1 << index))
+            deltas.append(1.0 if high else -1.0)
+            probability *= high_probability if high else 1.0 - high_probability
+        frozen_deltas = tuple(deltas)
+        if (
+            _bounded_mean_p(
+                frozen_deltas,
+                null_mean=0.0,
+                bets=bets,
+                observation_scales=scales,
+            )
+            < 0.05
+        ):
+            rejection_probability += probability
+        if (
+            _bounded_mean_lower_bound(
+                frozen_deltas,
+                alpha=0.05,
+                bets=bets,
+                observation_scales=scales,
+            )
+            > 0.0
+        ):
+            lower_noncoverage_probability += probability
+
+    assert rejection_probability <= 0.05 + 1e-12
+    assert lower_noncoverage_probability <= 0.05 + 1e-12
 
 
 def test_holm_adjustment_is_order_invariant_and_stable_across_ties() -> None:

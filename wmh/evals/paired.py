@@ -1,4 +1,4 @@
-"""Deterministic paired benchmark blocks and task-clustered panel analysis."""
+"""Deterministic paired benchmark blocks and fixed-roster panel analysis."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import math
 import random
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from enum import StrEnum
 from fractions import Fraction
 from statistics import fmean
@@ -21,8 +22,24 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from scipy.stats import t as student_t
 
-PAIRED_ANALYSIS_VERSION: Literal["2"] = "2"
+PAIRED_ANALYSIS_VERSION: Literal["5"] = "5"
+PAIRED_PRIMARY_ESTIMAND: Literal[
+    "fixed-roster-equal-task-conditional-expected-paired-reward-delta"
+] = "fixed-roster-equal-task-conditional-expected-paired-reward-delta"
+PAIRED_PRIMARY_EVIDENCE_METHOD: Literal[
+    "fixed-horizon-independent-task-bounded-mean-e-value-inverted-lower-bound"
+] = "fixed-horizon-independent-task-bounded-mean-e-value-inverted-lower-bound"
+PAIRED_SEMANTIC_CLUSTER_SENSITIVITY_METHOD: Literal[
+    "weighted-semantic-cluster-bounded-mean-e-value-inverted-lower-bound"
+] = "weighted-semantic-cluster-bounded-mean-e-value-inverted-lower-bound"
+PAIRED_MODEL_BASED_DIAGNOSTIC_METHOD: Literal[
+    "leave-one-semantic-cluster-out-jackknife-student-t"
+] = "leave-one-semantic-cluster-out-jackknife-student-t"
+PAIRED_PRIMARY_COMBINATION_RULE: Literal["intersection-union-all-lanes"] = (
+    "intersection-union-all-lanes"
+)
 
 
 class PairedArm(StrEnum):
@@ -52,6 +69,22 @@ class PairedPanelPlan(BaseModel):
     def _reject_boolean_attempts(cls, value: int) -> int:
         if isinstance(value, bool):
             raise ValueError("panel attempts cannot be boolean")
+        return value
+
+
+class PairedTaskPlan(BaseModel):
+    """One task identity and its predeclared semantic sensitivity cluster."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str = Field(min_length=1)
+    group_id: str = Field(min_length=1)
+
+    @field_validator("task_id", "group_id")
+    @classmethod
+    def _require_canonical_identity(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("paired task identities cannot have surrounding whitespace")
         return value
 
 
@@ -92,16 +125,34 @@ class PairedEvaluationDesign(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    analysis_version: Literal["2"] = PAIRED_ANALYSIS_VERSION
-    task_ids: tuple[str, ...]
+    analysis_version: Literal["5"] = PAIRED_ANALYSIS_VERSION
+    primary_estimand: Literal[
+        "fixed-roster-equal-task-conditional-expected-paired-reward-delta"
+    ] = PAIRED_PRIMARY_ESTIMAND
+    primary_evidence_method: Literal[
+        "fixed-horizon-independent-task-bounded-mean-e-value-inverted-lower-bound"
+    ] = PAIRED_PRIMARY_EVIDENCE_METHOD
+    semantic_cluster_sensitivity_method: Literal[
+        "weighted-semantic-cluster-bounded-mean-e-value-inverted-lower-bound"
+    ] = PAIRED_SEMANTIC_CLUSTER_SENSITIVITY_METHOD
+    model_based_diagnostic_method: Literal["leave-one-semantic-cluster-out-jackknife-student-t"] = (
+        PAIRED_MODEL_BASED_DIAGNOSTIC_METHOD
+    )
+    primary_combination_rule: Literal["intersection-union-all-lanes"] = (
+        PAIRED_PRIMARY_COMBINATION_RULE
+    )
+    tasks: tuple[PairedTaskPlan, ...]
     panel: tuple[PairedPanelPlan, ...]
-    bounded_mean_bets: tuple[BoundedMeanBet, ...]
+    primary_e_value_bets: tuple[BoundedMeanBet, ...]
     schedule_seed: str = Field(min_length=1)
     analysis_seed: str = Field(min_length=1)
     randomization_samples: StrictInt = Field(ge=999)
     alpha: float = Field(default=0.05, gt=0.0, lt=1.0, allow_inf_nan=False)
-    minimum_panel_delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
-    minimum_member_delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+    minimum_equal_task_member_delta: float = Field(
+        ge=-1.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
     noninferiority_margin: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     blocks: tuple[PairedBlock, ...]
 
@@ -114,8 +165,7 @@ class PairedEvaluationDesign(BaseModel):
 
     @field_validator(
         "alpha",
-        "minimum_panel_delta",
-        "minimum_member_delta",
+        "minimum_equal_task_member_delta",
         "noninferiority_margin",
         mode="before",
     )
@@ -143,6 +193,21 @@ class PairedEvaluationDesign(BaseModel):
         return tuple(plan.panel_member for plan in self.panel)
 
     @property
+    def task_ids(self) -> tuple[str, ...]:
+        """Return task identities in their frozen canonical order."""
+        return tuple(task.task_id for task in self.tasks)
+
+    @property
+    def group_ids_by_task(self) -> dict[str, str]:
+        """Return a copy of score-independent cluster identities keyed by task."""
+        return {task.task_id: task.group_id for task in self.tasks}
+
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        """Return unique score-independent clusters in canonical order."""
+        return tuple(sorted({task.group_id for task in self.tasks}))
+
+    @property
     def attempts_by_member(self) -> dict[str, int]:
         """Return a copy of repeated-attempt counts keyed by panel identity."""
         return {plan.panel_member: plan.attempts for plan in self.panel}
@@ -151,52 +216,54 @@ class PairedEvaluationDesign(BaseModel):
     def create(
         cls,
         *,
-        task_ids: tuple[str, ...],
+        tasks: tuple[PairedTaskPlan, ...],
         panel: tuple[PairedPanelPlan, ...],
-        bounded_mean_bets: tuple[BoundedMeanBet, ...],
+        primary_e_value_bets: tuple[BoundedMeanBet, ...],
         schedule_seed: str,
         analysis_seed: str,
         randomization_samples: int,
-        minimum_panel_delta: float,
-        minimum_member_delta: float,
+        minimum_equal_task_member_delta: float,
         noninferiority_margin: float,
         alpha: float = 0.05,
     ) -> PairedEvaluationDesign:
         """Create the canonical balanced AB/BA schedule for one declared matrix."""
-        canonical_tasks = _canonical_names(task_ids, label="task_ids")
+        canonical_tasks = _canonical_tasks(tasks)
         canonical_panel = _canonical_panel(panel)
-        canonical_bets = _canonical_bounded_mean_bets(bounded_mean_bets)
+        canonical_bets = _canonical_bounded_mean_bets(primary_e_value_bets)
         blocks = _scheduled_blocks(
-            canonical_tasks,
+            tuple(task.task_id for task in canonical_tasks),
             canonical_panel,
             seed=schedule_seed,
         )
         return cls(
-            task_ids=canonical_tasks,
+            tasks=canonical_tasks,
             panel=canonical_panel,
-            bounded_mean_bets=canonical_bets,
+            primary_e_value_bets=canonical_bets,
             schedule_seed=schedule_seed,
             analysis_seed=analysis_seed,
             randomization_samples=randomization_samples,
             alpha=alpha,
-            minimum_panel_delta=minimum_panel_delta,
-            minimum_member_delta=minimum_member_delta,
+            minimum_equal_task_member_delta=minimum_equal_task_member_delta,
             noninferiority_margin=noninferiority_margin,
             blocks=blocks,
         )
 
     @model_validator(mode="after")
     def _validate_frozen_schedule(self) -> Self:
-        if not self.task_ids or not self.panel:
+        if not self.tasks or not self.panel:
             raise ValueError("paired evaluation needs at least one task and panel member")
         if _divide_float_downward(self.alpha, max(2, len(self.panel))) == 0.0:
-            raise ValueError("alpha is too small for the frozen two-sided and memberwise tests")
-        if self.task_ids != _canonical_names(self.task_ids, label="task_ids"):
-            raise ValueError("task_ids must be unique and in canonical order")
+            raise ValueError("alpha is too small for the frozen primary and secondary bounds")
+        if self.tasks != _canonical_tasks(self.tasks):
+            raise ValueError("paired tasks must be unique and in canonical order")
+        if len(self.group_ids) < 2:
+            raise ValueError("paired diagnostics need at least two semantic sensitivity clusters")
         if self.panel != _canonical_panel(self.panel):
             raise ValueError("panel must be unique and in canonical order")
-        if self.bounded_mean_bets != _canonical_bounded_mean_bets(self.bounded_mean_bets):
-            raise ValueError("bounded-mean bets must be unique, normalized, and in canonical order")
+        if self.primary_e_value_bets != _canonical_bounded_mean_bets(self.primary_e_value_bets):
+            raise ValueError(
+                "primary e-value bets must be unique, normalized, and in canonical order"
+            )
         expected = _scheduled_blocks(
             self.task_ids,
             self.panel,
@@ -224,8 +291,8 @@ class PairedBlockOutcome(BaseModel):
         return float(value)
 
 
-class ClusterInterval(BaseModel):
-    """Finite-sample bounded-mean interval over complete task clusters."""
+class BoundedMeanInterval(BaseModel):
+    """Finite-sample bounded-mean interval over independent bounded observations."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -234,93 +301,204 @@ class ClusterInterval(BaseModel):
 
 
 class PanelMemberAnalysis(BaseModel):
-    """Effect and adjusted noninferiority evidence for one frozen panel member."""
+    """Fixed-roster primary evidence, cluster sensitivity, and diagnostics for one lane."""
 
     model_config = ConfigDict(frozen=True)
 
     panel_member: str = Field(min_length=1)
-    delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
-    raw_positive_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    holm_positive_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    simultaneous_lower_bound: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
-    raw_noninferiority_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    holm_noninferiority_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    equal_task_delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+    primary_positive_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    primary_lower_bound: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+    semantic_cluster_sensitivity_positive_p: float = Field(
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+    semantic_cluster_sensitivity_lower_bound: float = Field(
+        ge=-1.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+    model_based_jackknife_standard_error: float = Field(ge=0.0, allow_inf_nan=False)
+    model_based_jackknife_degrees_of_freedom: StrictInt = Field(ge=1)
+    model_based_jackknife_positive_p: float = Field(
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+    model_based_jackknife_lower_bound: float = Field(
+        ge=-1.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+    model_based_jackknife_bonferroni_lower_bound: float = Field(
+        ge=-1.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+    secondary_noninferiority_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    secondary_holm_noninferiority_p: float = Field(
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
 
 
 class PairedAnalysisReport(BaseModel):
-    """Task-clustered effect estimates, primary endpoint, and diagnostics."""
+    """Finite-sample primary evidence, effect-size endpoints, and diagnostics."""
 
     model_config = ConfigDict(frozen=True)
 
-    analysis_version: Literal["2"]
+    analysis_version: Literal["5"]
+    primary_estimand: Literal["fixed-roster-equal-task-conditional-expected-paired-reward-delta"]
+    primary_evidence_method: Literal[
+        "fixed-horizon-independent-task-bounded-mean-e-value-inverted-lower-bound"
+    ]
+    semantic_cluster_sensitivity_method: Literal[
+        "weighted-semantic-cluster-bounded-mean-e-value-inverted-lower-bound"
+    ]
+    model_based_diagnostic_method: Literal["leave-one-semantic-cluster-out-jackknife-student-t"]
+    primary_combination_rule: Literal["intersection-union-all-lanes"]
     design_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     outcome_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    panel_delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+    equal_task_panel_delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
     members: tuple[PanelMemberAnalysis, ...]
-    label_swap_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    panel_mean_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    cluster_interval: ClusterInterval
-    panel_lift_passed: bool
-    member_lifts_passed: bool
-    member_positive_passed: bool
-    member_intervals_passed: bool
-    label_swap_passed: bool
-    panel_mean_passed: bool
-    cluster_interval_passed: bool
-    noninferiority_passed: bool
+    model_based_label_swap_p: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    equal_task_member_lifts_passed: bool
+    member_primary_bounds_passed: bool
+    member_semantic_cluster_sensitivity_bounds_positive: bool
+    member_model_based_jackknife_bounds_passed: bool
+    member_model_based_jackknife_bonferroni_bounds_passed: bool
+    model_based_label_swap_passed: bool
+    secondary_noninferiority_passed: bool
 
     @property
-    def member_deltas(self) -> dict[str, float]:
-        """Return a copy of member effect estimates keyed by frozen panel identity."""
-        return {member.panel_member: member.delta for member in self.members}
+    def equal_task_member_deltas(self) -> dict[str, float]:
+        """Return observed equal-task effects on the fixed roster by lane identity."""
+        return {member.panel_member: member.equal_task_delta for member in self.members}
 
     @property
-    def raw_noninferiority_p(self) -> dict[str, float]:
-        """Return unadjusted noninferiority p-values keyed by panel identity."""
-        return {member.panel_member: member.raw_noninferiority_p for member in self.members}
+    def semantic_cluster_sensitivity_positive_p(self) -> dict[str, float]:
+        """Return conservative semantic-cluster sensitivity p-values by lane."""
+        return {
+            member.panel_member: member.semantic_cluster_sensitivity_positive_p
+            for member in self.members
+        }
 
     @property
-    def raw_positive_p(self) -> dict[str, float]:
-        """Return unadjusted positive-lift p-values keyed by panel identity."""
-        return {member.panel_member: member.raw_positive_p for member in self.members}
+    def semantic_cluster_sensitivity_lower_bounds(self) -> dict[str, float]:
+        """Return conservative semantic-cluster sensitivity lower bounds by lane."""
+        return {
+            member.panel_member: member.semantic_cluster_sensitivity_lower_bound
+            for member in self.members
+        }
 
     @property
-    def holm_positive_p(self) -> dict[str, float]:
-        """Return Holm-adjusted positive-lift p-values keyed by panel identity."""
-        return {member.panel_member: member.holm_positive_p for member in self.members}
+    def secondary_noninferiority_p(self) -> dict[str, float]:
+        """Return secondary noninferiority p-values keyed by panel identity."""
+        return {member.panel_member: member.secondary_noninferiority_p for member in self.members}
 
     @property
-    def simultaneous_lower_bounds(self) -> dict[str, float]:
-        """Return Bonferroni-simultaneous one-sided lower bounds by panel identity."""
-        return {member.panel_member: member.simultaneous_lower_bound for member in self.members}
+    def primary_positive_p(self) -> dict[str, float]:
+        """Return primary fixed-roster positive-lift p-values by lane identity."""
+        return {member.panel_member: member.primary_positive_p for member in self.members}
 
     @property
-    def holm_noninferiority_p(self) -> dict[str, float]:
-        """Return Holm-adjusted noninferiority p-values keyed by panel identity."""
-        return {member.panel_member: member.holm_noninferiority_p for member in self.members}
+    def primary_lower_bounds(self) -> dict[str, float]:
+        """Return finite-sample fixed-roster lower bounds by lane identity."""
+        return {member.panel_member: member.primary_lower_bound for member in self.members}
+
+    @property
+    def model_based_jackknife_lower_bounds(self) -> dict[str, float]:
+        """Return unadjusted model-based jackknife bounds by lane identity."""
+        return {
+            member.panel_member: member.model_based_jackknife_lower_bound for member in self.members
+        }
+
+    @property
+    def model_based_jackknife_bonferroni_lower_bounds(self) -> dict[str, float]:
+        """Return model-based Bonferroni jackknife bounds by lane identity."""
+        return {
+            member.panel_member: member.model_based_jackknife_bonferroni_lower_bound
+            for member in self.members
+        }
+
+    @property
+    def model_based_jackknife_positive_p(self) -> dict[str, float]:
+        """Return model-based jackknife p-values by lane identity."""
+        return {
+            member.panel_member: member.model_based_jackknife_positive_p for member in self.members
+        }
+
+    @property
+    def secondary_holm_noninferiority_p(self) -> dict[str, float]:
+        """Return Holm-adjusted secondary noninferiority p-values by panel identity."""
+        return {
+            member.panel_member: member.secondary_holm_noninferiority_p for member in self.members
+        }
 
     @property
     def passed(self) -> bool:
-        """Return whether every lane clears its point floor and simultaneous lower bound."""
-        return self.member_lifts_passed and self.member_intervals_passed
+        """Return the primary IUT plus equal-task observed effect-size decision."""
+        return self.equal_task_member_lifts_passed and self.member_primary_bounds_passed
+
+
+@dataclass(frozen=True)
+class _JackknifeStudentTInference:
+    """One model-based leave-one-semantic-cluster-out Student-t result."""
+
+    standard_error: float
+    degrees_of_freedom: int
+    positive_p: float
+    lower_bound: float
 
 
 def analyze_paired_outcomes(
     design: PairedEvaluationDesign,
     outcomes: list[PairedBlockOutcome],
 ) -> PairedAnalysisReport:
-    """Analyze one exact paired matrix under its frozen-roster independence assumptions.
+    """Analyze one complete fixed-roster paired matrix.
 
-    Every primary member test uses one attempt-averaged observation per frozen task.
-    Arbitrary dependence among repeated attempts within a task is therefore allowed;
-    finite-sample validity requires only independence across the frozen task clusters.
-    Attempts improve the precision of each task mean but never inflate the primary
-    sample size. The result targets equal-task expected success on the fixed roster
-    and makes no unobserved-task population claim.
+    For a lane, the primary observations are the complete planned per-task paired-
+    attempt mean deltas in [-1, 1]. Attempts may be arbitrarily dependent within a
+    task, but the complete task outcome vectors must be mutually independent. The
+    estimand is the equal-task mean of expected rerun deltas conditional on these
+    exact held-out task identities, the frozen harnesses, and the execution contract.
+    It is not a future-task, task-population, or finite-all-benchmark estimand.
+
+    For each frozen bet, task independence factors the expected product. Under the
+    weak null that the equal-task average expectation is at most ``m``, AM-GM bounds
+    that product by one. The frozen mixture is therefore an e-value even when task
+    distributions are nonidentical. Inverting its one-sided test gives the finite-
+    sample primary lower bound.
+
+    A conservative sensitivity allows arbitrary dependence within predeclared
+    semantic clusters and assumes only cluster independence. If cluster ``g`` has
+    equal-task weight ``w_g`` and mean ``X_g``, it uses scale
+    ``c_g = w_g / max_h(w_h)`` and factor
+    ``1 + f*c_g*(X_g-m)/(1+m)``. The weighted null makes the average expected
+    factor at most one because ``sum_g c_g*(E[X_g]-m)`` equals
+    ``(theta-m)/max_h(w_h)`` for the equal-task mean ``theta``. Independence and
+    AM-GM again yield an e-value. Failure of this stricter sensitivity is
+    inconclusive and does not alter the primary decision.
+
+    Every lane must clear its own unadjusted ``alpha`` primary bound. This
+    intersection-union rule controls the all-lanes claim at ``alpha`` without lane
+    independence or multiplicity correction. Every lane must also clear the frozen
+    observed equal-task effect floor. Jackknife Student-t, its Bonferroni variant,
+    and label swapping are explicitly model-based secondary diagnostics and make no
+    finite-sample alpha-control claim.
+
+    Validity additionally requires a fixed horizon and frozen bets; complete,
+    score-blind admission of every planned pair; no score-adaptive missingness or
+    retry; fresh isolated arm requests and sandboxes; and whole-pair score-blind
+    handling of allowlisted infrastructure failures. Common shocks across tasks,
+    shared mutable state, provider drift, or correlated infrastructure incidents
+    invalidate the primary task-independence claim.
     """
     ordered = _validate_and_order_outcomes(design, outcomes)
     task_member_deltas = _task_member_deltas(design, ordered)
-    member_deltas = {
+    equal_task_member_deltas = {
         member: fmean(task_member_deltas[(task, member)] for task in design.task_ids)
         for member in design.panel_members
     }
@@ -328,105 +506,261 @@ def analyze_paired_outcomes(
         task: fmean(task_member_deltas[(task, member)] for member in design.panel_members)
         for task in design.task_ids
     }
-    panel_delta = fmean(task_panel_deltas.values())
-    label_swap_p = _one_sided_sign_flip_p(
-        tuple(task_panel_deltas[task] for task in design.task_ids),
+    equal_task_panel_delta = fmean(task_panel_deltas.values())
+    model_based_label_swap_p = _one_sided_sign_flip_p(
+        _group_sum_deltas(
+            design,
+            {task: task_panel_deltas[task] for task in design.task_ids},
+        ),
         samples=design.randomization_samples,
         seed=_domain_seed(design.analysis_seed, "panel-randomization"),
-    )
-    panel_task_deltas = tuple(task_panel_deltas[task] for task in design.task_ids)
-    panel_mean_p = _bounded_mean_p(
-        panel_task_deltas,
-        null_mean=0.0,
-        bets=design.bounded_mean_bets,
-    )
-    cluster_interval = _bounded_mean_interval(
-        panel_task_deltas,
-        alpha=design.alpha,
-        bets=design.bounded_mean_bets,
     )
     member_task_deltas = {
         member: tuple(task_member_deltas[(task, member)] for task in design.task_ids)
         for member in design.panel_members
     }
-    raw_positive = {
+    member_semantic_observations = {
+        member: _semantic_group_observations(
+            design,
+            {task: task_member_deltas[(task, member)] for task in design.task_ids},
+        )
+        for member in design.panel_members
+    }
+    primary_positive = {
         member: _bounded_mean_p(
             member_task_deltas[member],
             null_mean=0.0,
-            bets=design.bounded_mean_bets,
+            bets=design.primary_e_value_bets,
         )
         for member in design.panel_members
     }
-    holm_positive = _holm_adjust(raw_positive)
-    member_alpha = _divide_float_downward(design.alpha, len(design.panel_members))
-    member_lower_bounds = {
+    primary_lower_bounds = {
         member: _bounded_mean_lower_bound(
             member_task_deltas[member],
-            alpha=member_alpha,
-            bets=design.bounded_mean_bets,
+            alpha=design.alpha,
+            bets=design.primary_e_value_bets,
         )
         for member in design.panel_members
     }
-    raw_noninferiority = {
+    semantic_cluster_sensitivity_positive = {
+        member: _bounded_mean_p(
+            member_semantic_observations[member][0],
+            null_mean=0.0,
+            bets=design.primary_e_value_bets,
+            observation_scales=member_semantic_observations[member][1],
+        )
+        for member in design.panel_members
+    }
+    semantic_cluster_sensitivity_lower_bounds = {
+        member: _bounded_mean_lower_bound(
+            member_semantic_observations[member][0],
+            alpha=design.alpha,
+            bets=design.primary_e_value_bets,
+            observation_scales=member_semantic_observations[member][1],
+        )
+        for member in design.panel_members
+    }
+    model_based_jackknife = {
+        member: _jackknife_student_t_inference(
+            member_task_deltas[member],
+            design=design,
+            alpha=design.alpha,
+        )
+        for member in design.panel_members
+    }
+    model_based_bonferroni_alpha = _divide_float_downward(
+        design.alpha,
+        len(design.panel_members),
+    )
+    model_based_jackknife_bonferroni_lower_bounds = {
+        member: _jackknife_student_t_lower_bound(
+            equal_task_member_deltas[member],
+            standard_error=model_based_jackknife[member].standard_error,
+            degrees_of_freedom=model_based_jackknife[member].degrees_of_freedom,
+            alpha=model_based_bonferroni_alpha,
+        )
+        for member in design.panel_members
+    }
+    secondary_noninferiority = {
         member: _bounded_mean_p(
             member_task_deltas[member],
             null_mean=-design.noninferiority_margin,
-            bets=design.bounded_mean_bets,
+            bets=design.primary_e_value_bets,
         )
         for member in design.panel_members
     }
-    holm = _holm_adjust(raw_noninferiority)
-    panel_lift_passed = panel_delta >= design.minimum_panel_delta
-    member_lifts_passed = all(
-        delta >= design.minimum_member_delta for delta in member_deltas.values()
+    secondary_holm_noninferiority = _holm_adjust(secondary_noninferiority)
+    equal_task_member_lifts_passed = all(
+        delta >= design.minimum_equal_task_member_delta
+        for delta in equal_task_member_deltas.values()
     )
-    member_positive_passed = all(value < design.alpha for value in holm_positive.values())
-    member_intervals_passed = all(value > 0.0 for value in member_lower_bounds.values())
-    label_swap_passed = label_swap_p < design.alpha
-    panel_mean_passed = panel_mean_p < design.alpha
-    cluster_interval_passed = cluster_interval.lower > 0.0
-    noninferiority_passed = all(value < design.alpha for value in holm.values())
+    member_primary_bounds_passed = all(value > 0.0 for value in primary_lower_bounds.values())
+    member_semantic_cluster_sensitivity_bounds_positive = all(
+        value > 0.0 for value in semantic_cluster_sensitivity_lower_bounds.values()
+    )
+    member_model_based_jackknife_bounds_passed = all(
+        inference.lower_bound > 0.0 for inference in model_based_jackknife.values()
+    )
+    member_model_based_jackknife_bonferroni_bounds_passed = all(
+        value > 0.0 for value in model_based_jackknife_bonferroni_lower_bounds.values()
+    )
+    model_based_label_swap_passed = model_based_label_swap_p < design.alpha
+    secondary_noninferiority_passed = all(
+        value < design.alpha for value in secondary_holm_noninferiority.values()
+    )
     return PairedAnalysisReport(
         analysis_version=PAIRED_ANALYSIS_VERSION,
+        primary_estimand=design.primary_estimand,
+        primary_evidence_method=design.primary_evidence_method,
+        semantic_cluster_sensitivity_method=design.semantic_cluster_sensitivity_method,
+        model_based_diagnostic_method=design.model_based_diagnostic_method,
+        primary_combination_rule=design.primary_combination_rule,
         design_digest=design.digest,
         outcome_digest=_canonical_digest([outcome.model_dump(mode="json") for outcome in ordered]),
-        panel_delta=panel_delta,
+        equal_task_panel_delta=equal_task_panel_delta,
         members=tuple(
             PanelMemberAnalysis(
                 panel_member=member,
-                delta=member_deltas[member],
-                raw_positive_p=raw_positive[member],
-                holm_positive_p=holm_positive[member],
-                simultaneous_lower_bound=member_lower_bounds[member],
-                raw_noninferiority_p=raw_noninferiority[member],
-                holm_noninferiority_p=holm[member],
+                equal_task_delta=equal_task_member_deltas[member],
+                primary_positive_p=primary_positive[member],
+                primary_lower_bound=primary_lower_bounds[member],
+                semantic_cluster_sensitivity_positive_p=(
+                    semantic_cluster_sensitivity_positive[member]
+                ),
+                semantic_cluster_sensitivity_lower_bound=(
+                    semantic_cluster_sensitivity_lower_bounds[member]
+                ),
+                model_based_jackknife_standard_error=(model_based_jackknife[member].standard_error),
+                model_based_jackknife_degrees_of_freedom=(
+                    model_based_jackknife[member].degrees_of_freedom
+                ),
+                model_based_jackknife_positive_p=(model_based_jackknife[member].positive_p),
+                model_based_jackknife_lower_bound=(model_based_jackknife[member].lower_bound),
+                model_based_jackknife_bonferroni_lower_bound=(
+                    model_based_jackknife_bonferroni_lower_bounds[member]
+                ),
+                secondary_noninferiority_p=secondary_noninferiority[member],
+                secondary_holm_noninferiority_p=(secondary_holm_noninferiority[member]),
             )
             for member in design.panel_members
         ),
-        label_swap_p=label_swap_p,
-        panel_mean_p=panel_mean_p,
-        cluster_interval=cluster_interval,
-        panel_lift_passed=panel_lift_passed,
-        member_lifts_passed=member_lifts_passed,
-        member_positive_passed=member_positive_passed,
-        member_intervals_passed=member_intervals_passed,
-        label_swap_passed=label_swap_passed,
-        panel_mean_passed=panel_mean_passed,
-        cluster_interval_passed=cluster_interval_passed,
-        noninferiority_passed=noninferiority_passed,
+        model_based_label_swap_p=model_based_label_swap_p,
+        equal_task_member_lifts_passed=equal_task_member_lifts_passed,
+        member_primary_bounds_passed=member_primary_bounds_passed,
+        member_semantic_cluster_sensitivity_bounds_positive=(
+            member_semantic_cluster_sensitivity_bounds_positive
+        ),
+        member_model_based_jackknife_bounds_passed=(member_model_based_jackknife_bounds_passed),
+        member_model_based_jackknife_bonferroni_bounds_passed=(
+            member_model_based_jackknife_bonferroni_bounds_passed
+        ),
+        model_based_label_swap_passed=model_based_label_swap_passed,
+        secondary_noninferiority_passed=secondary_noninferiority_passed,
     )
 
 
-def _canonical_names(values: tuple[str, ...], *, label: str) -> tuple[str, ...]:
-    if not values or any(
-        not isinstance(value, str) or not value.strip() or value != value.strip()
-        for value in values
-    ):
-        raise ValueError(f"{label} must contain non-empty strings")
-    duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
+def _canonical_tasks(tasks: tuple[PairedTaskPlan, ...]) -> tuple[PairedTaskPlan, ...]:
+    if not tasks:
+        raise ValueError("paired tasks must contain at least one task")
+    duplicates = sorted(
+        task_id for task_id, count in Counter(task.task_id for task in tasks).items() if count > 1
+    )
     if duplicates:
-        raise ValueError(f"{label} contains duplicates: {duplicates}")
-    return tuple(sorted(values))
+        raise ValueError(f"paired tasks contain duplicate task_ids: {duplicates}")
+    return tuple(sorted(tasks, key=lambda task: task.task_id))
+
+
+def _semantic_group_observations(
+    design: PairedEvaluationDesign,
+    task_deltas: dict[str, float],
+) -> tuple[tuple[float, ...], tuple[Fraction, ...]]:
+    """Return group means and scales that preserve the equal-task target.
+
+    With ``w_g = n_g/N`` and ``c_g = n_g/n_max = w_g/w_max``, the scaled weak
+    null is exactly ``sum_g c_g*(E[X_g]-m) = (theta-m)/w_max <= 0``, where
+    ``theta = sum_g w_g*E[X_g]`` is the equal-task fixed-roster estimand.
+    """
+    grouped: defaultdict[str, list[float]] = defaultdict(list)
+    for task in design.tasks:
+        grouped[task.group_id].append(task_deltas[task.task_id])
+    largest_group = max(len(values) for values in grouped.values())
+    return (
+        tuple(fmean(grouped[group_id]) for group_id in design.group_ids),
+        tuple(Fraction(len(grouped[group_id]), largest_group) for group_id in design.group_ids),
+    )
+
+
+def _group_sum_deltas(
+    design: PairedEvaluationDesign,
+    task_deltas: dict[str, float],
+) -> tuple[float, ...]:
+    grouped: defaultdict[str, list[float]] = defaultdict(list)
+    for task in design.tasks:
+        grouped[task.group_id].append(task_deltas[task.task_id])
+    return tuple(math.fsum(grouped[group_id]) for group_id in design.group_ids)
+
+
+def _jackknife_student_t_inference(
+    task_deltas: tuple[float, ...],
+    *,
+    design: PairedEvaluationDesign,
+    alpha: float,
+) -> _JackknifeStudentTInference:
+    if len(task_deltas) != len(design.tasks):
+        raise ValueError("jackknife task deltas must match the frozen design")
+    task_values = dict(zip(design.task_ids, task_deltas, strict=True))
+    estimate = fmean(task_deltas)
+    total = math.fsum(task_deltas)
+    deleted_estimates: list[float] = []
+    for group_id in design.group_ids:
+        group_tasks = tuple(task.task_id for task in design.tasks if task.group_id == group_id)
+        remaining_count = len(task_deltas) - len(group_tasks)
+        if remaining_count <= 0:
+            raise ValueError("jackknife needs at least two non-empty independence clusters")
+        deleted_estimates.append(
+            (total - math.fsum(task_values[task_id] for task_id in group_tasks)) / remaining_count
+        )
+    group_count = len(deleted_estimates)
+    deleted_mean = fmean(deleted_estimates)
+    variance = (
+        (group_count - 1)
+        / group_count
+        * math.fsum((value - deleted_mean) ** 2 for value in deleted_estimates)
+    )
+    standard_error = math.sqrt(max(0.0, variance))
+    degrees_of_freedom = group_count - 1
+    if standard_error == 0.0:
+        positive_p = 0.0 if estimate > 0.0 else 1.0
+    else:
+        positive_p = float(student_t.sf(estimate / standard_error, degrees_of_freedom))
+    return _JackknifeStudentTInference(
+        standard_error=standard_error,
+        degrees_of_freedom=degrees_of_freedom,
+        positive_p=positive_p,
+        lower_bound=_jackknife_student_t_lower_bound(
+            estimate,
+            standard_error=standard_error,
+            degrees_of_freedom=degrees_of_freedom,
+            alpha=alpha,
+        ),
+    )
+
+
+def _jackknife_student_t_lower_bound(
+    estimate: float,
+    *,
+    standard_error: float,
+    degrees_of_freedom: int,
+    alpha: float,
+) -> float:
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("jackknife Student-t alpha must be between zero and one")
+    if standard_error < 0.0 or not math.isfinite(standard_error):
+        raise ValueError("jackknife standard error must be finite and non-negative")
+    if degrees_of_freedom < 1:
+        raise ValueError("jackknife Student-t needs at least one degree of freedom")
+    critical_value = float(student_t.ppf(1.0 - alpha, degrees_of_freedom))
+    return min(1.0, max(-1.0, estimate - critical_value * standard_error))
 
 
 def _canonical_panel(panel: tuple[PairedPanelPlan, ...]) -> tuple[PairedPanelPlan, ...]:
@@ -452,6 +786,19 @@ def _canonical_bounded_mean_bets(
     if sum((Fraction.from_float(bet.weight) for bet in bets), start=Fraction()) != 1:
         raise ValueError("bounded-mean bet weights must sum to one")
     return tuple(sorted(bets, key=lambda bet: bet.fraction))
+
+
+def _bounded_mean_observation_scales(
+    observations: tuple[float, ...],
+    scales: tuple[Fraction, ...] | None,
+) -> tuple[Fraction, ...]:
+    """Validate exact preregistered scales for a bounded-mean e-value."""
+    canonical = scales if scales is not None else (Fraction(1),) * len(observations)
+    if len(canonical) != len(observations):
+        raise ValueError("bounded-mean observation scales must match the observations")
+    if any(scale <= 0 or scale > 1 for scale in canonical):
+        raise ValueError("bounded-mean observation scales must be in (0, 1]")
+    return canonical
 
 
 def _scheduled_blocks(
@@ -575,19 +922,26 @@ def _bounded_mean_p(
     *,
     null_mean: float,
     bets: tuple[BoundedMeanBet, ...],
+    observation_scales: tuple[Fraction, ...] | None = None,
 ) -> float:
-    """Test the composite null that the average task mean is at most ``null_mean``.
+    """Test a scaled average expectation of independent deltas against a weak null.
 
-    Each supplied delta must be an independent observation in [-1, 1]. The
-    caller may supply task-cluster deltas or fixed-roster fresh-attempt deltas
-    according to its declared estimand. The preregistered mixture is an e-value,
-    so ``min(1, 1 / e_value)`` is a finite-sample p-value without a symmetry or
-    identical-distribution assumption.
+    Each fixed-horizon input is an independent, potentially nonidentically
+    distributed observation in [-1, 1]. With exact scales ``c_i`` in ``(0, 1]``,
+    a frozen bet uses ``1 + f*c_i*(X_i-m)/(1+m)``. Under the weak null
+    ``sum(c_i*E[X_i-m]) <= 0``, the arithmetic mean of these nonnegative expected
+    factors is at most one. Independence and AM-GM therefore bound their product
+    by one. A frozen convex mixture preserves the e-value property. Thus
+    ``min(1, 1 / e_value)`` is a finite-sample p-value without symmetry or
+    identical-distribution assumptions. Unit scales target the equal-observation
+    mean. Adaptive horizons, score-dependent admission, or post-outcome scales and
+    bets are outside this guarantee.
     """
     log_e_value = _bounded_mean_log_e(
         task_deltas,
         null_mean=null_mean,
         bets=bets,
+        observation_scales=observation_scales,
     )
     if null_mean == -1.0:
         return 1.0 if all(delta == -1.0 for delta in task_deltas) else 0.0
@@ -598,6 +952,7 @@ def _bounded_mean_p(
         task_deltas,
         null_mean=null_mean,
         bets=bets,
+        observation_scales=observation_scales,
     )
     if exact_e_value <= 1:
         return 1.0
@@ -610,20 +965,23 @@ def _bounded_mean_interval(
     *,
     alpha: float,
     bets: tuple[BoundedMeanBet, ...],
-) -> ClusterInterval:
+    observation_scales: tuple[Fraction, ...] | None = None,
+) -> BoundedMeanInterval:
     """Invert two one-sided bounded-mean e-tests with Bonferroni coverage."""
     tail_alpha = _divide_float_downward(alpha, 2)
     lower = _bounded_mean_lower_bound(
         task_deltas,
         alpha=tail_alpha,
         bets=bets,
+        observation_scales=observation_scales,
     )
     upper = -_bounded_mean_lower_bound(
         tuple(-delta for delta in task_deltas),
         alpha=tail_alpha,
         bets=bets,
+        observation_scales=observation_scales,
     )
-    return ClusterInterval(lower=lower, upper=upper)
+    return BoundedMeanInterval(lower=lower, upper=upper)
 
 
 def _bounded_mean_lower_bound(
@@ -631,6 +989,7 @@ def _bounded_mean_lower_bound(
     *,
     alpha: float,
     bets: tuple[BoundedMeanBet, ...],
+    observation_scales: tuple[Fraction, ...] | None = None,
 ) -> float:
     """Return a lower endpoint rounded below the one-sided rejection boundary."""
     if not 0.0 < alpha < 1.0:
@@ -643,6 +1002,7 @@ def _bounded_mean_lower_bound(
         null_mean=rejected_mean,
         alpha=alpha,
         bets=bets,
+        observation_scales=observation_scales,
     ):
         return -1.0
     for _ in range(107):
@@ -654,6 +1014,7 @@ def _bounded_mean_lower_bound(
                 task_deltas,
                 null_mean=midpoint,
                 bets=bets,
+                observation_scales=observation_scales,
             )
             > rejection_log_e
         ):
@@ -666,6 +1027,7 @@ def _bounded_mean_lower_bound(
         null_mean=candidate,
         alpha=alpha,
         bets=bets,
+        observation_scales=observation_scales,
     ):
         return candidate
 
@@ -680,6 +1042,7 @@ def _bounded_mean_lower_bound(
             null_mean=midpoint,
             alpha=alpha,
             bets=bets,
+            observation_scales=observation_scales,
         ):
             exact_rejected = midpoint
         else:
@@ -692,6 +1055,7 @@ def _bounded_mean_log_e(
     *,
     null_mean: float,
     bets: tuple[BoundedMeanBet, ...],
+    observation_scales: tuple[Fraction, ...] | None = None,
 ) -> float:
     if not task_deltas:
         raise ValueError("bounded-mean evidence needs at least one task delta")
@@ -699,6 +1063,7 @@ def _bounded_mean_log_e(
         raise ValueError("bounded-mean task deltas must be finite and in [-1, 1]")
     if not math.isfinite(null_mean) or not -1.0 <= null_mean <= 1.0:
         raise ValueError("bounded-mean null must be finite and in [-1, 1]")
+    scales = _bounded_mean_observation_scales(task_deltas, observation_scales)
     if null_mean == -1.0:
         return 0.0 if all(delta == -1.0 for delta in task_deltas) else math.inf
     canonical_bets = _canonical_bounded_mean_bets(bets)
@@ -706,8 +1071,9 @@ def _bounded_mean_log_e(
     denominator = 1.0 + null_mean
     for bet in canonical_bets:
         component_log = math.log(bet.weight)
-        for delta in task_deltas:
-            factor = (1.0 - bet.fraction) + bet.fraction * (1.0 + delta) / denominator
+        for delta, scale in zip(task_deltas, scales, strict=True):
+            scaled_fraction = bet.fraction * float(scale)
+            factor = (1.0 - scaled_fraction) + scaled_fraction * (1.0 + delta) / denominator
             if factor == 0.0:
                 component_log = -math.inf
                 break
@@ -721,6 +1087,7 @@ def _bounded_mean_exact_e(
     *,
     null_mean: float,
     bets: tuple[BoundedMeanBet, ...],
+    observation_scales: tuple[Fraction, ...] | None = None,
 ) -> Fraction:
     """Return the exact e-value over the binary-float inputs for safe rounding."""
     if null_mean == -1.0:
@@ -728,13 +1095,14 @@ def _bounded_mean_exact_e(
     one = Fraction(1)
     null_fraction = Fraction.from_float(null_mean)
     denominator = one + null_fraction
+    scales = _bounded_mean_observation_scales(task_deltas, observation_scales)
     e_value = Fraction()
     for bet in _canonical_bounded_mean_bets(bets):
         fraction = Fraction.from_float(bet.fraction)
         component = Fraction.from_float(bet.weight)
-        for delta in task_deltas:
+        for delta, scale in zip(task_deltas, scales, strict=True):
             delta_fraction = Fraction.from_float(delta)
-            factor = (one - fraction) + fraction * (one + delta_fraction) / denominator
+            factor = one + fraction * scale * (delta_fraction - null_fraction) / denominator
             component *= factor
         e_value += component
     return e_value
@@ -746,11 +1114,13 @@ def _bounded_mean_exact_rejects(
     null_mean: float,
     alpha: float,
     bets: tuple[BoundedMeanBet, ...],
+    observation_scales: tuple[Fraction, ...] | None = None,
 ) -> bool:
     e_value = _bounded_mean_exact_e(
         task_deltas,
         null_mean=null_mean,
         bets=bets,
+        observation_scales=observation_scales,
     )
     return e_value * Fraction.from_float(alpha) > 1
 
