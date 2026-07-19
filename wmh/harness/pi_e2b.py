@@ -1079,7 +1079,7 @@ class E2BSandboxPool:
     installs. The lease is set exactly once by ``Sandbox.create`` and is never extended: neither
     acquisition nor runner heartbeats may call ``set_timeout``. Concurrent episodes acquire
     distinct sandboxes; a sandbox whose episode raised is discarded (the runner process is in an
-    unknown state — reuse could cross frames between episodes). `close()` kills everything; the
+    unknown state, so reuse could cross frames between episodes). `close()` kills everything; the
     pool lock guards only the free lists, so parallel bootstraps never serialize behind one
     sandbox's multi-minute npm install.
     """
@@ -1117,7 +1117,7 @@ class E2BSandboxPool:
         self._closed = False
         # Usage meter: lifetime seconds accumulate into _retired_seconds when a sandbox dies; an
         # ambiguous create contributes its full fixed horizon immediately. Live sandboxes are
-        # counted from their _started stamp. Keyed by id() — SandboxHandle is a protocol, not
+        # counted from their _started stamp. Keyed by id() because SandboxHandle is a protocol, not
         # hashable-by-contract.
         self._started: dict[int, float] = {}
         # An exact lease can be reached concurrently by pool.close() and an in-flight episode's
