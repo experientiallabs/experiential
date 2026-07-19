@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from wmh.core.text import validate_durable_text
 from wmh.core.types import JsonObject
 from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_loop
@@ -244,6 +245,7 @@ class SearchConfiguration(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    search_run_id: str | None = Field(default=None, min_length=1, max_length=512)
     name: str = Field(min_length=1)
     seed_doc_hash: str = Field(min_length=1)
     seed_execution_hash: str = Field(min_length=1)
@@ -260,7 +262,8 @@ class SearchConfiguration(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_independent_scorers(self) -> SearchConfiguration:
+    def _validate_configuration(self) -> SearchConfiguration:
+        _validate_search_run_id(self.search_run_id)
         holdout = self.holdout_scorer
         if holdout is None:
             return self
@@ -273,6 +276,19 @@ class SearchConfiguration(BaseModel):
                 f"overlap={overlap}"
             )
         return self
+
+
+def _validate_search_run_id(search_run_id: str | None) -> None:
+    """Reject ambiguous or non-durable caller-issued search identities."""
+    if search_run_id is None:
+        return
+    validate_durable_text(search_run_id, field="search run id")
+    if not search_run_id.strip():
+        raise ValueError("search run id must not be blank")
+    if len(search_run_id) > 512:
+        raise ValueError("search run id must contain at most 512 characters")
+    if search_run_id != search_run_id.strip():
+        raise ValueError("search run id must not contain surrounding whitespace")
 
 
 class FailureClusterExpansionRecord(BaseModel):
@@ -303,6 +319,82 @@ class SearchEvaluationRecord(BaseModel):
     report_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class SearchProposalBatchSlot(BaseModel):
+    """One exact proposer return slot stored before any candidate evaluation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["delta", "failure", "none"]
+    delta: HarnessDelta | None = None
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_slot(self) -> SearchProposalBatchSlot:
+        if self.kind == "delta":
+            if self.delta is None or self.reason is not None:
+                raise ValueError("delta proposal slots require only a delta")
+            if self.delta.child_doc_hash is not None or self.delta.verdict is not None:
+                raise ValueError("witnessed proposal deltas must be unevaluated")
+        elif self.kind == "failure":
+            if self.delta is not None or self.reason is None:
+                raise ValueError("failure proposal slots require only a reason")
+        elif self.delta is not None or self.reason is not None:
+            raise ValueError("none proposal slots cannot carry a delta or reason")
+        return self
+
+
+class SearchProposalBatchWitness(BaseModel):
+    """Checksummed transaction state around one potentially paid proposer batch.
+
+    A prepared record is durably published before the proposer call. A completed record replaces
+    it immediately after the proposer returns and before cancellation or candidate scoring. If a
+    process restarts with only the prepared record, whether the external call completed is
+    unknowable, so continuation fails closed instead of resampling.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["wmh.search-proposal-batch-witness.v1"] = (
+        "wmh.search-proposal-batch-witness.v1"
+    )
+    phase: Literal["prepared", "completed"]
+    prior_checkpoint_payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    configuration: SearchConfiguration
+    iteration: int = Field(ge=1)
+    parent_doc_hash: str = Field(min_length=1)
+    parent_execution_hash: str = Field(min_length=1)
+    trigger: FailureSignature
+    evidence: str
+    history: tuple[HarnessDelta, ...]
+    count: int = Field(ge=1)
+    proposer_state_before: JsonObject | None = None
+    prepared_payload_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    slots: tuple[SearchProposalBatchSlot, ...] = ()
+    proposer_state_after: JsonObject | None = None
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_witness(self) -> SearchProposalBatchWitness:
+        expected_digest = _proposal_batch_witness_payload_sha256(self)
+        if not hmac.compare_digest(self.payload_sha256, expected_digest):
+            raise ValueError("proposal batch witness payload digest does not match its state")
+        if self.iteration > self.configuration.iterations:
+            raise ValueError("proposal batch witness iteration exceeds configured iterations")
+        if self.phase == "prepared":
+            if (
+                self.prepared_payload_sha256 is not None
+                or self.slots
+                or self.proposer_state_after is not None
+            ):
+                raise ValueError("prepared proposal batch cannot carry completed output")
+        else:
+            if self.prepared_payload_sha256 is None:
+                raise ValueError("completed proposal batch must bind its prepared transaction")
+            if len(self.slots) != self.count:
+                raise ValueError("completed proposal batch slot count does not match count")
+        return self
+
+
 class SearchCheckpoint(BaseModel):
     """Checksummed host-only state committed at a complete iteration boundary.
 
@@ -312,7 +404,7 @@ class SearchCheckpoint(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["wmh.search-checkpoint.v1"] = "wmh.search-checkpoint.v1"
+    schema_version: Literal["wmh.search-checkpoint.v2"] = "wmh.search-checkpoint.v2"
     configuration: SearchConfiguration
     completed_iteration: int = Field(ge=0)
     docs: dict[str, HarnessDoc]
@@ -328,6 +420,7 @@ class SearchCheckpoint(BaseModel):
     confirmations: int = Field(ge=0)
     failure_cluster_expansions: list[FailureClusterExpansionRecord]
     evaluation_records: list[SearchEvaluationRecord]
+    proposal_batch_witness_digests: tuple[str, ...]
     proposer_state: JsonObject | None = None
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -338,6 +431,17 @@ class SearchCheckpoint(BaseModel):
             raise ValueError("search checkpoint payload digest does not match its serialized state")
         if self.completed_iteration > self.configuration.iterations:
             raise ValueError("completed_iteration exceeds the configured search iterations")
+        if len(self.proposal_batch_witness_digests) != self.completed_iteration:
+            raise ValueError("checkpoint must commit one proposal witness per completed iteration")
+        if len(set(self.proposal_batch_witness_digests)) != len(
+            self.proposal_batch_witness_digests
+        ):
+            raise ValueError("checkpoint proposal witness digests must be unique by iteration")
+        if any(
+            len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)
+            for digest in self.proposal_batch_witness_digests
+        ):
+            raise ValueError("checkpoint proposal witness digests must be SHA-256 hex values")
         if self.archive.seed.doc_hash != self.configuration.seed_doc_hash:
             raise ValueError("checkpoint archive seed does not match the configured seed")
         if self.archive.seed.execution_hash != self.configuration.seed_execution_hash:
@@ -533,6 +637,17 @@ def _search_checkpoint_payload_sha256(checkpoint: SearchCheckpoint) -> str:
     return _checkpoint_payload_digest(_checkpoint_payload(checkpoint))
 
 
+def _proposal_batch_witness_payload(witness: SearchProposalBatchWitness) -> JsonObject:
+    return cast(
+        "JsonObject",
+        witness.model_dump(mode="json", exclude={"payload_sha256"}),
+    )
+
+
+def _proposal_batch_witness_payload_sha256(witness: SearchProposalBatchWitness) -> str:
+    return _checkpoint_payload_digest(_proposal_batch_witness_payload(witness))
+
+
 def _build_search_checkpoint(
     *,
     configuration: SearchConfiguration,
@@ -550,11 +665,12 @@ def _build_search_checkpoint(
     confirmations: int,
     failure_cluster_expansions: dict[FailureClusterKey, int],
     evaluation_records: dict[str, SearchEvaluationRecord],
+    proposal_batch_witness_digests: list[str],
     proposer_state: JsonObject | None,
 ) -> SearchCheckpoint:
     """Detach live state, checksum it, and validate the complete resume invariant set."""
     unchecked = SearchCheckpoint.model_construct(
-        schema_version="wmh.search-checkpoint.v1",
+        schema_version="wmh.search-checkpoint.v2",
         configuration=configuration.model_copy(deep=True),
         completed_iteration=completed_iteration,
         docs={doc_hash: doc.model_copy(deep=True) for doc_hash, doc in docs.items()},
@@ -583,6 +699,7 @@ def _build_search_checkpoint(
             evaluation_records[evaluation_id].model_copy(deep=True)
             for evaluation_id in sorted(evaluation_records)
         ],
+        proposal_batch_witness_digests=tuple(proposal_batch_witness_digests),
         proposer_state=proposer_state,
         payload_sha256="0" * 64,
     )
@@ -642,6 +759,62 @@ def load_search_checkpoint(path: str | Path) -> SearchCheckpoint:
     if not hmac.compare_digest(persisted_digest, expected_digest):
         raise ValueError("search checkpoint payload digest does not match the file contents")
     return SearchCheckpoint.model_validate(raw)
+
+
+def write_search_proposal_batch_witness(
+    path: str | Path,
+    witness: SearchProposalBatchWitness,
+) -> None:
+    """Atomically replace one host-only prepared or completed proposal transaction."""
+    validated = SearchProposalBatchWitness.model_validate(witness.model_dump(mode="json"))
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = (
+        json.dumps(
+            validated.model_dump(mode="json"),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        directory_descriptor = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_search_proposal_batch_witness(path: str | Path) -> SearchProposalBatchWitness:
+    """Read a proposal transaction, rejecting truncation, corruption, and schema drift."""
+    target = Path(path).expanduser()
+    raw = _JSON_OBJECT_ADAPTER.validate_json(target.read_text(encoding="utf-8"))
+    persisted_digest = raw.get("payload_sha256")
+    if not isinstance(persisted_digest, str):
+        raise ValueError("proposal batch witness is missing its payload digest")
+    payload = dict(raw)
+    del payload["payload_sha256"]
+    expected_digest = _checkpoint_payload_digest(payload)
+    if not hmac.compare_digest(persisted_digest, expected_digest):
+        raise ValueError("proposal batch witness payload digest does not match the file contents")
+    return SearchProposalBatchWitness.model_validate(raw)
 
 
 @dataclass
@@ -858,6 +1031,7 @@ def _scorer_configuration(
 
 def _search_configuration(
     *,
+    search_run_id: str | None,
     name: str,
     seed_doc: HarnessDoc,
     scorer: HarnessScorer,
@@ -870,6 +1044,7 @@ def _search_configuration(
     search_cost_binding_digest: str | None,
 ) -> SearchConfiguration:
     return SearchConfiguration(
+        search_run_id=search_run_id,
         name=name,
         seed_doc_hash=seed_doc.doc_hash,
         seed_execution_hash=seed_doc.execution_hash,
@@ -987,12 +1162,167 @@ def _restore_proposer_state(
     restore(detached)
 
 
+def _restore_witnessed_proposer_state(
+    proposer: DeltaProposer,
+    *,
+    state_before: JsonObject | None,
+    state_after: JsonObject | None,
+    required: bool,
+) -> None:
+    """Advance proposer state through a validated completed proposal transaction."""
+    restore_witness = getattr(proposer, "restore_proposal_batch_state", None)
+    if restore_witness is None:
+        _restore_proposer_state(proposer, state_after, required=required)
+        return
+    if not callable(restore_witness):
+        raise ValueError("proposer.restore_proposal_batch_state must be callable")
+    if state_before is None or state_after is None:
+        if required:
+            raise RuntimeError("proposal witness is missing required durable proposer state")
+        _restore_proposer_state(proposer, state_after, required=False)
+        return
+    detached_before = _JSON_OBJECT_ADAPTER.validate_json(_canonical_json_object(state_before))
+    detached_after = _JSON_OBJECT_ADAPTER.validate_json(_canonical_json_object(state_after))
+    restore_witness(state_before=detached_before, state_after=detached_after)
+
+
+def _build_prepared_proposal_batch_witness(
+    *,
+    prior_checkpoint: SearchCheckpoint,
+    configuration: SearchConfiguration,
+    iteration: int,
+    parent: HarnessDoc,
+    trigger: FailureSignature,
+    evidence: str,
+    history: list[HarnessDelta],
+    count: int,
+    proposer_state_before: JsonObject | None,
+) -> SearchProposalBatchWitness:
+    """Freeze the exact request and pre-call state for one proposer transaction."""
+    unchecked = SearchProposalBatchWitness.model_construct(
+        schema_version="wmh.search-proposal-batch-witness.v1",
+        phase="prepared",
+        prior_checkpoint_payload_sha256=prior_checkpoint.payload_sha256,
+        configuration=configuration.model_copy(deep=True),
+        iteration=iteration,
+        parent_doc_hash=parent.doc_hash,
+        parent_execution_hash=parent.execution_hash,
+        trigger=trigger.model_copy(deep=True),
+        evidence=evidence,
+        history=tuple(delta.model_copy(deep=True) for delta in history),
+        count=count,
+        proposer_state_before=proposer_state_before,
+        prepared_payload_sha256=None,
+        slots=(),
+        proposer_state_after=None,
+        payload_sha256="0" * 64,
+    )
+    payload = _proposal_batch_witness_payload(unchecked)
+    payload["payload_sha256"] = _checkpoint_payload_digest(payload)
+    return SearchProposalBatchWitness.model_validate(payload)
+
+
+def _snapshot_proposal_batch_slots(
+    batch: list[HarnessDelta | ProposalFailure | None],
+) -> tuple[SearchProposalBatchSlot, ...]:
+    """Detach proposer-owned return values into exact typed witness slots."""
+    slots: list[SearchProposalBatchSlot] = []
+    for proposed in batch:
+        if isinstance(proposed, HarnessDelta):
+            delta = HarnessDelta.model_validate(proposed.model_dump(mode="json"))
+            slots.append(SearchProposalBatchSlot(kind="delta", delta=delta))
+        elif isinstance(proposed, ProposalFailure):
+            slots.append(SearchProposalBatchSlot(kind="failure", reason=proposed.reason))
+        elif proposed is None:
+            slots.append(SearchProposalBatchSlot(kind="none"))
+        else:
+            raise TypeError(
+                "proposer returned an unsupported proposal slot type: "
+                f"{type(proposed).__module__}.{type(proposed).__qualname__}"
+            )
+    return tuple(slots)
+
+
+def _build_completed_proposal_batch_witness(
+    prepared: SearchProposalBatchWitness,
+    *,
+    batch: list[HarnessDelta | ProposalFailure | None],
+    proposer_state_after: JsonObject | None,
+) -> SearchProposalBatchWitness:
+    """Freeze exact proposer outputs and post-call state before any next side effect."""
+    if prepared.phase != "prepared":
+        raise ValueError("completed proposal witness requires a prepared transaction")
+    unchecked = prepared.model_copy(
+        update={
+            "phase": "completed",
+            "prepared_payload_sha256": prepared.payload_sha256,
+            "slots": _snapshot_proposal_batch_slots(batch),
+            "proposer_state_after": proposer_state_after,
+            "payload_sha256": "0" * 64,
+        },
+        deep=True,
+    )
+    payload = _proposal_batch_witness_payload(unchecked)
+    payload["payload_sha256"] = _checkpoint_payload_digest(payload)
+    return SearchProposalBatchWitness.model_validate(payload)
+
+
+def _validate_proposal_batch_witness_request(
+    witness: SearchProposalBatchWitness,
+    expected: SearchProposalBatchWitness,
+) -> None:
+    """Reject any proposal transaction request drift with a specific audit error."""
+    comparisons = (
+        (
+            "prior checkpoint",
+            witness.prior_checkpoint_payload_sha256,
+            expected.prior_checkpoint_payload_sha256,
+        ),
+        ("configuration", witness.configuration, expected.configuration),
+        ("iteration", witness.iteration, expected.iteration),
+        ("parent document", witness.parent_doc_hash, expected.parent_doc_hash),
+        ("parent execution", witness.parent_execution_hash, expected.parent_execution_hash),
+        ("trigger", witness.trigger, expected.trigger),
+        ("evidence", witness.evidence, expected.evidence),
+        ("full proposal history", witness.history, expected.history),
+        ("slot count", witness.count, expected.count),
+        ("proposer state before", witness.proposer_state_before, expected.proposer_state_before),
+    )
+    for label, actual, wanted in comparisons:
+        if actual != wanted:
+            raise ValueError(f"proposal batch witness {label} does not match resume state")
+    if witness.phase == "completed" and witness.prepared_payload_sha256 != expected.payload_sha256:
+        raise ValueError("proposal batch witness prepared transaction does not match resume state")
+
+
+def _proposal_batch_from_witness(
+    witness: SearchProposalBatchWitness,
+) -> list[HarnessDelta | ProposalFailure | None]:
+    """Reconstruct one detached proposer batch from its completed witness."""
+    if witness.phase != "completed":
+        raise RuntimeError(
+            "ambiguous prepared proposal batch has no completed witness; refusing to resample"
+        )
+    batch: list[HarnessDelta | ProposalFailure | None] = []
+    for slot in witness.slots:
+        if slot.kind == "delta":
+            assert slot.delta is not None
+            batch.append(slot.delta.model_copy(deep=True))
+        elif slot.kind == "failure":
+            assert slot.reason is not None
+            batch.append(ProposalFailure(reason=slot.reason))
+        else:
+            batch.append(None)
+    return batch
+
+
 def search_harness(
     name: str,
     seed_doc: HarnessDoc,
     scorer: HarnessScorer,
     proposer: DeltaProposer,
     *,
+    search_run_id: str | None = None,
     iterations: int = 5,
     proposal_batch_size: int = 1,
     screen_proposals: bool = True,
@@ -1000,11 +1330,14 @@ def search_harness(
     confirm_narrow_vetoes: bool = True,
     cost_binding: SearchCostBinding | None = None,
     resume_from: SearchCheckpoint | None = None,
+    resume_proposal_batch_witness: SearchProposalBatchWitness | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
     on_proposal: Callable[[ProposalRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
     on_checkpoint: Callable[[SearchCheckpoint], None] | None = None,
+    on_proposal_batch_prepare: Callable[[SearchProposalBatchWitness], None] | None = None,
+    on_proposal_batch_witness: Callable[[SearchProposalBatchWitness], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> SearchResult:
     """Search over harness deltas using normalized scores from an injected evaluator.
@@ -1015,6 +1348,7 @@ def search_harness(
 
     Args:
         name: Name assigned to the final champion.
+        search_run_id: Optional caller-issued durable identity for this exact search run.
         seed_doc: Initial harness document.
         scorer: Discovery evaluator and candidate eligibility boundary.
         proposer: Existing delta proposer fed bounded scorer evidence.
@@ -1027,7 +1361,13 @@ def search_harness(
         confirm_narrow_vetoes: Whether capable scorers remeasure narrow gate vetoes.
         cost_binding: Optional frozen path-free accounts required from every paid component.
         resume_from: A validated checkpoint from a complete prior iteration.
+        resume_proposal_batch_witness: Prepared or completed next-iteration transaction recovered
+            with ``resume_from``, or an exact already-consumed witness from that checkpoint.
         on_checkpoint: Durable checkpoint callback. Exceptions abort before the next batch.
+        on_proposal_batch_prepare: Durable pre-call transaction callback. Exceptions prevent the
+            proposer call. Persist this record atomically to detect ambiguous interrupted calls.
+        on_proposal_batch_witness: Durable completed transaction callback, invoked immediately
+            after proposer return and before cancellation or candidate scoring.
 
     Returns:
         The champion, normalized reports, and complete delta audit record.
@@ -1036,6 +1376,7 @@ def search_harness(
         ValueError: If scorer capabilities, task matrices, attempts, or identities drift.
         HarnessSearchCancelled: If cancellation is requested at a search boundary.
     """
+    _validate_search_run_id(search_run_id)
     if iterations < 0:
         raise ValueError(f"iterations must be non-negative, got {iterations}")
     if proposal_batch_size < 1:
@@ -1101,9 +1442,21 @@ def search_harness(
         if holdout_seed_error is not None:
             raise ValueError(f"holdout seed is not eligible for scoring: {holdout_seed_error}")
 
-    checkpointing = resume_from is not None or on_checkpoint is not None
+    if resume_proposal_batch_witness is not None and resume_from is None:
+        raise ValueError("resume_proposal_batch_witness requires resume_from")
+    checkpointing = any(
+        value is not None
+        for value in (
+            resume_from,
+            resume_proposal_batch_witness,
+            on_checkpoint,
+            on_proposal_batch_prepare,
+            on_proposal_batch_witness,
+        )
+    )
     configuration = (
         _search_configuration(
+            search_run_id=search_run_id,
             name=name,
             seed_doc=seed_doc,
             scorer=scorer,
@@ -1129,6 +1482,25 @@ def search_harness(
     if resumed is not None:
         assert configuration is not None
         _validate_resume_configuration(resumed.configuration, configuration)
+    recovered_witness = (
+        SearchProposalBatchWitness.model_validate(
+            resume_proposal_batch_witness.model_dump(mode="json")
+        )
+        if resume_proposal_batch_witness is not None
+        else None
+    )
+    if resumed is not None and recovered_witness is not None:
+        if recovered_witness.iteration <= resumed.completed_iteration:
+            committed_digest = resumed.proposal_batch_witness_digests[
+                recovered_witness.iteration - 1
+            ]
+            if not hmac.compare_digest(recovered_witness.payload_sha256, committed_digest):
+                raise ValueError(
+                    "already-consumed proposal batch does not match its committed witness digest"
+                )
+            recovered_witness = None
+        elif recovered_witness.iteration != resumed.completed_iteration + 1:
+            raise ValueError("proposal batch witness iteration is not the next resume iteration")
 
     evaluations_by_id: dict[str, SearchEvaluationRecord] = {}
 
@@ -1230,6 +1602,7 @@ def search_harness(
         skipped = 0
         screened = 0
         confirmations = 0
+        proposal_batch_witness_digests: list[str] = []
 
         seed_report = _score(
             scorer,
@@ -1292,6 +1665,7 @@ def search_harness(
         skipped = resumed.skipped
         screened = resumed.screened
         confirmations = resumed.confirmations
+        proposal_batch_witness_digests = list(resumed.proposal_batch_witness_digests)
         champion_hash = resumed.champion_doc_hash
         best_full = resumed.best_full_score
         suite = list(resumed.suite)
@@ -1314,8 +1688,11 @@ def search_harness(
             proposal_records=proposal_records,
         )
 
+    current_checkpoint: SearchCheckpoint | None = resumed
+
     def _emit_checkpoint(completed_iteration: int) -> None:
-        if on_checkpoint is None:
+        nonlocal current_checkpoint
+        if configuration is None:
             return
         assert configuration is not None
         proposer_state = _export_proposer_state(
@@ -1338,9 +1715,12 @@ def search_harness(
             confirmations=confirmations,
             failure_cluster_expansions=failure_cluster_expansions,
             evaluation_records=evaluations_by_id,
+            proposal_batch_witness_digests=proposal_batch_witness_digests,
             proposer_state=proposer_state,
         )
-        on_checkpoint(checkpoint)
+        current_checkpoint = checkpoint
+        if on_checkpoint is not None:
+            on_checkpoint(checkpoint.model_copy(deep=True))
 
     if resumed is None:
         _emit_checkpoint(0)
@@ -1359,9 +1739,6 @@ def search_harness(
 
     for iteration_index in range(next_iteration, iterations + 1):
         _check_cancelled()
-        scorer.before_proposal_batch()
-        if holdout_scorer is not None and holdout_scorer is not scorer:
-            holdout_scorer.before_proposal_batch()
         parent = docs[champion_hash]
         parent_report = reports[champion_hash]
         frozen_champion_hash = champion_hash
@@ -1382,26 +1759,114 @@ def search_harness(
         else:
             trigger = FailureSignature(mechanism=ALL_PASS_MECHANISM)
         evidence = render_score_evidence(trigger, parent_report)
-        try:
-            batch = proposer.propose_batch(
-                parent.model_copy(deep=True),
-                trigger.model_copy(deep=True),
-                evidence,
-                history=[delta.model_copy(deep=True) for delta in archive.deltas],
-                count=proposal_batch_size,
-                should_cancel=should_cancel,
+        history = [delta.model_copy(deep=True) for delta in archive.deltas]
+        batch: list[HarnessDelta | ProposalFailure | None] = []
+        completed_witness: SearchProposalBatchWitness | None = None
+        if configuration is not None:
+            assert current_checkpoint is not None
+            proposer_state_before = _export_proposer_state(
+                proposer,
+                required=configuration.proposer.durable_state_required,
             )
-            if len(batch) != proposal_batch_size:
-                raise ValueError(
-                    f"proposer returned {len(batch)} proposals; expected {proposal_batch_size}"
+            prepared_witness = _build_prepared_proposal_batch_witness(
+                prior_checkpoint=current_checkpoint,
+                configuration=configuration,
+                iteration=iteration_index,
+                parent=parent,
+                trigger=trigger,
+                evidence=evidence,
+                history=history,
+                count=proposal_batch_size,
+                proposer_state_before=proposer_state_before,
+            )
+            if recovered_witness is not None:
+                _validate_proposal_batch_witness_request(recovered_witness, prepared_witness)
+                batch = _proposal_batch_from_witness(recovered_witness)
+                _restore_witnessed_proposer_state(
+                    proposer,
+                    state_before=recovered_witness.proposer_state_before,
+                    state_after=recovered_witness.proposer_state_after,
+                    required=configuration.proposer.durable_state_required,
                 )
-        except HarnessSearchCancelled:
-            raise
-        except Exception as error:  # noqa: BLE001
-            terminal = search_safety_terminal_error(error)
-            if terminal is not None:
-                raise terminal from None
-            batch = [ProposalFailure(reason=str(error))] * proposal_batch_size
+                completed_witness = recovered_witness
+                recovered_witness = None
+                scorer.before_proposal_batch()
+                if holdout_scorer is not None and holdout_scorer is not scorer:
+                    holdout_scorer.before_proposal_batch()
+            else:
+                scorer.before_proposal_batch()
+                if holdout_scorer is not None and holdout_scorer is not scorer:
+                    holdout_scorer.before_proposal_batch()
+                if on_proposal_batch_prepare is not None:
+                    on_proposal_batch_prepare(prepared_witness.model_copy(deep=True))
+                try:
+                    batch = proposer.propose_batch(
+                        parent.model_copy(deep=True),
+                        trigger.model_copy(deep=True),
+                        evidence,
+                        history=[delta.model_copy(deep=True) for delta in history],
+                        count=proposal_batch_size,
+                        should_cancel=should_cancel,
+                    )
+                    if len(batch) != proposal_batch_size:
+                        raise ValueError(
+                            f"proposer returned {len(batch)} proposals; "
+                            f"expected {proposal_batch_size}"
+                        )
+                except HarnessSearchCancelled:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    terminal = search_safety_terminal_error(error)
+                    if terminal is not None:
+                        raise terminal from None
+                    batch = cast(
+                        "list[HarnessDelta | ProposalFailure | None]",
+                        [ProposalFailure(reason=str(error))] * proposal_batch_size,
+                    )
+                proposer_state_after = _export_proposer_state(
+                    proposer,
+                    required=configuration.proposer.durable_state_required,
+                )
+                completed_witness = _build_completed_proposal_batch_witness(
+                    prepared_witness,
+                    batch=batch,
+                    proposer_state_after=proposer_state_after,
+                )
+                if on_proposal_batch_witness is not None:
+                    on_proposal_batch_witness(completed_witness.model_copy(deep=True))
+                batch = _proposal_batch_from_witness(completed_witness)
+        else:
+            scorer.before_proposal_batch()
+            if holdout_scorer is not None and holdout_scorer is not scorer:
+                holdout_scorer.before_proposal_batch()
+            try:
+                batch = proposer.propose_batch(
+                    parent.model_copy(deep=True),
+                    trigger.model_copy(deep=True),
+                    evidence,
+                    history=history,
+                    count=proposal_batch_size,
+                    should_cancel=should_cancel,
+                )
+                if len(batch) != proposal_batch_size:
+                    raise ValueError(
+                        f"proposer returned {len(batch)} proposals; expected {proposal_batch_size}"
+                    )
+            except HarnessSearchCancelled:
+                raise
+            except Exception as error:  # noqa: BLE001
+                terminal = search_safety_terminal_error(error)
+                if terminal is not None:
+                    raise terminal from None
+                batch = cast(
+                    "list[HarnessDelta | ProposalFailure | None]",
+                    [ProposalFailure(reason=str(error))] * proposal_batch_size,
+                )
+        if completed_witness is not None and not hmac.compare_digest(
+            completed_witness.prior_checkpoint_payload_sha256,
+            current_checkpoint.payload_sha256 if current_checkpoint is not None else "",
+        ):
+            raise RuntimeError("proposal witness detached from the current search checkpoint")
         _check_cancelled()
 
         batch_records: list[ProposalRecord] = []
@@ -1870,6 +2335,8 @@ def search_harness(
             )
 
         proposal_records.extend(batch_records)
+        if completed_witness is not None:
+            proposal_batch_witness_digests.append(completed_witness.payload_sha256)
         _emit_checkpoint(iteration_index)
         if winner is not None and on_accept is not None:
             on_accept(

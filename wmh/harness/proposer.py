@@ -469,13 +469,37 @@ class ProjectDeltaProposer:
         state = _ProjectProposerState.model_validate(raw_state)
         if state.configuration_id != self.configuration_id:
             raise ValueError("project proposer durable state configuration does not match")
+        if self._iteration not in (0, state.iteration):
+            raise ValueError("project proposer already contains a different iteration state")
+        self._apply_search_state(state)
+
+    def restore_proposal_batch_state(
+        self,
+        *,
+        state_before: JsonObject,
+        state_after: JsonObject,
+    ) -> None:
+        """Advance exactly one witnessed proposer call from its bound pre-call state."""
+        before = _ProjectProposerState.model_validate(state_before)
+        after = _ProjectProposerState.model_validate(state_after)
+        if before.configuration_id != self.configuration_id or after.configuration_id != (
+            self.configuration_id
+        ):
+            raise ValueError("project proposer witness configuration does not match")
+        current = _ProjectProposerState.model_validate(self.export_search_state())
+        if current != before:
+            raise ValueError("project proposer current state does not match witness pre-call state")
+        if after.iteration != before.iteration + 1:
+            raise ValueError("project proposer witness must advance exactly one iteration")
+        self._apply_search_state(after)
+
+    def _apply_search_state(self, state: _ProjectProposerState) -> None:
+        """Replace live state with one already validated durable snapshot."""
         restore_project = getattr(self._project, "restore_search_state", None)
         if not callable(restore_project):
             raise RuntimeError(
                 "checkpointed project proposal search requires AgentProject.restore_search_state"
             )
-        if self._iteration not in (0, state.iteration):
-            raise ValueError("project proposer already contains a different iteration state")
         restore_project(state.project_state)
         self._iteration = state.iteration
         self._evaluation_dirs = dict(state.evaluation_dirs)

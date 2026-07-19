@@ -36,11 +36,14 @@ from wmh.harness.create import (
     HarnessSearchCancelled,
     ProposalRecord,
     SearchCheckpoint,
+    SearchProposalBatchWitness,
     _create_harness_nonpaid,
     load_search_checkpoint,
+    load_search_proposal_batch_witness,
     search_harness,
     select_failure_cluster,
     write_search_checkpoint,
+    write_search_proposal_batch_witness,
 )
 from wmh.harness.create import (
     create_harness as _production_create_harness,
@@ -838,6 +841,19 @@ def test_search_checkpoint_binds_cost_provenance_and_rejects_drift(
     assert scorer.requests == []
 
 
+def _rehash_witness_payload(payload: dict[str, object]) -> None:
+    """Recompute a proposal transaction checksum after an adversarial test edit."""
+    unsigned = {key: value for key, value in payload.items() if key != "payload_sha256"}
+    canonical = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    payload["payload_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def test_search_harness_resumes_exactly_from_a_committed_iteration() -> None:
     seed = HarnessDoc.baseline("seed")
     checkpoints: list[SearchCheckpoint] = []
@@ -895,6 +911,653 @@ def test_search_harness_resumes_exactly_from_a_committed_iteration() -> None:
     assert [len(history) for history in uninterrupted_proposer.history_ids] == [0, 1, 2]
 
 
+def test_search_harness_replays_a_witnessed_batch_without_recalling_proposer() -> None:
+    """A crash after proposal return cannot resample a different candidate on resume."""
+
+    class StatefulProposer(_HistoryProposer):
+        configuration_id = "stateful-witness-proposer-v1"
+        durable_state_required = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.state = 0
+            self.restored: list[int] = []
+
+        def export_search_state(self) -> JsonObject:
+            return {"state": self.state}
+
+        def restore_search_state(self, raw_state: JsonObject) -> None:
+            state = raw_state["state"]
+            assert isinstance(state, int)
+            self.state = state
+            self.restored.append(state)
+
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            self.calls += 1
+            self.state += 1
+            return super().propose_batch(
+                parent,
+                trigger,
+                evidence,
+                history=history,
+                count=count,
+                should_cancel=should_cancel,
+            )
+
+    seed = HarnessDoc.baseline("seed")
+    checkpoints: list[SearchCheckpoint] = []
+    preparations: list[SearchProposalBatchWitness] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    first_proposer = StatefulProposer()
+
+    def _interrupt_after_witness(witness: SearchProposalBatchWitness) -> None:
+        witnesses.append(witness)
+        raise RuntimeError("simulated post-proposal process failure")
+
+    with pytest.raises(RuntimeError, match="post-proposal process failure"):
+        search_harness(
+            "winner",
+            seed,
+            _NeutralScorer(),
+            first_proposer,
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=preparations.append,
+            on_proposal_batch_witness=_interrupt_after_witness,
+        )
+
+    assert first_proposer.calls == 1
+    assert [checkpoint.completed_iteration for checkpoint in checkpoints] == [0]
+    [witness] = witnesses
+    [preparation] = preparations
+    assert preparation.phase == "prepared"
+    assert witness.phase == "completed"
+    assert witness.prepared_payload_sha256 == preparation.payload_sha256
+    assert witness.iteration == 1
+    assert witness.prior_checkpoint_payload_sha256 == checkpoints[0].payload_sha256
+    assert witness.proposer_state_before == {"state": 0}
+    assert witness.proposer_state_after == {"state": 1}
+
+    resumed_proposer = StatefulProposer()
+    resumed_scorer = _NeutralScorer()
+    resumed_checkpoints: list[SearchCheckpoint] = []
+    resumed = search_harness(
+        "winner",
+        seed,
+        resumed_scorer,
+        resumed_proposer,
+        iterations=1,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        resume_from=checkpoints[0],
+        resume_proposal_batch_witness=witness,
+        on_checkpoint=resumed_checkpoints.append,
+        on_proposal_batch_prepare=lambda prepared: (_ for _ in ()).throw(
+            AssertionError("a replayed witness must not be prepared again")
+        ),
+        on_proposal_batch_witness=lambda replayed: (_ for _ in ()).throw(
+            AssertionError("a replayed witness must not be republished")
+        ),
+    )
+
+    uninterrupted_proposer = StatefulProposer()
+    uninterrupted = search_harness(
+        "winner",
+        seed,
+        _NeutralScorer(),
+        uninterrupted_proposer,
+        iterations=1,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        on_checkpoint=lambda checkpoint: None,
+        on_proposal_batch_prepare=lambda prepared: None,
+        on_proposal_batch_witness=lambda witnessed: None,
+    )
+    assert resumed == uninterrupted
+    assert resumed_proposer.calls == 0
+    assert resumed_proposer.state == 1
+    assert resumed_proposer.restored == [0, 1]
+    assert [request.purpose for _, request in resumed_scorer.requests] == ["full"]
+    assert resumed_checkpoints[-1].proposal_batch_witness_digests == (witness.payload_sha256,)
+
+
+def test_search_harness_witnesses_proposer_failures_before_any_candidate_score() -> None:
+    class FailingStatefulProposer(_HistoryProposer):
+        configuration_id = "failing-stateful-witness-proposer-v1"
+        durable_state_required = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.state = 0
+
+        def export_search_state(self) -> JsonObject:
+            return {"state": self.state}
+
+        def restore_search_state(self, raw_state: JsonObject) -> None:
+            state = raw_state["state"]
+            assert isinstance(state, int)
+            self.state = state
+
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            del parent, trigger, evidence, history, count, should_cancel
+            self.state += 1
+            raise RuntimeError("provider returned an unusable response")
+
+    checkpoints: list[SearchCheckpoint] = []
+    preparations: list[SearchProposalBatchWitness] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    scorer = _NeutralScorer()
+
+    def _stop(witness: SearchProposalBatchWitness) -> None:
+        witnesses.append(witness)
+        raise RuntimeError("stop after durable witness")
+
+    with pytest.raises(RuntimeError, match="stop after durable witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            FailingStatefulProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=preparations.append,
+            on_proposal_batch_witness=_stop,
+        )
+
+    assert [request.purpose for _, request in scorer.requests] == ["seed"]
+    [witness] = witnesses
+    [preparation] = preparations
+    assert witness.prepared_payload_sha256 == preparation.payload_sha256
+    assert witness.proposer_state_after == {"state": 1}
+    assert witness.slots[0].kind == "failure"
+    assert witness.slots[0].reason == "provider returned an unusable response"
+
+
+def test_search_harness_witnesses_and_replays_every_proposal_slot_kind() -> None:
+    class MixedSlotProposer(_HistoryProposer):
+        configuration_id = "mixed-slot-witness-proposer-v1"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            self.calls += 1
+            assert count == 3
+            [delta] = super().propose_batch(
+                parent,
+                trigger,
+                evidence,
+                history=history,
+                count=1,
+                should_cancel=should_cancel,
+            )
+            return [delta, ProposalFailure(reason="provider failure"), None]
+
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            MixedSlotProposer(),
+            iterations=1,
+            proposal_batch_size=3,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=lambda witness: (
+                witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+    [witness] = witnesses
+    assert [slot.kind for slot in witness.slots] == ["delta", "failure", "none"]
+
+    resumed_proposer = MixedSlotProposer()
+    resumed = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _NeutralScorer(),
+        resumed_proposer,
+        iterations=1,
+        proposal_batch_size=3,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        resume_from=checkpoints[0],
+        resume_proposal_batch_witness=witness,
+    )
+    assert resumed_proposer.calls == 0
+    assert [record.outcome for record in resumed.proposal_records] == [
+        "scored",
+        "proposer_error",
+        "unusable",
+    ]
+
+
+def test_search_harness_rejects_a_drifted_or_unbound_proposal_witness_before_scoring() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    preparations: list[SearchProposalBatchWitness] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=preparations.append,
+            on_proposal_batch_witness=lambda witness: (
+                witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+
+    payload = witnesses[0].model_dump(mode="json")
+    payload["prior_checkpoint_payload_sha256"] = "0" * 64
+    unsigned = {key: value for key, value in payload.items() if key != "payload_sha256"}
+    payload["payload_sha256"] = hashlib.sha256(
+        json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    drifted = SearchProposalBatchWitness.model_validate(payload)
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match="prior checkpoint"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[0],
+            resume_proposal_batch_witness=drifted,
+        )
+    assert scorer.requests == []
+
+    with pytest.raises(ValueError, match="requires resume_from"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_proposal_batch_witness=witnesses[0],
+        )
+
+
+def test_proposal_batch_witness_file_is_atomic_and_rejects_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    preparations: list[SearchProposalBatchWitness] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=preparations.append,
+            on_proposal_batch_witness=lambda witness: (
+                witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+    path = tmp_path / "proposal-witness.json"
+    write_search_proposal_batch_witness(path, witnesses[0])
+    assert load_search_proposal_batch_witness(path) == witnesses[0]
+
+    corrupt = json.loads(path.read_text())
+    corrupt["iteration"] = 2
+    path.write_text(json.dumps(corrupt))
+    with pytest.raises(ValueError, match="witness payload digest"):
+        load_search_proposal_batch_witness(path)
+
+    write_search_proposal_batch_witness(path, witnesses[0])
+
+    def _fail_replace(source: Path, target: Path) -> None:
+        del source, target
+        raise OSError("simulated atomic replacement failure")
+
+    monkeypatch.setattr(create_module.os, "replace", _fail_replace)
+    with pytest.raises(OSError, match="simulated atomic replacement failure"):
+        write_search_proposal_batch_witness(path, witnesses[0])
+    assert load_search_proposal_batch_witness(path) == witnesses[0]
+
+
+def test_search_harness_fails_closed_on_an_unwitnessed_prepared_proposer_call() -> None:
+    """A prepared call is ambiguous after restart until its completed witness exists."""
+    checkpoints: list[SearchCheckpoint] = []
+    preparations: list[SearchProposalBatchWitness] = []
+
+    def _stop_after_prepare(prepared: SearchProposalBatchWitness) -> None:
+        preparations.append(prepared)
+        raise RuntimeError("simulated crash after preparing proposer call")
+
+    proposer = _HistoryProposer()
+    with pytest.raises(RuntimeError, match="crash after preparing"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            proposer,
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=_stop_after_prepare,
+            on_proposal_batch_witness=lambda witnessed: None,
+        )
+
+    assert proposer.history_ids == []
+    [prepared] = preparations
+    assert prepared.phase == "prepared"
+    scorer = _NeutralScorer()
+    resumed_proposer = _HistoryProposer()
+    with pytest.raises(RuntimeError, match="ambiguous prepared proposal batch"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            resumed_proposer,
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[0],
+            resume_proposal_batch_witness=prepared,
+        )
+    assert scorer.requests == []
+    assert scorer.before_proposal_calls == 0
+    assert resumed_proposer.history_ids == []
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("iteration", 2, "iteration"),
+        ("parent_doc_hash", "drifted-parent", "parent document"),
+        ("parent_execution_hash", "drifted-execution", "parent execution"),
+        ("evidence", "drifted evidence", "evidence"),
+        ("count", 2, "slot count"),
+        ("proposer_state_before", {"drifted": True}, "proposer state before"),
+    ],
+)
+def test_search_harness_rejects_rehashed_witness_binding_drift_before_scoring(
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=lambda witness: (
+                witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+    payload = witnesses[0].model_dump(mode="json")
+    payload[field] = replacement
+    if field == "count":
+        payload["slots"] = [*payload["slots"], payload["slots"][0]]
+    _rehash_witness_payload(payload)
+    drifted = SearchProposalBatchWitness.model_validate(payload)
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match=message):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[0],
+            resume_proposal_batch_witness=drifted,
+        )
+    assert scorer.requests == []
+    assert scorer.before_proposal_calls == 0
+
+
+def test_search_harness_rejects_history_drift_and_replays_witnessed_slots_exactly() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=lambda witness: (
+                witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+
+    history_payload = witnesses[0].model_dump(mode="json")
+    history_payload["history"] = [history_payload["slots"][0]["delta"]]
+    _rehash_witness_payload(history_payload)
+    history_drifted = SearchProposalBatchWitness.model_validate(history_payload)
+    with pytest.raises(ValueError, match="full proposal history"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[0],
+            resume_proposal_batch_witness=history_drifted,
+        )
+
+    slot_payload = witnesses[0].model_dump(mode="json")
+    slot_payload["slots"][0]["delta"]["expected_effect"] = "mutated witnessed output"
+    _rehash_witness_payload(slot_payload)
+    slot_drifted = SearchProposalBatchWitness.model_validate(slot_payload)
+    resumed = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _NeutralScorer(),
+        _HistoryProposer(),
+        iterations=1,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        resume_from=checkpoints[0],
+        resume_proposal_batch_witness=slot_drifted,
+    )
+    assert resumed.proposal_records[0].expected_effect == "mutated witnessed output"
+
+
+def test_completed_proposal_witness_precedes_cancellation_and_is_observer_detached() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    cancel_now = False
+
+    def _should_cancel() -> bool:
+        return cancel_now
+
+    def _capture_and_mutate(witness: SearchProposalBatchWitness) -> None:
+        nonlocal cancel_now
+        witnesses.append(witness.model_copy(deep=True))
+        delta = witness.slots[0].delta
+        assert delta is not None
+        delta.expected_effect = "observer mutation"
+        cancel_now = True
+
+    with pytest.raises(HarnessSearchCancelled):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=_capture_and_mutate,
+            should_cancel=_should_cancel,
+        )
+    [witness] = witnesses
+    assert witness.phase == "completed"
+    assert witness.slots[0].delta is not None
+    assert witness.slots[0].delta.expected_effect != "observer mutation"
+
+
+def test_search_checkpoint_commits_exactly_one_witness_digest_per_iteration() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _NeutralScorer(),
+        _HistoryProposer(),
+        iterations=2,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        on_checkpoint=checkpoints.append,
+        on_proposal_batch_prepare=lambda prepared: None,
+        on_proposal_batch_witness=witnesses.append,
+    )
+    assert [checkpoint.schema_version for checkpoint in checkpoints] == [
+        "wmh.search-checkpoint.v2",
+        "wmh.search-checkpoint.v2",
+        "wmh.search-checkpoint.v2",
+    ]
+    assert checkpoints[0].proposal_batch_witness_digests == ()
+    assert checkpoints[1].proposal_batch_witness_digests == (witnesses[0].payload_sha256,)
+    assert checkpoints[2].proposal_batch_witness_digests == tuple(
+        witness.payload_sha256 for witness in witnesses
+    )
+
+
+def test_search_harness_recognizes_only_the_exact_already_consumed_witness() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+
+    def _stop_at_iteration_one(checkpoint: SearchCheckpoint) -> None:
+        checkpoints.append(checkpoint)
+        if checkpoint.completed_iteration == 1:
+            raise RuntimeError("stop after first completed iteration")
+
+    with pytest.raises(RuntimeError, match="first completed iteration"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_stop_at_iteration_one,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=witnesses.append,
+        )
+    committed = checkpoints[-1]
+    assert committed.proposal_batch_witness_digests == (witnesses[0].payload_sha256,)
+
+    proposer = _HistoryProposer()
+    resumed = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _NeutralScorer(),
+        proposer,
+        iterations=2,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        resume_from=committed,
+        resume_proposal_batch_witness=witnesses[0],
+    )
+    assert resumed.iterations == 2
+    assert len(proposer.history_ids) == 1
+
+    tampered_payload = witnesses[0].model_dump(mode="json")
+    tampered_payload["slots"][0]["delta"]["expected_effect"] = "different batch"
+    _rehash_witness_payload(tampered_payload)
+    tampered = SearchProposalBatchWitness.model_validate(tampered_payload)
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match="committed witness digest"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=committed,
+            resume_proposal_batch_witness=tampered,
+        )
+    assert scorer.requests == []
+
+
 def test_search_harness_rejects_resume_configuration_drift_before_scoring() -> None:
     checkpoints: list[SearchCheckpoint] = []
     with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
@@ -925,6 +1588,46 @@ def test_search_harness_rejects_resume_configuration_drift_before_scoring() -> N
 
     assert scorer.requests == []
     assert scorer.before_proposal_calls == 0
+
+
+def test_search_harness_binds_search_run_id_into_checkpoint_and_witness() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    witnesses: list[SearchProposalBatchWitness] = []
+    with pytest.raises(RuntimeError, match="stop after witness"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            search_run_id="discovery-run-001",
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=checkpoints.append,
+            on_proposal_batch_prepare=lambda prepared: None,
+            on_proposal_batch_witness=lambda witness: (
+                witnesses.append(witness),
+                (_ for _ in ()).throw(RuntimeError("stop after witness")),
+            ),
+        )
+    assert checkpoints[0].configuration.search_run_id == "discovery-run-001"
+    assert witnesses[0].configuration.search_run_id == "discovery-run-001"
+
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match="search checkpoint configuration drift"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            search_run_id="discovery-run-002",
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[0],
+            resume_proposal_batch_witness=witnesses[0],
+        )
+    assert scorer.requests == []
 
 
 def test_search_harness_rejects_resume_scorer_matrix_drift_before_scoring() -> None:

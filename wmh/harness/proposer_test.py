@@ -1821,6 +1821,32 @@ def test_project_proposer_checkpoint_restores_private_archives_and_iteration_lin
     assert history["proposal_file"].endswith("/proposals/iteration-0001/proposal-01.json")
 
 
+def test_project_proposer_restores_one_exact_witnessed_batch_transition() -> None:
+    parent = HarnessDoc.baseline("parent")
+    first_project = _Project([_payload(parent, "first revision")])
+    first = ProjectDeltaProposer(first_project, meta_agent(), _Provider("unused"))
+    state_before = first.export_search_state()
+    first.propose_batch(parent, _trigger(), "inspect failures", history=[], count=1)
+    state_after = first.export_search_state()
+
+    restored_project = _Project([])
+    restored = ProjectDeltaProposer(restored_project, meta_agent(), _Provider("unused"))
+    restored.restore_search_state(state_before)
+    restored.restore_proposal_batch_state(
+        state_before=state_before,
+        state_after=state_after,
+    )
+
+    assert restored.export_search_state() == state_after
+    assert restored_project.files == first_project.files
+
+    with pytest.raises(ValueError, match="current state does not match witness pre-call"):
+        restored.restore_proposal_batch_state(
+            state_before=state_before,
+            state_after=state_after,
+        )
+
+
 def test_project_proposer_resume_rejects_uncommitted_link_state() -> None:
     parent = HarnessDoc.baseline("parent")
     first_project = _Project([_payload(parent, "first revision")])
