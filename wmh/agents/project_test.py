@@ -1430,10 +1430,7 @@ class _AttestedProjectSandbox(_Sandbox):
                 True if network_drift else create_kwargs["allow_internet_access"]
             ),
             volume_mounts=([{"name": "unexpected"}] if volume_drift else []),
-            lifecycle=SimpleNamespace(
-                on_timeout=lifecycle["on_timeout"],
-                auto_resume=lifecycle["auto_resume"],
-            ),
+            lifecycle=dict(lifecycle),
             started_at=started_at,
             end_at=started_at + timedelta(seconds=timeout),
         )
@@ -1530,6 +1527,32 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     reservations = SpendLedger(account.ledger_path, account.policy).reservations()
     assert len(reservations) == 2
     assert all(item.status is ReservationStatus.SETTLED for item in reservations)
+
+
+def test_budgeted_project_accepts_sdk_lifecycle_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The E2B SDK exposes SandboxInfo.lifecycle as a TypedDict at runtime."""
+    account = _project_resource_account(tmp_path)
+
+    def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        sandbox = _AttestedProjectSandbox(dict(kwargs), sandbox_id="project-sdk-shape")
+        sandbox.info.lifecycle = {"on_timeout": "kill", "auto_resume": False}
+        return lambda: sandbox
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        resource_budget_account=account,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        api_key="explicit-secret-key",
+    )
+
+    project.close()
 
 
 def test_budgeted_project_rejects_timeout_above_provider_maximum(tmp_path: Path) -> None:

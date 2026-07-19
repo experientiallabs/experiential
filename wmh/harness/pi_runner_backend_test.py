@@ -14,7 +14,7 @@ from pydantic import TypeAdapter, ValidationError
 
 import wmh.harness.pi_runner_backend as backend_mod
 from wmh.core.types import JsonObject
-from wmh.harness.e2b_sandbox import CommandOutput, SandboxHandle
+from wmh.harness.e2b_sandbox import CommandOutput, SandboxHandle, SandboxLifecyclePolicy
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE
 from wmh.harness.pi_runner_backend import (
     E2BOneShotRunnerFactory,
@@ -56,12 +56,6 @@ class _Channel:
 
 
 @dataclass(frozen=True)
-class _Lifecycle:
-    on_timeout: str = "kill"
-    auto_resume: bool = False
-
-
-@dataclass(frozen=True)
 class _Info:
     sandbox_id: str
     template_id: str
@@ -73,7 +67,7 @@ class _Info:
     envd_version: str
     allow_internet_access: bool
     metadata: dict[str, str]
-    lifecycle: _Lifecycle | None
+    lifecycle: SandboxLifecyclePolicy | None
     volume_mounts: list[dict[str, str]]
 
 
@@ -216,7 +210,7 @@ def _sandbox(spec: E2BPiRunnerSpec) -> _Sandbox:
             envd_version=spec.envd_version,
             allow_internet_access=False,
             metadata={},
-            lifecycle=_Lifecycle(),
+            lifecycle={"on_timeout": "kill", "auto_resume": False},
             volume_mounts=[],
         )
     )
@@ -363,6 +357,35 @@ def test_e2b_runner_is_one_shot_fixed_lifetime_and_attested(tmp_path: Path) -> N
     ledger = json.loads((tmp_path / "runner-lease.json").read_text())
     assert ledger["state"] == "retired"
     assert ledger["resource_id"] == "sandbox-immutable"
+
+
+def test_e2b_runner_accepts_sdk_lifecycle_mapping(tmp_path: Path) -> None:
+    """The E2B SDK exposes SandboxInfo.lifecycle as a TypedDict at runtime."""
+    spec = _e2b_spec()
+    sandbox = _sandbox(spec)
+    channel = _Channel()
+    factory = E2BOneShotRunnerFactory(
+        spec,
+        sandbox_factory=lambda: sandbox,
+        runner_starter=_starter(channel),
+        ledger_path=tmp_path / "runner-lease.json",
+        orphan_reaper=lambda _lease_id: (),
+    )
+    sandbox.info = replace(
+        sandbox.info,
+        metadata={
+            "wmh_runner_config": spec.config_digest,
+            "wmh_runner_lease": factory.lease_id,
+            "wmh_runner_owner": factory.owner_id,
+        },
+        lifecycle={"on_timeout": "kill", "auto_resume": False},
+    )
+
+    with factory() as observed:
+        assert observed is channel
+
+    assert factory.attestation == spec.attestation
+    assert sandbox.kill_calls == 1
 
 
 def test_e2b_runner_budget_denial_never_dispatches_or_reaps(tmp_path: Path) -> None:
@@ -591,7 +614,10 @@ def test_e2b_runner_rejects_runtime_identity_drift_and_kills(
         ),
         (lambda info: replace(info, lifecycle=None), "lifecycle"),
         (
-            lambda info: replace(info, lifecycle=_Lifecycle(on_timeout="pause")),
+            lambda info: replace(
+                info,
+                lifecycle={"on_timeout": "pause", "auto_resume": False},
+            ),
             "lifecycle",
         ),
         (lambda info: replace(info, volume_mounts=[{"name": "mutable"}]), "volume"),

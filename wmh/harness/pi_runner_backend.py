@@ -651,11 +651,6 @@ class LocalContainerRunnerFactory:
         self._closed.set()
 
 
-class _E2BLifecycleInfo(Protocol):
-    on_timeout: str
-    auto_resume: bool
-
-
 class _E2BSandboxInfo(Protocol):
     sandbox_id: str
     template_id: str
@@ -667,7 +662,7 @@ class _E2BSandboxInfo(Protocol):
     envd_version: str
     allow_internet_access: bool | None
     metadata: dict[str, str]
-    lifecycle: _E2BLifecycleInfo | None
+    lifecycle: SandboxLifecyclePolicy | None
     volume_mounts: Sequence[dict[str, str]]
 
 
@@ -945,9 +940,9 @@ class E2BOneShotRunnerFactory:
             raise RuntimeError("E2B runner lease does not match its frozen lifetime")
         lifecycle = info.lifecycle
         if (
-            lifecycle is None
-            or lifecycle.on_timeout != "kill"
-            or lifecycle.auto_resume is not False
+            not isinstance(lifecycle, dict)
+            or lifecycle.get("on_timeout") != "kill"
+            or lifecycle.get("auto_resume") is not False
         ):
             raise RuntimeError("E2B runner lifecycle does not fail closed on timeout")
         if info.volume_mounts:

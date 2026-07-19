@@ -326,9 +326,9 @@ class _BudgetedProjectSandboxFactory:
             raise RuntimeError("project sandbox metadata does not bind its opaque lease")
         lifecycle = getattr(info, "lifecycle", None)
         if (
-            lifecycle is None
-            or getattr(lifecycle, "on_timeout", None) != "kill"
-            or getattr(lifecycle, "auto_resume", None) is not False
+            not isinstance(lifecycle, dict)
+            or lifecycle.get("on_timeout") != "kill"
+            or lifecycle.get("auto_resume") is not False
         ):
             raise RuntimeError("project sandbox lifecycle can extend its immutable TTL")
         started_at = getattr(info, "started_at", None)
