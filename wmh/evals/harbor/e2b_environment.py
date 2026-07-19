@@ -145,12 +145,13 @@ class ExactE2BBuildSpec(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     environment_id: str = Field(min_length=1, max_length=512)
     build_context_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     docker_image: str | None = Field(default=None, min_length=1, max_length=2_048)
     cpu_count: int = Field(ge=1)
     memory_mb: int = Field(ge=1)
+    storage_mb: int | None = Field(ge=1)
 
     @property
     def digest(self) -> str:
@@ -161,7 +162,22 @@ class ExactE2BBuildSpec(BaseModel):
                 docker_image=self.docker_image,
                 cpu_count=self.cpu_count,
                 memory_mb=self.memory_mb,
+                storage_mb=self.storage_mb,
             )
+        )
+
+
+def validate_exact_e2b_task_resource_requests(config: EnvironmentConfig) -> None:
+    """Reject task resource requests that the exact E2B backend cannot enforce."""
+    if (config.gpus or 0) > 0 or config.gpu_types is not None:
+        raise ValueError(
+            "exact E2B task environments do not support GPU requests; use a GPU-capable "
+            "Harbor environment backend"
+        )
+    if config.tpu is not None:
+        raise ValueError(
+            "exact E2B task environments do not support TPU requests; use a TPU-capable "
+            "Harbor environment backend"
         )
 
 
@@ -391,7 +407,7 @@ class _ExactE2BBuildTerminalIdentity(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     reservation_id: str = Field(min_length=1)
     policy_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     ledger_identity: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -404,6 +420,7 @@ class _ExactE2BBuildTerminalIdentity(BaseModel):
     build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
     cpu_count: int = Field(ge=1)
     memory_mb: int = Field(ge=1)
+    storage_mb: int | None = Field(ge=1)
     provider: Literal["e2b"] = "e2b"
     provider_account_identity: str = Field(pattern=r"^[A-Za-z0-9_.:@/-]{1,256}$")
     provider_credential_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -421,7 +438,7 @@ class ExactE2BBuildRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
     build_config_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     environment_id: str = Field(min_length=1, max_length=512)
     build_context_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -429,6 +446,7 @@ class ExactE2BBuildRecord(BaseModel):
     build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
     cpu_count: int = Field(ge=1)
     memory_mb: int = Field(ge=1)
+    storage_mb: int | None = Field(ge=1)
     cost_attribution: _ExactE2BBuildAttribution
 
     @property
@@ -462,6 +480,7 @@ def _exact_build_terminal_provenance(
         build_id=record.build_id,
         cpu_count=record.cpu_count,
         memory_mb=record.memory_mb,
+        storage_mb=record.storage_mb,
         provider=statement.provider,
         provider_account_identity=statement.account_identity,
         provider_credential_fingerprint=statement.credential_fingerprint,
@@ -538,6 +557,14 @@ class ExactE2BEnvironment(E2BEnvironment):
         resource_budget_bindings: list[JsonObject] | None = None,
         allow_preexisting_e2b_builds: bool = False,
     ) -> None:
+        effective_accelerator_config = task_env_config.model_copy(
+            update={
+                **({"gpus": override_gpus} if override_gpus is not None else {}),
+                **({"tpu": override_tpu} if override_tpu is not None else {}),
+            },
+            deep=True,
+        )
+        validate_exact_e2b_task_resource_requests(effective_accelerator_config)
         super().__init__(
             environment_dir=environment_dir,
             environment_name=environment_name,
@@ -716,6 +743,7 @@ class ExactE2BEnvironment(E2BEnvironment):
             docker_image=self.task_env_config.docker_image,
             cpu_count=self._effective_cpus or 2,
             memory_mb=self._effective_memory_mb or 1024,
+            storage_mb=self._effective_storage_mb,
         )
         if spec.environment_id != self.environment_id:
             raise RuntimeError("E2B task environment changed after Harbor identity resolution")
@@ -726,6 +754,7 @@ class ExactE2BEnvironment(E2BEnvironment):
             docker_image=spec.docker_image,
             cpu_count=spec.cpu_count,
             memory_mb=spec.memory_mb,
+            storage_mb=spec.storage_mb,
             expected_budget_authority=self._wmh_resource_budget_account,
             allow_preexisting_outside_study=self._wmh_allow_preexisting_e2b_builds,
         )
@@ -812,6 +841,15 @@ class ExactE2BEnvironment(E2BEnvironment):
             or getattr(info, "memory_mb", None) != build.memory_mb
         ):
             raise RuntimeError("E2B task sandbox resources differ from the frozen build")
+        observed_storage_mb = getattr(info, "disk_size_mb", None)
+        if (
+            isinstance(observed_storage_mb, bool)
+            or not isinstance(observed_storage_mb, int)
+            or observed_storage_mb < 1
+        ):
+            raise RuntimeError("E2B task sandbox storage capacity was not proved")
+        if build.storage_mb is not None and observed_storage_mb < build.storage_mb:
+            raise RuntimeError("E2B task sandbox storage capacity is below the frozen request")
         expected_internet = self.network_policy.network_mode is not NetworkMode.NO_NETWORK
         if getattr(info, "allow_internet_access", None) is not expected_internet:
             raise RuntimeError("E2B task sandbox network mode was not proved")
@@ -862,7 +900,7 @@ class ExactE2BEnvironment(E2BEnvironment):
         return cast(
             "JsonObject",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "backend": "e2b",
                 "environment_id": build.environment_id,
                 "build_record_digest": build.digest,
@@ -873,6 +911,8 @@ class ExactE2BEnvironment(E2BEnvironment):
                 "platform": platform,
                 "cpu_count": build.cpu_count,
                 "memory_mb": build.memory_mb,
+                "requested_storage_mb": build.storage_mb,
+                "observed_storage_mb": observed_storage_mb,
                 "envd_version": envd_version,
                 "network_mode": self.network_policy.network_mode.value,
                 "allowed_hosts": sorted(self.network_policy.allowed_hosts),
@@ -999,6 +1039,7 @@ def freeze_exact_e2b_build_spec(
     docker_image: str | None,
     cpu_count: int,
     memory_mb: int,
+    storage_mb: int | None = None,
 ) -> ExactE2BBuildSpec:
     """Freeze one task-independent environment build input for a pre-open roster manifest."""
     if environment_dir.is_symlink():
@@ -1022,6 +1063,7 @@ def freeze_exact_e2b_build_spec(
         docker_image=image,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
+        storage_mb=storage_mb,
     )
 
 
@@ -1123,6 +1165,7 @@ async def _prepare_exact_e2b_build_locked(
                 build_context_digest=spec.build_context_digest,
                 cpu_count=spec.cpu_count,
                 memory_mb=spec.memory_mb,
+                storage_mb=spec.storage_mb,
             )
             _verify_build_budget_attribution(existing, expected_authority=account)
             return existing
@@ -1277,6 +1320,7 @@ async def _prepare_exact_e2b_build_locked(
             build_id=attempt.provider_build.build_id,
             cpu_count=spec.cpu_count,
             memory_mb=spec.memory_mb,
+            storage_mb=spec.storage_mb,
             cost_attribution=attempt.cost_attribution,
         )
         _settle_build_reservation(account, attempt, record=record)
@@ -1823,6 +1867,7 @@ def _record_completed_build(
     build_context_digest: str,
     cpu_count: int,
     memory_mb: int,
+    storage_mb: int | None = None,
     cost_attribution: BudgetedE2BBuildAttribution,
 ) -> ExactE2BBuildRecord:
     template_id = getattr(info, "template_id", None)
@@ -1842,6 +1887,7 @@ def _record_completed_build(
         build_id=build_id,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
+        storage_mb=storage_mb,
         cost_attribution=cost_attribution,
     )
 
@@ -1856,6 +1902,7 @@ def register_exact_e2b_build_record(
     build_id: str,
     cpu_count: int,
     memory_mb: int,
+    storage_mb: int | None = None,
     acknowledge_preexisting_outside_study: bool,
 ) -> ExactE2BBuildRecord:
     """Register externally prepared immutable build IDs without dispatching a paid build."""
@@ -1869,6 +1916,7 @@ def register_exact_e2b_build_record(
         docker_image=docker_image,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
+        storage_mb=storage_mb,
     )
     record = ExactE2BBuildRecord(
         build_config_digest=_digest(build_input),
@@ -1878,6 +1926,7 @@ def register_exact_e2b_build_record(
         build_id=build_id,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
+        storage_mb=storage_mb,
         cost_attribution=PreexistingE2BBuildAttribution(),
     )
     registry = _exact_build_registry(jobs_dir)
@@ -1906,6 +1955,7 @@ def require_exact_e2b_build_record(
     docker_image: str | None,
     cpu_count: int,
     memory_mb: int,
+    storage_mb: int | None = None,
     expected_budget_authority: TimedResourceBudgetAccount | None = None,
     allow_preexisting_outside_study: bool = False,
 ) -> ExactE2BBuildRecord:
@@ -1916,6 +1966,7 @@ def require_exact_e2b_build_record(
         docker_image=docker_image,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
+        storage_mb=storage_mb,
     )
     config_digest = _digest(build_input)
     registry = jobs_dir.expanduser().resolve() / _BUILD_REGISTRY_DIR
@@ -1932,6 +1983,7 @@ def require_exact_e2b_build_record(
         build_context_digest=build_context_digest,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
+        storage_mb=storage_mb,
     )
     _verify_build_budget_attribution(
         record,
@@ -1960,6 +2012,7 @@ def _require_record_key(
     build_context_digest: str,
     cpu_count: int,
     memory_mb: int,
+    storage_mb: int | None,
 ) -> None:
     if (
         record.build_config_digest != config_digest
@@ -1967,6 +2020,7 @@ def _require_record_key(
         or record.build_context_digest != build_context_digest
         or record.cpu_count != cpu_count
         or record.memory_mb != memory_mb
+        or record.storage_mb != storage_mb
     ):
         raise RuntimeError("E2B exact-build registry key does not match its record")
 
@@ -2104,17 +2158,19 @@ def _exact_build_input(
     docker_image: str | None,
     cpu_count: int,
     memory_mb: int,
+    storage_mb: int | None,
 ) -> JsonObject:
     return cast(
         "JsonObject",
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "environment_id": environment_id,
             "build_context_digest": build_context_digest,
             "definition_kind": "docker_image" if docker_image is not None else "dockerfile_context",
             "docker_image": docker_image,
             "cpu_count": cpu_count,
             "memory_mb": memory_mb,
+            "storage_mb": storage_mb,
         },
     )
 

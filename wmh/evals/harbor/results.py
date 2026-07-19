@@ -672,7 +672,7 @@ def _parse_task_environment_attestation(
         raise ValueError("Harbor agent metadata omits a valid task environment digest")
     if not isinstance(attestation, dict):
         raise ValueError("Harbor agent metadata omits task environment attestation evidence")
-    expected_schema = 2 if expected_backend == "e2b" else 1
+    expected_schema = 3 if expected_backend == "e2b" else 2
     if (
         attestation.get("schema_version") != expected_schema
         or attestation.get("backend") != expected_backend
@@ -694,10 +694,44 @@ def _parse_task_environment_attestation(
     if actual != digest:
         raise ValueError("Harbor task environment attestation does not match its digest")
     parsed = cast("JsonObject", json.loads(canonical))
-    if expected_backend == "e2b":
+    if expected_backend == "docker":
+        requested_storage_mb = parsed.get("requested_storage_mb")
+        if requested_storage_mb is not None and (
+            isinstance(requested_storage_mb, bool)
+            or not isinstance(requested_storage_mb, int)
+            or requested_storage_mb < 1
+        ):
+            raise ValueError(
+                "Harbor Docker task attestation has invalid requested storage evidence"
+            )
+        if parsed.get("storage_requirement_satisfied") is not True:
+            raise ValueError("Harbor Docker task attestation does not satisfy requested storage")
+    elif expected_backend == "e2b":
         launch_digest = parsed.get("launch_config_digest")
         if not is_sha256_digest(launch_digest):
             raise ValueError("Harbor E2B task attestation omits its launch configuration digest")
+        requested_value = parsed.get("requested_storage_mb")
+        if requested_value is None:
+            requested_storage_mb = None
+        elif (
+            isinstance(requested_value, bool)
+            or not isinstance(requested_value, int)
+            or requested_value < 1
+        ):
+            raise ValueError("Harbor E2B task attestation has invalid requested storage evidence")
+        else:
+            requested_storage_mb = requested_value
+        observed_storage_mb = parsed.get("observed_storage_mb")
+        if (
+            isinstance(observed_storage_mb, bool)
+            or not isinstance(observed_storage_mb, int)
+            or observed_storage_mb < 1
+            or (
+                requested_storage_mb is not None
+                and observed_storage_mb < requested_storage_mb
+            )
+        ):
+            raise ValueError("Harbor E2B task attestation has invalid observed storage evidence")
     return _ParsedTaskEnvironmentEvidence(digest=digest, attestation=parsed)
 
 

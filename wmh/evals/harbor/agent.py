@@ -23,7 +23,7 @@ from typing import Final, Protocol, cast
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
-from harbor.models.task.config import MCPServerConfig
+from harbor.models.task.config import EnvironmentConfig, MCPServerConfig
 from llm_waterfall import ChatResponse
 from pydantic import TypeAdapter
 
@@ -83,7 +83,7 @@ _TRACE_FILE = "wmh-events.jsonl"
 _RUNNER_LEASE_FILE = "wmh-runner-lease.json"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.7.0"
+WMH_PI_AGENT_VERSION: Final = "0.8.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -187,6 +187,8 @@ class _EnvironmentCall:
 # rather than silently producing an unattested score. Replace these views when Harbor adds a public
 # immutable environment-identity API.
 class _DockerEnvironmentView(Protocol):
+    task_env_config: EnvironmentConfig
+
     async def _run_docker_compose_command(
         self,
         command: list[str],
@@ -194,6 +196,15 @@ class _DockerEnvironmentView(Protocol):
         timeout_sec: int | None = None,
         stdin_data: bytes | None = None,
         on_output: object | None = None,
+    ) -> ExecResult: ...
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
     ) -> ExecResult: ...
 
 
@@ -1049,12 +1060,33 @@ async def _attest_docker_environment(
         )
         services.append((service, replica, image_id, image_platform))
 
+    requested_storage_mb = environment.task_env_config.storage_mb
+    if requested_storage_mb is not None:
+        if (
+            isinstance(requested_storage_mb, bool)
+            or not isinstance(requested_storage_mb, int)
+            or requested_storage_mb < 1
+        ):
+            raise RuntimeError("Docker task environment requested invalid storage capacity")
+        storage_result = await environment.exec(
+            _TASK_DISK_HEALTH_COMMAND,
+            timeout_sec=_TASK_DISK_HEALTH_TIMEOUT_S,
+        )
+        available_storage_kib = _task_free_disk_kib(storage_result)
+        if (
+            available_storage_kib is None
+            or available_storage_kib < requested_storage_mb * 1024
+        ):
+            raise RuntimeError("Docker task filesystem does not satisfy requested storage capacity")
+
     return cast(
         "JsonObject",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "backend": "docker",
             "daemon_platform": daemon_platform,
+            "requested_storage_mb": requested_storage_mb,
+            "storage_requirement_satisfied": True,
             "services": [
                 {
                     "service": service,
@@ -1076,7 +1108,7 @@ async def _attest_e2b_environment(
     evidence = view.wmh_environment_attestation
     if evidence is None:
         raise RuntimeError("trusted E2B environment attestation is unavailable")
-    if evidence.get("schema_version") != 2 or evidence.get("backend") != "e2b":
+    if evidence.get("schema_version") != 3 or evidence.get("backend") != "e2b":
         raise RuntimeError("trusted E2B environment attestation has an invalid schema")
     template_id = _bounded_identity(
         evidence.get("template_id"),
@@ -1104,6 +1136,26 @@ async def _attest_e2b_environment(
         or memory_mb < 1
     ):
         raise RuntimeError("E2B returned invalid sandbox resource evidence")
+    requested_storage_mb = evidence.get("requested_storage_mb")
+    observed_storage_mb = evidence.get("observed_storage_mb")
+    if (
+        (
+            requested_storage_mb is not None
+            and (
+                isinstance(requested_storage_mb, bool)
+                or not isinstance(requested_storage_mb, int)
+                or requested_storage_mb < 1
+            )
+        )
+        or isinstance(observed_storage_mb, bool)
+        or not isinstance(observed_storage_mb, int)
+        or observed_storage_mb < 1
+        or (
+            isinstance(requested_storage_mb, int)
+            and observed_storage_mb < requested_storage_mb
+        )
+    ):
+        raise RuntimeError("E2B returned invalid sandbox storage evidence")
     if evidence.get("timeout_action") != "kill" or evidence.get("auto_resume") is not False:
         raise RuntimeError("E2B task environment lifecycle evidence is not fail closed")
     if evidence.get("volume_mounts") is not False:
@@ -1155,6 +1207,8 @@ async def _attest_e2b_environment(
             "platform": platform,
             "cpu_count": cpu_count,
             "memory_mb": memory_mb,
+            "requested_storage_mb": requested_storage_mb,
+            "observed_storage_mb": observed_storage_mb,
         },
     )
 

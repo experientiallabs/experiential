@@ -17,6 +17,7 @@ import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.environment_type import EnvironmentType
+from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
 from llm_waterfall import ChatRequest, ChatResponse
 
 import wmh.evals.harbor.agent as mod
@@ -58,9 +59,11 @@ from wmh.tracking.budget import (
 _TASK_ENVIRONMENT_ATTESTATION = cast(
     "JsonObject",
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "backend": "docker",
         "daemon_platform": "linux/amd64",
+        "requested_storage_mb": None,
+        "storage_requirement_satisfied": True,
         "services": [
             {
                 "service": "main",
@@ -84,7 +87,7 @@ _TASK_ENVIRONMENT_DIGEST = (
 _E2B_TASK_ENVIRONMENT_ATTESTATION = cast(
     "JsonObject",
     {
-        "schema_version": 2,
+        "schema_version": 3,
         "backend": "e2b",
         "environment_id": "environment-immutable",
         "build_config_digest": "sha256:" + "8" * 64,
@@ -94,6 +97,8 @@ _E2B_TASK_ENVIRONMENT_ATTESTATION = cast(
         "platform": "linux/x86_64",
         "cpu_count": 4,
         "memory_mb": 8192,
+        "requested_storage_mb": 10_240,
+        "observed_storage_mb": 20_480,
         "envd_version": "1.2.3",
         "network_mode": "no_network",
         "allowed_hosts": [],
@@ -149,6 +154,7 @@ class _Environment:
         *,
         mounted: bool = True,
         health_results: list[ExecResult] | None = None,
+        storage_mb: int | None = None,
     ) -> None:
         self.results = list(results or [])
         self.health_results = list(health_results or [])
@@ -156,6 +162,7 @@ class _Environment:
         self.health_calls: list[tuple[str, dict[str, str] | None, int | None]] = []
         self.uploads: list[tuple[Path | str, str]] = []
         self.capabilities = SimpleNamespace(mounted=mounted)
+        self.task_env_config = TaskEnvironmentConfig(storage_mb=storage_mb)
 
     async def exec(
         self,
@@ -450,6 +457,47 @@ def test_local_attestation_binds_compose_replica_count(
     )
 
     assert one.digest != two.digest
+
+
+def test_local_attestation_requires_requested_storage_and_binds_a_stable_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "a" * 64
+
+    class DockerEnvironment(_Environment):
+        async def _run_docker_compose_command(
+            self,
+            command: list[str],
+            check: bool = True,
+            timeout_sec: int | None = None,
+            stdin_data: bytes | None = None,
+            on_output: object | None = None,
+        ) -> ExecResult:
+            _ = command, check, timeout_sec, stdin_data, on_output
+            return ExecResult(stdout=container_id + "\n", return_code=0)
+
+    async def host_command(*command: str) -> str:
+        if command[1] == "info" or command[1:3] == ("image", "inspect"):
+            return "linux/amd64\n"
+        return f"main\t1\tsha256:{'1' * 64}\trunning\thealthy\n"
+
+    monkeypatch.setattr(mod, "_run_host_command", host_command)
+    exact = DockerEnvironment(
+        health_results=[_healthy_disk_result(available_kib=10_240 * 1024)],
+        storage_mb=10_240,
+    )
+    evidence = asyncio.run(mod._attest_docker_environment(exact))
+
+    assert evidence["requested_storage_mb"] == 10_240
+    assert evidence["storage_requirement_satisfied"] is True
+    assert "available_storage_kib" not in evidence
+
+    undersized = DockerEnvironment(
+        health_results=[_healthy_disk_result(available_kib=10_240 * 1024 - 1)],
+        storage_mb=10_240,
+    )
+    with pytest.raises(RuntimeError, match="storage"):
+        asyncio.run(mod._attest_docker_environment(undersized))
 
 
 @pytest.mark.parametrize(

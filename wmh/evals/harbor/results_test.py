@@ -47,9 +47,11 @@ _TASK_CHECKSUM = "sha256:" + "b" * 64
 _TASK_SOURCE = "example-benchmark"
 _HARNESS = pi_node_baseline("candidate")
 _TASK_ENVIRONMENT_ATTESTATION = {
-    "schema_version": 1,
+    "schema_version": 2,
     "backend": "docker",
     "daemon_platform": "linux/amd64",
+    "requested_storage_mb": None,
+    "storage_requirement_satisfied": True,
     "services": [
         {
             "service": "main",
@@ -71,7 +73,7 @@ _TASK_ENVIRONMENT_DIGEST = (
 )
 _E2B_LAUNCH_CONFIG_DIGEST = "sha256:" + "d" * 64
 _E2B_TASK_ENVIRONMENT_ATTESTATION = {
-    "schema_version": 2,
+    "schema_version": 3,
     "backend": "e2b",
     "environment_id": "environment-immutable",
     "build_config_digest": "sha256:" + "e" * 64,
@@ -81,6 +83,8 @@ _E2B_TASK_ENVIRONMENT_ATTESTATION = {
     "platform": "linux/x86_64",
     "cpu_count": 2,
     "memory_mb": 1024,
+    "requested_storage_mb": 10_240,
+    "observed_storage_mb": 20_480,
     "envd_version": "1.2.3",
     "network_mode": "no_network",
     "allowed_hosts": [],

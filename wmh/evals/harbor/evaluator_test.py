@@ -63,9 +63,11 @@ from wmh.tracking.budget import (
 )
 
 _TASK_ENVIRONMENT_ATTESTATION = {
-    "schema_version": 1,
+    "schema_version": 2,
     "backend": "docker",
     "daemon_platform": "linux/amd64",
+    "requested_storage_mb": None,
+    "storage_requirement_satisfied": True,
     "services": [
         {
             "service": "main",
@@ -389,6 +391,52 @@ def test_exact_e2b_build_preflight_fails_before_atomic_job_creation(
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
     assert creates == 0
+    assert not (tmp_path / "jobs" / "evaluation").exists()
+
+
+@pytest.mark.parametrize(
+    ("resource_config", "resource_name"),
+    [
+        ("gpus = 1\n", "GPU"),
+        ('gpu_types = ["H100"]\n', "GPU"),
+        ('tpu = {type = "v4", topology = "2x2"}\n', "TPU"),
+    ],
+)
+def test_exact_e2b_rejects_unsupported_accelerators_before_build_lookup_or_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_config: str,
+    resource_name: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    config_path = task_dir / "task.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + resource_config,
+        encoding="utf-8",
+    )
+    spec = _spec(tmp_path, dataset).model_copy(
+        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        deep=True,
+    )
+
+    def unexpected_build_lookup(**_kwargs: object) -> None:
+        raise AssertionError("accelerator rejection must precede exact-build lookup")
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("accelerator rejection must precede Harbor job creation")
+
+    monkeypatch.setattr(mod, "require_exact_e2b_build_record", unexpected_build_lookup)
+    monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
+    evaluator = mod.HarborEvaluator(
+        spec,
+        _provider(),
+        **_e2b_budget_kwargs(tmp_path, task_environment=True),
+    )
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match=resource_name):
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
     assert not (tmp_path / "jobs" / "evaluation").exists()
 
 

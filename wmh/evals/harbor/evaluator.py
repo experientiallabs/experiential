@@ -60,6 +60,7 @@ from wmh.evals.harbor.e2b_environment import (
     ExactE2BEnvironment,
     freeze_exact_e2b_build_spec,
     require_exact_e2b_build_record,
+    validate_exact_e2b_task_resource_requests,
 )
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
@@ -734,6 +735,12 @@ def _preflight_exact_e2b_builds(
             if not task_dir.is_dir() or not config_path.is_file():
                 continue
             task_config = TaskConfig.model_validate_toml(config_path.read_text(encoding="utf-8"))
+            try:
+                validate_exact_e2b_task_resource_requests(task_config.environment)
+            except ValueError as exc:
+                raise UnsupportedHarborTaskError(
+                    f"task {task_dir.name!r} requests unsupported exact E2B resources: {exc}"
+                ) from exc
             environment_dir = task_dir / "environment"
             if any(
                 (environment_dir / filename).exists()
@@ -759,6 +766,7 @@ def _preflight_exact_e2b_builds(
                 docker_image=docker_image,
                 cpu_count=task_config.environment.cpus or 2,
                 memory_mb=task_config.environment.memory_mb or 1024,
+                storage_mb=task_config.environment.storage_mb,
             )
             resource_class = ExactE2BEnvironment._task_resource_class(
                 cpu_count=task_config.environment.cpus or 2,
@@ -785,6 +793,7 @@ def _preflight_exact_e2b_builds(
                 docker_image=build_spec.docker_image,
                 cpu_count=resource_class.cpu_count,
                 memory_mb=resource_class.memory_mb,
+                storage_mb=task_config.environment.storage_mb,
                 expected_budget_authority=matched_account,
                 allow_preexisting_outside_study=bool(
                     config.environment.kwargs.get("allow_preexisting_e2b_builds", False)

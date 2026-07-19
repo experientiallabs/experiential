@@ -66,6 +66,7 @@ def _environment(
     trial_name: str = "trial-a",
     network_mode: NetworkMode = NetworkMode.ALLOWLIST,
     resource_budget_account: TimedResourceBudgetAccount | None = None,
+    storage_mb: int | None = 10_240,
 ) -> mod.ExactE2BEnvironment:
     environment_dir = tmp_path / "environment"
     environment_dir.mkdir(exist_ok=True)
@@ -81,7 +82,11 @@ def _environment(
         environment_name="terminal-task",
         session_id=f"{trial_name}__env",
         trial_paths=TrialPaths(trial_dir),
-        task_env_config=TaskEnvironmentConfig(cpus=2, memory_mb=1024),
+        task_env_config=TaskEnvironmentConfig(
+            cpus=2,
+            memory_mb=1024,
+            storage_mb=storage_mb,
+        ),
         network_policy=NetworkPolicy(
             network_mode=network_mode,
             allowed_hosts=allowed_hosts,
@@ -330,6 +335,7 @@ def _build() -> mod.ExactE2BBuildRecord:
         build_id="build-immutable",
         cpu_count=2,
         memory_mb=1024,
+        storage_mb=10_240,
         cost_attribution=mod.PreexistingE2BBuildAttribution(),
     )
 
@@ -360,6 +366,7 @@ def _sandbox_for_create(
     kwargs: dict[str, object],
     *,
     template_id: str = "template-immutable",
+    disk_size_mb: object = 10_240,
 ) -> _Sandbox:
     started_at = datetime.now(UTC)
     network_options = cast("dict[str, list[str]]", kwargs["network"])
@@ -370,6 +377,7 @@ def _sandbox_for_create(
             metadata=kwargs["metadata"],
             cpu_count=2,
             memory_mb=1024,
+            disk_size_mb=disk_size_mb,
             allow_internet_access=True,
             network=SimpleNamespace(
                 allow_out=list(network_options["allow_out"]),
@@ -399,10 +407,12 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
         build_context_digest=_BUILD_CONTEXT_DIGEST,
         cpu_count=2,
         memory_mb=1024,
+        storage_mb=10_240,
         cost_attribution=_build_attribution(),
     )
 
     assert record.exact_template_ref == "template-immutable:build-immutable"
+    assert record.storage_mb == 10_240
 
     with pytest.raises(RuntimeError, match="immutable template/build IDs"):
         mod._record_completed_build(
@@ -417,6 +427,7 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
             build_context_digest=_BUILD_CONTEXT_DIGEST,
             cpu_count=2,
             memory_mb=1024,
+            storage_mb=10_240,
             cost_attribution=_build_attribution(),
         )
 
@@ -429,8 +440,39 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
             build_id="build:ambiguous",
             cpu_count=2,
             memory_mb=1024,
+            storage_mb=10_240,
             cost_attribution=mod.PreexistingE2BBuildAttribution(),
         )
+
+
+def test_exact_build_and_launch_identities_bind_requested_storage(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    source = tmp_path / "environment"
+    exact = mod.freeze_exact_e2b_build_spec(
+        environment_dir=source,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+        storage_mb=10_240,
+    )
+    larger = mod.freeze_exact_e2b_build_spec(
+        environment_dir=source,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+        storage_mb=20_480,
+    )
+
+    assert exact.environment_id == larger.environment_id
+    assert exact.build_context_digest == larger.build_context_digest
+    assert exact.digest != larger.digest
+
+    exact_record = _build()
+    larger_record = exact_record.model_copy(update={"storage_mb": 20_480})
+    assert exact_record.digest != larger_record.digest
+    assert environment._launch_config_digest(exact_record) != environment._launch_config_digest(
+        larger_record
+    )
 
 
 def test_content_keyed_build_registry_reuses_only_completed_exact_ids(
@@ -570,6 +612,7 @@ def test_build_record_reuse_resolves_attributed_meter_from_shared_ledger_authori
         record.model_copy(update={"build_id": "build-replayed"}),
         record.model_copy(update={"cpu_count": record.cpu_count + 1}),
         record.model_copy(update={"memory_mb": record.memory_mb + 1}),
+        record.model_copy(update={"storage_mb": 10_240}),
         record.model_copy(
             update={
                 "cost_attribution": attribution.model_copy(
@@ -1633,6 +1676,101 @@ def test_external_build_registration_requires_explicit_outside_study_acknowledgm
             memory_mb=1024,
             acknowledge_preexisting_outside_study=False,
         )
+
+
+@pytest.mark.parametrize("observed_storage_mb", [10_240, 20_480])
+def test_exact_create_attests_sufficient_observed_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_storage_mb: int,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+
+    async def create(**kwargs: object) -> _Sandbox:
+        return _sandbox_for_create(kwargs, disk_size_mb=observed_storage_mb)
+
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+
+    attestation = environment.wmh_environment_attestation
+    assert attestation is not None
+    assert attestation["requested_storage_mb"] == 10_240
+    assert attestation["observed_storage_mb"] == observed_storage_mb
+    asyncio.run(environment.stop(delete=True))
+
+
+def test_exact_create_rejects_insufficient_observed_storage_and_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    created: list[_Sandbox] = []
+
+    async def load_build() -> mod.ExactE2BBuildRecord:
+        return build
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs, disk_size_mb=10_239)
+        created.append(sandbox)
+        return sandbox
+
+    monkeypatch.setattr(environment, "_load_or_build_exact_template", load_build)
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+
+    with pytest.raises(RuntimeError, match="storage capacity"):
+        asyncio.run(environment.start(force_build=False))
+
+    assert len(created) == 1
+    assert created[0].kills == 1
+    assert environment.wmh_environment_attestation is None
+    receipt = RunnerLeaseRecord.model_validate_json(
+        (environment.trial_paths.trial_dir / mod.TASK_E2B_LEASE_FILE).read_bytes()
+    )
+    assert receipt.state == "retired"
+    assert receipt.resource_id == "sandbox-immutable"
+
+
+def test_task_attestation_digest_binds_observed_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digests: list[str] = []
+    for name, observed_storage_mb in (("exact", 10_240), ("larger", 20_480)):
+        root = tmp_path / name
+        root.mkdir()
+        environment = _environment(root)
+        build = _build()
+        launch_digest = environment._launch_config_digest(build)
+
+        async def create(
+            _observed_storage_mb: int = observed_storage_mb,
+            **kwargs: object,
+        ) -> _Sandbox:
+            return _sandbox_for_create(kwargs, disk_size_mb=_observed_storage_mb)
+
+        monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+        environment._wmh_ledger.begin(
+            backend="e2b",
+            lease_id=environment._wmh_lease_id,
+            owner_id=environment._wmh_owner_id,
+            config_digest=launch_digest,
+        )
+        asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+        assert environment._wmh_attestation is not None
+        digests.append(environment._wmh_attestation.digest)
+        asyncio.run(environment.stop(delete=True))
+
+    assert digests[0] != digests[1]
 
 
 def test_exact_create_binds_build_policy_and_terminal_cleanup_receipt(
