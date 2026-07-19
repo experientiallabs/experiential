@@ -124,6 +124,10 @@ PAIRED_HARBOR_PROTOCOL_VERSION: Literal["9"] = "9"
 PAIRED_HARBOR_RUN_VERSION: Literal["10"] = "10"
 MAX_RESUMABLE_INVOCATION_RUNTIME_S = 82_800
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_LEGACY_PAIR_STATE_VERSION_ERROR = (
+    "paired Harbor pair state version 2 predates evidence binding and cannot be resumed; "
+    "start a new operation_id"
+)
 
 
 class QualifiedE2BBuildIdentity(BaseModel):
@@ -2036,7 +2040,7 @@ class PairedHarborPairGenerationState(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    state_version: Literal["2"] = "2"
+    state_version: Literal["3"] = "3"
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
     generation_id: StrictInt = Field(ge=1)
@@ -2049,6 +2053,13 @@ class PairedHarborPairGenerationState(BaseModel):
     candidate_admission_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     evidence_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     state_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator("state_version", mode="before")
+    @classmethod
+    def _reject_pre_evidence_schema(cls, value: str) -> str:
+        if value == "2":
+            raise ValueError(_LEGACY_PAIR_STATE_VERSION_ERROR)
+        return value
 
     @model_validator(mode="after")
     def _validate_state(self) -> Self:
@@ -3242,7 +3253,7 @@ class PairedHarborRunner:
         generation_id = self._generation_id if generation_id is None else generation_id
         names = self._arm_job_names(block, generation_id=generation_id)
         payload = {
-            "state_version": "2",
+            "state_version": "3",
             "protocol_digest": self._protocol.digest,
             "operation_id": self._operation_id,
             "generation_id": generation_id,
@@ -3810,7 +3821,12 @@ def _read_pair_generation_state(path: Path) -> PairedHarborPairGenerationState:
     if path.is_symlink() or not path.is_file():
         raise PairedHarborPairStateError(f"paired Harbor pair state must be a regular file: {path}")
     try:
-        return PairedHarborPairGenerationState.model_validate_json(path.read_text(encoding="utf-8"))
+        payload = TypeAdapter(JsonValue).validate_json(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and payload.get("state_version") == "2":
+            raise PairedHarborPairStateError(_LEGACY_PAIR_STATE_VERSION_ERROR)
+        return PairedHarborPairGenerationState.model_validate(payload)
+    except PairedHarborPairStateError:
+        raise
     except (OSError, UnicodeDecodeError, ValidationError) as exc:
         raise PairedHarborPairStateError(
             f"paired Harbor pair state is unreadable or invalid: {path}"

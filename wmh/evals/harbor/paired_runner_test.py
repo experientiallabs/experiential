@@ -2413,6 +2413,33 @@ def test_job_and_pair_generation_identities_bind_operation_generation_and_block(
     assert len(names) == 8
 
 
+def test_pair_state_rejects_pre_evidence_schema_with_explicit_restart_path(
+    tmp_path: Path,
+) -> None:
+    runner = _runner(tmp_path, _candidate())
+    block = runner._protocol.design.blocks[0]
+    current = runner._pair_state(block, status="failed")
+    assert current.state_version == "3"
+    legacy = cast("dict[str, Any]", current.model_dump(mode="json"))
+    legacy["state_version"] = "2"
+    legacy.pop("evidence_digest")
+    legacy["state_digest"] = mod._canonical_digest(
+        cast(
+            "Any",
+            {key: value for key, value in legacy.items() if key != "state_digest"},
+        )
+    )
+
+    restart_error = "version 2 predates evidence binding.*new operation_id"
+    with pytest.raises(ValueError, match=restart_error):
+        mod.PairedHarborPairGenerationState.model_validate(legacy)
+
+    state_path = tmp_path / "legacy-pair-state.json"
+    state_path.write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(mod.PairedHarborPairStateError, match=restart_error):
+        mod._read_pair_generation_state(state_path)
+
+
 def test_pair_state_replacement_closes_descriptor_when_setup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
