@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import threading
@@ -43,7 +44,7 @@ from wmh.providers.base import (
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _ZERO_DIGEST = "sha256:" + "0" * 64
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _DEFAULT_BUSY_TIMEOUT_MS = 30_000
 _NANO_USD_PER_USD = 1_000_000_000
 _TOKENS_PER_MILLION = 1_000_000
@@ -83,7 +84,7 @@ class BudgetBreachKind(StrEnum):
 class BudgetScope(BaseModel):
     """Typed attribution attached to every reservation without carrying prompt data."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     phase: str = Field(min_length=1)
     category: str = Field(min_length=1)
@@ -105,7 +106,7 @@ class BudgetScope(BaseModel):
 class TokenPriceCeiling(BaseModel):
     """Frozen upper-bound price per token, represented exactly in nano-USD."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     input_nano_usd_per_token: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
     output_nano_usd_per_token: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
@@ -147,7 +148,7 @@ class TokenPriceCeiling(BaseModel):
 class ProviderCostMeter(BaseModel):
     """One immutable provider route, tariff ceiling, and input estimator."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["provider_tokens"] = "provider_tokens"
     provider_config: ProviderConfig
@@ -159,7 +160,7 @@ class ProviderCostMeter(BaseModel):
 class TimedResourceCostMeter(BaseModel):
     """Frozen upper-bound tariff for one class of externally billed timed resource."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["timed_resource"] = "timed_resource"
     resource_type: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
@@ -211,7 +212,7 @@ _CostMeter = Annotated[
 class BudgetPolicy(BaseModel):
     """Immutable experiment caps and route-specific conservative tariffs."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     study_id: str = Field(min_length=1)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -253,7 +254,7 @@ class BudgetPolicy(BaseModel):
 class BudgetAccount(BaseModel):
     """Serializable provider-call budget binding used by local and worker processes."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     ledger_path: Path
     policy: BudgetPolicy
@@ -276,7 +277,7 @@ class BudgetAccount(BaseModel):
 class TimedResourceBudgetAccount(BaseModel):
     """Serializable hard-budget account for one external timed resource lease."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     ledger_path: Path
     policy: BudgetPolicy
@@ -298,9 +299,10 @@ class TimedResourceBudgetAccount(BaseModel):
 class BudgetAccountBinding(BaseModel):
     """Path-free account reference safe to retain in durable evaluator configuration."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
     scope: BudgetScope
     meter_id: str = Field(min_length=1)
 
@@ -308,7 +310,7 @@ class BudgetAccountBinding(BaseModel):
 class BudgetReservation(BaseModel):
     """Current state reconstructed from one reservation's append-only events."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     reservation_id: str = Field(min_length=1)
     scope: BudgetScope
@@ -327,7 +329,7 @@ class BudgetReservation(BaseModel):
 class BudgetSnapshot(BaseModel):
     """Atomic exposure summary used by operator gates and call admission."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     hard_limit_nano_usd: int
     charged_nano_usd: int
@@ -338,11 +340,15 @@ class BudgetSnapshot(BaseModel):
 
 
 class _BudgetOpened(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     kind: Literal["opened"] = "opened"
     policy: BudgetPolicy
 
 
 class _BudgetReserved(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     kind: Literal["reserved"] = "reserved"
     reservation_id: str = Field(min_length=1)
     scope: BudgetScope
@@ -351,6 +357,8 @@ class _BudgetReserved(BaseModel):
 
 
 class _BudgetSettled(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     kind: Literal["settled"] = "settled"
     reservation_id: str = Field(min_length=1)
     charged_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
@@ -379,6 +387,8 @@ class _BudgetSettled(BaseModel):
 
 
 class _BudgetForfeited(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     kind: Literal["forfeited"] = "forfeited"
     reservation_id: str = Field(min_length=1)
     charged_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
@@ -394,7 +404,7 @@ _BudgetAction = Annotated[
 class BudgetEvent(BaseModel):
     """One immutable hash-linked ledger event."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     sequence: int = Field(ge=1)
     recorded_at: datetime
@@ -442,6 +452,18 @@ class SpendLedger:
     def policy(self) -> BudgetPolicy:
         """Return a defensive policy copy; callers cannot mutate admission state in memory."""
         return self._policy.model_copy(deep=True)
+
+    @property
+    def ledger_identity(self) -> str:
+        """Return an opaque identity unique to this initialized ledger and canonical path."""
+        return _digest_json(
+            {
+                "identity_version": 1,
+                "ledger_nonce": self._ledger_nonce,
+                "canonical_path": str(self.path),
+                "policy_digest": self._policy.policy_digest,
+            }
+        )
 
     def reserve(
         self,
@@ -726,28 +748,45 @@ class SpendLedger:
         if self.path.exists():
             os.chmod(self.path, 0o600)
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT policy_digest, policy_json, schema_version "
-                "FROM budget_metadata WHERE id = 1"
+            version_row = connection.execute(
+                "SELECT schema_version FROM budget_metadata WHERE id = 1"
             ).fetchone()
-            if row is None:
+            if version_row is None:
+                ledger_nonce = secrets.token_hex(32)
                 connection.execute(
                     """
-                    INSERT INTO budget_metadata (id, schema_version, policy_digest, policy_json)
-                    VALUES (1, ?, ?, ?)
+                    INSERT INTO budget_metadata (
+                        id, schema_version, ledger_nonce, policy_digest, policy_json
+                    )
+                    VALUES (1, ?, ?, ?, ?)
                     """,
                     (
                         _SCHEMA_VERSION,
+                        ledger_nonce,
                         self._policy.policy_digest,
                         _canonical_json(self._policy.model_dump(mode="json")),
                     ),
                 )
+                self._ledger_nonce = ledger_nonce
                 self._append_event(connection, _BudgetOpened(policy=self._policy))
             else:
-                if row["schema_version"] != _SCHEMA_VERSION:
+                if version_row["schema_version"] != _SCHEMA_VERSION:
                     raise BudgetIntegrityError(
-                        f"unsupported budget schema version {row['schema_version']}"
+                        f"unsupported budget schema version {version_row['schema_version']}"
                     )
+                row = connection.execute(
+                    "SELECT ledger_nonce, policy_digest, policy_json "
+                    "FROM budget_metadata WHERE id = 1"
+                ).fetchone()
+                if row is None:
+                    raise BudgetIntegrityError("budget metadata disappeared during initialization")
+                ledger_nonce = row["ledger_nonce"]
+                if (
+                    not isinstance(ledger_nonce, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", ledger_nonce) is None
+                ):
+                    raise BudgetIntegrityError("budget ledger identity is malformed")
+                self._ledger_nonce = ledger_nonce
                 try:
                     persisted = BudgetPolicy.model_validate_json(row["policy_json"])
                 except ValueError as exc:
@@ -938,7 +977,7 @@ class SpendLedger:
 _SHARED_LEDGER_LOCK = threading.Lock()
 _SHARED_LEDGERS: dict[Path, SpendLedger] = {}
 _REGISTERED_BUDGET_LOCK = threading.Lock()
-_REGISTERED_BUDGETS: dict[str, tuple[Path, BudgetPolicy]] = {}
+_REGISTERED_BUDGETS: dict[str, tuple[Path, BudgetPolicy, str]] = {}
 
 
 def open_shared_spend_ledger(path: str | Path, policy: BudgetPolicy) -> SpendLedger:
@@ -980,9 +1019,11 @@ def bind_budget_account(account: BudgetAccount) -> BudgetAccountBinding:
         _REGISTERED_BUDGETS[policy_digest] = (
             canonical_path,
             validated.policy.model_copy(deep=True),
+            ledger.ledger_identity,
         )
     return BudgetAccountBinding(
         policy_digest=policy_digest,
+        ledger_identity=ledger.ledger_identity,
         scope=validated.scope,
         meter_id=validated.meter_id,
     )
@@ -1005,9 +1046,11 @@ def bind_timed_resource_account(
         _REGISTERED_BUDGETS[policy_digest] = (
             canonical_path,
             validated.policy.model_copy(deep=True),
+            ledger.ledger_identity,
         )
     return BudgetAccountBinding(
         policy_digest=policy_digest,
+        ledger_identity=ledger.ledger_identity,
         scope=validated.scope,
         meter_id=validated.meter_id,
     )
@@ -1020,8 +1063,10 @@ def resolve_budget_account(binding: BudgetAccountBinding) -> BudgetAccount:
         registered = _REGISTERED_BUDGETS.get(validated.policy_digest)
         if registered is None:
             raise BudgetIntegrityError("budget policy digest is not registered in this process")
-        ledger_path, policy = registered
+        ledger_path, policy, ledger_identity = registered
         resolved_policy = policy.model_copy(deep=True)
+    if validated.ledger_identity != ledger_identity:
+        raise BudgetIntegrityError("budget binding differs from the registered ledger identity")
     if validated.scope.phase not in resolved_policy.phase_limits_nano_usd:
         raise BudgetIntegrityError("budget binding phase is absent from its registered policy")
     if validated.meter_id not in resolved_policy.meters:
@@ -1045,8 +1090,10 @@ def resolve_timed_resource_account(
         registered = _REGISTERED_BUDGETS.get(validated.policy_digest)
         if registered is None:
             raise BudgetIntegrityError("budget policy digest is not registered in this process")
-        ledger_path, policy = registered
+        ledger_path, policy, ledger_identity = registered
         resolved_policy = policy.model_copy(deep=True)
+    if validated.ledger_identity != ledger_identity:
+        raise BudgetIntegrityError("budget binding differs from the registered ledger identity")
     if validated.scope.phase not in resolved_policy.phase_limits_nano_usd:
         raise BudgetIntegrityError("budget binding phase is absent from its registered policy")
     if not isinstance(resolved_policy.meters.get(validated.meter_id), TimedResourceCostMeter):
@@ -1667,6 +1714,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS budget_metadata (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version INTEGER NOT NULL,
+    ledger_nonce TEXT NOT NULL CHECK (length(ledger_nonce) = 64),
     policy_digest TEXT NOT NULL,
     policy_json TEXT NOT NULL
 );

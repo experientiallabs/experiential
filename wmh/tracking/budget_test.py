@@ -19,6 +19,7 @@ from llm_waterfall.types import (
     ChatMessage,
     ChatUsage,
 )
+from pydantic import ValidationError
 
 from wmh.providers.base import (
     Completion,
@@ -155,6 +156,33 @@ def test_currency_helpers_round_up_to_exact_nano_usd_ceiling() -> None:
         nano_usd_from_usd("9223372037")
 
 
+def test_budget_inputs_reject_unknown_fields_instead_of_using_defaults() -> None:
+    with pytest.raises(ValidationError, match="billing_quantum_second"):
+        TimedResourceCostMeter.model_validate(
+            {
+                "resource_type": "sandbox",
+                "resource_class_digest": "sha256:" + "b" * 64,
+                "nano_usd_per_second": 1,
+                "billing_quantum_second": 60,
+                "max_billing_seconds": 120,
+            }
+        )
+
+    with pytest.raises(ValidationError, match="unexpected_cap"):
+        BudgetPolicy.model_validate({**_policy().model_dump(mode="json"), "unexpected_cap": 1})
+
+
+def test_independently_initialized_ledgers_have_distinct_durable_identities(
+    tmp_path: Path,
+) -> None:
+    policy = _policy()
+    first = SpendLedger(tmp_path / "first.sqlite3", policy)
+    second = SpendLedger(tmp_path / "second.sqlite3", policy)
+
+    assert first.ledger_identity != second.ledger_identity
+    assert SpendLedger(first.path, policy).ledger_identity == first.ledger_identity
+
+
 def test_budget_binding_is_path_independent_and_resolves_only_registered_policy(
     tmp_path: Path,
 ) -> None:
@@ -170,11 +198,17 @@ def test_budget_binding_is_path_independent_and_resolves_only_registered_policy(
 
     assert binding == BudgetAccountBinding(
         policy_digest=policy.policy_digest,
+        ledger_identity=SpendLedger(account.ledger_path, policy).ledger_identity,
         scope=_scope(),
         meter_id="worker",
     )
-    assert "ledger" not in binding.model_dump_json()
+    assert "ledger_path" not in binding.model_dump_json()
+    assert str(account.ledger_path) not in binding.model_dump_json()
     assert resolve_budget_account(binding) == account
+
+    tampered = binding.model_copy(update={"ledger_identity": "sha256:" + "f" * 64})
+    with pytest.raises(BudgetIntegrityError, match="registered ledger identity"):
+        resolve_budget_account(tampered)
 
     fork = account.model_copy(
         update={"ledger_path": (tmp_path / "fork.sqlite3").resolve()},
@@ -292,7 +326,8 @@ def test_timed_resource_binding_is_path_free_and_type_checked(tmp_path: Path) ->
 
     binding = bind_timed_resource_account(account)
 
-    assert "ledger" not in binding.model_dump_json()
+    assert "ledger_path" not in binding.model_dump_json()
+    assert str(account.ledger_path) not in binding.model_dump_json()
     assert resolve_timed_resource_account(binding) == account
     with pytest.raises(BudgetIntegrityError, match="provider token meter"):
         resolve_budget_account(binding)
@@ -930,7 +965,7 @@ def test_ledger_rejects_policy_drift_and_symlink_paths(tmp_path: Path) -> None:
     assert str(symlink) not in str(error.value)
 
 
-def test_ledger_schema_v1_requires_a_new_v2_ledger(tmp_path: Path) -> None:
+def test_ledger_schema_v1_requires_a_new_v3_ledger(tmp_path: Path) -> None:
     path = tmp_path / "budget.sqlite3"
     SpendLedger(path, _policy())
     with sqlite3.connect(path) as connection:

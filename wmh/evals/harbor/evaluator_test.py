@@ -606,6 +606,7 @@ def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: P
         BudgetPolicy,
         BudgetScope,
         ProviderCostMeter,
+        SpendLedger,
         TokenPriceCeiling,
     )
 
@@ -645,10 +646,15 @@ def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: P
     serialized_binding = agent.kwargs["budget_binding"]
     assert serialized_binding == {
         "policy_digest": account.policy.policy_digest,
+        "ledger_identity": SpendLedger(
+            account.ledger_path,
+            account.policy,
+        ).ledger_identity,
         "scope": account.scope.model_dump(mode="json"),
         "meter_id": account.meter_id,
     }
-    assert "ledger" not in json.dumps(serialized_binding)
+    assert "ledger_path" not in json.dumps(serialized_binding)
+    assert str(account.ledger_path) not in json.dumps(serialized_binding)
     assert agent.kwargs["budget_policy_digest"] == account.policy.policy_digest
     without_budget = mod.HarborEvaluator(
         _spec(tmp_path, tmp_path / "dataset"),
