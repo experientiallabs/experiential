@@ -1847,6 +1847,38 @@ def test_project_proposer_restores_one_exact_witnessed_batch_transition() -> Non
         )
 
 
+def test_project_proposer_replays_witness_without_a_second_full_project_restore() -> None:
+    class OneShotRestoreProject(_Project):
+        def __init__(self, outputs: list[str]) -> None:
+            super().__init__(outputs)
+            self.full_restores = 0
+
+        def restore_search_state(self, state: JsonObject) -> None:
+            self.full_restores += 1
+            if self.full_restores > 1:
+                raise ValueError("cannot restore search state over an initialized project")
+            super().restore_search_state(state)
+
+    parent = HarnessDoc.baseline("parent")
+    first_project = OneShotRestoreProject([_payload(parent, "first revision")])
+    first = ProjectDeltaProposer(first_project, meta_agent(), _Provider("unused"))
+    state_before = first.export_search_state()
+    first.propose_batch(parent, _trigger(), "inspect failures", history=[], count=1)
+    state_after = first.export_search_state()
+
+    restored_project = OneShotRestoreProject([])
+    restored = ProjectDeltaProposer(restored_project, meta_agent(), _Provider("unused"))
+    restored.restore_search_state(state_before)
+    restored.restore_proposal_batch_state(
+        state_before=state_before,
+        state_after=state_after,
+    )
+
+    assert restored.export_search_state() == state_after
+    assert restored_project.full_restores == 1
+    assert restored_project.files == first_project.files
+
+
 def test_project_proposer_resume_rejects_uncommitted_link_state() -> None:
     parent = HarnessDoc.baseline("parent")
     first_project = _Project([_payload(parent, "first revision")])
