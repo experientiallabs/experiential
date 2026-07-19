@@ -446,6 +446,12 @@ class _QualifiedTaskEvidence(BaseModel):
             requested_storage = self.task_environment_attestation.get("requested_storage_mb")
             observed_storage = self.task_environment_attestation.get("observed_storage_mb")
             if (
+                resource_class is not None
+                and self.task_environment_attestation.get("lease_timeout_s")
+                != resource_class.provider_ttl_seconds
+            ):
+                raise ValueError("E2B qualification lease horizon differs from its resource class")
+            if (
                 backend != "e2b"
                 or self.task_environment_attestation.get("schema_version") != 3
                 or build is None
@@ -455,12 +461,17 @@ class _QualifiedTaskEvidence(BaseModel):
                 or self.task_environment_attestation.get("template_id") != build.template_id
                 or self.task_environment_attestation.get("build_id") != build.build_id
                 or self.task_environment_attestation.get("environment_id") != build.environment_id
+                or self.task_environment_attestation.get("build_record_digest")
+                != build.build_record_digest
                 or self.task_environment_attestation.get("cpu_count") != resource_class.cpu_count
                 or self.task_environment_attestation.get("memory_mb") != resource_class.memory_mb
                 or self.task_environment_attestation.get("launch_config_digest")
                 != self.qualification.e2b_launch_config_digest
                 or requested_storage != self.qualification.requested_storage_mb
                 or observed_storage != self.qualification.observed_storage_mb
+                or self.task_environment_attestation.get("timeout_action") != "kill"
+                or self.task_environment_attestation.get("auto_resume") is not False
+                or self.task_environment_attestation.get("volume_mounts") is not False
             ):
                 raise ValueError("E2B qualification attestation differs from its exact build")
             receipt = self.cleanup_receipt

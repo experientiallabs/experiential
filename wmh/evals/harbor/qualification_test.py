@@ -227,6 +227,7 @@ def _install_fake_environments(
                 "build_id": build.build_id,
                 "environment_id": build.environment_id,
                 "build_config_digest": build.build_config_digest,
+                "build_record_digest": build.digest,
                 "launch_config_digest": "sha256:" + "2" * 64,
                 "platform": "linux/x86_64",
                 "cpu_count": build.cpu_count,
@@ -239,7 +240,10 @@ def _install_fake_environments(
                 ),
                 "envd_version": "0.2.1",
                 "internet_access": True,
-                "lease_timeout_s": 3600,
+                "lease_timeout_s": ExactE2BEnvironment._task_resource_class(
+                    cpu_count=build.cpu_count,
+                    memory_mb=build.memory_mb,
+                ).provider_ttl_seconds,
                 "timeout_action": "kill",
                 "auto_resume": False,
                 "volume_mounts": False,
@@ -683,6 +687,7 @@ def _fake_e2b_attestation_evidence(
     build: ExactE2BBuildRecord,
     *,
     requested_storage_mb: int | None,
+    lease_timeout_s: int | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 3,
@@ -691,6 +696,7 @@ def _fake_e2b_attestation_evidence(
         "build_id": build.build_id,
         "environment_id": build.environment_id,
         "build_config_digest": build.build_config_digest,
+        "build_record_digest": build.digest,
         "launch_config_digest": "sha256:" + "2" * 64,
         "platform": "linux/x86_64",
         "cpu_count": build.cpu_count,
@@ -701,7 +707,14 @@ def _fake_e2b_attestation_evidence(
         ),
         "envd_version": "0.2.1",
         "internet_access": True,
-        "lease_timeout_s": 3600,
+        "lease_timeout_s": (
+            ExactE2BEnvironment._task_resource_class(
+                cpu_count=build.cpu_count,
+                memory_mb=build.memory_mb,
+            ).provider_ttl_seconds
+            if lease_timeout_s is None
+            else lease_timeout_s
+        ),
         "timeout_action": "kill",
         "auto_resume": False,
         "volume_mounts": False,
@@ -710,6 +723,87 @@ def _fake_e2b_attestation_evidence(
         "network_allow_out": [],
         "network_deny_out": [],
     }
+
+
+def test_e2b_qualification_evidence_rejects_task_lease_horizon_drift(
+    tmp_path: Path,
+) -> None:
+    budget = _e2b_budget_runtime(tmp_path)
+    spec = ExactE2BBuildSpec(
+        environment_id="environment-immutable",
+        build_context_digest="sha256:" + "a" * 64,
+        docker_image="example.invalid/task:frozen",
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    build = _budgeted_build_record(
+        spec=spec,
+        budget=budget,
+        template_id="template-immutable",
+        build_id="build-immutable",
+    )
+    evidence = _fake_e2b_attestation_evidence(
+        build,
+        requested_storage_mb=None,
+        lease_timeout_s=3_600,
+    )
+    assert (
+        evidence["lease_timeout_s"]
+        != ExactE2BEnvironment._task_resource_class(
+            cpu_count=2,
+            memory_mb=1024,
+        ).provider_ttl_seconds
+    )
+    attestation = HarborTaskEnvironmentAttestation.from_evidence(evidence)
+    resource_class = ExactE2BEnvironment._task_resource_class(
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    build_identity = mod.QualifiedE2BBuildIdentity(
+        build_config_digest=build.build_config_digest,
+        build_record_digest=build.digest,
+        environment_id=build.environment_id,
+        build_context_digest=build.build_context_digest,
+        docker_image=spec.docker_image,
+        cpu_count=build.cpu_count,
+        memory_mb=build.memory_mb,
+        template_id=build.template_id,
+        build_id=build.build_id,
+    )
+    qualification = mod.QualifiedHarborTask(
+        task_id="task-a",
+        dataset_id="terminalbench",
+        content_digest="sha256:" + "b" * 64,
+        task_key="sha256:" + "c" * 64,
+        task_environment_digest=attestation.digest,
+        environment_backend=HarborEnvironmentBackend.E2B,
+        e2b_launch_config_digest=cast("str", evidence["launch_config_digest"]),
+        e2b_build_config_digest=build.build_config_digest,
+        e2b_build_record_digest=build.digest,
+        task_resource_class_digest=resource_class.digest,
+        e2b_build_identity=build_identity,
+        task_resource_class=resource_class,
+    )
+    now = datetime.now(UTC)
+    receipt = RunnerLeaseRecord(
+        backend="e2b",
+        lease_id="lease-task-a",
+        owner_id="sha256:" + "d" * 64,
+        config_digest=cast("str", evidence["launch_config_digest"]),
+        state="retired",
+        resource_id="sandbox-task-a",
+        created_at=now,
+        expected_end_at=now + timedelta(days=1),
+        retired_at=now + timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="lease horizon"):
+        mod._QualifiedTaskEvidence.freeze(
+            prepared_commitment_digest="sha256:" + "e" * 64,
+            qualification=qualification,
+            attestation=attestation,
+            cleanup_receipt=receipt,
+        )
 
 
 def _e2b_qualifier(
