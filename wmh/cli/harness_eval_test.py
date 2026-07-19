@@ -45,6 +45,7 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     ProviderTariffProvenance,
+    ProviderTariffRoute,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
@@ -58,10 +59,22 @@ _RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
 _CELL_CONFIG_DIGEST = "sha256:" + "b" * 64
 _RUNNER_CONFIG_DIGEST = "sha256:" + "c" * 64
 _RUNNER_ENVIRONMENT_DIGEST = "sha256:" + "d" * 64
-_TARIFF_PROVENANCE = ProviderTariffProvenance(
-    source_locator="https://example.test/provider-pricing",
-    verified_on=date(2026, 7, 19),
-)
+
+
+def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
+    return ProviderTariffProvenance(
+        source_locator="https://example.test/provider-pricing",
+        source_snapshot_digest="sha256:" + "f" * 64,
+        verified_on=date(2026, 7, 19),
+        effective_on=date(2026, 7, 1),
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=ProviderTariffRoute(
+            provider_config=provider_config,
+            billing_region=provider_config.region or "eastus2",
+            billing_sku="test-sku",
+        ),
+    )
 
 
 def _save_harness(root: Path) -> HarnessDoc:
@@ -417,7 +430,7 @@ def _write_budget_account(path: Path, provider_config: ProviderConfig) -> Budget
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_TARIFF_PROVENANCE,
+                tariff_provenance=_tariff_provenance(provider_config),
             )
         },
     )
@@ -458,7 +471,7 @@ def _write_e2b_task_budget_accounts(
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_TARIFF_PROVENANCE,
+                tariff_provenance=_tariff_provenance(provider_config),
             ),
             "task": TimedResourceCostMeter(
                 resource_type=resource_class.role.value,
@@ -650,6 +663,7 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
     dataset_ref = "sha256:" + "b" * 64
     provider_config = ProviderConfig(
         kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-model",
         model="gpt-model",
         endpoint="https://example.openai.azure.com",
         deployment="deployment-a",

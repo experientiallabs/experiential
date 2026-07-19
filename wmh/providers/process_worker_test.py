@@ -29,6 +29,7 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     ProviderTariffProvenance,
+    ProviderTariffRoute,
     ReservationStatus,
     SpendLedger,
     TokenPriceCeiling,
@@ -37,15 +38,24 @@ from wmh.tracking.budget import (
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="provider worker uses inherited sockets")
 
-_TARIFF_PROVENANCE = ProviderTariffProvenance(
-    source_locator="https://example.test/provider-pricing",
-    verified_on=date(2026, 7, 19),
-)
-
 _CONFIG = ProviderConfig(
     kind=ProviderKind.BEDROCK,
     model_type="claude-haiku-4-5",
     model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    region="us-east-1",
+)
+_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    source_snapshot_digest="sha256:" + "f" * 64,
+    verified_on=date(2026, 7, 19),
+    effective_on=date(2026, 7, 1),
+    currency="USD",
+    price_unit="per_1m_tokens",
+    route=ProviderTariffRoute(
+        provider_config=_CONFIG,
+        billing_region="us-east-1",
+        billing_sku="test-sku",
+    ),
 )
 _REQUEST = ChatRequest.model_validate(
     {

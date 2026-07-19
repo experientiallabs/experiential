@@ -46,6 +46,7 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     ProviderTariffProvenance,
+    ProviderTariffRoute,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
@@ -58,10 +59,22 @@ _TASK_KEYS = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
 _TASK_ENVIRONMENT_DIGESTS = ("sha256:" + "c" * 64, "sha256:" + "d" * 64)
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RUNNER = LocalPiRunnerSpec()
-_TARIFF_PROVENANCE = ProviderTariffProvenance(
-    source_locator="https://example.test/provider-pricing",
-    verified_on=date(2026, 7, 19),
-)
+
+
+def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
+    return ProviderTariffProvenance(
+        source_locator="https://example.test/provider-pricing",
+        source_snapshot_digest="sha256:" + "f" * 64,
+        verified_on=date(2026, 7, 19),
+        effective_on=date(2026, 7, 1),
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=ProviderTariffRoute(
+            provider_config=provider_config,
+            billing_region=provider_config.region or "test-region",
+            billing_sku="test-sku",
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -487,7 +500,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=1,
                 ),
-                tariff_provenance=_TARIFF_PROVENANCE,
+                tariff_provenance=_tariff_provenance(provider_config),
             ),
             "task": TimedResourceCostMeter(
                 resource_type=task_class.role.value,

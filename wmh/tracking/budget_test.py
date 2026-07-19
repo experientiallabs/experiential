@@ -49,6 +49,7 @@ from wmh.tracking.budget import (
     ExternalSpendAuthority,
     ProviderCostMeter,
     ProviderTariffProvenance,
+    ProviderTariffRoute,
     ReservationStatus,
     SpendLedger,
     TimedResourceBudget,
@@ -70,14 +71,29 @@ from wmh.tracking.budget import (
     validate_timed_resource_class,
 )
 
-_TEST_TARIFF_PROVENANCE = ProviderTariffProvenance(
-    source_locator="https://example.test/provider-pricing",
-    verified_on=date(2026, 7, 19),
-)
+
+def _test_tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
+    return ProviderTariffProvenance(
+        source_locator="https://example.test/provider-pricing",
+        source_snapshot_digest="sha256:" + "f" * 64,
+        verified_on=date(2026, 7, 19),
+        effective_on=date(2026, 7, 1),
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=ProviderTariffRoute(
+            provider_config=provider_config,
+            billing_region=provider_config.region or "test-region",
+            billing_sku="test-sku",
+        ),
+    )
 
 
 def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPolicy:
-    provider_config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model-1")
+    provider_config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="model-1",
+        region="test-region",
+    )
     return BudgetPolicy(
         study_id="study-1",
         manifest_digest="sha256:" + "a" * 64,
@@ -90,7 +106,7 @@ def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPoli
                     input_nano_usd_per_token=2,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_TEST_TARIFF_PROVENANCE,
+                tariff_provenance=_test_tariff_provenance(provider_config),
                 input_overhead_tokens=8,
             )
         },
@@ -1500,7 +1516,11 @@ class _FakeToolProvider:
         chat_usage: ChatUsage | None = None,
         error: Exception | None = None,
     ) -> None:
-        self.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model-1")
+        self.config = ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model="model-1",
+            region="test-region",
+        )
         self._text_usage = text_usage
         self._chat_usage = chat_usage
         self._error = error

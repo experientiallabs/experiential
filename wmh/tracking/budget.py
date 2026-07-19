@@ -27,6 +27,7 @@ from enum import StrEnum
 from pathlib import Path
 from time import monotonic as _system_monotonic
 from typing import Annotated, Literal, Self, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from llm_waterfall import ChatRequest, ChatResponse
@@ -38,6 +39,7 @@ from wmh.providers.base import (
     Message,
     Provider,
     ProviderConfig,
+    ProviderKind,
     SingleDispatchProvider,
     ToolCallingProvider,
     VerifyResult,
@@ -160,15 +162,80 @@ class TokenPriceCeiling(BaseModel):
         )
 
 
-class ProviderTariffProvenance(BaseModel):
-    """Auditable origin and usage scope for one frozen provider tariff."""
+class ProviderTariffRoute(BaseModel):
+    """Exact nonsecret execution and billing coordinates for one price record."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[1] = 1
+    provider_config: ProviderConfig
+    billing_region: str = Field(min_length=1, max_length=128)
+    billing_sku: str = Field(min_length=1, max_length=128)
+
+    @field_validator("provider_config", mode="after")
+    @classmethod
+    def _freeze_provider_config(cls, value: ProviderConfig) -> ProviderConfig:
+        return ProviderConfig.model_validate(value.model_dump())
+
+    @field_validator("billing_region", "billing_sku")
+    @classmethod
+    def _require_exact_nonblank_coordinate(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("tariff billing coordinates cannot have surrounding whitespace")
+        return value
+
+    @model_validator(mode="after")
+    def _require_complete_execution_route(self) -> Self:
+        config = self.provider_config
+        if config.kind is ProviderKind.BEDROCK:
+            if config.region is None:
+                raise ValueError("tariff route requires an explicit Bedrock region")
+            if self.billing_region != config.region:
+                raise ValueError("Bedrock billing region must match the provider region")
+        if config.kind is ProviderKind.AZURE_OPENAI:
+            if config.endpoint is None:
+                raise ValueError("tariff route requires an explicit Azure endpoint")
+            if config.deployment is None or config.api_version is None:
+                raise ValueError(
+                    "tariff route requires an explicit Azure deployment and API version"
+                )
+            if config.model_type is None:
+                raise ValueError("tariff route requires an explicit Azure canonical model_type")
+            parsed_endpoint = urlsplit(config.endpoint)
+            if (
+                parsed_endpoint.scheme != "https"
+                or parsed_endpoint.hostname is None
+                or parsed_endpoint.username is not None
+                or parsed_endpoint.password is not None
+                or parsed_endpoint.query
+                or parsed_endpoint.fragment
+            ):
+                raise ValueError(
+                    "tariff route Azure endpoint must be an HTTPS locator without credentials, "
+                    "query, or fragment"
+                )
+        if config.model_type is not None:
+            from wmh.providers.models import resolve_provider_model
+
+            resolved = resolve_provider_model(config.kind, config.model)
+            if resolved.model_type != config.model_type:
+                raise ValueError("tariff route model_type differs from its runtime model")
+        return self
+
+
+class ProviderTariffProvenance(BaseModel):
+    """Auditable source snapshot, exact route, and usage scope for one frozen tariff."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[2] = 2
     source_locator: str = Field(min_length=1, max_length=2_048)
+    source_snapshot_digest: str = Field(pattern=_DIGEST_PATTERN)
     verified_on: date
-    effective_on: date | None = None
+    effective_on: date
+    currency: Literal["USD"]
+    price_unit: Literal["per_1m_tokens"]
+    route: ProviderTariffRoute
     priced_usage_dimensions: tuple[str, ...] = ("input_tokens", "output_tokens")
 
     @field_validator("source_locator")
@@ -176,6 +243,21 @@ class ProviderTariffProvenance(BaseModel):
     def _require_canonical_source_locator(cls, value: str) -> str:
         if value != value.strip():
             raise ValueError("tariff source_locator cannot have surrounding whitespace")
+        parsed = urlsplit(value)
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("tariff source_locator cannot contain credentials, query, or fragment")
+        return value
+
+    @field_validator("source_snapshot_digest")
+    @classmethod
+    def _reject_placeholder_snapshot_digest(cls, value: str) -> str:
+        if value == _ZERO_DIGEST:
+            raise ValueError("tariff source_snapshot_digest cannot be the zero digest")
         return value
 
     @field_validator("priced_usage_dimensions")
@@ -199,6 +281,17 @@ class ProviderCostMeter(BaseModel):
     tariff_provenance: ProviderTariffProvenance
     input_estimator: Literal["canonical-json-utf8-v1"] = "canonical-json-utf8-v1"
     input_overhead_tokens: int = Field(default=8192, ge=1, le=_SQLITE_INTEGER_MAX)
+
+    @field_validator("provider_config", mode="after")
+    @classmethod
+    def _freeze_provider_config(cls, value: ProviderConfig) -> ProviderConfig:
+        return ProviderConfig.model_validate(value.model_dump())
+
+    @model_validator(mode="after")
+    def _require_tariff_route_match(self) -> Self:
+        if self.tariff_provenance.route.provider_config != self.provider_config:
+            raise ValueError("tariff route does not match provider config")
+        return self
 
 
 class ExternalSpendAuthority(BaseModel):

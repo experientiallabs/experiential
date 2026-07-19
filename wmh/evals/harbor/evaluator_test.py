@@ -61,6 +61,7 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     ProviderTariffProvenance,
+    ProviderTariffRoute,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
@@ -72,10 +73,22 @@ from wmh.tracking.rate_limit import (
     bind_external_dispatch_rate_authority,
 )
 
-_TARIFF_PROVENANCE = ProviderTariffProvenance(
-    source_locator="https://example.test/provider-pricing",
-    verified_on=date(2026, 7, 19),
-)
+
+def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
+    return ProviderTariffProvenance(
+        source_locator="https://example.test/provider-pricing",
+        source_snapshot_digest="sha256:" + "f" * 64,
+        verified_on=date(2026, 7, 19),
+        effective_on=date(2026, 7, 1),
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=ProviderTariffRoute(
+            provider_config=provider_config,
+            billing_region=provider_config.region or "test-region",
+            billing_sku="test-sku",
+        ),
+    )
+
 
 _TASK_ENVIRONMENT_ATTESTATION = {
     "schema_version": 2,
@@ -194,7 +207,11 @@ def _spec(tmp_path: Path, *datasets: Path, job_name: str = "evaluation") -> Harb
 
 
 def _provider() -> ProviderConfig:
-    return ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    return ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="model",
+        region="test-region",
+    )
 
 
 def _e2b_budget_kwargs(
@@ -213,7 +230,7 @@ def _e2b_budget_kwargs(
                 input_nano_usd_per_token=1,
                 output_nano_usd_per_token=1,
             ),
-            tariff_provenance=_TARIFF_PROVENANCE,
+            tariff_provenance=_tariff_provenance(provider),
         )
     }
     if task_environment:
@@ -1202,7 +1219,7 @@ def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: P
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_TARIFF_PROVENANCE,
+                tariff_provenance=_tariff_provenance(provider_config),
             )
         },
     )

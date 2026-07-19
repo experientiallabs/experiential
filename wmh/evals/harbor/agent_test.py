@@ -53,6 +53,7 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     ProviderTariffProvenance,
+    ProviderTariffRoute,
     TokenPriceCeiling,
     bind_budget_account,
     bootstrap_budget_ledger,
@@ -64,10 +65,22 @@ from wmh.tracking.rate_limit import (
     bind_external_dispatch_rate_authority,
 )
 
-_TARIFF_PROVENANCE = ProviderTariffProvenance(
-    source_locator="https://example.test/provider-pricing",
-    verified_on=date(2026, 7, 19),
-)
+
+def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
+    return ProviderTariffProvenance(
+        source_locator="https://example.test/provider-pricing",
+        source_snapshot_digest="sha256:" + "f" * 64,
+        verified_on=date(2026, 7, 19),
+        effective_on=date(2026, 7, 1),
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=ProviderTariffRoute(
+            provider_config=provider_config,
+            billing_region=provider_config.region or "test-region",
+            billing_sku="test-sku",
+        ),
+    )
+
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
     "JsonObject",
@@ -208,7 +221,11 @@ def _agent(
     require_provider_receipts: bool = False,
 ) -> mod.WmhPiAgent:
     monkeypatch.setattr(mod, "ProviderProcessWorker", _ProviderWorker)
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="model",
+        region="test-region",
+    )
     agent = mod.WmhPiAgent(
         logs_dir=tmp_path / "agent",
         model_name="bedrock/model",
@@ -276,7 +293,11 @@ def _provider_receipt_payload(
 
 
 def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path) -> None:
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="model",
+        region="test-region",
+    )
     policy = BudgetPolicy(
         study_id="study",
         manifest_digest="sha256:" + "a" * 64,
@@ -289,7 +310,7 @@ def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_TARIFF_PROVENANCE,
+                tariff_provenance=_tariff_provenance(config),
             )
         },
     )
