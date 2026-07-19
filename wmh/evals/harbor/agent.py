@@ -1143,6 +1143,8 @@ async def _attest_e2b_environment(
         raise RuntimeError("E2B returned invalid sandbox resource evidence")
     requested_storage_mb = evidence.get("requested_storage_mb")
     observed_storage_mb = evidence.get("observed_storage_mb")
+    if evidence.get("storage_capacity_scope") != "provider_reported_total":
+        raise RuntimeError("E2B returned an invalid sandbox storage capacity scope")
     if (requested_storage_mb is None and observed_storage_mb is not None) or (
         requested_storage_mb is not None
         and (

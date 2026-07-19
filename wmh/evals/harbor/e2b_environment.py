@@ -912,6 +912,7 @@ class ExactE2BEnvironment(E2BEnvironment):
                 "memory_mb": build.memory_mb,
                 "requested_storage_mb": requested_storage_mb,
                 "observed_storage_mb": observed_storage_mb,
+                "storage_capacity_scope": "provider_reported_total",
                 "envd_version": envd_version,
                 "network_mode": self.network_policy.network_mode.value,
                 "allowed_hosts": sorted(self.network_policy.allowed_hosts),

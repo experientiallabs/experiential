@@ -87,6 +87,7 @@ _E2B_TASK_ENVIRONMENT_ATTESTATION = {
     "memory_mb": 1024,
     "requested_storage_mb": 10_240,
     "observed_storage_mb": 20_480,
+    "storage_capacity_scope": "provider_reported_total",
     "envd_version": "1.2.3",
     "network_mode": "no_network",
     "allowed_hosts": [],
@@ -932,15 +933,27 @@ def _write_e2b_job(
     tmp_path: Path,
     *,
     receipt: dict[str, object] | None,
+    attestation: dict[str, object] | None = None,
 ) -> tuple[Path, HarborTrialManifest, TrialResult]:
+    effective_attestation = attestation or _E2B_TASK_ENVIRONMENT_ATTESTATION
+    effective_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                effective_attestation,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
     trial = _trial(tmp_path, "task", rewards={"reward": 1})
     trial.config.environment.type = EnvironmentType.E2B
     assert trial.agent_result is not None
     assert trial.agent_result.metadata is not None
     trial.agent_result.metadata.update(
         {
-            "task_environment_digest": _E2B_TASK_ENVIRONMENT_DIGEST,
-            "task_environment_attestation": _E2B_TASK_ENVIRONMENT_ATTESTATION,
+            "task_environment_digest": effective_digest,
+            "task_environment_attestation": effective_attestation,
         }
     )
     job_dir = tmp_path / "job"
@@ -978,6 +991,22 @@ def test_e2b_task_environment_retains_full_attestation_and_cleanup_receipt(
     assert trial.task_environment_digest == _E2B_TASK_ENVIRONMENT_DIGEST
     assert trial.task_environment_attestation == _E2B_TASK_ENVIRONMENT_ATTESTATION
     assert trial.task_environment_lease_receipt == receipt
+
+
+def test_e2b_task_environment_rejects_ambiguous_storage_capacity_scope(
+    tmp_path: Path,
+) -> None:
+    receipt = _task_environment_lease_receipt("task__harbor")
+    attestation: dict[str, object] = dict(_E2B_TASK_ENVIRONMENT_ATTESTATION)
+    attestation.pop("storage_capacity_scope")
+    job_dir, manifest, _trial_result = _write_e2b_job(
+        tmp_path,
+        receipt=receipt,
+        attestation=attestation,
+    )
+
+    with pytest.raises(ValueError, match="storage capacity scope"):
+        load_harbor_job_result(job_dir, manifest)
 
 
 @pytest.mark.parametrize(

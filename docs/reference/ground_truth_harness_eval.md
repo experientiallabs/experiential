@@ -273,8 +273,9 @@ does not accept disk size when building the exact template, so different task mi
 content, CPU, and memory keyed build. The requested minimum is instead bound into the launch digest.
 After create, WMH reads E2B's provider metrics, interprets `disk_total` as bytes, retries only an
 initially empty metric series across a fixed ten-second polling window with bounded requests, and
-requires the conservative observed
-total to cover the requested MiB before accepting the sandbox. Missing or malformed metrics fail
+requires the conservative observed total to cover the requested MiB before accepting the sandbox.
+The stable evidence labels this quantity as `provider_reported_total`; it is root-disk allocation,
+not a claim about currently free bytes. Missing or malformed metrics fail
 closed and use the ordinary owner-bound sandbox cleanup path.
 
 Local Docker has no portable per-container disk quota in this adapter. For a task storage request,

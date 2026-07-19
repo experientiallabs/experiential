@@ -715,6 +715,8 @@ def _parse_task_environment_attestation(
         launch_digest = parsed.get("launch_config_digest")
         if not is_sha256_digest(launch_digest):
             raise ValueError("Harbor E2B task attestation omits its launch configuration digest")
+        if parsed.get("storage_capacity_scope") != "provider_reported_total":
+            raise ValueError("Harbor E2B task attestation has invalid storage capacity scope")
         requested_value = parsed.get("requested_storage_mb")
         if requested_value is None:
             requested_storage_mb = None

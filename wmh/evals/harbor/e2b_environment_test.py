@@ -1720,6 +1720,7 @@ def test_exact_create_attests_sufficient_observed_storage(
     assert attestation is not None
     assert attestation["requested_storage_mb"] == 10_240
     assert attestation["observed_storage_mb"] == observed_storage_mb
+    assert attestation["storage_capacity_scope"] == "provider_reported_total"
     asyncio.run(environment.stop(delete=True))
 
 

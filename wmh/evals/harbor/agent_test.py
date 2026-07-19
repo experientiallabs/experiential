@@ -101,6 +101,7 @@ _E2B_TASK_ENVIRONMENT_ATTESTATION = cast(
         "memory_mb": 8192,
         "requested_storage_mb": 10_240,
         "observed_storage_mb": 20_480,
+        "storage_capacity_scope": "provider_reported_total",
         "envd_version": "1.2.3",
         "network_mode": "no_network",
         "allowed_hosts": [],
@@ -585,6 +586,27 @@ def test_setup_rejects_e2b_adapter_evidence_without_fail_closed_lifecycle(
                 "JsonObject",
                 {**_E2B_TASK_ENVIRONMENT_ATTESTATION, "auto_resume": True},
             )
+
+        @staticmethod
+        def type() -> EnvironmentType:
+            return EnvironmentType.E2B
+
+    with pytest.raises(mod.WmhPiEnvironmentError, match="attestation failed"):
+        asyncio.run(agent.setup(cast("BaseEnvironment", E2BEnvironment())))
+
+
+def test_setup_rejects_e2b_adapter_evidence_with_ambiguous_storage_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+
+    class E2BEnvironment(_Environment):
+        @property
+        def wmh_environment_attestation(self) -> JsonObject:
+            evidence = dict(_E2B_TASK_ENVIRONMENT_ATTESTATION)
+            evidence.pop("storage_capacity_scope")
+            return cast("JsonObject", evidence)
 
         @staticmethod
         def type() -> EnvironmentType:
