@@ -29,7 +29,7 @@ class ReapingDockerEnvironment(DockerEnvironment):
         stdin_data: bytes | None = None,
     ) -> ExecResult:
         try:
-            if timeout_sec:
+            if timeout_sec is not None:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     process.communicate(input=stdin_data),
                     timeout=timeout_sec,

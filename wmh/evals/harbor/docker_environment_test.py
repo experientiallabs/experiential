@@ -84,23 +84,24 @@ def test_buffered_command_preserves_completed_output() -> None:
     asyncio.run(scenario())
 
 
-def test_zero_timeout_preserves_harbor_no_timeout_semantics() -> None:
+def test_zero_timeout_expires_and_reaps_process() -> None:
     async def scenario() -> None:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-c",
-            "import sys; sys.stdout.write('ready')",
+            "import time; time.sleep(60)",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        result = await ReapingDockerEnvironment._collect_buffered_output(
-            process,
-            timeout_sec=0,
-        )
+        with pytest.raises(RuntimeError, match="timed out after 0 seconds"):
+            await ReapingDockerEnvironment._collect_buffered_output(
+                process,
+                timeout_sec=0,
+            )
 
-        assert result.return_code == 0
-        assert result.stdout == "ready"
+        assert process.returncode is not None
+        assert await process.wait() == process.returncode
 
     asyncio.run(scenario())

@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 from llm_waterfall import ChatRequest
@@ -137,6 +138,27 @@ def test_socketpair_start_failure_is_sanitized_and_closed(
 
     assert secret not in str(caught.value)
     assert worker.wait_closed(0)
+
+
+def test_cleanup_failure_signals_completion_without_proving_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = mod.ProviderProcessWorker(_CONFIG)
+    process = cast("subprocess.Popen[bytes]", object())
+    worker._process = process
+
+    def fail_cleanup(_process: subprocess.Popen[bytes], *, force: bool) -> None:
+        _ = force
+        assert _process is process
+        raise mod.ProviderWorkerCleanupError("provider worker cleanup was not proved")
+
+    monkeypatch.setattr(mod, "_stop_and_reap", fail_cleanup)
+
+    with pytest.raises(mod.ProviderWorkerCleanupError):
+        worker.cancel()
+
+    assert worker._closed.is_set()
+    assert worker.wait_closed(0) is False
 
 
 def test_close_kills_worker_process_group_after_leader_exit(

@@ -149,6 +149,7 @@ class ProviderProcessWorker:
         self._cancelled = False
         self._cancelled_event = threading.Event()
         self._closed = threading.Event()
+        self._cleanup_proved = False
 
     @property
     def is_ready(self) -> bool:
@@ -166,6 +167,7 @@ class ProviderProcessWorker:
                     raise ProviderWorkerUnavailable("provider worker is unavailable")
                 if os.name != "posix":
                     self._cancelled = True
+                    self._cleanup_proved = True
                     self._closed.set()
                     raise ProviderWorkerUnavailable(
                         "provider worker requires inherited POSIX sockets"
@@ -178,6 +180,7 @@ class ProviderProcessWorker:
                 with self._state_lock:
                     self._starting = False
                     self._cancelled = True
+                    self._cleanup_proved = True
                     self._closed.set()
                 raise ProviderWorkerUnavailable("provider worker failed to start") from None
             try:
@@ -196,6 +199,7 @@ class ProviderProcessWorker:
                 with self._state_lock:
                     self._starting = False
                     self._cancelled = True
+                    self._cleanup_proved = True
                     self._closed.set()
                 raise ProviderWorkerUnavailable("provider worker failed to start") from None
             finally:
@@ -315,7 +319,10 @@ class ProviderProcessWorker:
 
     def wait_closed(self, timeout_s: float) -> bool:
         """Wait until the worker process has been reaped."""
-        return self._closed.wait(timeout_s)
+        if not self._closed.wait(timeout_s):
+            return False
+        with self._state_lock:
+            return self._cleanup_proved
 
     def _abort(self, *, force: bool) -> None:
         with self._state_lock:
@@ -325,17 +332,24 @@ class ProviderProcessWorker:
             process = self._process
             starting = self._starting
         _close_socket(connection)
-        with self._cleanup_lock:
-            if process is not None:
-                _stop_and_reap(process, force=force)
-        with self._state_lock:
-            if self._process is process:
-                self._process = None
-            if self._socket is connection:
-                self._socket = None
-            self._ready = False
-            if not starting:
-                self._closed.set()
+        cleanup_failed = False
+        try:
+            with self._cleanup_lock:
+                if process is not None:
+                    _stop_and_reap(process, force=force)
+        except BaseException:
+            cleanup_failed = True
+            raise
+        finally:
+            with self._state_lock:
+                if not cleanup_failed and self._process is process:
+                    self._process = None
+                if self._socket is connection:
+                    self._socket = None
+                self._ready = False
+                if not starting:
+                    self._cleanup_proved = not cleanup_failed
+                    self._closed.set()
 
 
 def _worker_command(socket_fd: int) -> list[str]:

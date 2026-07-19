@@ -1418,6 +1418,18 @@ def test_trace_failure_cannot_skip_or_replace_runner_cleanup_proof(
     assert factory.wait_calls == 1
 
 
+def test_truthy_cleanup_proof_is_not_rejected_by_scheduler_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "_EXECUTION_CLEANUP_TIMEOUT_S", 0.001)
+
+    def proved_after_delay() -> bool:
+        time.sleep(0.02)
+        return True
+
+    assert asyncio.run(mod._run_cleanup_call(proved_after_delay, require_truthy=True))
+
+
 @pytest.mark.parametrize("branch", ["cancellation", "candidate", "infrastructure"])
 @pytest.mark.parametrize("cleanup_failure", ["cancel_exception", "cancel_timeout", "wait_timeout"])
 def test_all_failure_branches_sanitize_cancel_and_wait_cleanup_failures(

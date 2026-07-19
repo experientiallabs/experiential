@@ -1201,7 +1201,9 @@ async def _run_cleanup_call(
     thread.join()
     if failed.is_set() or len(results) != 1:
         return False
-    return elapsed_s <= _EXECUTION_CLEANUP_TIMEOUT_S and (not require_truthy or bool(results[0]))
+    if require_truthy:
+        return bool(results[0])
+    return elapsed_s <= _EXECUTION_CLEANUP_TIMEOUT_S
 
 
 async def _join_turn_task(turn_task: asyncio.Task[PiTurnResult]) -> bool:
