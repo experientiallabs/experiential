@@ -32,18 +32,25 @@ from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
     BudgetBreachError,
+    BudgetBreachKind,
     BudgetedProvider,
     BudgetExceededError,
     BudgetIntegrityError,
     BudgetPolicy,
+    BudgetReservation,
     BudgetScope,
     ProviderCostMeter,
     ReservationStatus,
     SpendLedger,
+    TimedResourceBudget,
+    TimedResourceBudgetAccount,
+    TimedResourceCostMeter,
     TokenPriceCeiling,
     bind_budget_account,
+    bind_timed_resource_account,
     nano_usd_from_usd,
     resolve_budget_account,
+    resolve_timed_resource_account,
 )
 
 
@@ -91,6 +98,8 @@ def _reserve_in_process(
     reservation_id: str,
     barrier: object,
     outcomes: object,
+    meter_id: str = "worker",
+    max_nano_usd: int = 60,
 ) -> None:
     process_barrier = cast("_ProcessBarrier", barrier)
     process_queue = cast("_StringQueue", outcomes)
@@ -99,8 +108,8 @@ def _reserve_in_process(
     try:
         ledger.reserve(
             _scope(),
-            meter_id="worker",
-            max_nano_usd=60,
+            meter_id=meter_id,
+            max_nano_usd=max_nano_usd,
             reservation_id=reservation_id,
         )
     except BudgetExceededError:
@@ -175,6 +184,419 @@ def test_budget_binding_is_path_independent_and_resolves_only_registered_policy(
         bind_budget_account(fork)
 
 
+def test_timed_resource_budget_reserves_ceiling_and_settles_billing_quantum(
+    tmp_path: Path,
+) -> None:
+    clock_values = iter([10.0, 70.001])
+    provider = _policy().meters["worker"]
+    assert isinstance(provider, ProviderCostMeter)
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "c" * 64,
+        fixed_nano_usd=10,
+        nano_usd_per_second=3,
+        billing_quantum_seconds=60,
+        max_billing_seconds=120,
+    )
+    policy = BudgetPolicy(
+        study_id="timed-resource",
+        manifest_digest="sha256:" + "d" * 64,
+        hard_limit_nano_usd=1_000,
+        phase_limits_nano_usd={"confirmation": 1_000},
+        meters={"worker": provider, "sandbox": resource},
+    )
+    account = TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "resource.sqlite3").resolve(),
+        policy=policy,
+        scope=_scope("confirmation", "sandbox"),
+        meter_id="sandbox",
+    )
+
+    reservation = TimedResourceBudget(
+        account,
+        id_factory=lambda: "sandbox-1",
+        monotonic=lambda: next(clock_values),
+    ).reserve()
+    assert SpendLedger(account.ledger_path, policy).snapshot().reserved_nano_usd == 370
+
+    settled = reservation.settle()
+
+    assert settled.status is ReservationStatus.SETTLED
+    assert settled.charged_nano_usd == 370
+    assert settled.usage_quantity == 120
+    assert settled.usage_unit == "billing_second"
+    assert settled.input_tokens is None
+    assert settled.output_tokens is None
+    assert resource.billed_seconds(0) == 60
+
+
+def test_provider_and_timed_resources_share_one_hard_cap(tmp_path: Path) -> None:
+    provider = _policy().meters["worker"]
+    assert isinstance(provider, ProviderCostMeter)
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "b" * 64,
+        nano_usd_per_second=3,
+        max_billing_seconds=100,
+    )
+    policy = BudgetPolicy(
+        study_id="combined-budget",
+        manifest_digest="sha256:" + "c" * 64,
+        hard_limit_nano_usd=400,
+        phase_limits_nano_usd={"confirmation": 400},
+        meters={"worker": provider, "sandbox": resource},
+    )
+    ledger_path = (tmp_path / "combined.sqlite3").resolve()
+    ledger = SpendLedger(ledger_path, policy)
+    ledger.reserve(
+        _scope("confirmation"),
+        meter_id="worker",
+        max_nano_usd=101,
+        reservation_id="provider-1",
+    )
+    account = TimedResourceBudgetAccount(
+        ledger_path=ledger_path,
+        policy=policy,
+        scope=_scope("confirmation", "sandbox"),
+        meter_id="sandbox",
+    )
+
+    with pytest.raises(BudgetExceededError, match="hard budget"):
+        TimedResourceBudget(account, id_factory=lambda: "sandbox-1").reserve()
+
+    assert ledger.snapshot().reserved_nano_usd == 101
+
+
+def test_timed_resource_binding_is_path_free_and_type_checked(tmp_path: Path) -> None:
+    provider = _policy().meters["worker"]
+    assert isinstance(provider, ProviderCostMeter)
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "b" * 64,
+        nano_usd_per_second=1,
+        max_billing_seconds=10,
+    )
+    policy = BudgetPolicy(
+        study_id="resource-binding",
+        manifest_digest="sha256:" + "c" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"confirmation": 100},
+        meters={"worker": provider, "sandbox": resource},
+    )
+    account = TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "binding.sqlite3").resolve(),
+        policy=policy,
+        scope=_scope("confirmation", "sandbox"),
+        meter_id="sandbox",
+    )
+
+    binding = bind_timed_resource_account(account)
+
+    assert "ledger" not in binding.model_dump_json()
+    assert resolve_timed_resource_account(binding) == account
+    with pytest.raises(BudgetIntegrityError, match="provider token meter"):
+        resolve_budget_account(binding)
+
+
+@pytest.mark.parametrize("resource_type", [" ", "Sandbox", "sandbox/path", "s" * 65])
+def test_timed_resource_type_must_be_bounded_and_canonical(resource_type: str) -> None:
+    with pytest.raises(ValueError):
+        TimedResourceCostMeter(
+            resource_type=resource_type,
+            resource_class_digest="sha256:" + "b" * 64,
+            nano_usd_per_second=1,
+            max_billing_seconds=1,
+        )
+
+
+def test_ledger_rejects_settlement_that_differs_from_frozen_tariff(
+    tmp_path: Path,
+) -> None:
+    provider = _policy().meters["worker"]
+    assert isinstance(provider, ProviderCostMeter)
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "b" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=60,
+    )
+    policy = BudgetPolicy(
+        study_id="tariff-validation",
+        manifest_digest="sha256:" + "c" * 64,
+        hard_limit_nano_usd=1_000,
+        phase_limits_nano_usd={"search": 1_000},
+        meters={"worker": provider, "sandbox": resource},
+    )
+    provider_ledger = SpendLedger(tmp_path / "provider.sqlite3", policy)
+    provider_ledger.reserve(
+        _scope(),
+        meter_id="worker",
+        max_nano_usd=500,
+        reservation_id="provider-1",
+    )
+    resource_ledger = SpendLedger(tmp_path / "resource.sqlite3", policy)
+    resource_ledger.reserve(
+        _scope(),
+        meter_id="sandbox",
+        max_nano_usd=120,
+        reservation_id="resource-1",
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="frozen tariff"):
+        provider_ledger.settle(
+            "provider-1",
+            charged_nano_usd=0,
+            input_tokens=2,
+            output_tokens=3,
+        )
+    with pytest.raises(BudgetIntegrityError, match="frozen tariff"):
+        resource_ledger.settle(
+            "resource-1",
+            charged_nano_usd=0,
+            usage_quantity=60,
+            usage_unit="billing_second",
+        )
+
+    assert provider_ledger.reservations()[0].status is ReservationStatus.RESERVED
+    assert resource_ledger.reservations()[0].status is ReservationStatus.RESERVED
+
+
+def test_timed_resource_reservation_retries_after_precommit_ledger_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock_values = iter([0.0, 0.1])
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "e" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=30,
+    )
+    policy = BudgetPolicy(
+        study_id="timed-resource-retry",
+        manifest_digest="sha256:" + "f" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={"sandbox": resource},
+    )
+    account = TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "retry.sqlite3").resolve(),
+        policy=policy,
+        scope=_scope(),
+        meter_id="sandbox",
+    )
+    reservation = TimedResourceBudget(
+        account,
+        id_factory=lambda: "sandbox-1",
+        monotonic=lambda: next(clock_values),
+    ).reserve()
+    original_settle = SpendLedger.settle
+    fail_once = True
+
+    def flaky_settle(
+        ledger: SpendLedger,
+        reservation_id: str,
+        *,
+        charged_nano_usd: int,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        usage_quantity: int | None = None,
+        usage_unit: str | None = None,
+        breach_kind: BudgetBreachKind | None = None,
+    ) -> BudgetReservation:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise sqlite3.OperationalError("transient")
+        return original_settle(
+            ledger,
+            reservation_id,
+            charged_nano_usd=charged_nano_usd,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            usage_quantity=usage_quantity,
+            usage_unit=usage_unit,
+            breach_kind=breach_kind,
+        )
+
+    monkeypatch.setattr(SpendLedger, "settle", flaky_settle)
+
+    with pytest.raises(sqlite3.OperationalError, match="transient"):
+        reservation.settle()
+    settled = reservation.settle()
+
+    assert settled.status is ReservationStatus.SETTLED
+    assert settled.usage_quantity == 1
+
+
+def test_timed_resource_reservation_requires_its_exact_maximum(tmp_path: Path) -> None:
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "e" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=30,
+    )
+    policy = BudgetPolicy(
+        study_id="timed-resource-ceiling",
+        manifest_digest="sha256:" + "f" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={"sandbox": resource},
+    )
+    ledger = SpendLedger(tmp_path / "ceiling.sqlite3", policy)
+
+    with pytest.raises(ValueError, match="exact maximum"):
+        ledger.reserve(
+            _scope(),
+            meter_id="sandbox",
+            max_nano_usd=59,
+            reservation_id="sandbox-1",
+        )
+
+    assert ledger.reservations() == []
+
+
+def test_timed_resource_under_reservation_is_rejected_during_replay(tmp_path: Path) -> None:
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "e" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=30,
+    )
+    policy = BudgetPolicy(
+        study_id="timed-resource-replay",
+        manifest_digest="sha256:" + "f" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={"sandbox": resource},
+    )
+    path = tmp_path / "replay.sqlite3"
+    SpendLedger(path, policy)
+    TimedResourceBudget(
+        TimedResourceBudgetAccount(
+            ledger_path=path.resolve(),
+            policy=policy,
+            scope=_scope(),
+            meter_id="sandbox",
+        ),
+        id_factory=lambda: "sandbox-1",
+    ).reserve()
+
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("DROP TRIGGER budget_events_no_update")
+        row = connection.execute(
+            "SELECT entry_json FROM budget_events WHERE sequence = 2"
+        ).fetchone()
+        assert row is not None
+        event = json.loads(row["entry_json"])
+        event["action"]["max_nano_usd"] = 59
+        unsigned = {key: value for key, value in event.items() if key != "digest"}
+        event["digest"] = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    unsigned,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+        )
+        connection.execute(
+            "UPDATE budget_events SET digest = ?, entry_json = ? WHERE sequence = 2",
+            (
+                event["digest"],
+                json.dumps(
+                    event,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+        connection.execute(
+            "UPDATE budget_reservations SET max_nano_usd = 59 WHERE reservation_id = 'sandbox-1'"
+        )
+
+    with pytest.raises(BudgetIntegrityError, match="exact maximum"):
+        SpendLedger(path, policy)
+
+
+def test_timed_resource_rejects_token_only_breach_kinds(tmp_path: Path) -> None:
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "e" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=30,
+    )
+    policy = BudgetPolicy(
+        study_id="timed-resource-breach-kind",
+        manifest_digest="sha256:" + "f" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={"sandbox": resource},
+    )
+    ledger = SpendLedger(tmp_path / "breach.sqlite3", policy)
+    ledger.reserve(
+        _scope(),
+        meter_id="sandbox",
+        max_nano_usd=60,
+        reservation_id="sandbox-1",
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="token breach"):
+        ledger.settle(
+            "sandbox-1",
+            charged_nano_usd=2,
+            usage_quantity=1,
+            usage_unit="billing_second",
+            breach_kind=BudgetBreachKind.INPUT_TOKEN_CEILING,
+        )
+
+    assert ledger.reservations()[0].status is ReservationStatus.RESERVED
+
+
+def test_timed_resource_failure_forfeits_full_ceiling_and_is_terminal(tmp_path: Path) -> None:
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "e" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=30,
+    )
+    policy = BudgetPolicy(
+        study_id="timed-resource-failure",
+        manifest_digest="sha256:" + "f" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={"sandbox": resource},
+    )
+    account = TimedResourceBudgetAccount(
+        ledger_path=(tmp_path / "resource.sqlite3").resolve(),
+        policy=policy,
+        scope=_scope(),
+        meter_id="sandbox",
+    )
+    reservation = TimedResourceBudget(account, id_factory=lambda: "sandbox-1").reserve()
+
+    forfeited = reservation.forfeit(failure_type="CreateUnknown")
+
+    assert forfeited.status is ReservationStatus.FORFEITED
+    assert forfeited.charged_nano_usd == 60
+    with pytest.raises(BudgetIntegrityError, match="already terminal"):
+        reservation.settle()
+
+
+def test_forfeit_failure_type_is_a_bounded_nonsecret_code(tmp_path: Path) -> None:
+    ledger = SpendLedger(tmp_path / "budget.sqlite3", _policy())
+    ledger.reserve(_scope(), meter_id="worker", max_nano_usd=10, reservation_id="r1")
+
+    with pytest.raises(ValueError, match="failure code"):
+        ledger.forfeit("r1", failure_type="/private/tmp/provider-error.txt")
+
+    assert ledger.reservations()[0].status is ReservationStatus.RESERVED
+
+
 def test_spend_ledger_reserves_settles_and_forfeits_without_releasing_history(
     tmp_path: Path,
 ) -> None:
@@ -186,7 +608,7 @@ def test_spend_ledger_reserves_settles_and_forfeits_without_releasing_history(
     assert reserved.reserved_nano_usd == 60
     assert reserved.remaining_nano_usd == 40
 
-    ledger.settle("r1", charged_nano_usd=20, input_tokens=3, output_tokens=4)
+    ledger.settle("r1", charged_nano_usd=20, input_tokens=0, output_tokens=4)
     ledger.reserve(_scope(), meter_id="worker", max_nano_usd=60, reservation_id="r2")
     ledger.forfeit("r2", failure_type="ConnectionError")
 
@@ -197,7 +619,7 @@ def test_spend_ledger_reserves_settles_and_forfeits_without_releasing_history(
     assert snapshot.by_phase_nano_usd == {"final": 0, "search": 80}
     reservations = {item.reservation_id: item for item in ledger.reservations()}
     assert reservations["r1"].status is ReservationStatus.SETTLED
-    assert reservations["r1"].input_tokens == 3
+    assert reservations["r1"].input_tokens == 0
     assert reservations["r2"].status is ReservationStatus.FORFEITED
     assert len(ledger.events()) == 5  # genesis, two reserves, settle, forfeit
     ledger.audit()
@@ -296,6 +718,53 @@ def test_processes_initialize_and_reserve_atomically(tmp_path: Path) -> None:
     assert SpendLedger(path, policy).snapshot().reserved_nano_usd == 60
 
 
+def test_provider_and_timed_processes_compete_for_one_atomic_cap(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "mixed-process-budget.sqlite3"
+    provider = _policy().meters["worker"]
+    assert isinstance(provider, ProviderCostMeter)
+    resource = TimedResourceCostMeter(
+        resource_type="sandbox",
+        resource_class_digest="sha256:" + "b" * 64,
+        nano_usd_per_second=2,
+        max_billing_seconds=30,
+    )
+    policy = BudgetPolicy(
+        study_id="mixed-process-budget",
+        manifest_digest="sha256:" + "c" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={"worker": provider, "sandbox": resource},
+    )
+    barrier = context.Barrier(3)
+    outcomes = context.Queue()
+    processes = [
+        context.Process(
+            target=_reserve_in_process,
+            args=(
+                str(path),
+                policy.model_dump_json(),
+                f"process-{meter_id}",
+                barrier,
+                outcomes,
+                meter_id,
+                60,
+            ),
+        )
+        for meter_id in ("worker", "sandbox")
+    ]
+    for process in processes:
+        process.start()
+    barrier.wait(timeout=10)
+    observed = sorted(outcomes.get(timeout=20) for _ in processes)
+    for process in processes:
+        process.join(timeout=20)
+
+    assert observed == ["admitted", "rejected"]
+    assert all(process.exitcode == 0 for process in processes)
+    assert SpendLedger(path, policy).snapshot().reserved_nano_usd == 60
+
+
 def test_process_death_after_reservation_keeps_full_exposure(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
     path = tmp_path / "orphan-budget.sqlite3"
@@ -321,11 +790,11 @@ def test_settlement_over_reservation_records_breach_and_blocks_future_spend(
     ledger.reserve(_scope(), meter_id="worker", max_nano_usd=60, reservation_id="r1")
 
     with pytest.raises(BudgetBreachError, match="exceeded its 60 nano-USD reservation"):
-        ledger.settle("r1", charged_nano_usd=90, input_tokens=9, output_tokens=9)
+        ledger.settle("r1", charged_nano_usd=63, input_tokens=9, output_tokens=9)
 
     snapshot = ledger.snapshot()
     assert snapshot.breached
-    assert snapshot.charged_nano_usd == 90
+    assert snapshot.charged_nano_usd == 63
     with pytest.raises(BudgetBreachError, match="already breached"):
         ledger.reserve(_scope("final"), meter_id="worker", max_nano_usd=1, reservation_id="r2")
     ledger.audit()
@@ -352,7 +821,7 @@ def test_full_audit_rejects_a_validly_rehashed_but_false_settlement(tmp_path: Pa
     path = tmp_path / "budget.sqlite3"
     ledger = SpendLedger(path, _policy())
     ledger.reserve(_scope(), meter_id="worker", max_nano_usd=60, reservation_id="r1")
-    ledger.settle("r1", charged_nano_usd=20, input_tokens=2, output_tokens=2)
+    ledger.settle("r1", charged_nano_usd=14, input_tokens=2, output_tokens=2)
 
     with sqlite3.connect(path) as connection:
         connection.row_factory = sqlite3.Row
@@ -391,7 +860,7 @@ def test_full_audit_rejects_a_validly_rehashed_but_false_settlement(tmp_path: Pa
             "UPDATE budget_reservations SET charged_nano_usd = 70 WHERE reservation_id = 'r1'"
         )
 
-    with pytest.raises(BudgetIntegrityError, match="exceeded its reservation"):
+    with pytest.raises(BudgetIntegrityError, match="frozen tariff"):
         SpendLedger(path, _policy())
 
 
@@ -402,15 +871,15 @@ def test_verified_state_does_not_release_spend_when_the_mutable_index_is_corrupt
     policy = _policy(hard=100, search=100, final=0)
     ledger = SpendLedger(path, policy)
     ledger.reserve(_scope(), meter_id="worker", max_nano_usd=80, reservation_id="r1")
-    ledger.settle("r1", charged_nano_usd=80, input_tokens=8, output_tokens=8)
-    assert ledger.snapshot().charged_nano_usd == 80
+    ledger.settle("r1", charged_nano_usd=56, input_tokens=8, output_tokens=8)
+    assert ledger.snapshot().charged_nano_usd == 56
 
     with sqlite3.connect(path) as connection:
         connection.execute("DELETE FROM budget_reservations WHERE reservation_id = 'r1'")
 
-    with pytest.raises(BudgetExceededError, match="remaining=20"):
+    with pytest.raises(BudgetExceededError, match="remaining=44"):
         ledger.reserve(_scope(), meter_id="worker", max_nano_usd=90, reservation_id="r2")
-    assert ledger.snapshot().charged_nano_usd == 80
+    assert ledger.snapshot().charged_nano_usd == 56
     with pytest.raises(BudgetIntegrityError, match="index differs"):
         SpendLedger(path, policy)
 
@@ -449,18 +918,34 @@ def test_ledger_rejects_policy_drift_and_symlink_paths(tmp_path: Path) -> None:
     target.touch()
     symlink = tmp_path / "link.sqlite3"
     symlink.symlink_to(target)
-    with pytest.raises(BudgetIntegrityError, match="symlink"):
+    with pytest.raises(BudgetIntegrityError, match="symlink") as error:
         SpendLedger(symlink, _policy())
+    assert str(symlink) not in str(error.value)
+
+
+def test_ledger_schema_v1_requires_a_new_v2_ledger(tmp_path: Path) -> None:
+    path = tmp_path / "budget.sqlite3"
+    SpendLedger(path, _policy())
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute("UPDATE budget_metadata SET schema_version = 1 WHERE id = 1")
+
+    with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version 1"):
+        SpendLedger(path, _policy())
 
 
 def test_exposed_policy_is_a_defensive_deep_copy(tmp_path: Path) -> None:
     ledger = SpendLedger(tmp_path / "budget.sqlite3", _policy())
     exposed = ledger.policy
     exposed.phase_limits_nano_usd["search"] = 1
-    exposed.meters["worker"].provider_config.model = "mutated"
+    exposed_meter = exposed.meters["worker"]
+    assert isinstance(exposed_meter, ProviderCostMeter)
+    exposed_meter.provider_config.model = "mutated"
 
     assert ledger.policy.phase_limits_nano_usd["search"] == 80
-    assert ledger.policy.meters["worker"].provider_config.model == "model-1"
+    persisted_meter = ledger.policy.meters["worker"]
+    assert isinstance(persisted_meter, ProviderCostMeter)
+    assert persisted_meter.provider_config.model == "model-1"
 
 
 class _FakeToolProvider:

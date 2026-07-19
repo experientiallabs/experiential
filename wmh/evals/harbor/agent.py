@@ -59,7 +59,11 @@ from wmh.providers.process_worker import (
     ProviderWorkerUnavailable,
 )
 from wmh.providers.receipt import validate_chat_provider_receipt
-from wmh.tracking.budget import BudgetAccountBinding, resolve_budget_account
+from wmh.tracking.budget import (
+    BudgetAccountBinding,
+    ProviderCostMeter,
+    resolve_budget_account,
+)
 
 _TOOL_OUTPUT_CHARS = 16_000
 _TOOL_STREAM_CHARS = _TOOL_OUTPUT_CHARS // 2
@@ -595,7 +599,7 @@ class WmhPiAgent(BaseAgent):
                 raise ValueError("budget binding differs from the frozen policy digest")
             account = resolve_budget_account(binding)
             meter = account.policy.meters[account.meter_id]
-            if meter.provider_config != config:
+            if not isinstance(meter, ProviderCostMeter) or meter.provider_config != config:
                 raise ValueError("budget account provider config must match the Harbor agent")
         else:
             account = None

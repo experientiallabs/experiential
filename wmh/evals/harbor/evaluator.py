@@ -78,6 +78,7 @@ from wmh.providers.base import ProviderConfig
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
+    ProviderCostMeter,
     bind_budget_account,
 )
 
@@ -318,7 +319,10 @@ class HarborEvaluator:
         if budget_account is not None:
             account = BudgetAccount.model_validate(budget_account.model_dump())
             meter = account.policy.meters[account.meter_id]
-            if meter.provider_config != self._provider_config:
+            if (
+                not isinstance(meter, ProviderCostMeter)
+                or meter.provider_config != self._provider_config
+            ):
                 raise ValueError(
                     "budget account provider config must match the Harbor evaluator provider"
                 )

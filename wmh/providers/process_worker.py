@@ -25,7 +25,7 @@ from wmh.providers.failure_attribution import (
     classify_provider_failure,
 )
 from wmh.providers.registry import get_provider
-from wmh.tracking.budget import BudgetAccount, BudgetedProvider
+from wmh.tracking.budget import BudgetAccount, BudgetedProvider, ProviderCostMeter
 
 _FRAME_HEADER = struct.Struct("!I")
 _MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -149,7 +149,7 @@ class ProviderProcessWorker:
         if budget_account is not None:
             account = BudgetAccount.model_validate(budget_account.model_dump())
             meter = account.policy.meters[account.meter_id]
-            if meter.provider_config != self._config:
+            if not isinstance(meter, ProviderCostMeter) or meter.provider_config != self._config:
                 raise ValueError("budget account provider config differs from provider worker")
             self._budget_account = account
         self._state_lock = threading.Lock()

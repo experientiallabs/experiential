@@ -74,7 +74,12 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE, validate_pi_container_image
 from wmh.providers.base import ProviderConfig
 from wmh.providers.receipt import validate_chat_provider_receipt
-from wmh.tracking.budget import BudgetAccount, BudgetPolicy, BudgetScope
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+)
 
 PAIRED_HARBOR_PROTOCOL_VERSION: Literal["2"] = "2"
 PAIRED_HARBOR_RUN_VERSION: Literal["3"] = "3"
@@ -1155,9 +1160,10 @@ class PairedHarborRunner:
             raise ValueError("paired budget runtime routes differ from the frozen panel")
         for member, route in self._routes.items():
             meter_id = self._budget_runtime.meter_by_panel_member[member]
+            meter = self._budget_runtime.policy.meters[meter_id]
             if (
-                self._budget_runtime.policy.meters[meter_id].provider_config.model_dump()
-                != route.provider_config.model_dump()
+                not isinstance(meter, ProviderCostMeter)
+                or meter.provider_config.model_dump() != route.provider_config.model_dump()
             ):
                 raise ValueError(
                     f"paired budget meter for {member!r} differs from its provider route"

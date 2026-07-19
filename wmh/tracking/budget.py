@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -21,6 +22,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
+from time import monotonic as _system_monotonic
 from typing import Annotated, Literal, Self, cast
 from uuid import uuid4
 
@@ -41,11 +43,12 @@ from wmh.providers.base import (
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _ZERO_DIGEST = "sha256:" + "0" * 64
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _DEFAULT_BUSY_TIMEOUT_MS = 30_000
 _NANO_USD_PER_USD = 1_000_000_000
 _TOKENS_PER_MILLION = 1_000_000
 _SQLITE_INTEGER_MAX = (1 << 63) - 1
+_FAILURE_CODE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
 class BudgetExceededError(RuntimeError):
@@ -146,10 +149,63 @@ class ProviderCostMeter(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    kind: Literal["provider_tokens"] = "provider_tokens"
     provider_config: ProviderConfig
     price: TokenPriceCeiling
     input_estimator: Literal["canonical-json-utf8-v1"] = "canonical-json-utf8-v1"
     input_overhead_tokens: int = Field(default=8192, ge=1, le=_SQLITE_INTEGER_MAX)
+
+
+class TimedResourceCostMeter(BaseModel):
+    """Frozen upper-bound tariff for one class of externally billed timed resource."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["timed_resource"] = "timed_resource"
+    resource_type: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
+    resource_class_digest: str = Field(pattern=_DIGEST_PATTERN)
+    fixed_nano_usd: int = Field(default=0, ge=0, le=_SQLITE_INTEGER_MAX)
+    nano_usd_per_second: int = Field(default=0, ge=0, le=_SQLITE_INTEGER_MAX)
+    billing_quantum_seconds: int = Field(default=1, ge=1, le=_SQLITE_INTEGER_MAX)
+    max_billing_seconds: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+
+    @model_validator(mode="after")
+    def _require_priced_resource(self) -> Self:
+        if self.fixed_nano_usd == self.nano_usd_per_second == 0:
+            raise ValueError("timed resource must have a positive fixed or duration price")
+        self.maximum_charge_nano_usd()
+        return self
+
+    def billed_seconds(self, elapsed_seconds: Decimal | str | int | float) -> int:
+        """Round one created resource's nonnegative duration up to at least one quantum."""
+        duration = _decimal_duration(elapsed_seconds)
+        if duration < 0:
+            raise ValueError("resource duration cannot be negative")
+        quanta = int(
+            (duration / self.billing_quantum_seconds).to_integral_value(rounding=ROUND_CEILING)
+        )
+        billed = max(quanta, 1) * self.billing_quantum_seconds
+        if billed > _SQLITE_INTEGER_MAX:
+            raise OverflowError("resource billing duration does not fit a SQLite integer")
+        return billed
+
+    def charge_nano_usd(self, *, billed_seconds: int) -> int:
+        if billed_seconds < 0 or billed_seconds > _SQLITE_INTEGER_MAX:
+            raise ValueError("billed resource seconds must fit a nonnegative SQLite integer")
+        charged = self.fixed_nano_usd + billed_seconds * self.nano_usd_per_second
+        if charged > _SQLITE_INTEGER_MAX:
+            raise OverflowError("timed resource charge does not fit a SQLite integer")
+        return charged
+
+    def maximum_charge_nano_usd(self) -> int:
+        billed = self.billed_seconds(self.max_billing_seconds)
+        return self.charge_nano_usd(billed_seconds=billed)
+
+
+_CostMeter = Annotated[
+    ProviderCostMeter | TimedResourceCostMeter,
+    Field(discriminator="kind"),
+]
 
 
 class BudgetPolicy(BaseModel):
@@ -161,7 +217,7 @@ class BudgetPolicy(BaseModel):
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     hard_limit_nano_usd: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
     phase_limits_nano_usd: dict[str, int] = Field(min_length=1)
-    meters: dict[str, ProviderCostMeter] = Field(min_length=1)
+    meters: dict[str, _CostMeter] = Field(min_length=1)
 
     @field_validator("phase_limits_nano_usd")
     @classmethod
@@ -176,8 +232,8 @@ class BudgetPolicy(BaseModel):
     @classmethod
     def _validate_meters(
         cls,
-        value: dict[str, ProviderCostMeter],
-    ) -> dict[str, ProviderCostMeter]:
+        value: dict[str, _CostMeter],
+    ) -> dict[str, _CostMeter]:
         if any(not meter_id.strip() for meter_id in value):
             raise ValueError("budget meter ids cannot be blank")
         return dict(sorted(value.items()))
@@ -212,6 +268,30 @@ class BudgetAccount(BaseModel):
             raise ValueError(f"budget scope phase {self.scope.phase!r} is absent from policy")
         if self.meter_id not in self.policy.meters:
             raise ValueError(f"budget meter {self.meter_id!r} is absent from policy")
+        if not isinstance(self.policy.meters[self.meter_id], ProviderCostMeter):
+            raise ValueError("provider budget account requires a provider token meter")
+        return self
+
+
+class TimedResourceBudgetAccount(BaseModel):
+    """Serializable hard-budget account for one external timed resource lease."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ledger_path: Path
+    policy: BudgetPolicy
+    scope: BudgetScope
+    meter_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _bind_scope_to_policy(self) -> Self:
+        if not self.ledger_path.is_absolute():
+            raise ValueError("budget ledger_path must be absolute for resource workers")
+        if self.scope.phase not in self.policy.phase_limits_nano_usd:
+            raise ValueError(f"budget scope phase {self.scope.phase!r} is absent from policy")
+        meter = self.policy.meters.get(self.meter_id)
+        if not isinstance(meter, TimedResourceCostMeter):
+            raise ValueError("timed resource account requires a timed resource meter")
         return self
 
 
@@ -238,6 +318,8 @@ class BudgetReservation(BaseModel):
     status: ReservationStatus
     input_tokens: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
     output_tokens: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
+    usage_quantity: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
+    usage_unit: str | None = Field(default=None, min_length=1)
     failure_type: str | None = None
     breach_kind: BudgetBreachKind | None = None
 
@@ -272,8 +354,10 @@ class _BudgetSettled(BaseModel):
     kind: Literal["settled"] = "settled"
     reservation_id: str = Field(min_length=1)
     charged_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
-    input_tokens: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
-    output_tokens: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    input_tokens: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
+    output_tokens: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
+    usage_quantity: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
+    usage_unit: str | None = Field(default=None, min_length=1)
     status: Literal[ReservationStatus.SETTLED, ReservationStatus.BREACHED]
     breach_kind: BudgetBreachKind | None = None
 
@@ -283,6 +367,14 @@ class _BudgetSettled(BaseModel):
             raise ValueError("breached settlement requires a breach kind")
         if self.status is ReservationStatus.SETTLED and self.breach_kind is not None:
             raise ValueError("ordinary settlement cannot carry a breach kind")
+        tokens = self.input_tokens is not None or self.output_tokens is not None
+        resource = self.usage_quantity is not None or self.usage_unit is not None
+        if tokens == resource:
+            raise ValueError("settlement must carry exactly one typed usage shape")
+        if tokens and (self.input_tokens is None or self.output_tokens is None):
+            raise ValueError("token settlement requires both input and output counts")
+        if resource and (self.usage_quantity is None or self.usage_unit is None):
+            raise ValueError("resource settlement requires quantity and unit")
         return self
 
 
@@ -290,7 +382,7 @@ class _BudgetForfeited(BaseModel):
     kind: Literal["forfeited"] = "forfeited"
     reservation_id: str = Field(min_length=1)
     charged_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
-    failure_type: str = Field(min_length=1)
+    failure_type: str = Field(pattern=_FAILURE_CODE_PATTERN.pattern)
 
 
 _BudgetAction = Annotated[
@@ -330,11 +422,11 @@ class SpendLedger:
     ) -> None:
         requested = Path(path).expanduser()
         if requested.is_symlink():
-            raise BudgetIntegrityError(f"budget ledger path cannot be a symlink: {requested}")
+            raise BudgetIntegrityError("budget ledger path cannot be a symlink")
         requested.parent.mkdir(parents=True, exist_ok=True)
         self.path = requested.parent.resolve() / requested.name
         if self.path.exists() and not stat.S_ISREG(self.path.stat(follow_symlinks=False).st_mode):
-            raise BudgetIntegrityError(f"budget ledger path must be a regular file: {self.path}")
+            raise BudgetIntegrityError("budget ledger path must be a regular file")
         self._policy = BudgetPolicy.model_validate(policy.model_dump())
         self._now = now or (lambda: datetime.now(UTC))
         self._state_lock = threading.RLock()
@@ -369,6 +461,12 @@ class SpendLedger:
             raise ValueError(f"unknown budget phase {scope.phase!r}")
         if meter_id not in self._policy.meters:
             raise ValueError(f"unknown budget meter {meter_id!r}")
+        meter = self._policy.meters[meter_id]
+        if (
+            isinstance(meter, TimedResourceCostMeter)
+            and max_nano_usd != meter.maximum_charge_nano_usd()
+        ):
+            raise ValueError("timed resource reservation must use its exact maximum charge")
         with self._verified_transaction() as connection:
             snapshot = _snapshot_from_reservations(
                 self._policy,
@@ -402,8 +500,9 @@ class SpendLedger:
                     """
                     INSERT INTO budget_reservations (
                         reservation_id, scope_json, meter_id, max_nano_usd, charged_nano_usd,
-                        status, input_tokens, output_tokens, failure_type, breach_kind
-                    ) VALUES (?, ?, ?, ?, 0, ?, NULL, NULL, NULL, NULL)
+                        status, input_tokens, output_tokens, usage_quantity, usage_unit,
+                        failure_type, breach_kind
+                    ) VALUES (?, ?, ?, ?, 0, ?, NULL, NULL, NULL, NULL, NULL, NULL)
                     """,
                     (
                         reservation_id,
@@ -424,13 +523,27 @@ class SpendLedger:
         reservation_id: str,
         *,
         charged_nano_usd: int,
-        input_tokens: int,
-        output_tokens: int,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        usage_quantity: int | None = None,
+        usage_unit: str | None = None,
         breach_kind: BudgetBreachKind | None = None,
     ) -> BudgetReservation:
         """Settle exact usage, recording and raising after any ceiling breach."""
-        if min(charged_nano_usd, input_tokens, output_tokens) < 0:
-            raise ValueError("settlement cost and token counts cannot be negative")
+        if charged_nano_usd < 0:
+            raise ValueError("settlement cost cannot be negative")
+        settlement = _BudgetSettled(
+            reservation_id=reservation_id,
+            charged_nano_usd=charged_nano_usd,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            usage_quantity=usage_quantity,
+            usage_unit=usage_unit,
+            status=(
+                ReservationStatus.BREACHED if breach_kind is not None else ReservationStatus.SETTLED
+            ),
+            breach_kind=breach_kind,
+        )
         breached = False
         resolved_breach = breach_kind
         with self._verified_transaction() as connection:
@@ -443,22 +556,16 @@ class SpendLedger:
                 resolved_breach = BudgetBreachKind.RESERVATION
             breached = resolved_breach is not None
             status = ReservationStatus.BREACHED if breached else ReservationStatus.SETTLED
-            self._append_event(
-                connection,
-                _BudgetSettled(
-                    reservation_id=reservation_id,
-                    charged_nano_usd=charged_nano_usd,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    status=status,
-                    breach_kind=resolved_breach,
-                ),
+            final_settlement = settlement.model_copy(
+                update={"status": status, "breach_kind": resolved_breach}
             )
+            _validate_settlement_event(final_settlement, reservation, self._policy)
+            self._append_event(connection, final_settlement)
             connection.execute(
                 """
                 UPDATE budget_reservations
                 SET charged_nano_usd = ?, status = ?, input_tokens = ?, output_tokens = ?,
-                    breach_kind = ?
+                    usage_quantity = ?, usage_unit = ?, breach_kind = ?
                 WHERE reservation_id = ?
                 """,
                 (
@@ -466,6 +573,8 @@ class SpendLedger:
                     status.value,
                     input_tokens,
                     output_tokens,
+                    usage_quantity,
+                    usage_unit,
                     resolved_breach.value if resolved_breach is not None else None,
                     reservation_id,
                 ),
@@ -485,8 +594,8 @@ class SpendLedger:
 
     def forfeit(self, reservation_id: str, *, failure_type: str) -> BudgetReservation:
         """Charge a full ceiling when exact provider usage cannot be proved."""
-        if not failure_type.strip():
-            raise ValueError("failure_type cannot be blank")
+        if _FAILURE_CODE_PATTERN.fullmatch(failure_type) is None:
+            raise ValueError("failure_type must be a bounded nonsecret failure code")
         with self._verified_transaction() as connection:
             reservation = self._verified_reservation(connection, reservation_id)
             if reservation.status is not ReservationStatus.RESERVED:
@@ -760,6 +869,8 @@ class SpendLedger:
                 status=row["status"],
                 input_tokens=row["input_tokens"],
                 output_tokens=row["output_tokens"],
+                usage_quantity=row["usage_quantity"],
+                usage_unit=row["usage_unit"],
                 failure_type=row["failure_type"],
                 breach_kind=row["breach_kind"],
             )
@@ -877,6 +988,31 @@ def bind_budget_account(account: BudgetAccount) -> BudgetAccountBinding:
     )
 
 
+def bind_timed_resource_account(
+    account: TimedResourceBudgetAccount,
+) -> BudgetAccountBinding:
+    """Register one timed-resource ledger and return its path-free durable binding."""
+    validated = TimedResourceBudgetAccount.model_validate(account.model_dump())
+    ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
+    canonical_path = ledger.path
+    policy_digest = validated.policy.policy_digest
+    with _REGISTERED_BUDGET_LOCK:
+        existing = _REGISTERED_BUDGETS.get(policy_digest)
+        if existing is not None and existing[0] != canonical_path:
+            raise BudgetIntegrityError(
+                "budget policy digest is already registered to a different ledger path"
+            )
+        _REGISTERED_BUDGETS[policy_digest] = (
+            canonical_path,
+            validated.policy.model_copy(deep=True),
+        )
+    return BudgetAccountBinding(
+        policy_digest=policy_digest,
+        scope=validated.scope,
+        meter_id=validated.meter_id,
+    )
+
+
 def resolve_budget_account(binding: BudgetAccountBinding) -> BudgetAccount:
     """Resolve a path-free binding only inside the trusted registered evaluator process."""
     validated = BudgetAccountBinding.model_validate(binding.model_dump())
@@ -890,7 +1026,32 @@ def resolve_budget_account(binding: BudgetAccountBinding) -> BudgetAccount:
         raise BudgetIntegrityError("budget binding phase is absent from its registered policy")
     if validated.meter_id not in resolved_policy.meters:
         raise BudgetIntegrityError("budget binding meter is absent from its registered policy")
+    if not isinstance(resolved_policy.meters[validated.meter_id], ProviderCostMeter):
+        raise BudgetIntegrityError("budget binding does not name a provider token meter")
     return BudgetAccount(
+        ledger_path=ledger_path,
+        policy=resolved_policy,
+        scope=validated.scope,
+        meter_id=validated.meter_id,
+    )
+
+
+def resolve_timed_resource_account(
+    binding: BudgetAccountBinding,
+) -> TimedResourceBudgetAccount:
+    """Resolve a timed-resource binding inside the trusted registered process."""
+    validated = BudgetAccountBinding.model_validate(binding.model_dump())
+    with _REGISTERED_BUDGET_LOCK:
+        registered = _REGISTERED_BUDGETS.get(validated.policy_digest)
+        if registered is None:
+            raise BudgetIntegrityError("budget policy digest is not registered in this process")
+        ledger_path, policy = registered
+        resolved_policy = policy.model_copy(deep=True)
+    if validated.scope.phase not in resolved_policy.phase_limits_nano_usd:
+        raise BudgetIntegrityError("budget binding phase is absent from its registered policy")
+    if not isinstance(resolved_policy.meters.get(validated.meter_id), TimedResourceCostMeter):
+        raise BudgetIntegrityError("budget binding does not name a timed resource meter")
+    return TimedResourceBudgetAccount(
         ledger_path=ledger_path,
         policy=resolved_policy,
         scope=validated.scope,
@@ -918,6 +1079,8 @@ class BudgetedProvider:
             )
         validated_account = BudgetAccount.model_validate(account.model_dump())
         meter = validated_account.policy.meters[validated_account.meter_id]
+        if not isinstance(meter, ProviderCostMeter):
+            raise TypeError("BudgetedProvider requires a provider token meter")
         if provider.config != meter.provider_config:
             raise ValueError("budget account provider config differs from the wrapped provider")
         self._provider = cast("SingleDispatchProvider", provider)
@@ -1076,6 +1239,123 @@ class BudgetedProvider:
             raise ledger_error from error
 
 
+class TimedResourceBudget:
+    """Reserve a worst-case ceiling before one externally billed resource is created."""
+
+    def __init__(
+        self,
+        account: TimedResourceBudgetAccount,
+        *,
+        id_factory: Callable[[], str] | None = None,
+        monotonic: Callable[[], float] | None = None,
+    ) -> None:
+        validated = TimedResourceBudgetAccount.model_validate(account.model_dump())
+        meter = validated.policy.meters[validated.meter_id]
+        if not isinstance(meter, TimedResourceCostMeter):
+            raise TypeError("TimedResourceBudget requires a timed resource meter")
+        self._account = validated
+        self._meter = meter
+        self._ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
+        self._id_factory = id_factory or (lambda: str(uuid4()))
+        self._monotonic = monotonic or _system_monotonic
+
+    def reserve(self) -> TimedResourceReservation:
+        """Atomically admit one resource lease before its create call."""
+        reservation_id = self._id_factory()
+        self._ledger.reserve(
+            self._account.scope,
+            meter_id=self._account.meter_id,
+            max_nano_usd=self._meter.maximum_charge_nano_usd(),
+            reservation_id=reservation_id,
+        )
+        started_at_s = self._monotonic()
+        return TimedResourceReservation(
+            ledger=self._ledger,
+            meter=self._meter,
+            reservation_id=reservation_id,
+            started_at_s=started_at_s,
+            monotonic=self._monotonic,
+        )
+
+
+class TimedResourceReservation:
+    """Exactly-once terminal handle for a previously admitted timed resource."""
+
+    def __init__(
+        self,
+        *,
+        ledger: SpendLedger,
+        meter: TimedResourceCostMeter,
+        reservation_id: str,
+        started_at_s: float,
+        monotonic: Callable[[], float],
+    ) -> None:
+        self._ledger = ledger
+        self._meter = meter
+        self._reservation_id = reservation_id
+        self._started_at_s = started_at_s
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._terminal = False
+        self._settlement_usage: tuple[int, int] | None = None
+
+    @property
+    def reservation_id(self) -> str:
+        return self._reservation_id
+
+    def settle(self) -> BudgetReservation:
+        """Settle a proved-cleaned lease using host-observed conservative duration."""
+        with self._lock:
+            if self._terminal:
+                raise BudgetIntegrityError("timed resource reservation is already terminal")
+            if self._settlement_usage is None:
+                billed_seconds = self._meter.billed_seconds(self._monotonic() - self._started_at_s)
+                charged = self._meter.charge_nano_usd(billed_seconds=billed_seconds)
+                self._settlement_usage = (billed_seconds, charged)
+            else:
+                billed_seconds, charged = self._settlement_usage
+            try:
+                settled = self._ledger.settle(
+                    self._reservation_id,
+                    charged_nano_usd=charged,
+                    usage_quantity=billed_seconds,
+                    usage_unit="billing_second",
+                )
+            except Exception:
+                self._reconcile_terminal_state()
+                raise
+            self._terminal = True
+            return settled
+
+    def forfeit(self, *, failure_type: str) -> BudgetReservation:
+        """Charge the full ceiling when create or cleanup cost cannot be proved."""
+        with self._lock:
+            if self._terminal:
+                raise BudgetIntegrityError("timed resource reservation is already terminal")
+            try:
+                forfeited = self._ledger.forfeit(
+                    self._reservation_id,
+                    failure_type=failure_type,
+                )
+            except Exception:
+                self._reconcile_terminal_state()
+                raise
+            self._terminal = True
+            return forfeited
+
+    def _reconcile_terminal_state(self) -> None:
+        """Permit retry only when the failed write is still durably open."""
+        try:
+            reservation = next(
+                item
+                for item in self._ledger.reservations()
+                if item.reservation_id == self._reservation_id
+            )
+        except (BudgetIntegrityError, OSError, sqlite3.Error, StopIteration):
+            return
+        self._terminal = reservation.status is not ReservationStatus.RESERVED
+
+
 def _chat_output_limit(request: ChatRequest) -> int:
     # Provider translators do not all prioritize the two compatibility fields identically. The
     # hard ceiling must dominate either dispatch path, including requests that set both fields.
@@ -1143,6 +1423,16 @@ def _decimal_currency(value: Decimal | str | int) -> Decimal:
     return amount
 
 
+def _decimal_duration(value: Decimal | str | int | float) -> Decimal:
+    try:
+        duration = Decimal(str(value)) if isinstance(value, float) else Decimal(value)
+    except ArithmeticError as exc:
+        raise ValueError(f"invalid resource duration {value!r}") from exc
+    if not duration.is_finite():
+        raise ValueError("resource duration must be finite")
+    return duration
+
+
 def _snapshot_from_reservations(
     policy: BudgetPolicy,
     reservations: list[BudgetReservation],
@@ -1182,7 +1472,38 @@ def _snapshot_from_reservations(
 def _validate_settlement_event(
     action: _BudgetSettled,
     reservation: BudgetReservation,
+    policy: BudgetPolicy,
 ) -> None:
+    meter = policy.meters[reservation.meter_id]
+    try:
+        if isinstance(meter, ProviderCostMeter):
+            if action.input_tokens is None or action.output_tokens is None:
+                raise BudgetIntegrityError("provider meter settlement lacks token usage")
+            expected_charge = meter.price.charge(
+                input_tokens=action.input_tokens,
+                output_tokens=action.output_tokens,
+            )
+        else:
+            if action.usage_unit != "billing_second" or action.usage_quantity is None:
+                raise BudgetIntegrityError("timed resource settlement lacks billed-second usage")
+            if action.breach_kind in {
+                BudgetBreachKind.INPUT_TOKEN_CEILING,
+                BudgetBreachKind.OUTPUT_TOKEN_CEILING,
+            }:
+                raise BudgetIntegrityError("timed resource settlement uses a token breach kind")
+            if action.usage_quantity % meter.billing_quantum_seconds:
+                raise BudgetIntegrityError(
+                    "timed resource settlement is not aligned to its billing quantum"
+                )
+            expected_charge = meter.charge_nano_usd(billed_seconds=action.usage_quantity)
+    except (OverflowError, ValueError) as exc:
+        raise BudgetIntegrityError(
+            f"settlement {action.reservation_id!r} cannot be priced by its frozen tariff"
+        ) from exc
+    if action.charged_nano_usd != expected_charge:
+        raise BudgetIntegrityError(
+            f"settlement {action.reservation_id!r} differs from its frozen tariff"
+        )
     exceeds_reservation = action.charged_nano_usd > reservation.max_nano_usd
     if exceeds_reservation:
         if (
@@ -1245,6 +1566,15 @@ def _apply_budget_event(
             raise BudgetIntegrityError(
                 f"reservation {action.reservation_id!r} uses an unknown budget meter"
             )
+        meter = policy.meters[action.meter_id]
+        if (
+            isinstance(meter, TimedResourceCostMeter)
+            and action.max_nano_usd != meter.maximum_charge_nano_usd()
+        ):
+            raise BudgetIntegrityError(
+                f"timed resource reservation {action.reservation_id!r} did not use its exact "
+                "maximum charge"
+            )
         before = _snapshot_from_reservations(policy, list(reconstructed.values()))
         if before.breached:
             raise BudgetIntegrityError("reservation was admitted after the ledger breached")
@@ -1271,13 +1601,15 @@ def _apply_budget_event(
         return
     if isinstance(action, _BudgetSettled):
         prior = _open_reconstructed(reconstructed, action.reservation_id)
-        _validate_settlement_event(action, prior)
+        _validate_settlement_event(action, prior, policy)
         reconstructed[action.reservation_id] = prior.model_copy(
             update={
                 "charged_nano_usd": action.charged_nano_usd,
                 "status": action.status,
                 "input_tokens": action.input_tokens,
                 "output_tokens": action.output_tokens,
+                "usage_quantity": action.usage_quantity,
+                "usage_unit": action.usage_unit,
                 "breach_kind": action.breach_kind,
             }
         )
@@ -1350,6 +1682,8 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
     status TEXT NOT NULL,
     input_tokens INTEGER,
     output_tokens INTEGER,
+    usage_quantity INTEGER,
+    usage_unit TEXT,
     failure_type TEXT,
     breach_kind TEXT
 );
