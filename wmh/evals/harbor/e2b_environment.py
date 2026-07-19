@@ -289,6 +289,30 @@ def _verify_e2b_spend_limit_signature(
     return statement
 
 
+def _require_e2b_external_spend_authority(
+    account: TimedResourceBudgetAccount,
+    trust: E2BSpendLimitTrust,
+    statement: E2BSpendLimitStatement,
+) -> TimedResourceCostMeter:
+    """Require the caller's trust artifact to match the frozen ledger policy authority."""
+    meter = account.policy.meters.get(account.meter_id)
+    if not isinstance(meter, TimedResourceCostMeter):
+        raise BudgetIntegrityError("E2B build account does not name a timed resource meter")
+    authority = meter.external_spend_authority
+    if authority is None:
+        raise BudgetIntegrityError("E2B build meter has no frozen external spend authority")
+    if authority.provider != "e2b":
+        raise BudgetIntegrityError("E2B build meter names a different external spend provider")
+    if not hmac.compare_digest(authority.verifier_digest, trust.digest):
+        raise BudgetIntegrityError("E2B spend-limit verifier differs from frozen budget authority")
+    if (
+        authority.account_identity != trust.account_identity
+        or authority.account_identity != statement.account_identity
+    ):
+        raise BudgetIntegrityError("E2B spend-limit account differs from frozen budget authority")
+    return meter
+
+
 def _verify_e2b_spend_limit(
     attestation: E2BSpendLimitAttestation,
     trust: E2BSpendLimitTrust,
@@ -299,6 +323,7 @@ def _verify_e2b_spend_limit(
     now: datetime | None = None,
 ) -> None:
     """Verify signer, freshness, active credential, and both independent hard ceilings."""
+    _require_e2b_external_spend_authority(account, trust, attestation.statement)
     statement = _verify_e2b_spend_limit_signature(attestation, trust)
     observed_now = (now or datetime.now(UTC)).astimezone(UTC)
     observed_at = statement.observed_at.astimezone(UTC)
@@ -1582,6 +1607,11 @@ def _require_resumable_build_attempt(
     ledger: SpendLedger,
 ) -> None:
     attribution = attempt.cost_attribution
+    _require_e2b_external_spend_authority(
+        account,
+        attribution.provider_spend_limit_trust,
+        attribution.provider_spend_limit.statement,
+    )
     statement = _verify_e2b_spend_limit_signature(
         attribution.provider_spend_limit,
         attribution.provider_spend_limit_trust,
@@ -1879,9 +1909,16 @@ def _verify_build_budget_attribution(
     if (
         attribution.policy_digest != account.policy.policy_digest
         or attribution.ledger_identity != account.ledger_identity
+        or attribution.meter_id != account.meter_id
+        or attribution.scope != account.scope
     ):
         raise BudgetIntegrityError("E2B build cost attribution differs from study authority")
     statement = attribution.provider_spend_limit.statement
+    meter = _require_e2b_external_spend_authority(
+        account,
+        attribution.provider_spend_limit_trust,
+        statement,
+    )
     _verify_e2b_spend_limit_signature(
         attribution.provider_spend_limit,
         attribution.provider_spend_limit_trust,
@@ -1898,7 +1935,6 @@ def _verify_build_budget_attribution(
         or statement.remaining_nano_usd > account.policy.hard_limit_nano_usd
     ):
         raise BudgetIntegrityError("E2B build provider spending-limit evidence is inconsistent")
-    meter = account.policy.meters.get(attribution.meter_id)
     build_class = exact_e2b_build_resource_class(
         cpu_count=record.cpu_count,
         memory_mb=record.memory_mb,

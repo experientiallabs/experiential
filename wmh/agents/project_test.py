@@ -1607,6 +1607,60 @@ def test_project_ambiguous_create_uses_explicit_key_and_forfeits_full_ceiling(
     assert reaped == [(reservation.reservation_id, "explicit-key")]
 
 
+@pytest.mark.parametrize("failed_activation", [1, 2])
+def test_project_activation_failure_kills_and_terminates_budget_and_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_activation: int,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    created: list[_AttestedProjectSandbox] = []
+    original_activate = project_module.RunnerLeaseLedger.activate
+    activation_calls = 0
+
+    def injected_activate(
+        ledger: project_module.RunnerLeaseLedger,
+        resource_id: str,
+        *,
+        expected_end_at: datetime | None = None,
+    ) -> None:
+        nonlocal activation_calls
+        activation_calls += 1
+        if activation_calls == failed_activation:
+            raise RuntimeError("injected activation persistence failure")
+        original_activate(ledger, resource_id, expected_end_at=expected_end_at)
+
+    def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        frozen = dict(kwargs)
+
+        def create() -> _AttestedProjectSandbox:
+            sandbox = _AttestedProjectSandbox(frozen, sandbox_id="activation-failure")
+            created.append(sandbox)
+            return sandbox
+
+        return create
+
+    monkeypatch.setattr(project_module.RunnerLeaseLedger, "activate", injected_activate)
+    monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
+
+    with pytest.raises(RuntimeError, match="activation persistence"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+        )
+
+    assert len(created) == 1
+    assert created[0].killed is True
+    [lease_path] = (tmp_path / "leases").glob("*.json")
+    assert json.loads(lease_path.read_text())["state"] == "retired"
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+
+
 @pytest.mark.parametrize(("network_drift", "volume_drift"), [(True, False), (False, True)])
 def test_project_creation_fails_closed_on_network_or_volume_attestation_drift(
     tmp_path: Path,

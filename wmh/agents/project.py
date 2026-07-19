@@ -225,18 +225,17 @@ class _BudgetedProjectSandboxFactory:
             reservation=reservation,
         )
         self._live[id(sandbox)] = lease
-        if not isinstance(resource_id, str) or not re.fullmatch(
-            r"[A-Za-z0-9_.:-]{1,512}", resource_id
-        ):
-            self.retire(sandbox)
-            raise RuntimeError("project sandbox did not expose a valid resource identity")
-        ledger.activate(resource_id)
         try:
+            if not isinstance(resource_id, str) or not re.fullmatch(
+                r"[A-Za-z0-9_.:-]{1,512}", resource_id
+            ):
+                raise RuntimeError("project sandbox did not expose a valid resource identity")
+            ledger.activate(resource_id)
             expected_end_at = self._attest(sandbox, lease_id=lease_id, resource_id=resource_id)
+            ledger.activate(resource_id, expected_end_at=expected_end_at)
         except BaseException:
             self.retire(sandbox)
             raise
-        ledger.activate(resource_id, expected_end_at=expected_end_at)
         return sandbox
 
     def retire(self, sandbox: SandboxHandle) -> None:

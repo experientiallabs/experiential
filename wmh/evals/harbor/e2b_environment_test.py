@@ -36,6 +36,7 @@ from wmh.tracking.budget import (
     BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
+    ExternalSpendAuthority,
     ReservationStatus,
     SpendLedger,
     TimedResourceBudgetAccount,
@@ -130,16 +131,29 @@ def _build_resource_account(
     tmp_path: Path,
     *,
     hard_limit: int | None = None,
+    spend_limit_trust: mod.E2BSpendLimitTrust | None = None,
+    authority_account_identity: str | None = None,
+    bind_external_authority: bool = True,
 ) -> TimedResourceBudgetAccount:
     resource_class = mod.exact_e2b_build_resource_class(
         cpu_count=2,
         memory_mb=1024,
     )
+    trust = spend_limit_trust or _spend_limit_trust()
     meter = TimedResourceCostMeter(
         resource_type=resource_class.role.value,
         resource_class_digest=resource_class.digest,
         nano_usd_per_second=1,
         max_billing_seconds=resource_class.max_host_observation_seconds,
+        external_spend_authority=(
+            ExternalSpendAuthority(
+                provider="e2b",
+                account_identity=authority_account_identity or trust.account_identity,
+                verifier_digest=trust.digest,
+            )
+            if bind_external_authority
+            else None
+        ),
     )
     limit = meter.maximum_charge_nano_usd() * 3 if hard_limit is None else hard_limit
     policy = BudgetPolicy(
@@ -171,12 +185,14 @@ def _spend_limit(
     observed_at: datetime | None = None,
     credential_api_key: str = _TEST_E2B_API_KEY,
     signer: Ed25519PrivateKey = _TEST_SPEND_LIMIT_PRIVATE_KEY,
+    account_identity: str = "test-team/test-account",
+    policy_digest: str | None = None,
 ) -> mod.E2BSpendLimitAttestation:
     now = observed_at or datetime.now(UTC)
     statement = mod.E2BSpendLimitStatement(
-        account_identity="test-team/test-account",
+        account_identity=account_identity,
         credential_fingerprint=mod._e2b_credential_fingerprint(credential_api_key),
-        policy_digest=account.policy.policy_digest,
+        policy_digest=policy_digest or account.policy.policy_digest,
         ledger_identity=account.ledger_identity,
         account_spend_nano_usd=account_spend_nano_usd,
         account_limit_nano_usd=(
@@ -200,6 +216,8 @@ def _spend_limit(
 
 def _spend_limit_trust(
     signer: Ed25519PrivateKey = _TEST_SPEND_LIMIT_PRIVATE_KEY,
+    *,
+    account_identity: str = "test-team/test-account",
 ) -> mod.E2BSpendLimitTrust:
     public_key = signer.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -207,7 +225,7 @@ def _spend_limit_trust(
     )
     return mod.E2BSpendLimitTrust(
         key_id="test-operator-key",
-        account_identity="test-team/test-account",
+        account_identity=account_identity,
         public_key_base64=mod.base64.b64encode(public_key).decode(),
     )
 
@@ -640,7 +658,7 @@ def test_signed_spend_limit_gates_dispatch_on_signature_freshness_key_and_allowa
             _spend_limit(account),
             _spend_limit_trust().model_copy(update={"account_identity": "different-team/account"}),
             BudgetIntegrityError,
-            "account differs",
+            "verifier differs",
         ),
         (
             _spend_limit(account, observed_at=datetime.now(UTC) - timedelta(minutes=10)),
@@ -687,6 +705,90 @@ def test_signed_spend_limit_gates_dispatch_on_signature_freshness_key_and_allowa
 
     assert starts == 0
     assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+
+
+def test_build_spend_limit_rejects_caller_selected_key_account_and_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _environment(tmp_path)
+    environment_dir = tmp_path / "environment"
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    alternate_signer = Ed25519PrivateKey.from_private_bytes(b"\x24" * 32)
+    alternate_trust = _spend_limit_trust(alternate_signer)
+    account = _build_resource_account(tmp_path / "key-case")
+    account_trust = _spend_limit_trust(
+        alternate_signer,
+        account_identity="other-team/account",
+    )
+    account_bound_to_other_key = _build_resource_account(
+        tmp_path / "account-case",
+        spend_limit_trust=account_trust,
+        authority_account_identity="test-team/test-account",
+    )
+    missing_authority = _build_resource_account(
+        tmp_path / "missing-case",
+        bind_external_authority=False,
+    )
+    cases = (
+        (
+            account,
+            _spend_limit(account, signer=alternate_signer),
+            alternate_trust,
+            "verifier differs",
+        ),
+        (
+            account_bound_to_other_key,
+            _spend_limit(
+                account_bound_to_other_key,
+                signer=alternate_signer,
+                account_identity="other-team/account",
+            ),
+            account_trust,
+            "account differs",
+        ),
+        (
+            account,
+            _spend_limit(account, policy_digest="sha256:" + "f" * 64),
+            _spend_limit_trust(),
+            "budget authority",
+        ),
+        (
+            missing_authority,
+            _spend_limit(missing_authority),
+            _spend_limit_trust(),
+            "external spend authority",
+        ),
+    )
+    starts = 0
+
+    async def unexpected_start(**_kwargs: object) -> BuildInfo:
+        nonlocal starts
+        starts += 1
+        raise AssertionError("caller-selected authority must be rejected before dispatch")
+
+    monkeypatch.setattr(mod, "_start_exact_template_build", unexpected_start)
+    for index, (case_account, attestation, trust, match) in enumerate(cases):
+        with pytest.raises(BudgetIntegrityError, match=match):
+            asyncio.run(
+                mod.prepare_exact_e2b_build(
+                    jobs_dir=tmp_path / f"authority-jobs-{index}",
+                    environment_dir=environment_dir,
+                    spec=spec,
+                    budget_account=case_account,
+                    provider_spend_limit=attestation,
+                    provider_spend_limit_trust=trust,
+                )
+            )
+
+    assert starts == 0
+    for case_account, _, _, _ in cases:
+        assert SpendLedger(case_account.ledger_path, case_account.policy).reservations() == []
 
 
 def test_identified_background_build_polling_resumes_without_redispatch(

@@ -42,6 +42,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetReservation,
     BudgetScope,
+    ExternalSpendAuthority,
     ProviderCostMeter,
     ReservationStatus,
     SpendLedger,
@@ -562,6 +563,37 @@ def test_timed_resource_class_binds_role_resources_ttl_and_host_horizon(
     short_account = account.model_copy(update={"policy": short_policy}, deep=True)
     with pytest.raises(BudgetIntegrityError, match="horizon"):
         validate_timed_resource_class(short_account, resource_class)
+
+
+def test_external_spend_authority_is_immutable_policy_authority() -> None:
+    authority = ExternalSpendAuthority(
+        provider="e2b",
+        account_identity="team/account",
+        verifier_digest="sha256:" + "8" * 64,
+    )
+    meter = TimedResourceCostMeter(
+        resource_type="task_environment_build",
+        resource_class_digest="sha256:" + "9" * 64,
+        nano_usd_per_second=1,
+        max_billing_seconds=30,
+        external_spend_authority=authority,
+    )
+    policy = BudgetPolicy(
+        study_id="external-spend-authority",
+        manifest_digest="sha256:" + "a" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"preparation": 100},
+        meters={"build": meter},
+    )
+
+    for mutation in (
+        authority.model_copy(update={"provider": "other"}),
+        authority.model_copy(update={"account_identity": "other/account"}),
+        authority.model_copy(update={"verifier_digest": "sha256:" + "b" * 64}),
+    ):
+        mutated_meter = meter.model_copy(update={"external_spend_authority": mutation})
+        mutated_policy = policy.model_copy(update={"meters": {"build": mutated_meter}})
+        assert mutated_policy.policy_digest != policy.policy_digest
 
 
 def test_orphaned_timed_resource_join_is_exact_and_conservative(tmp_path: Path) -> None:

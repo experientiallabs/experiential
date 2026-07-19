@@ -814,19 +814,22 @@ class E2BOneShotRunnerFactory:
                 else:
                     self._retire_predispatch_failure()
             raise
-        with self._lock:
-            self._sandbox = sandbox
-            self._opening = False
-            cancelled = self._cancelled
-        resource_id = getattr(sandbox, "sandbox_id", None)
-        if not isinstance(resource_id, str) or _RESOURCE_IDENTITY.fullmatch(resource_id) is None:
-            self._retire(sandbox)
-            raise RuntimeError("E2B runner did not expose a valid sandbox identity after create")
-        self._ledger.activate(resource_id)
-        if cancelled:
-            self._retire(sandbox)
-            raise RuntimeError("Pi runner was cancelled before E2B startup completed")
         try:
+            with self._lock:
+                self._sandbox = sandbox
+                self._opening = False
+                cancelled = self._cancelled
+            resource_id = getattr(sandbox, "sandbox_id", None)
+            if (
+                not isinstance(resource_id, str)
+                or _RESOURCE_IDENTITY.fullmatch(resource_id) is None
+            ):
+                raise RuntimeError(
+                    "E2B runner did not expose a valid sandbox identity after create"
+                )
+            self._ledger.activate(resource_id)
+            if cancelled:
+                raise RuntimeError("Pi runner was cancelled before E2B startup completed")
             info, attestation = self._attest(
                 cast("_AttestableSandbox", sandbox),
                 expected_resource_id=resource_id,

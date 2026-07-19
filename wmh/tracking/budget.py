@@ -160,6 +160,20 @@ class ProviderCostMeter(BaseModel):
     input_overhead_tokens: int = Field(default=8192, ge=1, le=_SQLITE_INTEGER_MAX)
 
 
+class ExternalSpendAuthority(BaseModel):
+    """Policy-pinned verifier and account for an independent provider spending cap."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
+    account_identity: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9_.:@/-]+$",
+    )
+    verifier_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+
 class TimedResourceCostMeter(BaseModel):
     """Frozen upper-bound tariff for one class of externally billed timed resource."""
 
@@ -172,6 +186,7 @@ class TimedResourceCostMeter(BaseModel):
     nano_usd_per_second: int = Field(default=0, ge=0, le=_SQLITE_INTEGER_MAX)
     billing_quantum_seconds: int = Field(default=1, ge=1, le=_SQLITE_INTEGER_MAX)
     max_billing_seconds: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+    external_spend_authority: ExternalSpendAuthority | None = None
 
     @model_validator(mode="after")
     def _require_priced_resource(self) -> Self:

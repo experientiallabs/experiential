@@ -408,6 +408,60 @@ def test_e2b_runner_ambiguous_create_forfeits_full_resource_ceiling(
     assert reaped == [factory.lease_id]
 
 
+@pytest.mark.parametrize("failed_activation", [1, 2])
+def test_e2b_runner_activation_failure_kills_and_terminates_budget_and_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_activation: int,
+) -> None:
+    spec = _e2b_spec()
+    account = _resource_account(tmp_path, spec)
+    sandbox = _sandbox(spec)
+    channel = _Channel()
+    original_activate = backend_mod.RunnerLeaseLedger.activate
+    activation_calls = 0
+
+    def injected_activate(
+        ledger: backend_mod.RunnerLeaseLedger,
+        resource_id: str,
+        *,
+        expected_end_at: datetime | None = None,
+    ) -> None:
+        nonlocal activation_calls
+        activation_calls += 1
+        if activation_calls == failed_activation:
+            raise RuntimeError("injected activation persistence failure")
+        original_activate(ledger, resource_id, expected_end_at=expected_end_at)
+
+    monkeypatch.setattr(backend_mod.RunnerLeaseLedger, "activate", injected_activate)
+    factory = E2BOneShotRunnerFactory(
+        spec,
+        sandbox_factory=lambda: sandbox,
+        runner_starter=_starter(channel),
+        ledger_path=tmp_path / "runner-lease.json",
+        resource_budget_account=account,
+        orphan_reaper=lambda _lease_id: (),
+    )
+    sandbox.info.metadata.update(
+        {
+            "wmh_runner_config": spec.config_digest,
+            "wmh_runner_lease": factory.lease_id,
+            "wmh_runner_owner": factory.owner_id,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="activation persistence"):
+        with factory():
+            pytest.fail("a runner with unpersisted activation must not be yielded")
+
+    assert sandbox.kill_calls == 1
+    assert channel.closed is False
+    assert factory.wait_closed(0.01)
+    assert json.loads((tmp_path / "runner-lease.json").read_text())["state"] == "retired"
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+
+
 def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
