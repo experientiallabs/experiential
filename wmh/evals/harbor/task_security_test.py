@@ -124,6 +124,30 @@ JUDGE_AUTH = "${AWS_SESSION_TOKEN:-fallback-value}"
     assert "credential values were not read" in message
 
 
+def test_task_audit_rejects_embedded_config_environment_references(tmp_path: Path) -> None:
+    task = _write_task(
+        tmp_path,
+        """
+[environment.env]
+ENDPOINT = "prefix_${AZURE_OPENAI_API_KEY}_suffix"
+
+[verifier.env]
+AUTH_HEADER = "Bearer $AWS_SESSION_TOKEN"
+""",
+    )
+
+    assert find_protected_host_environment_references(task) == (
+        ProtectedHostEnvironmentReference(
+            source="task.toml [environment].env",
+            variable="AZURE_OPENAI_API_KEY",
+        ),
+        ProtectedHostEnvironmentReference(
+            source="task.toml [verifier].env",
+            variable="AWS_SESSION_TOKEN",
+        ),
+    )
+
+
 def test_task_audit_follows_compose_include_and_extends_closure(tmp_path: Path) -> None:
     task = _write_task(tmp_path)
     environment_dir = task.paths.environment_dir

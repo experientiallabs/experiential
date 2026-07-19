@@ -19,7 +19,6 @@ from harbor.models.task.task import Task
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 _ENVIRONMENT_NAME_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_HARBOR_ENV_TEMPLATE_RE: Final = re.compile(r"\$\{([^}:]+)(?::-(.*))?\}", re.DOTALL)
 _COMPOSE_DOCUMENT_ADAPTER: Final[TypeAdapter[dict[str, JsonValue]]] = TypeAdapter(
     dict[str, JsonValue]
 )
@@ -168,12 +167,8 @@ def _audit_task_credential_boundary(task: Task) -> _TaskCredentialAudit:
     failures: set[TaskCredentialAuditFailure] = set()
     for source, env in _task_environment_maps(task):
         for value in env.values():
-            match = _HARBOR_ENV_TEMPLATE_RE.fullmatch(value)
-            if match is None:
-                continue
-            name = match.group(1)
-            if is_protected_host_environment_name(name):
-                references.add(ProtectedHostEnvironmentReference(source=source, variable=name))
+            for name in _compose_interpolation_references(value):
+                _record_protected_reference(source, name, references)
 
     task_dir = task.task_dir.resolve()
     try:

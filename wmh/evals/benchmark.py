@@ -9,6 +9,7 @@ benchmark-specific headline key.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Iterable
 from enum import StrEnum
 from statistics import fmean
@@ -249,11 +250,15 @@ class BenchmarkRunResult(BaseModel):
     @model_validator(mode="after")
     def _validate_trials(self) -> Self:
         expected_keys = [(cell.task_key, cell.attempt) for cell in self.expected_cells]
-        duplicate_expected = sorted({key for key in expected_keys if expected_keys.count(key) > 1})
+        duplicate_expected = sorted(
+            key for key, count in Counter(expected_keys).items() if count > 1
+        )
         if duplicate_expected:
             raise ValueError(f"duplicate expected benchmark cell(s): {duplicate_expected}")
         observed_keys = [(trial.cell.task_key, trial.cell.attempt) for trial in self.trials]
-        duplicate_observed = sorted({key for key in observed_keys if observed_keys.count(key) > 1})
+        duplicate_observed = sorted(
+            key for key, count in Counter(observed_keys).items() if count > 1
+        )
         if duplicate_observed:
             raise ValueError(f"duplicate observed benchmark cell(s): {duplicate_observed}")
         if set(observed_keys) != set(expected_keys):
