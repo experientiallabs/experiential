@@ -49,12 +49,11 @@ from wmh.evals.study_journal import (
     StudyPhaseRecord,
 )
 from wmh.evals.study_lifecycle import (
-    CandidateFrozenPayload,
-    CandidatePublishedPayload,
     DiscoveryRunningPayload,
     PreparationPlannedPayload,
     ProtocolPublishedPayload,
     RosterQualifiedPayload,
+    StudyArtifactPublication,
     StudyLifecycleController,
 )
 from wmh.harness.create import SearchCheckpoint
@@ -121,6 +120,22 @@ class _Publisher:
         pending: StudyPhaseCommitment | None,
     ) -> None:
         del genesis, records, pending
+
+    def verify_artifact(self, publication: StudyArtifactPublication) -> None:
+        expected = _artifact_publication(publication.artifact_digest)
+        if publication != expected:
+            raise ValueError("missing publication")
+
+
+def _artifact_publication(artifact_digest: str) -> StudyArtifactPublication:
+    return StudyArtifactPublication.create(
+        artifact_digest=artifact_digest,
+        publisher="test-artifacts",
+        publication_id=f"artifact-{artifact_digest}",
+        immutable_locator=f"test://artifacts/{artifact_digest}",
+        published_at=datetime(2026, 7, 19, 11, 0, tzinfo=UTC),
+        evidence={},
+    )
 
 
 def _roster_digest(manifest: BenchmarkPartitionManifest) -> str:
@@ -431,7 +446,11 @@ def _discovery_lifecycle(
         study_id=protocol.experiment_id,
         publisher_configuration_digest=publisher.configuration_digest,
     )
-    controller = StudyLifecycleController(store=store, publisher=publisher)
+    controller = StudyLifecycleController(
+        store=store,
+        publisher=publisher,
+        artifact_verifier=publisher,
+    )
     controller.publish(
         PreparationPlannedPayload(
             study_plan_digest=_digest("study-plan"),
@@ -448,15 +467,17 @@ def _discovery_lifecycle(
             qualified_task_count=4,
         )
     )
-    controller.publish(
+    protocol_publication = _artifact_publication(protocol.digest)
+    controller.publish_protocol(
         ProtocolPublishedPayload(
             protocol_digest=protocol.digest,
-            protocol_artifact_publication_digest=_digest("protocol-publication"),
+            protocol_artifact_publication_digest=protocol_publication.digest,
             partition_manifest_digest=protocol.partition_manifest_digest,
             qualified_roster_digest=protocol.qualification_roster_digest,
             search_cost_binding_digest=protocol.search_cost_binding_digest,
             confirmation_budget_binding_digest=protocol.confirmation_budget_binding_digest,
-        )
+        ),
+        publication=protocol_publication,
     )
     authorization = DiscoveryRunningPayload(
         protocol_digest=protocol.digest,
@@ -515,28 +536,23 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
             }
         )
 
-    lifecycle.publish(
-        CandidateFrozenPayload(
-            protocol_digest=protocol.digest,
-            candidate_execution_digest=frozen.candidate.execution_digest,
-            search_checkpoint_digest=frozen.checkpoint_payload_digest,
-            search_configuration_digest=discovery_authorization.search_configuration_digest,
-            search_cost_binding_digest=protocol.search_cost_binding_digest,
-            search_cost_report_digest=_digest("search-cost-report"),
-            champion_reconstruction_digest=frozen.candidate.execution_digest,
-            candidate_freeze_record_digest=frozen.freeze_record.digest,
-            completed_iterations=checkpoints[-1].completed_iteration,
-        )
-    )
-    candidate_publication = CandidatePublishedPayload(
+    cost_publication = _artifact_publication(_digest("search-cost-report"))
+    lifecycle.publish_candidate_frozen(
         protocol_digest=protocol.digest,
-        candidate_execution_digest=frozen.candidate.execution_digest,
-        candidate_source_artifact_digest=_canonical_digest(
-            frozen.candidate.model_dump(mode="json")
-        ),
-        candidate_artifact_publication_digest=_digest("candidate-publication"),
+        candidate=frozen.candidate,
+        checkpoint=checkpoints[-1],
+        search_configuration_digest=discovery_authorization.search_configuration_digest,
+        search_cost_binding_digest=protocol.search_cost_binding_digest,
+        search_cost_report_publication=cost_publication,
+        freeze_record=frozen.freeze_record,
+        completed_iterations=protocol.search.iterations,
     )
-    lifecycle.publish(candidate_publication)
+    candidate_source_digest = _canonical_digest(frozen.candidate.model_dump(mode="json"))
+    candidate_publication = lifecycle.publish_candidate_source(
+        protocol_digest=protocol.digest,
+        candidate=frozen.candidate,
+        publication=_artifact_publication(candidate_source_digest),
+    )
     opened = open_harness_optimization_confirmation(
         control_store,
         prepared=prepared,
@@ -550,6 +566,57 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
     assert opened.design.panel_members == ("glm", "haiku", "opus")
     assert opened.design.attempts_by_member == {"glm": 15, "haiku": 15, "opus": 15}
     assert opened.confirmation.confirmation_protocol_digest == frozen.confirmation_commitment.digest
+
+
+def test_heldout_open_rejects_a_candidate_publication_for_different_source(
+    tmp_path: Path,
+) -> None:
+    control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    checkpoints: list[SearchCheckpoint] = []
+    run_harness_optimization_search(
+        prepared.discovery_contract(),
+        scorer=_Scorer(manifest.discovery_task_ids),
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=checkpoints.append,
+    )
+    frozen = freeze_harness_optimization_candidate(
+        control_store,
+        prepared=prepared,
+        checkpoint=checkpoints[-1],
+        lifecycle=lifecycle,
+        authorization=authorization,
+    )
+    cost_publication = _artifact_publication(_digest("search-cost-report"))
+    lifecycle.publish_candidate_frozen(
+        protocol_digest=protocol.digest,
+        candidate=frozen.candidate,
+        checkpoint=checkpoints[-1],
+        search_configuration_digest=authorization.search_configuration_digest,
+        search_cost_binding_digest=protocol.search_cost_binding_digest,
+        search_cost_report_publication=cost_publication,
+        freeze_record=frozen.freeze_record,
+        completed_iterations=protocol.search.iterations,
+    )
+
+    wrong_source = default_agent("different-source")
+    wrong_digest = _canonical_digest(wrong_source.model_dump(mode="json"))
+    with pytest.raises(ValueError, match="exact candidate source"):
+        lifecycle.publish_candidate_source(
+            protocol_digest=protocol.digest,
+            candidate=frozen.candidate,
+            publication=_artifact_publication(wrong_digest),
+        )
+
+    assert lifecycle.current_phase.value == "candidate_frozen"
+    assert set(manifest.confirmation_task_ids).isdisjoint(
+        prepared.discovery_contract().protocol.discovery.tasks[index].task_id
+        for index in range(len(prepared.discovery_contract().protocol.discovery.tasks))
+    )
 
 
 def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
