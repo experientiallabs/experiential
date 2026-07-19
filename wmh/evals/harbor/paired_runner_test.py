@@ -1556,6 +1556,47 @@ def test_each_slice_holds_one_operation_lease_through_all_block_leases(
     assert not coordinator.active
 
 
+def test_crash_before_progress_publish_recovers_pairs_without_provider_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_concurrent_waves=2)
+    crashed_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    crashed_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+
+    def crash_before_publish(_progress: mod.PairedHarborSliceProgress) -> None:
+        raise RuntimeError("synthetic coordinator crash before progress publish")
+
+    monkeypatch.setattr(crashed_runner, "_persist_progress", crash_before_publish)
+    with pytest.raises(RuntimeError, match="before progress publish"):
+        asyncio.run(crashed_runner.run_slice(baseline=baseline, candidate=candidate))
+    assert len(crashed_calls) == 4
+    assert not crashed_runner._progress_directory().exists()
+
+    resumed_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    resumed = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+
+    assert resumed.report is not None
+    assert resumed.progress.slice_index == 1
+    assert tuple(item.block for item in resumed.progress.completed_before) == (_design().blocks[:2])
+    assert resumed.progress.selected_blocks == _design().blocks[2:]
+    assert len(resumed_calls) == 4
+
+
 def test_partial_final_slice_is_smaller_and_analysis_waits_for_complete_matrix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
