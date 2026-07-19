@@ -16,7 +16,9 @@ from harbor.models.job.config import DatasetConfig
 
 import wmh.evals.harbor.paired_runner as mod
 from wmh.evals.benchmark import (
+    BenchmarkCandidateFailureReason,
     BenchmarkCandidateOutcome,
+    BenchmarkCandidateStage,
     BenchmarkCandidateStatus,
     BenchmarkCell,
     BenchmarkRunHealth,
@@ -1107,6 +1109,51 @@ def test_reload_enforces_exact_call_count_controls_and_report_wide_request_uniqu
     _refresh_arm_admission_digest(second_arm)
     with pytest.raises(ValueError, match="reuses a provider request ID"):
         mod.PairedHarborRunReport.model_validate(reused_request)
+
+
+def test_zero_successful_calls_are_admissible_only_for_candidate_owned_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    report = asyncio.run(
+        _runner(tmp_path, candidate, baseline=baseline).run(
+            baseline=baseline,
+            candidate=candidate,
+        )
+    )
+    arm = cast("dict[str, Any]", report.evidence[0].first.model_dump(mode="json"))
+    arm["trial"]["status"] = "candidate_failure"
+    arm["trial"]["candidate_outcome"] = BenchmarkCandidateOutcome(
+        status=BenchmarkCandidateStatus.FAILED,
+        stage=BenchmarkCandidateStage.EXECUTION,
+        failure_reason=BenchmarkCandidateFailureReason.INVALID_REQUEST,
+    ).model_dump(mode="json")
+    arm["trial"]["run_health"] = "candidate_damaged"
+    arm["trial"]["rewards"] = None
+    arm["trial"]["usage"]["calls"] = 0
+    arm["verifier_reward"] = None
+    arm["analysis_score"] = 0.0
+    arm["provider_receipts"] = []
+    arm["provider_receipt_call_indexes"] = []
+    _refresh_arm_admission_digest(arm)
+
+    admitted = mod.PairedHarborArmEvidence.model_validate(arm)
+    assert admitted.trial.candidate_outcome.failure_reason is (
+        BenchmarkCandidateFailureReason.INVALID_REQUEST
+    )
+
+    arm["trial"]["status"] = "scored"
+    arm["trial"]["candidate_outcome"] = BenchmarkCandidateOutcome(
+        status=BenchmarkCandidateStatus.COMPLETED,
+    ).model_dump(mode="json")
+    arm["trial"]["run_health"] = "valid"
+    arm["trial"]["rewards"] = {"reward": 0.0}
+    _refresh_arm_admission_digest(arm)
+    with pytest.raises(ValueError, match="lacks provider-authored request receipts"):
+        mod.PairedHarborArmEvidence.model_validate(arm)
 
 
 def test_same_host_operations_share_global_route_and_task_capacity(

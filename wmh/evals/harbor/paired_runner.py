@@ -34,8 +34,8 @@ from pydantic import (
 
 from wmh.core.text import validate_durable_text
 from wmh.evals.benchmark import (
-    BenchmarkCandidateStage,
     BenchmarkCandidateStatus,
+    BenchmarkRunHealth,
     BenchmarkRunIdentity,
     BenchmarkTrialResult,
     BenchmarkUsageStatus,
@@ -600,9 +600,10 @@ class PairedHarborArmEvidence(BaseModel):
                 raise ValueError("only an admitted task timeout may have a missing trace")
         elif not _is_sha256_digest(self.trace_digest):
             raise ValueError("paired Harbor trace digest must be sha256 or admitted missing")
-        no_call_candidate_setup_failure = (
+        no_call_candidate_failure = (
             self.trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
-            and self.trial.candidate_outcome.stage is BenchmarkCandidateStage.SETUP
+            and self.trial.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+            and self.trial.usage.calls == 0
         )
         if (
             self.trial.usage.calls is None
@@ -613,7 +614,7 @@ class PairedHarborArmEvidence(BaseModel):
             raise ValueError(
                 "paired Harbor receipt count differs from the successful provider call count"
             )
-        if not self.provider_receipts and not no_call_candidate_setup_failure:
+        if not self.provider_receipts and not no_call_candidate_failure:
             raise ValueError(
                 "paired Harbor evidence lacks provider-authored request receipts; configured "
                 "routes are not proof of independent worker calls"
