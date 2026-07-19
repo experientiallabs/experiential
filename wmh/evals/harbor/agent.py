@@ -134,6 +134,10 @@ class _CandidateToolArgumentError(ValueError):
     """Candidate-supplied tool arguments failed a bounded validation rule."""
 
 
+class _TaskEnvironmentUnavailableError(RuntimeError):
+    """The task environment failed a trusted readiness check before candidate execution."""
+
+
 @dataclass(frozen=True)
 class _TaskEnvironmentAttestation:
     digest: str
@@ -307,7 +311,7 @@ class HarborToolExecutor:
             # A post-command loss therefore cannot prove candidate ownership without one fresh,
             # same-cell confirmation attempt in an isolated environment.
             raise AmbiguousTaskEnvironmentError
-        raise AmbiguousTaskEnvironmentError
+        raise _TaskEnvironmentUnavailableError
 
     def _environment_exec(
         self,

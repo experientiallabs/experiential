@@ -734,6 +734,31 @@ def test_suppressed_disk_loss_requires_confirmation_from_task_state() -> None:
     asyncio.run(scenario())
 
 
+def test_unhealthy_initial_disk_is_infrastructure_not_confirmation() -> None:
+    async def scenario() -> None:
+        environment = _Environment(
+            health_results=[_healthy_disk_result(available_kib=0)],
+        )
+        executor = mod.HarborToolExecutor(
+            asyncio.get_running_loop(), cast("BaseEnvironment", environment)
+        )
+
+        with pytest.raises(mod._TaskEnvironmentUnavailableError) as caught:
+            await asyncio.to_thread(
+                executor,
+                "bash",
+                cast("JsonObject", {"command": "pwd"}),
+                lambda *_args: None,
+                _deadline(),
+            )
+
+        assert not isinstance(caught.value, AmbiguousTaskEnvironmentError)
+        assert environment.calls == []
+        assert len(environment.health_calls) == 1
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "filesystem",
     ["overlay", "/dev/root", "tmpfs"],

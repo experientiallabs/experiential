@@ -580,10 +580,8 @@ class BenchmarkRunResult(BaseModel):
             )
         values: list[float] = []
         for trial in self.trials:
-            if (
-                trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
-                or trial.error is not None
-                and trial.error.kind is BenchmarkFailureKind.TASK_TIMEOUT
+            if trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED or (
+                trial.error is not None and trial.error.kind is BenchmarkFailureKind.TASK_TIMEOUT
             ):
                 values.append(0.0)
                 continue
