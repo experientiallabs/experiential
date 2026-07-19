@@ -71,7 +71,6 @@ from wmh.evals.paired import (
     PairedBlock,
     PairedBlockOutcome,
     PairedEvaluationDesign,
-    PairedTaskPlan,
     analyze_paired_outcomes,
 )
 from wmh.evals.partition import ConfirmationPartition
@@ -2340,8 +2339,7 @@ def _validate_backend_trial_evidence(
         if (
             not isinstance(attestation, dict)
             or attestation.get("backend") != "e2b"
-            or attestation.get("launch_config_digest")
-            != qualification.e2b_launch_config_digest
+            or attestation.get("launch_config_digest") != qualification.e2b_launch_config_digest
             or attestation.get("build_config_digest") != qualification.e2b_build_config_digest
             or attestation.get("build_record_digest") != qualification.e2b_build_record_digest
             or attestation.get("requested_storage_mb") != qualification.requested_storage_mb

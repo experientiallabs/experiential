@@ -992,12 +992,8 @@ class HarborRosterQualifier:
         )
         return QualifiedHarborTask(
             **common,
-            observed_storage_mb=cast(
-                "int | None", attestation.evidence.get("observed_storage_mb")
-            ),
-            e2b_launch_config_digest=cast(
-                "str", attestation.evidence.get("launch_config_digest")
-            ),
+            observed_storage_mb=cast("int | None", attestation.evidence.get("observed_storage_mb")),
+            e2b_launch_config_digest=cast("str", attestation.evidence.get("launch_config_digest")),
             e2b_build_config_digest=record.build_config_digest,
             e2b_build_record_digest=record.digest,
             task_resource_class_digest=resource_class.digest,
