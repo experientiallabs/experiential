@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import DatasetConfig
-from harbor.models.trial.config import AgentConfig
+from harbor.models.trial.config import AgentConfig, EnvironmentConfig
 from pydantic import ValidationError
 
 from wmh.evals.harbor.config import (
@@ -15,6 +15,7 @@ from wmh.evals.harbor.config import (
     HarborEnvironmentBackend,
     HarborJobSpec,
     build_harbor_job_config,
+    validate_controlled_harbor_environment,
 )
 
 _DATASET_REF = "sha256:" + "a" * 64
@@ -51,6 +52,13 @@ def test_local_default_maps_explicitly_to_harbor_docker(tmp_path: Path) -> None:
 
     assert config.environment.type is EnvironmentType.DOCKER
     assert config.environment.delete is True
+    assert config.environment.force_build is False
+    assert config.environment.import_path is None
+    assert config.environment.mounts is None
+    assert config.environment.extra_docker_compose == []
+    assert config.environment.env == {}
+    assert config.environment.kwargs == {}
+    assert config.environment.extra_allowed_hosts == []
     assert config.n_attempts == 5
     assert config.n_concurrent_trials == 3
     assert config.datasets[0].name == "example/benchmark"
@@ -148,3 +156,48 @@ def test_agent_concurrency_must_be_final_before_job_construction(tmp_path: Path)
 
 def test_supported_harbor_version_is_exact() -> None:
     assert SUPPORTED_HARBOR_VERSION == "0.18.0"
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"import_path": "evil:Environment"}, "import_path"),
+        ({"type": EnvironmentType.DAYTONA}, "Docker or E2B"),
+        ({"force_build": True}, "force_build"),
+        ({"delete": False}, "cleanup"),
+        (
+            {
+                "mounts": [
+                    {
+                        "type": "bind",
+                        "source": "/host",
+                        "target": "/mnt/host",
+                    }
+                ]
+            },
+            "host mounts",
+        ),
+        ({"extra_docker_compose": [Path("overlay.yml")]}, "Compose overlays"),
+        ({"env": {"TOKEN": "${TOKEN}"}}, "host variables"),
+        ({"kwargs": {"privileged": True}}, "backend kwargs"),
+        ({"extra_allowed_hosts": ["host.docker.internal"]}, "extra allowed hosts"),
+    ],
+)
+def test_controlled_environment_rejects_host_facing_overrides(
+    update: dict[str, object],
+    message: str,
+) -> None:
+    environment = EnvironmentConfig(type=EnvironmentType.DOCKER).model_copy(update=update)
+
+    with pytest.raises(ValueError, match=message):
+        validate_controlled_harbor_environment(environment)
+
+
+def test_controlled_environment_rejects_backend_drift() -> None:
+    environment = EnvironmentConfig(type=EnvironmentType.E2B)
+
+    with pytest.raises(ValueError, match="differs from the frozen job backend"):
+        validate_controlled_harbor_environment(
+            environment,
+            expected_type=EnvironmentType.DOCKER,
+        )

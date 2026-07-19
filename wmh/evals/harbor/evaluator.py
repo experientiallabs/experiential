@@ -7,13 +7,15 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import stat
 import tempfile
 from collections import defaultdict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
-from typing import override
+from typing import Protocol, override
 from uuid import UUID
 
 from harbor.environments.factory import EnvironmentFactory
@@ -50,6 +52,7 @@ from wmh.evals.harbor.config import (
     HarborEnvironmentBackend,
     HarborJobSpec,
     build_harbor_job_config,
+    validate_controlled_harbor_environment,
 )
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
@@ -60,7 +63,9 @@ from wmh.evals.harbor.results import (
     load_harbor_job_result,
 )
 from wmh.evals.harbor.task_security import (
+    PrebuiltImageTaskBoundaryError,
     TaskCredentialBoundaryError,
+    validate_prebuilt_image_task_tree,
     validate_task_credential_boundary,
 )
 from wmh.harness.doc import HarnessDoc
@@ -74,6 +79,7 @@ from wmh.providers.base import ProviderConfig
 _MANIFEST_FILENAME = "wmh-manifest.json"
 _MAX_TASK_HOST_TEXT_BYTES = 1024 * 1024
 _MAX_EXTRA_INSTRUCTION_FILES = 16
+_TASK_SNAPSHOT_ROOT = ".wmh-task-snapshots"
 _JOB_ROOT_FILES = frozenset(
     {_MANIFEST_FILENAME, "config.json", "job.log", "lock.json", "result.json"}
 )
@@ -93,6 +99,10 @@ class UnsupportedHarborTaskError(ValueError):
 
 class UnsupportedHarborMetricError(ValueError):
     """A Harbor metric could execute untrusted code on the credential-bearing host."""
+
+
+class _DigestWriter(Protocol):
+    def update(self, value: bytes, /) -> None: ...
 
 
 class _AtomicHarborJob(Job):
@@ -132,6 +142,16 @@ class _PreparedTrial:
             self.task_instruction,
             self.trial_lock_digest,
         )
+
+
+@dataclass
+class _OpenedDatasetSource:
+    """One source path identity held open from task discovery through snapshot copy."""
+
+    path: Path
+    fd: int
+    metadata: os.stat_result
+    task_names: tuple[str, ...]
 
 
 class HarborEvaluator:
@@ -178,6 +198,7 @@ class HarborEvaluator:
             run_config_digest=run_config_digest,
         )
         job_config = build_harbor_job_config(self._spec, agent=agent)
+        job_config = _snapshot_local_datasets(job_config)
         job_dir = job_config.jobs_dir / job_config.job_name
         await _reject_executable_harbor_metrics(job_config)
         existing_manifest = _inspect_existing_job(
@@ -186,7 +207,6 @@ class HarborEvaluator:
             expected_agent_digest=agent_digest,
             expected_job_config=job_config,
         )
-        _preflight_local_task_trees(job_config)
         await asyncio.to_thread(_preflight_task_environment, job_config)
         await self._ensure_runner_ready()
 
@@ -204,6 +224,16 @@ class HarborEvaluator:
             if not job._trial_configs:
                 raise ValueError(
                     "Harbor resolved zero trials; refusing to publish an empty evaluation"
+                )
+            expected_environment_type = job_config.environment.type
+            validate_controlled_harbor_environment(
+                job.config.environment,
+                expected_type=expected_environment_type,
+            )
+            for trial_config in job._trial_configs:
+                validate_controlled_harbor_environment(
+                    trial_config.environment,
+                    expected_type=expected_environment_type,
                 )
             tasks = _load_and_validate_tasks(
                 job,
@@ -425,6 +455,657 @@ def _preflight_local_task_trees(config: JobConfig) -> None:
             if not (config_path.exists() or config_path.is_symlink()):
                 continue
             _validate_task_tree_for_host_reads(task_dir, extra_instruction_paths=())
+            if config.environment.type is EnvironmentType.DOCKER:
+                _validate_prebuilt_local_task_tree(task_dir)
+
+
+def _snapshot_local_datasets(config: JobConfig) -> JobConfig:
+    """Run every local dataset from a content-addressed WMH-controlled task snapshot.
+
+    Harbor 0.18 resolves a local task path again when each trial starts. Pointing it at the source
+    checkout would leave a validation-to-execution race in which a Compose or dotenv file could be
+    added after preflight. Copying through held directory descriptors without following links,
+    validating the copy, and then atomically publishing a read-only content-addressed tree makes the
+    source path irrelevant to execution for both Docker and E2B. Remote/repository/package
+    acquisition remains disabled because Harbor 0.18 may dereference task symlinks before WMH
+    receives the downloaded tree to validate.
+    """
+    local_dataset_indexes = {
+        index for index, dataset in enumerate(config.datasets) if dataset.is_local()
+    }
+    if len(local_dataset_indexes) != len(config.datasets):
+        raise UnsupportedHarborTaskError(
+            "ground-truth evaluation requires preflightable local dataset paths for both "
+            "Docker and E2B"
+        )
+    if not local_dataset_indexes:
+        return config
+    snapshots_root = config.jobs_dir / _TASK_SNAPSHOT_ROOT
+    if snapshots_root.is_symlink():
+        raise UnsupportedHarborTaskError("Harbor task snapshot root cannot be a symbolic link")
+    snapshots_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if not snapshots_root.is_dir():
+        raise UnsupportedHarborTaskError("Harbor task snapshot root must be a directory")
+    try:
+        jobs_root = config.jobs_dir.resolve(strict=True)
+        snapshots_root_resolved = snapshots_root.resolve(strict=True)
+    except OSError:
+        raise UnsupportedHarborTaskError(
+            "Harbor task snapshot namespace cannot be resolved"
+        ) from None
+    _require_private_owned_directory(jobs_root, label="Harbor jobs directory")
+    _require_private_owned_directory(
+        snapshots_root_resolved,
+        label="Harbor task snapshot root",
+    )
+
+    opened_datasets: dict[int, _OpenedDatasetSource] = {}
+    source_names: set[str] = set()
+    try:
+        for index in sorted(local_dataset_indexes):
+            dataset = config.datasets[index]
+            if dataset.path is None:
+                raise RuntimeError("local Harbor dataset is missing its path")
+            requested_root = dataset.path.expanduser().absolute()
+            source_fd, source_metadata, task_names = _open_local_dataset_snapshot_source(
+                requested_root
+            )
+            try:
+                source_root = requested_root.resolve(strict=True)
+                resolved_metadata = source_root.stat(follow_symlinks=False)
+            except OSError:
+                os.close(source_fd)
+                raise UnsupportedHarborTaskError(
+                    "local dataset root cannot be resolved while its identity is held open"
+                ) from None
+            if (resolved_metadata.st_dev, resolved_metadata.st_ino) != (
+                source_metadata.st_dev,
+                source_metadata.st_ino,
+            ):
+                os.close(source_fd)
+                raise UnsupportedHarborTaskError(
+                    "local dataset path changed identity while it was resolved"
+                )
+            if source_root.is_relative_to(jobs_root) or jobs_root.is_relative_to(source_root):
+                os.close(source_fd)
+                raise UnsupportedHarborTaskError(
+                    "local dataset and Harbor jobs directory must not contain one another"
+                )
+            if source_root.name in source_names:
+                os.close(source_fd)
+                raise UnsupportedHarborTaskError(
+                    "local datasets must have unique directory names because Harbor uses the "
+                    "directory name as the dataset source identity"
+                )
+            source_names.add(source_root.name)
+            opened_datasets[index] = _OpenedDatasetSource(
+                path=source_root,
+                fd=source_fd,
+                metadata=source_metadata,
+                task_names=task_names,
+            )
+
+        frozen_datasets: list[DatasetConfig] = []
+        for index, dataset in enumerate(config.datasets):
+            source = opened_datasets[index]
+            source_key = hashlib.sha256(str(source.path).encode()).hexdigest()
+            source_snapshot_root = snapshots_root_resolved / source_key
+            source_snapshot_root.mkdir(mode=0o700, exist_ok=True)
+            if source_snapshot_root.is_symlink() or not source_snapshot_root.is_dir():
+                raise UnsupportedHarborTaskError(
+                    "Harbor dataset snapshot namespace must be a regular directory"
+                )
+            _require_private_owned_directory(
+                source_snapshot_root,
+                label="Harbor dataset snapshot namespace",
+            )
+            snapshot = _build_or_reuse_dataset_snapshot(
+                config,
+                dataset,
+                source=source,
+                source_snapshot_root=source_snapshot_root,
+            )
+            os.close(source.fd)
+            source.fd = -1
+            frozen_datasets.append(dataset.model_copy(update={"path": snapshot}, deep=True))
+    finally:
+        for source in opened_datasets.values():
+            if source.fd >= 0:
+                os.close(source.fd)
+
+    frozen = config.model_copy(update={"datasets": frozen_datasets}, deep=True)
+    _preflight_local_task_trees(frozen)
+    return frozen
+
+
+def _build_or_reuse_dataset_snapshot(
+    config: JobConfig,
+    dataset: DatasetConfig,
+    *,
+    source: _OpenedDatasetSource,
+    source_snapshot_root: Path,
+) -> Path:
+    temporary_root = Path(tempfile.mkdtemp(prefix=".pending-", dir=source_snapshot_root))
+    # Harbor uses the local dataset directory basename as its source identity. Keep that stable
+    # across snapshots; the source path namespace above guarantees different roots cannot share
+    # this leaf, while the preflight rejects ambiguous basenames within one job.
+    temporary_dataset = temporary_root / source.path.name
+
+    try:
+        # Do not use shutil.copytree here. Its lstat/open sequence can follow a source entry that
+        # is swapped to a symlink between those operations. The fd-relative copier below holds
+        # every parent directory open and uses O_NOFOLLOW for each child.
+        _copy_local_tasks_from_open_dataset(
+            source.fd,
+            source.metadata,
+            temporary_dataset,
+            task_names=source.task_names,
+        )
+        temporary_config = config.model_copy(
+            update={
+                "datasets": [dataset.model_copy(update={"path": temporary_dataset}, deep=True)]
+            },
+            deep=True,
+        )
+        _preflight_local_task_trees(temporary_config)
+        digest = _task_snapshot_digest(temporary_dataset)
+        snapshot_version_root = source_snapshot_root / digest.removeprefix("sha256:")
+        try:
+            snapshot_version_root.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            raise UnsupportedHarborTaskError(
+                "Harbor task snapshot version directory could not be created"
+            ) from None
+        if snapshot_version_root.is_symlink() or not snapshot_version_root.is_dir():
+            raise UnsupportedHarborTaskError(
+                "Harbor task snapshot version path must be a regular directory"
+            )
+        _require_private_owned_directory(
+            snapshot_version_root,
+            label="Harbor task snapshot version directory",
+        )
+        final = snapshot_version_root / source.path.name
+        if final.exists() or final.is_symlink():
+            _validate_existing_dataset_snapshot(final, expected_digest=digest)
+            return final
+
+        _make_task_snapshot_read_only(temporary_dataset)
+        try:
+            temporary_dataset.rename(final)
+        except FileExistsError:
+            _validate_existing_dataset_snapshot(final, expected_digest=digest)
+        except OSError:
+            if not final.is_dir():
+                raise UnsupportedHarborTaskError(
+                    "Harbor task snapshot could not be published atomically"
+                ) from None
+            _validate_existing_dataset_snapshot(final, expected_digest=digest)
+        else:
+            try:
+                final.chmod(0o555)
+            except OSError:
+                raise UnsupportedHarborTaskError(
+                    "Harbor task snapshot could not be made read-only"
+                ) from None
+        _validate_existing_dataset_snapshot(final, expected_digest=digest)
+        return final
+    finally:
+        _remove_temporary_snapshot(temporary_root)
+
+
+def _open_local_dataset_snapshot_source(
+    source_root: Path,
+) -> tuple[int, os.stat_result, tuple[str, ...]]:
+    """Open one exact dataset root and discover its task names through the held fd."""
+    _require_secure_copy_primitives()
+    source_fd: int | None = None
+    try:
+        before = source_root.stat(follow_symlinks=False)
+        source_fd = os.open(source_root, _source_directory_open_flags())
+        opened = os.fstat(source_fd)
+    except OSError:
+        if source_fd is not None:
+            os.close(source_fd)
+        raise UnsupportedHarborTaskError(
+            "local Harbor dataset root could not be opened without following links"
+        ) from None
+    if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) or not stat.S_ISDIR(
+        opened.st_mode
+    ):
+        os.close(source_fd)
+        raise UnsupportedHarborTaskError("local Harbor dataset root changed identity")
+    try:
+        _require_owned_nonwritable_by_others(opened, label="local Harbor dataset root")
+        task_names = _discover_local_task_names(source_fd, opened)
+    except BaseException:
+        os.close(source_fd)
+        raise
+    if not task_names:
+        os.close(source_fd)
+        raise UnsupportedHarborTaskError("local Harbor dataset contains no task directories")
+    return source_fd, opened, task_names
+
+
+def _copy_local_tasks_from_open_dataset(
+    source_fd: int,
+    source_metadata: os.stat_result,
+    destination_root: Path,
+    *,
+    task_names: tuple[str, ...],
+) -> None:
+    """Copy selected task trees through held directory fds without following links."""
+    source_flags = _source_directory_open_flags()
+    try:
+        destination_root.mkdir(mode=0o700)
+        destination_fd = os.open(destination_root, source_flags)
+    except OSError:
+        raise UnsupportedHarborTaskError(
+            "Harbor task snapshot destination could not be created safely"
+        ) from None
+    try:
+        for task_name in task_names:
+            _copy_source_directory(
+                source_fd,
+                destination_fd,
+                task_name,
+                source_device=source_metadata.st_dev,
+            )
+        final_source_metadata = os.fstat(source_fd)
+        if _directory_metadata_changed(source_metadata, final_source_metadata):
+            raise UnsupportedHarborTaskError(
+                "local Harbor dataset root changed while its task snapshot was copied"
+            )
+    finally:
+        os.close(destination_fd)
+
+
+def _discover_local_task_names(
+    source_fd: int,
+    source_metadata: os.stat_result,
+) -> tuple[str, ...]:
+    try:
+        names = sorted(os.listdir(source_fd))
+    except OSError:
+        raise UnsupportedHarborTaskError("local Harbor dataset cannot be enumerated") from None
+    task_names: list[str] = []
+    for name in names:
+        try:
+            entry = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        except OSError:
+            raise UnsupportedHarborTaskError(
+                "local Harbor dataset entry changed during task discovery"
+            ) from None
+        if stat.S_ISLNK(entry.st_mode):
+            raise UnsupportedHarborTaskError("local dataset child cannot be a symbolic link")
+        if not stat.S_ISDIR(entry.st_mode):
+            continue
+        directory_fd, _ = _open_verified_source_entry(
+            source_fd,
+            name,
+            expect_directory=True,
+            source_device=source_metadata.st_dev,
+        )
+        try:
+            try:
+                task_config = os.stat(
+                    "task.toml",
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise UnsupportedHarborTaskError(
+                    "local Harbor task configuration changed during discovery"
+                ) from None
+            if stat.S_ISLNK(task_config.st_mode):
+                raise UnsupportedHarborTaskError(
+                    "local Harbor task configuration cannot be a symbolic link"
+                )
+            if not stat.S_ISREG(task_config.st_mode) or task_config.st_nlink != 1:
+                raise UnsupportedHarborTaskError(
+                    "local Harbor task configuration must be a single-link regular file"
+                )
+            _require_owned_nonwritable_by_others(
+                task_config,
+                label="local Harbor task configuration",
+            )
+            task_names.append(name)
+        finally:
+            os.close(directory_fd)
+    if _directory_metadata_changed(source_metadata, os.fstat(source_fd)):
+        raise UnsupportedHarborTaskError("local Harbor dataset root changed during task discovery")
+    return tuple(task_names)
+
+
+def _source_directory_open_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _require_secure_copy_primitives() -> None:
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    if any(not hasattr(os, name) for name in required_flags):
+        raise RuntimeError("local Harbor task snapshots require POSIX no-follow file operations")
+    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
+        raise RuntimeError("local Harbor task snapshots require fd-relative open and stat")
+    if os.mkdir not in os.supports_dir_fd or os.listdir not in os.supports_fd:
+        raise RuntimeError("local Harbor task snapshots require fd-relative directory traversal")
+
+
+def _copy_source_directory(
+    source_parent_fd: int,
+    destination_parent_fd: int,
+    name: str,
+    *,
+    source_device: int,
+) -> None:
+    source_fd, source_metadata = _open_verified_source_entry(
+        source_parent_fd,
+        name,
+        expect_directory=True,
+        source_device=source_device,
+    )
+    try:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=destination_parent_fd)
+            destination_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=destination_parent_fd,
+            )
+        except OSError:
+            raise UnsupportedHarborTaskError(
+                "Harbor task snapshot directory could not be created safely"
+            ) from None
+        try:
+            try:
+                child_names = sorted(os.listdir(source_fd))
+            except OSError:
+                raise UnsupportedHarborTaskError(
+                    "local Harbor task directory could not be enumerated safely"
+                ) from None
+            for child_name in child_names:
+                try:
+                    child_metadata = os.stat(
+                        child_name,
+                        dir_fd=source_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    raise UnsupportedHarborTaskError(
+                        "local Harbor task entry changed while its snapshot was copied"
+                    ) from None
+                if stat.S_ISLNK(child_metadata.st_mode):
+                    raise UnsupportedHarborTaskError(
+                        "local Harbor task snapshot source cannot contain a symbolic link"
+                    )
+                if stat.S_ISDIR(child_metadata.st_mode):
+                    _copy_source_directory(
+                        source_fd,
+                        destination_fd,
+                        child_name,
+                        source_device=source_device,
+                    )
+                elif stat.S_ISREG(child_metadata.st_mode):
+                    _copy_source_file(
+                        source_fd,
+                        destination_fd,
+                        child_name,
+                        source_device=source_device,
+                    )
+                else:
+                    raise UnsupportedHarborTaskError(
+                        "local Harbor task snapshot source can contain only single-link regular "
+                        "files and directories"
+                    )
+            if _directory_metadata_changed(source_metadata, os.fstat(source_fd)):
+                raise UnsupportedHarborTaskError(
+                    "local Harbor task directory changed while its snapshot was copied"
+                )
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+
+
+def _copy_source_file(
+    source_parent_fd: int,
+    destination_parent_fd: int,
+    name: str,
+    *,
+    source_device: int,
+) -> None:
+    source_fd, source_metadata = _open_verified_source_entry(
+        source_parent_fd,
+        name,
+        expect_directory=False,
+        source_device=source_device,
+    )
+    destination_fd: int | None = None
+    try:
+        try:
+            destination_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o600 | (source_metadata.st_mode & 0o111),
+                dir_fd=destination_parent_fd,
+            )
+            os.fchmod(destination_fd, 0o600 | (source_metadata.st_mode & 0o111))
+            while chunk := os.read(source_fd, 1024 * 1024):
+                _write_all(destination_fd, chunk)
+        except OSError:
+            raise UnsupportedHarborTaskError(
+                "local Harbor task file could not be copied safely"
+            ) from None
+        if _file_metadata_changed(source_metadata, os.fstat(source_fd)):
+            raise UnsupportedHarborTaskError(
+                "local Harbor task file changed while its snapshot was copied"
+            )
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(source_fd)
+
+
+def _open_verified_source_entry(
+    parent_fd: int,
+    name: str,
+    *,
+    expect_directory: bool,
+    source_device: int,
+) -> tuple[int, os.stat_result]:
+    opened_fd: int | None = None
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        if expect_directory:
+            flags |= os.O_DIRECTORY
+        else:
+            # A regular source swapped to a FIFO must fail after fstat instead of blocking the
+            # evaluator indefinitely while open waits for a writer.
+            flags |= os.O_NONBLOCK
+        opened_fd = os.open(name, flags, dir_fd=parent_fd)
+        opened = os.fstat(opened_fd)
+    except OSError:
+        if opened_fd is not None:
+            os.close(opened_fd)
+        raise UnsupportedHarborTaskError(
+            "local Harbor task entry could not be opened without following links"
+        ) from None
+    expected_type = stat.S_ISDIR if expect_directory else stat.S_ISREG
+    unsafe = (
+        (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        or opened.st_dev != source_device
+        or not expected_type(opened.st_mode)
+        or (not expect_directory and opened.st_nlink != 1)
+    )
+    if unsafe:
+        os.close(opened_fd)
+        raise UnsupportedHarborTaskError(
+            "local Harbor task entry changed identity or crossed its source filesystem"
+        )
+    try:
+        _require_owned_nonwritable_by_others(opened, label="local Harbor task entry")
+    except BaseException:
+        os.close(opened_fd)
+        raise
+    return opened_fd, opened
+
+
+def _require_owned_nonwritable_by_others(metadata: os.stat_result, *, label: str) -> None:
+    if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+        raise UnsupportedHarborTaskError(
+            f"{label} must be owned by the evaluator user and not group/world writable"
+        )
+
+
+def _require_private_owned_directory(path: Path, *, label: str) -> None:
+    if path.is_symlink():
+        raise UnsupportedHarborTaskError(f"{label} cannot be a symbolic link")
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError:
+        raise UnsupportedHarborTaskError(f"{label} metadata is unavailable") from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise UnsupportedHarborTaskError(f"{label} must be a regular directory")
+    _require_owned_nonwritable_by_others(metadata, label=label)
+
+
+def _write_all(destination_fd: int, value: bytes) -> None:
+    remaining = memoryview(value)
+    while remaining:
+        written = os.write(destination_fd, remaining)
+        if written <= 0:
+            raise OSError("short write while copying Harbor task snapshot")
+        remaining = remaining[written:]
+
+
+def _directory_metadata_changed(before: os.stat_result, after: os.stat_result) -> bool:
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+    return any(getattr(before, field) != getattr(after, field) for field in fields)
+
+
+def _file_metadata_changed(before: os.stat_result, after: os.stat_result) -> bool:
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+    return any(getattr(before, field) != getattr(after, field) for field in fields)
+
+
+def _task_snapshot_digest(root: Path) -> str:
+    hasher = hashlib.sha256()
+    _update_snapshot_digest_part(hasher, b"wmh-harbor-task-snapshot-v2")
+    try:
+        paths = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    except OSError:
+        raise UnsupportedHarborTaskError("Harbor task snapshot cannot be enumerated") from None
+    for path in paths:
+        if path.is_symlink():
+            raise UnsupportedHarborTaskError("Harbor task snapshot cannot contain symbolic links")
+        relative = path.relative_to(root).as_posix().encode()
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except OSError:
+            raise UnsupportedHarborTaskError(
+                "Harbor task snapshot metadata is unavailable"
+            ) from None
+        if stat.S_ISDIR(metadata.st_mode):
+            _update_snapshot_digest_part(hasher, b"directory")
+            _update_snapshot_digest_part(hasher, relative)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise UnsupportedHarborTaskError(
+                "Harbor task snapshot can contain only regular files and directories"
+            )
+        _update_snapshot_digest_part(hasher, b"file")
+        _update_snapshot_digest_part(hasher, relative)
+        # Snapshot publication makes any source-executable file executable for all container
+        # users, so identity binds that normalized semantic bit rather than host ownership bits.
+        _update_snapshot_digest_part(
+            hasher,
+            (0o111 if metadata.st_mode & 0o111 else 0).to_bytes(2, "big"),
+        )
+        # File content is streamed rather than materialized, so frame it with the stable byte
+        # count before hashing. Without this boundary, a file's suffix can encode the next
+        # path/mode record and make two different trees share a digest without breaking SHA-256.
+        _update_snapshot_digest_part(hasher, metadata.st_size.to_bytes(8, "big"))
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    hasher.update(chunk)
+                final_metadata = os.fstat(handle.fileno())
+        except OSError:
+            raise UnsupportedHarborTaskError("Harbor task snapshot file cannot be read") from None
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(
+            getattr(metadata, field) != getattr(final_metadata, field) for field in stable_fields
+        ):
+            raise UnsupportedHarborTaskError("Harbor task snapshot changed while it was hashed")
+    return "sha256:" + hasher.hexdigest()
+
+
+def _update_snapshot_digest_part(hasher: _DigestWriter, value: bytes) -> None:
+    hasher.update(len(value).to_bytes(8, "big"))
+    hasher.update(value)
+
+
+def _make_task_snapshot_read_only(root: Path) -> None:
+    paths = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+    for path in paths:
+        mode = path.stat(follow_symlinks=False).st_mode
+        if path.is_dir():
+            # Harbor may upload the frozen tree into a task or verifier that runs as non-root.
+            # Private 0700 snapshot parents retain host isolation; the published tree itself must
+            # preserve read/traverse semantics for every configured container user.
+            path.chmod(0o555)
+        else:
+            path.chmod(0o555 if mode & 0o111 else 0o444)
+
+
+def _validate_existing_dataset_snapshot(path: Path, *, expected_digest: str) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise UnsupportedHarborTaskError("Harbor task snapshot path is not a regular directory")
+    try:
+        paths = (path, *path.rglob("*"))
+        for item in paths:
+            metadata = item.stat(follow_symlinks=False)
+            if metadata.st_uid != os.geteuid():
+                raise UnsupportedHarborTaskError(
+                    "Harbor task snapshot must remain owned by the evaluator user"
+                )
+            if metadata.st_mode & 0o222:
+                raise UnsupportedHarborTaskError("Harbor task snapshot must remain read-only")
+    except OSError:
+        raise UnsupportedHarborTaskError(
+            "Harbor task snapshot permissions are unavailable"
+        ) from None
+    actual = _task_snapshot_digest(path)
+    if actual != expected_digest:
+        raise UnsupportedHarborTaskError("Harbor task snapshot digest does not match its path")
+
+
+def _remove_temporary_snapshot(root: Path) -> None:
+    if not root.exists() or root.is_symlink():
+        return
+    try:
+        for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if path.is_dir() and not path.is_symlink():
+                path.chmod(0o700)
+            elif not path.is_symlink():
+                path.chmod(0o600)
+        root.chmod(0o700)
+        shutil.rmtree(root)
+    except OSError:
+        # Pending roots are never used by Harbor. A later maintenance sweep may remove one that
+        # survived an interruption; failure to clean it does not weaken the published snapshot.
+        return
+
+
+def _validate_prebuilt_local_task_tree(task_dir: Path) -> None:
+    try:
+        validate_prebuilt_image_task_tree(task_dir)
+    except PrebuiltImageTaskBoundaryError as exc:
+        raise UnsupportedHarborTaskError(
+            f"local Harbor task {task_dir.name!r} violates the prebuilt-image policy: {exc}"
+        ) from None
 
 
 def _validate_task_tree_for_host_reads(
@@ -500,12 +1181,17 @@ def harbor_run_config_digest(spec: HarborJobSpec, agent_config_digest: str) -> s
     per-attempt ledger exists.
     """
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "evaluator": "wmh-harbor",
         "harbor_version": SUPPORTED_HARBOR_VERSION,
         "agent_version": WMH_PI_AGENT_VERSION,
         "agent_config_digest": agent_config_digest,
         "task_environment": spec.environment_backend.value,
+        "task_source_policy": (
+            "prebuilt-image-only"
+            if spec.environment_backend is HarborEnvironmentBackend.LOCAL
+            else "e2b-image-or-dockerfile"
+        ),
         "attempts_per_task": spec.n_attempts,
         "trial_concurrency": spec.n_concurrent_trials,
         "agent_concurrency": spec.agent_n_concurrent,
@@ -539,6 +1225,8 @@ def _load_and_validate_tasks(
             download.path,
             extra_instruction_paths=trial_config.extra_instruction_paths,
         )
+        if environment_backend is HarborEnvironmentBackend.LOCAL:
+            _validate_prebuilt_local_task_tree(download.path)
         task = Task(
             download.path,
             extra_instruction_paths=trial_config.extra_instruction_paths,
@@ -873,7 +1561,9 @@ def _inspect_existing_job(
         raise StaleHarborJobError(
             f"Harbor job config, result, or lock is unreadable or invalid: {job_dir}"
         ) from exc
-    if existing_job_config.model_dump(mode="json") != expected_job_config.model_dump(mode="json"):
+    # Compare Python-mode values so semantically unordered Harbor sets (notably retry exception
+    # names) do not become order-sensitive merely because JSON represents them as arrays.
+    if existing_job_config.model_dump() != expected_job_config.model_dump():
         raise StaleHarborJobError(f"Harbor job config does not match this evaluation: {job_dir}")
 
     for trial_dir, entry in trial_dirs:
@@ -1102,7 +1792,7 @@ def harbor_job_lease_path(jobs_dir: Path, job_name: str) -> Path:
 
 def _validate_job_name(job_name: str) -> None:
     if (
-        job_name in {".", ".."}
+        job_name in {".", "..", _TASK_SNAPSHOT_ROOT}
         or "\0" in job_name
         or Path(job_name).is_absolute()
         or "/" in job_name

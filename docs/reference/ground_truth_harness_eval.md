@@ -209,8 +209,8 @@ Do not pool the lanes. Report a paired delta over the matching pi baseline insid
 
 Harbor supports two task-environment backends in this protocol:
 
-- **local**, the default, for Docker-backed development, deterministic debugging, and final runs
-  when capacity permits;
+- **local**, the default, for prebuilt-image Docker development, deterministic debugging, and
+  final runs when capacity permits;
 - **e2b**, an explicit acceleration option for high-concurrency task execution.
 
 These choices move only Harbor's task environment. The isolated pi runner remains in local Docker
@@ -224,11 +224,14 @@ also used to claim backend equivalence, freeze a separate paired design, equival
 sample size, and task-clustered analysis with adequate power. Otherwise report those live samples
 as descriptive route evidence only. Provider calls remain on the trusted host in both modes.
 Provider credentials must not enter task containers, E2B sandboxes, candidate prompts, traces, or
-canonical result JSON. Before Harbor
-constructs a task environment, WMH audits each resolved task source and rejects credential-like
-host variable references in task and verifier environment maps, Docker Compose sources, and
-Compose environment files. The audit reports variable names and source locations only. It never
-resolves or logs credential values.
+canonical result JSON. Local execution requires a literal prebuilt image and rejects all
+task-authored Compose and dotenv sources, host interpolation, MCP/skills sources, and run-level
+imports, mounts, overlays, host variables, backend kwargs, or extra hosts before Harbor creates a
+job. For both backends, a local dataset is copied into a content-addressed, read-only WMH snapshot,
+revalidated there, and only that snapshot path is given to Harbor. The broader task audit still
+reports only variable names and source locations; it never resolves or logs credential values.
+The source must be a private checkout owned by the evaluator user on one filesystem: group/world
+writable entries, hardlinks, symlinks, special files, and cross-filesystem descendants fail closed.
 
 ### Python scoring boundary
 
@@ -238,8 +241,8 @@ ordered, literal list. Globs, exclusions, random task limits, request-time subse
 request-time attempt changes are rejected. Scored search accepts only local dataset paths that WMH
 can inspect before Harbor job creation. Harbor 0.18 dereferences symlinks while copying remote/Git
 tasks, before WMH can validate the downloaded tree, so registry, package, and remote acquisition
-remain evaluator-only until a symlink-preserving acquisition boundary lands. Dataset-qualified task
-keys from a frozen qualification
+are rejected by the ground-truth evaluator under both Docker and E2B until a symlink-preserving
+acquisition boundary lands. Dataset-qualified task keys from a frozen qualification
 manifest bind each selection to its Harbor source, identity, and task checksum across candidates.
 Qualification also freezes the executed environment definition. Local runs attest the Docker
 daemon platform plus every Compose service's immutable image ID and image platform. Ephemeral
@@ -301,11 +304,11 @@ When this scorer is passed to `search_harness`, set `screen_proposals=False` and
 reference harness fixes runtime kind, turns, output tokens, temperature, effective tools, and the
 per-turn deadline. A candidate that changes that compute envelope is ineligible.
 
-This static check is a narrow credential boundary, not proof that an arbitrary Harbor task is safe.
-A malicious Dockerfile, Compose mount, image, script, or verifier can attack the host through other
-channels. Every scored dataset must therefore be frozen by content, reviewed as executable code,
-and limited to audited task sources and image digests before credentials are loaded or a paid run
-is approved.
+The local policy prevents Harbor from building task Dockerfiles or consuming task-authored Compose
+host capabilities, but it is not proof that an arbitrary container image or verifier is safe.
+Every scored dataset must therefore be frozen by content, reviewed as executable code, and limited
+to audited task sources and resolved image digests before credentials are loaded or a paid run is
+approved.
 
 Harbor job metrics and remote dataset metadata can also declare `uv-script` metrics, while package
 datasets can provide a dataset-level `metric.py`. Harbor runs those scripts as host subprocesses
@@ -852,7 +855,8 @@ The reusable evaluation slice provides:
   drift, and projects only complete binary verifier evidence into generic harness scores;
 - typed completed, failed, unknown, and cancelled candidate evidence without arbitrary Harbor
   metadata passthrough;
-- pre-environment rejection of task-authored imports of credential-like host variables;
+- pre-job local enforcement of one literal prebuilt image with task Compose, dotenv, host
+  interpolation, MCP/skills injection, run-level imports, mounts, overlays, and kwargs disabled;
 - fail-closed rejection of unaudited Harbor retries;
 - explicit separation of scored task failures from provider, environment, runner, and verifier
   infrastructure failures.
@@ -883,11 +887,6 @@ The following remain required work before experiment launch:
 - bind the resolved pi-runner platform and child-manifest digest after cross-platform qualification;
 - make Harbor's remaining root and per-trial config, lock, and result writes crash-safe, or validate
   a fail-closed snapshot recovery procedure;
-- implement a fail-closed local Compose host policy from compatibility data, with an audited
-  allowlist for bind mounts and build contexts and unconditional rejection of privileged mode,
-  host devices, Docker socket access, build SSH forwarding, and any `HOST_*_PATH` or equivalent
-  evidence-path escape; apply it before provider or E2B credentials are loaded and before any paid
-  local task starts;
 - add deadline-aware, interruptible provider calls, prove provider and Harbor subprocess cleanup,
   freeze the timeout stack, and probe the Azure/Bedrock failure taxonomy;
 - classify candidate-authored request, context, and tool-schema 4xx failures as candidate zero
@@ -899,7 +898,7 @@ The following remain required work before experiment launch:
 - create E2B sandboxes from an immutable build reference and surface the exact resolved build ID
   before admitting E2B scores; keep E2B acceleration diagnostic-only until that boundary lands;
 - make remote, registry, and package task acquisition preserve symlinks for pre-read validation,
-  or keep scored search restricted to preflighted local dataset paths;
+  or keep all ground-truth evaluation restricted to preflighted local dataset paths;
 - add and fund a generic Claude Code control only if making a matched headline-uplift claim;
 - perform real local/E2B parity canaries on a machine with Docker and valid E2B credentials;
 - run leakage audits and the paid Azure/Bedrock matrices.
@@ -908,10 +907,9 @@ These gaps must close before a paid experiment run begins. They should be implem
 search, budgeting, and analysis components driven by experiment configuration, not as paper-named
 branches in the WMH core.
 
-As a compatibility check, the official Terminal-Bench 2 repository at commit
-`2fd12b88aafdd04a52c298e3940bcb189f9766d6` contained 89 task documents on July 18, 2026. All 89
-parsed under Harbor 0.18 without a separate verifier environment, so the evaluator's fail-closed
-separate-verifier restriction does not block that snapshot. This repository inspection does not
-establish compatibility with the paper-target commit `69671fbaac6d67a7ef0dfec016cc38a64ef7a77c`
-or its pinned terminal-bench package. It also does not replace freezing the Harbor registry
-resolution and per-task checksums used by the paid run.
+As a compatibility check on July 18, 2026, the official Terminal-Bench 2 repository at the pinned
+paper-target commit `69671fbaac6d67a7ef0dfec016cc38a64ef7a77c` contained 89 task documents. All
+89 passed Harbor 0.18 parsing, the strict local prebuilt-image policy, and the no-follow immutable
+dataset snapshot path; none uses a separate verifier environment. This source qualification does
+not replace freezing each resolved trial lock, task checksum, executed image digest/platform, or
+the pinned terminal-bench package commit in the paid-run manifest.

@@ -85,17 +85,62 @@ def build_harbor_job_config(spec: HarborJobSpec, *, agent: AgentConfig) -> JobCo
     if agent.n_concurrent != spec.agent_n_concurrent:
         raise ValueError("agent n_concurrent must already match HarborJobSpec.agent_n_concurrent")
     retry = RetryConfig(max_retries=0, include_exceptions=None)
-    return JobConfig(
+    config = JobConfig(
         job_name=spec.job_name,
         jobs_dir=spec.jobs_dir,
         n_attempts=spec.n_attempts,
         n_concurrent_trials=spec.n_concurrent_trials,
         datasets=[dataset.model_copy(deep=True) for dataset in spec.datasets],
         agents=[agent.model_copy(deep=True)],
-        environment=EnvironmentConfig(type=environment_type, delete=True),
+        environment=EnvironmentConfig(
+            type=environment_type,
+            import_path=None,
+            force_build=False,
+            delete=True,
+            mounts=None,
+            extra_docker_compose=[],
+            env={},
+            kwargs={},
+            extra_allowed_hosts=[],
+        ),
         retry=retry,
         artifacts=list(spec.artifact_paths),
     )
+    validate_controlled_harbor_environment(config.environment, expected_type=environment_type)
+    return config
+
+
+def validate_controlled_harbor_environment(
+    environment: EnvironmentConfig,
+    *,
+    expected_type: EnvironmentType | None = None,
+) -> None:
+    """Require WMH's credential-bearing Harbor process to control every host-facing input.
+
+    Task-authored environment definitions are checked separately. This boundary covers the
+    run-level Harbor environment configuration, which otherwise supports arbitrary imports,
+    host mounts, Compose overlays, host environment interpolation, and backend kwargs.
+    """
+    if environment.type not in {EnvironmentType.DOCKER, EnvironmentType.E2B}:
+        raise ValueError("Harbor environment type must be Docker or E2B")
+    if expected_type is not None and environment.type is not expected_type:
+        raise ValueError("Harbor environment type differs from the frozen job backend")
+    if environment.import_path is not None:
+        raise ValueError("Harbor environment import_path is unsupported")
+    if environment.force_build:
+        raise ValueError("Harbor environment force_build must remain disabled")
+    if not environment.delete:
+        raise ValueError("Harbor environment cleanup must remain enabled")
+    if environment.mounts:
+        raise ValueError("Harbor environment host mounts are unsupported")
+    if environment.extra_docker_compose:
+        raise ValueError("Harbor environment Compose overlays are unsupported")
+    if environment.env:
+        raise ValueError("Harbor environment host variables are unsupported")
+    if environment.kwargs:
+        raise ValueError("Harbor environment backend kwargs are unsupported")
+    if environment.extra_allowed_hosts:
+        raise ValueError("Harbor run-level extra allowed hosts are unsupported")
 
 
 def _require_supported_harbor_version() -> None:

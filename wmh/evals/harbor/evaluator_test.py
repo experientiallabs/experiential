@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -20,7 +21,7 @@ from harbor.models.job.lock import JobLock
 from harbor.models.job.result import JobResult, JobStats
 from harbor.models.metric.config import MetricConfig
 from harbor.models.metric.type import MetricType
-from harbor.models.registry import DatasetFileInfo, DatasetMetadata
+from harbor.models.registry import DatasetMetadata
 from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import AgentInfo, ExceptionInfo, ModelInfo, TrialResult
 from harbor.models.verifier.result import VerifierResult
@@ -75,7 +76,9 @@ def _write_task(
     task_dir = dataset_dir / task_name
     (task_dir / "environment").mkdir(parents=True)
     (task_dir / "tests").mkdir()
-    task_config = '[verifier]\nenvironment_mode = "separate"\n' if separate_verifier else ""
+    task_config = f'[environment]\ndocker_image = "example.invalid/{task_name}:frozen"\n'
+    if separate_verifier:
+        task_config += '[verifier]\nenvironment_mode = "separate"\n'
     if multi_step:
         task_config += '[[steps]]\nname = "first"\n\n[[steps]]\nname = "second"\n'
         for step_name in ("first", "second"):
@@ -214,38 +217,26 @@ def test_remote_dataset_executable_metric_is_rejected_from_metadata(
     assert names == [expected_name]
 
 
-def test_package_metric_file_cannot_run_or_reach_provider_or_e2b_environment(
+def test_remote_package_dataset_cannot_reach_metadata_provider_or_e2b_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
     leaked_values: list[str] = []
-    metadata = DatasetMetadata(
-        name="owner/benchmark",
-        version="sha256:dataset",
-        task_ids=[],
-        files=[
-            DatasetFileInfo(
-                path="metric.py",
-                storage_path="datasets/metric.py",
-                content_hash="sha256:metric",
-            )
-        ],
-    )
 
     class FakePackageClient:
         async def get_dataset_metadata(self, name: str) -> DatasetMetadata:
             events.append(f"metadata:{name}")
-            return metadata
+            raise AssertionError("remote dataset metadata must not be resolved")
 
     async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
         events.append("job-create")
         leaked_values.extend([os.environ["AZURE_OPENAI_API_KEY"], os.environ["E2B_API_KEY"]])
-        raise AssertionError("executable dataset metrics must fail before Harbor job creation")
+        raise AssertionError("remote datasets must fail before Harbor job creation")
 
     def unexpected_task_environment(_config: JobConfig) -> None:
         events.append("task-environment")
-        raise AssertionError("metric rejection must precede task-environment setup")
+        raise AssertionError("remote dataset rejection must precede task-environment setup")
 
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-provider-secret")
     monkeypatch.setenv("E2B_API_KEY", "e2b-secret")
@@ -260,31 +251,23 @@ def test_package_metric_file_cannot_run_or_reach_provider_or_e2b_environment(
         deep=True,
     )
 
-    with pytest.raises(mod.UnsupportedHarborMetricError, match="'metric.py'"):
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="local dataset paths"):
         asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
 
-    assert events == ["metadata:owner/benchmark@sha256:dataset"]
+    assert events == []
     assert leaked_values == []
     assert not (tmp_path / "jobs" / "evaluation").exists()
 
 
-def test_resolved_metric_recheck_closes_remote_metadata_mutation_window(
+def test_resolved_metric_recheck_closes_harbor_job_mutation_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    safe_metadata = DatasetMetadata(
-        name="owner/benchmark",
-        version="sha256:safe",
-        task_ids=[],
-    )
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
     metric_path = tmp_path / "mutated-metric.py"
     metric_path.write_text("raise AssertionError('must never execute')\n", encoding="utf-8")
-
-    class FakePackageClient:
-        async def get_dataset_metadata(self, name: str) -> DatasetMetadata:
-            events.append(f"audit:{name}")
-            return safe_metadata
 
     class MutatedJob:
         _metrics = {"owner/benchmark": [UvScript(metric_path)]}
@@ -300,19 +283,13 @@ def test_resolved_metric_recheck_closes_remote_metadata_mutation_window(
         events.append("create:mutated")
         return cast("Job", MutatedJob())
 
-    monkeypatch.setattr(mod, "PackageDatasetClient", FakePackageClient)
     monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(create_mutated_job))
-    spec = _spec(tmp_path, tmp_path / "unused").model_copy(
-        update={
-            "datasets": [DatasetConfig(name="owner/benchmark", ref="latest")],
-        },
-        deep=True,
-    )
+    spec = _spec(tmp_path, dataset)
 
     with pytest.raises(mod.UnsupportedHarborMetricError, match="resolved executable"):
         asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
 
-    assert events == ["audit:owner/benchmark@latest", "create:mutated", "closed"]
+    assert events == ["create:mutated", "closed"]
 
 
 def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_keys(
@@ -399,6 +376,8 @@ def test_runner_readiness_failure_precedes_harbor_job_and_task_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
 
     def fail_probe(*, image: str) -> None:
         assert image == mod.PI_CONTAINER_IMAGE
@@ -440,6 +419,8 @@ def test_e2b_missing_extra_fails_before_runner_or_harbor_job_creation(
     missing_module: str,
 ) -> None:
     events: list[str] = []
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
 
     def unexpected_probe(**_kwargs: object) -> None:
         events.append("runner-probe")
@@ -455,7 +436,7 @@ def test_e2b_missing_extra_fails_before_runner_or_harbor_job_creation(
     )
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
     monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
-    spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
+    spec = _spec(tmp_path, dataset).model_copy(
         update={"environment_backend": HarborEnvironmentBackend.E2B},
         deep=True,
     )
@@ -472,6 +453,8 @@ def test_e2b_missing_api_key_fails_before_runner_or_harbor_job_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
 
     def fail_preflight(**_kwargs: object) -> None:
         events.append("task-preflight")
@@ -487,7 +470,7 @@ def test_e2b_missing_api_key_fails_before_runner_or_harbor_job_creation(
     monkeypatch.setattr(mod.EnvironmentFactory, "run_preflight", fail_preflight)
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
     monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
-    spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
+    spec = _spec(tmp_path, dataset).model_copy(
         update={"environment_backend": HarborEnvironmentBackend.E2B},
         deep=True,
     )
@@ -634,6 +617,7 @@ def test_e2b_backend_is_bound_into_harbor_config_and_run_identity(
 
     async def fake_run(job: Job) -> None:
         captured["environment"] = job.config.environment.type
+        captured["dataset_path"] = job.config.datasets[0].path
         captured["manifest"] = HarborTrialManifest.model_validate_json(
             (job.job_dir / mod._MANIFEST_FILENAME).read_text(encoding="utf-8")
         )
@@ -648,6 +632,9 @@ def test_e2b_backend_is_bound_into_harbor_config_and_run_identity(
 
     assert result is sentinel
     assert captured["environment"] is EnvironmentType.E2B
+    dataset_path = cast("Path", captured["dataset_path"])
+    assert dataset_path != dataset.resolve()
+    assert dataset_path.is_relative_to((tmp_path / "jobs" / mod._TASK_SNAPSHOT_ROOT).resolve())
     manifest = cast("HarborTrialManifest", captured["manifest"])
     assert manifest.identity.task_environment is BenchmarkTaskEnvironment.E2B
 
@@ -1031,7 +1018,7 @@ def test_interrupted_job_rejects_malformed_completed_result_instead_of_overwriti
     assert malformed_result.read_text(encoding="utf-8") == "{"
 
 
-def test_interrupted_job_rejects_changed_resolved_task_lock(
+def test_interrupted_job_rejects_changed_local_dataset_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1062,10 +1049,332 @@ def test_interrupted_job_rejects_changed_resolved_task_lock(
         raise AssertionError("changed task lock must be rejected before Harbor runs")
 
     monkeypatch.setattr(Job, "run", unexpected_run)
-    with pytest.raises(mod.StaleHarborJobError, match="newly resolved task inputs"):
+    with pytest.raises(mod.StaleHarborJobError, match="job config does not match"):
         asyncio.run(evaluator.evaluate(candidate))
 
     assert completed_result_path.read_bytes() == completed_result_before
+
+
+def _local_snapshot_config(tmp_path: Path, dataset: Path) -> JobConfig:
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+    agent = evaluator._build_agent(pi_node_baseline("candidate"))
+    config = mod.build_harbor_job_config(evaluator._spec, agent=agent)
+    return mod._snapshot_local_datasets(config)
+
+
+def test_local_docker_runs_harbor_from_read_only_snapshot_not_live_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    captured: dict[str, Path] = {}
+    sentinel = cast("LoadedHarborJobResult", object())
+
+    async def inspect_run(job: Job) -> None:
+        snapshot = job.config.datasets[0].path
+        assert snapshot is not None
+        captured["snapshot"] = snapshot
+        assert snapshot != dataset.resolve()
+        assert snapshot.name == dataset.name
+        assert snapshot.is_relative_to((tmp_path / "jobs" / mod._TASK_SNAPSHOT_ROOT).resolve())
+        assert all(
+            item.stat(follow_symlinks=False).st_mode & 0o222 == 0
+            for item in (snapshot, *snapshot.rglob("*"))
+        )
+
+        # This is the precise validation-to-execution mutation that the snapshot closes. Harbor's
+        # already-resolved config and every trial path must remain rooted in the frozen copy.
+        (task_dir / "environment" / "docker-compose.yaml").write_text(
+            "services:\n  main:\n    privileged: true\n",
+            encoding="utf-8",
+        )
+        assert not (snapshot / task_dir.name / "environment" / "docker-compose.yaml").exists()
+        assert all(
+            config.task.path is not None and config.task.path.is_relative_to(snapshot)
+            for config in job._trial_configs
+        )
+
+    monkeypatch.setattr(Job, "run", inspect_run)
+    monkeypatch.setattr(mod, "load_harbor_job_result", lambda *_args: sentinel)
+
+    result = asyncio.run(
+        mod.HarborEvaluator(_spec(tmp_path, dataset), _provider()).evaluate(
+            pi_node_baseline("candidate")
+        )
+    )
+
+    assert result is sentinel
+    assert captured["snapshot"].is_dir()
+
+
+def test_identical_local_dataset_reuses_exact_snapshot_path(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+
+    first = _local_snapshot_config(tmp_path, dataset)
+    second = _local_snapshot_config(tmp_path, dataset)
+
+    assert first.datasets[0].path == second.datasets[0].path
+
+
+def test_read_only_snapshot_remains_traversable_by_non_root_container_users(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    executable = task_dir / "environment" / "setup.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    frozen = _local_snapshot_config(tmp_path, dataset)
+    snapshot = frozen.datasets[0].path
+    assert snapshot is not None
+
+    directories = [snapshot, *(path for path in snapshot.rglob("*") if path.is_dir())]
+    files = [path for path in snapshot.rglob("*") if path.is_file()]
+    assert all(
+        stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) == 0o555 for path in directories
+    )
+    assert all(
+        stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) & 0o444 == 0o444 for path in files
+    )
+    assert (
+        stat.S_IMODE((snapshot / task_dir.name / "environment" / "setup.sh").stat().st_mode)
+        == 0o555
+    )
+
+
+def test_local_dataset_content_change_selects_new_snapshot_without_mutating_old(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    first = _local_snapshot_config(tmp_path, dataset)
+    first_path = first.datasets[0].path
+    assert first_path is not None
+    frozen_instruction = first_path / task_dir.name / "instruction.md"
+    frozen_bytes = frozen_instruction.read_bytes()
+
+    (task_dir / "instruction.md").write_text("Changed task.\n", encoding="utf-8")
+    second = _local_snapshot_config(tmp_path, dataset)
+
+    assert second.datasets[0].path != first_path
+    assert frozen_instruction.read_bytes() == frozen_bytes
+
+
+def test_snapshot_digest_frames_file_content_before_the_next_tree_record(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    first_file = task_dir / "zz-a"
+    second_file = task_dir / "zz-b"
+
+    def framed(value: bytes) -> bytes:
+        return len(value).to_bytes(8, "big") + value
+
+    # Under the legacy unframed stream, this suffix is byte-for-byte the record that follows
+    # `zz-a` in the two-file tree below, so both distinct source trees had the same digest.
+    first_file.write_bytes(
+        b"payload-a"
+        + framed(b"file")
+        + framed(second_file.relative_to(dataset).as_posix().encode())
+        + framed((0).to_bytes(2, "big"))
+        + b"payload-b"
+    )
+    first = _local_snapshot_config(tmp_path, dataset)
+    first_path = first.datasets[0].path
+    assert first_path is not None
+
+    first_file.write_bytes(b"payload-a")
+    second_file.write_bytes(b"payload-b")
+    second = _local_snapshot_config(tmp_path, dataset)
+
+    assert second.datasets[0].path != first_path
+
+
+def test_existing_local_dataset_snapshot_must_remain_read_only(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    first = _local_snapshot_config(tmp_path, dataset)
+    snapshot = first.datasets[0].path
+    assert snapshot is not None
+    frozen_instruction = snapshot / task_dir.name / "instruction.md"
+    frozen_instruction.chmod(0o600)
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="must remain read-only"):
+        _local_snapshot_config(tmp_path, dataset)
+
+
+def test_copied_local_dataset_is_revalidated_before_snapshot_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    real_preflight = mod._preflight_local_task_trees
+
+    def inject_compose_before_copied_tree_preflight(config: JobConfig) -> None:
+        copied_dataset = config.datasets[0].path
+        if copied_dataset is not None and any(
+            part.startswith(".pending-") for part in copied_dataset.parts
+        ):
+            (copied_dataset / task_dir.name / "environment" / "docker-compose.yaml").write_text(
+                "services: {}\n",
+                encoding="utf-8",
+            )
+        real_preflight(config)
+
+    monkeypatch.setattr(
+        mod,
+        "_preflight_local_task_trees",
+        inject_compose_before_copied_tree_preflight,
+    )
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="Docker Compose"):
+        _local_snapshot_config(tmp_path, dataset)
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "fifo"])
+def test_snapshot_copy_rejects_file_swapped_at_nofollow_open_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    instruction = task_dir / "instruction.md"
+    outside = tmp_path / "outside-secret"
+    secret = "outside-secret-must-not-enter-snapshot"
+    outside.write_text(secret, encoding="utf-8")
+    mod._require_secure_copy_primitives()
+    monkeypatch.setattr(mod, "_require_secure_copy_primitives", lambda: None)
+    real_open = mod.os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if (
+            not swapped
+            and path == "instruction.md"
+            and dir_fd is not None
+            and flags & os.O_NOFOLLOW
+            and not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT)
+        ):
+            instruction.unlink()
+            if replacement == "symlink":
+                instruction.symlink_to(outside)
+            else:
+                os.mkfifo(instruction)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(mod.os, "open", racing_open)
+
+    with pytest.raises(mod.UnsupportedHarborTaskError) as caught:
+        _local_snapshot_config(tmp_path, dataset)
+
+    assert swapped is True
+    assert secret not in str(caught.value)
+    published = tmp_path / "jobs" / mod._TASK_SNAPSHOT_ROOT
+    assert not any(path.name == dataset.name for path in published.rglob(dataset.name))
+
+
+def test_snapshot_binds_dataset_root_identity_before_path_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    moved = tmp_path / "original-dataset"
+    requested = dataset.absolute()
+    real_resolve = Path.resolve
+    swapped = False
+
+    def racing_resolve(path: Path, strict: bool = False) -> Path:
+        nonlocal swapped
+        if not swapped and path == requested:
+            dataset.rename(moved)
+            _write_task(dataset)
+            swapped = True
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", racing_resolve)
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="changed identity"):
+        _local_snapshot_config(tmp_path, dataset)
+
+    assert swapped is True
+
+
+def test_snapshot_source_rejects_hardlinked_regular_file(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    outside = tmp_path / "outside"
+    outside.write_text("must not be copied\n", encoding="utf-8")
+    instruction = task_dir / "instruction.md"
+    instruction.unlink()
+    os.link(outside, instruction)
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="single-link|changed identity"):
+        _local_snapshot_config(tmp_path, dataset)
+
+
+def test_snapshot_namespace_must_not_be_group_or_world_writable(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    jobs_dir = tmp_path / "jobs"
+    snapshots_root = jobs_dir / mod._TASK_SNAPSHOT_ROOT
+    snapshots_root.mkdir(parents=True)
+    snapshots_root.chmod(0o777)
+
+    try:
+        with pytest.raises(mod.UnsupportedHarborTaskError, match="group/world writable"):
+            _local_snapshot_config(tmp_path, dataset)
+    finally:
+        snapshots_root.chmod(0o700)
+
+
+def test_local_docker_rejects_remote_dataset_before_harbor_job_creation(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path, tmp_path / "unused").model_copy(
+        update={"datasets": [DatasetConfig(name="terminal-bench", version="v2")]},
+        deep=True,
+    )
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="local dataset paths"):
+        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+
+
+def test_local_dataset_and_jobs_directory_cannot_contain_one_another(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    spec = _spec(tmp_path, dataset).model_copy(update={"jobs_dir": dataset / "jobs"}, deep=True)
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="must not contain one another"):
+        asyncio.run(mod.HarborEvaluator(spec, _provider()).evaluate(pi_node_baseline("candidate")))
+
+
+def test_local_datasets_require_unambiguous_harbor_source_names(tmp_path: Path) -> None:
+    dataset_a = tmp_path / "a" / "dataset"
+    dataset_b = tmp_path / "b" / "dataset"
+    _write_task(dataset_a, "task-a")
+    _write_task(dataset_b, "task-b")
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="unique directory names"):
+        asyncio.run(
+            mod.HarborEvaluator(_spec(tmp_path, dataset_a, dataset_b), _provider()).evaluate(
+                pi_node_baseline("candidate")
+            )
+        )
 
 
 def test_zero_resolved_trials_are_rejected_before_manifest_or_run(
@@ -1347,6 +1656,116 @@ def test_unselected_local_sibling_is_preflighted_before_harbor_scans_dataset(
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
 
+def test_local_task_requires_prebuilt_image_before_harbor_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    (task_dir / "task.toml").write_text("", encoding="utf-8")
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("Dockerfile-only task must fail before Harbor reads it")
+
+    monkeypatch.setattr(Job, "create", classmethod(unexpected_create))
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="prebuilt-image policy") as caught:
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
+    assert "docker_image" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("relative_source", "contents", "reason"),
+    [
+        (
+            "docker-compose.yaml",
+            "services:\n"
+            "  main:\n"
+            "    build: {context: /}\n"
+            "    privileged: true\n"
+            "    network_mode: host\n"
+            "    devices: [/dev/disk0:/dev/disk0]\n"
+            "    volumes: [/:/host]\n"
+            "secrets: {prod: {file: /host/secret}}\n"
+            "configs: {prod: {file: /host/config}}\n",
+            "Docker Compose",
+        ),
+        ("nested/benchmark-compose.yml", "services: {}\n", "Docker Compose"),
+        (".env", "PROD_SECRET=must-not-surface\n", "dotenv"),
+        ("nested/runtime.env", "TOKEN=must-not-surface\n", "dotenv"),
+    ],
+)
+def test_local_task_rejects_host_capability_sources_before_harbor_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_source: str,
+    contents: str,
+    reason: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    source = task_dir / "environment" / relative_source
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(contents, encoding="utf-8")
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("host-capability task source must fail before Harbor reads it")
+
+    monkeypatch.setattr(Job, "create", classmethod(unexpected_create))
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match=reason) as caught:
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
+    assert "must-not-surface" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "task_config",
+    [
+        "[environment]\n"
+        'docker_image = "example.invalid/task:frozen"\n'
+        "[environment.env]\n"
+        'MODE = "${UNPROTECTED_HOST_VALUE}"\n',
+        "[environment]\n"
+        'docker_image = "example.invalid/task:frozen"\n'
+        "[environment.env]\n"
+        'PATH = "/task-controlled/bin"\n'
+        'DOCKER_HOST = "tcp://task-controlled.invalid:2375"\n',
+        "[environment]\n"
+        'docker_image = "example.invalid/task:frozen"\n'
+        "[verifier.env]\n"
+        'DOCKER_CONTEXT = "task-controlled"\n',
+        '[environment]\ndocker_image = "example.invalid/task:${IMAGE_TAG}"\n',
+        "[environment]\n"
+        'docker_image = "example.invalid/task:frozen"\n'
+        'skills_dir = "../host-skills"\n',
+        "[environment]\n"
+        'docker_image = "example.invalid/task:frozen"\n'
+        'mcp_servers = [{name = "host", command = "host-tool"}]\n',
+    ],
+)
+def test_local_task_rejects_host_resolved_configuration_before_harbor_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_config: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    (task_dir / "task.toml").write_text(task_config, encoding="utf-8")
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("host-resolved task config must fail before Harbor reads it")
+
+    monkeypatch.setattr(Job, "create", classmethod(unexpected_create))
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="prebuilt-image policy"):
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
+
 @pytest.mark.parametrize("keep_dockerfile", [False, True])
 @pytest.mark.parametrize("compose_filename", ["docker-compose.yaml", "docker-compose.yml"])
 def test_e2b_rejects_every_task_authored_compose_source_before_run(
@@ -1387,7 +1806,10 @@ def test_task_host_credential_reference_is_rejected_before_manifest_or_run(
     dataset = tmp_path / "dataset"
     task_dir = _write_task(dataset)
     (task_dir / "task.toml").write_text(
-        '[environment.env]\nTASK_AUTH = "${AZURE_OPENAI_API_KEY}"\n',
+        "[environment]\n"
+        'docker_image = "example.invalid/shared-task:frozen"\n'
+        "[environment.env]\n"
+        'TASK_AUTH = "${AZURE_OPENAI_API_KEY}"\n',
         encoding="utf-8",
     )
     secret = "credential-value-must-not-appear"
@@ -1403,13 +1825,16 @@ def test_task_host_credential_reference_is_rejected_before_manifest_or_run(
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
     message = str(caught.value)
-    assert "host credential boundary" in message
-    assert "AZURE_OPENAI_API_KEY" in message
+    assert "prebuilt-image policy" in message
+    assert "cannot define environment maps" in message
     assert secret not in message
     assert not (tmp_path / "jobs" / "evaluation" / mod._MANIFEST_FILENAME).exists()
 
 
-@pytest.mark.parametrize("job_name", ["../escape", "nested/job", "nested\\job"])
+@pytest.mark.parametrize(
+    "job_name",
+    ["../escape", "nested/job", "nested\\job", mod._TASK_SNAPSHOT_ROOT],
+)
 def test_job_name_must_be_one_safe_component(tmp_path: Path, job_name: str) -> None:
     dataset = tmp_path / "dataset"
     _write_task(dataset)

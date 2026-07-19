@@ -9,6 +9,7 @@ constructs an environment.
 from __future__ import annotations
 
 import re
+import tomllib
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -103,6 +104,105 @@ class TaskCredentialBoundaryError(ValueError):
             )
             details.append(f"task Compose credential audit failed closed ({failure_details})")
         super().__init__("; ".join(details) + "; credential values were not read")
+
+
+class PrebuiltImageTaskBoundaryError(ValueError):
+    """A task could make Harbor consume host state instead of one prebuilt image."""
+
+
+def validate_prebuilt_image_task_tree(task_dir: Path) -> None:
+    """Require a task source that can only select a prebuilt container image.
+
+    Harbor's local Docker backend otherwise accepts task-authored Compose files and resolves
+    environment templates from the credential-bearing host. Scored local evaluations use a
+    prebuilt image, with ``force_build`` controlled by WMH, so task Dockerfiles may remain as
+    provenance but cannot be selected for execution.
+
+    The caller must first establish that ``task_dir`` is a bounded, symlink-free task tree.
+    This function intentionally reports only source locations and policy reasons, never task
+    values that might have been interpolated from the host.
+    """
+    config_path = task_dir / "task.toml"
+    try:
+        document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml must be readable, valid UTF-8 TOML before Harbor job creation"
+        ) from exc
+
+    raw_environment = document.get("environment")
+    if not isinstance(raw_environment, dict):
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml must define an [environment] table with docker_image"
+        )
+    docker_image = raw_environment.get("docker_image")
+    if not isinstance(docker_image, str) or not docker_image.strip():
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml [environment].docker_image must select a prebuilt image"
+        )
+    if (
+        docker_image != docker_image.strip()
+        or "$" in docker_image
+        or any(character.isspace() or ord(character) < 32 for character in docker_image)
+    ):
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml [environment].docker_image must be one literal image reference"
+        )
+    if raw_environment.get("skills_dir") is not None:
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml [environment].skills_dir is unsupported for prebuilt-image evaluation"
+        )
+    if raw_environment.get("mcp_servers"):
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml [environment].mcp_servers is unsupported for prebuilt-image evaluation"
+        )
+    if _contains_nonempty_env_mapping(document):
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml cannot define environment maps for prebuilt-image evaluation"
+        )
+    if _contains_host_interpolation(document):
+        raise PrebuiltImageTaskBoundaryError(
+            "task.toml cannot contain host environment interpolation"
+        )
+
+    environment_dir = task_dir / "environment"
+    if not environment_dir.is_dir():
+        raise PrebuiltImageTaskBoundaryError("task environment directory must be a directory")
+    for path in environment_dir.rglob("*"):
+        name = path.name.lower()
+        if path.is_file() and (name == ".env" or path.suffix.lower() == ".env"):
+            raise PrebuiltImageTaskBoundaryError("task environment cannot contain dotenv sources")
+        if (
+            path.is_file()
+            and path.suffix.lower() in {".yaml", ".yml"}
+            and "compose" in path.stem.lower()
+        ):
+            raise PrebuiltImageTaskBoundaryError(
+                "task environment cannot contain task-authored Docker Compose sources"
+            )
+
+
+def _contains_host_interpolation(value: object) -> bool:
+    if isinstance(value, str):
+        return "${" in value
+    if isinstance(value, Mapping):
+        return any(_contains_host_interpolation(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_host_interpolation(item) for item in value)
+    return False
+
+
+def _contains_nonempty_env_mapping(value: object) -> bool:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key == "env" and isinstance(item, Mapping) and item:
+                return True
+            if _contains_nonempty_env_mapping(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_nonempty_env_mapping(item) for item in value)
+    return False
 
 
 class _ComposeDocumentError(ValueError):

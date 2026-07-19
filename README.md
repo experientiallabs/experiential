@@ -58,8 +58,16 @@ uv run wmh harness eval pi-baseline@champion \
   --attempts 1 --concurrency 1 --out result.json
 ```
 
-Local Docker task environments are the default. E2B changes only Harbor's task environment: the
-isolated pi runner still runs in local Docker, so Docker is required for both backend choices.
+Local Docker task environments are the default. Local tasks must name a prebuilt image; WMH keeps
+Harbor builds disabled and rejects task-authored Compose, dotenv, host interpolation, MCP, and
+skills sources before Harbor creates the job. WMH runs local dataset inputs from validated,
+content-addressed read-only snapshots under both backends. E2B changes only Harbor's task
+environment: the isolated pi runner still runs in local Docker, so Docker is required for both
+backend choices. Ground-truth evaluation currently requires local dataset paths under both
+backends because Harbor's remote acquisition can dereference task symlinks before WMH validates
+them. Use a private checkout owned by the evaluator user on one filesystem; writable-by-group,
+writable-by-others, hardlinked, symlinked, and cross-filesystem task entries fail closed.
+
 Install the E2B extra and select it explicitly to fan task environments out through E2B:
 
 ```bash
@@ -73,12 +81,11 @@ uv run wmh harness eval pi-baseline@champion \
   --task-backend e2b --concurrency 50 --out result-e2b.json
 ```
 
-WMH does not inject provider credentials into the task or pi-runner environment. Before Harbor
-constructs an environment, WMH rejects credential-like host variable references in task
-environment maps and task-owned Compose sources. This is a credential boundary, not a sandbox for
-malicious task definitions: use only a frozen dataset whose Dockerfiles, Compose files, mounts,
-images, scripts, and verifier inputs have been audited. Every paid run asks for confirmation unless
-`--yes` is supplied. See the
+WMH does not inject provider credentials into the task or pi-runner environment. The local
+prebuilt-image policy also rejects run-level environment imports, host mounts, Compose overlays,
+host variables, and backend kwargs. A container image and verifier are still executable inputs, so
+use only a frozen dataset whose image digests, scripts, and verifier inputs have been audited.
+Every paid run asks for confirmation unless `--yes` is supplied. See the
 [ground-truth harness evaluation protocol](./docs/reference/ground_truth_harness_eval.md) for run
 identity, backend parity, analysis, and budget gates.
 
