@@ -1470,6 +1470,12 @@ class PairedHarborRunner:
         _replace_pair_generation_state(self._pair_state_path(evidence.block), completed)
 
     def _fail_pair_generation(self, current: PairedHarborPairGenerationState) -> None:
+        if current.status == "complete":
+            return
+        if current.status != "running":
+            raise PairedHarborPairStateError(
+                "only a running paired Harbor generation can become failed"
+            )
         failed = self._pair_state(current.block, status="failed")
         _replace_pair_generation_state(self._pair_state_path(current.block), failed)
 

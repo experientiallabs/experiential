@@ -828,6 +828,23 @@ def test_pair_state_replacement_closes_descriptor_when_setup_fails(
     assert not temporary_path.exists()
 
 
+def test_completed_pair_generation_cannot_be_downgraded_to_failed(tmp_path: Path) -> None:
+    runner = _runner(tmp_path, _candidate())
+    block = runner._protocol.design.blocks[0]
+    completed = runner._pair_state(
+        block,
+        status="complete",
+        baseline_admission_digest="sha256:" + "a" * 64,
+        candidate_admission_digest="sha256:" + "b" * 64,
+    )
+    path = runner._pair_state_path(block)
+    mod._create_pair_generation_state(path, completed)
+
+    runner._fail_pair_generation(completed)
+
+    assert mod._read_pair_generation_state(path) == completed
+
+
 def test_partial_existing_pair_is_rejected_before_any_provider_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
