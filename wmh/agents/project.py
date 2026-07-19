@@ -95,6 +95,10 @@ class AgentProject:
     ) -> None:
         self._sandbox = sandbox
         self.workspace = workspace.rstrip("/")
+        # Optimizer audit records live beside the agent-visible workspace. Project tools are
+        # rooted strictly at ``workspace``, so the ordinary meta agent cannot enumerate or read
+        # holdout material even though the host can retain it across proposer instances.
+        self._private_workspace = f"{self.workspace}.wmh-internal"
         self._channel_factory = channel_factory or _start_channel
         # Replacing a caller-owned sandbox would exceed this object's authority. Injected test or
         # application sandboxes still get the bounded fresh-session retry in the same filesystem.
@@ -113,6 +117,7 @@ class AgentProject:
         # Keep an in-process mirror of mediated writes so a dead E2B transport can be replaced
         # without discarding the prior proposals that make this a persistent meta-agent project.
         self._file_contents: dict[str, str] = {}
+        self._private_file_contents: dict[str, str] = {}
         self._channel: Channel | None = None
         self._session: LiveSession | None = None
         self._session_agent_hash: str | None = None
@@ -188,6 +193,40 @@ class AgentProject:
                 return self._file_contents[relative]
             raise
         self._file_contents[relative] = content
+        return content
+
+    def write_private_text(self, path: str, content: str) -> None:
+        """Write one host-only audit file outside the agent-visible project workspace."""
+        if self._closing:
+            raise RuntimeError("cannot write to a closed project")
+        absolute = self._private_absolute_path(path)
+        try:
+            self._write_sandbox_file(self._sandbox, absolute, content)
+        except Exception as error:
+            if self._sandbox_factory is None or not _is_recoverable_transport_error(error):
+                raise
+            try:
+                self._replace_sandbox()
+                self._write_sandbox_file(self._sandbox, absolute, content)
+            except Exception as recovery_error:
+                raise RuntimeError(
+                    f"{error}; fresh project sandbox recovery failed: {recovery_error}"
+                ) from recovery_error
+        self._private_file_contents[self._private_relative_path(absolute)] = content
+
+    def read_private_text(self, path: str) -> str:
+        """Read one host-only audit file without admitting it to project tools."""
+        if self._closing:
+            raise RuntimeError("cannot read from a closed project")
+        absolute = self._private_absolute_path(path)
+        relative = self._private_relative_path(absolute)
+        try:
+            content = self._sandbox.files.read(absolute)
+        except Exception:
+            if relative in self._private_file_contents:
+                return self._private_file_contents[relative]
+            raise
+        self._private_file_contents[relative] = content
         return content
 
     def run(
@@ -506,11 +545,30 @@ class AgentProject:
         """Return one already-contained absolute path relative to the project root."""
         return PurePosixPath(absolute).relative_to(PurePosixPath(self.workspace)).as_posix()
 
+    def _private_absolute_path(self, path: str) -> str:
+        """Resolve a relative path beneath the host-only audit root."""
+        candidate = PurePosixPath(path)
+        if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
+            raise ValueError(f"expected a relative private project path, got {path!r}")
+        return f"{self._private_workspace}/{candidate.as_posix()}"
+
+    def _private_relative_path(self, absolute: str) -> str:
+        """Return one already-contained path relative to the host-only audit root."""
+        return (
+            PurePosixPath(absolute).relative_to(PurePosixPath(self._private_workspace)).as_posix()
+        )
+
     def _initialize_sandbox(self, sandbox: SandboxHandle) -> None:
         """Create the workspace and replay the authoritative project-file mirror."""
-        sandbox.commands.run(f"mkdir -p {shlex.quote(self.workspace)}", timeout=30)
+        sandbox.commands.run(
+            f"mkdir -p {shlex.quote(self.workspace)} {shlex.quote(self._private_workspace)}",
+            timeout=30,
+        )
         for relative, content in self._file_contents.items():
             absolute = f"{self.workspace}/{relative}"
+            self._write_sandbox_file(sandbox, absolute, content)
+        for relative, content in self._private_file_contents.items():
+            absolute = f"{self._private_workspace}/{relative}"
             self._write_sandbox_file(sandbox, absolute, content)
 
     @staticmethod

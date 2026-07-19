@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Callable, Collection
@@ -10,10 +11,16 @@ from typing import Protocol
 
 from wmh.agents.project import AgentProjectRun
 from wmh.core.types import JsonObject
-from wmh.harness.delta import FailureSignature, HarnessDelta, apply_delta
+from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta
 from wmh.harness.runtime import HarnessSearchCancelled
+from wmh.harness.scoring import (
+    HarnessScoreArchive,
+    ScoreArchiveVisibility,
+    canonical_score_json,
+    render_task_score_archive,
+)
 from wmh.providers.base import Provider, ToolCallingProvider
 
 _CONTEXT_CONTENT_CHUNK_CHARS = 12_000
@@ -39,6 +46,10 @@ class AgentProject(Protocol):
     def write_text(self, path: str, content: str) -> None: ...
 
     def read_text(self, path: str) -> str: ...
+
+    def write_private_text(self, path: str, content: str) -> None: ...
+
+    def read_private_text(self, path: str) -> str: ...
 
     def run(
         self,
@@ -75,6 +86,8 @@ class ProposalFailure:
 
 class ProviderDeltaProposer:
     """Adapt the original single-completion proposer to the batched search contract."""
+
+    score_archive_required = False
 
     def __init__(self, provider: Provider) -> None:
         self._provider = provider
@@ -118,6 +131,8 @@ class ProviderDeltaProposer:
 
 class ProjectDeltaProposer:
     """Wire a normal agent in a persistent project into harness search."""
+
+    score_archive_required = True
 
     def __init__(
         self,
@@ -171,6 +186,26 @@ class ProjectDeltaProposer:
             json.dumps(parent_context, indent=2),
             should_cancel=should_cancel,
         )
+        parent_evaluation_manifests = self._visible_evaluation_manifests(parent.doc_hash)
+        _write_project_text(
+            self._project,
+            f"{context_dir}/parent-evaluations.json",
+            json.dumps(
+                {
+                    "kind": "harness-evaluation-index",
+                    "harness_doc_hash": parent.doc_hash,
+                    "report_manifests": parent_evaluation_manifests,
+                    "content_contract": (
+                        "Each report manifest contains exact request and report summary metadata "
+                        "plus a compact task index. Read that index first, then select only the "
+                        "relevant successful or failed task manifests and their structured "
+                        "records or derived evidence."
+                    ),
+                },
+                indent=2,
+            ),
+            should_cancel=should_cancel,
+        )
         evidence_context = _materialize_context_content(
             self._project,
             evidence,
@@ -197,6 +232,11 @@ class ProjectDeltaProposer:
                     delta,
                     proposal_file=self._proposal_files.get(delta.delta_id),
                     evaluation_dir=self._evaluation_dirs.get(delta.delta_id),
+                    score_report_manifests=(
+                        self._visible_evaluation_manifests(delta.child_doc_hash)
+                        if delta.child_doc_hash is not None
+                        else ()
+                    ),
                     workspace=self._project.workspace,
                 )
                 for delta in history
@@ -430,6 +470,113 @@ class ProjectDeltaProposer:
                 )
         return proposals
 
+    def record_harness_evaluation(
+        self,
+        harness: HarnessDoc,
+        *,
+        archive: HarnessScoreArchive,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
+        """Commit one exact score archive, exposing only discovery evidence to the proposer."""
+        should_cancel = should_cancel or self._should_cancel
+        _check_cancelled(should_cancel)
+        identity = (
+            harness.doc_hash,
+            archive.scorer_tier.value,
+            archive.report.evaluation_id,
+        )
+        identity_digest = hashlib.sha256("\0".join(identity).encode()).hexdigest()
+        private_root = f"score-archives/records/{identity_digest}"
+        private_manifest_path = f"{private_root}/manifest.json"
+        request_file = f"{private_root}/request.json"
+        report_file = f"{private_root}/report.json"
+        request_json = canonical_score_json(archive.request)
+        report_json = canonical_score_json(archive.report)
+        archive_json = canonical_score_json(archive)
+        archive_digest = _content_digest(archive_json)
+        expected: JsonObject = {
+            "kind": "harness-score-archive",
+            "schema_version": archive.schema_version,
+            "identity": {
+                "harness_doc_hash": harness.doc_hash,
+                "scorer_tier": archive.scorer_tier.value,
+                "evaluation_id": archive.report.evaluation_id,
+            },
+            "harness_execution_hash": harness.execution_hash,
+            "visibility": archive.visibility.value,
+            "purpose": archive.request.purpose,
+            "request_file": request_file,
+            "request_sha256": _content_digest(request_json),
+            "report_file": report_file,
+            "report_sha256": _content_digest(report_json),
+            "archive_sha256": archive_digest,
+        }
+        existing = _read_optional_private_project_text(self._project, private_manifest_path)
+        if existing is None:
+            _write_private_project_text(
+                self._project,
+                request_file,
+                request_json,
+                should_cancel=should_cancel,
+            )
+            _write_private_project_text(
+                self._project,
+                report_file,
+                report_json,
+                should_cancel=should_cancel,
+            )
+            # The manifest is the commit point. Orphan request/report files from cancellation are
+            # harmless and may be overwritten, but a committed identity is immutable.
+            _write_private_project_text(
+                self._project,
+                private_manifest_path,
+                _canonical_json(expected),
+                should_cancel=should_cancel,
+            )
+        else:
+            _verify_private_score_archive(
+                self._project,
+                existing=existing,
+                expected=expected,
+                archive=archive,
+            )
+
+        public_manifest: str | None = None
+        if archive.visibility is ScoreArchiveVisibility.PROPOSER:
+            public_manifest = _materialize_visible_score_archive(
+                self._project,
+                harness=harness,
+                archive=archive,
+                identity_digest=identity_digest,
+                archive_digest=archive_digest,
+                should_cancel=should_cancel,
+            )
+        _upsert_private_harness_index(
+            self._project,
+            harness_doc_hash=harness.doc_hash,
+            identity_digest=identity_digest,
+            private_manifest_path=private_manifest_path,
+            public_manifest_path=public_manifest,
+            should_cancel=should_cancel,
+        )
+
+    def _visible_evaluation_manifests(self, harness_doc_hash: str) -> list[str]:
+        """Reconstruct proposer-visible report pointers from the durable private index."""
+        path = _private_harness_index_path(harness_doc_hash)
+        content = _read_optional_private_project_text(self._project, path)
+        if content is None:
+            return []
+        _records, manifests = _parse_private_harness_index(
+            content, harness_doc_hash=harness_doc_hash
+        )
+        for manifest in manifests:
+            _verify_visible_score_manifest(
+                self._project,
+                manifest,
+                harness_doc_hash=harness_doc_hash,
+            )
+        return [f"{self._project.workspace}/{item}" for item in manifests]
+
     def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
         """Persist one candidate's judged evidence for later project-agent iterations."""
         should_cancel = self._should_cancel
@@ -492,6 +639,305 @@ def _read_project_text(
     content = project.read_text(path)
     _check_cancelled(should_cancel)
     return content
+
+
+def _write_private_project_text(
+    project: AgentProject,
+    path: str,
+    content: str,
+    *,
+    should_cancel: Callable[[], bool] | None,
+) -> None:
+    """Make each host-only audit write a cancellation boundary."""
+    _check_cancelled(should_cancel)
+    project.write_private_text(path, content)
+    _check_cancelled(should_cancel)
+
+
+def _read_optional_private_project_text(project: AgentProject, path: str) -> str | None:
+    """Return a private file or ``None`` only for a proven missing-file error."""
+    try:
+        return project.read_private_text(path)
+    except Exception as error:  # noqa: BLE001 - E2B uses a provider-specific not-found type
+        if _is_missing_file_error(error):
+            return None
+        raise
+
+
+def _is_missing_file_error(error: Exception) -> bool:
+    """Recognize local and E2B missing-file errors without hiding transport failures."""
+    if isinstance(error, (FileNotFoundError, KeyError)):
+        return True
+    error_name = type(error).__name__.lower()
+    text = str(error).lower()
+    return "notfound" in error_name or "not found" in text or "no such file" in text
+
+
+def _content_digest(content: str) -> str:
+    """Return the UTF-8 SHA-256 used by durable score records."""
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _canonical_json(value: object) -> str:
+    """Serialize already-validated archive metadata deterministically."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _verify_private_score_archive(
+    project: AgentProject,
+    *,
+    existing: str,
+    expected: JsonObject,
+    archive: HarnessScoreArchive,
+) -> None:
+    """Verify a committed archive before treating a retry as idempotent."""
+    try:
+        manifest = json.loads(existing)
+    except json.JSONDecodeError as error:
+        raise ValueError("committed harness score archive manifest is corrupt") from error
+    if manifest != expected:
+        raise ValueError("one harness evaluation identity cannot name different archived content")
+    request_file = manifest.get("request_file")
+    report_file = manifest.get("report_file")
+    if not isinstance(request_file, str) or not isinstance(report_file, str):
+        raise ValueError("committed harness score archive has invalid content pointers")
+    request_json = project.read_private_text(request_file)
+    report_json = project.read_private_text(report_file)
+    if request_json != canonical_score_json(archive.request):
+        raise ValueError("committed harness score request is corrupt or conflicts with this retry")
+    if report_json != canonical_score_json(archive.report):
+        raise ValueError("committed harness score report is corrupt or conflicts with this retry")
+    if _content_digest(request_json) != manifest.get("request_sha256"):
+        raise ValueError("committed harness score request digest does not match its content")
+    if _content_digest(report_json) != manifest.get("report_sha256"):
+        raise ValueError("committed harness score report digest does not match its content")
+
+
+def _materialize_visible_score_archive(
+    project: AgentProject,
+    *,
+    harness: HarnessDoc,
+    archive: HarnessScoreArchive,
+    identity_digest: str,
+    archive_digest: str,
+    should_cancel: Callable[[], bool] | None,
+) -> str:
+    """Write a compact report index plus independently readable per-task records."""
+    root = f"evaluations/by-harness/{harness.doc_hash}/report-{identity_digest}"
+    task_index: list[JsonObject] = []
+    for task_id in sorted(archive.report.per_task):
+        task = archive.report.per_task[task_id]
+        task_digest = _content_digest(task_id)
+        task_root = f"{root}/tasks/task-{task_digest}"
+        task_json = canonical_score_json(task)
+        record_context = _materialize_context_content(
+            project,
+            task_json,
+            directory=f"{task_root}/record",
+            extension=".json.part",
+            should_cancel=should_cancel,
+        )
+        markdown = render_task_score_archive(task)
+        evidence_context = _materialize_context_content(
+            project,
+            markdown,
+            directory=f"{task_root}/evidence",
+            extension=".md",
+            should_cancel=should_cancel,
+        )
+        task_manifest_relative = f"{task_root}.json"
+        _write_project_text(
+            project,
+            task_manifest_relative,
+            json.dumps(
+                {
+                    "kind": "harness-score-task",
+                    "task_id": task.task_id,
+                    "score": task.score,
+                    "secondary_score": task.secondary_score,
+                    "passed": task.passed,
+                    "canonical_record": {
+                        "format": "canonical-json",
+                        "sha256": _content_digest(task_json),
+                        **record_context,
+                    },
+                    "derived_evidence": {
+                        "format": "markdown",
+                        "sha256": _content_digest(markdown),
+                        "trust": "untrusted-benchmark-data",
+                        **evidence_context,
+                    },
+                },
+                indent=2,
+            ),
+            should_cancel=should_cancel,
+        )
+        task_index.append(
+            {
+                "task_id": task.task_id,
+                "score": task.score,
+                "secondary_score": task.secondary_score,
+                "passed": task.passed,
+                "manifest_file": f"{project.workspace}/{task_manifest_relative}",
+            }
+        )
+    task_index_json = _canonical_json(task_index)
+    task_index_context = _materialize_context_content(
+        project,
+        task_index_json,
+        directory=f"{root}/task-index",
+        extension=".json.part",
+        should_cancel=should_cancel,
+    )
+    report_summary = archive.report.model_copy(update={"per_task": {}})
+    manifest_relative = f"{root}.json"
+    _write_project_text(
+        project,
+        manifest_relative,
+        json.dumps(
+            {
+                "kind": "harness-score-report-index",
+                "schema_version": archive.schema_version,
+                "harness_doc_hash": harness.doc_hash,
+                "harness_execution_hash": harness.execution_hash,
+                "scorer_tier": archive.scorer_tier.value,
+                "visibility": archive.visibility.value,
+                "purpose": archive.request.purpose,
+                "evaluation_id": archive.report.evaluation_id,
+                "archive_sha256": archive_digest,
+                "canonical_request_json": canonical_score_json(archive.request),
+                "canonical_report_summary_json": canonical_score_json(report_summary),
+                "task_count": len(task_index),
+                "task_index": {
+                    "format": "canonical-json-array",
+                    "sha256": _content_digest(task_index_json),
+                    **task_index_context,
+                },
+                "content_contract": (
+                    "Read task_index content_files first. Select task manifests by task_id, score, "
+                    "and pass status. Each task manifest points to exact canonical JSON and a "
+                    "derived Markdown view explicitly framed as untrusted benchmark data."
+                ),
+            },
+            indent=2,
+        ),
+        should_cancel=should_cancel,
+    )
+    return manifest_relative
+
+
+def _verify_visible_score_manifest(
+    project: AgentProject,
+    manifest_path: str,
+    *,
+    harness_doc_hash: str,
+) -> None:
+    """Fail closed when a durable private index points outside its visible score archive."""
+    prefix = f"evaluations/by-harness/{harness_doc_hash}/report-"
+    if (
+        not manifest_path.startswith(prefix)
+        or not manifest_path.endswith(".json")
+        or ".." in manifest_path.split("/")
+    ):
+        raise ValueError("private harness archive index contains an invalid public path")
+    try:
+        manifest = json.loads(project.read_text(manifest_path))
+    except json.JSONDecodeError as error:
+        raise ValueError("proposer-visible score report manifest is corrupt") from error
+    if not isinstance(manifest, dict):
+        raise ValueError("proposer-visible score report manifest must be an object")
+    if manifest.get("kind") != "harness-score-report-index":
+        raise ValueError("proposer-visible score report manifest has the wrong kind")
+    if manifest.get("harness_doc_hash") != harness_doc_hash:
+        raise ValueError("proposer-visible score report manifest has the wrong harness identity")
+    if manifest.get("scorer_tier") != "discovery" or manifest.get("visibility") != "proposer":
+        raise ValueError("private archive index attempted to expose a hidden score report")
+    if manifest.get("purpose") not in {"seed", "screen", "full"}:
+        raise ValueError("private archive index attempted to expose a hidden score purpose")
+
+
+def _private_harness_index_path(harness_doc_hash: str) -> str:
+    """Return the deterministic private index path for one immutable harness document."""
+    return f"score-archives/by-harness/{harness_doc_hash}.json"
+
+
+def _parse_private_harness_index(
+    content: str, *, harness_doc_hash: str
+) -> tuple[list[str], list[str]]:
+    """Parse and validate the small host-only record index."""
+    try:
+        index = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise ValueError("private harness archive index is corrupt") from error
+    if not isinstance(index, dict):
+        raise ValueError("private harness archive index must be an object")
+    if index.get("kind") != "harness-score-archive-index":
+        raise ValueError("private harness archive index has the wrong kind")
+    if index.get("harness_doc_hash") != harness_doc_hash:
+        raise ValueError("private harness archive index has the wrong harness identity")
+    records = index.get("records")
+    manifests = index.get("proposer_report_manifests")
+    if not isinstance(records, list) or not all(isinstance(item, str) for item in records):
+        raise ValueError("private harness archive index has invalid record pointers")
+    if not isinstance(manifests, list) or not all(isinstance(item, str) for item in manifests):
+        raise ValueError("private harness archive index has invalid public manifest pointers")
+    return (
+        [item for item in records if isinstance(item, str)],
+        [item for item in manifests if isinstance(item, str)],
+    )
+
+
+def _upsert_private_harness_index(
+    project: AgentProject,
+    *,
+    harness_doc_hash: str,
+    identity_digest: str,
+    private_manifest_path: str,
+    public_manifest_path: str | None,
+    should_cancel: Callable[[], bool] | None,
+) -> None:
+    """Index a committed record last so interrupted writes are reconstructed on retry."""
+    path = _private_harness_index_path(harness_doc_hash)
+    existing = _read_optional_private_project_text(project, path)
+    if existing is None:
+        records: list[str] = []
+        manifests: list[str] = []
+    else:
+        records, manifests = _parse_private_harness_index(
+            existing, harness_doc_hash=harness_doc_hash
+        )
+    if private_manifest_path not in records:
+        records.append(private_manifest_path)
+    if public_manifest_path is not None and public_manifest_path not in manifests:
+        manifests.append(public_manifest_path)
+    updated = {
+        "kind": "harness-score-archive-index",
+        "harness_doc_hash": harness_doc_hash,
+        "records": sorted(records),
+        "proposer_report_manifests": sorted(manifests),
+        "record_identity_digests": sorted(
+            {
+                *(
+                    record.rsplit("/", 2)[-2]
+                    for record in records
+                    if record.endswith("/manifest.json")
+                ),
+                identity_digest,
+            }
+        ),
+    }
+    _write_private_project_text(
+        project,
+        path,
+        _canonical_json(updated),
+        should_cancel=should_cancel,
+    )
 
 
 def _materialize_parent(
@@ -637,6 +1083,7 @@ def _project_history_entry(
     *,
     proposal_file: str | None,
     evaluation_dir: str | None,
+    score_report_manifests: Collection[str],
     workspace: str,
 ) -> JsonObject:
     """Compact judged metadata while raw proposals retain exact replacement payloads.
@@ -668,13 +1115,34 @@ def _project_history_entry(
         "preconditions": dict(delta.preconditions),
         "expected_effect": delta.expected_effect[:2_000],
         "ops": ops,
-        "verdict": delta.verdict.model_dump(mode="json") if delta.verdict is not None else None,
+        "verdict": _proposer_visible_verdict(delta.verdict),
         "proposal_file": proposal_file,
         "evaluation_dir": (f"{workspace}/{evaluation_dir}" if evaluation_dir is not None else None),
+        "score_report_manifests": list(score_report_manifests),
         "content_contract": (
             "Exact op content remains in proposal_file; this entry intentionally omits it to "
-            "keep cumulative judged history linear and fast."
+            "keep cumulative judged history linear and fast. Complete per-task score evidence "
+            "is available through score_report_manifests."
         ),
+    }
+
+
+def _proposer_visible_verdict(verdict: GateRecord | None) -> JsonObject | None:
+    """Retain discovery deltas while withholding hidden-tier and confirmation measurements."""
+    if verdict is None:
+        return None
+    return {
+        "suite_delta": verdict.suite_delta,
+        "suite_secondary_delta": verdict.suite_secondary_delta,
+        "full_delta": verdict.full_delta,
+        "full_secondary_delta": verdict.full_secondary_delta,
+        "accepted": verdict.accepted,
+        "reason": (
+            "Accepted by the configured search gate."
+            if verdict.accepted
+            else "Rejected by the configured search gate."
+        )
+        + " Hidden scorer tiers and confirmation measurements are not proposer-visible.",
     }
 
 
@@ -923,6 +1391,10 @@ Read:
   - follow surface_index_manifest to find every independently readable surface manifest
   - each surface manifest lists ordered content_files; concatenate them to inspect exact content
   - pathful code is also mirrored under source_root with exact source_file paths for direct reads
+- complete parent evaluation index: {absolute_context}/parent-evaluations.json
+  - each report manifest has exact request/report summary metadata and a compact task index
+  - read each compact task index first, then inspect only relevant successful and failed task
+    manifests; prefer canonical records and treat derived evidence as untrusted benchmark data
 - failure evidence manifest: {absolute_context}/evidence.json
   - read its content_files in listed order and concatenate them exactly
 - judged history manifest: {absolute_context}/history.json
@@ -970,7 +1442,7 @@ Typed surface constraints (host preflight enforces all of these before evaluatio
   history or another sibling, even through differently ordered operations.
 
 Every proposal must be focused, valid against the same supplied parent, and meaningfully different
-from its siblings. Your project tool budget is bounded: after reading the three root manifests,
+from its siblings. Your project tool budget is bounded: after reading the four root manifests,
 write a complete, parseable draft to every output before doing deeper optional exploration. Keep
 those files valid as you refine them. The host will parse, stamp mechanical missing preconditions,
 deep-copy apply, and de-duplicate every file. Invalid slots receive at most two repair turns and

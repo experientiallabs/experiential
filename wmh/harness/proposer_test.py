@@ -17,6 +17,16 @@ from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.mutate import parse_delta
 from wmh.harness.proposer import ProjectDeltaProposer, ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runtime import HarnessSearchCancelled, TokenUsage
+from wmh.harness.scoring import (
+    HarnessScoreArchive,
+    HarnessScoreReport,
+    ScoreArchiveTier,
+    ScoreArchiveVisibility,
+    ScoreRequest,
+    ScoreRunHealth,
+    TaskScore,
+    canonical_score_json,
+)
 from wmh.providers.base import (
     Completion,
     Message,
@@ -115,6 +125,7 @@ class _Project:
 
     def __init__(self, outputs: list[str]) -> None:
         self.files: dict[str, str] = {}
+        self.private_files: dict[str, str] = {}
         self.outputs = outputs
         self.runs = 0
 
@@ -123,6 +134,12 @@ class _Project:
 
     def read_text(self, path: str) -> str:
         return self.files[path]
+
+    def write_private_text(self, path: str, content: str) -> None:
+        self.private_files[path] = content
+
+    def read_private_text(self, path: str) -> str:
+        return self.private_files[path]
 
     def run(
         self,
@@ -149,6 +166,65 @@ def _manifest_content(project: _Project, path: str) -> tuple[dict[str, object], 
         for absolute in manifest["content_files"]
     ]
     return manifest, chunks
+
+
+def _context_chunks(project: _Project, context: object) -> list[str]:
+    assert isinstance(context, dict)
+    manifest = cast("dict[str, object]", context)
+    files = manifest["content_files"]
+    assert isinstance(files, list)
+    return [
+        project.files[str(absolute).removeprefix(f"{project.workspace}/")] for absolute in files
+    ]
+
+
+def _score_archive(
+    evaluation_id: str,
+    *,
+    purpose: str = "seed",
+    tier: ScoreArchiveTier = ScoreArchiveTier.DISCOVERY,
+    visibility: ScoreArchiveVisibility | None = None,
+    evidence: str = "successful parent trace\nfailed parent trace",
+) -> HarnessScoreArchive:
+    if visibility is None:
+        visibility = (
+            ScoreArchiveVisibility.PROPOSER
+            if tier is ScoreArchiveTier.DISCOVERY and purpose in {"seed", "screen", "full"}
+            else ScoreArchiveVisibility.AUDIT_ONLY
+        )
+    tasks = {
+        "pass-task": TaskScore(
+            task_id="pass-task",
+            score=1.0,
+            secondary_score=0.9999999994,
+            passed=True,
+            description="keep the successful behavior",
+            evidence="successful trajectory",
+        ),
+        "fail-task": TaskScore(
+            task_id="fail-task",
+            score=0.1234567894,
+            secondary_score=0.2345678912,
+            passed=False,
+            description="find the requested artifact",
+            mechanisms=("verification",),
+            evidence=evidence,
+        ),
+    }
+    return HarnessScoreArchive(
+        scorer_tier=tier,
+        visibility=visibility,
+        request=ScoreRequest.model_validate({"purpose": purpose}),
+        report=HarnessScoreReport(
+            evaluation_id=evaluation_id,
+            label="candidate",
+            score=0.5617283947,
+            secondary_score=0.6172839453,
+            attempts=2,
+            run_health=ScoreRunHealth.VALID,
+            per_task=tasks,
+        ),
+    )
 
 
 def _parent_surface_manifests(project: _Project, root_path: str) -> list[dict[str, object]]:
@@ -380,10 +456,12 @@ def test_project_proposer_uses_one_agent_turn_and_keeps_iteration_files() -> Non
     assert len(second) == 2
     assert all(proposal is not None for proposal in proposals)
     assert "context/iteration-0001/parent.json" in project.files
+    assert "context/iteration-0001/parent-evaluations.json" in project.files
     assert "context/iteration-0001/evidence.json" in project.files
     assert "context/iteration-0001/history.json" in project.files
     assert "context/iteration-0002/history.json" in project.files
     assert "proposal-01.json" in project.files["context/iteration-0002/REQUEST.md"]
+    assert "complete parent evaluation index" in project.files["context/iteration-0002/REQUEST.md"]
     assert "failure evidence manifest" in project.files["context/iteration-0002/REQUEST.md"]
     assert "content_files in listed order" in project.files["context/iteration-0002/REQUEST.md"]
     assert all(project.files[path] == content for path, content in first_files.items())
@@ -479,7 +557,12 @@ def test_project_context_preserves_evidence_and_compacts_judged_history() -> Non
 
     first = proposer.propose_batch(parent, _trigger(), "first evidence", history=[], count=1)[0]
     assert isinstance(first, HarnessDelta)
-    first.verdict = GateRecord(accepted=False, reason="screened out after exact trace review")
+    first.verdict = GateRecord(
+        accepted=False,
+        holdout_delta=-0.5,
+        holdout_secondary_delta=-0.25,
+        reason="secret holdout task regressed during confirmation",
+    )
     second = first.model_copy(
         deep=True,
         update={"delta_id": "second-history-entry", "expected_effect": "different prediction"},
@@ -511,6 +594,12 @@ def test_project_context_preserves_evidence_and_compacts_judged_history() -> Non
     assert [entry["delta_id"] for entry in judged_history] == [second.delta_id, first.delta_id]
     assert all("content" not in entry["ops"][0] for entry in judged_history)
     assert all(entry["ops"][0]["content_length"] == len(large_change) for entry in judged_history)
+    assert "secret holdout task" not in reconstructed_history
+    assert all("holdout_delta" not in entry["verdict"] for entry in judged_history)
+    assert all(
+        "confirmation measurements are not proposer-visible" in entry["verdict"]["reason"]
+        for entry in judged_history
+    )
     assert judged_history[0]["proposal_file"] is None
     assert judged_history[1]["proposal_file"].endswith("/proposals/iteration-0001/proposal-01.json")
 
@@ -534,6 +623,266 @@ def test_project_proposer_persists_candidate_evaluation_beside_its_proposal() ->
     assert len(chunks) > 1
     assert all(len(chunk) <= 12_000 for chunk in chunks)
     assert "".join(chunks) == evidence
+
+
+def test_project_proposer_indexes_complete_harness_evidence_for_parent_and_history() -> None:
+    parent = HarnessDoc.baseline("parent")
+    project = _Project([_payload(parent, "careful")])
+    proposer = ProjectDeltaProposer(project, meta_agent(), _Provider("unused"))
+    parent_archive = _score_archive(
+        "eval-parent",
+        evidence="successful parent trace\nfailed parent trace\n" * 1_001,
+    )
+
+    proposer.record_harness_evaluation(parent, archive=parent_archive)
+    proposal = proposer.propose_batch(
+        parent,
+        _trigger(),
+        "inspect failures",
+        history=[],
+        count=1,
+    )[0]
+    assert isinstance(proposal, HarnessDelta)
+    child = apply_delta(parent, proposal, "child")
+    child_archive = _score_archive(
+        "eval-child",
+        purpose="full",
+        evidence="complete child evidence",
+    )
+    proposer.record_harness_evaluation(child, archive=child_archive)
+    proposer.propose_batch(
+        child,
+        _trigger(),
+        "inspect child failures",
+        history=[proposal],
+        count=1,
+    )
+
+    parent_index = json.loads(project.files["context/iteration-0001/parent-evaluations.json"])
+    assert parent_index["harness_doc_hash"] == parent.doc_hash
+    [parent_manifest_absolute] = parent_index["report_manifests"]
+    parent_manifest_relative = str(parent_manifest_absolute).removeprefix(f"{project.workspace}/")
+    parent_manifest = json.loads(project.files[parent_manifest_relative])
+    assert parent_manifest["kind"] == "harness-score-report-index"
+    assert parent_manifest["purpose"] == "seed"
+    assert parent_manifest["scorer_tier"] == "discovery"
+    assert parent_manifest["visibility"] == "proposer"
+    assert parent_manifest["evaluation_id"] == "eval-parent"
+    assert json.loads(parent_manifest["canonical_request_json"]) == {  # exact typed request
+        "attempts": None,
+        "purpose": "seed",
+        "task_ids": None,
+    }
+    task_index = json.loads("".join(_context_chunks(project, parent_manifest["task_index"])))
+    assert [item["task_id"] for item in task_index] == ["fail-task", "pass-task"]
+    fail_manifest_path = str(task_index[0]["manifest_file"]).removeprefix(f"{project.workspace}/")
+    fail_manifest = json.loads(project.files[fail_manifest_path])
+    exact_task = "".join(_context_chunks(project, fail_manifest["canonical_record"]))
+    assert exact_task == canonical_score_json(parent_archive.report.per_task["fail-task"])
+    derived = "".join(_context_chunks(project, fail_manifest["derived_evidence"]))
+    assert "untrusted benchmark data" in derived
+    assert "failed parent trace" in derived
+
+    child_index = json.loads(project.files["context/iteration-0002/parent-evaluations.json"])
+    [child_manifest_absolute] = child_index["report_manifests"]
+    child_manifest_relative = str(child_manifest_absolute).removeprefix(f"{project.workspace}/")
+    child_manifest = json.loads(project.files[child_manifest_relative])
+    assert child_manifest["harness_doc_hash"] == child.doc_hash
+    assert child_manifest["purpose"] == "full"
+
+    _history_manifest, history_chunks = _manifest_content(
+        project, "context/iteration-0002/history.json"
+    )
+    [history_entry] = json.loads("".join(history_chunks))
+    assert history_entry["score_report_manifests"] == [child_manifest_absolute]
+
+
+def test_project_proposer_complete_evaluation_identity_is_idempotent_and_immutable() -> None:
+    harness = HarnessDoc.baseline("parent")
+    project = _Project([])
+    proposer = ProjectDeltaProposer(project, meta_agent(), _Provider("unused"))
+
+    archive = _score_archive("eval-1", evidence="same evidence")
+    proposer.record_harness_evaluation(harness, archive=archive)
+    first_files = dict(project.files)
+    first_private_files = dict(project.private_files)
+    reconstructed = ProjectDeltaProposer(project, meta_agent(), _Provider("unused"))
+    reconstructed.record_harness_evaluation(harness, archive=archive)
+
+    assert project.files == first_files
+    assert project.private_files == first_private_files
+    with pytest.raises(ValueError, match="cannot name different archived content"):
+        reconstructed.record_harness_evaluation(
+            harness,
+            archive=_score_archive("eval-1", evidence="different evidence"),
+        )
+
+    reconstructed.propose_batch(harness, _trigger(), "inspect failures", history=[], count=1)
+    parent_index = json.loads(project.files["context/iteration-0001/parent-evaluations.json"])
+    assert len(parent_index["report_manifests"]) == 1
+
+
+def test_project_proposer_recovers_post_manifest_cancellation_without_identity_overwrite() -> None:
+    harness = HarnessDoc.baseline("parent")
+    project = _Project([])
+    proposer = ProjectDeltaProposer(project, meta_agent(), _Provider("unused"))
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        proposer.record_harness_evaluation(
+            harness,
+            archive=_score_archive("eval-1", evidence="large evidence\n" * 2_000),
+            should_cancel=lambda: len(project.private_files) >= 3,
+        )
+
+    assert len(project.private_files) == 3
+    assert any(path.endswith("/manifest.json") for path in project.private_files)
+    assert not any(path.startswith("score-archives/by-harness/") for path in project.private_files)
+    assert not project.files
+
+    reconstructed = ProjectDeltaProposer(project, meta_agent(), _Provider("unused"))
+    with pytest.raises(ValueError, match="cannot name different archived content"):
+        reconstructed.record_harness_evaluation(
+            harness,
+            archive=_score_archive("eval-1", evidence="different evidence"),
+        )
+
+    reconstructed.record_harness_evaluation(
+        harness,
+        archive=_score_archive("eval-1", evidence="large evidence\n" * 2_000),
+    )
+    assert any(path.startswith("score-archives/by-harness/") for path in project.private_files)
+    assert any(path.endswith(".json") for path in project.files)
+
+
+def test_project_proposer_never_exposes_holdout_or_confirmation_archives() -> None:
+    harness = HarnessDoc.baseline("parent")
+    project = _Project([_payload(harness, "careful")])
+    proposer = ProjectDeltaProposer(project, meta_agent(), _Provider("unused"))
+
+    proposer.record_harness_evaluation(harness, archive=_score_archive("discovery-seed"))
+    proposer.record_harness_evaluation(
+        harness,
+        archive=_score_archive(
+            "holdout-seed",
+            purpose="holdout",
+            tier=ScoreArchiveTier.HOLDOUT,
+            evidence="secret holdout instruction",
+        ),
+    )
+    proposer.record_harness_evaluation(
+        harness,
+        archive=_score_archive(
+            "discovery-confirmation",
+            purpose="confirmation",
+            evidence="secret confirmation instruction",
+        ),
+    )
+
+    assert "secret holdout instruction" not in "\n".join(project.files.values())
+    assert "secret confirmation instruction" not in "\n".join(project.files.values())
+    assert "secret holdout instruction" in "\n".join(project.private_files.values())
+    assert "secret confirmation instruction" in "\n".join(project.private_files.values())
+    proposer.propose_batch(harness, _trigger(), "inspect failures", history=[], count=1)
+    parent_index = json.loads(project.files["context/iteration-0001/parent-evaluations.json"])
+    assert len(parent_index["report_manifests"]) == 1
+    private_index_path = f"score-archives/by-harness/{harness.doc_hash}.json"
+    private_index = json.loads(project.private_files[private_index_path])
+    assert len(private_index["records"]) == 3
+    assert len(private_index["proposer_report_manifests"]) == 1
+
+
+def test_project_proposer_fails_closed_on_corrupt_committed_score_content() -> None:
+    harness = HarnessDoc.baseline("parent")
+    project = _Project([])
+    archive = _score_archive("eval-corrupt")
+    proposer = ProjectDeltaProposer(project, meta_agent(), _Provider("unused"))
+    proposer.record_harness_evaluation(harness, archive=archive)
+    report_path = next(path for path in project.private_files if path.endswith("/report.json"))
+    project.private_files[report_path] = "{}"
+
+    with pytest.raises(ValueError, match="report is corrupt"):
+        ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).record_harness_evaluation(
+            harness,
+            archive=archive,
+        )
+
+
+def test_project_proposer_rejects_a_private_index_that_exposes_hidden_metadata() -> None:
+    harness = HarnessDoc.baseline("parent")
+    project = _Project([_payload(harness, "careful")])
+    archive = _score_archive("eval-visible")
+    ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).record_harness_evaluation(
+        harness,
+        archive=archive,
+    )
+    report_path = next(
+        path
+        for path, content in project.files.items()
+        if path.endswith(".json") and '"kind": "harness-score-report-index"' in content
+    )
+    manifest = json.loads(project.files[report_path])
+    manifest["visibility"] = "audit_only"
+    project.files[report_path] = json.dumps(manifest)
+
+    with pytest.raises(ValueError, match="attempted to expose a hidden score report"):
+        ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).propose_batch(
+            harness,
+            _trigger(),
+            "inspect failures",
+            history=[],
+            count=1,
+        )
+
+
+def test_project_proposer_large_report_uses_compact_selective_task_index() -> None:
+    harness = HarnessDoc.baseline("parent")
+    project = _Project([])
+    tasks = {
+        f"task-{index:03d}": TaskScore(
+            task_id=f"task-{index:03d}",
+            score=float(index % 2),
+            secondary_score=index / 100,
+            passed=bool(index % 2),
+            description=f"instruction {index}",
+            evidence="x" * 64_000,
+        )
+        for index in range(89)
+    }
+    archive = HarnessScoreArchive(
+        scorer_tier=ScoreArchiveTier.DISCOVERY,
+        visibility=ScoreArchiveVisibility.PROPOSER,
+        request=ScoreRequest(purpose="seed"),
+        report=HarnessScoreReport(
+            evaluation_id="large-eval",
+            score=44 / 89,
+            secondary_score=0.44,
+            attempts=1,
+            run_health=ScoreRunHealth.VALID,
+            per_task=tasks,
+        ),
+    )
+
+    ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).record_harness_evaluation(
+        harness,
+        archive=archive,
+    )
+
+    report_path = next(
+        path
+        for path, content in project.files.items()
+        if path.endswith(".json") and '"kind": "harness-score-report-index"' in content
+    )
+    report_manifest = json.loads(project.files[report_path])
+    assert len(project.files[report_path]) < 16_000
+    task_index_chunks = _context_chunks(project, report_manifest["task_index"])
+    assert len(task_index_chunks) < 5
+    assert all(len(chunk) <= 12_000 for chunk in task_index_chunks)
+    task_index = json.loads("".join(task_index_chunks))
+    assert len(task_index) == 89
+    selected_path = str(task_index[42]["manifest_file"]).removeprefix(f"{project.workspace}/")
+    selected_manifest = json.loads(project.files[selected_path])
+    selected_record = "".join(_context_chunks(project, selected_manifest["canonical_record"]))
+    assert selected_record == canonical_score_json(tasks["task-042"])
 
 
 def test_project_proposer_checks_cancellation_before_evaluation_writes() -> None:

@@ -203,11 +203,51 @@ def test_project_preserves_files_and_runs_through_live_session() -> None:
     assert any(frame["type"] == "user_message" for frame in channel.sent)
     assert channel.closed is False
     assert sandbox.commands.runs[:2] == [
-        "mkdir -p /home/user/project",
+        "mkdir -p /home/user/project /home/user/project.wmh-internal",
         "mkdir -p /home/user/project/history",
     ]
     project.close()
     assert channel.closed is True
+
+
+def test_private_project_files_are_host_readable_but_agent_inaccessible() -> None:
+    sandbox = _Sandbox()
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+
+    project.write_private_text("score-archives/holdout.json", '{"secret": true}')
+
+    assert project.read_private_text("score-archives/holdout.json") == '{"secret": true}'
+    absolute = "/home/user/project.wmh-internal/score-archives/holdout.json"
+    assert sandbox.files.values[absolute] == '{"secret": true}'
+    outcome = project._execute_tool(  # noqa: SLF001 - verify the actual tool boundary
+        "read_file",
+        {"path": absolute},
+        lambda stream, data: None,
+    )
+    assert outcome.is_error is True
+    assert "escapes project workspace" in outcome.content
+
+
+def test_private_project_files_are_reconstructed_by_a_fresh_host_project() -> None:
+    sandbox = _Sandbox()
+    first = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+    first.write_private_text("score-archives/record.json", '{"committed": true}')
+
+    reconstructed = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+
+    assert reconstructed.read_private_text("score-archives/record.json") == '{"committed": true}'
 
 
 def test_project_grants_agent_writes_to_exact_files_only() -> None:
@@ -449,6 +489,7 @@ def test_project_replaces_owned_sandbox_after_repeated_closed_http2_writes() -> 
     replacement = _Sandbox()
     project = AgentProject(original, sandbox_factory=lambda: replacement)
     project.write_text("history/round-0006.json", '{"kept": true}')
+    project.write_private_text("score-archives/holdout.json", '{"secret": true}')
     original_commands.closed = True
 
     project.write_text("context/round-0007/parent.json", '{"round": 7}')
@@ -461,6 +502,10 @@ def test_project_replaces_owned_sandbox_after_repeated_closed_http2_writes() -> 
     )
     assert replacement.files.values["/home/user/project/context/round-0007/parent.json"] == (
         '{"round": 7}'
+    )
+    assert (
+        replacement.files.values["/home/user/project.wmh-internal/score-archives/holdout.json"]
+        == '{"secret": true}'
     )
 
 

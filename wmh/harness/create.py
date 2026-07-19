@@ -48,8 +48,11 @@ from wmh.harness.runtime import (
 from wmh.harness.scoring import (
     MAX_TASK_DESCRIPTION_CHARS,
     MAX_TASK_EVIDENCE_CHARS,
+    HarnessScoreArchive,
     HarnessScorer,
     HarnessScoreReport,
+    ScoreArchiveTier,
+    ScoreArchiveVisibility,
     ScoreCapabilities,
     ScoreRequest,
     ScoreRunHealth,
@@ -409,6 +412,12 @@ def search_harness(
         raise ValueError(f"iterations must be non-negative, got {iterations}")
     if proposal_batch_size < 1:
         raise ValueError(f"proposal_batch_size must be positive, got {proposal_batch_size}")
+    if getattr(proposer, "score_archive_required", False) and not callable(
+        getattr(proposer, "record_harness_evaluation", None)
+    ):
+        raise RuntimeError(
+            "proposer requires durable score archives but exposes no archive recorder"
+        )
     discovery_attempts = scorer.default_attempts
     if discovery_attempts < 1:
         raise ValueError("scorer.default_attempts must be positive")
@@ -455,6 +464,7 @@ def search_harness(
         active_scorer: HarnessScorer,
         doc: HarnessDoc,
         *,
+        scorer_tier: ScoreArchiveTier,
         purpose: Literal["seed", "screen", "full", "holdout", "confirmation"],
         task_ids: list[str] | None = None,
         attempts: int | None = None,
@@ -469,13 +479,10 @@ def search_harness(
         report = _snapshot_score_report(active_scorer.score(doc, request=request))
         if report.run_health is not ScoreRunHealth.VALID:
             raise ScoreRunHealthError(report.evaluation_id, report.run_health)
-        scorer_attempts = (
-            discovery_attempts
-            if active_scorer is scorer
-            else holdout_attempts
-            if active_scorer is holdout_scorer
-            else None
-        )
+        if scorer_tier is ScoreArchiveTier.DISCOVERY:
+            scorer_attempts = discovery_attempts if active_scorer is scorer else None
+        else:
+            scorer_attempts = holdout_attempts if active_scorer is holdout_scorer else None
         if scorer_attempts is None:
             raise ValueError("search received a report from an unknown scorer")
         expected_attempts = attempts or scorer_attempts
@@ -501,6 +508,26 @@ def search_harness(
                 f"evaluation_id {report.evaluation_id!r} identifies a different report"
             )
         evaluations_by_id[report.evaluation_id] = evaluation_record
+        visibility = (
+            ScoreArchiveVisibility.PROPOSER
+            if scorer_tier is ScoreArchiveTier.DISCOVERY and purpose in {"seed", "screen", "full"}
+            else ScoreArchiveVisibility.AUDIT_ONLY
+        )
+        archive_error = _record_harness_score_evaluation(
+            proposer,
+            doc,
+            archive=HarnessScoreArchive(
+                scorer_tier=scorer_tier,
+                visibility=visibility,
+                request=request,
+                report=report,
+            ),
+            should_cancel=should_cancel,
+        )
+        if archive_error is not None:
+            raise RuntimeError(
+                f"complete {purpose} score evidence could not be persisted: {archive_error}"
+            )
         _check_cancelled()
         return report
 
@@ -513,14 +540,24 @@ def search_harness(
     screened = 0
     confirmations = 0
 
-    seed_report = _score(scorer, seed_doc, purpose="seed")
+    seed_report = _score(
+        scorer,
+        seed_doc,
+        scorer_tier=ScoreArchiveTier.DISCOVERY,
+        purpose="seed",
+    )
     if not seed_report.per_task:
         raise ValueError("seed score report contains no tasks")
     discovery_task_ids = frozenset(seed_report.per_task)
     reports[seed_doc.doc_hash] = seed_report
     holdout_task_ids: frozenset[str] | None = None
     if holdout_scorer is not None:
-        seed_holdout = _score(holdout_scorer, seed_doc, purpose="holdout")
+        seed_holdout = _score(
+            holdout_scorer,
+            seed_doc,
+            scorer_tier=ScoreArchiveTier.HOLDOUT,
+            purpose="holdout",
+        )
         if not seed_holdout.per_task:
             raise ValueError("holdout seed score report contains no tasks")
         holdout_task_ids = frozenset(seed_holdout.per_task)
@@ -751,6 +788,7 @@ def search_harness(
                 screen_report = _score(
                     scorer,
                     child,
+                    scorer_tier=ScoreArchiveTier.DISCOVERY,
                     purpose="screen",
                     task_ids=screen_task_ids,
                 )
@@ -818,6 +856,7 @@ def search_harness(
             child_report = _score(
                 scorer,
                 child,
+                scorer_tier=ScoreArchiveTier.DISCOVERY,
                 purpose="full",
                 expected_task_ids=discovery_task_ids,
             )
@@ -842,6 +881,7 @@ def search_harness(
                 child_holdout = _score(
                     holdout_scorer,
                     child,
+                    scorer_tier=ScoreArchiveTier.HOLDOUT,
                     purpose="holdout",
                     expected_task_ids=holdout_task_ids,
                 )
@@ -850,6 +890,7 @@ def search_harness(
                     frozen_champion_holdout = _score(
                         holdout_scorer,
                         parent,
+                        scorer_tier=ScoreArchiveTier.HOLDOUT,
                         purpose="holdout",
                         expected_task_ids=holdout_task_ids,
                     )
@@ -893,6 +934,11 @@ def search_harness(
                     child_re = _score(
                         active_scorer,
                         child,
+                        scorer_tier=(
+                            ScoreArchiveTier.DISCOVERY
+                            if tier == "suite"
+                            else ScoreArchiveTier.HOLDOUT
+                        ),
                         purpose="confirmation",
                         task_ids=task_ids,
                         attempts=attempts,
@@ -903,6 +949,11 @@ def search_harness(
                     champion_re = _score(
                         active_scorer,
                         parent,
+                        scorer_tier=(
+                            ScoreArchiveTier.DISCOVERY
+                            if tier == "suite"
+                            else ScoreArchiveTier.HOLDOUT
+                        ),
                         purpose="confirmation",
                         task_ids=task_ids,
                         attempts=attempts,
@@ -1013,7 +1064,7 @@ def search_harness(
                 candidate.delta,
                 stage="full",
                 report=candidate.report,
-                summary=candidate.delta.verdict.reason,
+                summary=_proposer_visible_gate_summary(candidate.delta.verdict),
             )
             if feedback_error is not None:
                 _note(
@@ -1446,6 +1497,47 @@ def _record_score_evaluation(
     )
     try:
         recorder(delta, stage=stage, content=content)
+    except HarnessSearchCancelled:
+        raise
+    except Exception as error:  # noqa: BLE001
+        return str(error)
+    return None
+
+
+def _proposer_visible_gate_summary(verdict: GateRecord) -> str:
+    """Describe a final gate without disclosing holdout or confirmation measurements."""
+    outcome = "accepted" if verdict.accepted else "rejected"
+    selection_note = ""
+    if verdict.reason.startswith("gate eligible but not selected:"):
+        selection_note = f" {verdict.reason.partition(' | ')[0]}."
+    return (
+        f"{outcome} by the configured search gate.{selection_note} Discovery suite_delta="
+        f"{verdict.suite_delta:.6g}, suite_secondary_delta="
+        f"{verdict.suite_secondary_delta:.6g}, full_delta={verdict.full_delta:.6g}, "
+        f"full_secondary_delta={verdict.full_secondary_delta:.6g}. Hidden scorer tiers and "
+        "confirmation measurements are not proposer-visible."
+    )
+
+
+def _record_harness_score_evaluation(
+    proposer: DeltaProposer,
+    harness: HarnessDoc,
+    *,
+    archive: HarnessScoreArchive,
+    should_cancel: Callable[[], bool] | None,
+) -> str | None:
+    """Persist exact score data, failing closed when a proposer declares it mandatory."""
+    recorder = getattr(proposer, "record_harness_evaluation", None)
+    if not callable(recorder):
+        if getattr(proposer, "score_archive_required", False):
+            return "proposer requires durable score archives but exposes no archive recorder"
+        return None
+    try:
+        recorder(
+            harness,
+            archive=archive,
+            should_cancel=should_cancel,
+        )
     except HarnessSearchCancelled:
         raise
     except Exception as error:  # noqa: BLE001

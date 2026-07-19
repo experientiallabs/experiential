@@ -38,7 +38,10 @@ from wmh.harness.mutate import parse_delta
 from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runtime import Runtime, StopReason
 from wmh.harness.scoring import (
+    HarnessScoreArchive,
     HarnessScoreReport,
+    ScoreArchiveTier,
+    ScoreArchiveVisibility,
     ScoreCapabilities,
     ScoreRequest,
     ScoreRunHealth,
@@ -229,6 +232,8 @@ class _EvidenceRecordingProposer:
 
     def __init__(self) -> None:
         self.evidence: list[str] = []
+        self.archives: list[tuple[str, HarnessScoreArchive]] = []
+        self.feedback: list[str] = []
 
     def propose_batch(
         self,
@@ -246,6 +251,20 @@ class _EvidenceRecordingProposer:
         proposal = parse_delta(parent, trigger, _meta_reply(parent, _CAREFUL_PROMPT))
         assert proposal is not None
         return [proposal]
+
+    def record_harness_evaluation(
+        self,
+        harness: HarnessDoc,
+        *,
+        archive: HarnessScoreArchive,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
+        del should_cancel
+        self.archives.append((harness.doc_hash, archive))
+
+    def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+        del delta, stage
+        self.feedback.append(content)
 
 
 def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:
@@ -268,7 +287,113 @@ def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:
     assert [request.purpose for _, request in scorer.requests] == ["seed", "full"]
     assert scorer.before_proposal_calls == 1
     assert "verifier reward and execution trace" in proposer.evidence[0]
+    assert [archive.request.purpose for _, archive in proposer.archives] == ["seed", "full"]
+    assert all(
+        archive.scorer_tier is ScoreArchiveTier.DISCOVERY for _, archive in proposer.archives
+    )
+    assert all(
+        archive.visibility is ScoreArchiveVisibility.PROPOSER for _, archive in proposer.archives
+    )
+    assert all(
+        "verifier reward and execution trace"
+        in archive.report.per_task["ground-truth-task"].evidence
+        for _, archive in proposer.archives
+    )
+    assert "Hidden scorer tiers and confirmation measurements" in proposer.feedback[0]
     assert result.suite == ["ground-truth-task"]
+
+
+def test_search_harness_fails_closed_when_complete_project_evidence_cannot_be_archived() -> None:
+    class FailingArchiveProposer(_EvidenceRecordingProposer):
+        def record_harness_evaluation(
+            self,
+            harness: HarnessDoc,
+            *,
+            archive: HarnessScoreArchive,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> None:
+            del harness, archive, should_cancel
+            raise OSError("durable project unavailable")
+
+    with pytest.raises(RuntimeError, match="complete seed score evidence.*durable project"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            FailingArchiveProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_fails_when_required_archive_capability_has_no_recorder() -> None:
+    class RequiredArchiveProposer:
+        score_archive_required = True
+
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            del parent, trigger, evidence, history, count, should_cancel
+            raise AssertionError("scoring must fail before proposal generation")
+
+    scorer = _NeutralScorer()
+    with pytest.raises(RuntimeError, match="requires durable score archives"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            RequiredArchiveProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+    assert scorer.requests == []
+
+
+def test_search_harness_marks_holdout_reports_audit_only() -> None:
+    seed = HarnessDoc.baseline("seed")
+    discovery = _NeutralScorer()
+    holdout = _NeutralScorer()
+    proposer = _EvidenceRecordingProposer()
+
+    search_harness(
+        "winner",
+        seed,
+        discovery,
+        proposer,
+        holdout_scorer=holdout,
+        iterations=1,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+    )
+
+    assert [archive.request.purpose for _, archive in proposer.archives] == [
+        "seed",
+        "holdout",
+        "full",
+        "holdout",
+    ]
+    discovery_archive = proposer.archives[0][1]
+    holdout_archive = proposer.archives[1][1]
+    assert discovery_archive.scorer_tier is ScoreArchiveTier.DISCOVERY
+    assert discovery_archive.visibility is ScoreArchiveVisibility.PROPOSER
+    assert holdout_archive.scorer_tier is ScoreArchiveTier.HOLDOUT
+    assert holdout_archive.visibility is ScoreArchiveVisibility.AUDIT_ONLY
+    assert all(
+        archive.visibility is ScoreArchiveVisibility.AUDIT_ONLY
+        for _, archive in proposer.archives
+        if archive.request.purpose == "holdout"
+    )
+    assert "held-out" not in proposer.feedback[0]
+    assert "Hidden scorer tiers and confirmation measurements" in proposer.feedback[0]
 
 
 def test_search_harness_never_gates_on_retryable_run_health() -> None:
@@ -806,10 +931,10 @@ def test_create_rotates_failure_evidence_after_a_screened_batch() -> None:
         k=1,
     )
 
-    assert "[TARGET] t1" in provider.meta_users[0]
-    assert "[other] t2" in provider.meta_users[0]
-    assert "[TARGET] t2" in provider.meta_users[1]
-    assert "[other] t1" in provider.meta_users[1]
+    assert '[TARGET] task_id="t1"' in provider.meta_users[0]
+    assert '[other] task_id="t2"' in provider.meta_users[0]
+    assert '[TARGET] task_id="t2"' in provider.meta_users[1]
+    assert '[other] task_id="t1"' in provider.meta_users[1]
 
 
 def test_create_does_not_discount_a_cluster_when_the_proposer_failed() -> None:
@@ -890,10 +1015,10 @@ def test_create_does_not_discount_a_cluster_when_every_delta_is_invalid() -> Non
     )
 
     assert result.skipped == 2
-    assert "[TARGET] t1" in provider.meta_users[0]
-    assert "[TARGET] t1" in provider.meta_users[1]
-    assert "[other] t2" in provider.meta_users[0]
-    assert "[other] t2" in provider.meta_users[1]
+    assert '[TARGET] task_id="t1"' in provider.meta_users[0]
+    assert '[TARGET] task_id="t1"' in provider.meta_users[1]
+    assert '[other] task_id="t2"' in provider.meta_users[0]
+    assert '[other] task_id="t2"' in provider.meta_users[1]
 
 
 # -- staged verification: screening + history ---------------------------------------------------
