@@ -790,6 +790,44 @@ def test_job_and_pair_generation_identities_bind_operation_generation_and_block(
     assert len(names) == 8
 
 
+def test_pair_state_replacement_closes_descriptor_when_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path, _candidate())
+    block = runner._protocol.design.blocks[0]
+    state = runner._pair_state(block, status="running")
+    path = runner._pair_state_path(block)
+    mod._create_pair_generation_state(path, state)
+    real_mkstemp = mod.tempfile.mkstemp
+    created_descriptor = -1
+    temporary_path: Path | None = None
+
+    def tracked_mkstemp(*, prefix: str, dir: str | Path) -> tuple[int, str]:
+        nonlocal created_descriptor, temporary_path
+        created_descriptor, temporary = real_mkstemp(prefix=prefix, dir=dir)
+        temporary_path = Path(temporary)
+        return created_descriptor, temporary
+
+    def fail_fchmod(_descriptor: int, _mode: int) -> None:
+        raise OSError("synthetic mode failure")
+
+    monkeypatch.setattr(mod.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(mod.os, "fchmod", fail_fchmod)
+    try:
+        with pytest.raises(OSError, match="synthetic mode failure"):
+            mod._replace_pair_generation_state(path, state)
+        with pytest.raises(OSError):
+            os.fstat(created_descriptor)
+    finally:
+        try:
+            os.close(created_descriptor)
+        except OSError:
+            pass
+    assert temporary_path is not None
+    assert not temporary_path.exists()
+
+
 def test_partial_existing_pair_is_rejected_before_any_provider_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

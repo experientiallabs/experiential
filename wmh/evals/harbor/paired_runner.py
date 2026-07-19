@@ -1625,14 +1625,20 @@ def _replace_pair_generation_state(
     temporary_path = Path(temporary)
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
             handle.write(state.model_dump_json(indent=2) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
         _fsync_directory(path.parent)
     finally:
-        temporary_path.unlink(missing_ok=True)
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _read_pair_generation_state(path: Path) -> PairedHarborPairGenerationState:
