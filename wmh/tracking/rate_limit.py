@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -25,10 +26,20 @@ else:
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _MAX_STATE_BYTES = 16 * 1024
 _NANOSECONDS_PER_MILLISECOND = 1_000_000
+_NANOSECONDS_PER_SECOND = 1_000_000_000
+_RATE_LOCK_POLL_SECONDS = 0.01
 
 
 class ExternalDispatchRateIntegrityError(RuntimeError):
     """A dispatch-rate authority cannot safely admit another external request."""
+
+
+class ExternalDispatchRateAdmissionTimeout(RuntimeError):
+    """A bounded caller could not obtain dispatch admission before its deadline."""
+
+
+class _ExternalDispatchRateLeaseBusy(RuntimeError):
+    """The durable pacing ledger is currently leased by another host process."""
 
 
 def _canonical_digest(value: object) -> str:
@@ -113,7 +124,7 @@ class ExternalDispatchPermit(BaseModel):
 class ExternalDispatchRateGate(Protocol):
     """Minimal synchronous pacing boundary consumed by external dispatch sites."""
 
-    def acquire(self) -> ExternalDispatchPermit: ...
+    def acquire(self, *, timeout_seconds: float | None = None) -> ExternalDispatchPermit: ...
 
 
 class _ExternalDispatchRateState(BaseModel):
@@ -180,6 +191,7 @@ class ExternalDispatchRateAuthority:
         ledger_identity: str,
         path_lock: threading.RLock,
         clock_ns: Callable[[], int],
+        wait_clock_ns: Callable[[], int],
         sleeper: Callable[[float], None],
     ) -> None:
         self._path = path
@@ -187,6 +199,7 @@ class ExternalDispatchRateAuthority:
         self._ledger_identity = ledger_identity
         self._path_lock = path_lock
         self._clock_ns = clock_ns
+        self._wait_clock_ns = wait_clock_ns
         self._sleeper = sleeper
 
     @classmethod
@@ -196,6 +209,7 @@ class ExternalDispatchRateAuthority:
         policy: ExternalDispatchRatePolicy,
         *,
         clock_ns: Callable[[], int] = time.time_ns,
+        wait_clock_ns: Callable[[], int] = time.monotonic_ns,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> ExternalDispatchRateAuthority:
         """Create or reopen one private durable pacing ledger."""
@@ -228,6 +242,7 @@ class ExternalDispatchRateAuthority:
             ledger_identity=state.ledger_identity,
             path_lock=path_lock,
             clock_ns=clock_ns,
+            wait_clock_ns=wait_clock_ns,
             sleeper=sleeper,
         )
 
@@ -244,11 +259,40 @@ class ExternalDispatchRateAuthority:
             ledger_identity=self._ledger_identity,
         )
 
-    def acquire(self) -> ExternalDispatchPermit:
-        """Block until one dispatch can return without violating the shared rate."""
+    def acquire(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ExternalDispatchPermit:
+        """Block until admission, optionally bounding shared-ledger contention and pacing."""
+        deadline_ns: int | None = None
+        if timeout_seconds is not None:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, int | float)
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0
+            ):
+                raise ValueError("dispatch rate admission timeout must be finite and positive")
+            deadline_ns = self._wait_now_ns() + math.ceil(timeout_seconds * _NANOSECONDS_PER_SECOND)
         while True:
-            with self._path_lock:
-                with _exclusive_state_lease(self._path):
+            if deadline_ns is None:
+                self._path_lock.acquire()
+            else:
+                remaining_ns = deadline_ns - self._wait_now_ns()
+                if remaining_ns <= 0 or not self._path_lock.acquire(
+                    timeout=remaining_ns / _NANOSECONDS_PER_SECOND
+                ):
+                    raise ExternalDispatchRateAdmissionTimeout("dispatch rate admission timed out")
+            try:
+                with _exclusive_state_lease(
+                    self._path,
+                    blocking=deadline_ns is None,
+                ):
+                    if deadline_ns is not None and self._wait_now_ns() >= deadline_ns:
+                        raise ExternalDispatchRateAdmissionTimeout(
+                            "dispatch rate admission timed out"
+                        )
                     state = _read_state(self._path)
                     self._validate_state(state)
                     now_ns = self._clock_ns()
@@ -265,7 +309,10 @@ class ExternalDispatchRateAuthority:
                             raise ExternalDispatchRateIntegrityError(
                                 "dispatch rate clock regressed beyond the frozen period"
                             )
-                        wait_ns = max(0, last_ns + self._policy.minimum_spacing_ns - now_ns)
+                        wait_ns = max(
+                            0,
+                            last_ns + self._policy.minimum_spacing_ns - now_ns,
+                        )
                     if wait_ns == 0:
                         next_state = _ExternalDispatchRateState.freeze(
                             policy_digest=self._policy.digest,
@@ -280,7 +327,28 @@ class ExternalDispatchRateAuthority:
                             sequence=next_state.sequence,
                             admitted_at_unix_ns=now_ns,
                         )
-            self._sleeper(wait_ns / 1_000_000_000)
+                    wait_seconds = wait_ns / _NANOSECONDS_PER_SECOND
+            except _ExternalDispatchRateLeaseBusy:
+                wait_seconds = _RATE_LOCK_POLL_SECONDS
+            finally:
+                self._path_lock.release()
+            if deadline_ns is not None:
+                remaining_ns = deadline_ns - self._wait_now_ns()
+                if remaining_ns <= 0:
+                    raise ExternalDispatchRateAdmissionTimeout("dispatch rate admission timed out")
+                wait_seconds = min(
+                    wait_seconds,
+                    remaining_ns / _NANOSECONDS_PER_SECOND,
+                )
+            self._sleeper(wait_seconds)
+
+    def _wait_now_ns(self) -> int:
+        now_ns = self._wait_clock_ns()
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            raise ExternalDispatchRateIntegrityError(
+                "dispatch rate wait clock returned an invalid timestamp"
+            )
+        return now_ns
 
     def _validate_state(self, state: _ExternalDispatchRateState) -> None:
         if state.policy_digest != self._policy.digest:
@@ -342,7 +410,7 @@ def _resolve_private_state_path(path: Path) -> Path:
 
 
 @contextmanager
-def _exclusive_state_lease(path: Path) -> Iterator[None]:
+def _exclusive_state_lease(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Serialize one short ledger transaction across trusted host processes."""
     if fcntl is None:
         raise ExternalDispatchRateIntegrityError("dispatch rate ledgers require POSIX file locking")
@@ -363,7 +431,13 @@ def _exclusive_state_lease(path: Path) -> Iterator[None]:
             raise ExternalDispatchRateIntegrityError(
                 "dispatch rate lock is not a private regular file"
             )
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(descriptor, operation)
+        except OSError as error:
+            if not blocking and error.errno in (errno.EACCES, errno.EAGAIN):
+                raise _ExternalDispatchRateLeaseBusy from None
+            raise
         try:
             yield
         finally:

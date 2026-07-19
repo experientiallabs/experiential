@@ -14,6 +14,7 @@ import pytest
 import wmh.tracking.rate_limit as rate_limit
 from wmh.tracking.rate_limit import (
     E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAdmissionTimeout,
     ExternalDispatchRateAuthority,
     ExternalDispatchRateIntegrityError,
     ExternalDispatchRatePolicy,
@@ -136,6 +137,24 @@ def test_task_and_runner_consumers_share_one_no_burst_sequence(tmp_path: Path) -
     assert clock.sleeps == [0.25, 0.25, 0.25, 0.25]
 
 
+def test_rate_authority_bounds_policy_spacing_wait(tmp_path: Path) -> None:
+    clock = _Clock()
+    authority = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "rate.json").resolve(),
+        _policy(),
+        clock_ns=clock.time_ns,
+        wait_clock_ns=clock.time_ns,
+        sleeper=clock.sleep,
+    )
+    assert authority.acquire().sequence == 1
+
+    with pytest.raises(ExternalDispatchRateAdmissionTimeout, match="timed out"):
+        authority.acquire(timeout_seconds=0.1)
+
+    assert clock.sleeps == [0.1]
+    assert json.loads((tmp_path / "rate.json").read_text())["sequence"] == 1
+
+
 @pytest.mark.skipif(os.name != "posix", reason="rate leases require POSIX file locking")
 def test_rate_authority_waits_for_a_cross_process_ledger_lease(tmp_path: Path) -> None:
     path = (tmp_path / "rate.json").resolve()
@@ -165,6 +184,31 @@ def test_rate_authority_waits_for_a_cross_process_ledger_lease(tmp_path: Path) -
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="rate leases require POSIX file locking")
+def test_rate_authority_bounds_cross_process_ledger_contention(tmp_path: Path) -> None:
+    path = (tmp_path / "rate.json").resolve()
+    authority = ExternalDispatchRateAuthority.bootstrap(path, _policy())
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(target=_hold_rate_lease, args=(str(path), ready, release))
+    try:
+        holder.start()
+        assert ready.wait(timeout=5)
+
+        with pytest.raises(ExternalDispatchRateAdmissionTimeout, match="timed out"):
+            authority.acquire(timeout_seconds=0.05)
+
+        assert json.loads(path.read_text())["sequence"] == 0
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=5)
+        assert holder.exitcode == 0
 
 
 def test_rate_authority_rejects_tampered_state_before_admission(tmp_path: Path) -> None:
