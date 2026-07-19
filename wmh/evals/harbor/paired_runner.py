@@ -946,20 +946,17 @@ class _LocalPairedHarborLeaseCoordinator:
         )
         task_path = self._lease_path("task", protocol_digest, block.task_id)
         while True:
-            stack = ExitStack()
-            try:
-                _enter_first_available_lease(stack, global_paths)
-                _enter_first_available_lease(stack, route_paths)
-                stack.enter_context(_block_file_lease(task_path))
-            except PairedHarborLeaseContentionError:
-                stack.close()
-                await asyncio.sleep(self._poll_interval_s)
-                continue
-            try:
-                yield
-            finally:
-                stack.close()
-            return
+            with ExitStack() as stack:
+                try:
+                    _enter_first_available_lease(stack, global_paths)
+                    _enter_first_available_lease(stack, route_paths)
+                    stack.enter_context(_block_file_lease(task_path))
+                except PairedHarborLeaseContentionError:
+                    pass
+                else:
+                    yield
+                    return
+            await asyncio.sleep(self._poll_interval_s)
 
     def _slot_paths(self, kind: str, parts: tuple[str, ...], count: int) -> tuple[Path, ...]:
         token = _lease_token(kind, *parts)

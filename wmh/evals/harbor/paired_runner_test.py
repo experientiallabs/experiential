@@ -8,6 +8,8 @@ import json
 import multiprocessing
 import os
 from collections import Counter, defaultdict
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -1258,6 +1260,52 @@ def test_local_block_capacity_is_enforced_across_processes(tmp_path: Path) -> No
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+
+
+def test_local_block_lease_releases_partial_acquisition_on_noncontention_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = mod._LocalPairedHarborLeaseCoordinator(tmp_path / "jobs")
+    block = mod.PairedBlock(
+        task_id="task-a",
+        panel_member="worker",
+        attempt=1,
+        first_arm=PairedArm.BASELINE,
+    )
+    acquisition_calls = 0
+    released = False
+
+    @contextmanager
+    def tracked_lease() -> Iterator[None]:
+        nonlocal released
+        try:
+            yield
+        finally:
+            released = True
+
+    def enter_first_available(stack: ExitStack, _paths: tuple[Path, ...]) -> None:
+        nonlocal acquisition_calls
+        acquisition_calls += 1
+        if acquisition_calls == 1:
+            stack.enter_context(tracked_lease())
+            return
+        raise OSError("irregular route lease")
+
+    monkeypatch.setattr(mod, "_enter_first_available_lease", enter_first_available)
+
+    async def acquire() -> None:
+        async with coordinator.block_lease(
+            protocol_digest="sha256:" + "a" * 64,
+            block=block,
+            max_concurrent_blocks=1,
+            max_concurrent_route_blocks=1,
+        ):
+            pytest.fail("block lease unexpectedly succeeded")
+
+    with pytest.raises(OSError, match="irregular route lease"):
+        asyncio.run(acquire())
+    assert released is True
 
 
 def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
