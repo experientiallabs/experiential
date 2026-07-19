@@ -70,6 +70,68 @@ def test_receipt_digest_changes_with_nested_request_content() -> None:
     assert first.cache_config_supplied is False
 
 
+def test_receipt_digest_supports_signed_bedrock_reasoning_bytes_without_collisions() -> None:
+    kwargs = {
+        "provider": "bedrock",
+        "provider_request_id": "request-1",
+        "response_id": None,
+        "requested_model": "us.anthropic.claude-opus-4-6-v1",
+        "response_model": None,
+        "system_fingerprint": None,
+        "temperature": None,
+        "max_tokens": 4_096,
+        "max_tokens_field": "inferenceConfig.maxTokens",
+        "started_at_unix_s": 10.0,
+        "finished_at_unix_s": 11.0,
+    }
+    signed = build_chat_provider_receipt(
+        **kwargs,
+        request_payload={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"redactedContent": b"\x00signed\xffreasoning"}}
+                    ],
+                }
+            ]
+        },
+    )
+    repeated = build_chat_provider_receipt(
+        **kwargs,
+        request_payload={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"redactedContent": b"\x00signed\xffreasoning"}}
+                    ],
+                }
+            ]
+        },
+    )
+    json_lookalike = build_chat_provider_receipt(
+        **kwargs,
+        request_payload={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "reasoningContent": {
+                                "redactedContent": ["bytes", "AHNpZ25lZP9yZWFzb25pbmc="]
+                            }
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert signed.request_digest == repeated.request_digest
+    assert signed.request_digest != json_lookalike.request_digest
+
+
 def test_ordinary_tool_schema_cache_names_are_not_provider_cache_controls() -> None:
     receipt = build_chat_provider_receipt(
         provider="bedrock",

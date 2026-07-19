@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import time
 from collections.abc import Mapping, Sequence
+from typing import TypeAlias
 
 from llm_waterfall import ChatProviderReceipt
+from pydantic import JsonValue
 
-from wmh.core.types import JsonObject
 from wmh.providers.base import ProviderConfig, ProviderKind
+
+ProviderRequestScalar: TypeAlias = None | bool | int | float | str | bytes
+ProviderRequestValue: TypeAlias = (
+    ProviderRequestScalar | Sequence["ProviderRequestValue"] | Mapping[str, "ProviderRequestValue"]
+)
+ProviderRequestPayload: TypeAlias = "Mapping[str, ProviderRequestValue]"
 
 
 def build_chat_provider_receipt(
@@ -21,7 +29,7 @@ def build_chat_provider_receipt(
     requested_model: str,
     response_model: str | None,
     system_fingerprint: str | None,
-    request_payload: JsonObject,
+    request_payload: ProviderRequestPayload,
     temperature: float | None,
     max_tokens: int,
     max_tokens_field: str,
@@ -30,7 +38,7 @@ def build_chat_provider_receipt(
 ) -> ChatProviderReceipt:
     """Build a strict receipt without retaining prompt, tool, or credential material."""
     canonical = json.dumps(
-        request_payload,
+        _canonical_receipt_value(request_payload),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -54,14 +62,41 @@ def build_chat_provider_receipt(
     )
 
 
-def _seed_supplied(request_payload: JsonObject) -> bool:
+def _canonical_receipt_value(value: ProviderRequestValue) -> JsonValue:
+    """Encode one wire value into a collision-safe, deterministic JSON representation."""
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", value]
+    if isinstance(value, float):
+        return ["float", value]
+    if isinstance(value, str):
+        return ["string", value]
+    if isinstance(value, bytes):
+        return ["bytes", base64.b64encode(value).decode("ascii")]
+    if isinstance(value, Mapping):
+        keys = list(value)
+        if any(not isinstance(key, str) for key in keys):
+            raise TypeError("provider receipt request objects require string keys")
+        entries: list[JsonValue] = [
+            [key, _canonical_receipt_value(value[key])] for key in sorted(keys)
+        ]
+        return ["object", entries]
+    if isinstance(value, Sequence):
+        return ["array", [_canonical_receipt_value(item) for item in value]]
+    raise TypeError(f"unsupported provider receipt request value: {type(value).__name__}")
+
+
+def _seed_supplied(request_payload: ProviderRequestPayload) -> bool:
     if "seed" in request_payload:
         return True
     additional = request_payload.get("additionalModelRequestFields")
     return isinstance(additional, Mapping) and "seed" in additional
 
 
-def _cache_config_supplied(provider: str, request_payload: JsonObject) -> bool:
+def _cache_config_supplied(provider: str, request_payload: ProviderRequestPayload) -> bool:
     """Detect provider cache controls only in their documented wire locations."""
     if provider in {"openai", "azure"}:
         return any(
