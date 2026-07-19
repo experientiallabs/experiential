@@ -6,7 +6,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,12 +18,15 @@ import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.environment_type import EnvironmentType
+from llm_waterfall import ChatRequest, ChatResponse
 
 import wmh.evals.harbor.agent as mod
 from wmh.core.types import JsonObject
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.pi_runner import (
     AmbiguousTaskEnvironmentError,
+    DeadlineAwareToolExecutor,
+    DeadlineAwareWorker,
     PiCandidateError,
     PiCandidateFailureReason,
     PiCandidateFailureStage,
@@ -31,6 +36,11 @@ from wmh.harness.pi_runner import (
 )
 from wmh.harness.runner_link import TokenUsage
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.process_worker import (
+    ProviderWorkerCleanupError,
+    ProviderWorkerDeadlineExceeded,
+    ProviderWorkerUnavailable,
+)
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
     "JsonObject",
@@ -60,11 +70,30 @@ _TASK_ENVIRONMENT_DIGEST = (
 )
 
 
-class _Provider:
-    """Structural tool-calling provider whose network method is never called here."""
+class _ProviderWorker:
+    """Disposable worker double whose lifecycle is always proved."""
 
-    def complete_chat(self, request: object) -> object:
-        raise AssertionError(f"unexpected completion request: {request}")
+    def __init__(self, _config: ProviderConfig) -> None:
+        self.closed = threading.Event()
+
+    def start(self, _deadline: mod.TurnDeadline) -> None:
+        return
+
+    def complete_chat(
+        self,
+        _request: ChatRequest,
+        _deadline: mod.TurnDeadline,
+    ) -> ChatResponse:
+        raise AssertionError("unexpected provider request")
+
+    def cancel(self) -> None:
+        self.closed.set()
+
+    def close(self) -> None:
+        self.closed.set()
+
+    def wait_closed(self, timeout_s: float) -> bool:
+        return self.closed.wait(timeout_s)
 
 
 class _Environment:
@@ -106,7 +135,7 @@ class _Environment:
 
 
 def _agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> mod.WmhPiAgent:
-    monkeypatch.setattr(mod, "get_provider", lambda _config: _Provider())
+    monkeypatch.setattr(mod, "ProviderProcessWorker", _ProviderWorker)
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
     agent = mod.WmhPiAgent(
         logs_dir=tmp_path / "agent",
@@ -132,8 +161,8 @@ def _healthy_disk_result(*, available_kib: int | None = None) -> ExecResult:
     )
 
 
-def _deadline(seconds: float = 300.0) -> mod.ToolExecutionDeadline:
-    return mod.ToolExecutionDeadline.after(seconds)
+def _deadline(seconds: float = 300.0) -> mod.TurnDeadline:
+    return mod.TurnDeadline.after(seconds)
 
 
 @pytest.mark.parametrize("turn_timeout_s", [float("nan"), float("inf"), float("-inf")])
@@ -142,7 +171,6 @@ def test_agent_rejects_non_finite_turn_timeout(
     monkeypatch: pytest.MonkeyPatch,
     turn_timeout_s: float,
 ) -> None:
-    monkeypatch.setattr(mod, "get_provider", lambda _config: _Provider())
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
 
     with pytest.raises(ValueError, match="finite and positive"):
@@ -159,7 +187,6 @@ def test_agent_rejects_mutable_runner_image(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mod, "get_provider", lambda _config: _Provider())
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
 
     with pytest.raises(ValueError, match="digest-qualified"):
@@ -175,7 +202,6 @@ def test_agent_rejects_mutable_runner_image(
 def test_agent_rejects_environment_injection_before_task_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(mod, "get_provider", lambda _config: _Provider())
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
     secret = "credential-secret-sentinel"
 
@@ -842,7 +868,7 @@ def test_tool_executor_refuses_to_start_without_one_harbor_timeout_tick() -> Non
             asyncio.get_running_loop(), cast("BaseEnvironment", environment)
         )
 
-        with pytest.raises(mod.ToolExecutionDeadlineExceeded):
+        with pytest.raises(mod.TurnDeadlineExceeded):
             await asyncio.to_thread(
                 executor,
                 "bash",
@@ -887,6 +913,65 @@ def test_harbor_environment_timeout_before_turn_deadline_remains_infrastructure(
         assert environment.calls == []
         assert environment.health_calls[0][2] is not None
         assert environment.health_calls[0][2] <= 42
+
+    asyncio.run(scenario())
+
+
+def test_tool_executor_cancellation_unblocks_its_active_harbor_call() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        finish_cleanup = asyncio.Event()
+        cancelled = asyncio.Event()
+        never = asyncio.Event()
+
+        class BlockingEnvironment(_Environment):
+            async def exec(
+                self,
+                command: str,
+                cwd: str | None = None,
+                env: dict[str, str] | None = None,
+                timeout_sec: int | None = None,
+                user: str | int | None = None,
+            ) -> ExecResult:
+                _ = command, cwd, env, timeout_sec, user
+                started.set()
+                try:
+                    await never.wait()
+                except asyncio.CancelledError:
+                    cleanup_started.set()
+                    await finish_cleanup.wait()
+                    raise
+                finally:
+                    cancelled.set()
+                raise AssertionError("cancelled Harbor call unexpectedly resumed")
+
+        executor = mod.HarborToolExecutor(
+            asyncio.get_running_loop(), cast("BaseEnvironment", BlockingEnvironment())
+        )
+        call = asyncio.create_task(
+            asyncio.to_thread(
+                executor._environment_exec,
+                "sleep",
+                deadline=_deadline(),
+                timeout_s=30,
+                env={},
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        executor.cancel()
+        with pytest.raises(AmbiguousTaskEnvironmentError):
+            await asyncio.wait_for(call, timeout=2)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+        assert executor.wait_closed(0) is False
+        finish_cleanup.set()
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+        for _ in range(200):
+            if executor.wait_closed(0):
+                break
+            await asyncio.sleep(0.01)
+        assert executor.wait_closed(0)
 
     asyncio.run(scenario())
 
@@ -1011,6 +1096,283 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
     assert "worker provider unavailable" in trace
 
 
+def test_provider_start_deadline_is_typed_and_persisted_without_raw_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+    secret = "provider-secret-sentinel"
+
+    class DeadlineWorker(_ProviderWorker):
+        def start(self, _deadline: object) -> None:
+            raise ProviderWorkerDeadlineExceeded(secret)
+
+    monkeypatch.setattr(mod, "ProviderProcessWorker", DeadlineWorker)
+    monkeypatch.setattr(
+        mod,
+        "run_pi_turn",
+        lambda *_args, **_kwargs: pytest.fail("turn must not start after provider startup timeout"),
+    )
+    context = AgentContext()
+
+    with pytest.raises(mod.WmhPiProviderDeadlineError) as caught:
+        asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), context))
+
+    assert secret not in str(caught.value)
+    assert context.metadata is not None
+    assert context.metadata["infrastructure_failure_kind"] == "provider_deadline"
+    assert context.metadata["run_health"] == "infrastructure_failure"
+
+
+def test_provider_cleanup_failure_is_typed_runner_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+
+    class UnreapedWorker(_ProviderWorker):
+        def close(self) -> None:
+            raise ProviderWorkerCleanupError("secret cleanup detail")
+
+        def cancel(self) -> None:
+            raise ProviderWorkerCleanupError("secret cleanup detail")
+
+        def wait_closed(self, timeout_s: float) -> bool:
+            _ = timeout_s
+            return False
+
+    monkeypatch.setattr(mod, "ProviderProcessWorker", UnreapedWorker)
+    monkeypatch.setattr(
+        mod,
+        "run_pi_turn",
+        lambda *_args, **_kwargs: PiTurnResult(
+            answer="done",
+            terminal_reason="completed",
+            events=(),
+            worker_usage=TokenUsage(),
+        ),
+    )
+
+    with pytest.raises(mod.WmhPiCleanupError) as caught:
+        asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), AgentContext()))
+
+    assert "secret" not in str(caught.value)
+
+
+def test_outer_cancellation_unblocks_and_joins_provider_turn_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+    call_started = threading.Event()
+    call_finished = threading.Event()
+    release_call = threading.Event()
+    workers: list[_ProviderWorker] = []
+
+    class BlockingWorker(_ProviderWorker):
+        def __init__(self, config: ProviderConfig) -> None:
+            super().__init__(config)
+            workers.append(self)
+
+        def complete_chat(
+            self,
+            _request: ChatRequest,
+            _deadline: mod.TurnDeadline,
+        ) -> ChatResponse:
+            call_started.set()
+            release_call.wait()
+            raise ProviderWorkerUnavailable("provider worker is unavailable")
+
+        def cancel(self) -> None:
+            release_call.set()
+            super().cancel()
+
+    def block_on_provider(*_args: object, **kwargs: object) -> PiTurnResult:
+        worker_fn = cast("DeadlineAwareWorker", kwargs["worker_fn"])
+        try:
+            worker_fn(
+                ChatRequest.model_validate({"messages": [{"role": "user", "content": "hello"}]}),
+                _deadline(),
+            )
+        finally:
+            call_finished.set()
+        raise AssertionError("cancelled provider call unexpectedly returned")
+
+    monkeypatch.setattr(mod, "ProviderProcessWorker", BlockingWorker)
+    monkeypatch.setattr(mod, "run_pi_turn", block_on_provider)
+
+    async def scenario() -> None:
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+        task = asyncio.create_task(
+            agent.run("task", cast("BaseEnvironment", _Environment()), AgentContext())
+        )
+        for _ in range(200):
+            if call_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert call_started.is_set()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert call_finished.is_set()
+    assert len(workers) == 1
+    assert workers[0].wait_closed(0)
+
+
+def test_agent_cancellation_waits_for_harbor_coroutine_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+    environment_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    environment_closed = asyncio.Event()
+
+    class BlockingEnvironment(_Environment):
+        async def exec(
+            self,
+            command: str,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: int | None = None,
+            user: str | int | None = None,
+        ) -> ExecResult:
+            _ = command, cwd, env, timeout_sec, user
+            environment_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await finish_cleanup.wait()
+                raise
+            finally:
+                environment_closed.set()
+            raise AssertionError("cancelled Harbor coroutine unexpectedly resumed")
+
+    def block_on_environment(*_args: object, **kwargs: object) -> PiTurnResult:
+        execute_tool = cast("DeadlineAwareToolExecutor", kwargs["execute_tool"])
+        execute_tool(
+            "bash",
+            cast("JsonObject", {"command": "pwd"}),
+            lambda *_args: None,
+            _deadline(),
+        )
+        raise AssertionError("cancelled Harbor call unexpectedly returned")
+
+    monkeypatch.setattr(mod, "run_pi_turn", block_on_environment)
+
+    async def scenario() -> None:
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+        task = asyncio.create_task(
+            agent.run(
+                "task",
+                cast("BaseEnvironment", BlockingEnvironment()),
+                AgentContext(),
+            )
+        )
+        await asyncio.wait_for(environment_started.wait(), timeout=2)
+
+        task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+
+        finish_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+        assert environment_closed.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_during_cleanup", [False, True])
+def test_candidate_deadline_cleanup_preserves_late_cancellation(
+    cancel_during_cleanup: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+    environment_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    environment_closed = asyncio.Event()
+
+    class BlockingEnvironment(_Environment):
+        async def exec(
+            self,
+            command: str,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: int | None = None,
+            user: str | int | None = None,
+        ) -> ExecResult:
+            _ = command, cwd, env, timeout_sec, user
+            environment_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await finish_cleanup.wait()
+                raise
+            finally:
+                environment_closed.set()
+            raise AssertionError("cancelled Harbor coroutine unexpectedly resumed")
+
+    def expire_environment_call(*_args: object, **kwargs: object) -> PiTurnResult:
+        executor = cast("mod.HarborToolExecutor", kwargs["execute_tool"])
+        try:
+            executor._environment_exec(
+                "sleep",
+                deadline=_deadline(0.05),
+                timeout_s=1,
+                env={},
+            )
+        except mod.TurnDeadlineExceeded:
+            raise PiCandidateError(
+                "candidate turn expired",
+                stage=PiCandidateFailureStage.TURN,
+                reason=PiCandidateFailureReason.TIMEOUT,
+                events=(SessionEvent(kind="error", payload={"message": "turn expired"}),),
+                worker_usage=TokenUsage(),
+            ) from None
+        raise AssertionError("environment call unexpectedly completed")
+
+    monkeypatch.setattr(mod, "run_pi_turn", expire_environment_call)
+
+    async def scenario() -> None:
+        context = AgentContext()
+        task = asyncio.create_task(
+            agent.run(
+                "task",
+                cast("BaseEnvironment", BlockingEnvironment()),
+                context,
+            )
+        )
+        await asyncio.wait_for(environment_started.wait(), timeout=2)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+        if cancel_during_cleanup:
+            task.cancel()
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+
+        finish_cleanup.set()
+        if cancel_during_cleanup:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+        else:
+            await asyncio.wait_for(task, timeout=2)
+        assert environment_closed.is_set()
+        assert context.metadata is not None
+        if cancel_during_cleanup:
+            assert "candidate_failure" not in context.metadata
+        else:
+            assert context.metadata["candidate_failure"] is True
+            assert context.metadata["candidate_failure_reason"] == "timeout"
+
+    asyncio.run(scenario())
+
+
 def test_trace_failure_cannot_skip_or_replace_runner_cleanup_proof(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1056,7 +1418,7 @@ def test_trace_failure_cannot_skip_or_replace_runner_cleanup_proof(
     assert factory.wait_calls == 1
 
 
-@pytest.mark.parametrize("branch", ["cancellation", "infrastructure"])
+@pytest.mark.parametrize("branch", ["cancellation", "candidate", "infrastructure"])
 @pytest.mark.parametrize("cleanup_failure", ["cancel_exception", "cancel_timeout", "wait_timeout"])
 def test_all_failure_branches_sanitize_cancel_and_wait_cleanup_failures(
     branch: str,
@@ -1088,16 +1450,24 @@ def test_all_failure_branches_sanitize_cancel_and_wait_cleanup_failures(
 
     factory = FailingCleanupFactory(image=mod.PI_CONTAINER_IMAGE)
     monkeypatch.setattr(mod, "LocalContainerRunnerFactory", lambda **_kwargs: factory)
-    monkeypatch.setattr(mod, "_RUNNER_CLEANUP_TIMEOUT_S", 0.005)
+    monkeypatch.setattr(mod, "_EXECUTION_CLEANUP_TIMEOUT_S", 0.005)
 
     def fail(*_args: object, **_kwargs: object) -> PiTurnResult:
         if branch == "cancellation":
             raise asyncio.CancelledError
+        if branch == "candidate":
+            raise PiCandidateError(
+                "candidate failed",
+                stage=PiCandidateFailureStage.TURN,
+                reason=PiCandidateFailureReason.RUNTIME_ERROR,
+                events=(),
+                worker_usage=TokenUsage(),
+            )
         raise RuntimeError("runner infrastructure failed")
 
     monkeypatch.setattr(mod, "run_pi_turn", fail)
 
-    with pytest.raises(mod.WmhPiCleanupError, match="runner cleanup was not proved") as caught:
+    with pytest.raises(mod.WmhPiCleanupError, match="execution cleanup was not proved") as caught:
         asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), AgentContext()))
 
     assert secret not in str(caught.value)

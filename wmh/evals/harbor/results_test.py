@@ -411,7 +411,12 @@ def test_usage_total_is_reported_only_when_every_cell_is_metered(tmp_path: Path)
 
 @pytest.mark.parametrize(
     "exception_type",
-    ["WmhPiProviderError", "AgentTimeoutError", "CancelledError"],
+    [
+        "WmhPiProviderDeadlineError",
+        "WmhPiProviderError",
+        "AgentTimeoutError",
+        "CancelledError",
+    ],
 )
 def test_interrupted_usage_is_a_known_lower_bound_not_an_exact_total(
     tmp_path: Path,
@@ -457,6 +462,11 @@ def test_interrupted_usage_is_a_known_lower_bound_not_an_exact_total(
         ),
         (
             "WmhPiProviderError",
+            BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+            BenchmarkFailureKind.PROVIDER,
+        ),
+        (
+            "WmhPiProviderDeadlineError",
             BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
             BenchmarkFailureKind.PROVIDER,
         ),
@@ -513,6 +523,11 @@ def test_exception_classification_is_not_blanket_infrastructure(
         ("AgentTimeoutError", BenchmarkTrialStatus.SCORED, BenchmarkFailureKind.TASK_TIMEOUT),
         (
             "WmhPiProviderError",
+            BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+            BenchmarkFailureKind.PROVIDER,
+        ),
+        (
+            "WmhPiProviderDeadlineError",
             BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
             BenchmarkFailureKind.PROVIDER,
         ),

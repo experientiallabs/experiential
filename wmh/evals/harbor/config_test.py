@@ -17,6 +17,7 @@ from wmh.evals.harbor.config import (
     build_harbor_job_config,
     validate_controlled_harbor_environment,
 )
+from wmh.evals.harbor.docker_environment import REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
 
 _DATASET_REF = "sha256:" + "a" * 64
 
@@ -51,9 +52,9 @@ def test_local_default_maps_explicitly_to_harbor_docker(tmp_path: Path) -> None:
     config = build_harbor_job_config(_spec(tmp_path), agent=_agent())
 
     assert config.environment.type is EnvironmentType.DOCKER
+    assert config.environment.import_path == REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
     assert config.environment.delete is True
     assert config.environment.force_build is False
-    assert config.environment.import_path is None
     assert config.environment.mounts is None
     assert config.environment.extra_docker_compose == []
     assert config.environment.env == {}
@@ -75,6 +76,7 @@ def test_e2b_is_an_explicit_environment_with_no_docker_fallback(tmp_path: Path) 
     )
 
     assert config.environment.type is EnvironmentType.E2B
+    assert config.environment.import_path is None
 
 
 def test_native_local_and_git_dataset_sources_are_preserved(tmp_path: Path) -> None:
@@ -187,7 +189,10 @@ def test_controlled_environment_rejects_host_facing_overrides(
     update: dict[str, object],
     message: str,
 ) -> None:
-    environment = EnvironmentConfig(type=EnvironmentType.DOCKER).model_copy(update=update)
+    environment = EnvironmentConfig(
+        type=EnvironmentType.DOCKER,
+        import_path=REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH,
+    ).model_copy(update=update)
 
     with pytest.raises(ValueError, match=message):
         validate_controlled_harbor_environment(environment)

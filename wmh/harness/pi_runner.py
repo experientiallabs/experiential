@@ -33,40 +33,59 @@ from wmh.harness.live_session import (
     ToolOutcome,
 )
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
-from wmh.harness.runner_link import Channel, TokenUsage, WorkerFn
+from wmh.harness.runner_link import Channel, TokenUsage
 from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
 from wmh.harness.tools import READ_SKILL, ToolSpec, resolve_tools
-from wmh.providers.base import ToolCallingProvider
 from wmh.providers.failure_attribution import (
     ProviderFailureOwner,
     classify_provider_failure,
 )
+from wmh.providers.process_worker import (
+    ProviderWorkerDeadlineExceeded,
+    ProviderWorkerFailure,
+    ProviderWorkerUnavailable,
+    RequestDeadlineSource,
+)
 
 DEFAULT_PI_TURN_TIMEOUT_S = 300.0
+DEFAULT_PROVIDER_CALL_TIMEOUT_S = 240.0
 _PUMP_INTERVAL_S = 0.5
 _MAX_PI_EVENTS = 4_096
 _MAX_PI_EVENT_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
-class ToolExecutionDeadline:
-    """Absolute monotonic deadline shared by every tool call in one agent turn."""
+class TurnDeadline:
+    """Absolute monotonic deadline shared by provider and tool calls in one turn."""
 
     expires_at: float
+    limiting_source: RequestDeadlineSource = RequestDeadlineSource.CALLER_BUDGET
 
     @classmethod
-    def after(cls, timeout_s: float) -> ToolExecutionDeadline:
+    def after(cls, timeout_s: float) -> TurnDeadline:
         """Construct a deadline relative to the current process monotonic clock."""
         if not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError("tool execution timeout must be finite and positive")
+            raise ValueError("turn timeout must be finite and positive")
         return cls(expires_at=time.monotonic() + timeout_s)
 
     def remaining_s(self) -> float:
         """Return the nonnegative time still available to the whole turn."""
         return max(0.0, self.expires_at - time.monotonic())
 
+    def bounded_by(self, operation_timeout_s: float) -> TurnDeadline:
+        """Return the earlier of this caller budget and one operation limit."""
+        if not math.isfinite(operation_timeout_s) or operation_timeout_s <= 0:
+            raise ValueError("operation timeout must be finite and positive")
+        operation_expires_at = time.monotonic() + operation_timeout_s
+        if operation_expires_at < self.expires_at:
+            return TurnDeadline(
+                expires_at=operation_expires_at,
+                limiting_source=RequestDeadlineSource.OPERATION_LIMIT,
+            )
+        return self
 
-class ToolExecutionDeadlineExceeded(TimeoutError):
+
+class TurnDeadlineExceeded(TimeoutError):
     """A deadline-aware executor exhausted its caller-owned turn budget."""
 
 
@@ -78,9 +97,20 @@ class DeadlineAwareToolExecutor(Protocol):
         name: str,
         arguments: JsonObject,
         emit: OutputEmitter,
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
         /,
     ) -> ToolOutcome: ...
+
+
+class DeadlineAwareWorker(Protocol):
+    """Complete one provider request within the caller-owned turn deadline."""
+
+    def __call__(
+        self,
+        request: ChatRequest,
+        deadline: TurnDeadline,
+        /,
+    ) -> ChatResponse: ...
 
 
 class PiRunnerFactory(Protocol):
@@ -147,6 +177,7 @@ class PiInfrastructureFailureKind(StrEnum):
     """Trusted failure sources that must invalidate an evaluation trial."""
 
     PROVIDER = "provider"
+    PROVIDER_DEADLINE = "provider_deadline"
     TASK_ENVIRONMENT = "task_environment"
     TASK_ENVIRONMENT_CONFIRMATION_REQUIRED = "task_environment_confirmation_required"
 
@@ -164,6 +195,9 @@ class PiInfrastructureError(RuntimeError):
     ) -> None:
         message = {
             PiInfrastructureFailureKind.PROVIDER: "pi turn worker provider failed",
+            PiInfrastructureFailureKind.PROVIDER_DEADLINE: (
+                "pi turn worker provider deadline expired"
+            ),
             PiInfrastructureFailureKind.TASK_ENVIRONMENT: "pi turn tool executor failed",
             PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED: (
                 "pi turn task environment requires confirmation"
@@ -177,6 +211,7 @@ class PiInfrastructureError(RuntimeError):
             run_health
             or {
                 PiInfrastructureFailureKind.PROVIDER: PiRunHealth.INFRASTRUCTURE_FAILURE,
+                PiInfrastructureFailureKind.PROVIDER_DEADLINE: (PiRunHealth.INFRASTRUCTURE_FAILURE),
                 PiInfrastructureFailureKind.TASK_ENVIRONMENT: PiRunHealth.AMBIGUOUS,
                 PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED: (
                     PiRunHealth.AMBIGUOUS
@@ -288,11 +323,11 @@ def run_pi_turn(
     instruction: str,
     *,
     execute_tool: DeadlineAwareToolExecutor,
-    provider: ToolCallingProvider | None = None,
-    worker_fn: WorkerFn | None = None,
+    worker_fn: DeadlineAwareWorker,
     on_event: EventSink | None = None,
     runner_factory: PiRunnerFactory,
     timeout_s: float = DEFAULT_PI_TURN_TIMEOUT_S,
+    provider_call_timeout_s: float = DEFAULT_PROVIDER_CALL_TIMEOUT_S,
 ) -> PiTurnResult:
     """Run one instruction through the document's pi harness and return its observed event trace.
 
@@ -303,10 +338,10 @@ def run_pi_turn(
         raise ValueError(
             f"pi turn runner requires runtime kind 'pi-node', got {doc.runtime_kind()!r}"
         )
-    if provider is None and worker_fn is None:
-        raise ValueError("pi turn runner needs a ToolCallingProvider or worker_fn")
     if not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError("pi turn timeout must be finite and positive")
+    if not math.isfinite(provider_call_timeout_s) or provider_call_timeout_s <= 0:
+        raise ValueError("provider call timeout must be finite and positive")
 
     system, tools, files, skill_bodies = assemble_pi_harness(doc)
     events: list[SessionEvent] = []
@@ -316,8 +351,8 @@ def run_pi_turn(
     infrastructure_failure: PiInfrastructureError | None = None
     candidate_worker_failure = False
     candidate_task_failure: CandidateTaskEnvironmentError | None = None
-    tool_deadline_exceeded = False
-    turn_deadline: ToolExecutionDeadline | None = None
+    turn_deadline_exceeded = False
+    turn_deadline: TurnDeadline | None = None
     event_bytes = 0
     finalizing = False
 
@@ -349,17 +384,31 @@ def run_pi_turn(
         if on_event is not None:
             on_event(event)
 
-    selected_worker: WorkerFn
-    if worker_fn is not None:
-        selected_worker = worker_fn
-    else:
-        assert provider is not None
-        selected_worker = provider.complete_chat
-
     def checked_worker(request: ChatRequest) -> ChatResponse:
-        nonlocal candidate_worker_failure, infrastructure_failure
+        nonlocal candidate_worker_failure, infrastructure_failure, turn_deadline_exceeded
+        if turn_deadline is None:
+            infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
+            raise RuntimeError("worker provider unavailable")
         try:
-            return selected_worker(request)
+            return worker_fn(request, turn_deadline.bounded_by(provider_call_timeout_s))
+        except ProviderWorkerDeadlineExceeded as exc:
+            if exc.source is RequestDeadlineSource.CALLER_BUDGET:
+                turn_deadline_exceeded = True
+                raise RuntimeError("pi turn deadline exhausted during provider execution") from None
+            infrastructure_failure = PiInfrastructureError(
+                PiInfrastructureFailureKind.PROVIDER_DEADLINE
+            )
+            raise RuntimeError("worker provider deadline expired") from None
+        except ProviderWorkerFailure as exc:
+            attribution = exc.attribution
+            if attribution.owner is ProviderFailureOwner.CANDIDATE:
+                candidate_worker_failure = True
+                raise RuntimeError("candidate worker request rejected") from None
+            infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
+            raise RuntimeError("worker provider unavailable") from None
+        except ProviderWorkerUnavailable:
+            infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
+            raise RuntimeError("worker provider unavailable") from None
         except Exception as exc:  # noqa: BLE001 - replace trusted error text before it crosses
             attribution = classify_provider_failure(exc)
             if attribution.owner is ProviderFailureOwner.CANDIDATE:
@@ -373,7 +422,7 @@ def run_pi_turn(
         args: JsonObject,
         emit: OutputEmitter,
     ) -> ToolOutcome:
-        nonlocal candidate_task_failure, infrastructure_failure, tool_deadline_exceeded
+        nonlocal candidate_task_failure, infrastructure_failure, turn_deadline_exceeded
         if turn_deadline is None:
             raise RuntimeError("task tools are unavailable before the pi turn starts")
         try:
@@ -387,8 +436,8 @@ def run_pi_turn(
                 run_health=PiRunHealth.AMBIGUOUS,
             )
             raise RuntimeError("task environment health is ambiguous") from None
-        except ToolExecutionDeadlineExceeded:
-            tool_deadline_exceeded = True
+        except TurnDeadlineExceeded:
+            turn_deadline_exceeded = True
             raise RuntimeError("pi turn deadline exhausted during task execution") from None
         except Exception:  # noqa: BLE001 - replace trusted error text before it crosses to pi
             infrastructure_failure = PiInfrastructureError(
@@ -508,7 +557,7 @@ def run_pi_turn(
             pending_candidate = evidenced_candidate(stage=PiCandidateFailureStage.MATERIALIZATION)
             if pending_candidate is not None:
                 raise pending_candidate
-            turn_deadline = ToolExecutionDeadline.after(timeout_s)
+            turn_deadline = TurnDeadline.after(timeout_s)
             session.send_user_message(instruction)
             try:
                 while not session.closed and not terminal_reason:
@@ -529,7 +578,7 @@ def run_pi_turn(
                     pending_candidate = evidenced_candidate(stage=PiCandidateFailureStage.TURN)
                     if pending_candidate is not None:
                         raise pending_candidate
-                    if tool_deadline_exceeded:
+                    if turn_deadline_exceeded:
                         session.interrupt("pi_turn_timeout")
                         session.flush_pending_intents()
                         raise PiCandidateError(

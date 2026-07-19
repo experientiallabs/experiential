@@ -72,6 +72,7 @@ _PROVIDER_EXCEPTIONS = frozenset(
         "NetworkConnectionError",
         "OutputLengthExceededError",
         "UnknownApiError",
+        "WmhPiProviderDeadlineError",
         "WmhPiProviderError",
     }
 )

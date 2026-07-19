@@ -12,6 +12,8 @@ from harbor.models.job.config import DatasetConfig, JobConfig, RetryConfig
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from wmh.evals.harbor.docker_environment import REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
+
 SUPPORTED_HARBOR_VERSION = "0.18.0"
 
 
@@ -78,10 +80,8 @@ def build_harbor_job_config(spec: HarborJobSpec, *, agent: AgentConfig) -> JobCo
     """
     _require_supported_harbor_version()
     spec = HarborJobSpec.model_validate(spec.model_dump())
-    environment_type = {
-        HarborEnvironmentBackend.LOCAL: EnvironmentType.DOCKER,
-        HarborEnvironmentBackend.E2B: EnvironmentType.E2B,
-    }[spec.environment_backend]
+    local_environment = spec.environment_backend is HarborEnvironmentBackend.LOCAL
+    environment_type = EnvironmentType.DOCKER if local_environment else EnvironmentType.E2B
     if agent.n_concurrent != spec.agent_n_concurrent:
         raise ValueError("agent n_concurrent must already match HarborJobSpec.agent_n_concurrent")
     retry = RetryConfig(max_retries=0, include_exceptions=None)
@@ -94,7 +94,7 @@ def build_harbor_job_config(spec: HarborJobSpec, *, agent: AgentConfig) -> JobCo
         agents=[agent.model_copy(deep=True)],
         environment=EnvironmentConfig(
             type=environment_type,
-            import_path=None,
+            import_path=REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH if local_environment else None,
             force_build=False,
             delete=True,
             mounts=None,
@@ -125,8 +125,16 @@ def validate_controlled_harbor_environment(
         raise ValueError("Harbor environment type must be Docker or E2B")
     if expected_type is not None and environment.type is not expected_type:
         raise ValueError("Harbor environment type differs from the frozen job backend")
-    if environment.import_path is not None:
-        raise ValueError("Harbor environment import_path is unsupported")
+    expected_import_path = (
+        REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
+        if environment.type is EnvironmentType.DOCKER
+        else None
+    )
+    if environment.import_path != expected_import_path:
+        raise ValueError(
+            "Harbor environment import_path must be the trusted local reaping adapter for "
+            "Docker and absent for E2B"
+        )
     if environment.force_build:
         raise ValueError("Harbor environment force_build must remain disabled")
     if not environment.delete:

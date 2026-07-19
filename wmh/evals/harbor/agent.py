@@ -13,7 +13,8 @@ import re
 import shlex
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,20 +42,27 @@ from wmh.harness.pi_runner import (
     PiInfrastructureFailureKind,
     PiRunHealth,
     PiTurnResult,
-    ToolExecutionDeadline,
-    ToolExecutionDeadlineExceeded,
+    TurnDeadline,
+    TurnDeadlineExceeded,
     run_pi_turn,
 )
 from wmh.harness.runner_link import Channel, TokenUsage
-from wmh.providers.base import ProviderConfig, ToolCallingProvider
-from wmh.providers.registry import get_provider
+from wmh.providers.base import ProviderConfig
+from wmh.providers.process_worker import (
+    ProviderProcessWorker,
+    ProviderWorkerCleanupError,
+    ProviderWorkerDeadlineExceeded,
+    ProviderWorkerFailure,
+    ProviderWorkerUnavailable,
+)
 
 _TOOL_OUTPUT_CHARS = 16_000
 _TOOL_STREAM_CHARS = _TOOL_OUTPUT_CHARS // 2
 _TOOL_COMMAND_BYTES = 32 * 1024
 _TOOL_PATH_BYTES = 4 * 1024
 _TOOL_CONTENT_BYTES = 64 * 1024
-_RUNNER_CLEANUP_TIMEOUT_S = 30.0
+_EXECUTION_CLEANUP_TIMEOUT_S = 30.0
+_PROVIDER_WORKER_START_TIMEOUT_S = 30.0
 _ENVIRONMENT_ATTESTATION_TIMEOUT_S = 30
 _MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES = 64 * 1024
 _MAX_ENVIRONMENT_CONTAINERS = 64
@@ -63,7 +71,7 @@ _MIN_TASK_FREE_DISK_KIB = 128 * 1024
 _TRACE_FILE = "wmh-events.jsonl"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.2.0"
+WMH_PI_AGENT_VERSION: Final = "0.3.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -114,6 +122,10 @@ class WmhPiProviderError(RuntimeError):
     """The host-side worker provider failed during a benchmark trial."""
 
 
+class WmhPiProviderDeadlineError(RuntimeError):
+    """The host-side provider exceeded its evaluator-owned hard deadline."""
+
+
 class WmhPiEnvironmentError(RuntimeError):
     """Harbor's task environment failed while executing a pi tool request."""
 
@@ -127,7 +139,7 @@ class WmhPiRunnerError(RuntimeError):
 
 
 class WmhPiCleanupError(RuntimeError):
-    """Candidate runner cleanup could not be proved."""
+    """Trusted pi execution cleanup could not be proved."""
 
 
 class _CandidateToolArgumentError(ValueError):
@@ -142,6 +154,15 @@ class _TaskEnvironmentUnavailableError(RuntimeError):
 class _TaskEnvironmentAttestation:
     digest: str
     evidence: JsonObject
+
+
+@dataclass
+class _EnvironmentCall:
+    result: Future[ExecResult]
+    closed: threading.Event
+    cleanup_failed: threading.Event
+    task: asyncio.Task[ExecResult] | None = None
+    cancel_requested: bool = False
 
 
 # Harbor 0.18 exposes no public API for the exact Docker Compose project or the E2B sandbox that
@@ -186,13 +207,43 @@ class HarborToolExecutor:
         self._event_loop = event_loop
         self._environment = environment
         self._disk_health_initialized = False
+        self._lock = threading.Lock()
+        self._current_call: _EnvironmentCall | None = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Cancel any active Harbor environment call from the host event loop."""
+        with self._lock:
+            self._cancelled = True
+            call = self._current_call
+        if call is not None:
+            self._cancel_call(call)
+
+    def wait_closed(self, timeout_s: float) -> bool:
+        """Wait until the latest Harbor coroutine has finished cancellation cleanup."""
+        with self._lock:
+            call = self._current_call
+        if call is None:
+            return True
+        return call.closed.wait(timeout_s) and not call.cleanup_failed.is_set()
+
+    def join_closed(self, timeout_s: float) -> bool:
+        """Join the latest Harbor coroutine without abandoning it after the proof timeout."""
+        with self._lock:
+            call = self._current_call
+        if call is None:
+            return True
+        closed_in_time = call.closed.wait(timeout_s)
+        if not closed_in_time:
+            call.closed.wait()
+        return closed_in_time and not call.cleanup_failed.is_set()
 
     def __call__(
         self,
         name: str,
         arguments: JsonObject,
         emit: OutputEmitter,
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
     ) -> ToolOutcome:
         """Execute a supported task tool and preserve command failures as observations."""
         try:
@@ -242,7 +293,7 @@ class HarborToolExecutor:
         self,
         command: str,
         *,
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
         env: dict[str, str] | None = None,
     ) -> ExecResult:
         if not self._disk_health_initialized:
@@ -251,7 +302,7 @@ class HarborToolExecutor:
         remaining_s = deadline.remaining_s()
         environment_timeout_s = math.floor(remaining_s)
         if environment_timeout_s < 1:
-            raise ToolExecutionDeadlineExceeded
+            raise TurnDeadlineExceeded
         timeout_headroom_s = min(
             30.0,
             max(0.1, environment_timeout_s / 10),
@@ -285,13 +336,13 @@ class HarborToolExecutor:
     def _check_task_disk_health(
         self,
         *,
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
         after_candidate: bool,
     ) -> None:
         """Require fixed free space before execution and attribute a post-command loss."""
         remaining_s = math.floor(deadline.remaining_s())
         if remaining_s < 1:
-            raise ToolExecutionDeadlineExceeded
+            raise TurnDeadlineExceeded
         result = self._environment_exec(
             _TASK_DISK_HEALTH_COMMAND,
             deadline=deadline,
@@ -317,33 +368,114 @@ class HarborToolExecutor:
         self,
         command: str,
         *,
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
         timeout_s: int,
         env: dict[str, str],
     ) -> ExecResult:
         """Call Harbor's backend within one deadline and sanitize backend ambiguity."""
-        future = asyncio.run_coroutine_threadsafe(
-            self._environment.exec(command, env=env, timeout_sec=timeout_s),
-            self._event_loop,
-        )
+        call = self._submit_environment_call(command, timeout_s=timeout_s, env=env)
         try:
             wait_timeout_s = deadline.remaining_s()
             if wait_timeout_s <= 0:
-                raise ToolExecutionDeadlineExceeded
-            return future.result(timeout=wait_timeout_s)
+                raise TurnDeadlineExceeded
+            return call.result.result(timeout=wait_timeout_s)
         except TimeoutError:
             if deadline.remaining_s() <= 0:
-                raise ToolExecutionDeadlineExceeded from None
+                raise TurnDeadlineExceeded from None
             raise AmbiguousTaskEnvironmentError from None
-        except ToolExecutionDeadlineExceeded:
+        except TurnDeadlineExceeded:
             raise
         except Exception:  # noqa: BLE001 - backend exceptions lack one portable base class
             # An API exception cannot prove whether the backend or candidate destroyed the task
             # environment. Keep that boundary retryable instead of silently assigning ownership.
             raise AmbiguousTaskEnvironmentError from None
         finally:
-            if not future.done():
-                future.cancel()
+            if not call.closed.is_set():
+                self._cancel_call(call)
+
+    def _submit_environment_call(
+        self,
+        command: str,
+        *,
+        timeout_s: int,
+        env: dict[str, str],
+    ) -> _EnvironmentCall:
+        call = _EnvironmentCall(
+            result=Future(),
+            closed=threading.Event(),
+            cleanup_failed=threading.Event(),
+        )
+        with self._lock:
+            if self._cancelled:
+                call.result.cancel()
+                call.closed.set()
+                raise AmbiguousTaskEnvironmentError
+            self._current_call = call
+
+        def complete(task: asyncio.Task[ExecResult]) -> None:
+            try:
+                result = task.result()
+            except asyncio.CancelledError:
+                outcome: ExecResult | BaseException = asyncio.CancelledError()
+            except BaseException as exc:  # noqa: BLE001 - forwarded only to the trusted bridge
+                outcome = exc
+            else:
+                outcome = result
+            with self._lock:
+                cancelled = call.cancel_requested
+            if (
+                cancelled
+                and isinstance(outcome, BaseException)
+                and not isinstance(outcome, asyncio.CancelledError)
+            ):
+                call.cleanup_failed.set()
+            call.closed.set()
+            if call.result.done():
+                return
+            if isinstance(outcome, asyncio.CancelledError):
+                call.result.cancel()
+            elif isinstance(outcome, BaseException):
+                call.result.set_exception(outcome)
+            else:
+                call.result.set_result(outcome)
+
+        def schedule() -> None:
+            with self._lock:
+                cancelled = call.cancel_requested
+            if cancelled:
+                call.result.cancel()
+                call.closed.set()
+                return
+            task = self._event_loop.create_task(
+                self._environment.exec(command, env=env, timeout_sec=timeout_s)
+            )
+            task.add_done_callback(complete)
+            with self._lock:
+                call.task = task
+                cancelled = call.cancel_requested
+            if cancelled:
+                task.cancel()
+
+        try:
+            self._event_loop.call_soon_threadsafe(schedule)
+        except RuntimeError:
+            call.result.cancel()
+            call.closed.set()
+            raise AmbiguousTaskEnvironmentError from None
+        return call
+
+    def _cancel_call(self, call: _EnvironmentCall) -> None:
+        with self._lock:
+            if call.cancel_requested:
+                return
+            call.cancel_requested = True
+            task = call.task
+        call.result.cancel()
+        if task is not None:
+            try:
+                self._event_loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
 
 
 class LocalContainerRunnerFactory:
@@ -438,9 +570,7 @@ class WmhPiAgent(BaseAgent):
             extra_env=extra_env,
         )
         self._harness = HarnessDoc.model_validate(harness)
-        provider = get_provider(ProviderConfig.model_validate(provider_config))
-        if not isinstance(provider, ToolCallingProvider):
-            raise TypeError("WMH pi benchmark evaluation needs a ToolCallingProvider")
+        config = ProviderConfig.model_validate(provider_config)
         if self._harness.runtime_kind() != "pi-node":
             raise ValueError(
                 "WMH pi benchmark evaluation requires runtime kind 'pi-node', got "
@@ -449,7 +579,7 @@ class WmhPiAgent(BaseAgent):
         validate_pi_container_image(runner_image)
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
-        self._provider = provider
+        self._provider_config = config.model_copy(deep=True)
         self._runner_image = runner_image
         self._turn_timeout_s = turn_timeout_s
         self._task_environment_attestation: _TaskEnvironmentAttestation | None = None
@@ -510,22 +640,52 @@ class WmhPiAgent(BaseAgent):
         event_loop = asyncio.get_running_loop()
         executor = HarborToolExecutor(event_loop, environment)
         runner_factory = LocalContainerRunnerFactory(image=self._runner_image)
+        provider_worker = ProviderProcessWorker(self._provider_config)
         candidate_error: PiCandidateError | None = None
         result: PiTurnResult | None = None
-        try:
-            result = await asyncio.to_thread(
-                run_pi_turn,
+        turn_task = asyncio.create_task(
+            asyncio.to_thread(
+                _run_isolated_turn,
+                provider_worker,
+                runner_factory,
+                executor,
                 self._harness,
                 instruction,
-                execute_tool=executor,
-                provider=self._provider,
-                runner_factory=runner_factory,
-                timeout_s=self._turn_timeout_s,
+                self._turn_timeout_s,
             )
+        )
+        try:
+            result = await asyncio.shield(turn_task)
         except PiCandidateError as exc:
             candidate_error = exc
+            try:
+                await _cancel_and_wait_execution(
+                    executor,
+                    provider_worker,
+                    runner_factory,
+                    turn_task,
+                )
+            except WmhPiCleanupError:
+                _populate_context(
+                    context,
+                    exc.worker_usage,
+                    cast(
+                        "JsonObject",
+                        {
+                            **identity_metadata,
+                            "infrastructure_failure": True,
+                            "run_health": PiRunHealth.INFRASTRUCTURE_FAILURE.value,
+                        },
+                    ),
+                )
+                raise
         except asyncio.CancelledError:
-            await _cancel_and_wait_runner(runner_factory)
+            await _cancel_and_wait_execution(
+                executor,
+                provider_worker,
+                runner_factory,
+                turn_task,
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - sanitize every infrastructure failure uniformly
             trace_error: WmhPiRunnerError | None = None
@@ -559,9 +719,14 @@ class WmhPiAgent(BaseAgent):
                         },
                     ),
                 )
-            # Cleanup proof is independent of evidence persistence and always wins: a
-            # surviving runner cannot be downgraded to an ordinary trace/provider error.
-            await _cancel_and_wait_runner(runner_factory)
+            # Cleanup proof is independent of evidence persistence and always wins: surviving
+            # trusted execution cannot be downgraded to an ordinary trace or provider error.
+            await _cancel_and_wait_execution(
+                executor,
+                provider_worker,
+                runner_factory,
+                turn_task,
+            )
             if trace_error is not None:
                 raise trace_error from None
             raise _typed_infrastructure_error(exc) from None
@@ -650,6 +815,34 @@ class WmhPiAgent(BaseAgent):
                 temporary_path.unlink(missing_ok=True)
         except OSError:
             raise WmhPiRunnerError("WMH pi trace persistence failed") from None
+
+
+def _run_isolated_turn(
+    provider_worker: ProviderProcessWorker,
+    runner_factory: LocalContainerRunnerFactory,
+    executor: HarborToolExecutor,
+    harness: HarnessDoc,
+    instruction: str,
+    timeout_s: float,
+) -> PiTurnResult:
+    """Own the disposable provider lifecycle for one synchronous pi turn."""
+    try:
+        provider_worker.start(TurnDeadline.after(_PROVIDER_WORKER_START_TIMEOUT_S))
+    except ProviderWorkerDeadlineExceeded:
+        raise PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER_DEADLINE) from None
+    except (ProviderWorkerFailure, ProviderWorkerUnavailable):
+        raise PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER) from None
+    try:
+        return run_pi_turn(
+            harness,
+            instruction,
+            execute_tool=executor,
+            worker_fn=provider_worker.complete_chat,
+            runner_factory=runner_factory,
+            timeout_s=timeout_s,
+        )
+    finally:
+        provider_worker.close()
 
 
 async def _attest_task_environment(
@@ -916,31 +1109,125 @@ def _bounded_identity(value: object, *, label: str) -> str:
     return value
 
 
-async def _cancel_and_wait_runner(runner_factory: LocalContainerRunnerFactory) -> None:
-    """Attempt cancellation and wait independently, then publish only sanitized failure text."""
-    cleanup_failed = False
+async def _cancel_and_wait_execution(
+    executor: HarborToolExecutor,
+    provider_worker: ProviderProcessWorker,
+    runner_factory: LocalContainerRunnerFactory,
+    turn_task: asyncio.Task[PiTurnResult],
+) -> None:
+    """Cancel all trusted execution and do not abandon its threads or subprocesses."""
+    cleanup = asyncio.create_task(
+        _prove_execution_cleanup(executor, provider_worker, runner_factory, turn_task)
+    )
+    cancelled_during_cleanup = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # Repeated host cancellation cannot interrupt evaluator cleanup proof.
+            cancelled_during_cleanup = True
+            continue
+    if not cleanup.result():
+        raise WmhPiCleanupError("WMH pi execution cleanup was not proved") from None
+    if cancelled_during_cleanup:
+        raise asyncio.CancelledError
+
+
+async def _prove_execution_cleanup(
+    executor: HarborToolExecutor,
+    provider_worker: ProviderProcessWorker,
+    runner_factory: LocalContainerRunnerFactory,
+    turn_task: asyncio.Task[PiTurnResult],
+) -> bool:
+    cleanup_proved = True
+    try:
+        executor.cancel()
+    except BaseException:  # noqa: BLE001 - cleanup must continue across every component
+        cleanup_proved = False
+
+    provider_cancelled, runner_cancelled = await asyncio.gather(
+        _run_cleanup_call(provider_worker.cancel),
+        _run_cleanup_call(runner_factory.cancel),
+    )
+    cleanup_proved = cleanup_proved and provider_cancelled and runner_cancelled
+
+    environment_closed, provider_closed, runner_closed = await asyncio.gather(
+        _run_cleanup_call(
+            lambda: executor.join_closed(_EXECUTION_CLEANUP_TIMEOUT_S),
+            require_truthy=True,
+        ),
+        _run_cleanup_call(
+            lambda: provider_worker.wait_closed(_EXECUTION_CLEANUP_TIMEOUT_S),
+            require_truthy=True,
+        ),
+        _run_cleanup_call(
+            lambda: runner_factory.wait_closed(_EXECUTION_CLEANUP_TIMEOUT_S),
+            require_truthy=True,
+        ),
+    )
+    cleanup_proved = cleanup_proved and environment_closed and provider_closed and runner_closed
+    turn_closed = await _join_turn_task(turn_task)
+    return cleanup_proved and turn_closed
+
+
+async def _run_cleanup_call(
+    operation: Callable[[], bool | None],
+    *,
+    require_truthy: bool = False,
+) -> bool:
+    """Run and join cleanup without depending on the possibly saturated turn executor."""
+    completed = threading.Event()
+    failed = threading.Event()
+    results: list[bool | None] = []
+
+    def run() -> None:
+        try:
+            results.append(operation())
+        except BaseException:  # noqa: BLE001 - publish only one stable cleanup error
+            failed.set()
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=run, name="wmh-execution-cleanup")
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        thread.start()
+    except RuntimeError:
+        return False
+    while not completed.is_set():
+        await asyncio.sleep(0.01)
+    elapsed_s = loop.time() - started_at
+    thread.join()
+    if failed.is_set() or len(results) != 1:
+        return False
+    return elapsed_s <= _EXECUTION_CLEANUP_TIMEOUT_S and (not require_truthy or bool(results[0]))
+
+
+async def _join_turn_task(turn_task: asyncio.Task[PiTurnResult]) -> bool:
+    """Consume one turn task and prove its backing thread exited, even after timeout."""
+    completed_in_time = True
     try:
         await asyncio.wait_for(
-            asyncio.to_thread(runner_factory.cancel),
-            timeout=_RUNNER_CLEANUP_TIMEOUT_S,
+            asyncio.shield(turn_task),
+            timeout=_EXECUTION_CLEANUP_TIMEOUT_S,
         )
-    except (Exception, asyncio.CancelledError):  # noqa: BLE001
-        # Cancellation, timeout, and close errors all require independent cleanup proof.
-        cleanup_failed = True
+    except TimeoutError:
+        completed_in_time = False
+    except BaseException:  # noqa: BLE001 - task outcome is handled by the caller
+        pass
+    while not turn_task.done():
+        try:
+            await asyncio.shield(turn_task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:  # noqa: BLE001 - task is joined, not reclassified here
+            break
     try:
-        closed = await asyncio.wait_for(
-            asyncio.to_thread(
-                runner_factory.wait_closed,
-                _RUNNER_CLEANUP_TIMEOUT_S,
-            ),
-            timeout=_RUNNER_CLEANUP_TIMEOUT_S + 1.0,
-        )
-    except (Exception, asyncio.CancelledError):  # noqa: BLE001
-        # A second cancellation must not expose a partial cleanup as success.
-        cleanup_failed = True
-        closed = False
-    if cleanup_failed or not closed:
-        raise WmhPiCleanupError("WMH pi runner cleanup was not proved") from None
+        turn_task.result()
+    except BaseException:  # noqa: BLE001 - consume the joined task outcome
+        pass
+    return completed_in_time
 
 
 def _tool_string_argument(
@@ -1064,9 +1351,13 @@ def _populate_context(
 
 def _typed_infrastructure_error(error: Exception) -> RuntimeError:
     """Classify and sanitize a failure before Harbor persists its exception text."""
+    if isinstance(error, ProviderWorkerCleanupError):
+        return WmhPiCleanupError("WMH pi execution cleanup was not proved")
     if isinstance(error, PiInfrastructureError):
         if error.kind is PiInfrastructureFailureKind.PROVIDER:
             return WmhPiProviderError("WMH pi worker provider failed")
+        if error.kind is PiInfrastructureFailureKind.PROVIDER_DEADLINE:
+            return WmhPiProviderDeadlineError("WMH pi worker provider deadline expired")
         if error.kind is PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED:
             return WmhPiEnvironmentConfirmationRequiredError(
                 "WMH pi task environment needs a fresh confirmation attempt"
@@ -1078,5 +1369,5 @@ def _typed_infrastructure_error(error: Exception) -> RuntimeError:
     if message.startswith("pi turn tool executor failed"):
         return WmhPiEnvironmentError("WMH pi task environment failed")
     if "cleanup" in message.lower():
-        return WmhPiCleanupError("WMH pi runner cleanup was not proved")
+        return WmhPiCleanupError("WMH pi execution cleanup was not proved")
     return WmhPiRunnerError(f"WMH pi runner infrastructure failed ({type(error).__name__})")

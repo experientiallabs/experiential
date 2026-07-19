@@ -24,13 +24,17 @@ from wmh.harness.pi_runner import (
     PiInfrastructureFailureKind,
     PiOutboundFrameTooLargeError,
     PiRunHealth,
-    ToolExecutionDeadline,
-    ToolExecutionDeadlineExceeded,
+    TurnDeadline,
+    TurnDeadlineExceeded,
     assemble_pi_harness,
     pi_node_baseline,
     run_pi_turn,
 )
 from wmh.harness.runner_link import TokenUsage
+from wmh.providers.process_worker import (
+    ProviderWorkerDeadlineExceeded,
+    RequestDeadlineSource,
+)
 
 
 class _ScriptedChannel:
@@ -66,14 +70,17 @@ def _no_tool(
     name: str,
     args: JsonObject,
     emit: Callable[[str, str], None],
-    deadline: ToolExecutionDeadline,
+    deadline: TurnDeadline,
 ) -> ToolOutcome:
     _ = name, args, emit, deadline
     return ToolOutcome(content="unused")
 
 
-def _unused_worker(request: ChatRequest) -> ChatResponse:
-    _ = request
+def _unused_worker(
+    request: ChatRequest,
+    deadline: TurnDeadline,
+) -> ChatResponse:
+    _ = request, deadline
     raise AssertionError("the scripted turn should not request a worker completion")
 
 
@@ -298,8 +305,11 @@ def test_run_pi_turn_keeps_worker_failures_infrastructure_typed() -> None:
 
     secret = "provider-secret-sentinel"
 
-    def failing_worker(request: ChatRequest) -> ChatResponse:
-        _ = request
+    def failing_worker(
+        request: ChatRequest,
+        deadline: TurnDeadline,
+    ) -> ChatResponse:
+        _ = request, deadline
         raise RuntimeError(f"provider unavailable: {secret}")
 
     @contextmanager
@@ -379,8 +389,11 @@ def test_candidate_owned_provider_rejections_are_gradeable_zeroes(
 
     CandidateRequestError.__module__ = module
 
-    def rejected_worker(request: ChatRequest) -> ChatResponse:
-        _ = request
+    def rejected_worker(
+        request: ChatRequest,
+        deadline: TurnDeadline,
+    ) -> ChatResponse:
+        _ = request, deadline
         raise CandidateRequestError
 
     @contextmanager
@@ -432,8 +445,11 @@ def test_openai_operational_errors_still_invalidate_the_trial(
 
     OperationalError.__module__ = "openai._exceptions"
 
-    def failing_worker(request: ChatRequest) -> ChatResponse:
-        _ = request
+    def failing_worker(
+        request: ChatRequest,
+        deadline: TurnDeadline,
+    ) -> ChatResponse:
+        _ = request, deadline
         raise OperationalError
 
     @contextmanager
@@ -464,9 +480,12 @@ def test_worker_failure_after_success_preserves_bounded_partial_usage_and_events
     calls = 0
     secret = "provider-secret-sentinel"
 
-    def worker(request: ChatRequest) -> ChatResponse:
+    def worker(
+        request: ChatRequest,
+        deadline: TurnDeadline,
+    ) -> ChatResponse:
         nonlocal calls
-        _ = request
+        _ = request, deadline
         calls += 1
         if calls == 1:
             return _completion("first answer", input_tokens=17, output_tokens=5)
@@ -495,6 +514,88 @@ def test_worker_failure_after_success_preserves_bounded_partial_usage_and_events
     assert secret not in str(caught.value)
 
 
+def test_operation_provider_deadline_is_typed_infrastructure() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+    observed_deadlines: list[TurnDeadline] = []
+
+    def deadline_worker(
+        request: ChatRequest,
+        deadline: TurnDeadline,
+    ) -> ChatResponse:
+        _ = request
+        observed_deadlines.append(deadline)
+        raise ProviderWorkerDeadlineExceeded(
+            "provider detail",
+            source=deadline.limiting_source,
+        )
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiInfrastructureError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=deadline_worker,
+            runner_factory=runner_factory,
+            provider_call_timeout_s=0.25,
+        )
+
+    assert len(observed_deadlines) == 1
+    assert 0 < observed_deadlines[0].remaining_s() <= 0.25
+    assert observed_deadlines[0].limiting_source is RequestDeadlineSource.OPERATION_LIMIT
+    assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER_DEADLINE
+    assert "provider detail" not in str(caught.value)
+    assert "provider detail" not in str(channel.sent)
+
+
+def test_caller_budget_provider_deadline_remains_candidate_timeout() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+
+    def deadline_worker(
+        request: ChatRequest,
+        deadline: TurnDeadline,
+    ) -> ChatResponse:
+        _ = request
+        assert deadline.limiting_source is RequestDeadlineSource.CALLER_BUDGET
+        raise ProviderWorkerDeadlineExceeded(
+            "provider detail",
+            source=deadline.limiting_source,
+        )
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=deadline_worker,
+            runner_factory=runner_factory,
+            timeout_s=0.25,
+            provider_call_timeout_s=1,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.TIMEOUT
+    assert "provider detail" not in str(caught.value)
+    assert "provider detail" not in str(channel.sent)
+
+
 def test_run_pi_turn_keeps_tool_executor_failures_infrastructure_typed() -> None:
     channel = _ScriptedChannel()
     channel._inbound = [
@@ -509,7 +610,7 @@ def test_run_pi_turn_keeps_tool_executor_failures_infrastructure_typed() -> None
         name: str,
         args: JsonObject,
         emit: Callable[[str, str], None],
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
     ) -> ToolOutcome:
         _ = name, args, emit, deadline
         raise RuntimeError(f"task container unavailable: {secret}")
@@ -548,7 +649,7 @@ def test_candidate_task_environment_destruction_is_a_gradeable_resource_failure(
         name: str,
         args: JsonObject,
         emit: Callable[[str, str], None],
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
     ) -> ToolOutcome:
         _ = name, args, emit, deadline
         raise CandidateTaskEnvironmentError(PiCandidateFailureReason.RESOURCE_LIMIT)
@@ -586,7 +687,7 @@ def test_candidate_task_damage_precedes_event_budget_fallback(
         name: str,
         args: JsonObject,
         emit: Callable[[str, str], None],
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
     ) -> ToolOutcome:
         _ = name, args, emit, deadline
         raise CandidateTaskEnvironmentError(PiCandidateFailureReason.RESOURCE_LIMIT)
@@ -620,7 +721,7 @@ def test_ambiguous_task_environment_loss_requires_a_retry() -> None:
         name: str,
         args: JsonObject,
         emit: Callable[[str, str], None],
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
     ) -> ToolOutcome:
         _ = name, args, emit, deadline
         raise AmbiguousTaskEnvironmentError
@@ -662,7 +763,7 @@ def test_run_pi_turn_passes_each_tool_the_current_turn_deadline() -> None:
         name: str,
         args: JsonObject,
         emit: Callable[[str, str], None],
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
     ) -> ToolOutcome:
         _ = name, args, emit
         remaining_budgets.append(deadline.remaining_s())
@@ -698,10 +799,10 @@ def test_tool_deadline_exhaustion_is_a_gradeable_candidate_timeout() -> None:
         name: str,
         args: JsonObject,
         emit: Callable[[str, str], None],
-        deadline: ToolExecutionDeadline,
+        deadline: TurnDeadline,
     ) -> ToolOutcome:
         _ = name, args, emit, deadline
-        raise ToolExecutionDeadlineExceeded
+        raise TurnDeadlineExceeded
 
     @contextmanager
     def runner_factory() -> Iterator[_ScriptedChannel]:
@@ -881,10 +982,36 @@ def test_run_pi_turn_rejects_non_finite_timeout(timeout_s: float) -> None:
     assert channel.sent == []
 
 
+@pytest.mark.parametrize(
+    "provider_call_timeout_s",
+    [0.0, float("nan"), float("inf"), float("-inf")],
+)
+def test_run_pi_turn_rejects_invalid_provider_call_timeout(
+    provider_call_timeout_s: float,
+) -> None:
+    channel = _ScriptedChannel()
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(ValueError, match="provider call timeout must be finite and positive"):
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+            provider_call_timeout_s=provider_call_timeout_s,
+        )
+
+    assert channel.sent == []
+
+
 @pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf")])
-def test_tool_execution_deadline_rejects_non_finite_timeout(timeout_s: float) -> None:
+def test_turn_deadline_rejects_non_finite_timeout(timeout_s: float) -> None:
     with pytest.raises(ValueError, match="finite and positive"):
-        ToolExecutionDeadline.after(timeout_s)
+        TurnDeadline.after(timeout_s)
 
 
 def test_run_pi_turn_bounds_a_flood_of_individually_valid_events(
