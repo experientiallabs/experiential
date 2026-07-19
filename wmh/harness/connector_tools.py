@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from wmh.connect import (
     ConnectError,
-    ConnectorAuth,
     PullQuery,
     get_connector,
     load_connector_auth,
@@ -150,7 +149,13 @@ def github_search_fetch(args: JsonObject) -> ToolOutcome:
         return ToolOutcome(
             content="github_search needs a 'target' repository as 'owner/repo'", is_error=True
         )
-    auth = _resolve_auth()
+    try:
+        auth = load_connector_auth(_CONNECTOR)
+    except ConnectError as error:
+        # A credential is present but unusable (e.g. a malformed stored file):
+        # surface the real reason, not the "not configured" message. This is the
+        # error github_search_available promises the fetch will report.
+        return ToolOutcome(content=f"github_search credential is invalid: {error}", is_error=True)
     if auth is None:
         hint = " or ".join(f"${var}" for var in token_env_vars(_CONNECTOR))
         return ToolOutcome(
@@ -171,11 +176,3 @@ def github_search_fetch(args: JsonObject) -> ToolOutcome:
     except ConnectError as error:
         return ToolOutcome(content=f"github_search failed: {error}", is_error=True)
     return ToolOutcome(content=_render_items(items))
-
-
-def _resolve_auth() -> ConnectorAuth | None:
-    """The host-side GitHub credential, or None when a corrupt stored one still cannot be used."""
-    try:
-        return load_connector_auth(_CONNECTOR)
-    except ConnectError:
-        return None

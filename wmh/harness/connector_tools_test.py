@@ -187,6 +187,27 @@ def test_fetch_without_a_credential_is_a_clean_error() -> None:
 
     assert outcome.is_error is True
     assert "WMH_GITHUB_TOKEN" in outcome.content
+    assert "not configured" in outcome.content
+
+
+def test_fetch_with_a_corrupt_credential_surfaces_the_real_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present-but-unusable credential reports the invalid-credential error, not 'not configured'.
+
+    This is what github_search_available promises when it offers the tool despite a ConnectError.
+    """
+
+    def _raise(_connector: str) -> object:
+        raise ConnectError("stored github credential is malformed")
+
+    monkeypatch.setattr(mod, "load_connector_auth", _raise)
+
+    outcome = mod.github_search_fetch({"target": "octocat/hello"})
+
+    assert outcome.is_error is True
+    assert "credential is invalid" in outcome.content
+    assert "not configured" not in outcome.content
 
 
 def test_fetch_maps_connect_error_to_a_clean_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
