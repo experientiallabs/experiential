@@ -483,6 +483,30 @@ def test_checkpointed_search_requires_an_independently_configured_holdout() -> N
     assert holdout.requests == []
 
 
+def test_checkpointed_search_requires_disjoint_discovery_and_holdout_tasks() -> None:
+    class DistinctRouteSameTasks(_NeutralScorer):
+        configuration_id = "distinct-route-same-tasks-v1"
+
+    discovery = _NeutralScorer()
+    holdout = DistinctRouteSameTasks()
+
+    with pytest.raises(ValueError, match="task identities must be disjoint"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            discovery,
+            _HistoryProposer(),
+            iterations=0,
+            screen_proposals=False,
+            holdout_scorer=holdout,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=lambda checkpoint: None,
+        )
+
+    assert discovery.requests == []
+    assert holdout.requests == []
+
+
 def test_search_harness_fails_before_proposals_when_required_state_cannot_export() -> None:
     class MissingDurableExport(_HistoryProposer):
         configuration_id = "missing-durable-export-v1"
@@ -501,7 +525,31 @@ def test_search_harness_fails_before_proposals_when_required_state_cannot_export
             on_checkpoint=lambda checkpoint: None,
         )
 
-    assert [request.purpose for _, request in scorer.requests] == ["seed"]
+    assert scorer.requests == []
+    assert scorer.before_proposal_calls == 0
+
+
+def test_search_harness_rejects_export_only_checkpoint_state_before_scoring() -> None:
+    class ExportOnlyProposer(_HistoryProposer):
+        configuration_id = "export-only-proposer-v1"
+
+        def export_search_state(self) -> JsonObject:
+            return {"state": "cannot be restored"}
+
+    scorer = _NeutralScorer()
+    with pytest.raises(RuntimeError, match="exposes no restore_search_state"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            ExportOnlyProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=lambda checkpoint: None,
+        )
+
+    assert scorer.requests == []
     assert scorer.before_proposal_calls == 0
 
 
@@ -633,6 +681,37 @@ def test_search_checkpoint_rejects_report_request_identity_drift() -> None:
         SearchCheckpoint.model_validate(payload)
 
 
+def test_search_checkpoint_binds_seed_execution_to_the_archive() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=0),
+        )
+    payload = checkpoints[-1].model_dump(mode="json")
+    seed_hash = payload["configuration"]["seed_doc_hash"]
+    seed_payload = payload["docs"][seed_hash]
+    core_payload = next(
+        surface for surface in seed_payload["surfaces"] if surface["id"] == "prompt:core"
+    )
+    core_payload["budget"] = len(core_payload["content"]) + 1
+    drifted_seed = HarnessDoc.model_validate(seed_payload)
+    assert drifted_seed.doc_hash == seed_hash
+    assert drifted_seed.execution_hash != payload["configuration"]["seed_execution_hash"]
+    [seed_evaluation] = payload["evaluation_records"]
+    seed_evaluation["harness_execution_hash"] = drifted_seed.execution_hash
+    _rehash_checkpoint_payload(payload)
+
+    with pytest.raises(ValueError, match="seed document differs from archive seed"):
+        SearchCheckpoint.model_validate(payload)
+
+
 def test_search_checkpoint_rejects_an_unselected_accepted_delta() -> None:
     class TwoProposalProposer(_HistoryProposer):
         configuration_id = "two-proposal-proposer-v1"
@@ -760,6 +839,115 @@ def test_seed_checkpoint_precedes_fallible_progress_callback() -> None:
         )
 
     assert [checkpoint.completed_iteration for checkpoint in checkpoints] == [0]
+
+
+def test_observer_callbacks_cannot_mutate_live_search_state() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+
+    def _mutate_accept(candidate: HarnessDoc, delta: HarnessDelta, score: float) -> None:
+        del score
+        candidate.surfaces[0].content = "observer-corrupted candidate"
+        assert delta.verdict is not None
+        delta.verdict.accepted = False
+
+    def _mutate_proposal(record: ProposalRecord) -> None:
+        record.selected = False
+        record.reason = "observer-corrupted record"
+
+    result = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _NeutralScorer(),
+        _HistoryProposer(),
+        iterations=2,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        on_accept=_mutate_accept,
+        on_proposal=_mutate_proposal,
+        on_checkpoint=checkpoints.append,
+    )
+
+    assert [checkpoint.completed_iteration for checkpoint in checkpoints] == [0, 1, 2]
+    assert len(result.archive.accepted()) == 2
+    assert [record.selected for record in result.proposal_records] == [True, True]
+    assert all("observer-corrupted" not in surface.content for surface in result.best.surfaces)
+
+
+def test_scorer_and_proposer_hooks_cannot_mutate_live_search_state() -> None:
+    class MutatingScorer(_NeutralScorer):
+        def validate_candidate(self, candidate: HarnessDoc) -> str | None:
+            candidate.name = "validation-corrupted"
+            return None
+
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            candidate.surfaces[0].content = "scorer-corrupted"
+            return report
+
+    class MutatingProposer(_HistoryProposer):
+        configuration_id = "mutating-proposer-v1"
+
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            proposals = super().propose_batch(
+                parent,
+                trigger,
+                evidence,
+                history=history,
+                count=count,
+                should_cancel=should_cancel,
+            )
+            parent.surfaces[0].content = "proposer-corrupted"
+            for delta in history:
+                if delta.verdict is not None:
+                    delta.verdict.accepted = False
+            return proposals
+
+        def record_harness_evaluation(
+            self,
+            harness: HarnessDoc,
+            *,
+            archive: HarnessScoreArchive,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> None:
+            super().record_harness_evaluation(
+                harness,
+                archive=archive,
+                should_cancel=should_cancel,
+            )
+            harness.surfaces[0].content = "archive-hook-corrupted"
+            archive.report.label = "archive-hook-corrupted"
+
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            super().record_evaluation(delta, stage=stage, content=content)
+            assert delta.verdict is not None or stage == "screen"
+            if delta.verdict is not None:
+                delta.verdict.accepted = False
+
+    checkpoints: list[SearchCheckpoint] = []
+    result = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        MutatingScorer(),
+        MutatingProposer(),
+        iterations=2,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        on_checkpoint=checkpoints.append,
+    )
+
+    assert [checkpoint.completed_iteration for checkpoint in checkpoints] == [0, 1, 2]
+    assert len(result.archive.accepted()) == 2
+    assert all("corrupted" not in surface.content for surface in result.best.surfaces)
+    assert all("corrupted" not in report.label for report in result.reports.values())
 
 
 def test_search_rejects_a_distinct_execution_with_the_same_document_hash() -> None:

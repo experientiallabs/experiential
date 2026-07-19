@@ -10,8 +10,9 @@ iteration's champion:
   mastered) must not drop below the champion's. Newly-passing tasks promote into the suite on
   accept, so wins are locked in and later deltas cannot quietly trade them away.
 - **Tier 2 — full split**: the child's overall success rate must be at least the best seen.
-- **Tier 3 — held-out (optional)**: with a holdout task file, the child must also be no worse than
-  the champion on tasks the proposer never saw evidence from.
+- **Tier 3, adaptive holdout (optional)**: with a holdout task file, the child must also be no
+  worse than the champion on tasks the proposer never saw exact evidence from. Because its gate
+  outcome affects search, this tier is not a sealed final confirmation split.
 
 Ties pass every gate tier: with k passes per task, scores are coarse, and "no worse" is the
 eligibility contract. When multiple siblings are eligible, full success wins, then secondary
@@ -249,11 +250,17 @@ class SearchConfiguration(BaseModel):
 
     @model_validator(mode="after")
     def _validate_independent_scorers(self) -> SearchConfiguration:
-        if (
-            self.holdout_scorer is not None
-            and self.holdout_scorer.configuration_id == self.discovery_scorer.configuration_id
-        ):
+        holdout = self.holdout_scorer
+        if holdout is None:
+            return self
+        if holdout.configuration_id == self.discovery_scorer.configuration_id:
             raise ValueError("checkpointed holdout requires an independent scorer configuration")
+        overlap = sorted(set(self.discovery_scorer.task_ids).intersection(holdout.task_ids))
+        if overlap:
+            raise ValueError(
+                "checkpointed discovery and holdout task identities must be disjoint; "
+                f"overlap={overlap}"
+            )
         return self
 
 
@@ -329,6 +336,8 @@ class SearchCheckpoint(BaseModel):
                 raise ValueError(f"checkpoint document key {doc_hash!r} does not match its hash")
         if self.configuration.seed_doc_hash not in self.docs:
             raise ValueError("checkpoint documents do not contain the configured seed")
+        if self.docs[self.configuration.seed_doc_hash] != self.archive.seed:
+            raise ValueError("checkpoint seed document differs from archive seed")
         if self.champion_doc_hash not in self.docs or self.champion_doc_hash not in self.reports:
             raise ValueError("checkpoint champion is missing its document or discovery report")
         if set(self.reports) != set(self.docs):
@@ -362,8 +371,14 @@ class SearchCheckpoint(BaseModel):
             raise ValueError("checkpoint suite contains a task outside the discovery matrix")
         if any(not champion_report.per_task[task_id].passed for task_id in self.suite):
             raise ValueError("checkpoint champion regressed a task in the locked suite")
-        if self.archive.reconstruct(self.champion_doc_hash).doc_hash != self.champion_doc_hash:
+        reconstructed_champion = self.archive.reconstruct(self.champion_doc_hash)
+        if reconstructed_champion.doc_hash != self.champion_doc_hash:
             raise ValueError("checkpoint champion is not reconstructable from accepted history")
+        if (
+            reconstructed_champion.execution_hash
+            != self.docs[self.champion_doc_hash].execution_hash
+        ):
+            raise ValueError("checkpoint champion execution differs from accepted history")
         checkpoint_delta_ids = [delta.delta_id for delta in self.archive.deltas]
         delta_records = [record for record in self.proposal_records if record.delta_id is not None]
         recorded_delta_ids = [record.delta_id for record in delta_records]
@@ -878,6 +893,27 @@ def _validate_resume_configuration(
     raise ValueError("search checkpoint configuration drift; changed fields=" + ", ".join(changed))
 
 
+def _validate_checkpoint_proposer_capabilities(
+    proposer: DeltaProposer,
+    *,
+    durable_state_required: bool,
+) -> None:
+    """Reject unusable checkpoint hooks before any scorer can spend evaluation budget."""
+    export = getattr(proposer, "export_search_state", None)
+    if export is None:
+        if durable_state_required:
+            raise RuntimeError(
+                "proposer requires durable state but exposes no export_search_state callback"
+            )
+        return
+    if not callable(export):
+        raise ValueError("proposer.export_search_state must be callable")
+    if not callable(getattr(proposer, "restore_search_state", None)):
+        raise RuntimeError(
+            "proposer exports checkpoint state but exposes no restore_search_state callback"
+        )
+
+
 def _validated_checkpoint_copy(checkpoint: SearchCheckpoint) -> SearchCheckpoint:
     """Revalidate a potentially nested-mutated in-memory checkpoint before using it."""
     return SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
@@ -971,7 +1007,9 @@ def search_harness(
         iterations: Number of proposal batches. Zero performs seed qualification only.
         proposal_batch_size: Sibling proposals evaluated against each frozen champion.
         screen_proposals: Whether to prefilter each child on its trigger task subset.
-        holdout_scorer: Optional independent evaluator used as a third gate tier.
+        holdout_scorer: Optional independent adaptive gate. Its exact reports stay hidden from the
+            proposer, but its accept or reject outcome affects selection, so never supply a sealed
+            final confirmation split here.
         confirm_narrow_vetoes: Whether capable scorers remeasure narrow gate vetoes.
         resume_from: A validated checkpoint from a complete prior iteration.
         on_checkpoint: Durable checkpoint callback. Exceptions abort before the next batch.
@@ -1017,11 +1055,11 @@ def search_harness(
                 "confirmation requires discovery and holdout scorers to use the same "
                 "default_attempts"
             )
-    seed_error = scorer.validate_candidate(seed_doc)
+    seed_error = scorer.validate_candidate(seed_doc.model_copy(deep=True))
     if seed_error is not None:
         raise ValueError(f"seed is not eligible for scoring: {seed_error}")
     if holdout_scorer is not None:
-        holdout_seed_error = holdout_scorer.validate_candidate(seed_doc)
+        holdout_seed_error = holdout_scorer.validate_candidate(seed_doc.model_copy(deep=True))
         if holdout_seed_error is not None:
             raise ValueError(f"holdout seed is not eligible for scoring: {holdout_seed_error}")
 
@@ -1041,6 +1079,11 @@ def search_harness(
         if checkpointing
         else None
     )
+    if configuration is not None:
+        _validate_checkpoint_proposer_capabilities(
+            proposer,
+            durable_state_required=configuration.proposer.durable_state_required,
+        )
     resumed = _validated_checkpoint_copy(resume_from) if resume_from is not None else None
     if resumed is not None:
         assert configuration is not None
@@ -1072,7 +1115,9 @@ def search_harness(
             task_ids=tuple(task_ids) if task_ids is not None else None,
             attempts=attempts,
         )
-        report = _snapshot_score_report(active_scorer.score(doc, request=request))
+        report = _snapshot_score_report(
+            active_scorer.score(doc.model_copy(deep=True), request=request)
+        )
         if report.run_health is not ScoreRunHealth.VALID:
             raise ScoreRunHealthError(report.evaluation_id, report.run_health)
         if scorer_tier is ScoreArchiveTier.DISCOVERY:
@@ -1292,10 +1337,10 @@ def search_harness(
         evidence = render_score_evidence(trigger, parent_report)
         try:
             batch = proposer.propose_batch(
-                parent,
-                trigger,
+                parent.model_copy(deep=True),
+                trigger.model_copy(deep=True),
                 evidence,
-                history=archive.deltas,
+                history=[delta.model_copy(deep=True) for delta in archive.deltas],
                 count=proposal_batch_size,
                 should_cancel=should_cancel,
             )
@@ -1438,9 +1483,9 @@ def search_harness(
                 )
                 continue
             seen_child_hashes.add(child.doc_hash)
-            validation_error = scorer.validate_candidate(child)
+            validation_error = scorer.validate_candidate(child.model_copy(deep=True))
             if validation_error is None and holdout_scorer is not None:
-                validation_error = holdout_scorer.validate_candidate(child)
+                validation_error = holdout_scorer.validate_candidate(child.model_copy(deep=True))
             if validation_error is not None:
                 reason = f"invalid before eval: {validation_error}"
                 delta.verdict = GateRecord(accepted=False, reason=reason)
@@ -1777,10 +1822,14 @@ def search_harness(
         proposal_records.extend(batch_records)
         _emit_checkpoint(iteration_index)
         if winner is not None and on_accept is not None:
-            on_accept(winner.child, winner.delta, winner.report.score)
+            on_accept(
+                winner.child.model_copy(deep=True),
+                winner.delta.model_copy(deep=True),
+                winner.report.score,
+            )
         if on_proposal is not None:
             for record in batch_records:
-                on_proposal(record)
+                on_proposal(record.model_copy(deep=True))
         if on_progress is not None:
             champion = docs[champion_hash]
             on_progress(
@@ -2188,7 +2237,7 @@ def _record_score_evaluation(
         f"{render_score_evidence(delta.trigger, report)}"
     )
     try:
-        recorder(delta, stage=stage, content=content)
+        recorder(delta.model_copy(deep=True), stage=stage, content=content)
     except HarnessSearchCancelled:
         raise
     except Exception as error:  # noqa: BLE001
@@ -2226,8 +2275,8 @@ def _record_harness_score_evaluation(
         return None
     try:
         recorder(
-            harness,
-            archive=archive,
+            harness.model_copy(deep=True),
+            archive=HarnessScoreArchive.model_validate(archive.model_dump(mode="json")),
             should_cancel=should_cancel,
         )
     except HarnessSearchCancelled:
