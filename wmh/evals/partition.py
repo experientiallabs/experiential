@@ -871,7 +871,27 @@ class _PartitionSpace:
     feasible_count: int
 
     def discovery_groups_for_rank(self, rank: int) -> tuple[str, ...]:
-        """Unrank one feasible group subset in canonical exclude-first order."""
+        """Unrank one feasible group subset in canonical exclude-first order.
+
+        At group index ``i``, ``suffix_counts[i + 1][remainder]`` is the
+        number of feasible completions that exclude group ``i``. Those
+        completions occupy the first contiguous rank interval. Completions
+        that include the group occupy the immediately following interval and
+        are indexed after subtracting the exclude interval's size. Iterating
+        groups in canonical order therefore gives a bijection between
+        ``range(feasible_count)`` and exact-quota subsets.
+
+        Args:
+            rank: Zero-based rank inside the uniformly sampled feasible space.
+
+        Returns:
+            Canonically ordered group identities in the ranked subset.
+
+        Raises:
+            ValueError: If ``rank`` is not an integer in the feasible range.
+            RuntimeError: If the frozen dynamic-programming tables are internally
+                inconsistent with the target quota.
+        """
         if isinstance(rank, bool) or not isinstance(rank, int):
             raise ValueError("partition rank must be an integer")
         if not 0 <= rank < self.feasible_count:
@@ -1015,6 +1035,21 @@ def _suffix_subset_counts(
     *,
     target: _CountVector,
 ) -> tuple[dict[_CountVector, int], ...]:
+    """Count attainable quota vectors for every suffix of the group sequence.
+
+    Table ``i`` maps a quota vector to the number of subsets of
+    ``group_vectors[i:]`` that sum to that vector. Table ``n`` contains only
+    the empty subset at the zero vector. Each earlier table is formed from the
+    disjoint exclude and include cases, while vectors above ``target`` are
+    discarded because all coordinates are nonnegative.
+
+    Args:
+        group_vectors: Canonically ordered nonnegative per-group quota vectors.
+        target: Maximum vector retained by every dynamic-programming table.
+
+    Returns:
+        ``n + 1`` suffix tables indexed from zero through ``n``.
+    """
     _validate_group_vectors(group_vectors, target=target)
     zero = (0,) * len(target)
     tables: list[dict[_CountVector, int]] = [{} for _ in range(len(group_vectors) + 1)]
@@ -1035,6 +1070,20 @@ def _prefix_subset_counts(
     *,
     target: _CountVector,
 ) -> tuple[dict[_CountVector, int], ...]:
+    """Count attainable quota vectors for every prefix of the group sequence.
+
+    Table ``i`` maps a quota vector to the number of subsets of
+    ``group_vectors[:i]`` that sum to that vector. Table zero contains only
+    the empty subset. The transition adds the disjoint exclude and include
+    cases and retains only vectors coordinate-wise bounded by ``target``.
+
+    Args:
+        group_vectors: Canonically ordered nonnegative per-group quota vectors.
+        target: Maximum vector retained by every dynamic-programming table.
+
+    Returns:
+        ``n + 1`` prefix tables indexed from zero through ``n``.
+    """
     zero = (0,) * len(target)
     tables: list[dict[_CountVector, int]] = [{zero: 1}]
     for vector in group_vectors:
@@ -1055,6 +1104,24 @@ def _group_inclusion_count(
     prefix_counts: tuple[dict[_CountVector, int], ...],
     suffix_counts: tuple[dict[_CountVector, int], ...],
 ) -> int:
+    """Count exact-target subsets that include one designated group.
+
+    For every prefix sum attainable before ``index``, the designated group is
+    included exactly once. The remaining target is then completed only from
+    groups after ``index``. Multiplying the independent prefix and suffix
+    subset counts and summing over prefix vectors counts each feasible subset
+    containing the group exactly once.
+
+    Args:
+        index: Zero-based position of the designated group.
+        group_vector: Quota contribution of the designated group.
+        target: Exact quota vector required of a feasible subset.
+        prefix_counts: Prefix tables where entry ``index`` excludes the group.
+        suffix_counts: Suffix tables where entry ``index + 1`` excludes the group.
+
+    Returns:
+        Number of feasible exact-target subsets containing the designated group.
+    """
     count = 0
     for prefix, prefix_count in prefix_counts[index].items():
         remainder = _subtract_vectors(_subtract_vectors(target, group_vector), prefix)

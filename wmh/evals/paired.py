@@ -694,6 +694,20 @@ def _group_sum_deltas(
     design: PairedEvaluationDesign,
     task_deltas: dict[str, float],
 ) -> tuple[float, ...]:
+    """Aggregate task deltas into canonical semantic-group totals.
+
+    Every task appears in exactly one frozen semantic group. Group totals are
+    emitted in ``design.group_ids`` order so leave-one-group-out diagnostics
+    can combine them with the matching frozen group sizes without relying on
+    dictionary iteration order.
+
+    Args:
+        design: Frozen task roster and score-independent semantic groups.
+        task_deltas: Complete task-level paired deltas keyed by task identity.
+
+    Returns:
+        One exact floating-point sum per canonical semantic group.
+    """
     grouped: defaultdict[str, list[float]] = defaultdict(list)
     for task in design.tasks:
         grouped[task.group_id].append(task_deltas[task.task_id])
