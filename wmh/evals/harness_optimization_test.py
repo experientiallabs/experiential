@@ -45,6 +45,7 @@ from wmh.evals.study_journal import (
     ExternalPublicationReceipt,
     StudyJournalGenesis,
     StudyJournalStore,
+    StudyPhase,
     StudyPhaseCommitment,
     StudyPhaseRecord,
 )
@@ -160,6 +161,32 @@ def _canonical_digest(value: object) -> str:
         allow_nan=False,
     )
     return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _checkpoint_with_search_run_id(
+    checkpoint: SearchCheckpoint,
+    search_run_id: str,
+) -> SearchCheckpoint:
+    changed = checkpoint.model_copy(
+        update={
+            "configuration": checkpoint.configuration.model_copy(
+                update={"search_run_id": search_run_id}
+            ),
+            "payload_sha256": "0" * 64,
+        },
+        deep=True,
+    )
+    payload = changed.model_dump(mode="json", exclude={"payload_sha256"})
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    return SearchCheckpoint.model_validate(
+        {**payload, "payload_sha256": hashlib.sha256(serialized).hexdigest()}
+    )
 
 
 def _partition(tmp_path: Path) -> tuple[PartitionControlStore, BenchmarkPartitionManifest]:
@@ -527,6 +554,16 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
     )
     assert result.best.execution_digest != baseline.execution_digest
     assert checkpoints[-1].completed_iteration == protocol.search.iterations
+    assert checkpoints[-1].configuration.search_run_id == discovery_authorization.search_run_id
+
+    with pytest.raises(ValueError, match="search run"):
+        freeze_harness_optimization_candidate(
+            control_store,
+            prepared=prepared,
+            checkpoint=_checkpoint_with_search_run_id(checkpoints[-1], "different-run"),
+            lifecycle=lifecycle,
+            authorization=discovery_authorization,
+        )
 
     frozen = freeze_harness_optimization_candidate(
         control_store,
@@ -632,7 +669,7 @@ def test_heldout_open_rejects_a_candidate_publication_for_different_source(
             publication=_artifact_publication(wrong_digest),
         )
 
-    assert lifecycle.current_phase.value == "candidate_frozen"
+    assert lifecycle.current_phase is StudyPhase.CANDIDATE_FROZEN
     assert set(manifest.confirmation_task_ids).isdisjoint(
         prepared.discovery_contract().protocol.discovery.tasks[index].task_id
         for index in range(len(prepared.discovery_contract().protocol.discovery.tasks))
