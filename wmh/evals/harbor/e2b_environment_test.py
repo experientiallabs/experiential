@@ -14,7 +14,7 @@ from typing import cast
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from e2b import ALL_TRAFFIC, AsyncSandbox
+from e2b import ALL_TRAFFIC, AsyncSandbox, SandboxInfo, SandboxMetrics, SandboxState
 from e2b.api import client_async as e2b_client_async
 from e2b.api.client.api.templates import (
     get_templates_aliases_alias,
@@ -335,7 +335,6 @@ def _build() -> mod.ExactE2BBuildRecord:
         build_id="build-immutable",
         cpu_count=2,
         memory_mb=1024,
-        storage_mb=10_240,
         cost_attribution=mod.PreexistingE2BBuildAttribution(),
     )
 
@@ -348,14 +347,24 @@ class _Commands:
 
 
 class _Sandbox:
-    def __init__(self, info: SimpleNamespace) -> None:
-        self.sandbox_id = cast("str", info.sandbox_id)
+    def __init__(self, info: SandboxInfo, metrics: list[SandboxMetrics]) -> None:
+        self.sandbox_id = info.sandbox_id
         self.commands = _Commands()
         self._info = info
+        self._metric_reports = [metrics]
+        self.metric_calls = 0
+        self.metric_request_timeouts: list[int] = []
         self.kills = 0
 
-    async def get_info(self) -> SimpleNamespace:
+    async def get_info(self) -> SandboxInfo:
         return self._info
+
+    async def get_metrics(self, *, request_timeout: int) -> list[SandboxMetrics]:
+        self.metric_calls += 1
+        self.metric_request_timeouts.append(request_timeout)
+        if len(self._metric_reports) > 1:
+            return self._metric_reports.pop(0)
+        return self._metric_reports[0]
 
     async def kill(self, **_kwargs: object) -> bool:
         self.kills += 1
@@ -366,31 +375,43 @@ def _sandbox_for_create(
     kwargs: dict[str, object],
     *,
     template_id: str = "template-immutable",
-    disk_size_mb: object = 10_240,
+    observed_storage_mb: int = 10_240,
 ) -> _Sandbox:
     started_at = datetime.now(UTC)
     network_options = cast("dict[str, list[str]]", kwargs["network"])
     return _Sandbox(
-        SimpleNamespace(
+        SandboxInfo(
             sandbox_id="sandbox-immutable",
+            sandbox_domain=None,
             template_id=template_id,
-            metadata=kwargs["metadata"],
-            cpu_count=2,
-            memory_mb=1024,
-            disk_size_mb=disk_size_mb,
-            allow_internet_access=True,
-            network=SimpleNamespace(
-                allow_out=list(network_options["allow_out"]),
-                deny_out=list(network_options["deny_out"]),
-                rules={},
-            ),
-            lifecycle=SimpleNamespace(on_timeout="kill", auto_resume=False),
-            volume_mounts=[],
-            state=SimpleNamespace(value="running"),
+            name=None,
+            metadata=cast("dict[str, str]", kwargs["metadata"]),
             started_at=started_at,
             end_at=started_at + timedelta(seconds=mod._TASK_LEASE_TIMEOUT_S),
+            state=SandboxState.RUNNING,
+            cpu_count=2,
+            memory_mb=1024,
             envd_version="1.2.3",
-        )
+            allow_internet_access=True,
+            network={
+                "allow_out": list(network_options["allow_out"]),
+                "deny_out": list(network_options["deny_out"]),
+            },
+            lifecycle={"on_timeout": "kill", "auto_resume": False},
+            volume_mounts=[],
+        ),
+        [
+            SandboxMetrics(
+                cpu_count=2,
+                cpu_used_pct=0.0,
+                disk_total=observed_storage_mb * 1024 * 1024,
+                disk_used=1024 * 1024,
+                mem_total=1024 * 1024 * 1024,
+                mem_used=128 * 1024 * 1024,
+                mem_cache=64 * 1024 * 1024,
+                timestamp=started_at,
+            )
+        ],
     )
 
 
@@ -407,12 +428,10 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
         build_context_digest=_BUILD_CONTEXT_DIGEST,
         cpu_count=2,
         memory_mb=1024,
-        storage_mb=10_240,
         cost_attribution=_build_attribution(),
     )
 
     assert record.exact_template_ref == "template-immutable:build-immutable"
-    assert record.storage_mb == 10_240
 
     with pytest.raises(RuntimeError, match="immutable template/build IDs"):
         mod._record_completed_build(
@@ -427,7 +446,6 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
             build_context_digest=_BUILD_CONTEXT_DIGEST,
             cpu_count=2,
             memory_mb=1024,
-            storage_mb=10_240,
             cost_attribution=_build_attribution(),
         )
 
@@ -440,38 +458,38 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
             build_id="build:ambiguous",
             cpu_count=2,
             memory_mb=1024,
-            storage_mb=10_240,
             cost_attribution=mod.PreexistingE2BBuildAttribution(),
         )
 
 
-def test_exact_build_and_launch_identities_bind_requested_storage(tmp_path: Path) -> None:
-    environment = _environment(tmp_path)
-    source = tmp_path / "environment"
+def test_requested_storage_changes_launch_but_reuses_the_exact_build(tmp_path: Path) -> None:
+    exact_root = tmp_path / "exact"
+    larger_root = tmp_path / "larger"
+    exact_root.mkdir()
+    larger_root.mkdir()
+    exact_environment = _environment(exact_root, storage_mb=10_240)
+    larger_environment = _environment(larger_root, storage_mb=20_480)
     exact = mod.freeze_exact_e2b_build_spec(
-        environment_dir=source,
+        environment_dir=exact_root / "environment",
         docker_image=None,
         cpu_count=2,
         memory_mb=1024,
-        storage_mb=10_240,
     )
     larger = mod.freeze_exact_e2b_build_spec(
-        environment_dir=source,
+        environment_dir=larger_root / "environment",
         docker_image=None,
         cpu_count=2,
         memory_mb=1024,
-        storage_mb=20_480,
     )
 
-    assert exact.environment_id == larger.environment_id
-    assert exact.build_context_digest == larger.build_context_digest
-    assert exact.digest != larger.digest
+    assert exact == larger
+    assert "storage_mb" not in mod.ExactE2BBuildRecord.model_fields
 
-    exact_record = _build()
-    larger_record = exact_record.model_copy(update={"storage_mb": 20_480})
-    assert exact_record.digest != larger_record.digest
-    assert environment._launch_config_digest(exact_record) != environment._launch_config_digest(
-        larger_record
+    build = _build()
+    assert exact_environment._launch_config_digest(
+        build
+    ) != larger_environment._launch_config_digest(
+        build
     )
 
 
@@ -612,7 +630,6 @@ def test_build_record_reuse_resolves_attributed_meter_from_shared_ledger_authori
         record.model_copy(update={"build_id": "build-replayed"}),
         record.model_copy(update={"cpu_count": record.cpu_count + 1}),
         record.model_copy(update={"memory_mb": record.memory_mb + 1}),
-        record.model_copy(update={"storage_mb": 10_240}),
         record.model_copy(
             update={
                 "cost_attribution": attribution.model_copy(
@@ -1689,7 +1706,7 @@ def test_exact_create_attests_sufficient_observed_storage(
     launch_digest = environment._launch_config_digest(build)
 
     async def create(**kwargs: object) -> _Sandbox:
-        return _sandbox_for_create(kwargs, disk_size_mb=observed_storage_mb)
+        return _sandbox_for_create(kwargs, observed_storage_mb=observed_storage_mb)
 
     monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
     environment._wmh_ledger.begin(
@@ -1708,6 +1725,109 @@ def test_exact_create_attests_sufficient_observed_storage(
     asyncio.run(environment.stop(delete=True))
 
 
+def test_exact_create_retries_initially_empty_provider_storage_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+    created: list[_Sandbox] = []
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs)
+        sandbox._metric_reports.insert(0, [])
+        sandbox._metric_reports.insert(0, [])
+        created.append(sandbox)
+        return sandbox
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+
+    assert "disk_size_mb" not in SandboxInfo.__dataclass_fields__
+    assert created[0].metric_calls == 3
+    assert created[0].metric_request_timeouts == [
+        mod._E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S
+    ] * 3
+    assert environment.wmh_environment_attestation is not None
+    asyncio.run(environment.stop(delete=True))
+
+
+def test_exact_create_does_not_claim_storage_without_a_task_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path, storage_mb=None)
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+    created: list[_Sandbox] = []
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs)
+        created.append(sandbox)
+        return sandbox
+
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+
+    assert created[0].metric_calls == 0
+    attestation = environment.wmh_environment_attestation
+    assert attestation is not None
+    assert attestation["requested_storage_mb"] is None
+    assert attestation["observed_storage_mb"] is None
+    asyncio.run(environment.stop(delete=True))
+
+
+def test_empty_provider_storage_metrics_fail_closed_and_clean_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    created: list[_Sandbox] = []
+
+    async def load_build() -> mod.ExactE2BBuildRecord:
+        return build
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs)
+        sandbox._metric_reports = [[]]
+        created.append(sandbox)
+        return sandbox
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(environment, "_load_or_build_exact_template", load_build)
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(RuntimeError, match="storage capacity was not proved"):
+        asyncio.run(environment.start(force_build=False))
+
+    assert created[0].metric_calls == mod._E2B_STORAGE_METRIC_ATTEMPTS
+    assert created[0].kills == 1
+    assert environment.wmh_environment_attestation is None
+
+
 def test_exact_create_rejects_insufficient_observed_storage_and_cleans_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1720,7 +1840,7 @@ def test_exact_create_rejects_insufficient_observed_storage_and_cleans_up(
         return build
 
     async def create(**kwargs: object) -> _Sandbox:
-        sandbox = _sandbox_for_create(kwargs, disk_size_mb=10_239)
+        sandbox = _sandbox_for_create(kwargs, observed_storage_mb=10_239)
         created.append(sandbox)
         return sandbox
 
@@ -1756,7 +1876,7 @@ def test_task_attestation_digest_binds_observed_storage(
             _observed_storage_mb: int = observed_storage_mb,
             **kwargs: object,
         ) -> _Sandbox:
-            return _sandbox_for_create(kwargs, disk_size_mb=_observed_storage_mb)
+            return _sandbox_for_create(kwargs, observed_storage_mb=_observed_storage_mb)
 
         monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
         environment._wmh_ledger.begin(
@@ -2208,7 +2328,7 @@ def test_unknown_task_sandbox_cleanup_remains_nonterminal(
         (NetworkMode.PUBLIC, None, True),
         (
             NetworkMode.NO_NETWORK,
-            SimpleNamespace(allow_out=[], deny_out=[ALL_TRAFFIC], rules={}),
+            {"allow_out": [], "deny_out": [ALL_TRAFFIC], "rules": {}},
             False,
         ),
     ],
@@ -2231,11 +2351,11 @@ def test_network_attestation_accepts_only_policy_equivalent_service_state(
 def test_network_attestation_rejects_allowlist_drift(tmp_path: Path) -> None:
     environment = _environment(tmp_path)
     info = SimpleNamespace(
-        network=SimpleNamespace(
-            allow_out=["unexpected.example.com"],
-            deny_out=[ALL_TRAFFIC],
-            rules={},
-        )
+        network={
+            "allow_out": ["unexpected.example.com"],
+            "deny_out": [ALL_TRAFFIC],
+            "rules": {},
+        }
     )
 
     with pytest.raises(RuntimeError, match="allowlist differs"):

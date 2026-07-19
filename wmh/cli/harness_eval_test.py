@@ -76,7 +76,6 @@ def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: P
         docker_image=None,
         cpu_count=2,
         memory_mb=1024,
-        storage_mb=10_240,
     )
     result = runner.invoke(
         app,
@@ -95,8 +94,6 @@ def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: P
             "2",
             "--memory-mb",
             "1024",
-            "--storage-mb",
-            "10240",
             "--acknowledge-preexisting-outside-study",
         ],
     )
@@ -109,11 +106,9 @@ def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: P
         docker_image=None,
         cpu_count=2,
         memory_mb=1024,
-        storage_mb=10_240,
         allow_preexisting_outside_study=True,
     )
     assert record.exact_template_ref == "template-immutable:build-immutable"
-    assert record.storage_mb == 10_240
     assert spec.environment_id not in result.output
 
 

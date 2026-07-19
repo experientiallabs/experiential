@@ -706,6 +706,11 @@ def _parse_task_environment_attestation(
             )
         if parsed.get("storage_requirement_satisfied") is not True:
             raise ValueError("Harbor Docker task attestation does not satisfy requested storage")
+        if (
+            parsed.get("storage_capacity_scope") != "shared_task_filesystem_available"
+            or parsed.get("storage_provider_enforced") is not False
+        ):
+            raise ValueError("Harbor Docker task attestation misstates its storage guarantee")
     elif expected_backend == "e2b":
         launch_digest = parsed.get("launch_config_digest")
         if not is_sha256_digest(launch_digest):
@@ -723,12 +728,14 @@ def _parse_task_environment_attestation(
             requested_storage_mb = requested_value
         observed_storage_mb = parsed.get("observed_storage_mb")
         if (
-            isinstance(observed_storage_mb, bool)
-            or not isinstance(observed_storage_mb, int)
-            or observed_storage_mb < 1
-            or (
-                requested_storage_mb is not None
-                and observed_storage_mb < requested_storage_mb
+            requested_storage_mb is None
+            and observed_storage_mb is not None
+        ) or (
+            requested_storage_mb is not None
+            and (
+                isinstance(observed_storage_mb, bool)
+                or not isinstance(observed_storage_mb, int)
+                or observed_storage_mb < requested_storage_mb
             )
         ):
             raise ValueError("Harbor E2B task attestation has invalid observed storage evidence")

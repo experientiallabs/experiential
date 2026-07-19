@@ -63,6 +63,8 @@ _TASK_ENVIRONMENT_ATTESTATION = cast(
         "backend": "docker",
         "daemon_platform": "linux/amd64",
         "requested_storage_mb": None,
+        "storage_capacity_scope": "shared_task_filesystem_available",
+        "storage_provider_enforced": False,
         "storage_requirement_satisfied": True,
         "services": [
             {
@@ -489,8 +491,22 @@ def test_local_attestation_requires_requested_storage_and_binds_a_stable_claim(
     evidence = asyncio.run(mod._attest_docker_environment(exact))
 
     assert evidence["requested_storage_mb"] == 10_240
+    assert evidence["storage_capacity_scope"] == "shared_task_filesystem_available"
+    assert evidence["storage_provider_enforced"] is False
     assert evidence["storage_requirement_satisfied"] is True
     assert "available_storage_kib" not in evidence
+    assert exact.health_calls == [
+        (
+            mod._TASK_DISK_HEALTH_COMMAND,
+            {
+                "BASH_ENV": "/dev/null",
+                "ENV": "/dev/null",
+                "BASHOPTS": "",
+                "SHELLOPTS": "",
+            },
+            mod._TASK_DISK_HEALTH_TIMEOUT_S,
+        )
+    ]
 
     undersized = DockerEnvironment(
         health_results=[_healthy_disk_result(available_kib=10_240 * 1024 - 1)],

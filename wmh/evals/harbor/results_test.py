@@ -51,6 +51,8 @@ _TASK_ENVIRONMENT_ATTESTATION = {
     "backend": "docker",
     "daemon_platform": "linux/amd64",
     "requested_storage_mb": None,
+    "storage_capacity_scope": "shared_task_filesystem_available",
+    "storage_provider_enforced": False,
     "storage_requirement_satisfied": True,
     "services": [
         {

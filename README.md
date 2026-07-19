@@ -71,6 +71,12 @@ symlinks before WMH validates them. Use a private checkout owned by the evaluato
 filesystem; writable-by-group, writable-by-others, hardlinked, symlinked, and cross-filesystem
 task entries fail closed.
 
+Task storage minima follow each backend's real boundary. E2B binds the requested MiB into the launch
+identity and verifies it against provider-reported byte metrics after create; storage does not split
+otherwise identical exact template builds. Local Docker performs a sanitized available-space check
+on the task's shared backing filesystem. That local check is an admission guard, not a provider-
+enforced per-container quota.
+
 Install the E2B extra and select it explicitly to fan task environments out through E2B:
 
 ```bash

@@ -766,7 +766,6 @@ def _preflight_exact_e2b_builds(
                 docker_image=docker_image,
                 cpu_count=task_config.environment.cpus or 2,
                 memory_mb=task_config.environment.memory_mb or 1024,
-                storage_mb=task_config.environment.storage_mb,
             )
             resource_class = ExactE2BEnvironment._task_resource_class(
                 cpu_count=task_config.environment.cpus or 2,
@@ -793,7 +792,6 @@ def _preflight_exact_e2b_builds(
                 docker_image=build_spec.docker_image,
                 cpu_count=resource_class.cpu_count,
                 memory_mb=resource_class.memory_mb,
-                storage_mb=task_config.environment.storage_mb,
                 expected_budget_authority=matched_account,
                 allow_preexisting_outside_study=bool(
                     config.environment.kwargs.get("allow_preexisting_e2b_builds", False)

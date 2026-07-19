@@ -1070,6 +1070,12 @@ async def _attest_docker_environment(
             raise RuntimeError("Docker task environment requested invalid storage capacity")
         storage_result = await environment.exec(
             _TASK_DISK_HEALTH_COMMAND,
+            env={
+                "BASH_ENV": "/dev/null",
+                "ENV": "/dev/null",
+                "BASHOPTS": "",
+                "SHELLOPTS": "",
+            },
             timeout_sec=_TASK_DISK_HEALTH_TIMEOUT_S,
         )
         available_storage_kib = _task_free_disk_kib(storage_result)
@@ -1086,6 +1092,8 @@ async def _attest_docker_environment(
             "backend": "docker",
             "daemon_platform": daemon_platform,
             "requested_storage_mb": requested_storage_mb,
+            "storage_capacity_scope": "shared_task_filesystem_available",
+            "storage_provider_enforced": False,
             "storage_requirement_satisfied": True,
             "services": [
                 {
@@ -1139,20 +1147,17 @@ async def _attest_e2b_environment(
     requested_storage_mb = evidence.get("requested_storage_mb")
     observed_storage_mb = evidence.get("observed_storage_mb")
     if (
-        (
-            requested_storage_mb is not None
-            and (
-                isinstance(requested_storage_mb, bool)
-                or not isinstance(requested_storage_mb, int)
-                or requested_storage_mb < 1
-            )
-        )
-        or isinstance(observed_storage_mb, bool)
-        or not isinstance(observed_storage_mb, int)
-        or observed_storage_mb < 1
-        or (
-            isinstance(requested_storage_mb, int)
-            and observed_storage_mb < requested_storage_mb
+        requested_storage_mb is None
+        and observed_storage_mb is not None
+    ) or (
+        requested_storage_mb is not None
+        and (
+            isinstance(requested_storage_mb, bool)
+            or not isinstance(requested_storage_mb, int)
+            or requested_storage_mb < 1
+            or isinstance(observed_storage_mb, bool)
+            or not isinstance(observed_storage_mb, int)
+            or observed_storage_mb < requested_storage_mb
         )
     ):
         raise RuntimeError("E2B returned invalid sandbox storage evidence")

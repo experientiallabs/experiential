@@ -55,7 +55,6 @@ def register_e2b_build(
     build_id: str = typer.Option(..., "--build-id"),
     cpu_count: int = typer.Option(..., "--cpu-count", min=1),
     memory_mb: int = typer.Option(..., "--memory-mb", min=1),
-    storage_mb: int | None = typer.Option(None, "--storage-mb", min=1),
     acknowledge_preexisting_outside_study: bool = typer.Option(
         False,
         "--acknowledge-preexisting-outside-study",
@@ -69,7 +68,6 @@ def register_e2b_build(
             docker_image=docker_image,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
-            storage_mb=storage_mb,
         )
         record = register_exact_e2b_build_record(
             jobs_dir=Path(jobs_dir),
@@ -80,7 +78,6 @@ def register_e2b_build(
             build_id=build_id,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
-            storage_mb=storage_mb,
             acknowledge_preexisting_outside_study=acknowledge_preexisting_outside_study,
         )
     except (OSError, ValueError, RuntimeError) as exc:
@@ -96,7 +93,6 @@ def prepare_e2b_build(
     docker_image: str | None = typer.Option(None, "--docker-image"),
     cpu_count: int = typer.Option(..., "--cpu-count", min=1),
     memory_mb: int = typer.Option(..., "--memory-mb", min=1),
-    storage_mb: int | None = typer.Option(None, "--storage-mb", min=1),
     resource_budget_account_path: str = typer.Option(..., "--resource-budget-account"),
     spend_limit_attestation_path: str = typer.Option(
         ...,
@@ -124,7 +120,6 @@ def prepare_e2b_build(
             docker_image=docker_image,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
-            storage_mb=storage_mb,
         )
         account = _load_timed_resource_budget_account(
             resource_budget_account_path,

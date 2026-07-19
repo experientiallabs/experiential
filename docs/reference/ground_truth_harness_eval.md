@@ -268,6 +268,22 @@ digest, and writes an owner-bound resource receipt after metadata reconciliation
 sandbox absent. Valid and candidate-damaged E2B cells are rejected unless that receipt is terminal
 and bound to the attested launch configuration.
 
+A task `storage_mb` value is a launch-time minimum, not an E2B template-build input. The E2B SDK
+does not accept disk size when building the exact template, so different task minima reuse the same
+content, CPU, and memory keyed build. The requested minimum is instead bound into the launch digest.
+After create, WMH reads E2B's provider metrics, interprets `disk_total` as bytes, retries only an
+initially empty metric series across a fixed ten-second polling window with bounded requests, and
+requires the conservative observed
+total to cover the requested MiB before accepting the sandbox. Missing or malformed metrics fail
+closed and use the ordinary owner-bound sandbox cleanup path.
+
+Local Docker has no portable per-container disk quota in this adapter. For a task storage request,
+WMH runs the same sanitized writable-inode and POSIX `df -Pk` probe used by command health checks and
+requires that the task's current filesystem report at least the requested available KiB. The stable
+attestation explicitly identifies this as shared-task-filesystem admission and records that it is
+not provider enforced; it omits the volatile free-block count. A pass therefore proves conservative
+headroom at admission time only. Parallel cells can consume the same backing store afterward.
+
 ```python
 from harbor.models.job.config import DatasetConfig
 
