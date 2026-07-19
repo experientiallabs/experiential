@@ -71,6 +71,7 @@ from wmh.evals.paired import (
     PairedBlock,
     PairedBlockOutcome,
     PairedEvaluationDesign,
+    PairedTaskPlan,
     analyze_paired_outcomes,
 )
 from wmh.evals.partition import ConfirmationPartition
@@ -831,6 +832,14 @@ class PairedHarborProtocol(BaseModel):
         if self.opened_selection != expected_selection:
             raise ValueError(
                 "paired Harbor selection is not the deterministic full-roster projection"
+            )
+        confirmation_tasks = tuple(
+            PairedTaskPlan(task_id=task.task_id, group_id=task.group_id)
+            for task in self.confirmation.tasks
+        )
+        if confirmation_tasks != self.design.tasks:
+            raise ValueError(
+                "paired Harbor design task clusters differ from its opened confirmation tasks"
             )
 
         routes = tuple(route.panel_member for route in self.panel_routes)

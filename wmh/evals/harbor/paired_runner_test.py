@@ -835,8 +835,8 @@ def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
     design = _design()
     assert len(calls) == 2 * len(design.blocks)
     assert len(report.evidence) == len(design.blocks)
-    assert report.run_version == "7"
-    assert report.protocol.protocol_version == "6"
+    assert report.run_version == "8"
+    assert report.protocol.protocol_version == "7"
     assert report.protocol.design_digest == design.digest
     assert report.protocol.baseline_execution_digest == baseline.execution_digest
     assert report.protocol.candidate_execution_digest == candidate.execution_digest
