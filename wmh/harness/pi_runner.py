@@ -37,6 +37,10 @@ from wmh.harness.runner_link import Channel, TokenUsage, WorkerFn
 from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
 from wmh.harness.tools import READ_SKILL, ToolSpec, resolve_tools
 from wmh.providers.base import ToolCallingProvider
+from wmh.providers.failure_attribution import (
+    ProviderFailureOwner,
+    classify_provider_failure,
+)
 
 DEFAULT_PI_TURN_TIMEOUT_S = 300.0
 _PUMP_INTERVAL_S = 0.5
@@ -110,6 +114,33 @@ class PiCandidateFailureReason(StrEnum):
     TIMEOUT = "timeout"
     RESOURCE_LIMIT = "resource_limit"
     RUNTIME_ERROR = "runtime_error"
+    INVALID_REQUEST = "invalid_request"
+
+
+class PiRunHealth(StrEnum):
+    """Whether one run is valid evidence or needs operational handling."""
+
+    VALID = "valid"
+    CANDIDATE_DAMAGED = "candidate_damaged"
+    INFRASTRUCTURE_FAILURE = "infrastructure_failure"
+    AMBIGUOUS = "ambiguous"
+
+
+class CandidateTaskEnvironmentError(RuntimeError):
+    """A candidate action destroyed or exhausted its isolated task environment."""
+
+    def __init__(self, reason: PiCandidateFailureReason) -> None:
+        if reason not in {
+            PiCandidateFailureReason.RESOURCE_LIMIT,
+            PiCandidateFailureReason.RUNTIME_ERROR,
+        }:
+            raise ValueError("candidate task environment errors need a resource or runtime reason")
+        super().__init__("candidate damaged the task environment")
+        self.reason = reason
+
+
+class AmbiguousTaskEnvironmentError(RuntimeError):
+    """The task environment disappeared without enough evidence to assign ownership."""
 
 
 class PiInfrastructureFailureKind(StrEnum):
@@ -117,6 +148,7 @@ class PiInfrastructureFailureKind(StrEnum):
 
     PROVIDER = "provider"
     TASK_ENVIRONMENT = "task_environment"
+    TASK_ENVIRONMENT_CONFIRMATION_REQUIRED = "task_environment_confirmation_required"
 
 
 class PiInfrastructureError(RuntimeError):
@@ -128,15 +160,29 @@ class PiInfrastructureError(RuntimeError):
         *,
         events: tuple[SessionEvent, ...] = (),
         worker_usage: TokenUsage | None = None,
+        run_health: PiRunHealth | None = None,
     ) -> None:
         message = {
             PiInfrastructureFailureKind.PROVIDER: "pi turn worker provider failed",
             PiInfrastructureFailureKind.TASK_ENVIRONMENT: "pi turn tool executor failed",
+            PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED: (
+                "pi turn task environment requires confirmation"
+            ),
         }[kind]
         super().__init__(message)
         self.kind = kind
         self.events = events
         self.worker_usage = worker_usage or TokenUsage()
+        self.run_health = (
+            run_health
+            or {
+                PiInfrastructureFailureKind.PROVIDER: PiRunHealth.INFRASTRUCTURE_FAILURE,
+                PiInfrastructureFailureKind.TASK_ENVIRONMENT: PiRunHealth.AMBIGUOUS,
+                PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED: (
+                    PiRunHealth.AMBIGUOUS
+                ),
+            }[kind]
+        )
 
 
 class PiCandidateError(RuntimeError):
@@ -150,12 +196,14 @@ class PiCandidateError(RuntimeError):
         reason: PiCandidateFailureReason,
         events: tuple[SessionEvent, ...],
         worker_usage: TokenUsage,
+        run_health: PiRunHealth = PiRunHealth.VALID,
     ) -> None:
         super().__init__(message)
         self.stage = stage
         self.reason = reason
         self.events = events
         self.worker_usage = worker_usage
+        self.run_health = run_health
 
 
 @dataclass(frozen=True)
@@ -166,6 +214,7 @@ class PiTurnResult:
     terminal_reason: str
     events: tuple[SessionEvent, ...]
     worker_usage: TokenUsage
+    run_health: PiRunHealth = PiRunHealth.VALID
 
 
 class _EpisodeObservingChannel:
@@ -265,6 +314,8 @@ def run_pi_turn(
     terminal_reason = ""
     turn_started = False
     infrastructure_failure: PiInfrastructureError | None = None
+    candidate_worker_failure = False
+    candidate_task_failure: CandidateTaskEnvironmentError | None = None
     tool_deadline_exceeded = False
     turn_deadline: ToolExecutionDeadline | None = None
     event_bytes = 0
@@ -306,10 +357,14 @@ def run_pi_turn(
         selected_worker = provider.complete_chat
 
     def checked_worker(request: ChatRequest) -> ChatResponse:
-        nonlocal infrastructure_failure
+        nonlocal candidate_worker_failure, infrastructure_failure
         try:
             return selected_worker(request)
-        except Exception:  # noqa: BLE001 - replace trusted error text before it crosses to pi
+        except Exception as exc:  # noqa: BLE001 - replace trusted error text before it crosses
+            attribution = classify_provider_failure(exc)
+            if attribution.owner is ProviderFailureOwner.CANDIDATE:
+                candidate_worker_failure = True
+                raise RuntimeError("candidate worker request rejected") from None
             infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
             raise RuntimeError("worker provider unavailable") from None
 
@@ -318,11 +373,20 @@ def run_pi_turn(
         args: JsonObject,
         emit: OutputEmitter,
     ) -> ToolOutcome:
-        nonlocal infrastructure_failure, tool_deadline_exceeded
+        nonlocal candidate_task_failure, infrastructure_failure, tool_deadline_exceeded
         if turn_deadline is None:
             raise RuntimeError("task tools are unavailable before the pi turn starts")
         try:
             return execute_tool(name, args, emit, turn_deadline)
+        except CandidateTaskEnvironmentError as exc:
+            candidate_task_failure = exc
+            raise RuntimeError("candidate damaged the task environment") from None
+        except AmbiguousTaskEnvironmentError:
+            infrastructure_failure = PiInfrastructureError(
+                PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED,
+                run_health=PiRunHealth.AMBIGUOUS,
+            )
+            raise RuntimeError("task environment health is ambiguous") from None
         except ToolExecutionDeadlineExceeded:
             tool_deadline_exceeded = True
             raise RuntimeError("pi turn deadline exhausted during task execution") from None
@@ -338,7 +402,32 @@ def run_pi_turn(
             error.kind,
             events=tuple(events),
             worker_usage=session.worker_usage.model_copy(),
+            run_health=error.run_health,
         )
+
+    def evidenced_candidate(
+        *,
+        stage: PiCandidateFailureStage,
+    ) -> PiCandidateError | None:
+        """Materialize a pending trusted candidate attribution with bounded evidence."""
+        if candidate_worker_failure:
+            return PiCandidateError(
+                f"pi candidate {stage.value} failed: worker request was rejected",
+                stage=stage,
+                reason=PiCandidateFailureReason.INVALID_REQUEST,
+                events=tuple(events),
+                worker_usage=session.worker_usage.model_copy(),
+            )
+        if candidate_task_failure is not None:
+            return PiCandidateError(
+                f"pi candidate {stage.value} failed: candidate damaged the task environment",
+                stage=stage,
+                reason=candidate_task_failure.reason,
+                events=tuple(events),
+                worker_usage=session.worker_usage.model_copy(),
+                run_health=PiRunHealth.CANDIDATE_DAMAGED,
+            )
+        return None
 
     with runner_factory() as channel:
         observed_channel = _EpisodeObservingChannel(channel)
@@ -360,6 +449,13 @@ def run_pi_turn(
             try:
                 session.start()
             except _PiCandidateEventBudgetExceeded as exc:
+                if infrastructure_failure is not None:
+                    raise evidenced_infrastructure(infrastructure_failure) from exc
+                pending_candidate = evidenced_candidate(
+                    stage=PiCandidateFailureStage.MATERIALIZATION
+                )
+                if pending_candidate is not None:
+                    raise pending_candidate from exc
                 raise PiCandidateError(
                     "pi candidate materialization failed: event budget exceeded",
                     stage=PiCandidateFailureStage.MATERIALIZATION,
@@ -381,6 +477,11 @@ def run_pi_turn(
             except RuntimeError as exc:
                 if infrastructure_failure is not None:
                     raise evidenced_infrastructure(infrastructure_failure) from exc
+                pending_candidate = evidenced_candidate(
+                    stage=PiCandidateFailureStage.MATERIALIZATION
+                )
+                if pending_candidate is not None:
+                    raise pending_candidate from exc
                 candidate_message = (
                     observed_channel.episode_error_message
                     or observed_channel.candidate_channel_error_message
@@ -404,6 +505,9 @@ def run_pi_turn(
                 raise
             if infrastructure_failure is not None:
                 raise evidenced_infrastructure(infrastructure_failure)
+            pending_candidate = evidenced_candidate(stage=PiCandidateFailureStage.MATERIALIZATION)
+            if pending_candidate is not None:
+                raise pending_candidate
             turn_deadline = ToolExecutionDeadline.after(timeout_s)
             session.send_user_message(instruction)
             try:
@@ -422,6 +526,9 @@ def run_pi_turn(
                     session.pump(timeout=min(_PUMP_INTERVAL_S, remaining))
                     if infrastructure_failure is not None:
                         raise evidenced_infrastructure(infrastructure_failure)
+                    pending_candidate = evidenced_candidate(stage=PiCandidateFailureStage.TURN)
+                    if pending_candidate is not None:
+                        raise pending_candidate
                     if tool_deadline_exceeded:
                         session.interrupt("pi_turn_timeout")
                         session.flush_pending_intents()
@@ -433,6 +540,11 @@ def run_pi_turn(
                             worker_usage=session.worker_usage.model_copy(),
                         )
             except _PiCandidateEventBudgetExceeded as exc:
+                if infrastructure_failure is not None:
+                    raise evidenced_infrastructure(infrastructure_failure) from exc
+                pending_candidate = evidenced_candidate(stage=PiCandidateFailureStage.TURN)
+                if pending_candidate is not None:
+                    raise pending_candidate from exc
                 raise PiCandidateError(
                     "pi candidate turn failed: event budget exceeded",
                     stage=PiCandidateFailureStage.TURN,
@@ -468,4 +580,5 @@ def run_pi_turn(
         terminal_reason=terminal_reason,
         events=tuple(events),
         worker_usage=usage,
+        run_health=PiRunHealth.VALID,
     )

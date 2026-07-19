@@ -21,9 +21,11 @@ import wmh.evals.harbor.agent as mod
 from wmh.core.types import JsonObject
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.pi_runner import (
+    AmbiguousTaskEnvironmentError,
     PiCandidateError,
     PiCandidateFailureReason,
     PiCandidateFailureStage,
+    PiRunHealth,
     PiTurnResult,
     pi_node_baseline,
 )
@@ -68,9 +70,17 @@ class _Provider:
 class _Environment:
     """Harbor environment slice used by the tool bridge and trace writer."""
 
-    def __init__(self, results: list[ExecResult] | None = None, *, mounted: bool = True) -> None:
+    def __init__(
+        self,
+        results: list[ExecResult] | None = None,
+        *,
+        mounted: bool = True,
+        health_results: list[ExecResult] | None = None,
+    ) -> None:
         self.results = list(results or [])
+        self.health_results = list(health_results or [])
         self.calls: list[tuple[str, dict[str, str] | None, int | None]] = []
+        self.health_calls: list[tuple[str, dict[str, str] | None, int | None]] = []
         self.uploads: list[tuple[Path | str, str]] = []
         self.capabilities = SimpleNamespace(mounted=mounted)
 
@@ -83,6 +93,11 @@ class _Environment:
         user: str | int | None = None,
     ) -> ExecResult:
         _ = cwd, user
+        if command == mod._TASK_DISK_HEALTH_COMMAND:
+            self.health_calls.append((command, env, timeout_sec))
+            if self.health_results:
+                return self.health_results.pop(0)
+            return _healthy_disk_result()
         self.calls.append((command, env, timeout_sec))
         return self.results.pop(0) if self.results else ExecResult(return_code=0)
 
@@ -104,6 +119,17 @@ def _agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> mod.WmhPiAgent:
         evidence=_TASK_ENVIRONMENT_ATTESTATION,
     )
     return agent
+
+
+def _healthy_disk_result(*, available_kib: int | None = None) -> ExecResult:
+    available = mod._MIN_TASK_FREE_DISK_KIB * 2 if available_kib is None else available_kib
+    return ExecResult(
+        stdout=(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+            f"overlay 1048576 1 {available} 1% /workspace\n"
+        ),
+        return_code=0,
+    )
 
 
 def _deadline(seconds: float = 300.0) -> mod.ToolExecutionDeadline:
@@ -643,12 +669,87 @@ def test_tool_output_is_bounded_before_emission_and_structurally_at_exec() -> No
         command, env, _timeout = environment.calls[0]
         assert command == mod._BOUNDED_EXEC_COMMAND
         assert "head -c" in command
-        assert "wc -c" in command
+        assert "tail -c" in command
+        assert "wc -c" not in command
         assert "poison-output" not in command
         assert env is not None
         assert base64.b64decode(env["WMH_TOOL_COMMAND_B64"]).decode() == "printf poison-output"
 
     asyncio.run(scenario())
+
+
+def test_large_candidate_output_cannot_hide_confirmation_required_disk_loss() -> None:
+    async def scenario() -> None:
+        retained_output = (
+            "candidate-prefix" * mod._TOOL_OUTPUT_CHARS
+            + mod._TRUNCATION_MARKER
+            + "bash: write error: No space left on device"
+        )
+        environment = _Environment([ExecResult(stderr=retained_output, return_code=1)])
+        executor = mod.HarborToolExecutor(
+            asyncio.get_running_loop(), cast("BaseEnvironment", environment)
+        )
+
+        with pytest.raises(AmbiguousTaskEnvironmentError):
+            await asyncio.to_thread(
+                executor,
+                "bash",
+                cast("JsonObject", {"command": "emit a large prefix, then fill the disk"}),
+                lambda *_args: None,
+                _deadline(),
+            )
+
+        assert "tail -c" in mod._BOUNDED_EXEC_SCRIPT
+
+    asyncio.run(scenario())
+
+
+def test_suppressed_disk_loss_requires_confirmation_from_task_state() -> None:
+    async def scenario() -> None:
+        environment = _Environment(
+            [ExecResult(return_code=0)],
+            health_results=[
+                _healthy_disk_result(),
+                _healthy_disk_result(available_kib=0),
+            ],
+        )
+        executor = mod.HarborToolExecutor(
+            asyncio.get_running_loop(), cast("BaseEnvironment", environment)
+        )
+
+        with pytest.raises(AmbiguousTaskEnvironmentError):
+            await asyncio.to_thread(
+                executor,
+                "bash",
+                cast(
+                    "JsonObject",
+                    {"command": "fill the disk while suppressing diagnostics; exit 0"},
+                ),
+                lambda *_args: None,
+                _deadline(),
+            )
+
+        assert len(environment.health_calls) == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "filesystem",
+    ["overlay", "/dev/root", "tmpfs"],
+)
+def test_disk_health_parser_accepts_portable_posix_df_output(filesystem: str) -> None:
+    result = ExecResult(
+        stdout=(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+            f"{filesystem} 1048576 10 1048566 1% /workspace\n"
+        ),
+        return_code=0,
+    )
+
+    assert mod._task_free_disk_kib(result) == 1_048_566
+    assert "--output" not in mod._TASK_DISK_HEALTH_SCRIPT
+    assert "/usr/bin" not in mod._TASK_DISK_HEALTH_SCRIPT
 
 
 def test_candidate_command_deadline_is_a_tool_observation_not_infrastructure() -> None:
@@ -676,6 +777,35 @@ def test_candidate_command_deadline_is_a_tool_observation_not_infrastructure() -
         assert float(env["WMH_TOOL_DEADLINE_S"]) < cast("int", timeout)
         assert cast("int", timeout) <= 42
         assert base64.b64decode(env["WMH_TOOL_COMMAND_B64"]) == b"sleep 600"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        ExecResult(stderr="Killed", return_code=-9),
+        ExecResult(stderr="Killed", return_code=137),
+        ExecResult(stderr="bash: write error: No space left on device", return_code=1),
+    ],
+)
+def test_raw_oom_or_disk_loss_requires_fresh_same_cell_confirmation(
+    result: ExecResult,
+) -> None:
+    async def scenario() -> None:
+        environment = _Environment([result])
+        executor = mod.HarborToolExecutor(
+            asyncio.get_running_loop(), cast("BaseEnvironment", environment)
+        )
+
+        with pytest.raises(AmbiguousTaskEnvironmentError):
+            await asyncio.to_thread(
+                executor,
+                "bash",
+                cast("JsonObject", {"command": "consume task resources"}),
+                lambda *_args: None,
+                _deadline(),
+            )
 
     asyncio.run(scenario())
 
@@ -720,7 +850,7 @@ def test_harbor_environment_timeout_before_turn_deadline_remains_infrastructure(
             asyncio.get_running_loop(), cast("BaseEnvironment", environment)
         )
 
-        with pytest.raises(TimeoutError, match="Harbor environment timed out early"):
+        with pytest.raises(AmbiguousTaskEnvironmentError):
             await asyncio.to_thread(
                 executor,
                 "bash",
@@ -729,8 +859,9 @@ def test_harbor_environment_timeout_before_turn_deadline_remains_infrastructure(
                 _deadline(42),
             )
 
-        assert environment.calls[0][2] is not None
-        assert environment.calls[0][2] <= 42
+        assert environment.calls == []
+        assert environment.health_calls[0][2] is not None
+        assert environment.health_calls[0][2] <= 42
 
     asyncio.run(scenario())
 
@@ -742,9 +873,10 @@ def test_candidate_failure_returns_for_native_verification(
     failure = PiCandidateError(
         "candidate failed",
         stage=PiCandidateFailureStage.MATERIALIZATION,
-        reason=PiCandidateFailureReason.TIMEOUT,
+        reason=PiCandidateFailureReason.RESOURCE_LIMIT,
         events=(SessionEvent(kind="error", payload={"message": "candidate failed"}),),
         worker_usage=TokenUsage(input_tokens=3, output_tokens=2, calls=1),
+        run_health=PiRunHealth.CANDIDATE_DAMAGED,
     )
 
     def fail_candidate(*_args: object, **_kwargs: object) -> PiTurnResult:
@@ -761,7 +893,8 @@ def test_candidate_failure_returns_for_native_verification(
     assert context.metadata is not None
     assert context.metadata["candidate_failure"] is True
     assert context.metadata["candidate_failure_stage"] == "materialization"
-    assert context.metadata["candidate_failure_reason"] == "timeout"
+    assert context.metadata["candidate_failure_reason"] == "resource_limit"
+    assert context.metadata["run_health"] == "candidate_damaged"
     trace = (tmp_path / "wmh-events.jsonl").read_text(encoding="utf-8")
     assert "candidate failed" in trace
 
@@ -789,6 +922,7 @@ def test_success_populates_usage_and_backend_identity(
     assert context.metadata["harness_hash"] == agent._harness.execution_hash
     assert context.metadata["task_environment_digest"] == _TASK_ENVIRONMENT_DIGEST
     assert context.metadata["task_environment_attestation"] == _TASK_ENVIRONMENT_ATTESTATION
+    assert context.metadata["run_health"] == "valid"
 
 
 def test_infrastructure_error_does_not_persist_raw_provider_secret(
@@ -816,6 +950,7 @@ def test_infrastructure_error_does_not_persist_raw_provider_secret(
     assert context.metadata is not None
     assert context.metadata["harness_hash"] == agent._harness.execution_hash
     assert context.metadata["runner_image"] == mod.PI_CONTAINER_IMAGE
+    assert context.metadata["run_health"] == "infrastructure_failure"
 
 
 def test_second_provider_call_failure_persists_partial_usage_and_trace(
@@ -845,6 +980,7 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
     assert context.metadata is not None
     assert context.metadata["infrastructure_failure"] is True
     assert context.metadata["infrastructure_failure_kind"] == "provider"
+    assert context.metadata["run_health"] == "infrastructure_failure"
     trace = (tmp_path / "wmh-events.jsonl").read_text(encoding="utf-8")
     assert "first answer" in trace
     assert "worker provider unavailable" in trace
@@ -961,6 +1097,18 @@ def test_infrastructure_taxonomy_is_preserved_without_raw_details(
     assert "secret" not in str(classified)
 
 
+def test_ambiguous_task_environment_requires_a_fresh_confirmation() -> None:
+    classified = mod._typed_infrastructure_error(
+        mod.PiInfrastructureError(
+            mod.PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED,
+            run_health=PiRunHealth.AMBIGUOUS,
+        )
+    )
+
+    assert isinstance(classified, mod.WmhPiEnvironmentConfirmationRequiredError)
+    assert "fresh confirmation attempt" in str(classified)
+
+
 def test_trace_stays_outside_task_mounted_logs_and_replaces_symlink_safely(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1011,7 +1159,47 @@ def test_trace_persistence_failure_is_sanitized_infrastructure(
 
     monkeypatch.setattr(mod.os, "replace", fail_replace)
 
+    context = AgentContext()
     with pytest.raises(mod.WmhPiRunnerError, match="trace persistence") as caught:
-        asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), AgentContext()))
+        asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), context))
 
     assert secret not in str(caught.value)
+    assert context.metadata is not None
+    assert context.metadata["infrastructure_failure"] is True
+    assert context.metadata["run_health"] == "infrastructure_failure"
+
+
+def test_candidate_trace_failure_cannot_reuse_stale_resumed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+    trace = tmp_path / "wmh-events.jsonl"
+    trace.write_text('{"kind":"stale"}\n', encoding="utf-8")
+    failure = PiCandidateError(
+        "candidate damaged the task environment",
+        stage=PiCandidateFailureStage.TURN,
+        reason=PiCandidateFailureReason.RESOURCE_LIMIT,
+        events=(SessionEvent(kind="error", payload={"message": "fresh candidate failure"}),),
+        worker_usage=TokenUsage(),
+        run_health=PiRunHealth.CANDIDATE_DAMAGED,
+    )
+    monkeypatch.setattr(
+        mod,
+        "run_pi_turn",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("replacement failed")
+
+    monkeypatch.setattr(mod.os, "replace", fail_replace)
+    context = AgentContext()
+
+    with pytest.raises(mod.WmhPiRunnerError, match="trace persistence"):
+        asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), context))
+
+    assert trace.exists() is False
+    assert context.metadata is not None
+    assert context.metadata["infrastructure_failure"] is True
+    assert context.metadata["run_health"] == "infrastructure_failure"
+    assert "candidate_failure" not in context.metadata

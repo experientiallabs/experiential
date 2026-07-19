@@ -320,11 +320,29 @@ portable output stream, host-side byte cutoff, process handle, or confirmed kill
 WMH task-tool call now receives the absolute pi-turn deadline. The Harbor bridge bounds its own
 wait and Harbor's integer execution timeout to the remaining turn budget, and places an earlier
 deadline and output cap inside the task. A task-side exit 124 remains a candidate tool observation;
-a Harbor environment failure remains infrastructure; exhaustion of the caller-owned turn deadline
-remains a gradeable candidate timeout. These controls handle ordinary commands and frozen task
-images. They are not a trusted kill boundary against a hostile root candidate: root can replace the
-task-side shell or cap utilities, detach descendants, or otherwise defeat a mutable in-container
-supervisor, while Harbor exposes no portable descendant-kill proof.
+exhaustion of the caller-owned turn deadline remains a gradeable candidate timeout. Raw exit 137,
+SIGKILL/OOM, ENOSPC, or filesystem-postcondition loss is not enough to assign ownership: parallel
+local Docker cells share host memory and backing storage, and GNU `timeout --kill-after` can itself
+produce exit 137. Those signals therefore carry `environment_confirmation_required` and cannot
+enter optimizer selection. In addition to bounded head-and-tail command evidence, the bridge
+establishes a healthy free-block and writable-inode baseline, then runs a fixed POSIX `df -Pk` and
+inode-creation postcondition after each command. Falling below the frozen 128 MiB reserve or losing
+the writable-inode postcondition requests the same fresh-cell confirmation. The task image must
+provide the same Bash and POSIX utilities already required by the tool executor; qualification
+exercises this probe before scoring.
+
+These controls handle ordinary commands and frozen task images. They observe only the command's
+default filesystem. Exhaustion of another verifier mount remains ambiguous. They are also not a
+trusted kill boundary against a hostile root candidate: root can replace the task-side shell or
+utilities, detach descendants, or otherwise defeat a mutable in-container supervisor, while
+Harbor exposes no portable descendant-kill or host-side filesystem proof.
+
+The next execution-boundary slice must implement exactly one explicit confirmation attempt for
+the typed `environment_confirmation_required` outcome. It must start a fresh sandbox, reproduce
+the same candidate and benchmark cell, receive its own manifest entry and attempt identity, and be
+charged to the external-resource and spend ledgers. It must not use Harbor's hidden retry path.
+Only a second matching environment loss under the frozen confirmation policy may be promoted to
+candidate damage; a nonmatching result invalidates the pair as infrastructure evidence.
 
 Before paid search, do one of the following:
 
@@ -381,15 +399,19 @@ paid search, add a deadline-aware provider contract that passes the remaining tu
 SDK request, or run the provider call in a cancellable disposable worker with an externally proved
 termination boundary. Do not add an untracked background executor that can leave paid calls alive.
 
-The same interface exposes raw provider exceptions without a portable failure class. Azure and
-Bedrock do not use one common signal for context overflow, policy intervention, authentication,
-quota, and transient service failure. WMH currently classifies an exception conservatively as
-provider infrastructure and invalidates the cell. `HarborJobSpec` rejects every nonzero retry
-configuration because Harbor 0.18 overwrites the final trial result without retaining complete
-attempt usage and exceptions. Before enabling paid retry or search ranking, add an atomic attempt
-ledger and a typed adapter-level taxonomy validated by live probes on the frozen Azure and Bedrock
-routes. Only exact deterministic context or policy signals may become gradeable candidate outcomes;
-ambiguous errors must stay infrastructure failures.
+Azure/OpenAI request failures become candidate-owned invalid-request outcomes only for frozen
+candidate codes or structured candidate parameter roots, after credential, deployment/model
+route, throttle, timeout, transport, and server precedence. A known 422 `invalid_request_error`
+also covers tool-call ordering failures without a parameter path. Bedrock `ValidationException`
+and local botocore parameter validation cross the boundary only through anchored provider templates
+or SDK-authored candidate parameter roots. Unknown request shapes fail closed as infrastructure.
+Those typed candidate failures are valid zeroes. Auth, route, throttle, timeout, transport, 5xx,
+and unknown errors produce retry-required run health. Raw provider text is never copied into
+candidate-visible or canonical evidence. `HarborJobSpec` still rejects every nonzero retry
+configuration because Harbor 0.18
+overwrites the final trial result without retaining complete attempt usage and exceptions. Before
+enabling paid retry, add an atomic attempt ledger and validate the taxonomy with live probes on the
+frozen Azure and Bedrock routes.
 
 Current agent evidence records input and output tokens for completed calls, but not cache-token
 detail or authoritative provider cost. Each canonical usage field carries an `exact`,
@@ -697,14 +719,14 @@ Before claiming an improvement:
 
 ## Analysis contract
 
-For a cell that finishes without a candidate-owned task timeout, its analysis outcome is the
-selected binary verifier reward. A candidate-owned agent or task timeout has primary outcome zero,
-even if Harbor later obtains a valid verifier reward from the final task state. Preserve that reward
-and the timeout failure kind as diagnostic evidence. A verifier, provider, environment, runner, or
-unclassified infrastructure failure is not a zero and invalidates the planned matrix until an
-allowlisted, fully ledgered recovery fills that cell. The timeout sensitivity analysis substitutes
-Harbor's valid post-timeout verifier reward for the primary zero; it may not replace the primary
-result after scores are observed.
+For a cell that finishes without a candidate-owned failure, its analysis outcome is the selected
+binary verifier reward. Candidate-owned invalid provider requests, agent/task timeouts, and typed
+task-container destruction or exhaustion have primary outcome zero. Preserve any later verifier
+reward and the candidate failure kind as diagnostic evidence. A verifier, provider, environment,
+runner, or unclassified failure with retry-required or unknown run health is not a zero and
+invalidates the planned matrix until an allowlisted, fully ledgered recovery fills that cell. The
+timeout sensitivity analysis substitutes Harbor's valid post-timeout verifier reward for the
+primary zero; it may not replace the primary result after scores are observed.
 
 First average the planned analysis outcomes within each task and arm: five for primary confirmation
 and the separately frozen count for Azure transfer. The primary empirical metric is the paired

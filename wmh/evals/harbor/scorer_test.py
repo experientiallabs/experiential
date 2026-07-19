@@ -19,6 +19,7 @@ from wmh.evals.benchmark import (
     BenchmarkCell,
     BenchmarkError,
     BenchmarkFailureKind,
+    BenchmarkRunHealth,
     BenchmarkRunIdentity,
     BenchmarkRunResult,
     BenchmarkTaskEnvironment,
@@ -30,7 +31,7 @@ from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE
 from wmh.harness.pi_runner import pi_node_baseline
-from wmh.harness.scoring import ScoreRequest
+from wmh.harness.scoring import ScoreRequest, ScoreRunHealth
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 _TASK_IDS = ("alpha", "beta")
@@ -50,6 +51,9 @@ class _ResultOptions:
     task_ids: tuple[str, ...] = _TASK_IDS
     task_environment_digests: tuple[str, ...] = _TASK_ENVIRONMENT_DIGESTS
     task_timeout: bool = False
+    run_health: BenchmarkRunHealth = BenchmarkRunHealth.VALID
+    candidate_damage_error: bool = False
+    failure_kind: BenchmarkFailureKind = BenchmarkFailureKind.ENVIRONMENT
 
 
 def _provider() -> ProviderConfig:
@@ -89,11 +93,13 @@ def _cell(task_id: str, attempt: int) -> BenchmarkCell:
     )
 
 
-def _candidate_failure() -> BenchmarkCandidateOutcome:
+def _candidate_failure(
+    reason: BenchmarkCandidateFailureReason = BenchmarkCandidateFailureReason.TIMEOUT,
+) -> BenchmarkCandidateOutcome:
     return BenchmarkCandidateOutcome(
         status=BenchmarkCandidateStatus.FAILED,
         stage=BenchmarkCandidateStage.EXECUTION,
-        failure_reason=BenchmarkCandidateFailureReason.TIMEOUT,
+        failure_reason=reason,
     )
 
 
@@ -111,6 +117,9 @@ def _loaded_result(
     task_environment_digests: tuple[str, ...] = _TASK_ENVIRONMENT_DIGESTS,
     task_timeout: bool = False,
     diagnostic_reward: float | None = None,
+    run_health: BenchmarkRunHealth = BenchmarkRunHealth.VALID,
+    candidate_damage_error: bool = False,
+    failure_kind: BenchmarkFailureKind = BenchmarkFailureKind.ENVIRONMENT,
 ) -> LoadedHarborJobResult:
     environment_digest_by_task = dict(zip(_TASK_IDS, task_environment_digests, strict=True))
     selected_rewards = rewards or {
@@ -138,12 +147,22 @@ def _loaded_result(
                     type="AgentTimeoutError",
                     message="agent execution exceeded the task time limit",
                 )
+            if candidate_damage_error:
+                error = BenchmarkError(
+                    kind=BenchmarkFailureKind.ENVIRONMENT,
+                    type="WmhPiEnvironmentError",
+                    message="task environment infrastructure failed",
+                )
             if status is not BenchmarkTrialStatus.SCORED:
                 trial_rewards = None
                 error = BenchmarkError(
-                    kind=BenchmarkFailureKind.ENVIRONMENT,
-                    type="EnvironmentStartTimeoutError",
-                    message="task environment infrastructure failed",
+                    kind=failure_kind,
+                    type=(
+                        "WmhPiEnvironmentConfirmationRequiredError"
+                        if failure_kind is BenchmarkFailureKind.ENVIRONMENT_CONFIRMATION_REQUIRED
+                        else "EnvironmentStartTimeoutError"
+                    ),
+                    message="benchmark trial requires operational handling",
                 )
             trials.append(
                 BenchmarkTrialResult(
@@ -161,6 +180,7 @@ def _loaded_result(
                     error=error,
                     candidate_outcome=candidate_outcome
                     or BenchmarkCandidateOutcome(status=BenchmarkCandidateStatus.COMPLETED),
+                    run_health=run_health,
                 )
             )
             trial_dir = Path(f"trial-{task_id}-{attempt}")
@@ -241,6 +261,9 @@ def _install_fake_evaluator(
                 task_environment_digests=options.task_environment_digests,
                 task_timeout=options.task_timeout,
                 diagnostic_reward=options.diagnostic_reward,
+                run_health=options.run_health,
+                candidate_damage_error=options.candidate_damage_error,
+                failure_kind=options.failure_kind,
             )
 
     monkeypatch.setattr(mod, "HarborEvaluator", FakeEvaluator)
@@ -294,6 +317,7 @@ def test_projects_exact_binary_task_means_and_bounded_evidence(
     assert scorer.task_keys == _TASK_KEYS
     assert scorer.task_environment_digests == _TASK_ENVIRONMENT_DIGESTS
     assert report.attempts == 2
+    assert report.run_health is ScoreRunHealth.VALID
     assert report.score == pytest.approx(0.75)
     assert report.secondary_score == report.score
     assert list(report.per_task) == list(_TASK_IDS)
@@ -501,6 +525,97 @@ def test_scored_candidate_failure_is_data_but_infrastructure_is_invalid(
         result_options=_ResultOptions(status=BenchmarkTrialStatus.INFRASTRUCTURE_ERROR),
     )
     with _scorer(tmp_path) as scorer, pytest.raises(ValueError, match="not scored"):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
+def test_candidate_damaged_trial_without_verifier_reward_is_a_valid_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_evaluator(
+        monkeypatch,
+        tmp_path,
+        result_options=_ResultOptions(
+            status=BenchmarkTrialStatus.CANDIDATE_FAILURE,
+            candidate_outcome=_candidate_failure(),
+            run_health=BenchmarkRunHealth.CANDIDATE_DAMAGED,
+        ),
+    )
+
+    with _scorer(tmp_path) as scorer:
+        report = scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+    assert report.run_health is ScoreRunHealth.VALID
+    assert report.score == 0.0
+    assert report.secondary_score == 0.0
+    assert "candidate timeout" in report.per_task["alpha"].mechanisms
+    assert "verifier_reward=unavailable" in report.per_task["alpha"].evidence
+
+
+def test_candidate_invalid_provider_request_is_a_valid_zero_mechanism(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_evaluator(
+        monkeypatch,
+        tmp_path,
+        result_options=_ResultOptions(
+            candidate_outcome=_candidate_failure(BenchmarkCandidateFailureReason.INVALID_REQUEST),
+        ),
+    )
+
+    with _scorer(tmp_path) as scorer:
+        report = scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+    assert report.run_health is ScoreRunHealth.VALID
+    assert report.score == 0.0
+    assert "candidate invalid request" in report.per_task["alpha"].mechanisms
+
+
+def test_candidate_damage_with_a_later_reward_keeps_diagnostic_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_evaluator(
+        monkeypatch,
+        tmp_path,
+        result_options=_ResultOptions(
+            rewards={
+                ("alpha", 1): 1.0,
+                ("alpha", 2): 1.0,
+                ("beta", 1): 1.0,
+                ("beta", 2): 1.0,
+            },
+            candidate_outcome=_candidate_failure(),
+            run_health=BenchmarkRunHealth.CANDIDATE_DAMAGED,
+            candidate_damage_error=True,
+        ),
+    )
+
+    with _scorer(tmp_path) as scorer:
+        report = scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+    assert report.run_health is ScoreRunHealth.VALID
+    assert report.score == 0.0
+    assert "verifier_reward=1.0" in report.per_task["alpha"].evidence
+    assert "trial_error=environment" in report.per_task["alpha"].evidence
+
+
+def test_confirmation_required_trial_with_existing_trace_never_enters_a_score_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_evaluator(
+        monkeypatch,
+        tmp_path,
+        result_options=_ResultOptions(
+            status=BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+            run_health=BenchmarkRunHealth.RETRY_REQUIRED,
+            failure_kind=BenchmarkFailureKind.ENVIRONMENT_CONFIRMATION_REQUIRED,
+        ),
+    )
+
+    with _scorer(tmp_path) as scorer, pytest.raises(ValueError, match="retry or invalidate"):
         scorer.score(pi_node_baseline("candidate"), request=_full_request())
 
 

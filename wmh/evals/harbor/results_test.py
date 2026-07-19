@@ -25,6 +25,7 @@ from wmh.evals.benchmark import (
     BenchmarkCandidateTerminalReason,
     BenchmarkCell,
     BenchmarkFailureKind,
+    BenchmarkRunHealth,
     BenchmarkRunIdentity,
     BenchmarkTaskEnvironment,
     BenchmarkTrialStatus,
@@ -165,6 +166,7 @@ def _trial(
                 "runner_image": "runner-image",
                 "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
                 "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
+                "run_health": "valid",
                 **(candidate_metadata or {}),
             },
         ),
@@ -541,15 +543,19 @@ def test_verifier_rewards_after_exception_preserve_harbor_mixed_result_semantics
     job_dir = tmp_path / "job"
     _write_job(job_dir, [trial], expected=1)
 
-    result = load_harbor_job_result(
+    run_result = load_harbor_job_result(
         job_dir, _manifest("job", ("task", 1, trial.trial_name))
-    ).result.trials[0]
+    ).result
+    result = run_result.trials[0]
 
     assert result.status is status
     if status is BenchmarkTrialStatus.SCORED:
         assert result.rewards == {"reward": 0, "tests_passed": 2}
+        assert result.run_health is BenchmarkRunHealth.VALID
+        assert run_result.mean_reward("reward") == 0.0
     else:
         assert result.rewards is None
+        assert result.run_health is BenchmarkRunHealth.RETRY_REQUIRED
     assert result.error is not None
     assert result.error.kind is kind
 
@@ -633,6 +639,113 @@ def test_scored_candidate_failure_is_retained_without_arbitrary_metadata(tmp_pat
     assert secret not in result.model_dump_json()
 
 
+def test_candidate_request_rejection_reason_is_preserved_as_a_valid_zero_signal(
+    tmp_path: Path,
+) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        rewards={"reward": 0},
+        candidate_metadata={
+            "candidate_failure": True,
+            "candidate_failure_stage": "turn",
+            "candidate_failure_reason": "invalid_request",
+            "run_health": "valid",
+        },
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    result = load_harbor_job_result(
+        job_dir, _manifest("job", ("task", 1, trial.trial_name))
+    ).result.trials[0]
+
+    assert result.status is BenchmarkTrialStatus.SCORED
+    assert result.run_health is BenchmarkRunHealth.VALID
+    assert (
+        result.candidate_outcome.failure_reason is BenchmarkCandidateFailureReason.INVALID_REQUEST
+    )
+
+
+@pytest.mark.parametrize("exception_type", ["WmhPiEnvironmentError", "VerifierTimeoutError"])
+def test_candidate_damaged_task_environment_is_a_scoreable_zero_without_rewards(
+    tmp_path: Path,
+    exception_type: str,
+) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        exception_type=exception_type,
+        candidate_metadata={
+            "candidate_failure": True,
+            "candidate_failure_stage": "turn",
+            "candidate_failure_reason": "resource_limit",
+            "run_health": "candidate_damaged",
+        },
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    result = load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name))).result
+
+    assert result.trials[0].status is BenchmarkTrialStatus.CANDIDATE_FAILURE
+    assert result.trials[0].run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+    assert result.n_candidate_failure_zeroes == 1
+    assert result.n_infrastructure_errors == 0
+    assert result.mean_reward("reward") == 0.0
+
+
+def test_candidate_damage_retains_later_verifier_reward_for_diagnostics(tmp_path: Path) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        rewards={"reward": 1},
+        exception_type="WmhPiEnvironmentError",
+        candidate_metadata={
+            "candidate_failure": True,
+            "candidate_failure_stage": "turn",
+            "candidate_failure_reason": "resource_limit",
+            "run_health": "candidate_damaged",
+        },
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    run_result = load_harbor_job_result(
+        job_dir, _manifest("job", ("task", 1, trial.trial_name))
+    ).result
+    result = run_result.trials[0]
+
+    assert result.status is BenchmarkTrialStatus.SCORED
+    assert result.rewards == {"reward": 1}
+    assert result.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+    assert result.error is not None
+    assert result.error.kind is BenchmarkFailureKind.ENVIRONMENT
+    assert run_result.mean_reward("reward") == 0.0
+
+
+def test_ambiguous_environment_loss_is_explicitly_retryable(tmp_path: Path) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        exception_type="WmhPiEnvironmentConfirmationRequiredError",
+        candidate_metadata={
+            "run_health": "ambiguous",
+        },
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    result = load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name))).result
+
+    assert result.trials[0].status is BenchmarkTrialStatus.INFRASTRUCTURE_ERROR
+    assert result.trials[0].error is not None
+    assert result.trials[0].error.kind is BenchmarkFailureKind.ENVIRONMENT_CONFIRMATION_REQUIRED
+    assert result.trials[0].run_health is BenchmarkRunHealth.RETRY_REQUIRED
+    with pytest.raises(ValueError, match="run health is not valid"):
+        result.mean_reward("reward")
+
+
 @pytest.mark.parametrize(
     "candidate_metadata",
     [
@@ -647,6 +760,7 @@ def test_scored_candidate_failure_is_retained_without_arbitrary_metadata(tmp_pat
         },
         {"candidate_failure": False, "terminal_reason": "unknown-reason"},
         {"candidate_failure_stage": "turn"},
+        {"candidate_failure": False, "run_health": "unknown-value"},
     ],
 )
 def test_malformed_candidate_outcome_metadata_is_rejected(

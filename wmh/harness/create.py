@@ -52,6 +52,8 @@ from wmh.harness.scoring import (
     HarnessScoreReport,
     ScoreCapabilities,
     ScoreRequest,
+    ScoreRunHealth,
+    ScoreRunHealthError,
     TaskScore,
     cluster_score_failures,
     render_score_evidence,
@@ -465,6 +467,8 @@ def search_harness(
             attempts=attempts,
         )
         report = _snapshot_score_report(active_scorer.score(doc, request=request))
+        if report.run_health is not ScoreRunHealth.VALID:
+            raise ScoreRunHealthError(report.evaluation_id, report.run_health)
         scorer_attempts = (
             discovery_attempts
             if active_scorer is scorer
@@ -1237,6 +1241,7 @@ def _closed_loop_score(
         score=report.success_rate,
         secondary_score=report.mean_fraction,
         attempts=report.k,
+        run_health=ScoreRunHealth.VALID,
         per_task=task_scores,
     )
 

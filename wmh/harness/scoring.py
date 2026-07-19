@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from enum import StrEnum
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -26,6 +27,26 @@ _MAX_SCORECARD_CHARS = 32_000
 _MAX_FAILURE_HEADER_CHARS = 8_000
 _MAX_MECHANISM_SUMMARY_CHARS = 16_000
 MechanismLabel = Annotated[str, Field(min_length=1, max_length=4_000)]
+
+
+class ScoreRunHealth(StrEnum):
+    """Whether a scorer report is valid optimizer evidence."""
+
+    VALID = "valid"
+    RETRY_REQUIRED = "retry_required"
+    UNKNOWN = "unknown"
+
+
+class ScoreRunHealthError(RuntimeError):
+    """A scorer returned a matrix that must not enter search selection."""
+
+    def __init__(self, evaluation_id: str, run_health: ScoreRunHealth) -> None:
+        super().__init__(
+            f"evaluation {evaluation_id!r} has run_health={run_health.value!r}; "
+            "retry or invalidate it before optimizer selection"
+        )
+        self.evaluation_id = evaluation_id
+        self.run_health = run_health
 
 
 class ScoreCapabilities(BaseModel):
@@ -81,6 +102,7 @@ class HarnessScoreReport(BaseModel):
     score: float = Field(default=0.0, ge=0.0, le=1.0)
     secondary_score: float = Field(default=0.0, ge=0.0, le=1.0)
     attempts: int = Field(ge=1)
+    run_health: ScoreRunHealth
     per_task: dict[str, TaskScore] = Field(default_factory=dict)
 
     @model_validator(mode="after")

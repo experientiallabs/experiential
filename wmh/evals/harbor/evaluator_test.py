@@ -702,6 +702,7 @@ def _materialize_job(
                     "runner_image": mod.PI_CONTAINER_IMAGE,
                     "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
                     "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
+                    "run_health": "valid",
                 },
             ),
             verifier_result=VerifierResult(rewards={"score": 1}),

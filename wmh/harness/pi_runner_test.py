@@ -10,9 +10,12 @@ from typing import cast
 import pytest
 from llm_waterfall import ChatRequest, ChatResponse
 
+import wmh.harness.pi_runner as mod
 from wmh.core.types import JsonObject
 from wmh.harness.live_session import ToolOutcome
 from wmh.harness.pi_runner import (
+    AmbiguousTaskEnvironmentError,
+    CandidateTaskEnvironmentError,
     PiCandidateChannelError,
     PiCandidateError,
     PiCandidateFailureReason,
@@ -20,6 +23,7 @@ from wmh.harness.pi_runner import (
     PiInfrastructureError,
     PiInfrastructureFailureKind,
     PiOutboundFrameTooLargeError,
+    PiRunHealth,
     ToolExecutionDeadline,
     ToolExecutionDeadlineExceeded,
     assemble_pi_harness,
@@ -319,6 +323,136 @@ def test_run_pi_turn_keeps_worker_failures_infrastructure_typed() -> None:
     assert "worker provider unavailable" in str(channel.sent)
 
 
+@pytest.mark.parametrize(
+    ("module", "code", "message", "parameter"),
+    [
+        (
+            "openai._exceptions",
+            "invalid_function_parameters",
+            "tools[0].function.parameters is invalid",
+            None,
+        ),
+        (
+            "openai._exceptions",
+            "invalid_request_error",
+            "candidate max output tokens were rejected",
+            "max_completion_tokens",
+        ),
+        (
+            "openai._exceptions",
+            "invalid_request_error",
+            "candidate temperature was rejected",
+            "temperature",
+        ),
+        (
+            "botocore.exceptions",
+            "ValidationException",
+            "A toolResult block must follow each toolUse block",
+            None,
+        ),
+    ],
+)
+def test_candidate_owned_provider_rejections_are_gradeable_zeroes(
+    module: str,
+    code: str,
+    message: str,
+    parameter: str | None,
+) -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+
+    class CandidateRequestError(RuntimeError):
+        status_code = 400
+
+        def __init__(self) -> None:
+            super().__init__(message)
+            self.code = code
+            self.body = {"code": code, "message": message, "param": parameter}
+            self.response = {
+                "Error": {"Code": code, "Message": message},
+                "ResponseMetadata": {"HTTPStatusCode": 400},
+            }
+
+    CandidateRequestError.__module__ = module
+
+    def rejected_worker(request: ChatRequest) -> ChatResponse:
+        _ = request
+        raise CandidateRequestError
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="worker request was rejected") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=rejected_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.INVALID_REQUEST
+    assert caught.value.run_health is PiRunHealth.VALID
+    assert message not in str(caught.value)
+    assert message not in str(channel.sent)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "code"),
+    [
+        (401, "invalid_api_key"),
+        (404, "DeploymentNotFound"),
+        (429, "rate_limit_exceeded"),
+        (500, "server_error"),
+    ],
+)
+def test_openai_operational_errors_still_invalidate_the_trial(
+    status_code: int,
+    code: str,
+) -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+
+    class OperationalError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("provider operational failure")
+            self.status_code = status_code
+            self.code = code
+            self.body = {"error": {"code": code}}
+
+    OperationalError.__module__ = "openai._exceptions"
+
+    def failing_worker(request: ChatRequest) -> ChatResponse:
+        _ = request
+        raise OperationalError
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiInfrastructureError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=failing_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER
+    assert caught.value.run_health is PiRunHealth.INFRASTRUCTURE_FAILURE
+
+
 def test_worker_failure_after_success_preserves_bounded_partial_usage_and_events() -> None:
     channel = _ScriptedChannel()
     channel._inbound = [
@@ -399,6 +533,113 @@ def test_run_pi_turn_keeps_tool_executor_failures_infrastructure_typed() -> None
     assert secret not in str(caught.value)
     assert secret not in str(channel.sent)
     assert "task environment unavailable" in str(channel.sent)
+    assert caught.value.run_health is PiRunHealth.AMBIGUOUS
+
+
+def test_candidate_task_environment_destruction_is_a_gradeable_resource_failure() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+    ]
+
+    def destructive_tool(
+        name: str,
+        args: JsonObject,
+        emit: Callable[[str, str], None],
+        deadline: ToolExecutionDeadline,
+    ) -> ToolOutcome:
+        _ = name, args, emit, deadline
+        raise CandidateTaskEnvironmentError(PiCandidateFailureReason.RESOURCE_LIMIT)
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError, match="damaged the task environment") as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=destructive_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.stage is PiCandidateFailureStage.TURN
+    assert caught.value.reason is PiCandidateFailureReason.RESOURCE_LIMIT
+    assert caught.value.run_health is PiRunHealth.CANDIDATE_DAMAGED
+
+
+def test_candidate_task_damage_precedes_event_budget_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "_MAX_PI_EVENTS", 4)
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+    ]
+
+    def destructive_tool(
+        name: str,
+        args: JsonObject,
+        emit: Callable[[str, str], None],
+        deadline: ToolExecutionDeadline,
+    ) -> ToolOutcome:
+        _ = name, args, emit, deadline
+        raise CandidateTaskEnvironmentError(PiCandidateFailureReason.RESOURCE_LIMIT)
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiCandidateError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=destructive_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.reason is PiCandidateFailureReason.RESOURCE_LIMIT
+    assert caught.value.run_health is PiRunHealth.CANDIDATE_DAMAGED
+
+
+def test_ambiguous_task_environment_loss_requires_a_retry() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+    ]
+
+    def ambiguous_tool(
+        name: str,
+        args: JsonObject,
+        emit: Callable[[str, str], None],
+        deadline: ToolExecutionDeadline,
+    ) -> ToolOutcome:
+        _ = name, args, emit, deadline
+        raise AmbiguousTaskEnvironmentError
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiInfrastructureError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=ambiguous_tool,
+            worker_fn=_unused_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.kind is PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED
+    assert caught.value.run_health is PiRunHealth.AMBIGUOUS
 
 
 def test_run_pi_turn_passes_each_tool_the_current_turn_deadline() -> None:

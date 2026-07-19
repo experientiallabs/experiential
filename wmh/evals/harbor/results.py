@@ -26,6 +26,7 @@ from wmh.evals.benchmark import (
     BenchmarkCell,
     BenchmarkError,
     BenchmarkFailureKind,
+    BenchmarkRunHealth,
     BenchmarkRunIdentity,
     BenchmarkRunResult,
     BenchmarkTrialResult,
@@ -59,6 +60,7 @@ _ENVIRONMENT_EXCEPTIONS = frozenset(
         "WmhPiRunnerError",
     }
 )
+_ENVIRONMENT_CONFIRMATION_EXCEPTIONS = frozenset({"WmhPiEnvironmentConfirmationRequiredError"})
 _PROVIDER_EXCEPTIONS = frozenset(
     {
         "ApiConnectionClosedError",
@@ -87,6 +89,9 @@ _REDACTED_ERROR_MESSAGES = {
     BenchmarkFailureKind.CANCELLED: "benchmark trial was cancelled",
     BenchmarkFailureKind.TASK_TIMEOUT: "agent execution exceeded the task time limit",
     BenchmarkFailureKind.ENVIRONMENT: "task environment infrastructure failed",
+    BenchmarkFailureKind.ENVIRONMENT_CONFIRMATION_REQUIRED: (
+        "task environment needs a fresh confirmation attempt"
+    ),
     BenchmarkFailureKind.PROVIDER: "model provider infrastructure failed",
     BenchmarkFailureKind.VERIFIER: "ground-truth verifier infrastructure failed",
     BenchmarkFailureKind.MALFORMED_RESULT: "Harbor result metadata was malformed",
@@ -102,6 +107,7 @@ _CANDIDATE_FAILURE_REASON_MAP = {
     "timeout": BenchmarkCandidateFailureReason.TIMEOUT,
     "resource_limit": BenchmarkCandidateFailureReason.RESOURCE_LIMIT,
     "runtime_error": BenchmarkCandidateFailureReason.RUNTIME_ERROR,
+    "invalid_request": BenchmarkCandidateFailureReason.INVALID_REQUEST,
 }
 _CANDIDATE_TERMINAL_REASON_MAP = {
     "completed": BenchmarkCandidateTerminalReason.COMPLETED,
@@ -120,11 +126,18 @@ _CANDIDATE_OUTCOME_METADATA_KEYS = frozenset(
 _TASK_ENVIRONMENT_DIGEST_KEY = "task_environment_digest"
 _TASK_ENVIRONMENT_ATTESTATION_KEY = "task_environment_attestation"
 _MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES = 64 * 1024
+_RUN_HEALTH_MAP = {
+    "valid": BenchmarkRunHealth.VALID,
+    "candidate_damaged": BenchmarkRunHealth.CANDIDATE_DAMAGED,
+    "infrastructure_failure": BenchmarkRunHealth.RETRY_REQUIRED,
+    "ambiguous": BenchmarkRunHealth.RETRY_REQUIRED,
+}
 
 
 @dataclass(frozen=True)
 class _TrustedRunEvidence:
     candidate_outcome: BenchmarkCandidateOutcome
+    run_health: BenchmarkRunHealth
     task_environment_digest: str | None
 
 
@@ -474,7 +487,7 @@ def _validate_run_identity(
     contexts.extend(
         step.agent_result for step in result.step_results or [] if step.agent_result is not None
     )
-    outcomes: list[BenchmarkCandidateOutcome] = []
+    outcomes: list[tuple[BenchmarkCandidateOutcome, BenchmarkRunHealth]] = []
     environment_digests: list[str] = []
     for context in contexts:
         metadata = context.metadata or {}
@@ -495,20 +508,33 @@ def _validate_run_identity(
                 expected_backend=expected.task_environment.value,
             )
         )
-        outcomes.append(_parse_candidate_outcome(metadata))
+        outcome = _parse_candidate_outcome(metadata)
+        run_health = _parse_run_health(metadata)
+        if (
+            run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+            and outcome.status is not BenchmarkCandidateStatus.FAILED
+        ):
+            raise ValueError(
+                "candidate-damaged run health requires failed candidate outcome metadata"
+            )
+        outcomes.append((outcome, run_health))
     if not outcomes:
         return _TrustedRunEvidence(
             candidate_outcome=BenchmarkCandidateOutcome(),
+            run_health=BenchmarkRunHealth.UNKNOWN,
             task_environment_digest=None,
         )
     first = outcomes[0]
     if any(outcome != first for outcome in outcomes[1:]):
-        raise ValueError("Harbor step contexts contain inconsistent candidate outcome metadata")
+        raise ValueError(
+            "Harbor step contexts contain inconsistent candidate outcome or run health metadata"
+        )
     first_environment_digest = environment_digests[0]
     if any(digest != first_environment_digest for digest in environment_digests[1:]):
         raise ValueError("Harbor step contexts contain inconsistent task environment metadata")
     return _TrustedRunEvidence(
-        candidate_outcome=first,
+        candidate_outcome=first[0],
+        run_health=first[1],
         task_environment_digest=first_environment_digest,
     )
 
@@ -542,6 +568,16 @@ def _parse_task_environment_attestation(
     if actual != digest:
         raise ValueError("Harbor task environment attestation does not match its digest")
     return digest
+
+
+def _parse_run_health(metadata: dict[str, object]) -> BenchmarkRunHealth:
+    """Normalize the trusted adapter's run-health field for evidence admission."""
+    if "run_health" not in metadata:
+        return BenchmarkRunHealth.UNKNOWN
+    raw = metadata["run_health"]
+    if not isinstance(raw, str) or raw not in _RUN_HEALTH_MAP:
+        raise ValueError("candidate outcome metadata has unknown run health")
+    return _RUN_HEALTH_MAP[raw]
 
 
 def _parse_candidate_outcome(metadata: dict[str, object]) -> BenchmarkCandidateOutcome:
@@ -635,14 +671,51 @@ def _convert_trial(
     entry: HarborTrialManifestEntry,
     run_evidence: _TrustedRunEvidence,
 ) -> BenchmarkTrialResult:
+    candidate_outcome = run_evidence.candidate_outcome
+    run_health = run_evidence.run_health
     error = _convert_exception(result.exception_info)
     has_rewards = result.verifier_result is not None and result.verifier_result.rewards is not None
-    if has_rewards and (error is None or error.kind is BenchmarkFailureKind.TASK_TIMEOUT):
+    candidate_damage_error = (
+        candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+        and run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+        and error is not None
+        and error.kind
+        in {
+            BenchmarkFailureKind.ENVIRONMENT,
+            BenchmarkFailureKind.VERIFIER,
+            BenchmarkFailureKind.UNCLASSIFIED,
+        }
+    )
+    if has_rewards and (
+        error is None or error.kind is BenchmarkFailureKind.TASK_TIMEOUT or candidate_damage_error
+    ):
         status = BenchmarkTrialStatus.SCORED
+    elif (
+        candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+        and run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+        and (
+            error is None
+            or error.kind
+            in {
+                BenchmarkFailureKind.ENVIRONMENT,
+                BenchmarkFailureKind.VERIFIER,
+                BenchmarkFailureKind.UNCLASSIFIED,
+            }
+        )
+    ):
+        status = BenchmarkTrialStatus.CANDIDATE_FAILURE
     elif error is not None:
         status = _status_for_failure(error.kind)
     else:
         status = BenchmarkTrialStatus.INCOMPLETE
+
+    if status in {
+        BenchmarkTrialStatus.CANCELLED,
+        BenchmarkTrialStatus.TASK_TIMEOUT,
+        BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+        BenchmarkTrialStatus.UNCLASSIFIED_ERROR,
+    }:
+        run_health = BenchmarkRunHealth.RETRY_REQUIRED
 
     n_input, n_cache, n_output, cost = result.compute_token_cost_totals()
     usage_may_be_incomplete = error is not None and error.kind in {
@@ -665,7 +738,8 @@ def _convert_trial(
         status=status,
         rewards=rewards,
         error=error,
-        candidate_outcome=run_evidence.candidate_outcome,
+        candidate_outcome=candidate_outcome,
+        run_health=run_health,
         usage=BenchmarkUsage(
             input_tokens=n_input,
             input_tokens_status=_usage_status(
@@ -721,6 +795,8 @@ def _failure_kind(exception_type: str) -> BenchmarkFailureKind:
         return BenchmarkFailureKind.CANCELLED
     if exception_type in _ENVIRONMENT_EXCEPTIONS:
         return BenchmarkFailureKind.ENVIRONMENT
+    if exception_type in _ENVIRONMENT_CONFIRMATION_EXCEPTIONS:
+        return BenchmarkFailureKind.ENVIRONMENT_CONFIRMATION_REQUIRED
     if exception_type in _PROVIDER_EXCEPTIONS:
         return BenchmarkFailureKind.PROVIDER
     if exception_type in _VERIFIER_EXCEPTIONS:
@@ -749,6 +825,7 @@ def _malformed_trial(
         source=entry.task_source,
         task_instruction=entry.task_instruction,
         status=BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
+        run_health=BenchmarkRunHealth.RETRY_REQUIRED,
         error=BenchmarkError(
             kind=BenchmarkFailureKind.MALFORMED_RESULT,
             type=error_type,

@@ -14,6 +14,7 @@ from wmh.evals.benchmark import (
     BenchmarkCell,
     BenchmarkError,
     BenchmarkFailureKind,
+    BenchmarkRunHealth,
     BenchmarkRunIdentity,
     BenchmarkRunResult,
     BenchmarkTaskEnvironment,
@@ -69,6 +70,7 @@ def _trial(
     error: BenchmarkError | None = None,
     candidate_outcome: BenchmarkCandidateOutcome | None = None,
     usage: BenchmarkUsage | None = None,
+    run_health: BenchmarkRunHealth = BenchmarkRunHealth.VALID,
 ) -> BenchmarkTrialResult:
     return BenchmarkTrialResult(
         cell=cell,
@@ -79,6 +81,7 @@ def _trial(
         error=error,
         candidate_outcome=candidate_outcome or BenchmarkCandidateOutcome(),
         usage=usage or BenchmarkUsage(),
+        run_health=run_health,
     )
 
 
@@ -361,6 +364,108 @@ def test_mean_reward_requires_every_planned_cell_and_requested_key() -> None:
     )
     with pytest.raises(ValueError, match="planned cells are not scored"):
         invalid.mean_reward("score")
+
+
+def test_candidate_damaged_environment_is_an_explicit_valid_zero() -> None:
+    cell = _cell("candidate-killed-container")
+    trial = _trial(
+        cell,
+        BenchmarkTrialStatus.CANDIDATE_FAILURE,
+        error=BenchmarkError(
+            kind=BenchmarkFailureKind.ENVIRONMENT,
+            type="WmhPiEnvironmentError",
+            message="candidate task environment was destroyed",
+        ),
+        candidate_outcome=BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.FAILED,
+            stage=BenchmarkCandidateStage.EXECUTION,
+            failure_reason=BenchmarkCandidateFailureReason.RESOURCE_LIMIT,
+        ),
+        run_health=BenchmarkRunHealth.CANDIDATE_DAMAGED,
+    )
+    result = BenchmarkRunResult(
+        job_name="candidate-zero",
+        identity=_IDENTITY,
+        expected_cells=[cell],
+        trials=[trial],
+    )
+
+    assert result.n_scored == 0
+    assert result.n_scoreable == 1
+    assert result.n_candidate_failure_zeroes == 1
+    assert result.n_infrastructure_errors == 0
+    assert result.mean_reward("reward") == 0.0
+
+
+def test_candidate_damage_preserves_a_later_verifier_reward_as_diagnostic_data() -> None:
+    trial = _trial(
+        _cell("candidate-damaged-but-verified"),
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 1},
+        error=BenchmarkError(
+            kind=BenchmarkFailureKind.ENVIRONMENT,
+            type="WmhPiEnvironmentError",
+        ),
+        candidate_outcome=BenchmarkCandidateOutcome(
+            status=BenchmarkCandidateStatus.FAILED,
+            stage=BenchmarkCandidateStage.EXECUTION,
+            failure_reason=BenchmarkCandidateFailureReason.RESOURCE_LIMIT,
+        ),
+        run_health=BenchmarkRunHealth.CANDIDATE_DAMAGED,
+    )
+
+    assert trial.rewards == {"reward": 1}
+    assert trial.error is not None
+    assert trial.error.kind is BenchmarkFailureKind.ENVIRONMENT
+    result = BenchmarkRunResult(
+        job_name="candidate-diagnostic",
+        identity=_IDENTITY,
+        expected_cells=[trial.cell],
+        trials=[trial],
+    )
+    assert result.mean_reward("reward") == 0.0
+
+
+def test_candidate_failure_zero_requires_failed_candidate_and_damaged_health() -> None:
+    cell = _cell("candidate-killed-container")
+
+    with pytest.raises(ValidationError, match="candidate_failure trial requires"):
+        _trial(
+            cell,
+            BenchmarkTrialStatus.CANDIDATE_FAILURE,
+            candidate_outcome=BenchmarkCandidateOutcome(
+                status=BenchmarkCandidateStatus.FAILED,
+                stage=BenchmarkCandidateStage.EXECUTION,
+                failure_reason=BenchmarkCandidateFailureReason.RESOURCE_LIMIT,
+            ),
+            run_health=BenchmarkRunHealth.VALID,
+        )
+
+
+@pytest.mark.parametrize(
+    "run_health",
+    [BenchmarkRunHealth.RETRY_REQUIRED, BenchmarkRunHealth.UNKNOWN],
+)
+def test_unhealthy_or_unknown_evidence_cannot_enter_reward_aggregation(
+    run_health: BenchmarkRunHealth,
+) -> None:
+    cell = _cell("ambiguous")
+    result = BenchmarkRunResult(
+        job_name="ambiguous",
+        identity=_IDENTITY,
+        expected_cells=[cell],
+        trials=[
+            _trial(
+                cell,
+                BenchmarkTrialStatus.SCORED,
+                rewards={"reward": 1},
+                run_health=run_health,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="run health is not valid"):
+        result.mean_reward("reward")
 
 
 def test_duplicate_cells_are_rejected() -> None:

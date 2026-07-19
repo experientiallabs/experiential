@@ -41,6 +41,8 @@ from wmh.harness.scoring import (
     HarnessScoreReport,
     ScoreCapabilities,
     ScoreRequest,
+    ScoreRunHealth,
+    ScoreRunHealthError,
     TaskScore,
 )
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
@@ -207,6 +209,7 @@ class _NeutralScorer:
             score=score,
             secondary_score=score,
             attempts=self.default_attempts,
+            run_health=ScoreRunHealth.VALID,
             per_task={
                 "ground-truth-task": TaskScore(
                     task_id="ground-truth-task",
@@ -266,6 +269,26 @@ def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:
     assert scorer.before_proposal_calls == 1
     assert "verifier reward and execution trace" in proposer.evidence[0]
     assert result.suite == ["ground-truth-task"]
+
+
+def test_search_harness_never_gates_on_retryable_run_health() -> None:
+    class RetryableScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            return report.model_copy(update={"run_health": ScoreRunHealth.RETRY_REQUIRED})
+
+    with pytest.raises(ScoreRunHealthError, match="retry or invalidate") as caught:
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            RetryableScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+    assert caught.value.run_health is ScoreRunHealth.RETRY_REQUIRED
 
 
 def test_search_harness_rejects_unsupported_paid_stages_before_scoring() -> None:
@@ -972,6 +995,7 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
         score=0.0,
         secondary_score=0.45,
         attempts=1,
+        run_health=ScoreRunHealth.VALID,
         per_task={
             "target": TaskScore(task_id="target", score=0.0, secondary_score=0.0, passed=False),
             "other": TaskScore(task_id="other", score=0.0, secondary_score=0.9, passed=False),
@@ -982,6 +1006,7 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
         score=0.0,
         secondary_score=0.25,
         attempts=1,
+        run_health=ScoreRunHealth.VALID,
         per_task={
             "target": TaskScore(task_id="target", score=0.0, secondary_score=0.5, passed=False),
             "other": TaskScore(task_id="other", score=0.0, secondary_score=0.0, passed=False),
@@ -1011,6 +1036,7 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
         score=0.0,
         secondary_score=0.1,
         attempts=1,
+        run_health=ScoreRunHealth.VALID,
         per_task={
             "target": TaskScore(task_id="target", score=0.0, secondary_score=0.0, passed=False),
             "other": TaskScore(task_id="other", score=0.0, secondary_score=0.2, passed=False),
@@ -1021,6 +1047,7 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
         score=0.0,
         secondary_score=0.35,
         attempts=1,
+        run_health=ScoreRunHealth.VALID,
         per_task={
             "target": TaskScore(task_id="target", score=0.0, secondary_score=0.5, passed=False),
             "other": TaskScore(task_id="other", score=0.0, secondary_score=0.2, passed=False),

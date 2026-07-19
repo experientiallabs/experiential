@@ -40,6 +40,7 @@ class BenchmarkTrialStatus(StrEnum):
     """Whether one planned benchmark cell is usable, pending, or operationally failed."""
 
     SCORED = "scored"
+    CANDIDATE_FAILURE = "candidate_failure"
     INCOMPLETE = "incomplete"
     CANCELLED = "cancelled"
     TASK_TIMEOUT = "task_timeout"
@@ -53,6 +54,7 @@ class BenchmarkFailureKind(StrEnum):
     CANCELLED = "cancelled"
     TASK_TIMEOUT = "task_timeout"
     ENVIRONMENT = "environment"
+    ENVIRONMENT_CONFIRMATION_REQUIRED = "environment_confirmation_required"
     PROVIDER = "provider"
     VERIFIER = "verifier"
     MALFORMED_RESULT = "malformed_result"
@@ -80,6 +82,16 @@ class BenchmarkCandidateFailureReason(StrEnum):
     TIMEOUT = "timeout"
     RESOURCE_LIMIT = "resource_limit"
     RUNTIME_ERROR = "runtime_error"
+    INVALID_REQUEST = "invalid_request"
+
+
+class BenchmarkRunHealth(StrEnum):
+    """Whether one trial is valid evidence or requires operational handling."""
+
+    VALID = "valid"
+    CANDIDATE_DAMAGED = "candidate_damaged"
+    RETRY_REQUIRED = "retry_required"
+    UNKNOWN = "unknown"
 
 
 class BenchmarkCandidateTerminalReason(StrEnum):
@@ -276,6 +288,7 @@ class BenchmarkTrialResult(BaseModel):
     error: BenchmarkError | None = None
     usage: BenchmarkUsage = Field(default_factory=BenchmarkUsage)
     candidate_outcome: BenchmarkCandidateOutcome = Field(default_factory=BenchmarkCandidateOutcome)
+    run_health: BenchmarkRunHealth = BenchmarkRunHealth.UNKNOWN
 
     @field_validator("rewards", mode="before")
     @classmethod
@@ -291,13 +304,56 @@ class BenchmarkTrialResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_evidence(self) -> Self:
+        if self.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED and (
+            self.candidate_outcome.status is not BenchmarkCandidateStatus.FAILED
+        ):
+            raise ValueError("candidate-damaged run health requires a failed candidate outcome")
         if self.status is BenchmarkTrialStatus.SCORED:
             if self.rewards is None:
                 raise ValueError(
                     "scored trial must carry rewards, including an empty reward mapping"
                 )
-            if self.error is not None and self.error.kind is not BenchmarkFailureKind.TASK_TIMEOUT:
-                raise ValueError("scored trial only permits task-timeout error evidence")
+            allowed_candidate_damage = (
+                self.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+                and self.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+                and self.error is not None
+                and self.error.kind
+                in {
+                    BenchmarkFailureKind.ENVIRONMENT,
+                    BenchmarkFailureKind.VERIFIER,
+                    BenchmarkFailureKind.UNCLASSIFIED,
+                }
+            )
+            if (
+                self.error is not None
+                and self.error.kind is not BenchmarkFailureKind.TASK_TIMEOUT
+                and not allowed_candidate_damage
+            ):
+                raise ValueError(
+                    "scored trial only permits task-timeout or typed candidate-damage "
+                    "error evidence"
+                )
+            return self
+        if self.status is BenchmarkTrialStatus.CANDIDATE_FAILURE:
+            if self.rewards is not None:
+                raise ValueError("candidate_failure trial cannot carry verifier rewards")
+            if (
+                self.candidate_outcome.status is not BenchmarkCandidateStatus.FAILED
+                or self.run_health is not BenchmarkRunHealth.CANDIDATE_DAMAGED
+            ):
+                raise ValueError(
+                    "candidate_failure trial requires a failed candidate outcome and "
+                    "candidate-damaged run health"
+                )
+            if self.error is not None and self.error.kind not in {
+                BenchmarkFailureKind.ENVIRONMENT,
+                BenchmarkFailureKind.VERIFIER,
+                BenchmarkFailureKind.UNCLASSIFIED,
+            }:
+                raise ValueError(
+                    "candidate_failure trial only permits environment, verifier, or "
+                    "unclassified terminal error evidence"
+                )
             return self
         if self.rewards is not None:
             raise ValueError("non-scored trial cannot carry verifier rewards")
@@ -312,6 +368,7 @@ class BenchmarkTrialResult(BaseModel):
             BenchmarkTrialStatus.CANCELLED: {BenchmarkFailureKind.CANCELLED},
             BenchmarkTrialStatus.INFRASTRUCTURE_ERROR: {
                 BenchmarkFailureKind.ENVIRONMENT,
+                BenchmarkFailureKind.ENVIRONMENT_CONFIRMATION_REQUIRED,
                 BenchmarkFailureKind.PROVIDER,
                 BenchmarkFailureKind.VERIFIER,
                 BenchmarkFailureKind.MALFORMED_RESULT,
@@ -396,6 +453,19 @@ class BenchmarkRunResult(BaseModel):
         return sum(trial.status is BenchmarkTrialStatus.SCORED for trial in self.trials)
 
     @property
+    def n_scoreable(self) -> int:
+        """Return trials usable in reward means, including typed candidate-failure zeroes."""
+        return sum(
+            trial.status in {BenchmarkTrialStatus.SCORED, BenchmarkTrialStatus.CANDIDATE_FAILURE}
+            for trial in self.trials
+        )
+
+    @property
+    def n_candidate_failure_zeroes(self) -> int:
+        """Return candidate-damaged trials that are valid zeroes without verifier rewards."""
+        return sum(trial.status is BenchmarkTrialStatus.CANDIDATE_FAILURE for trial in self.trials)
+
+    @property
     def n_infrastructure_errors(self) -> int:
         """Return the number of terminal evaluator or environment failures."""
         return sum(
@@ -472,15 +542,27 @@ class BenchmarkRunResult(BaseModel):
         return self.n_incomplete == 0
 
     def mean_reward(self, key: str) -> float:
-        """Return one verifier-reward mean only when the entire planned matrix is scoreable."""
+        """Return the primary reward mean, assigning failed candidates and timeouts zero."""
         if not key:
             raise ValueError("reward key must be non-empty")
         if not self.trials:
             raise ValueError("cannot aggregate an empty benchmark matrix")
+        unhealthy = [
+            trial.cell.task_key
+            for trial in self.trials
+            if trial.run_health
+            not in {BenchmarkRunHealth.VALID, BenchmarkRunHealth.CANDIDATE_DAMAGED}
+        ]
+        if unhealthy:
+            raise ValueError(
+                f"cannot aggregate reward {key!r}; {len(unhealthy)} planned cells' "
+                "run health is not valid"
+            )
         invalid = [
             trial.cell.task_key
             for trial in self.trials
-            if trial.status is not BenchmarkTrialStatus.SCORED
+            if trial.status
+            not in {BenchmarkTrialStatus.SCORED, BenchmarkTrialStatus.CANDIDATE_FAILURE}
         ]
         if invalid:
             raise ValueError(
@@ -489,17 +571,24 @@ class BenchmarkRunResult(BaseModel):
         missing = [
             trial.cell.task_key
             for trial in self.trials
-            if trial.rewards is None or key not in trial.rewards
+            if trial.status is BenchmarkTrialStatus.SCORED
+            and (trial.rewards is None or key not in trial.rewards)
         ]
         if missing:
             raise ValueError(
                 f"cannot aggregate reward {key!r}; {len(missing)} scored cells omit that key"
             )
-        values = [
-            float(trial.rewards[key])
-            for trial in self.trials
-            if trial.rewards is not None and key in trial.rewards
-        ]
+        values: list[float] = []
+        for trial in self.trials:
+            if (
+                trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+                or trial.error is not None
+                and trial.error.kind is BenchmarkFailureKind.TASK_TIMEOUT
+            ):
+                values.append(0.0)
+                continue
+            assert trial.rewards is not None
+            values.append(float(trial.rewards[key]))
         return fmean(values)
 
 

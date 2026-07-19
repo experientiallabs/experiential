@@ -12,6 +12,7 @@ from wmh.harness.scoring import (
     MAX_TASK_EVIDENCE_CHARS,
     HarnessScoreReport,
     ScoreRequest,
+    ScoreRunHealth,
     TaskScore,
     cluster_score_failures,
     render_score_evidence,
@@ -47,6 +48,7 @@ def _report(*tasks: TaskScore) -> HarnessScoreReport:
         score=sum(task.score for task in tasks) / len(tasks),
         secondary_score=sum(task.secondary_score for task in tasks) / len(tasks),
         attempts=2,
+        run_health=ScoreRunHealth.VALID,
         per_task=per_task,
     )
 
@@ -58,6 +60,7 @@ def test_score_report_rejects_mismatched_task_key() -> None:
             score=0.0,
             secondary_score=0.0,
             attempts=1,
+            run_health=ScoreRunHealth.VALID,
             per_task={"wrong": _task("task", score=0.0)},
         )
 
@@ -71,17 +74,32 @@ def test_score_request_rejects_empty_or_duplicate_subset(task_ids: tuple[str, ..
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
 def test_score_report_rejects_non_normalized_scores(value: float) -> None:
     with pytest.raises(ValidationError):
-        HarnessScoreReport(evaluation_id="eval-1", score=value, secondary_score=0.0, attempts=1)
+        HarnessScoreReport(
+            evaluation_id="eval-1",
+            score=value,
+            secondary_score=0.0,
+            attempts=1,
+            run_health=ScoreRunHealth.VALID,
+        )
 
 
 def test_score_report_requires_identity_and_bounds_proposer_evidence() -> None:
     with pytest.raises(ValidationError, match="evaluation_id"):
-        HarnessScoreReport(evaluation_id="", attempts=1)
+        HarnessScoreReport(
+            evaluation_id="",
+            attempts=1,
+            run_health=ScoreRunHealth.VALID,
+        )
     with pytest.raises(ValidationError, match="evidence"):
         _report(_task("task", score=0.0, evidence="x" * 64_001))
     report = _report(_task("task", score=0.0))
     with pytest.raises(ValidationError, match="frozen"):
         report.evaluation_id = "changed"
+
+
+def test_score_report_requires_explicit_run_health() -> None:
+    with pytest.raises(ValidationError, match="run_health"):
+        HarnessScoreReport.model_validate({"evaluation_id": "eval-1", "attempts": 1})
 
 
 def test_cluster_score_failures_uses_shared_mechanisms_and_singletons() -> None:
@@ -157,6 +175,7 @@ def test_render_score_evidence_is_invariant_to_task_and_label_insertion_order() 
         score=forward.score,
         secondary_score=forward.secondary_score,
         attempts=forward.attempts,
+        run_health=ScoreRunHealth.VALID,
         per_task={"second": second, "first": first},
     )
 

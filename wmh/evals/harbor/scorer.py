@@ -23,6 +23,7 @@ from wmh.evals.benchmark import (
     BenchmarkCandidateStatus,
     BenchmarkCell,
     BenchmarkFailureKind,
+    BenchmarkRunHealth,
     BenchmarkRunResult,
     BenchmarkTaskEnvironment,
     BenchmarkTrialResult,
@@ -42,6 +43,7 @@ from wmh.harness.scoring import (
     HarnessScoreReport,
     ScoreCapabilities,
     ScoreRequest,
+    ScoreRunHealth,
     TaskScore,
 )
 from wmh.harness.tools import READ_SKILL
@@ -88,9 +90,10 @@ class _EvaluationCellIdentity(BaseModel):
     task_environment_digest: str
     status: BenchmarkTrialStatus
     rewards_digest: str
-    verifier_reward: float = Field(ge=0.0, le=1.0)
+    verifier_reward: float | None = Field(ge=0.0, le=1.0)
     score: float = Field(ge=0.0, le=1.0)
     candidate_outcome: BenchmarkCandidateOutcome
+    run_health: BenchmarkRunHealth
     error_kind: BenchmarkFailureKind | None
     trace_digest: str
 
@@ -104,7 +107,7 @@ class _TraceEvidence:
 @dataclass(frozen=True)
 class _ScoredTrial:
     trial: BenchmarkTrialResult
-    verifier_reward: float
+    verifier_reward: float | None
     score: float
     trace: _TraceEvidence
 
@@ -368,6 +371,7 @@ class HarborHarnessScorer:
                         verifier_reward=item.verifier_reward,
                         score=item.score,
                         candidate_outcome=trial.candidate_outcome,
+                        run_health=trial.run_health,
                         error_kind=trial.error.kind if trial.error is not None else None,
                         trace_digest=item.trace.digest,
                     )
@@ -391,6 +395,7 @@ class HarborHarnessScorer:
             score=aggregate,
             secondary_score=aggregate,
             attempts=self.default_attempts,
+            run_health=ScoreRunHealth.VALID,
             per_task=per_task,
         )
 
@@ -607,18 +612,65 @@ def _validate_and_order_matrix(
         )
         scored: list[_ScoredTrial] = []
         for trial in trials:
-            if trial.status is not BenchmarkTrialStatus.SCORED:
+            if trial.run_health not in {
+                BenchmarkRunHealth.VALID,
+                BenchmarkRunHealth.CANDIDATE_DAMAGED,
+            }:
+                raise ValueError(
+                    f"Harbor task {task_id!r} attempt {trial.cell.attempt} has "
+                    f"run health {trial.run_health.value!r}; retry or invalidate the cell"
+                )
+            if trial.status not in {
+                BenchmarkTrialStatus.SCORED,
+                BenchmarkTrialStatus.CANDIDATE_FAILURE,
+            }:
                 detail = trial.error.kind.value if trial.error is not None else trial.status.value
                 raise ValueError(
                     f"Harbor task {task_id!r} attempt {trial.cell.attempt} is not scored: {detail}"
                 )
+            if trial.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED and (
+                trial.candidate_outcome.status is not BenchmarkCandidateStatus.FAILED
+            ):
+                raise ValueError(
+                    f"Harbor task {task_id!r} attempt {trial.cell.attempt} has "
+                    "candidate-damaged health without a failed candidate outcome"
+                )
             if (
-                trial.error is not None
+                trial.status is BenchmarkTrialStatus.SCORED
+                and trial.error is not None
                 and trial.error.kind is not BenchmarkFailureKind.TASK_TIMEOUT
+                and not (
+                    trial.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+                    and trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+                    and trial.error.kind
+                    in {
+                        BenchmarkFailureKind.ENVIRONMENT,
+                        BenchmarkFailureKind.VERIFIER,
+                        BenchmarkFailureKind.UNCLASSIFIED,
+                    }
+                )
             ):
                 raise ValueError(
                     f"Harbor task {task_id!r} attempt {trial.cell.attempt} carries "
                     f"infrastructure error {trial.error.kind.value!r} despite scored status"
+                )
+            if trial.status is BenchmarkTrialStatus.CANDIDATE_FAILURE and (
+                trial.run_health is not BenchmarkRunHealth.CANDIDATE_DAMAGED
+                or trial.candidate_outcome.status is not BenchmarkCandidateStatus.FAILED
+                or trial.rewards is not None
+                or (
+                    trial.error is not None
+                    and trial.error.kind
+                    not in {
+                        BenchmarkFailureKind.ENVIRONMENT,
+                        BenchmarkFailureKind.VERIFIER,
+                        BenchmarkFailureKind.UNCLASSIFIED,
+                    }
+                )
+            ):
+                raise ValueError(
+                    f"Harbor task {task_id!r} attempt {trial.cell.attempt} has invalid "
+                    "candidate-failure evidence"
                 )
             if trial.candidate_outcome.status is BenchmarkCandidateStatus.UNKNOWN and not (
                 trial.error is not None and trial.error.kind is BenchmarkFailureKind.TASK_TIMEOUT
@@ -627,23 +679,31 @@ def _validate_and_order_matrix(
                     f"Harbor task {task_id!r} attempt {trial.cell.attempt} lacks trusted "
                     "candidate outcome metadata"
                 )
-            if trial.rewards is None or reward_key not in trial.rewards:
-                raise ValueError(
-                    f"Harbor task {task_id!r} attempt {trial.cell.attempt} omits binary reward "
-                    f"{reward_key!r}"
-                )
-            raw_reward = trial.rewards[reward_key]
-            if isinstance(raw_reward, bool) or raw_reward not in (0, 0.0, 1, 1.0):
-                raise ValueError(
-                    f"Harbor task {task_id!r} attempt {trial.cell.attempt} reward "
-                    f"{reward_key!r} must be binary, got {raw_reward!r}"
-                )
+            verifier_reward: float | None
+            score: float
+            if trial.status is BenchmarkTrialStatus.CANDIDATE_FAILURE:
+                verifier_reward = None
+                score = 0.0
+            else:
+                if trial.rewards is None or reward_key not in trial.rewards:
+                    raise ValueError(
+                        f"Harbor task {task_id!r} attempt {trial.cell.attempt} omits binary reward "
+                        f"{reward_key!r}"
+                    )
+                raw_reward = trial.rewards[reward_key]
+                if isinstance(raw_reward, bool) or raw_reward not in (0, 0.0, 1, 1.0):
+                    raise ValueError(
+                        f"Harbor task {task_id!r} attempt {trial.cell.attempt} reward "
+                        f"{reward_key!r} must be binary, got {raw_reward!r}"
+                    )
+                verifier_reward = float(raw_reward)
+                score = _analysis_score(trial, verifier_reward=verifier_reward)
             locator = locators[(trial.cell.task_key, trial.cell.attempt)]
             scored.append(
                 _ScoredTrial(
                     trial=trial,
-                    verifier_reward=float(raw_reward),
-                    score=_analysis_score(trial, verifier_reward=float(raw_reward)),
+                    verifier_reward=verifier_reward,
+                    score=score,
                     trace=_read_trace(
                         loaded,
                         locator,
@@ -758,6 +818,7 @@ def _failure_mechanisms(trials: list[_ScoredTrial]) -> tuple[str, ...]:
                 BenchmarkCandidateFailureReason.TIMEOUT: "candidate timeout",
                 BenchmarkCandidateFailureReason.RESOURCE_LIMIT: "candidate resource limit",
                 BenchmarkCandidateFailureReason.RUNTIME_ERROR: "candidate runtime error",
+                BenchmarkCandidateFailureReason.INVALID_REQUEST: "candidate invalid request",
                 None: "candidate failure",
             }
             mechanisms.add(labels[reason])
@@ -784,7 +845,11 @@ def _render_task_evidence(trials: list[_ScoredTrial]) -> str:
         details = [
             f"## Attempt {trial.cell.attempt}",
             f"score={item.score:.1f}",
-            f"verifier_reward={item.verifier_reward:.1f}",
+            (
+                "verifier_reward=unavailable"
+                if item.verifier_reward is None
+                else f"verifier_reward={item.verifier_reward:.1f}"
+            ),
             f"candidate_status={outcome.status.value}",
         ]
         if outcome.failure_reason is not None:
@@ -879,17 +944,18 @@ def _required_task_environment_digest(trial: BenchmarkTrialResult) -> str:
 
 
 def _rewards_digest(rewards: Rewards | None) -> str:
-    if rewards is None:
-        raise ValueError("scored Harbor trial is missing its reward mapping")
-    for key, value in rewards.items():
-        if (
-            not isinstance(key, str)
-            or isinstance(value, bool)
-            or not isinstance(value, (int, float))
-        ):
-            raise ValueError("Harbor reward mappings must contain string keys and numeric values")
-        if not math.isfinite(value):
-            raise ValueError("Harbor reward mappings must contain only finite values")
+    if rewards is not None:
+        for key, value in rewards.items():
+            if (
+                not isinstance(key, str)
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+            ):
+                raise ValueError(
+                    "Harbor reward mappings must contain string keys and numeric values"
+                )
+            if not math.isfinite(value):
+                raise ValueError("Harbor reward mappings must contain only finite values")
     canonical = json.dumps(
         rewards,
         sort_keys=True,

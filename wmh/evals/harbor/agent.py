@@ -35,9 +35,11 @@ from wmh.harness.pi_local import (
     validate_pi_container_image,
 )
 from wmh.harness.pi_runner import (
+    AmbiguousTaskEnvironmentError,
     PiCandidateError,
     PiInfrastructureError,
     PiInfrastructureFailureKind,
+    PiRunHealth,
     PiTurnResult,
     ToolExecutionDeadline,
     ToolExecutionDeadlineExceeded,
@@ -56,12 +58,16 @@ _RUNNER_CLEANUP_TIMEOUT_S = 30.0
 _ENVIRONMENT_ATTESTATION_TIMEOUT_S = 30
 _MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES = 64 * 1024
 _MAX_ENVIRONMENT_CONTAINERS = 64
+_TASK_DISK_HEALTH_TIMEOUT_S = 10
+_MIN_TASK_FREE_DISK_KIB = 128 * 1024
 _TRACE_FILE = "wmh-events.jsonl"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
 WMH_PI_AGENT_VERSION: Final = "0.2.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
-_TOOL_EXEC_HEAD_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
+_TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
+_TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
+_TOOL_EXEC_TAIL_BYTES = _TOOL_EXEC_RETAINED_BYTES - _TOOL_EXEC_HEAD_BYTES
 _BOUNDED_EXEC_SCRIPT = f"""\
 set -o pipefail
 encoded_command=$WMH_TOOL_COMMAND_B64
@@ -69,12 +75,13 @@ command_deadline=$WMH_TOOL_DEADLINE_S
 command_kill_after=$WMH_TOOL_KILL_AFTER_S
 unset WMH_TOOL_COMMAND_B64 WMH_TOOL_DEADLINE_S WMH_TOOL_KILL_AFTER_S BASH_ENV ENV
 cap_stream() {{
-  local prefix remainder
+  local prefix suffix
   prefix=$(head -c {_TOOL_EXEC_HEAD_BYTES})
-  remainder=$(wc -c)
+  suffix=$(tail -c {_TOOL_EXEC_TAIL_BYTES})
   printf '%s' "$prefix"
-  if [ "$remainder" -gt 0 ]; then
+  if [ -n "$suffix" ]; then
     printf '%s' {shlex.quote(_TRUNCATION_MARKER)}
+    printf '%s' "$suffix"
   fi
 }}
 (
@@ -87,6 +94,20 @@ status=${{PIPESTATUS[0]}}
 exit "$status"
 """
 _BOUNDED_EXEC_COMMAND = f"/bin/bash --noprofile --norc -p -c {shlex.quote(_BOUNDED_EXEC_SCRIPT)}"
+_TASK_DISK_HEALTH_SCRIPT = """\
+set -o pipefail
+unset BASH_ENV ENV
+probe=.wmh-evaluator-disk-health-4f8c31f2
+if [ -e "$probe" ]; then
+  exit 70
+fi
+mkdir "$probe" || exit 71
+rmdir "$probe" || exit 72
+LC_ALL=C df -Pk .
+"""
+_TASK_DISK_HEALTH_COMMAND = (
+    f"/bin/bash --noprofile --norc -p -c {shlex.quote(_TASK_DISK_HEALTH_SCRIPT)}"
+)
 
 
 class WmhPiProviderError(RuntimeError):
@@ -95,6 +116,10 @@ class WmhPiProviderError(RuntimeError):
 
 class WmhPiEnvironmentError(RuntimeError):
     """Harbor's task environment failed while executing a pi tool request."""
+
+
+class WmhPiEnvironmentConfirmationRequiredError(RuntimeError):
+    """Harbor lost the task environment without enough evidence to assign ownership."""
 
 
 class WmhPiRunnerError(RuntimeError):
@@ -156,6 +181,7 @@ class HarborToolExecutor:
     ) -> None:
         self._event_loop = event_loop
         self._environment = environment
+        self._disk_health_initialized = False
 
     def __call__(
         self,
@@ -215,6 +241,9 @@ class HarborToolExecutor:
         deadline: ToolExecutionDeadline,
         env: dict[str, str] | None = None,
     ) -> ExecResult:
+        if not self._disk_health_initialized:
+            self._check_task_disk_health(deadline=deadline, after_candidate=False)
+            self._disk_health_initialized = True
         remaining_s = deadline.remaining_s()
         environment_timeout_s = math.floor(remaining_s)
         if environment_timeout_s < 1:
@@ -238,12 +267,59 @@ class HarborToolExecutor:
         bounded_env["WMH_TOOL_COMMAND_B64"] = base64.b64encode(command.encode()).decode()
         bounded_env["WMH_TOOL_DEADLINE_S"] = f"{candidate_timeout_s:.6f}"
         bounded_env["WMH_TOOL_KILL_AFTER_S"] = f"{kill_after_s:.6f}"
+        result = self._environment_exec(
+            _BOUNDED_EXEC_COMMAND,
+            deadline=deadline,
+            timeout_s=environment_timeout_s,
+            env=bounded_env,
+        )
+        if _task_environment_resource_loss_requires_confirmation(result):
+            raise AmbiguousTaskEnvironmentError
+        self._check_task_disk_health(deadline=deadline, after_candidate=True)
+        return result
+
+    def _check_task_disk_health(
+        self,
+        *,
+        deadline: ToolExecutionDeadline,
+        after_candidate: bool,
+    ) -> None:
+        """Require fixed free space before execution and attribute a post-command loss."""
+        remaining_s = math.floor(deadline.remaining_s())
+        if remaining_s < 1:
+            raise ToolExecutionDeadlineExceeded
+        result = self._environment_exec(
+            _TASK_DISK_HEALTH_COMMAND,
+            deadline=deadline,
+            timeout_s=min(_TASK_DISK_HEALTH_TIMEOUT_S, remaining_s),
+            env={
+                "BASH_ENV": "/dev/null",
+                "ENV": "/dev/null",
+                "BASHOPTS": "",
+                "SHELLOPTS": "",
+            },
+        )
+        available_kib = _task_free_disk_kib(result)
+        if available_kib is not None and available_kib >= _MIN_TASK_FREE_DISK_KIB:
+            return
+        if after_candidate:
+            # Local Docker tasks share host memory and backing storage with parallel cells.
+            # A post-command loss therefore cannot prove candidate ownership without one fresh,
+            # same-cell confirmation attempt in an isolated environment.
+            raise AmbiguousTaskEnvironmentError
+        raise AmbiguousTaskEnvironmentError
+
+    def _environment_exec(
+        self,
+        command: str,
+        *,
+        deadline: ToolExecutionDeadline,
+        timeout_s: int,
+        env: dict[str, str],
+    ) -> ExecResult:
+        """Call Harbor's backend within one deadline and sanitize backend ambiguity."""
         future = asyncio.run_coroutine_threadsafe(
-            self._environment.exec(
-                _BOUNDED_EXEC_COMMAND,
-                env=bounded_env,
-                timeout_sec=environment_timeout_s,
-            ),
+            self._environment.exec(command, env=env, timeout_sec=timeout_s),
             self._event_loop,
         )
         try:
@@ -254,7 +330,13 @@ class HarborToolExecutor:
         except TimeoutError:
             if deadline.remaining_s() <= 0:
                 raise ToolExecutionDeadlineExceeded from None
+            raise AmbiguousTaskEnvironmentError from None
+        except ToolExecutionDeadlineExceeded:
             raise
+        except Exception:  # noqa: BLE001 - backend exceptions lack one portable base class
+            # An API exception cannot prove whether the backend or candidate destroyed the task
+            # environment. Keep that boundary retryable instead of silently assigning ownership.
+            raise AmbiguousTaskEnvironmentError from None
         finally:
             if not future.done():
                 future.cancel()
@@ -401,9 +483,26 @@ class WmhPiAgent(BaseAgent):
                 "runner_image": self._runner_image,
                 "task_environment_digest": attestation.digest,
                 "task_environment_attestation": attestation.evidence,
+                "run_health": PiRunHealth.VALID.value,
             },
         )
         _populate_context(context, TokenUsage(), identity_metadata)
+        try:
+            self._prepare_trace()
+        except Exception:  # noqa: BLE001 - never expose host filesystem details
+            _populate_context(
+                context,
+                TokenUsage(),
+                cast(
+                    "JsonObject",
+                    {
+                        **identity_metadata,
+                        "infrastructure_failure": True,
+                        "run_health": PiRunHealth.INFRASTRUCTURE_FAILURE.value,
+                    },
+                ),
+            )
+            raise WmhPiRunnerError("WMH pi trace persistence failed") from None
         event_loop = asyncio.get_running_loop()
         executor = HarborToolExecutor(event_loop, environment)
         runner_factory = LocalContainerRunnerFactory(image=self._runner_image)
@@ -426,13 +525,16 @@ class WmhPiAgent(BaseAgent):
             raise
         except Exception as exc:  # noqa: BLE001 - sanitize every infrastructure failure uniformly
             trace_error: WmhPiRunnerError | None = None
+            run_health = PiRunHealth.INFRASTRUCTURE_FAILURE
             if isinstance(exc, PiInfrastructureError):
+                run_health = exc.run_health
                 metadata = cast(
                     "JsonObject",
                     {
                         **identity_metadata,
                         "infrastructure_failure": True,
                         "infrastructure_failure_kind": exc.kind.value,
+                        "run_health": run_health.value,
                     },
                 )
                 _populate_context(context, exc.worker_usage, metadata)
@@ -440,6 +542,19 @@ class WmhPiAgent(BaseAgent):
                     self._write_trace(exc.events)
                 except Exception:  # noqa: BLE001 - retain only a stable trace failure
                     trace_error = WmhPiRunnerError("WMH pi trace persistence failed")
+            else:
+                _populate_context(
+                    context,
+                    TokenUsage(),
+                    cast(
+                        "JsonObject",
+                        {
+                            **identity_metadata,
+                            "infrastructure_failure": True,
+                            "run_health": run_health.value,
+                        },
+                    ),
+                )
             # Cleanup proof is independent of evidence persistence and always wins: a
             # surviving runner cannot be downgraded to an ordinary trace/provider error.
             await _cancel_and_wait_runner(runner_factory)
@@ -456,6 +571,7 @@ class WmhPiAgent(BaseAgent):
                     **identity_metadata,
                     "terminal_reason": result.terminal_reason,
                     "candidate_failure": False,
+                    "run_health": result.run_health.value,
                 },
             )
         else:
@@ -469,10 +585,37 @@ class WmhPiAgent(BaseAgent):
                     "candidate_failure": True,
                     "candidate_failure_stage": candidate_error.stage.value,
                     "candidate_failure_reason": candidate_error.reason.value,
+                    "run_health": candidate_error.run_health.value,
                 },
             )
         _populate_context(context, usage, metadata)
-        self._write_trace(events)
+        try:
+            self._write_trace(events)
+        except Exception:  # noqa: BLE001 - never admit candidate evidence without its fresh trace
+            _populate_context(
+                context,
+                usage,
+                cast(
+                    "JsonObject",
+                    {
+                        **identity_metadata,
+                        "infrastructure_failure": True,
+                        "run_health": PiRunHealth.INFRASTRUCTURE_FAILURE.value,
+                    },
+                ),
+            )
+            raise WmhPiRunnerError("WMH pi trace persistence failed") from None
+
+    def _prepare_trace(self) -> None:
+        """Remove deterministic-path evidence from an earlier resumed attempt."""
+        trial_dir = self.logs_dir.parent
+        if trial_dir.is_symlink():
+            raise WmhPiRunnerError("WMH pi trace persistence failed")
+        try:
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            (trial_dir / _TRACE_FILE).unlink(missing_ok=True)
+        except OSError:
+            raise WmhPiRunnerError("WMH pi trace persistence failed") from None
 
     def _write_trace(self, events: tuple[SessionEvent, ...]) -> None:
         """Atomically write trace evidence outside task-mounted log directories."""
@@ -850,6 +993,37 @@ def _command_outcome(result: ExecResult, emit: OutputEmitter) -> ToolOutcome:
     )
 
 
+def _task_environment_resource_loss_requires_confirmation(result: ExecResult) -> bool:
+    """Return whether raw resource-loss evidence needs a fresh same-cell confirmation.
+
+    Exit 137 is ambiguous between an evaluator-owned hard deadline, a container OOM, and host
+    pressure. Local Docker cells also share backing storage, so ENOSPC cannot prove candidate
+    ownership. Candidate-authored strings can trigger only a retryable confirmation, never a
+    score or an infrastructure-cost exemption.
+    """
+    if result.return_code in {-9, 137}:
+        return True
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    return "no space left on device" in output or "disk quota exceeded" in output
+
+
+def _task_free_disk_kib(result: ExecResult) -> int | None:
+    """Parse the POSIX ``df -Pk`` record emitted by the task-disk health command."""
+    if result.return_code != 0 or result.stderr not in {None, ""}:
+        return None
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    if len(lines) != 2:
+        return None
+    header = lines[0].split()
+    fields = lines[1].split()
+    if len(header) < 6 or "Available" not in header or len(fields) < 6:
+        return None
+    value = fields[3]
+    if not value.isascii() or not value.isdecimal():
+        return None
+    return int(value)
+
+
 def _bounded_text(content: str, limit: int) -> tuple[str, bool]:
     """Return at most ``limit`` characters with a fixed-size truncation marker."""
     if len(content) <= limit:
@@ -889,6 +1063,10 @@ def _typed_infrastructure_error(error: Exception) -> RuntimeError:
     if isinstance(error, PiInfrastructureError):
         if error.kind is PiInfrastructureFailureKind.PROVIDER:
             return WmhPiProviderError("WMH pi worker provider failed")
+        if error.kind is PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED:
+            return WmhPiEnvironmentConfirmationRequiredError(
+                "WMH pi task environment needs a fresh confirmation attempt"
+            )
         return WmhPiEnvironmentError("WMH pi task environment failed")
     message = str(error)
     if message.startswith("pi turn worker provider failed"):
