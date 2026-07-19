@@ -99,10 +99,12 @@ def _seed_supplied(request_payload: ProviderRequestPayload) -> bool:
 def _cache_config_supplied(provider: str, request_payload: ProviderRequestPayload) -> bool:
     """Detect provider cache controls only in their documented wire locations."""
     if provider in {"openai", "azure"}:
-        return any(
+        if any(
             field in request_payload
             for field in ("prompt_cache_key", "prompt_cache_retention", "cache_control")
-        )
+        ):
+            return True
+        return _openai_message_content_has_cache_control(request_payload.get("messages"))
     if provider == "bedrock":
         if _bedrock_content_has_cache_point(request_payload.get("system")):
             return True
@@ -124,6 +126,20 @@ def _cache_config_supplied(provider: str, request_payload: ProviderRequestPayloa
             field in additional
             for field in ("prompt_cache_key", "prompt_cache_retention", "cache_control")
         )
+    return False
+
+
+def _openai_message_content_has_cache_control(value: ProviderRequestValue) -> bool:
+    """Detect compatible-endpoint cache controls without scanning tool schemas."""
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return False
+    for message in value:
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+            if any(isinstance(block, Mapping) and "cache_control" in block for block in content):
+                return True
     return False
 
 

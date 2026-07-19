@@ -206,6 +206,39 @@ def test_openai_tool_schema_cache_names_are_not_request_cache_controls() -> None
     assert receipt.cache_config_supplied is False
 
 
+@pytest.mark.parametrize("provider", ["openai", "azure"])
+def test_openai_compatible_message_content_cache_control_is_detected(provider: str) -> None:
+    receipt = build_chat_provider_receipt(
+        provider=provider,
+        provider_request_id="request-1",
+        response_id="completion-1",
+        requested_model="model",
+        response_model="served-model",
+        system_fingerprint=None,
+        request_payload={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ]
+        },
+        temperature=None,
+        max_tokens=4_096,
+        max_tokens_field="max_completion_tokens",
+        started_at_unix_s=10.0,
+        finished_at_unix_s=11.0,
+    )
+
+    assert receipt.cache_config_supplied is True
+
+
 def test_provider_cache_controls_are_detected_only_at_structural_wire_locations() -> None:
     common = {
         "provider_request_id": "request-1",
