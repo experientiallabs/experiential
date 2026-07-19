@@ -106,9 +106,16 @@ from wmh.tracking.budget import (
     open_shared_spend_ledger,
     validate_timed_resource_class,
 )
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRatePolicy,
+    bind_external_dispatch_rate_authority,
+    validate_e2b_sandbox_create_rate_policy,
+)
 
-PAIRED_HARBOR_PROTOCOL_VERSION: Literal["8"] = "8"
-PAIRED_HARBOR_RUN_VERSION: Literal["9"] = "9"
+PAIRED_HARBOR_PROTOCOL_VERSION: Literal["9"] = "9"
+PAIRED_HARBOR_RUN_VERSION: Literal["10"] = "10"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -586,11 +593,12 @@ class HarborExecutionPlan(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    plan_version: Literal["1"] = "1"
+    plan_version: Literal["2"] = "2"
     environment_backend: HarborEnvironmentBackend = HarborEnvironmentBackend.LOCAL
     runner_spec: PiRunnerBackendSpec
     runner_config_digest: str = Field(pattern=_DIGEST_PATTERN)
     runner_environment_digest: str = Field(pattern=_DIGEST_PATTERN)
+    create_rate_policy: ExternalDispatchRatePolicy | None = None
     compute_envelope: HarborAgentComputeEnvelope
     turn_timeout_s: float = Field(gt=0.0, allow_inf_nan=False)
     attempts_per_job: Literal[1] = 1
@@ -632,6 +640,16 @@ class HarborExecutionPlan(BaseModel):
             raise ValueError("Harbor execution plan timeout differs from its compute envelope")
         if self.compute_envelope.runtime_kind != "pi-node":
             raise ValueError("Harbor execution requires pi-node harnesses")
+        requires_create_rate = (
+            self.environment_backend is HarborEnvironmentBackend.E2B
+            or isinstance(self.runner_spec, E2BPiRunnerSpec)
+        )
+        if requires_create_rate:
+            if self.create_rate_policy is None:
+                raise ValueError("E2B execution plans require a create-rate policy")
+            validate_e2b_sandbox_create_rate_policy(self.create_rate_policy)
+        elif self.create_rate_policy is not None:
+            raise ValueError("local execution plans cannot carry an E2B create-rate policy")
         if self.harbor_version != SUPPORTED_HARBOR_VERSION:
             raise ValueError("Harbor execution plan uses an unsupported Harbor version")
         if self.evaluator_version != HARBOR_EVALUATOR_VERSION:
@@ -666,11 +684,18 @@ class HarborExecutionPlan(BaseModel):
             reference_harness,
             turn_timeout_s=turn_timeout_s,
         )
+        create_rate_policy = (
+            None
+            if environment_backend is HarborEnvironmentBackend.LOCAL
+            and isinstance(frozen_runner, LocalPiRunnerSpec)
+            else E2B_SANDBOX_CREATE_RATE_POLICY
+        )
         return cls(
             environment_backend=environment_backend,
             runner_spec=frozen_runner,
             runner_config_digest=frozen_runner.config_digest,
             runner_environment_digest=frozen_runner.attestation.digest,
+            create_rate_policy=create_rate_policy,
             compute_envelope=compute_envelope,
             turn_timeout_s=turn_timeout_s,
             artifact_paths=artifact_paths,
@@ -734,6 +759,7 @@ class HarborExecutionRuntime(BaseModel):
     jobs_dir: Path
     dataset_paths_by_id: dict[str, Path] = Field(min_length=1)
     budget: PairedHarborBudgetRuntime
+    create_rate_ledger_path: Path | None = None
 
     @model_validator(mode="after")
     def _require_absolute_private_coordinates(self) -> Self:
@@ -748,6 +774,11 @@ class HarborExecutionRuntime(BaseModel):
         )
         if len(normalized) != len(set(normalized)):
             raise ValueError("Harbor execution dataset IDs must map to distinct roots")
+        if (
+            self.create_rate_ledger_path is not None
+            and not self.create_rate_ledger_path.is_absolute()
+        ):
+            raise ValueError("Harbor execution create-rate ledger path must be absolute")
         return self
 
     def single_task_spec(
@@ -772,6 +803,7 @@ class HarborExecutionRuntime(BaseModel):
             n_concurrent_trials=plan.trial_concurrency,
             agent_n_concurrent=plan.agent_concurrency,
             environment_backend=plan.environment_backend,
+            create_rate_policy=plan.create_rate_policy,
             allow_preexisting_e2b_builds=plan.allow_preexisting_e2b_builds,
             max_retries=plan.max_retries,
             retry_exceptions=set(plan.retry_exceptions),
@@ -794,6 +826,7 @@ def _execution_plan_expectation_spec(plan: HarborExecutionPlan) -> HarborJobSpec
         n_concurrent_trials=plan.trial_concurrency,
         agent_n_concurrent=plan.agent_concurrency,
         environment_backend=plan.environment_backend,
+        create_rate_policy=plan.create_rate_policy,
         allow_preexisting_e2b_builds=plan.allow_preexisting_e2b_builds,
         max_retries=plan.max_retries,
         retry_exceptions=set(plan.retry_exceptions),
@@ -1125,7 +1158,7 @@ class PairedHarborProtocol(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    protocol_version: Literal["8"] = PAIRED_HARBOR_PROTOCOL_VERSION
+    protocol_version: Literal["9"] = PAIRED_HARBOR_PROTOCOL_VERSION
     preopen_commitment: HarborConfirmationExecutionCommitment
     preopen_commitment_digest: str = Field(pattern=_DIGEST_PATTERN)
     design: PairedEvaluationDesign
@@ -1538,7 +1571,7 @@ class PairedHarborRunReport(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    run_version: Literal["9"]
+    run_version: Literal["10"]
     protocol: PairedHarborProtocol
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
@@ -2052,6 +2085,18 @@ class PairedHarborRunner:
             raise ValueError("paired budget runtime differs from the frozen ledger identity")
         if self._budget_runtime.binding_digest != self._protocol.budget_binding_digest:
             raise ValueError("paired budget runtime differs from the frozen account bindings")
+        rate_policy = self._protocol.execution_plan.create_rate_policy
+        rate_path = self._runtime.create_rate_ledger_path
+        if rate_policy is None:
+            if rate_path is not None:
+                raise ValueError("local paired execution cannot carry an E2B create-rate ledger")
+            self._create_rate_authority: ExternalDispatchRateAuthority | None = None
+        else:
+            if rate_path is None:
+                raise ValueError("E2B paired execution requires a create-rate ledger path")
+            authority = ExternalDispatchRateAuthority.bootstrap(rate_path, rate_policy)
+            bind_external_dispatch_rate_authority(authority)
+            self._create_rate_authority = authority
         if not isinstance(multi_host, bool):
             raise ValueError("multi_host must be a boolean")
         if multi_host:
@@ -2300,17 +2345,31 @@ class PairedHarborRunner:
             arm=arm,
             run_id=job_name,
         )
-        evaluator = HarborEvaluator(
-            spec,
-            route.provider_config.model_copy(deep=True),
-            runner_spec=plan.runner_spec,
-            turn_timeout_s=plan.turn_timeout_s,
-            require_provider_receipts=True,
-            session=evaluator_session,
-            budget_account=provider_account,
-            task_resource_budget_accounts=task_resource_accounts,
-            runner_resource_budget_account=runner_resource_account,
-        )
+        if self._create_rate_authority is None:
+            evaluator = HarborEvaluator(
+                spec,
+                route.provider_config.model_copy(deep=True),
+                runner_spec=plan.runner_spec,
+                turn_timeout_s=plan.turn_timeout_s,
+                require_provider_receipts=True,
+                session=evaluator_session,
+                budget_account=provider_account,
+                task_resource_budget_accounts=task_resource_accounts,
+                runner_resource_budget_account=runner_resource_account,
+            )
+        else:
+            evaluator = HarborEvaluator(
+                spec,
+                route.provider_config.model_copy(deep=True),
+                runner_spec=plan.runner_spec,
+                turn_timeout_s=plan.turn_timeout_s,
+                require_provider_receipts=True,
+                session=evaluator_session,
+                budget_account=provider_account,
+                task_resource_budget_accounts=task_resource_accounts,
+                runner_resource_budget_account=runner_resource_account,
+                create_rate_authority=self._create_rate_authority,
+            )
         loaded = await evaluator.evaluate(harness)
         validate_harbor_run_identity(
             loaded.result,

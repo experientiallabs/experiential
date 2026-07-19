@@ -55,6 +55,12 @@ from wmh.tracking.budget import (
     bind_budget_account,
     bootstrap_budget_ledger,
 )
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRatePolicy,
+    bind_external_dispatch_rate_authority,
+)
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
     "JsonObject",
@@ -358,6 +364,10 @@ def test_agent_admits_e2b_runner_lease_with_turn_cleanup_margin(tmp_path: Path) 
         envd_version="0.2.1",
         lease_timeout_s=3_660,
     )
+    rate_authority = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
 
     agent = mod.WmhPiAgent(
         logs_dir=tmp_path / "agent",
@@ -365,6 +375,10 @@ def test_agent_admits_e2b_runner_lease_with_turn_cleanup_margin(tmp_path: Path) 
         harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
         provider_config=cast("JsonObject", config.model_dump(mode="json")),
         runner_spec=cast("JsonObject", runner_spec.model_dump(mode="json")),
+        create_rate_binding=cast(
+            "JsonObject",
+            bind_external_dispatch_rate_authority(rate_authority).model_dump(mode="json"),
+        ),
         turn_timeout_s=3_600,
     )
 
@@ -1494,12 +1508,25 @@ def test_agent_selects_e2b_runner_and_persists_actual_attestation(
         lease_timeout_s=420,
     )
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    rate_authority = ExternalDispatchRateAuthority.bootstrap(
+        tmp_path / "rate.json",
+        ExternalDispatchRatePolicy(
+            provider="e2b",
+            operation="sandbox_create",
+            maximum_dispatches=4,
+            period_milliseconds=1000,
+        ),
+    )
     agent = mod.WmhPiAgent(
         logs_dir=tmp_path / "agent",
         model_name="bedrock/model",
         harness=cast("JsonObject", pi_node_baseline("candidate").model_dump(mode="json")),
         provider_config=cast("JsonObject", config.model_dump(mode="json")),
         runner_spec=cast("JsonObject", runner_spec.model_dump(mode="json")),
+        create_rate_binding=cast(
+            "JsonObject",
+            bind_external_dispatch_rate_authority(rate_authority).model_dump(mode="json"),
+        ),
     )
     agent._task_environment_attestation = mod._TaskEnvironmentAttestation(
         digest=_TASK_ENVIRONMENT_DIGEST,
@@ -1527,10 +1554,17 @@ def test_agent_selects_e2b_runner_and_persists_actual_attestation(
 
     factory = Factory()
 
-    def build(observed: object, *, ledger_path: Path, owner_id: str) -> Factory:
+    def build(
+        observed: object,
+        *,
+        ledger_path: Path,
+        owner_id: str,
+        create_rate_authority: object,
+    ) -> Factory:
         assert observed == runner_spec
         assert ledger_path == tmp_path / "wmh-runner-lease.json"
         assert owner_id == runner_owner_id(tmp_path.name)
+        assert create_rate_authority is rate_authority
         return factory
 
     monkeypatch.setattr(mod, "build_pi_runner_factory", build)

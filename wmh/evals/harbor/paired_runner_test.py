@@ -272,6 +272,7 @@ def test_execution_plan_is_task_and_host_path_independent() -> None:
 
     assert plan.environment_backend is HarborEnvironmentBackend.LOCAL
     assert isinstance(plan.runner_spec, LocalPiRunnerSpec)
+    assert plan.create_rate_policy is None
     assert plan.reward_key == "reward"
     assert plan.artifact_paths == ("agent/log.txt",)
     assert "task" not in plan.model_dump(mode="json")
@@ -302,6 +303,10 @@ def test_execution_plan_admits_long_official_task_timeout_with_e2b_runner_lease(
     assert plan.compute_envelope.turn_timeout_s == 12_000
     assert isinstance(plan.runner_spec, E2BPiRunnerSpec)
     assert plan.runner_spec.lease_timeout_s == 18_000
+    assert plan.create_rate_policy is not None
+    assert plan.create_rate_policy.maximum_dispatches == 4
+    assert plan.create_rate_policy.period_milliseconds == 1000
+    assert plan.create_rate_policy.minimum_spacing_ns == 250_000_000
 
 
 def test_confirmation_selection_is_a_deterministic_projection_of_full_roster() -> None:
@@ -1039,6 +1044,7 @@ def _e2b_runner(
             jobs_dir=(tmp_path / "jobs").resolve(),
             dataset_paths_by_id={"terminalbench2": (tmp_path / "dataset").resolve()},
             budget=budget,
+            create_rate_ledger_path=(tmp_path / "paired-create-rate.json").resolve(),
         ),
         operation_id="e2b-wiring",
         generation_id=1,
@@ -1319,8 +1325,8 @@ def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
     design = _design()
     assert len(calls) == 2 * len(design.blocks)
     assert len(report.evidence) == len(design.blocks)
-    assert report.run_version == "9"
-    assert report.protocol.protocol_version == "8"
+    assert report.run_version == "10"
+    assert report.protocol.protocol_version == "9"
     assert report.protocol.design_digest == design.digest
     assert report.protocol.baseline_execution_digest == baseline.execution_digest
     assert report.protocol.candidate_execution_digest == candidate.execution_digest
@@ -1714,6 +1720,65 @@ def test_runtime_host_paths_do_not_change_frozen_protocol(tmp_path: Path) -> Non
     assert second._runtime.jobs_dir != first._runtime.jobs_dir
 
 
+def test_e2b_rate_ledger_paths_are_host_private_and_not_protocol_identity(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate()
+    first = _e2b_runner(tmp_path, candidate)
+    alternate_runtime = first._runtime.model_copy(
+        update={
+            "jobs_dir": (tmp_path / "alternate-jobs").resolve(),
+            "dataset_paths_by_id": {"terminalbench2": (tmp_path / "alternate-dataset").resolve()},
+            "create_rate_ledger_path": (tmp_path / "alternate-rate.json").resolve(),
+        },
+        deep=True,
+    )
+
+    second = mod.PairedHarborRunner(
+        protocol=first._protocol,
+        runtime=alternate_runtime,
+        operation_id="alternate-e2b-host-paths",
+        generation_id=1,
+    )
+
+    assert second._protocol == first._protocol
+    assert second._protocol.digest == first._protocol.digest
+    assert str(tmp_path) not in second._protocol.model_dump_json()
+    assert second._create_rate_authority is not first._create_rate_authority
+    assert second._create_rate_authority is not None
+    assert first._create_rate_authority is not None
+    assert second._create_rate_authority.binding != first._create_rate_authority.binding
+
+
+def test_local_paired_execution_rejects_e2b_rate_ledger(tmp_path: Path) -> None:
+    candidate = _candidate()
+    runner = _runner(tmp_path, candidate)
+    invalid_runtime = runner._runtime.model_copy(
+        update={"create_rate_ledger_path": (tmp_path / "unexpected-rate.json").resolve()}
+    )
+
+    with pytest.raises(ValueError, match="local paired execution"):
+        mod.PairedHarborRunner(
+            protocol=runner._protocol,
+            runtime=invalid_runtime,
+            operation_id="local-rate-input",
+            generation_id=1,
+        )
+
+
+def test_e2b_paired_execution_rejects_missing_rate_ledger(tmp_path: Path) -> None:
+    runner = _e2b_runner(tmp_path, _candidate())
+    invalid_runtime = runner._runtime.model_copy(update={"create_rate_ledger_path": None})
+
+    with pytest.raises(ValueError, match="requires a create-rate ledger"):
+        mod.PairedHarborRunner(
+            protocol=runner._protocol,
+            runtime=invalid_runtime,
+            operation_id="missing-e2b-rate-ledger",
+            generation_id=1,
+        )
+
+
 def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1781,7 +1846,9 @@ def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
     )
     runner_account = wiring["runner_resource_budget_account"]
     assert spec.environment_backend is HarborEnvironmentBackend.E2B
+    assert spec.create_rate_policy == runner._protocol.execution_plan.create_rate_policy
     assert spec.allow_preexisting_e2b_builds is False
+    assert wiring["create_rate_authority"] is runner._create_rate_authority
     assert isinstance(wiring["runner_spec"], E2BPiRunnerSpec)
     assert len(task_accounts) == 1
     assert runner_account is not None

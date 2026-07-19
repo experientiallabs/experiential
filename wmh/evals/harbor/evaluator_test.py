@@ -30,7 +30,11 @@ from harbor.utils.logger import logger as harbor_logger
 import wmh.evals.harbor.evaluator as mod
 from wmh.evals.benchmark import BenchmarkCell, BenchmarkTaskEnvironment
 from wmh.evals.harbor import _file_lease
-from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.config import (
+    HarborEnvironmentBackend,
+    HarborJobSpec,
+    build_harbor_job_config,
+)
 from wmh.evals.harbor.e2b_environment import (
     ExactE2BEnvironment,
     freeze_exact_e2b_build_spec,
@@ -60,6 +64,11 @@ from wmh.tracking.budget import (
     TimedResourceCostMeter,
     TokenPriceCeiling,
     bootstrap_budget_ledger,
+)
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRatePolicy,
+    bind_external_dispatch_rate_authority,
 )
 
 _TASK_ENVIRONMENT_ATTESTATION = {
@@ -96,6 +105,7 @@ class _E2BBudgetKwargs(TypedDict):
     budget_account: BudgetAccount
     task_resource_budget_accounts: NotRequired[tuple[TimedResourceBudgetAccount, ...]]
     runner_resource_budget_account: NotRequired[TimedResourceBudgetAccount]
+    create_rate_authority: NotRequired[ExternalDispatchRateAuthority]
 
 
 def _runner_lease_receipt(trial_name: str) -> dict[str, object]:
@@ -123,6 +133,19 @@ def _e2b_runner(*, lease_timeout_s: int = 420) -> E2BPiRunnerSpec:
         envd_version="0.2.1",
         lease_timeout_s=lease_timeout_s,
     )
+
+
+def _rate_policy() -> ExternalDispatchRatePolicy:
+    return ExternalDispatchRatePolicy(
+        provider="e2b",
+        operation="sandbox_create",
+        maximum_dispatches=4,
+        period_milliseconds=1000,
+    )
+
+
+def _rate_spec(spec: HarborJobSpec) -> HarborJobSpec:
+    return spec.model_copy(update={"create_rate_policy": _rate_policy()}, deep=True)
 
 
 def _write_task(
@@ -222,7 +245,11 @@ def _e2b_budget_kwargs(
             policy=policy,
             scope=scope,
             meter_id="worker",
-        )
+        ),
+        "create_rate_authority": ExternalDispatchRateAuthority.bootstrap(
+            (tmp_path / "e2b-create-rate.json").resolve(),
+            _rate_policy(),
+        ),
     }
     if task_environment:
         kwargs["task_resource_budget_accounts"] = (
@@ -311,7 +338,7 @@ def test_evaluator_requires_fixed_e2b_lease_to_cover_the_turn(tmp_path: Path) ->
 def test_evaluator_admits_hour_turn_with_long_e2b_runner_lease(tmp_path: Path) -> None:
     runner_spec = _e2b_runner(lease_timeout_s=7_200)
     evaluator = mod.HarborEvaluator(
-        _spec(tmp_path, tmp_path / "dataset"),
+        _rate_spec(_spec(tmp_path, tmp_path / "dataset")),
         _provider(),
         runner_spec=runner_spec,
         turn_timeout_s=3_600,
@@ -344,7 +371,7 @@ def test_e2b_runner_readiness_checks_only_local_prerequisites(
         lambda **_kwargs: pytest.fail("E2B runner readiness must not probe Docker"),
     )
     evaluator = mod.HarborEvaluator(
-        _spec(tmp_path, tmp_path / "dataset"),
+        _rate_spec(_spec(tmp_path, tmp_path / "dataset")),
         _provider(),
         runner_spec=_e2b_runner(),
         **_e2b_budget_kwargs(tmp_path, runner_spec=_e2b_runner()),
@@ -361,7 +388,7 @@ def test_e2b_runner_missing_host_credential_fails_before_job_creation(
     monkeypatch.delenv(E2B_API_KEY_ENV, raising=False)
     monkeypatch.setattr(mod, "find_spec", lambda _name: object())
     evaluator = mod.HarborEvaluator(
-        _spec(tmp_path, tmp_path / "dataset"),
+        _rate_spec(_spec(tmp_path, tmp_path / "dataset")),
         _provider(),
         runner_spec=_e2b_runner(),
         **_e2b_budget_kwargs(tmp_path, runner_spec=_e2b_runner()),
@@ -375,7 +402,10 @@ def test_e2b_task_and_runner_backends_reject_unbudgeted_programmatic_entry(
     tmp_path: Path,
 ) -> None:
     task_spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
         deep=True,
     )
     with pytest.raises(ValueError, match="E2B task environments require"):
@@ -396,7 +426,10 @@ def test_exact_e2b_build_preflight_fails_before_atomic_job_creation(
     dataset = tmp_path / "dataset"
     _write_task(dataset)
     spec = _spec(tmp_path, dataset).model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
         deep=True,
     )
     creates = 0
@@ -442,7 +475,10 @@ def test_exact_e2b_rejects_unsupported_accelerators_before_build_lookup_or_job_c
         encoding="utf-8",
     )
     spec = _spec(tmp_path, dataset).model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
         deep=True,
     )
 
@@ -610,6 +646,7 @@ def test_remote_package_dataset_cannot_reach_metadata_provider_or_e2b_environmen
         update={
             "datasets": [DatasetConfig(name="owner/benchmark", ref="sha256:dataset")],
             "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
         },
         deep=True,
     )
@@ -808,7 +845,10 @@ def test_e2b_missing_extra_fails_before_runner_or_harbor_job_creation(
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
     monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
     spec = _spec(tmp_path, dataset).model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
         deep=True,
     )
 
@@ -848,7 +888,10 @@ def test_e2b_missing_api_key_fails_before_runner_or_harbor_job_creation(
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
     monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
     spec = _spec(tmp_path, dataset).model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
         deep=True,
     )
 
@@ -936,7 +979,13 @@ def test_run_config_digest_binds_semantics_and_concurrency_but_not_paths(tmp_pat
 
     semantic_variants = [
         spec.model_copy(update={"n_attempts": 3}, deep=True),
-        spec.model_copy(update={"environment_backend": HarborEnvironmentBackend.E2B}, deep=True),
+        spec.model_copy(
+            update={
+                "environment_backend": HarborEnvironmentBackend.E2B,
+                "create_rate_policy": _rate_policy(),
+            },
+            deep=True,
+        ),
         spec.model_copy(update={"n_concurrent_trials": 7}, deep=True),
         spec.model_copy(update={"agent_n_concurrent": 1}, deep=True),
     ]
@@ -968,6 +1017,99 @@ def test_run_config_digest_binds_semantics_and_concurrency_but_not_paths(tmp_pat
         reversed_artifacts,
         agent_digest,
     ) != mod.harbor_run_config_digest(artifact_variant, agent_digest)
+
+    rate_variant = spec.model_copy(update={"create_rate_policy": _rate_policy()}, deep=True)
+    assert mod.harbor_run_config_digest(rate_variant, agent_digest) != baseline
+
+
+def test_e2b_runner_agent_binding_is_path_free_and_not_logical_identity(tmp_path: Path) -> None:
+    first = ExternalDispatchRateAuthority.bootstrap(tmp_path / "first-rate.json", _rate_policy())
+    second = ExternalDispatchRateAuthority.bootstrap(tmp_path / "second-rate.json", _rate_policy())
+    candidate = pi_node_baseline("candidate")
+    runner = _e2b_runner()
+
+    first_agent = mod._build_harbor_agent_config(
+        candidate=candidate,
+        provider_config=_provider(),
+        runner_spec=runner,
+        turn_timeout_s=300.0,
+        agent_n_concurrent=1,
+        require_provider_receipts=True,
+        create_rate_binding=bind_external_dispatch_rate_authority(first),
+    )
+    second_agent = mod._build_harbor_agent_config(
+        candidate=candidate,
+        provider_config=_provider(),
+        runner_spec=runner,
+        turn_timeout_s=300.0,
+        agent_n_concurrent=1,
+        require_provider_receipts=True,
+        create_rate_binding=bind_external_dispatch_rate_authority(second),
+    )
+
+    assert str(tmp_path) not in json.dumps(first_agent.kwargs)
+    assert first_agent.kwargs["create_rate_binding"] != second_agent.kwargs["create_rate_binding"]
+    assert harbor_agent_config_digest(first_agent) == harbor_agent_config_digest(second_agent)
+
+
+def test_evaluator_shares_one_rate_authority_between_e2b_task_and_runner(
+    tmp_path: Path,
+) -> None:
+    runner = _e2b_runner()
+    rate_authority = ExternalDispatchRateAuthority.bootstrap(
+        tmp_path / "e2b-rate.json",
+        _rate_policy(),
+    )
+    spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
+        deep=True,
+    )
+    budget_kwargs = _e2b_budget_kwargs(
+        tmp_path,
+        task_environment=True,
+        runner_spec=runner,
+    )
+    budget_kwargs["create_rate_authority"] = rate_authority
+    evaluator = mod.HarborEvaluator(
+        spec,
+        _provider(),
+        runner_spec=runner,
+        **budget_kwargs,
+    )
+
+    agent = evaluator._build_agent(pi_node_baseline("candidate"))
+    job_config = build_harbor_job_config(
+        evaluator._spec,
+        agent=agent,
+        task_resource_budget_bindings=evaluator._task_resource_budget_bindings,
+        create_rate_binding=evaluator._create_rate_binding,
+    )
+
+    expected = rate_authority.binding.model_dump(mode="json")
+    assert agent.kwargs["create_rate_binding"] == expected
+    assert job_config.environment.kwargs["create_rate_binding"] == expected
+
+
+def test_evaluator_rejects_e2b_create_without_frozen_rate_authority(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
+        deep=True,
+    )
+    budget_kwargs = _e2b_budget_kwargs(tmp_path, task_environment=True)
+    del budget_kwargs["create_rate_authority"]
+
+    with pytest.raises(ValueError, match="create-rate authority"):
+        mod.HarborEvaluator(
+            spec,
+            _provider(),
+            **budget_kwargs,
+        )
 
 
 def test_reasoning_effort_is_explicit_in_agent_config_and_run_identity(tmp_path: Path) -> None:
@@ -1156,6 +1298,7 @@ def test_e2b_backend_is_bound_into_harbor_config_and_run_identity(
     spec = _spec(tmp_path, dataset).model_copy(
         update={
             "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
             "allow_preexisting_e2b_builds": True,
         }
     )
@@ -2359,7 +2502,10 @@ def test_e2b_rejects_every_task_authored_compose_source_before_run(
 
     monkeypatch.setattr(Job, "run", unexpected_run)
     spec = _spec(tmp_path, dataset).model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B},
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+        },
         deep=True,
     )
     evaluator = mod.HarborEvaluator(

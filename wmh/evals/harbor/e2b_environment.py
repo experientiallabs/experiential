@@ -66,6 +66,11 @@ from wmh.tracking.budget import (
     resolve_timed_resource_account,
     validate_timed_resource_class,
 )
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateBinding,
+    resolve_external_dispatch_rate_authority,
+    validate_e2b_sandbox_create_rate_policy,
+)
 
 if TYPE_CHECKING:
     from e2b import AsyncSandbox
@@ -564,8 +569,15 @@ class ExactE2BEnvironment(E2BEnvironment):
         phase_network_policies: Sequence[NetworkPolicy] | None = None,
         extra_docker_compose: Sequence[Path | str] | None = None,
         resource_budget_bindings: list[JsonObject] | None = None,
+        create_rate_binding: JsonObject | None = None,
         allow_preexisting_e2b_builds: bool = False,
     ) -> None:
+        if create_rate_binding is None:
+            raise ValueError("E2B task environments require a create-rate authority")
+        create_rate_authority = resolve_external_dispatch_rate_authority(
+            ExternalDispatchRateBinding.model_validate(create_rate_binding)
+        )
+        validate_e2b_sandbox_create_rate_policy(create_rate_authority.policy)
         effective_resource_config = task_env_config.model_copy(
             update={
                 **({"storage_mb": override_storage_mb} if override_storage_mb is not None else {}),
@@ -606,6 +618,7 @@ class ExactE2BEnvironment(E2BEnvironment):
         self._wmh_resource_budget_accounts = tuple(
             resolve_timed_resource_account(binding) for binding in bindings
         )
+        self._wmh_create_rate_authority = create_rate_authority
         self._wmh_allow_preexisting_e2b_builds = allow_preexisting_e2b_builds
         self._wmh_resource_budget_account: TimedResourceBudgetAccount | None = None
         self._wmh_resource_budget: TimedResourceBudget | None = None
@@ -795,6 +808,7 @@ class ExactE2BEnvironment(E2BEnvironment):
             self._wmh_resource_reservation = self._wmh_resource_budget.reserve()
             if self._wmh_resource_reservation.reservation_id != self._wmh_lease_id:
                 raise RuntimeError("E2B task budget reservation differs from its lease")
+        await asyncio.to_thread(self._wmh_create_rate_authority.acquire)
         self._wmh_create_dispatched = True
         sandbox = await AsyncSandbox.create(
             template=build.exact_template_ref,

@@ -30,6 +30,11 @@ from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import BudgetAccount, TimedResourceBudgetAccount
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+    bind_external_dispatch_rate_authority,
+)
 
 _console = Console()
 _OUTPUT_LEASE_SUFFIX = ".wmh-eval-output.lock"
@@ -330,6 +335,16 @@ def eval_harness(
         if jobs_dir is not None
         else (Path(root).expanduser().resolve() / "eval-jobs")
     )
+    requires_create_rate = backend is HarborEnvironmentBackend.E2B or runner_spec.backend == "e2b"
+    create_rate_authority: ExternalDispatchRateAuthority | None
+    if requires_create_rate:
+        create_rate_authority = ExternalDispatchRateAuthority.bootstrap(
+            (resolved_jobs_dir / ".wmh-e2b-create-rate.json").resolve(),
+            E2B_SANDBOX_CREATE_RATE_POLICY,
+        )
+        bind_external_dispatch_rate_authority(create_rate_authority)
+    else:
+        create_rate_authority = None
     spec = HarborJobSpec(
         job_name=job_name,
         jobs_dir=resolved_jobs_dir,
@@ -337,18 +352,31 @@ def eval_harness(
         n_attempts=attempts,
         n_concurrent_trials=concurrency,
         environment_backend=backend,
+        create_rate_policy=(E2B_SANDBOX_CREATE_RATE_POLICY if requires_create_rate else None),
         allow_preexisting_e2b_builds=allow_preexisting_e2b_builds,
     )
     try:
-        evaluator = HarborEvaluator(
-            spec,
-            provider_config,
-            runner_spec=runner_spec,
-            turn_timeout_s=turn_timeout_s,
-            budget_account=budget_account,
-            task_resource_budget_accounts=task_resource_budget_accounts,
-            runner_resource_budget_account=runner_resource_budget_account,
-        )
+        if create_rate_authority is None:
+            evaluator = HarborEvaluator(
+                spec,
+                provider_config,
+                runner_spec=runner_spec,
+                turn_timeout_s=turn_timeout_s,
+                budget_account=budget_account,
+                task_resource_budget_accounts=task_resource_budget_accounts,
+                runner_resource_budget_account=runner_resource_budget_account,
+            )
+        else:
+            evaluator = HarborEvaluator(
+                spec,
+                provider_config,
+                runner_spec=runner_spec,
+                turn_timeout_s=turn_timeout_s,
+                budget_account=budget_account,
+                task_resource_budget_accounts=task_resource_budget_accounts,
+                runner_resource_budget_account=runner_resource_budget_account,
+                create_rate_authority=create_rate_authority,
+            )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     output_path = _validate_output_path(

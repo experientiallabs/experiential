@@ -44,6 +44,13 @@ from wmh.tracking.budget import (
     bind_timed_resource_account,
     bootstrap_budget_ledger,
 )
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRateBinding,
+    ExternalDispatchRatePolicy,
+    bind_external_dispatch_rate_authority,
+)
 
 _BUILD_CONTEXT_DIGEST = "sha256:" + "e" * 64
 _TEST_E2B_API_KEY = "test-e2b-api-key"
@@ -66,6 +73,8 @@ def _environment(
     trial_name: str = "trial-a",
     network_mode: NetworkMode = NetworkMode.ALLOWLIST,
     resource_budget_account: TimedResourceBudgetAccount | None = None,
+    create_rate_binding: ExternalDispatchRateBinding | None = None,
+    bind_create_rate: bool = True,
     storage_mb: int | None = 10_240,
 ) -> mod.ExactE2BEnvironment:
     environment_dir = tmp_path / "environment"
@@ -77,6 +86,13 @@ def _environment(
     trial_dir = tmp_path / "jobs" / "job" / trial_name
     trial_dir.mkdir(parents=True)
     allowed_hosts = ["api.example.com"] if network_mode is NetworkMode.ALLOWLIST else []
+    if create_rate_binding is None and bind_create_rate:
+        create_rate_binding = bind_external_dispatch_rate_authority(
+            ExternalDispatchRateAuthority.bootstrap(
+                (tmp_path / "e2b-create-rate.json").resolve(),
+                E2B_SANDBOX_CREATE_RATE_POLICY,
+            )
+        )
     return mod.ExactE2BEnvironment(
         environment_dir=environment_dir,
         environment_name="terminal-task",
@@ -96,7 +112,17 @@ def _environment(
             if resource_budget_account is None
             else [bind_timed_resource_account(resource_budget_account).model_dump(mode="json")]
         ),
+        create_rate_binding=(
+            None if create_rate_binding is None else create_rate_binding.model_dump(mode="json")
+        ),
     )
+
+
+def test_exact_e2b_environment_rejects_missing_rate_authority_before_setup(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="create-rate authority"):
+        _environment(tmp_path, bind_create_rate=False)
 
 
 def _resource_account(
@@ -1731,6 +1757,43 @@ def test_exact_create_attests_sufficient_observed_storage(
     assert attestation["requested_storage_mb"] == 10_240
     assert attestation["observed_storage_mb"] == observed_storage_mb
     assert attestation["storage_capacity_scope"] == "provider_reported_total"
+    asyncio.run(environment.stop(delete=True))
+
+
+def test_exact_task_rate_admission_precedes_provider_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rate_path = tmp_path / "e2b-create-rate.json"
+    authority = ExternalDispatchRateAuthority.bootstrap(
+        rate_path,
+        ExternalDispatchRatePolicy(
+            provider="e2b",
+            operation="sandbox_create",
+            maximum_dispatches=4,
+            period_milliseconds=1000,
+        ),
+    )
+    environment = _environment(
+        tmp_path,
+        create_rate_binding=bind_external_dispatch_rate_authority(authority),
+    )
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+
+    async def create(**kwargs: object) -> _Sandbox:
+        assert json.loads(rate_path.read_text())["sequence"] == 1
+        return _sandbox_for_create(kwargs)
+
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
     asyncio.run(environment.stop(delete=True))
 
 

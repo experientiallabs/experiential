@@ -50,6 +50,10 @@ from wmh.tracking.budget import (
     TimedResourceRole,
     orphaned_timed_resource_requires_reap,
 )
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateAuthority,
+    validate_e2b_sandbox_create_rate_policy,
+)
 
 _IDENTITY = re.compile(r"[A-Za-z0-9_.-]{1,512}\Z")
 _RESOURCE_IDENTITY = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
@@ -716,6 +720,7 @@ class E2BOneShotRunnerFactory:
         ledger_path: Path,
         owner_id: str | None = None,
         resource_budget_account: TimedResourceBudgetAccount | None = None,
+        create_rate_authority: ExternalDispatchRateAuthority | None = None,
         sandbox_factory: Callable[[], SandboxHandle] | None = None,
         runner_starter: _RunnerStarter = start_live_runner,
         orphan_reaper: Callable[[str], tuple[str, ...]] = reap_e2b_runner_lease,
@@ -743,6 +748,10 @@ class E2BOneShotRunnerFactory:
             else None
         )
         self._resource_reservation: TimedResourceReservation | None = None
+        if create_rate_authority is None:
+            raise ValueError("E2B Pi runners require a create-rate authority")
+        validate_e2b_sandbox_create_rate_policy(create_rate_authority.policy)
+        self._create_rate_authority = create_rate_authority
         self._sandbox_factory = sandbox_factory or default_sandbox_factory(
             template=spec.exact_template_ref,
             timeout=float(spec.lease_timeout_s),
@@ -846,6 +855,7 @@ class E2BOneShotRunnerFactory:
                 self._resource_reservation = self._resource_budget.reserve()
                 if self._resource_reservation.reservation_id != self._lease_id:
                     raise RuntimeError("E2B runner budget reservation differs from its lease")
+            self._create_rate_authority.acquire()
             create_dispatched = True
             sandbox = self._sandbox_factory()
         except BaseException:
@@ -1088,15 +1098,19 @@ def build_pi_runner_factory(
     ledger_path: Path,
     owner_id: str,
     resource_budget_account: TimedResourceBudgetAccount | None = None,
+    create_rate_authority: ExternalDispatchRateAuthority | None = None,
 ) -> ManagedPiRunnerFactory:
     """Construct the one managed implementation named by a strict runner spec."""
     if isinstance(spec, LocalPiRunnerSpec):
         if resource_budget_account is not None:
             raise ValueError("local Pi runners cannot consume an external resource meter")
+        if create_rate_authority is not None:
+            raise ValueError("local Pi runners cannot consume an E2B create-rate authority")
         return LocalContainerRunnerFactory(spec, ledger_path=ledger_path, owner_id=owner_id)
     return E2BOneShotRunnerFactory(
         spec,
         ledger_path=ledger_path,
         owner_id=owner_id,
         resource_budget_account=resource_budget_account,
+        create_rate_authority=create_rate_authority,
     )

@@ -36,6 +36,10 @@ from wmh.tracking.budget import (
     TimedResourceCostMeter,
     bootstrap_budget_ledger,
 )
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+)
 
 
 class _Channel:
@@ -53,6 +57,13 @@ class _Channel:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _rate_authority(tmp_path: Path) -> ExternalDispatchRateAuthority:
+    return ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "e2b-create-rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
 
 
 @dataclass(frozen=True)
@@ -515,6 +526,7 @@ def test_e2b_runner_is_one_shot_fixed_lifetime_and_attested(tmp_path: Path) -> N
         runner_starter=start,
         ledger_path=tmp_path / "runner-lease.json",
         orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=_rate_authority(tmp_path),
     )
     sandbox.info.metadata.update(
         {
@@ -558,6 +570,57 @@ def test_e2b_runner_is_one_shot_fixed_lifetime_and_attested(tmp_path: Path) -> N
     assert ledger["resource_id"] == "sandbox-immutable"
 
 
+def test_e2b_runner_rate_admission_precedes_create(tmp_path: Path) -> None:
+    spec = _e2b_spec()
+    sandbox = _sandbox(spec)
+    channel = _Channel()
+    rate_path = (tmp_path / "e2b-create-rate.json").resolve()
+    authority = _rate_authority(tmp_path)
+
+    def create() -> SandboxHandle:
+        assert json.loads(rate_path.read_text())["sequence"] == 1
+        return sandbox
+
+    factory = E2BOneShotRunnerFactory(
+        spec,
+        ledger_path=tmp_path / "runner-lease.json",
+        sandbox_factory=create,
+        runner_starter=_starter(channel),
+        orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=authority,
+    )
+    sandbox.info.metadata.update(
+        {
+            "wmh_runner_config": spec.config_digest,
+            "wmh_runner_lease": factory.lease_id,
+            "wmh_runner_owner": factory.owner_id,
+        }
+    )
+
+    with factory():
+        pass
+
+    assert json.loads(rate_path.read_text())["sequence"] == 1
+
+
+def test_e2b_runner_rejects_missing_rate_authority_before_create(tmp_path: Path) -> None:
+    creates = 0
+
+    def unexpected_create() -> SandboxHandle:
+        nonlocal creates
+        creates += 1
+        raise AssertionError("missing rate authority must precede provider create")
+
+    with pytest.raises(ValueError, match="create-rate authority"):
+        E2BOneShotRunnerFactory(
+            _e2b_spec(),
+            sandbox_factory=unexpected_create,
+            ledger_path=tmp_path / "runner-lease.json",
+        )
+
+    assert creates == 0
+
+
 def test_e2b_runner_accepts_sdk_lifecycle_mapping(tmp_path: Path) -> None:
     """The E2B SDK exposes SandboxInfo.lifecycle as a TypedDict at runtime."""
     spec = _e2b_spec()
@@ -569,6 +632,7 @@ def test_e2b_runner_accepts_sdk_lifecycle_mapping(tmp_path: Path) -> None:
         runner_starter=_starter(channel),
         ledger_path=tmp_path / "runner-lease.json",
         orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=_rate_authority(tmp_path),
     )
     sandbox.info = replace(
         sandbox.info,
@@ -605,6 +669,7 @@ def test_e2b_runner_budget_denial_never_dispatches_or_reaps(tmp_path: Path) -> N
         ledger_path=tmp_path / "runner-lease.json",
         resource_budget_account=account,
         orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+        create_rate_authority=_rate_authority(tmp_path),
     )
 
     with pytest.raises(BudgetExceededError, match="hard budget"):
@@ -635,6 +700,7 @@ def test_e2b_runner_ambiguous_create_forfeits_full_resource_ceiling(
         ledger_path=tmp_path / "runner-lease.json",
         resource_budget_account=account,
         orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+        create_rate_authority=_rate_authority(tmp_path),
     )
 
     with pytest.raises(RuntimeError, match="ambiguous create"):
@@ -681,6 +747,7 @@ def test_e2b_runner_activation_failure_kills_and_terminates_budget_and_lease(
         ledger_path=tmp_path / "runner-lease.json",
         resource_budget_account=account,
         orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=_rate_authority(tmp_path),
     )
     sandbox.info.metadata.update(
         {
@@ -734,6 +801,7 @@ def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
         spec,
         ledger_path=tmp_path / "runner-lease.json",
         orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=_rate_authority(tmp_path),
     )
 
     assert captured == {
@@ -776,6 +844,7 @@ def test_e2b_runner_rejects_runtime_identity_drift_and_kills(
         runner_starter=_starter(_Channel()),
         ledger_path=tmp_path / "runner-lease.json",
         orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=_rate_authority(tmp_path),
     )
     sandbox.info = mutate(
         replace(
@@ -835,6 +904,7 @@ def test_e2b_runner_rejects_lifecycle_drift_and_kills(
         runner_starter=_starter(_Channel()),
         ledger_path=tmp_path / "runner-lease.json",
         orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=_rate_authority(tmp_path),
     )
     sandbox.info = mutate(
         replace(
@@ -863,6 +933,7 @@ def test_e2b_runner_cancel_closes_channel_and_proves_kill(tmp_path: Path) -> Non
         runner_starter=_starter(channel),
         ledger_path=tmp_path / "runner-lease.json",
         orphan_reaper=lambda _lease_id: (),
+        create_rate_authority=_rate_authority(tmp_path),
     )
     sandbox.info.metadata.update(
         {
@@ -919,6 +990,7 @@ def test_pre_cancel_is_terminal_and_never_creates(
             runner_starter=_starter(_Channel()),
             ledger_path=tmp_path / "runner-lease.json",
             orphan_reaper=lambda _lease_id: (),
+            create_rate_authority=_rate_authority(tmp_path),
         )
 
     factory.cancel()

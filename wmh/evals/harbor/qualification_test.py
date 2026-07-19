@@ -14,6 +14,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from harbor.agents.factory import AgentFactory
+from harbor.environments.base import BaseEnvironment
 from harbor.environments.factory import EnvironmentFactory
 from harbor.job import Job
 from harbor.models.environment_type import EnvironmentType
@@ -961,10 +962,85 @@ def _e2b_qualifier(
             jobs_dir=(tmp_path / "jobs").resolve(),
             dataset_paths_by_id={"terminalbench": dataset.resolve()},
             budget=budget,
+            create_rate_ledger_path=(tmp_path / "qualification-rate.json").resolve(),
         ),
         operation_id="e2b-full-roster",
         e2b_spend_limit_provider=spend_limit_provider,
     )
+
+
+def test_qualification_rate_bootstrap_is_phase_free_and_side_effect_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    budget = _e2b_budget_runtime(tmp_path)
+    events: list[str] = []
+    monkeypatch.setenv("E2B_API_KEY", "must-not-enter-rate-evidence")
+
+    async def unexpected_build(**_kwargs: object) -> ExactE2BBuildRecord:
+        events.append("build")
+        raise AssertionError("rate bootstrap cannot dispatch a build")
+
+    def unexpected_environment(*_args: object, **_kwargs: object) -> BaseEnvironment:
+        events.append("environment")
+        raise AssertionError("rate bootstrap cannot create an environment")
+
+    monkeypatch.setattr(mod, "prepare_exact_e2b_build", unexpected_build)
+    monkeypatch.setattr(
+        EnvironmentFactory,
+        "create_environment_from_config",
+        classmethod(unexpected_environment),
+    )
+    qualifier = _e2b_qualifier(tmp_path, dataset, budget=budget)
+    authority = cast("Any", qualifier._create_rate_authority)
+    serialized = json.dumps(
+        {
+            "policy": authority.policy.model_dump(mode="json"),
+            "binding": authority.binding.model_dump(mode="json"),
+        },
+        sort_keys=True,
+    )
+
+    assert events == []
+    assert "phase" not in serialized
+    assert "must-not-enter-rate-evidence" not in serialized
+    assert str(tmp_path) not in serialized
+    assert (tmp_path / "qualification-rate.json").is_file()
+
+
+def test_qualification_rejects_missing_or_local_rate_ledger(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    e2b_plan = HarborExecutionPlan.freeze(
+        reference_harness=pi_node_baseline("reference"),
+        reward_key="reward",
+        environment_backend=HarborEnvironmentBackend.E2B,
+    )
+    with pytest.raises(ValueError, match="requires a create-rate ledger"):
+        mod.HarborRosterQualifier(
+            execution_plan=e2b_plan,
+            runtime=mod.HarborRosterQualificationRuntime(
+                jobs_dir=(tmp_path / "e2b-jobs").resolve(),
+                dataset_paths_by_id={"terminalbench": dataset.resolve()},
+                budget=_e2b_budget_runtime(tmp_path / "missing"),
+            ),
+            operation_id="missing-rate-ledger",
+        )
+
+    local_plan = HarborExecutionPlan.freeze(
+        reference_harness=pi_node_baseline("reference"),
+        reward_key="reward",
+    )
+    with pytest.raises(ValueError, match="local qualification"):
+        mod.HarborRosterQualifier(
+            execution_plan=local_plan,
+            runtime=mod.HarborRosterQualificationRuntime(
+                jobs_dir=(tmp_path / "local-jobs").resolve(),
+                dataset_paths_by_id={"terminalbench": dataset.resolve()},
+                create_rate_ledger_path=(tmp_path / "unexpected-rate.json").resolve(),
+            ),
+            operation_id="local-rate-ledger",
+        )
 
 
 def test_e2b_qualification_dedupes_builds_and_binds_launch_accounts(
@@ -1038,6 +1114,11 @@ def test_e2b_qualification_dedupes_builds_and_binds_launch_accounts(
         cast("Any", kwargs["config"]).kwargs["resource_budget_bindings"]
         for kwargs in constructor_kwargs
     )
+    create_rate_bindings = [
+        cast("Any", kwargs["config"]).kwargs["create_rate_binding"] for kwargs in constructor_kwargs
+    ]
+    assert all(binding == create_rate_bindings[0] for binding in create_rate_bindings)
+    assert str(tmp_path) not in json.dumps(create_rate_bindings)
 
 
 def test_e2b_partial_resume_reuses_completed_task_without_second_launch(

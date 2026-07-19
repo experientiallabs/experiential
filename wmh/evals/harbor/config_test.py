@@ -19,6 +19,11 @@ from wmh.evals.harbor.config import (
 )
 from wmh.evals.harbor.docker_environment import REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
 from wmh.evals.harbor.e2b_environment import EXACT_E2B_ENVIRONMENT_IMPORT_PATH
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRatePolicy,
+    bind_external_dispatch_rate_authority,
+)
 
 _DATASET_REF = "sha256:" + "a" * 64
 
@@ -49,6 +54,15 @@ def _agent() -> AgentConfig:
     )
 
 
+def _rate_policy() -> ExternalDispatchRatePolicy:
+    return ExternalDispatchRatePolicy(
+        provider="e2b",
+        operation="sandbox_create",
+        maximum_dispatches=4,
+        period_milliseconds=1000,
+    )
+
+
 def test_local_default_maps_explicitly_to_harbor_docker(tmp_path: Path) -> None:
     config = build_harbor_job_config(_spec(tmp_path), agent=_agent())
 
@@ -69,11 +83,31 @@ def test_local_default_maps_explicitly_to_harbor_docker(tmp_path: Path) -> None:
     assert config.agents[0].import_path == "wmh.evals.harbor.agent:WmhPiAgent"
     assert config.agents[0].kwargs == {"harness_name": "candidate", "harness_version": 7}
 
+    authority = ExternalDispatchRateAuthority.bootstrap(tmp_path / "rate.json", _rate_policy())
+    with pytest.raises(ValueError, match="local.*create-rate authority"):
+        build_harbor_job_config(
+            _spec(tmp_path),
+            agent=_agent(),
+            create_rate_binding=bind_external_dispatch_rate_authority(authority),
+        )
+    with pytest.raises(ValueError, match="unused E2B create-rate policy"):
+        build_harbor_job_config(
+            _spec(tmp_path, create_rate_policy=_rate_policy()),
+            agent=_agent(),
+        )
+
 
 def test_e2b_is_an_explicit_environment_with_no_docker_fallback(tmp_path: Path) -> None:
+    authority = ExternalDispatchRateAuthority.bootstrap(tmp_path / "rate.json", _rate_policy())
+    binding = bind_external_dispatch_rate_authority(authority)
     config = build_harbor_job_config(
-        _spec(tmp_path, environment_backend=HarborEnvironmentBackend.E2B),
+        _spec(
+            tmp_path,
+            environment_backend=HarborEnvironmentBackend.E2B,
+            create_rate_policy=_rate_policy(),
+        ),
         agent=_agent(),
+        create_rate_binding=binding,
     )
 
     assert config.environment.type is EnvironmentType.E2B
@@ -81,17 +115,47 @@ def test_e2b_is_an_explicit_environment_with_no_docker_fallback(tmp_path: Path) 
     assert config.environment.kwargs == {
         "allow_preexisting_e2b_builds": False,
         "resource_budget_bindings": [],
+        "create_rate_binding": binding.model_dump(mode="json"),
     }
 
 
+def test_e2b_job_rejects_missing_or_mismatched_create_rate_authority(tmp_path: Path) -> None:
+    spec = _spec(
+        tmp_path,
+        environment_backend=HarborEnvironmentBackend.E2B,
+        create_rate_policy=_rate_policy(),
+    )
+    with pytest.raises(ValueError, match="create-rate authority"):
+        build_harbor_job_config(spec, agent=_agent())
+
+    other_policy = _rate_policy().model_copy(update={"maximum_dispatches": 3})
+    authority = ExternalDispatchRateAuthority.bootstrap(tmp_path / "other-rate.json", other_policy)
+    with pytest.raises(ValueError, match="create-rate policy"):
+        build_harbor_job_config(
+            spec,
+            agent=_agent(),
+            create_rate_binding=bind_external_dispatch_rate_authority(authority),
+        )
+
+    with pytest.raises(ValidationError, match="four-per-second"):
+        _spec(
+            tmp_path,
+            environment_backend=HarborEnvironmentBackend.E2B,
+            create_rate_policy=_rate_policy().model_copy(update={"maximum_dispatches": 5}),
+        )
+
+
 def test_preexisting_e2b_build_admission_is_explicit_and_frozen(tmp_path: Path) -> None:
+    authority = ExternalDispatchRateAuthority.bootstrap(tmp_path / "rate.json", _rate_policy())
     config = build_harbor_job_config(
         _spec(
             tmp_path,
             environment_backend=HarborEnvironmentBackend.E2B,
+            create_rate_policy=_rate_policy(),
             allow_preexisting_e2b_builds=True,
         ),
         agent=_agent(),
+        create_rate_binding=bind_external_dispatch_rate_authority(authority),
     )
 
     assert config.environment.kwargs["allow_preexisting_e2b_builds"] is True

@@ -4,17 +4,22 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
-from typing import Self
+from typing import Self, cast
 
 import harbor
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import DatasetConfig, JobConfig, RetryConfig
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wmh.evals.harbor.docker_environment import REAPING_DOCKER_ENVIRONMENT_IMPORT_PATH
 from wmh.evals.harbor.e2b_environment import EXACT_E2B_ENVIRONMENT_IMPORT_PATH
 from wmh.tracking.budget import BudgetAccountBinding
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateBinding,
+    ExternalDispatchRatePolicy,
+    validate_e2b_sandbox_create_rate_policy,
+)
 
 SUPPORTED_HARBOR_VERSION = "0.18.0"
 
@@ -29,6 +34,8 @@ class HarborEnvironmentBackend(StrEnum):
 class HarborJobSpec(BaseModel):
     """Stable task-matrix inputs used to construct one exact Harbor job configuration."""
 
+    model_config = ConfigDict(extra="forbid")
+
     job_name: str = Field(min_length=1)
     jobs_dir: Path
     datasets: list[DatasetConfig] = Field(min_length=1)
@@ -36,6 +43,7 @@ class HarborJobSpec(BaseModel):
     n_concurrent_trials: int = Field(default=1, ge=1)
     agent_n_concurrent: int | None = Field(default=None, ge=1)
     environment_backend: HarborEnvironmentBackend = HarborEnvironmentBackend.LOCAL
+    create_rate_policy: ExternalDispatchRatePolicy | None = None
     allow_preexisting_e2b_builds: bool = False
     max_retries: int = Field(
         default=0,
@@ -74,6 +82,13 @@ class HarborJobSpec(BaseModel):
             and self.environment_backend is not HarborEnvironmentBackend.E2B
         ):
             raise ValueError("preexisting E2B builds can be admitted only with the E2B backend")
+        if self.create_rate_policy is not None:
+            validate_e2b_sandbox_create_rate_policy(self.create_rate_policy)
+        if (
+            self.environment_backend is HarborEnvironmentBackend.E2B
+            and self.create_rate_policy is None
+        ):
+            raise ValueError("Harbor E2B environments require a create-rate policy")
         return self
 
 
@@ -82,6 +97,7 @@ def build_harbor_job_config(
     *,
     agent: AgentConfig,
     task_resource_budget_bindings: tuple[BudgetAccountBinding, ...] = (),
+    create_rate_binding: ExternalDispatchRateBinding | None = None,
 ) -> JobConfig:
     """Translate a stable WMH job spec to Harbor 0.18's programmatic ``JobConfig``.
 
@@ -96,6 +112,38 @@ def build_harbor_job_config(
     local_environment = spec.environment_backend is HarborEnvironmentBackend.LOCAL
     if local_environment and task_resource_budget_bindings:
         raise ValueError("local Harbor task environments cannot consume a resource meter")
+    if local_environment and create_rate_binding is not None:
+        raise ValueError("local Harbor task environments cannot consume a create-rate authority")
+    frozen_rate_binding = (
+        None
+        if create_rate_binding is None
+        else ExternalDispatchRateBinding.model_validate(create_rate_binding.model_dump())
+    )
+    serialized_agent_rate_binding = agent.kwargs.get("create_rate_binding")
+    agent_rate_binding = (
+        None
+        if serialized_agent_rate_binding is None
+        else ExternalDispatchRateBinding.model_validate(serialized_agent_rate_binding)
+    )
+    if spec.create_rate_policy is None:
+        if agent_rate_binding is not None:
+            raise ValueError("local Harbor execution cannot consume a create-rate authority")
+    elif agent_rate_binding is not None and (
+        agent_rate_binding.policy_digest != spec.create_rate_policy.digest
+    ):
+        raise ValueError("E2B Pi runner create-rate policy differs from its authority")
+    if local_environment and spec.create_rate_policy is not None and agent_rate_binding is None:
+        raise ValueError("local Harbor execution cannot carry an unused E2B create-rate policy")
+    if not local_environment:
+        if frozen_rate_binding is None:
+            raise ValueError("E2B task environments require a create-rate authority")
+        if (
+            spec.create_rate_policy is None
+            or frozen_rate_binding.policy_digest != spec.create_rate_policy.digest
+        ):
+            raise ValueError("E2B create-rate policy differs from its authority")
+        if agent_rate_binding is not None and agent_rate_binding != frozen_rate_binding:
+            raise ValueError("E2B task and runner creates require one shared authority")
     frozen_bindings = tuple(
         BudgetAccountBinding.model_validate(binding.model_dump())
         for binding in task_resource_budget_bindings
@@ -131,6 +179,9 @@ def build_harbor_job_config(
                     "resource_budget_bindings": [
                         binding.model_dump(mode="json") for binding in frozen_bindings
                     ],
+                    "create_rate_binding": cast(
+                        "ExternalDispatchRateBinding", frozen_rate_binding
+                    ).model_dump(mode="json"),
                 }
             ),
             extra_allowed_hosts=[],
@@ -180,6 +231,7 @@ def validate_controlled_harbor_environment(
         if environment.type is not EnvironmentType.E2B or set(environment.kwargs) != {
             "allow_preexisting_e2b_builds",
             "resource_budget_bindings",
+            "create_rate_binding",
         }:
             raise ValueError("Harbor environment backend kwargs are unsupported")
         if not isinstance(environment.kwargs["allow_preexisting_e2b_builds"], bool):
@@ -192,6 +244,7 @@ def validate_controlled_harbor_environment(
             raise ValueError("Harbor task resource budget bindings must be unique")
         if bindings and len({item.policy_digest for item in bindings}) != 1:
             raise ValueError("Harbor task resource budgets must share one policy")
+        ExternalDispatchRateBinding.model_validate(environment.kwargs["create_rate_binding"])
     if environment.extra_allowed_hosts:
         raise ValueError("Harbor run-level extra allowed hosts are unsupported")
 

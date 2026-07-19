@@ -84,6 +84,10 @@ from wmh.tracking.budget import (
     open_shared_spend_ledger,
     validate_timed_resource_class,
 )
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateAuthority,
+    bind_external_dispatch_rate_authority,
+)
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _QUALIFICATION_ROOT = ".wmh-roster-qualification"
@@ -311,6 +315,7 @@ class HarborRosterQualificationRuntime(BaseModel):
     jobs_dir: Path
     dataset_paths_by_id: dict[str, Path] = Field(min_length=1)
     budget: HarborRosterQualificationBudgetRuntime | None = None
+    create_rate_ledger_path: Path | None = None
     environment_start_timeout_s: float = Field(default=1800.0, gt=0.0, allow_inf_nan=False)
 
     @model_validator(mode="after")
@@ -319,6 +324,11 @@ class HarborRosterQualificationRuntime(BaseModel):
             raise ValueError("qualification jobs_dir must be absolute")
         if not math.isfinite(self.environment_start_timeout_s):
             raise ValueError("qualification environment timeout must be finite")
+        if (
+            self.create_rate_ledger_path is not None
+            and not self.create_rate_ledger_path.is_absolute()
+        ):
+            raise ValueError("qualification create-rate ledger path must be absolute")
         paths: list[Path] = []
         source_names: set[str] = set()
         for dataset_id, path in self.dataset_paths_by_id.items():
@@ -550,8 +560,23 @@ class HarborRosterQualifier:
         if self._plan.environment_backend is HarborEnvironmentBackend.LOCAL:
             if self._runtime.budget is not None:
                 raise ValueError("local qualification cannot carry E2B budget authority")
+            if self._runtime.create_rate_ledger_path is not None:
+                raise ValueError("local qualification cannot carry an E2B create-rate ledger")
+            self._create_rate_authority: ExternalDispatchRateAuthority | None = None
         elif self._runtime.budget is None:
             raise ValueError("E2B qualification requires build and launch budget authority")
+        elif self._runtime.create_rate_ledger_path is None:
+            raise ValueError("E2B qualification requires a create-rate ledger path")
+        else:
+            rate_policy = self._plan.create_rate_policy
+            if rate_policy is None:
+                raise ValueError("E2B qualification execution plan lacks a create-rate policy")
+            authority = ExternalDispatchRateAuthority.bootstrap(
+                self._runtime.create_rate_ledger_path,
+                rate_policy,
+            )
+            bind_external_dispatch_rate_authority(authority)
+            self._create_rate_authority = authority
         operation_hash = hashlib.sha256(operation_id.encode()).hexdigest()
         self._root = self._runtime.jobs_dir / _QUALIFICATION_ROOT / operation_hash
 
@@ -650,6 +675,11 @@ class HarborRosterQualifier:
             n_concurrent_trials=1,
             agent_n_concurrent=1,
             environment_backend=self._plan.environment_backend,
+            create_rate_policy=(
+                self._plan.create_rate_policy
+                if self._plan.environment_backend is HarborEnvironmentBackend.E2B
+                else None
+            ),
             allow_preexisting_e2b_builds=False,
             max_retries=0,
         )
@@ -657,6 +687,9 @@ class HarborRosterQualifier:
             spec,
             agent=agent,
             task_resource_budget_bindings=task_bindings,
+            create_rate_binding=(
+                None if self._create_rate_authority is None else self._create_rate_authority.binding
+            ),
         )
         config = snapshot_local_harbor_datasets(config)
         await reject_executable_harbor_metrics(config)

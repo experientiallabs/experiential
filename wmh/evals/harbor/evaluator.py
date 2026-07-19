@@ -97,6 +97,11 @@ from wmh.tracking.budget import (
     bind_timed_resource_account,
     validate_timed_resource_class,
 )
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRateBinding,
+    bind_external_dispatch_rate_authority,
+)
 
 _MANIFEST_FILENAME = "wmh-manifest.json"
 _MAX_TASK_HOST_TEXT_BYTES = 1024 * 1024
@@ -105,7 +110,7 @@ _TASK_SNAPSHOT_ROOT = ".wmh-task-snapshots"
 _JOB_ROOT_FILES = frozenset(
     {_MANIFEST_FILENAME, "config.json", "job.log", "lock.json", "result.json"}
 )
-HARBOR_EVALUATOR_VERSION = "1"
+HARBOR_EVALUATOR_VERSION = "2"
 
 
 class StaleHarborJobError(RuntimeError):
@@ -236,6 +241,7 @@ def _build_harbor_agent_config(
     budget_policy_digest: str | None = None,
     budget_binding: BudgetAccountBinding | None = None,
     runner_budget_binding: BudgetAccountBinding | None = None,
+    create_rate_binding: ExternalDispatchRateBinding | None = None,
 ) -> AgentConfig:
     if budget_binding is not None and budget_binding.policy_digest != budget_policy_digest:
         raise ValueError("budget binding differs from the frozen policy digest")
@@ -243,6 +249,8 @@ def _build_harbor_agent_config(
         budget_binding is None or runner_budget_binding.policy_digest != budget_policy_digest
     ):
         raise ValueError("runner resource budget differs from the provider budget policy")
+    if isinstance(runner_spec, LocalPiRunnerSpec) and create_rate_binding is not None:
+        raise ValueError("local Pi runners cannot consume an E2B create-rate authority")
     model_name = f"{provider_config.kind.value}/{provider_config.model}"
     kwargs = {
         "harness": candidate.model_dump(mode="json"),
@@ -257,6 +265,8 @@ def _build_harbor_agent_config(
         kwargs["budget_binding"] = budget_binding.model_dump(mode="json")
     if runner_budget_binding is not None:
         kwargs["runner_budget_binding"] = runner_budget_binding.model_dump(mode="json")
+    if create_rate_binding is not None:
+        kwargs["create_rate_binding"] = create_rate_binding.model_dump(mode="json")
     return AgentConfig(
         import_path=WmhPiAgent.import_path(),
         model_name=model_name,
@@ -377,6 +387,7 @@ class HarborEvaluator:
         budget_account: BudgetAccount | None = None,
         task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
         runner_resource_budget_account: TimedResourceBudgetAccount | None = None,
+        create_rate_authority: ExternalDispatchRateAuthority | None = None,
     ) -> None:
         validated_runner = _coerce_runner_spec(
             runner_spec=runner_spec,
@@ -399,6 +410,7 @@ class HarborEvaluator:
         self._budget_binding: BudgetAccountBinding | None = None
         self._task_resource_budget_bindings: tuple[BudgetAccountBinding, ...] = ()
         self._runner_resource_budget_binding: BudgetAccountBinding | None = None
+        self._create_rate_binding: ExternalDispatchRateBinding | None = None
         self._task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = ()
         self._runner_resource_budget_account: TimedResourceBudgetAccount | None = None
         if budget_account is not None:
@@ -461,6 +473,18 @@ class HarborEvaluator:
         )
         if runner_account is not None:
             self._runner_resource_budget_binding = bind_timed_resource_account(runner_account)
+        requires_create_rate = (
+            self._spec.environment_backend is HarborEnvironmentBackend.E2B
+            or not isinstance(self._runner_spec, LocalPiRunnerSpec)
+        )
+        if requires_create_rate:
+            if self._spec.create_rate_policy is None or create_rate_authority is None:
+                raise ValueError("E2B execution requires a frozen create-rate authority")
+            if create_rate_authority.policy != self._spec.create_rate_policy:
+                raise ValueError("E2B create-rate authority differs from the frozen policy")
+            self._create_rate_binding = bind_external_dispatch_rate_authority(create_rate_authority)
+        elif self._spec.create_rate_policy is not None or create_rate_authority is not None:
+            raise ValueError("local execution cannot carry an E2B create-rate authority")
         self._runner_ready = False
 
     @staticmethod
@@ -498,6 +522,11 @@ class HarborEvaluator:
             self._spec,
             agent=agent,
             task_resource_budget_bindings=self._task_resource_budget_bindings,
+            create_rate_binding=(
+                self._create_rate_binding
+                if self._spec.environment_backend is HarborEnvironmentBackend.E2B
+                else None
+            ),
         )
         job_config = _snapshot_local_datasets(job_config)
         job_dir = job_config.jobs_dir / job_config.job_name
@@ -585,6 +614,11 @@ class HarborEvaluator:
             budget_policy_digest=self._budget_policy_digest,
             budget_binding=self._budget_binding,
             runner_budget_binding=self._runner_resource_budget_binding,
+            create_rate_binding=(
+                self._create_rate_binding
+                if not isinstance(self._runner_spec, LocalPiRunnerSpec)
+                else None
+            ),
         )
 
     def _run_identity(
@@ -1621,6 +1655,9 @@ def harbor_run_config_digest(spec: HarborJobSpec, agent_config_digest: str) -> s
         "attempts_per_task": spec.n_attempts,
         "trial_concurrency": spec.n_concurrent_trials,
         "agent_concurrency": spec.agent_n_concurrent,
+        "create_rate_policy_digest": (
+            None if spec.create_rate_policy is None else spec.create_rate_policy.digest
+        ),
         "artifact_paths": list(spec.artifact_paths),
         "retry": {
             "max_retries": spec.max_retries,

@@ -68,6 +68,12 @@ from wmh.tracking.budget import (
     resolve_budget_account,
     resolve_timed_resource_account,
 )
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRateBinding,
+    resolve_external_dispatch_rate_authority,
+    validate_e2b_sandbox_create_rate_policy,
+)
 
 _TOOL_OUTPUT_CHARS = 16_000
 _TOOL_STREAM_CHARS = _TOOL_OUTPUT_CHARS // 2
@@ -85,7 +91,7 @@ _TRACE_FILE = "wmh-events.jsonl"
 _RUNNER_LEASE_FILE = "wmh-runner-lease.json"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.8.1"
+WMH_PI_AGENT_VERSION: Final = "0.9.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -542,6 +548,7 @@ class WmhPiAgent(BaseAgent):
         budget_policy_digest: str | None = None,
         budget_binding: JsonObject | None = None,
         runner_budget_binding: JsonObject | None = None,
+        create_rate_binding: JsonObject | None = None,
         runner_spec: JsonObject | None = None,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = False,
@@ -584,6 +591,7 @@ class WmhPiAgent(BaseAgent):
         validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
             runner_spec if runner_spec is not None else LocalPiRunnerSpec().model_dump(mode="json")
         )
+        validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
         runner_binding = (
             BudgetAccountBinding.model_validate(runner_budget_binding)
             if runner_budget_binding is not None
@@ -597,10 +605,24 @@ class WmhPiAgent(BaseAgent):
             runner_budget_account = resolve_timed_resource_account(runner_binding)
         else:
             runner_budget_account = None
+        rate_binding = (
+            None
+            if create_rate_binding is None
+            else ExternalDispatchRateBinding.model_validate(create_rate_binding)
+        )
+        create_rate_authority: ExternalDispatchRateAuthority | None
+        if isinstance(validated_runner, E2BPiRunnerSpec):
+            if rate_binding is None:
+                raise ValueError("E2B Pi runners require a create-rate authority")
+            create_rate_authority = resolve_external_dispatch_rate_authority(rate_binding)
+            validate_e2b_sandbox_create_rate_policy(create_rate_authority.policy)
+        else:
+            if rate_binding is not None:
+                raise ValueError("local Pi runners cannot consume an E2B create-rate authority")
+            create_rate_authority = None
         if isinstance(validated_runner, E2BPiRunnerSpec) and binding is not None:
             if runner_budget_account is None:
                 raise ValueError("budgeted E2B runners require a timed resource budget")
-        validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
         if not isinstance(require_provider_receipts, bool):
             raise ValueError("require_provider_receipts must be a boolean")
         self._provider_config = config.model_copy(deep=True)
@@ -610,6 +632,7 @@ class WmhPiAgent(BaseAgent):
             if runner_budget_account is not None
             else None
         )
+        self._create_rate_authority = create_rate_authority
         self._runner_spec = validated_runner
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
@@ -643,11 +666,25 @@ class WmhPiAgent(BaseAgent):
             raise WmhPiEnvironmentError("task environment attestation is unavailable")
         ledger_path = self.logs_dir.parent / _RUNNER_LEASE_FILE
         owner_id = runner_owner_id(self.logs_dir.parent.name)
-        if self._runner_budget_account is None:
+        if self._runner_budget_account is None and self._create_rate_authority is None:
             runner_factory = build_pi_runner_factory(
                 self._runner_spec,
                 ledger_path=ledger_path,
                 owner_id=owner_id,
+            )
+        elif self._runner_budget_account is None:
+            runner_factory = build_pi_runner_factory(
+                self._runner_spec,
+                ledger_path=ledger_path,
+                owner_id=owner_id,
+                create_rate_authority=self._create_rate_authority,
+            )
+        elif self._create_rate_authority is None:
+            runner_factory = build_pi_runner_factory(
+                self._runner_spec,
+                ledger_path=ledger_path,
+                owner_id=owner_id,
+                resource_budget_account=self._runner_budget_account,
             )
         else:
             runner_factory = build_pi_runner_factory(
@@ -655,6 +692,7 @@ class WmhPiAgent(BaseAgent):
                 ledger_path=ledger_path,
                 owner_id=owner_id,
                 resource_budget_account=self._runner_budget_account,
+                create_rate_authority=self._create_rate_authority,
             )
 
         def identity_metadata() -> JsonObject:

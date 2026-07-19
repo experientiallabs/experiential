@@ -1170,6 +1170,7 @@ def harbor_agent_config_digest(config: AgentConfig) -> str:
     if isinstance(kwargs, dict):
         kwargs.pop("budget_binding", None)
         kwargs.pop("runner_budget_binding", None)
+        kwargs.pop("create_rate_binding", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
 

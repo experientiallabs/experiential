@@ -49,6 +49,7 @@ from wmh.tracking.budget import (
     TokenPriceCeiling,
     bootstrap_budget_ledger,
 )
+from wmh.tracking.rate_limit import E2B_SANDBOX_CREATE_RATE_POLICY
 
 _TASK_IDS = ("alpha", "beta")
 _TASK_KEYS = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
@@ -94,6 +95,9 @@ def _spec(
         n_concurrent_trials=2,
         agent_n_concurrent=1,
         environment_backend=backend,
+        create_rate_policy=(
+            E2B_SANDBOX_CREATE_RATE_POLICY if backend is HarborEnvironmentBackend.E2B else None
+        ),
     )
 
 

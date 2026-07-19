@@ -48,6 +48,7 @@ from wmh.tracking.budget import (
     TokenPriceCeiling,
     bootstrap_budget_ledger,
 )
+from wmh.tracking.rate_limit import ExternalDispatchRateAuthority
 
 harness_eval_module = importlib.import_module("wmh.cli.harness_eval")
 runner = CliRunner()
@@ -351,6 +352,7 @@ def _patch_evaluator(
             budget_account: BudgetAccount | None = None,
             task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
             runner_resource_budget_account: TimedResourceBudgetAccount | None = None,
+            create_rate_authority: ExternalDispatchRateAuthority | None = None,
         ) -> None:
             self._call: dict[str, object] = {
                 "spec": spec,
@@ -360,6 +362,7 @@ def _patch_evaluator(
                 "budget_account": budget_account,
                 "task_resource_budget_accounts": task_resource_budget_accounts,
                 "runner_resource_budget_account": runner_resource_budget_account,
+                "create_rate_authority": create_rate_authority,
             }
 
         async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
@@ -706,6 +709,9 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
     assert provider.api_version == "2026-01-01-preview"
     assert call["budget_account"] == provider_account
     assert call["task_resource_budget_accounts"] == (task_account,)
+    rate_authority = cast("ExternalDispatchRateAuthority", call["create_rate_authority"])
+    assert rate_authority.policy == spec.create_rate_policy
+    assert str(tmp_path) not in rate_authority.binding.model_dump_json()
     assert provider.region is None
 
 
