@@ -18,7 +18,7 @@ from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, model_validator
 
-from wmh.core.file_lease import exclusive_posix_file_lease
+from wmh.core.file_lease import exclusive_posix_file_lease_at
 from wmh.core.text import validate_durable_text
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
@@ -209,10 +209,17 @@ class StudyJournalStore:
         publisher_configuration_digest: str,
     ) -> None:
         self._directory = Path(os.path.abspath(Path(directory).expanduser()))
-        self._directory_identity = _validate_private_directory(self._directory)
-        self._genesis = StudyJournalGenesis.model_validate_json(
-            _read_regular_file(self._directory / _GENESIS_FILE)
-        )
+        directory_descriptor = _open_private_directory(self._directory)
+        try:
+            self._directory_identity = _private_directory_identity(
+                os.fstat(directory_descriptor)
+            )
+            self._genesis = StudyJournalGenesis.model_validate_json(
+                _read_regular_file_at(directory_descriptor, _GENESIS_FILE)
+            )
+            _require_directory_binding(self._directory, self._directory_identity)
+        finally:
+            os.close(directory_descriptor)
         if self._genesis.study_id != study_id:
             raise ValueError("study journal belongs to a different study")
         if self._genesis.publisher_configuration_digest != publisher_configuration_digest:
@@ -232,15 +239,28 @@ class StudyJournalStore:
             study_id=study_id,
             publisher_configuration_digest=publisher_configuration_digest,
         )
+        created = False
         try:
             path.mkdir(parents=True, mode=0o700)
+            created = True
         except FileExistsError:
             pass
-        _validate_private_directory(path)
-        _publish_regular_file_once(
-            path / _GENESIS_FILE,
-            _canonical_json_bytes(genesis.model_dump(mode="json")),
+        if created:
+            _fsync_parent_directory(path)
+        directory_identity = _validate_private_directory(path)
+        directory_descriptor = _open_private_directory(
+            path,
+            expected_identity=directory_identity,
         )
+        try:
+            _publish_regular_file_once_at(
+                directory_descriptor,
+                _GENESIS_FILE,
+                _canonical_json_bytes(genesis.model_dump(mode="json")),
+            )
+            _require_directory_binding(path, directory_identity)
+        finally:
+            os.close(directory_descriptor)
         return cls(
             path,
             study_id=study_id,
@@ -258,17 +278,35 @@ class StudyJournalStore:
         return self._genesis
 
     @contextmanager
-    def locked(self) -> Iterator[None]:
-        """Hold the store lease and reject directory replacement."""
-        with exclusive_posix_file_lease(
-            self._directory / _LOCK_FILE,
-            unsupported_error=RuntimeError("study journal requires POSIX file locking"),
-            irregular_file_error=OSError("study journal lock must be a regular file"),
-            contention_error=RuntimeError("study journal is already locked"),
-        ):
-            if _validate_private_directory(self._directory) != self._directory_identity:
-                raise OSError("study journal directory was replaced")
-            yield
+    def locked(self) -> Iterator[int]:
+        """Hold the store lease and pin every operation to the opened directory."""
+        directory_descriptor = _open_private_directory(
+            self._directory,
+            expected_identity=self._directory_identity,
+        )
+        try:
+            with exclusive_posix_file_lease_at(
+                directory_descriptor,
+                _LOCK_FILE,
+                unsupported_error=RuntimeError("study journal requires POSIX file locking"),
+                irregular_file_error=OSError("study journal lock must be a regular file"),
+                contention_error=RuntimeError("study journal is already locked"),
+            ):
+                _require_directory_binding(self._directory, self._directory_identity)
+                try:
+                    yield directory_descriptor
+                except BaseException as primary_error:
+                    try:
+                        _require_directory_binding(self._directory, self._directory_identity)
+                    except OSError as binding_error:
+                        primary_error.add_note(
+                            f"study journal directory binding also failed: {binding_error}"
+                        )
+                    raise
+                else:
+                    _require_directory_binding(self._directory, self._directory_identity)
+        finally:
+            os.close(directory_descriptor)
 
 
 def load_study_journal(
@@ -277,8 +315,8 @@ def load_study_journal(
     publisher: ExternalCommitmentPublisher | None = None,
 ) -> tuple[StudyPhaseRecord, ...]:
     """Load and revalidate the complete local chain and optional external proofs."""
-    with store.locked():
-        records = _load_records_locked(store)
+    with store.locked() as directory_descriptor:
+        records = _load_records_locked(store, directory_descriptor)
         if publisher is not None:
             _validate_publisher(store, publisher)
             for record in records:
@@ -299,8 +337,8 @@ def append_study_phase(
         raise ValueError("study phase payload_digest must be a canonical SHA-256 digest")
     _validate_publisher(store, publisher)
     requested_index = STUDY_PHASES.index(requested_phase)
-    with store.locked():
-        records = _load_records_locked(store)
+    with store.locked() as directory_descriptor:
+        records = _load_records_locked(store, directory_descriptor)
         if requested_index < len(records):
             existing = records[requested_index]
             if existing.commitment.payload_digest != payload_digest:
@@ -328,37 +366,42 @@ def append_study_phase(
         if records and publication.published_at < records[-1].publication.published_at:
             raise ValueError("study journal publication timestamps move backwards")
         record = StudyPhaseRecord.create(commitment=commitment, publication=publication)
-        _publish_regular_file_once(
-            _record_path(store.directory, requested_index, requested_phase),
+        _publish_regular_file_once_at(
+            directory_descriptor,
+            _record_name(requested_index, requested_phase),
             _canonical_json_bytes(record.model_dump(mode="json")),
         )
-        persisted = _load_records_locked(store)
+        persisted = _load_records_locked(store, directory_descriptor)
         if len(persisted) != len(records) + 1 or persisted[-1] != record:
             raise RuntimeError("study journal append did not persist the exact phase record")
         return record
 
 
-def _load_records_locked(store: StudyJournalStore) -> tuple[StudyPhaseRecord, ...]:
-    record_names: list[tuple[int, StudyPhase, Path]] = []
-    for entry in os.scandir(store.directory):
-        match = _RECORD_PATTERN.fullmatch(entry.name)
+def _load_records_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+) -> tuple[StudyPhaseRecord, ...]:
+    record_names: list[tuple[int, StudyPhase, str]] = []
+    for name in os.listdir(directory_descriptor):
+        match = _RECORD_PATTERN.fullmatch(name)
         if match is None:
             continue
         try:
             phase = StudyPhase(match.group("phase"))
         except ValueError as exc:
-            raise ValueError(f"study journal contains unknown phase file {entry.name!r}") from exc
-        record_names.append((int(match.group("sequence")), phase, Path(entry.path)))
+            raise ValueError(f"study journal contains unknown phase file {name!r}") from exc
+        record_names.append((int(match.group("sequence")), phase, name))
     record_names.sort(key=lambda item: (item[0], item[1].value))
 
     records: list[StudyPhaseRecord] = []
-    for expected_sequence, (sequence, phase, path) in enumerate(record_names):
+    for expected_sequence, (sequence, phase, name) in enumerate(record_names):
         if sequence != expected_sequence or phase is not STUDY_PHASES[expected_sequence]:
             raise ValueError("study journal phase files are missing, duplicated, or out of order")
-        expected_path = _record_path(store.directory, sequence, phase)
-        if path != expected_path:
+        if name != _record_name(sequence, phase):
             raise ValueError("study journal phase filename is not canonical")
-        record = StudyPhaseRecord.model_validate_json(_read_regular_file(path))
+        record = StudyPhaseRecord.model_validate_json(
+            _read_regular_file_at(directory_descriptor, name)
+        )
         expected_previous = records[-1].digest if records else None
         if (
             record.commitment.journal_genesis_digest != store.genesis.digest
@@ -374,8 +417,8 @@ def _load_records_locked(store: StudyJournalStore) -> tuple[StudyPhaseRecord, ..
     return tuple(records)
 
 
-def _record_path(directory: Path, sequence: int, phase: StudyPhase) -> Path:
-    return directory / f"{sequence:03d}-{phase.value}.json"
+def _record_name(sequence: int, phase: StudyPhase) -> str:
+    return f"{sequence:03d}-{phase.value}.json"
 
 
 def _validate_publisher(
@@ -391,6 +434,10 @@ def _validate_private_directory(path: Path) -> tuple[int, int]:
         metadata = os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
         raise OSError("study journal directory does not exist") from None
+    return _private_directory_identity(metadata)
+
+
+def _private_directory_identity(metadata: os.stat_result) -> tuple[int, int]:
     if not stat.S_ISDIR(metadata.st_mode):
         raise OSError("study journal path must be a directory, not a symlink or file")
     if metadata.st_mode & 0o077:
@@ -400,9 +447,63 @@ def _validate_private_directory(path: Path) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
-def _read_regular_file(path: Path) -> bytes:
+def _open_private_directory(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> int:
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except FileNotFoundError:
+        raise OSError("study journal directory does not exist") from None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise OSError(
+                "study journal path must be a directory, not a symlink or file"
+            ) from exc
+        raise
+    try:
+        identity = _private_directory_identity(os.fstat(descriptor))
+        if expected_identity is not None and identity != expected_identity:
+            raise OSError("study journal directory was replaced or changed")
+        _require_directory_binding(path, identity)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_directory_binding(path: Path, expected_identity: tuple[int, int]) -> None:
+    try:
+        actual_identity = _validate_private_directory(path)
+    except OSError as exc:
+        raise OSError("study journal directory was replaced or changed") from exc
+    if actual_identity != expected_identity:
+        raise OSError("study journal directory was replaced or changed")
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    descriptor = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file_at(directory_descriptor: int, name: str) -> bytes:
+    _validate_leaf_name(name)
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_descriptor,
+        )
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise OSError("study journal record must be a regular file") from exc
@@ -433,43 +534,58 @@ def _read_regular_file(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def _publish_regular_file_once(path: Path, payload: bytes) -> None:
+def _publish_regular_file_once_at(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+) -> None:
+    _validate_leaf_name(name)
     if len(payload) > _MAX_RECORD_BYTES:
         raise OSError("study journal record exceeds its size limit")
-    temporary = path.parent / f".tmp-{path.name}-{uuid.uuid4().hex}"
+    temporary = f".tmp-{name}-{uuid.uuid4().hex}"
     descriptor = os.open(
         temporary,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
         0o600,
+        dir_fd=directory_descriptor,
     )
     try:
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(descriptor, payload[offset:])
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
         try:
-            os.link(temporary, path, follow_symlinks=False)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
         except FileExistsError:
-            if _read_regular_file(path) != payload:
+            if _read_regular_file_at(directory_descriptor, name) != payload:
                 raise ValueError(
                     "study journal file already exists with different content"
                 ) from None
-        directory_descriptor = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        os.fsync(directory_descriptor)
     finally:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary, dir_fd=directory_descriptor)
         except FileNotFoundError:
             pass
+
+
+def _validate_leaf_name(name: str) -> None:
+    if (
+        not name
+        or name in {".", ".."}
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+    ):
+        raise ValueError("study journal filename must be one path component")
 
 
 def _canonical_json_bytes(value: object) -> bytes:
