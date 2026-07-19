@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter
+from fractions import Fraction
 
 import pytest
 from pydantic import ValidationError
 
 from wmh.evals.paired import (
+    BoundedMeanBet,
     PairedArm,
     PairedBlockOutcome,
     PairedEvaluationDesign,
     PairedPanelPlan,
+    _bounded_mean_interval,
+    _bounded_mean_log_e,
+    _bounded_mean_p,
+    _divide_float_downward,
+    _holm_adjust,
     analyze_paired_outcomes,
 )
 
@@ -22,6 +30,8 @@ def _design(
     panel_members: tuple[str, ...] = ("small", "medium", "large"),
     attempts: int = 2,
     attempts_by_member: dict[str, int] | None = None,
+    bounded_mean_bets: tuple[BoundedMeanBet, ...] | None = None,
+    noninferiority_margin: float = 0.02,
 ) -> PairedEvaluationDesign:
     attempt_counts = attempts_by_member or {
         panel_member: attempts for panel_member in panel_members
@@ -35,13 +45,13 @@ def _design(
             )
             for panel_member in panel_members
         ),
+        bounded_mean_bets=bounded_mean_bets or (BoundedMeanBet(fraction=1.0, weight=1.0),),
         schedule_seed="schedule-v1",
         analysis_seed="analysis-v1",
         randomization_samples=2_000,
-        bootstrap_samples=2_000,
         minimum_panel_delta=0.05,
         minimum_member_delta=0.03,
-        noninferiority_margin=0.02,
+        noninferiority_margin=noninferiority_margin,
     )
 
 
@@ -134,17 +144,16 @@ def test_schedule_supports_predeclared_member_specific_attempt_counts() -> None:
 
     per_task_member: dict[tuple[str, str], Counter[PairedArm]] = {}
     for block in design.blocks:
-        per_task_member.setdefault(
-            (block.task_id, block.panel_member), Counter()
-        )[block.first_arm] += 1
+        per_task_member.setdefault((block.task_id, block.panel_member), Counter())[
+            block.first_arm
+        ] += 1
     for plan in design.panel:
         member_counts = {
             task: per_task_member[(task, plan.panel_member)] for task in design.task_ids
         }
         assert all(sum(value.values()) == plan.attempts for value in member_counts.values())
         assert all(
-            abs(value[PairedArm.BASELINE] - value[PairedArm.CANDIDATE])
-            == plan.attempts % 2
+            abs(value[PairedArm.BASELINE] - value[PairedArm.CANDIDATE]) == plan.attempts % 2
             for value in member_counts.values()
         )
         total = sum(member_counts.values(), Counter())
@@ -167,6 +176,68 @@ def test_design_rejects_a_schedule_that_differs_from_its_frozen_seed() -> None:
     with pytest.raises(ValidationError, match="schedule_seed"):
         PairedEvaluationDesign.model_validate(
             {**design.model_dump(mode="json"), "blocks": [block.model_dump() for block in changed]}
+        )
+
+
+def test_bounded_mean_bets_are_frozen_canonical_and_part_of_the_digest() -> None:
+    first = _design(
+        bounded_mean_bets=(
+            BoundedMeanBet(fraction=1.0, weight=0.4),
+            BoundedMeanBet(fraction=0.25, weight=0.6),
+        )
+    )
+    reordered = _design(
+        bounded_mean_bets=(
+            BoundedMeanBet(fraction=0.25, weight=0.6),
+            BoundedMeanBet(fraction=1.0, weight=0.4),
+        )
+    )
+
+    assert first == reordered
+    assert first.digest == reordered.digest
+    assert tuple(bet.fraction for bet in first.bounded_mean_bets) == (0.25, 1.0)
+    changed = _design(
+        bounded_mean_bets=(
+            BoundedMeanBet(fraction=0.25, weight=0.4),
+            BoundedMeanBet(fraction=1.0, weight=0.6),
+        )
+    )
+    assert changed.digest != first.digest
+
+
+def test_bounded_mean_bets_reject_duplicates_and_unnormalized_weights() -> None:
+    with pytest.raises(ValueError, match="duplicate fractions"):
+        _design(
+            bounded_mean_bets=(
+                BoundedMeanBet(fraction=0.5, weight=0.5),
+                BoundedMeanBet(fraction=0.5, weight=0.5),
+            )
+        )
+    with pytest.raises(ValueError, match="sum to one"):
+        _design(
+            bounded_mean_bets=(
+                BoundedMeanBet(fraction=0.25, weight=0.4),
+                BoundedMeanBet(fraction=1.0, weight=0.4),
+            )
+        )
+    with pytest.raises(ValueError, match="sum to one"):
+        _design(
+            bounded_mean_bets=(
+                BoundedMeanBet(fraction=0.1, weight=0.07),
+                BoundedMeanBet(fraction=0.5, weight=0.14),
+                BoundedMeanBet(fraction=1.0, weight=0.79),
+            )
+        )
+    with pytest.raises(ValidationError, match="cannot be boolean"):
+        BoundedMeanBet(fraction=True, weight=1.0)
+
+
+def test_design_rejects_alpha_that_underflows_its_adjusted_tests() -> None:
+    design = _design()
+
+    with pytest.raises(ValidationError, match="alpha is too small"):
+        PairedEvaluationDesign.model_validate(
+            {**design.model_dump(mode="json"), "alpha": math.ulp(0.0)}
         )
 
 
@@ -194,20 +265,56 @@ def test_uniform_lift_passes_every_frozen_criterion() -> None:
     )
 
     assert report.panel_delta == 1.0
-    assert report.analysis_version == "1"
+    assert report.analysis_version == "2"
     assert report.design_digest == design.digest
     assert report.outcome_digest.startswith("sha256:")
     assert report.member_deltas == {"large": 1.0, "medium": 1.0, "small": 1.0}
-    assert report.randomization_p < 0.05
-    assert report.cluster_interval.lower == 1.0
+    assert report.raw_positive_p == {
+        "large": pytest.approx(2.0**-12),
+        "medium": pytest.approx(2.0**-12),
+        "small": pytest.approx(2.0**-12),
+    }
+    assert report.label_swap_p < 0.05
+    assert report.panel_mean_p < 0.05
+    assert report.cluster_interval.lower > 0.0
     assert report.cluster_interval.upper == 1.0
     assert all(value < 0.05 for value in report.holm_noninferiority_p.values())
     assert report.panel_lift_passed is True
     assert report.member_lifts_passed is True
-    assert report.randomization_passed is True
+    assert report.member_positive_passed is True
+    assert report.member_intervals_passed is True
+    assert all(value < 0.05 for value in report.holm_positive_p.values())
+    assert all(value > 0.0 for value in report.simultaneous_lower_bounds.values())
+    assert report.label_swap_passed is True
+    assert report.panel_mean_passed is True
     assert report.cluster_interval_passed is True
     assert report.noninferiority_passed is True
     assert report.passed is True
+
+
+def test_passed_uses_only_member_floors_and_simultaneous_lower_bounds() -> None:
+    design = _design(task_ids=tuple(f"task-{index}" for index in range(12)))
+    report = analyze_paired_outcomes(
+        design,
+        _outcomes(design, baseline=0.0, candidate=1.0),
+    )
+
+    diagnostics_failed = report.model_copy(
+        update={
+            "panel_lift_passed": False,
+            "member_positive_passed": False,
+            "label_swap_passed": False,
+            "panel_mean_passed": False,
+            "cluster_interval_passed": False,
+            "noninferiority_passed": False,
+        }
+    )
+
+    assert diagnostics_failed.member_lifts_passed is True
+    assert diagnostics_failed.member_intervals_passed is True
+    assert diagnostics_failed.passed is True
+    assert diagnostics_failed.model_copy(update={"member_lifts_passed": False}).passed is False
+    assert diagnostics_failed.model_copy(update={"member_intervals_passed": False}).passed is False
 
 
 def test_panel_average_cannot_hide_a_member_below_the_lift_floor() -> None:
@@ -228,6 +335,34 @@ def test_panel_average_cannot_hide_a_member_below_the_lift_floor() -> None:
     assert report.panel_delta > design.minimum_panel_delta
     assert report.member_deltas["small"] == 0.0
     assert report.member_lifts_passed is False
+    assert report.member_positive_passed is False
+    assert report.member_intervals_passed is False
+    assert report.passed is False
+
+
+def test_repeated_attempts_do_not_inflate_member_primary_sample_size() -> None:
+    design = _design(
+        task_ids=tuple(f"task-{index:02d}" for index in range(59)),
+        attempts=25,
+    )
+    outcomes = [
+        PairedBlockOutcome(
+            block=block,
+            baseline_reward=0.0,
+            candidate_reward=float(block.attempt == 1),
+        )
+        for block in design.blocks
+    ]
+
+    report = analyze_paired_outcomes(design, outcomes)
+
+    assert report.panel_delta == pytest.approx(0.04)
+    assert report.panel_lift_passed is False
+    assert report.panel_mean_passed is False
+    assert report.cluster_interval_passed is False
+    assert report.member_lifts_passed is True
+    assert report.member_positive_passed is False
+    assert report.member_intervals_passed is False
     assert report.passed is False
 
 
@@ -241,7 +376,10 @@ def test_no_lift_fails_every_positive_evidence_gate() -> None:
     assert report.panel_delta == 0.0
     assert report.panel_lift_passed is False
     assert report.member_lifts_passed is False
-    assert report.randomization_passed is False
+    assert report.member_positive_passed is False
+    assert report.member_intervals_passed is False
+    assert report.label_swap_passed is False
+    assert report.panel_mean_passed is False
     assert report.cluster_interval_passed is False
     assert report.passed is False
 
@@ -270,7 +408,214 @@ def test_exact_task_cluster_randomization_flips_all_panel_members_together() -> 
     report = analyze_paired_outcomes(design, outcomes)
 
     assert report.panel_delta == 0.0
-    assert report.randomization_p == 0.75
+    assert report.label_swap_p == 0.75
+
+
+def test_bounded_mean_gate_rejects_the_sign_flip_rare_tail_counterexample() -> None:
+    task_ids = tuple(f"task-{index:02d}" for index in range(59))
+    design = _design(task_ids=task_ids, panel_members=("member",), attempts=49)
+    outcomes = [
+        PairedBlockOutcome(
+            block=block,
+            baseline_reward=0.0,
+            candidate_reward=float(block.attempt == 1),
+        )
+        for block in design.blocks
+    ]
+
+    report = analyze_paired_outcomes(design, outcomes)
+
+    assert report.panel_delta == pytest.approx(1 / 49)
+    assert report.label_swap_passed is True
+    assert report.panel_mean_p == pytest.approx((49 / 50) ** 59)
+    assert report.panel_mean_passed is False
+    assert report.cluster_interval.lower <= 0.0
+    assert report.cluster_interval_passed is False
+    assert report.passed is False
+
+
+def test_noninferiority_uses_the_weak_mean_null_without_sign_flipping_margin() -> None:
+    design = _design(task_ids=tuple(f"task-{index:02d}" for index in range(59)))
+    report = analyze_paired_outcomes(
+        design,
+        _outcomes(design, baseline=0.0, candidate=0.0),
+    )
+    expected_raw = 0.98**59
+
+    assert report.raw_noninferiority_p == {
+        "large": pytest.approx(expected_raw),
+        "medium": pytest.approx(expected_raw),
+        "small": pytest.approx(expected_raw),
+    }
+    assert report.holm_noninferiority_p == {
+        "large": pytest.approx(3 * expected_raw),
+        "medium": pytest.approx(3 * expected_raw),
+        "small": pytest.approx(3 * expected_raw),
+    }
+    assert report.noninferiority_passed is False
+
+
+def test_bounded_mean_evidence_handles_boundary_losses_and_log_space() -> None:
+    losing = _design(task_ids=tuple(f"task-{index:03d}" for index in range(200)))
+    losing_report = analyze_paired_outcomes(
+        losing,
+        _outcomes(losing, baseline=1.0, candidate=0.0),
+    )
+    assert losing_report.panel_mean_p == 1.0
+    assert losing_report.cluster_interval.lower == -1.0
+    assert losing_report.cluster_interval.upper < 0.0
+
+    winning_report = analyze_paired_outcomes(
+        losing,
+        _outcomes(losing, baseline=0.0, candidate=1.0),
+    )
+    assert winning_report.panel_mean_p == pytest.approx(2.0**-200)
+    assert winning_report.cluster_interval.lower > 0.0
+    assert winning_report.cluster_interval.upper == 1.0
+
+
+def test_bounded_mean_interval_rounds_outward_at_the_analytic_boundary() -> None:
+    task_count = 12
+    alpha = 0.05
+    bets = (BoundedMeanBet(fraction=1.0, weight=1.0),)
+    interval = _bounded_mean_interval((1.0,) * task_count, alpha=alpha, bets=bets)
+    analytic_lower = 2.0 * (alpha / 2.0) ** (1.0 / task_count) - 1.0
+    reflected = _bounded_mean_interval((-1.0,) * task_count, alpha=alpha, bets=bets)
+
+    assert interval.lower <= analytic_lower
+    assert analytic_lower - interval.lower < 1e-14
+    assert reflected.upper >= -analytic_lower
+    assert reflected.upper + analytic_lower < 1e-14
+
+
+def test_noninferiority_supports_the_negative_one_boundary_null() -> None:
+    design = _design(noninferiority_margin=1.0)
+    all_losses = analyze_paired_outcomes(
+        design,
+        _outcomes(design, baseline=1.0, candidate=0.0),
+    )
+    ties = analyze_paired_outcomes(
+        design,
+        _outcomes(design, baseline=0.0, candidate=0.0),
+    )
+
+    assert all(value == 1.0 for value in all_losses.raw_noninferiority_p.values())
+    assert all_losses.noninferiority_passed is False
+    assert all(value == 0.0 for value in ties.raw_noninferiority_p.values())
+    assert ties.noninferiority_passed is True
+
+
+def test_bounded_mean_evidence_stays_finite_for_large_preregistered_mixtures() -> None:
+    bets = (
+        BoundedMeanBet(fraction=0.1, weight=0.2),
+        BoundedMeanBet(fraction=0.5, weight=0.3),
+        BoundedMeanBet(fraction=1.0, weight=0.5),
+    )
+
+    assert math.isfinite(_bounded_mean_log_e((1.0,) * 10_000, null_mean=0.0, bets=bets))
+    assert _bounded_mean_log_e((-1.0,) * 10_000, null_mean=0.0, bets=bets) < 0.0
+    single_bet = (BoundedMeanBet(fraction=1.0, weight=1.0),)
+    assert _bounded_mean_p((1.0,) * 2_000, null_mean=0.0, bets=single_bet) == math.ulp(0.0)
+
+
+@pytest.mark.parametrize(
+    ("null_mean", "low", "high"),
+    (
+        (0.0, -1.0, 1 / 49),
+        (0.0, -1.0, 1.0),
+        (0.0, -0.25, 0.75),
+        (0.0, -0.1, 0.4),
+        (-0.02, -1.0, 0.03),
+    ),
+)
+def test_bounded_mean_exact_two_point_null_calibration_grid(
+    null_mean: float,
+    low: float,
+    high: float,
+) -> None:
+    task_count = 59
+    high_probability = (null_mean - low) / (high - low)
+    bets = (
+        BoundedMeanBet(fraction=0.1, weight=0.2),
+        BoundedMeanBet(fraction=0.5, weight=0.3),
+        BoundedMeanBet(fraction=1.0, weight=0.5),
+    )
+    rejection_probability = 0.0
+    noncoverage_probability = 0.0
+    for high_count in range(task_count + 1):
+        probability = (
+            math.comb(task_count, high_count)
+            * high_probability**high_count
+            * (1.0 - high_probability) ** (task_count - high_count)
+        )
+        deltas = (high,) * high_count + (low,) * (task_count - high_count)
+        if _bounded_mean_p(deltas, null_mean=null_mean, bets=bets) < 0.05:
+            rejection_probability += probability
+        interval = _bounded_mean_interval(deltas, alpha=0.05, bets=bets)
+        if not interval.lower <= null_mean <= interval.upper:
+            noncoverage_probability += probability
+
+    assert rejection_probability <= 0.05 + 1e-12
+    assert noncoverage_probability <= 0.05 + 1e-12
+
+
+def test_bounded_mean_nonidentical_null_calibration() -> None:
+    high_probabilities = (0.99, 0.99, 0.01, 0.01, 0.8, 0.2, 0.7, 0.3)
+    assert sum(2.0 * probability - 1.0 for probability in high_probabilities) == pytest.approx(0.0)
+    bets = (
+        BoundedMeanBet(fraction=0.1, weight=0.2),
+        BoundedMeanBet(fraction=0.5, weight=0.3),
+        BoundedMeanBet(fraction=1.0, weight=0.5),
+    )
+    rejection_probability = 0.0
+    noncoverage_probability = 0.0
+    for mask in range(1 << len(high_probabilities)):
+        deltas: list[float] = []
+        probability = 1.0
+        for index, high_probability in enumerate(high_probabilities):
+            high = bool(mask & (1 << index))
+            deltas.append(1.0 if high else -1.0)
+            probability *= high_probability if high else 1.0 - high_probability
+        frozen_deltas = tuple(deltas)
+        if _bounded_mean_p(frozen_deltas, null_mean=0.0, bets=bets) < 0.05:
+            rejection_probability += probability
+        interval = _bounded_mean_interval(frozen_deltas, alpha=0.05, bets=bets)
+        if not interval.lower <= 0.0 <= interval.upper:
+            noncoverage_probability += probability
+
+    assert rejection_probability <= 0.05 + 1e-12
+    assert noncoverage_probability <= 0.05 + 1e-12
+
+
+def test_holm_adjustment_is_order_invariant_and_stable_across_ties() -> None:
+    first = _holm_adjust({"z": 0.02, "a": 0.01, "m": 0.01})
+    second = _holm_adjust({"m": 0.01, "z": 0.02, "a": 0.01})
+
+    rounded_up = math.nextafter(0.03, math.inf)
+    assert first == second == {"a": rounded_up, "m": rounded_up, "z": rounded_up}
+
+
+def test_alpha_division_is_rounded_downward() -> None:
+    alpha = 0.05
+    divisor = 7
+    exact = Fraction.from_float(alpha) / divisor
+    ordinary = alpha / divisor
+
+    assert Fraction.from_float(ordinary) > exact
+    adjusted = _divide_float_downward(alpha, divisor)
+    assert Fraction.from_float(adjusted) <= exact
+    assert Fraction.from_float(math.nextafter(adjusted, math.inf)) > exact
+
+
+def test_holm_adjustment_rounds_integer_products_upward() -> None:
+    raw_p = float.fromhex("0x1.111111111110fp-6")
+    exact_scaled = Fraction.from_float(raw_p) * 3
+
+    assert Fraction.from_float(raw_p * 3) < exact_scaled
+    adjusted = _holm_adjust({"first": raw_p, "second": 0.2, "third": 0.3})
+    certified = adjusted["first"]
+    assert Fraction.from_float(certified) >= exact_scaled
+    assert Fraction.from_float(math.nextafter(certified, -math.inf)) < exact_scaled
 
 
 def test_analysis_is_reproducible_from_the_frozen_seed() -> None:
