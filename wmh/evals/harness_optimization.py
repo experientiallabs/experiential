@@ -553,6 +553,7 @@ def run_harness_optimization_search(
             study.baseline.model_copy(deep=True),
             scorer,
             proposer,
+            search_run_id=authorization.search_run_id,
             iterations=plan.iterations,
             proposal_batch_size=plan.proposal_batch_size,
             screen_proposals=plan.screen_proposals,
@@ -587,7 +588,11 @@ def freeze_harness_optimization_candidate(
     ):
         raise ValueError("discovery authorization differs from the optimization protocol")
     state = SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
-    _validate_completed_search_checkpoint(study, state)
+    _validate_completed_search_checkpoint(
+        study,
+        state,
+        search_run_id=authorization.search_run_id,
+    )
     candidate = state.docs[state.champion_doc_hash].model_copy(
         update={"name": study.protocol.search.candidate_name, "version": 0},
         deep=True,
@@ -799,20 +804,25 @@ def _validate_search_component_bindings(
 def _validate_completed_search_checkpoint(
     prepared: PreparedHarnessOptimizationStudy,
     checkpoint: SearchCheckpoint,
+    *,
+    search_run_id: str,
 ) -> None:
     plan = prepared.protocol.search
     config = checkpoint.configuration
     if checkpoint.completed_iteration != plan.iterations:
         raise ValueError("cannot freeze a candidate before every planned search iteration commits")
     if (
-        config.name != plan.candidate_name
+        config.search_run_id != search_run_id
+        or config.name != plan.candidate_name
         or config.iterations != plan.iterations
         or config.proposal_batch_size != plan.proposal_batch_size
         or config.screen_proposals != plan.screen_proposals
         or config.confirm_narrow_vetoes != plan.confirm_narrow_vetoes
         or config.holdout_scorer is not None
     ):
-        raise ValueError("search checkpoint configuration differs from the optimization protocol")
+        raise ValueError(
+            "search checkpoint configuration or search run differs from the optimization protocol"
+        )
     if (
         config.seed_doc_hash != prepared.baseline.doc_hash
         or config.seed_execution_hash != prepared.baseline.execution_hash
