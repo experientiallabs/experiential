@@ -30,6 +30,11 @@ _ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31"
 
 # Default Titan text-embeddings model (confirmed reachable; v2 supports `dimensions` 256/512/1024).
 _DEFAULT_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+_USAGE_FIELD_NAMES = {
+    "totalTokens": "total_tokens",
+    "cacheReadInputTokens": "cache_read_input_tokens",
+    "cacheWriteInputTokens": "cache_write_input_tokens",
+}
 
 
 class _ContentBlock(TypedDict):
@@ -162,9 +167,10 @@ class BedrockProvider:
         raw = self._get_client().invoke_model(modelId=self.config.model, body=json.dumps(body))
         data = cast("_BedrockResponse", json.loads(raw["body"].read()))
         text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
-        usage = TokenUsage(
-            input_tokens=data["usage"]["input_tokens"],
-            output_tokens=data["usage"]["output_tokens"],
+        usage = _token_usage(
+            data["usage"],
+            input_field="input_tokens",
+            output_field="output_tokens",
         )
         return Completion(text=text, usage=usage)
 
@@ -238,11 +244,14 @@ class BedrockProvider:
         )
         response = self.complete_chat(request)
         choice = response.choices[0]
+        if response.usage is None:
+            return Completion(text=str(choice.message.content or ""))
         return Completion(
             text=str(choice.message.content or ""),
-            usage=TokenUsage(
-                input_tokens=response.token_usage().input_tokens,
-                output_tokens=response.token_usage().output_tokens,
+            usage=_token_usage(
+                response.usage.model_dump(mode="json"),
+                input_field="prompt_tokens",
+                output_field="completion_tokens",
             ),
         )
 
@@ -269,9 +278,10 @@ class BedrockProvider:
         response = self._get_client().converse(**kwargs)
         blocks = response["output"]["message"]["content"]
         text = "".join(block["text"] for block in blocks if "text" in block)
-        usage = TokenUsage(
-            input_tokens=int(response["usage"]["inputTokens"]),
-            output_tokens=int(response["usage"]["outputTokens"]),
+        usage = _token_usage(
+            response["usage"],
+            input_field="inputTokens",
+            output_field="outputTokens",
         )
         return Completion(text=text, usage=usage)
 
@@ -298,9 +308,10 @@ class BedrockProvider:
         raw = self._get_client().invoke_model(modelId=self.config.model, body=json.dumps(body))
         data = cast("_NovaResponse", json.loads(raw["body"].read()))
         text = "".join(block["text"] for block in data["output"]["message"]["content"])
-        usage = TokenUsage(
-            input_tokens=data["usage"]["inputTokens"],
-            output_tokens=data["usage"]["outputTokens"],
+        usage = _token_usage(
+            data["usage"],
+            input_field="inputTokens",
+            output_field="outputTokens",
         )
         return Completion(text=text, usage=usage)
 
@@ -326,3 +337,38 @@ class BedrockProvider:
 
     def verify(self) -> VerifyResult:
         return verify_via_ping(self)
+
+
+def _token_usage(
+    value: object,
+    *,
+    input_field: str,
+    output_field: str,
+) -> TokenUsage:
+    """Preserve every provider usage dimension for fail-closed downstream pricing."""
+    if not isinstance(value, dict):
+        raise ValueError("Bedrock usage must be an object")
+    usage = cast("dict[str, object]", value)
+    input_tokens = usage.get(input_field)
+    output_tokens = usage.get(output_field)
+    if (
+        isinstance(input_tokens, bool)
+        or not isinstance(input_tokens, int)
+        or input_tokens < 0
+        or isinstance(output_tokens, bool)
+        or not isinstance(output_tokens, int)
+        or output_tokens < 0
+    ):
+        raise ValueError("Bedrock usage counters must be non-negative integers")
+    extras = {
+        _USAGE_FIELD_NAMES.get(name, name): item
+        for name, item in usage.items()
+        if name not in {input_field, output_field}
+    }
+    return TokenUsage.model_validate(
+        {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            **extras,
+        }
+    )

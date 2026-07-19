@@ -31,6 +31,13 @@ def test_bedrock_dated_inference_profile_id_normalizes() -> None:
     assert cost_usd("anthropic.claude-opus-4-6-v1", usage) == pytest.approx(5.0)
 
 
+def test_bedrock_glm_5_uses_the_verified_nominal_price() -> None:
+    price = price_for("zai.glm-5")
+
+    assert price is not None
+    assert (price.input_per_mtok, price.output_per_mtok) == (1.0, 3.2)
+
+
 def test_gpt_5_5_output_is_30_per_mtok() -> None:
     # Verified 2026-06-25 against OpenAI's live pricing page: gpt-5.5 is $5 in / $30 out.
     price = price_for("gpt-5.5")

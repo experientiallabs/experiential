@@ -288,6 +288,24 @@ def test_responses_response_rejects_reserved_usage_aliases(reserved_name: str) -
         )
 
 
+def test_responses_response_rejects_partial_usage() -> None:
+    with pytest.raises(ValueError, match="usage counters"):
+        responses_response(
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+                "usage": {"input_tokens": 1},
+            }
+        )
+
+
 def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> None:
     """A stateless second turn replays every ordered reasoning item through Pi once."""
     first = responses_response(

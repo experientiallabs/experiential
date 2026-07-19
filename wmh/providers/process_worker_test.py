@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from typing import cast
 
@@ -27,6 +28,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     ReservationStatus,
     SpendLedger,
     TokenPriceCeiling,
@@ -34,6 +36,11 @@ from wmh.tracking.budget import (
 )
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="provider worker uses inherited sockets")
+
+_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    verified_on=date(2026, 7, 19),
+)
 
 _CONFIG = ProviderConfig(
     kind=ProviderKind.BEDROCK,
@@ -171,6 +178,7 @@ def test_worker_child_wraps_provider_with_registered_crash_safe_budget(
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
+                tariff_provenance=_TARIFF_PROVENANCE,
             )
         },
     )

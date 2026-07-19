@@ -11,6 +11,7 @@ import os
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Iterator
 from contextlib import ExitStack, asynccontextmanager, contextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -66,6 +67,7 @@ from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     SpendLedger,
     TimedResourceClass,
     TimedResourceCostMeter,
@@ -93,6 +95,10 @@ _ENVIRONMENT_DIGESTS = {
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RETRY_POLICY_DIGEST = "sha256:" + "5" * 64
 _BUDGET_POLICY_DIGEST = "sha256:" + "6" * 64
+_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    verified_on=date(2026, 7, 19),
+)
 
 
 class _ProcessEvent(Protocol):
@@ -772,6 +778,7 @@ def _budget_runtime(
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
+                tariff_provenance=_TARIFF_PROVENANCE,
             )
             for route in routes
         },

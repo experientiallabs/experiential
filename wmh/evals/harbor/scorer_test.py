@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Coroutine
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
@@ -56,6 +58,10 @@ _TASK_KEYS = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
 _TASK_ENVIRONMENT_DIGESTS = ("sha256:" + "c" * 64, "sha256:" + "d" * 64)
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RUNNER = LocalPiRunnerSpec()
+_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    verified_on=date(2026, 7, 19),
+)
 
 
 @dataclass(frozen=True)
@@ -481,6 +487,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=1,
                 ),
+                tariff_provenance=_TARIFF_PROVENANCE,
             ),
             "task": TimedResourceCostMeter(
                 resource_type=task_class.role.value,

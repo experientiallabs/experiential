@@ -32,6 +32,7 @@ class ModelPrice(BaseModel):
 # Completion prices verified 2026-06-25 against the live vendor pricing pages:
 #   - Claude: platform.claude.com/docs/en/about-claude/models/overview
 #   - OpenAI GPT-5.x: developers.openai.com/api/docs/pricing (Standard tier, short context)
+# The Bedrock GLM-5 row was verified 2026-07-19 against aws.amazon.com/bedrock/pricing.
 # Embedding prices are long-stable list prices NOT re-fetched in that pass (the OpenAI pricing
 # page no longer surfaces them); treat as approximate and re-verify if embed cost matters.
 _PRICES: dict[str, ModelPrice] = {
@@ -46,6 +47,7 @@ _PRICES: dict[str, ModelPrice] = {
     "claude-sonnet-5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-sonnet-4-6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0),
+    "zai.glm-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=3.2),
     # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
     "gpt-5.5": ModelPrice(input_per_mtok=5.0, output_per_mtok=30.0),
     "gpt-5.5-pro": ModelPrice(input_per_mtok=30.0, output_per_mtok=180.0),

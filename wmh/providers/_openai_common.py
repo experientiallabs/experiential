@@ -93,11 +93,17 @@ def complete(
         # provider-reported zero. Supplying a default TokenUsage here would incorrectly settle a
         # paid request at $0 instead of forfeiting its conservative reservation.
         return Completion(text=text)
+    usage_payload = cast("dict[str, object]", usage.model_dump(mode="json"))
+    usage_payload.pop("prompt_tokens", None)
+    usage_payload.pop("completion_tokens", None)
     return Completion(
         text=text,
-        usage=TokenUsage(
-            input_tokens=usage.prompt_tokens,
-            output_tokens=usage.completion_tokens,
+        usage=TokenUsage.model_validate(
+            {
+                "input_tokens": usage.prompt_tokens,
+                "output_tokens": usage.completion_tokens,
+                **usage_payload,
+            }
         ),
     )
 

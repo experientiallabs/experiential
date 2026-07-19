@@ -23,6 +23,7 @@ from wmh.tracking.budget import (
     BudgetTerminalProvenance,
     ExternalSpendAuthority,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     SpendLedger,
     TimedResourceBudget,
     TimedResourceBudgetAccount,
@@ -31,6 +32,7 @@ from wmh.tracking.budget import (
     TimedResourceReservation,
     TimedResourceRole,
     TokenPriceCeiling,
+    UnpricedProviderUsageError,
     bind_budget_account,
     bind_timed_resource_account,
     bootstrap_budget_ledger,
@@ -46,6 +48,12 @@ from wmh.tracking.clock import Clock, SystemClock
 from wmh.tracking.metered import MeteredProvider, classify_build_call
 from wmh.tracking.pricing import ModelPrice, cost_usd, price_for
 from wmh.tracking.store import load_runs, save_run
+from wmh.tracking.tariffs import (
+    ProviderTokenTariff,
+    catalog_provider_token_tariff,
+    catalog_provider_token_tariffs,
+    provider_cost_meter,
+)
 from wmh.tracking.tracker import (
     Phase,
     RunRecord,
@@ -73,6 +81,8 @@ __all__ = [
     "SystemClock",
     "MeteredProvider",
     "ProviderCostMeter",
+    "ProviderTariffProvenance",
+    "ProviderTokenTariff",
     "classify_build_call",
     "ModelPrice",
     "cost_usd",
@@ -92,9 +102,13 @@ __all__ = [
     "UsageEvent",
     "UsageTotals",
     "TokenPriceCeiling",
+    "UnpricedProviderUsageError",
+    "catalog_provider_token_tariff",
+    "catalog_provider_token_tariffs",
     "nano_usd_from_usd",
     "open_shared_spend_ledger",
     "orphaned_timed_resource_requires_reap",
+    "provider_cost_meter",
     "reconcile_orphaned_timed_resource",
     "resolve_budget_account",
     "resolve_timed_resource_account",

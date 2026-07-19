@@ -11,6 +11,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -45,6 +46,7 @@ from wmh.tracking.budget import (
     BudgetTerminalProvenance,
     ExternalSpendAuthority,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     ReservationStatus,
     SpendLedger,
     TimedResourceBudget,
@@ -53,6 +55,7 @@ from wmh.tracking.budget import (
     TimedResourceCostMeter,
     TimedResourceRole,
     TokenPriceCeiling,
+    UnpricedProviderUsageError,
     bind_budget_account,
     bind_timed_resource_account,
     bootstrap_budget_ledger,
@@ -63,6 +66,11 @@ from wmh.tracking.budget import (
     resolve_budget_account,
     resolve_timed_resource_account,
     validate_timed_resource_class,
+)
+
+_TEST_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    verified_on=date(2026, 7, 19),
 )
 
 
@@ -80,6 +88,7 @@ def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPoli
                     input_nano_usd_per_token=2,
                     output_nano_usd_per_token=5,
                 ),
+                tariff_provenance=_TEST_TARIFF_PROVENANCE,
                 input_overhead_tokens=8,
             )
         },
@@ -185,6 +194,20 @@ def test_currency_helpers_round_up_to_exact_nano_usd_ceiling() -> None:
 
 
 def test_budget_inputs_reject_unknown_fields_instead_of_using_defaults() -> None:
+    with pytest.raises(ValidationError, match="tariff_provenance"):
+        ProviderCostMeter.model_validate(
+            {
+                "provider_config": ProviderConfig(
+                    kind=ProviderKind.BEDROCK,
+                    model="model-1",
+                ).model_dump(mode="json"),
+                "price": {
+                    "input_nano_usd_per_token": 1,
+                    "output_nano_usd_per_token": 1,
+                },
+            }
+        )
+
     with pytest.raises(ValidationError, match="billing_quantum_second"):
         TimedResourceCostMeter.model_validate(
             {
@@ -1550,6 +1573,103 @@ def test_budgeted_provider_reserves_before_call_and_settles_exact_usage(tmp_path
     assert reservation.status is ReservationStatus.SETTLED
     assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
     assert reservation.max_nano_usd > reservation.charged_nano_usd
+
+
+def test_budgeted_chat_forfeits_before_settlement_on_unpriced_usage_dimensions(
+    tmp_path: Path,
+) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            chat_usage=ChatUsage.model_validate(
+                {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                }
+            )
+        ),
+        ids=iter(["chat-unpriced"]),
+    )
+    request = ChatRequest(
+        messages=[ChatMessage(role="user", content="hello")],
+        max_completion_tokens=20,
+    )
+
+    with pytest.raises(UnpricedProviderUsageError, match="prompt_tokens_details"):
+        provider.complete_chat(request)
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UnpricedUsage"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+def test_budgeted_chat_accepts_a_consistent_derived_total_token_field(tmp_path: Path) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            chat_usage=ChatUsage.model_validate(
+                {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+            )
+        ),
+        ids=iter(["chat-derived-total"]),
+    )
+
+    provider.complete_chat(
+        ChatRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+            max_completion_tokens=20,
+        )
+    )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
+
+
+def test_budgeted_chat_rejects_a_non_numeric_derived_total_token_field(tmp_path: Path) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            chat_usage=ChatUsage.model_validate(
+                {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": None}
+            )
+        ),
+        ids=iter(["chat-invalid-total"]),
+    )
+
+    with pytest.raises(UnpricedProviderUsageError, match="total_tokens"):
+        provider.complete_chat(
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hello")],
+                max_completion_tokens=20,
+            )
+        )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+
+
+def test_budgeted_text_forfeits_before_settlement_on_unpriced_usage_dimensions(
+    tmp_path: Path,
+) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            text_usage=TokenUsage.model_validate(
+                {"input_tokens": 4, "output_tokens": 2, "cache_read_input_tokens": 1}
+            )
+        ),
+        ids=iter(["text-unpriced"]),
+    )
+
+    with pytest.raises(UnpricedProviderUsageError, match="cache_read_input_tokens"):
+        provider.complete("", [Message(role="user", content="hello")], max_tokens=10)
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UnpricedUsage"
 
 
 def test_budgeted_chat_ceiling_dominates_both_compatibility_token_fields(

@@ -637,8 +637,10 @@ def _object_dict(value: object) -> dict[str, object] | None:
 
 
 def _usage_count(value: object) -> int:
-    """Read a non-boolean integer usage counter, defaulting absent values to zero."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    """Read one required nonnegative provider usage counter."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("Responses API usage counters must be non-negative integers")
+    return value
 
 
 def _boolean_extra(request: ChatRequest, name: str, *, default: bool) -> bool:

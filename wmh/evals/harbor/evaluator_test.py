@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import stat
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
@@ -60,6 +60,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
@@ -69,6 +70,11 @@ from wmh.tracking.rate_limit import (
     ExternalDispatchRateAuthority,
     ExternalDispatchRatePolicy,
     bind_external_dispatch_rate_authority,
+)
+
+_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    verified_on=date(2026, 7, 19),
 )
 
 _TASK_ENVIRONMENT_ATTESTATION = {
@@ -207,6 +213,7 @@ def _e2b_budget_kwargs(
                 input_nano_usd_per_token=1,
                 output_nano_usd_per_token=1,
             ),
+            tariff_provenance=_TARIFF_PROVENANCE,
         )
     }
     if task_environment:
@@ -1195,6 +1202,7 @@ def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: P
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
+                tariff_provenance=_TARIFF_PROVENANCE,
             )
         },
     )

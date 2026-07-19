@@ -167,10 +167,23 @@ def bedrock_converse_response(raw: object, model: str) -> ChatResponse:
         usage_data = _object(usage, "Bedrock Converse usage")
         if not {"inputTokens", "outputTokens"}.issubset(usage_data):
             raise ValueError("Bedrock Converse usage must include inputTokens and outputTokens")
-        result["usage"] = {
+        translated_usage: dict[str, object] = {
             "prompt_tokens": _usage_count(usage_data["inputTokens"]),
             "completion_tokens": _usage_count(usage_data["outputTokens"]),
         }
+        usage_names = {
+            "totalTokens": "total_tokens",
+            "cacheReadInputTokens": "cache_read_input_tokens",
+            "cacheWriteInputTokens": "cache_write_input_tokens",
+        }
+        translated_usage.update(
+            {
+                usage_names.get(name, name): value
+                for name, value in usage_data.items()
+                if name not in {"inputTokens", "outputTokens"}
+            }
+        )
+        result["usage"] = translated_usage
     return ChatResponse.model_validate(result)
 
 

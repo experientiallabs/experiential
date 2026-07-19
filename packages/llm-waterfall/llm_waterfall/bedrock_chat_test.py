@@ -182,6 +182,28 @@ def test_missing_usage_remains_distinguishable_from_reported_zero() -> None:
     assert response.usage is None
 
 
+def test_usage_preserves_provider_dimensions_for_downstream_pricing() -> None:
+    response = bedrock_converse_response(
+        {
+            "output": {"message": {"role": "assistant", "content": [{"text": "done"}]}},
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 2,
+                "totalTokens": 12,
+                "cacheReadInputTokens": 4,
+            },
+        },
+        _MODEL,
+    )
+
+    assert response.usage is not None
+    assert response.usage.model_extra == {
+        "total_tokens": 12,
+        "cache_read_input_tokens": 4,
+    }
+
+
 def test_partial_usage_fails_closed() -> None:
     with pytest.raises(ValueError, match="must include inputTokens and outputTokens"):
         bedrock_converse_response(

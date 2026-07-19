@@ -48,6 +48,46 @@ def test_complete_handles_missing_usage() -> None:
     assert completion.usage.output_tokens == 0
 
 
+def test_complete_preserves_provider_usage_dimensions_for_budget_pricing() -> None:
+    class _Choice:
+        def __init__(self) -> None:
+            self.message = type("M", (), {"content": "hi"})()
+
+    class _Usage:
+        prompt_tokens = 8
+        completion_tokens = 3
+
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {
+                "prompt_tokens": 8,
+                "completion_tokens": 3,
+                "total_tokens": 11,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            }
+
+    class _Resp:
+        choices = [_Choice()]
+        usage = _Usage()
+
+    class _Chat:
+        def create(self, **kwargs: object) -> _Resp:
+            return _Resp()
+
+    completion = _openai_common.complete(
+        cast("_openai_common._ChatCompletions", _Chat()),
+        "m",
+        "",
+        [Message(role="user", content="x")],
+        8,
+    )
+
+    assert completion.usage.model_extra == {
+        "total_tokens": 11,
+        "prompt_tokens_details": {"cached_tokens": 2},
+    }
+
+
 def test_complete_raises_clearly_on_empty_choices() -> None:
     class _Resp:
         choices: list[object] = []

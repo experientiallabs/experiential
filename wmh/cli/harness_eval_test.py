@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from datetime import date
 from pathlib import Path
 from typing import cast
 
@@ -43,6 +44,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     TokenPriceCeiling,
@@ -56,6 +58,10 @@ _RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
 _CELL_CONFIG_DIGEST = "sha256:" + "b" * 64
 _RUNNER_CONFIG_DIGEST = "sha256:" + "c" * 64
 _RUNNER_ENVIRONMENT_DIGEST = "sha256:" + "d" * 64
+_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    verified_on=date(2026, 7, 19),
+)
 
 
 def _save_harness(root: Path) -> HarnessDoc:
@@ -411,6 +417,7 @@ def _write_budget_account(path: Path, provider_config: ProviderConfig) -> Budget
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
+                tariff_provenance=_TARIFF_PROVENANCE,
             )
         },
     )
@@ -451,6 +458,7 @@ def _write_e2b_task_budget_accounts(
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
+                tariff_provenance=_TARIFF_PROVENANCE,
             ),
             "task": TimedResourceCostMeter(
                 resource_type=resource_class.role.value,

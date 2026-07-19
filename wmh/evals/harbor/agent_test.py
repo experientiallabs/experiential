@@ -9,6 +9,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -51,6 +52,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    ProviderTariffProvenance,
     TokenPriceCeiling,
     bind_budget_account,
     bootstrap_budget_ledger,
@@ -60,6 +62,11 @@ from wmh.tracking.rate_limit import (
     ExternalDispatchRateAuthority,
     ExternalDispatchRatePolicy,
     bind_external_dispatch_rate_authority,
+)
+
+_TARIFF_PROVENANCE = ProviderTariffProvenance(
+    source_locator="https://example.test/provider-pricing",
+    verified_on=date(2026, 7, 19),
 )
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
@@ -282,6 +289,7 @@ def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
+                tariff_provenance=_TARIFF_PROVENANCE,
             )
         },
     )

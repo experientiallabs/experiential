@@ -29,6 +29,14 @@ class _FakeUsage:
         self.prompt_tokens = prompt
         self.completion_tokens = completion
 
+    def model_dump(self, *, mode: str) -> dict[str, int]:
+        assert mode == "json"
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.prompt_tokens + self.completion_tokens,
+        }
+
 
 class _FakeChatResponse:
     def __init__(self, content: str, usage: _FakeUsage) -> None:

@@ -100,6 +100,24 @@ def test_complete_builds_anthropic_body_and_parses(monkeypatch: pytest.MonkeyPat
     assert "temperature" not in body  # Claude 4.8 rejects sampling params
 
 
+def test_complete_preserves_provider_usage_dimensions_for_budget_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload()
+    payload["usage"] = {
+        "input_tokens": 5,
+        "output_tokens": 3,
+        "cache_read_input_tokens": 2,
+    }
+    fake = _FakeClient(payload)
+    provider = BedrockProvider(_config())
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    completion = provider.complete("sys", [Message(role="user", content="hi")], max_tokens=32)
+
+    assert completion.usage.model_extra == {"cache_read_input_tokens": 2}
+
+
 def test_complete_default_max_tokens_is_8k(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(_payload())
     provider = BedrockProvider(_config())

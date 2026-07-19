@@ -21,7 +21,7 @@ import stat
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -65,6 +65,10 @@ class BudgetBreachError(RuntimeError):
 
 class BudgetIntegrityError(RuntimeError):
     """The persisted policy, event chain, or derived reservation state is invalid."""
+
+
+class UnpricedProviderUsageError(RuntimeError):
+    """A provider response exposed usage dimensions absent from the frozen tariff."""
 
 
 class ReservationStatus(StrEnum):
@@ -148,6 +152,34 @@ class TokenPriceCeiling(BaseModel):
         )
 
 
+class ProviderTariffProvenance(BaseModel):
+    """Auditable origin and usage scope for one frozen provider tariff."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    source_locator: str = Field(min_length=1, max_length=2_048)
+    verified_on: date
+    effective_on: date | None = None
+    priced_usage_dimensions: tuple[str, ...] = ("input_tokens", "output_tokens")
+
+    @field_validator("source_locator")
+    @classmethod
+    def _require_canonical_source_locator(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("tariff source_locator cannot have surrounding whitespace")
+        return value
+
+    @field_validator("priced_usage_dimensions")
+    @classmethod
+    def _require_supported_usage_dimensions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value != ("input_tokens", "output_tokens"):
+            raise ValueError(
+                "priced_usage_dimensions must be exactly input_tokens and output_tokens"
+            )
+        return value
+
+
 class ProviderCostMeter(BaseModel):
     """One immutable provider route, tariff ceiling, and input estimator."""
 
@@ -156,6 +188,7 @@ class ProviderCostMeter(BaseModel):
     kind: Literal["provider_tokens"] = "provider_tokens"
     provider_config: ProviderConfig
     price: TokenPriceCeiling
+    tariff_provenance: ProviderTariffProvenance
     input_estimator: Literal["canonical-json-utf8-v1"] = "canonical-json-utf8-v1"
     input_overhead_tokens: int = Field(default=8192, ge=1, le=_SQLITE_INTEGER_MAX)
 
@@ -1831,6 +1864,12 @@ class BudgetedProvider:
         }.issubset(completion.usage.model_fields_set):
             self._ledger.forfeit(reservation_id, failure_type="UsageUnavailable")
             return completion
+        self._reject_unpriced_usage(
+            reservation_id,
+            completion.usage,
+            input_field="input_tokens",
+            output_field="output_tokens",
+        )
         self._settle_usage(
             reservation_id,
             input_tokens=completion.usage.input_tokens,
@@ -1862,6 +1901,12 @@ class BudgetedProvider:
         }.issubset(response.usage.model_fields_set):
             self._ledger.forfeit(reservation_id, failure_type="UsageUnavailable")
             return response
+        self._reject_unpriced_usage(
+            reservation_id,
+            response.usage,
+            input_field="prompt_tokens",
+            output_field="completion_tokens",
+        )
         self._settle_usage(
             reservation_id,
             input_tokens=response.usage.prompt_tokens,
@@ -1928,6 +1973,34 @@ class BudgetedProvider:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             breach_kind=breach_kind,
+        )
+
+    def _reject_unpriced_usage(
+        self,
+        reservation_id: str,
+        usage: BaseModel,
+        *,
+        input_field: str,
+        output_field: str,
+    ) -> None:
+        """Forfeit and stop when a response exposes dimensions absent from the tariff."""
+        extras = dict(usage.model_extra or {})
+        total_present = "total_tokens" in extras
+        total = extras.pop("total_tokens", None)
+        input_tokens = getattr(usage, input_field)
+        output_tokens = getattr(usage, output_field)
+        if total_present and (
+            isinstance(total, bool)
+            or not isinstance(total, int)
+            or total != input_tokens + output_tokens
+        ):
+            extras["total_tokens"] = total
+        if not extras:
+            return
+        dimensions = ", ".join(sorted(extras))
+        self._ledger.forfeit(reservation_id, failure_type="UnpricedUsage")
+        raise UnpricedProviderUsageError(
+            f"provider usage exposes unpriced dimension(s): {dimensions}"
         )
 
     def _forfeit_after_error(self, reservation_id: str, error: Exception) -> None:
