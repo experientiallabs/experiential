@@ -286,14 +286,25 @@ class RunnerLeaseRecord(BaseModel):
         pattern=r"^[A-Za-z0-9_.:-]{1,512}$",
     )
     created_at: datetime
+    provider_expiry_at: datetime | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     expected_end_at: datetime | None = None
     retired_at: datetime | None = None
 
     @model_validator(mode="after")
     def _require_consistent_lifecycle(self) -> RunnerLeaseRecord:
-        for timestamp in (self.created_at, self.expected_end_at, self.retired_at):
+        for timestamp in (
+            self.created_at,
+            self.provider_expiry_at,
+            self.expected_end_at,
+            self.retired_at,
+        ):
             if timestamp is not None and timestamp.tzinfo is None:
                 raise ValueError("runner lease timestamps must be timezone-aware")
+        if self.provider_expiry_at is not None and self.provider_expiry_at <= self.created_at:
+            raise ValueError("runner provider expiry must follow durable admission")
         if self.expected_end_at is not None and self.expected_end_at <= self.created_at:
             raise ValueError("runner lease endpoint must follow durable admission")
         if self.retired_at is not None and self.retired_at < self.created_at:
@@ -341,7 +352,14 @@ class RunnerLeaseLedger:
         if orphan_budget_reconciler is not None:
             requires_reap = orphan_budget_reconciler(previous.lease_id)
         if requires_reap and orphan_expiry_horizon_s is not None:
-            safe_expiry = previous.created_at + timedelta(seconds=orphan_expiry_horizon_s)
+            expiry_candidates = [previous.created_at + timedelta(seconds=orphan_expiry_horizon_s)]
+            if previous.provider_expiry_at is not None:
+                expiry_candidates.append(previous.provider_expiry_at)
+            if previous.expected_end_at is not None:
+                expiry_candidates.append(
+                    previous.expected_end_at + timedelta(seconds=_PROVIDER_CLOCK_SKEW_S)
+                )
+            safe_expiry = max(expiry_candidates)
             requires_reap = datetime.now(UTC) < safe_expiry
         if requires_reap:
             orphan_reaper(previous.lease_id)
@@ -356,8 +374,15 @@ class RunnerLeaseLedger:
         lease_id: str,
         owner_id: str,
         config_digest: str,
+        provider_expiry_horizon_s: int | None = None,
     ) -> None:
         """Durably claim ownership before issuing a resource create request."""
+        created_at = datetime.now(UTC)
+        provider_expiry_at = (
+            None
+            if provider_expiry_horizon_s is None
+            else created_at + timedelta(seconds=provider_expiry_horizon_s)
+        )
         self._persist(
             RunnerLeaseRecord(
                 backend=backend,
@@ -365,7 +390,8 @@ class RunnerLeaseLedger:
                 owner_id=owner_id,
                 config_digest=config_digest,
                 state="creating",
-                created_at=datetime.now(UTC),
+                created_at=created_at,
+                provider_expiry_at=provider_expiry_at,
             )
         )
 
@@ -809,6 +835,11 @@ class E2BOneShotRunnerFactory:
                 lease_id=self._lease_id,
                 owner_id=self._owner_id,
                 config_digest=self._spec.config_digest,
+                provider_expiry_horizon_s=(
+                    E2B_CREATE_REQUEST_TIMEOUT_S
+                    + self._spec.lease_timeout_s
+                    + int(_PROVIDER_CLOCK_SKEW_S)
+                ),
             )
             lease_claimed = True
             if self._resource_budget is not None:

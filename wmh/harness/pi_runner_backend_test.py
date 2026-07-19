@@ -277,6 +277,87 @@ def test_runner_lease_receipt_rejects_impossible_timestamp_order(field: str) -> 
         RunnerLeaseRecord.model_validate(payload)
 
 
+def test_runner_lease_omits_an_absent_provider_expiry_from_legacy_receipts() -> None:
+    record = RunnerLeaseRecord(
+        backend="local",
+        lease_id="local-lease",
+        owner_id="sha256:" + "a" * 64,
+        config_digest="sha256:" + "b" * 64,
+        state="creating",
+        created_at=datetime.now(UTC),
+    )
+
+    assert "provider_expiry_at" not in record.model_dump(mode="json")
+
+
+def test_e2b_reconciliation_uses_the_prior_lease_expiry_when_specs_shrink(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "runner-lease.json"
+    now = datetime.now(UTC)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "backend": "e2b",
+                "lease_id": "prior-long-lease",
+                "owner_id": "sha256:" + "a" * 64,
+                "config_digest": "sha256:" + "b" * 64,
+                "state": "creating",
+                "resource_id": None,
+                "created_at": (now - timedelta(minutes=5)).isoformat(),
+                "provider_expiry_at": (now + timedelta(hours=1)).isoformat(),
+                "expected_end_at": None,
+                "retired_at": None,
+            }
+        )
+    )
+    reaped: list[str] = []
+
+    backend_mod.RunnerLeaseLedger(ledger_path).reconcile(
+        backend="e2b",
+        orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+        orphan_budget_reconciler=lambda _lease_id: True,
+        orphan_expiry_horizon_s=1,
+    )
+
+    assert reaped == ["prior-long-lease"]
+    assert json.loads(ledger_path.read_text())["state"] == "retired"
+
+
+def test_e2b_reconciliation_honors_a_legacy_observed_provider_endpoint(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "runner-lease.json"
+    now = datetime.now(UTC)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "backend": "e2b",
+                "lease_id": "prior-active-lease",
+                "owner_id": "sha256:" + "a" * 64,
+                "config_digest": "sha256:" + "b" * 64,
+                "state": "active",
+                "resource_id": "prior-sandbox",
+                "created_at": (now - timedelta(minutes=5)).isoformat(),
+                "expected_end_at": (now + timedelta(hours=1)).isoformat(),
+                "retired_at": None,
+            }
+        )
+    )
+    reaped: list[str] = []
+
+    backend_mod.RunnerLeaseLedger(ledger_path).reconcile(
+        backend="e2b",
+        orphan_reaper=lambda lease_id: (reaped.append(lease_id), ())[1],
+        orphan_budget_reconciler=lambda _lease_id: True,
+        orphan_expiry_horizon_s=1,
+    )
+
+    assert reaped == ["prior-active-lease"]
+
+
 def test_local_attestation_binds_exact_platform_manifest_and_bundle() -> None:
     evidence = LocalPiRunnerSpec().attestation.evidence
 
