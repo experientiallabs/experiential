@@ -51,6 +51,7 @@ from wmh.tracking.budget import (
     BudgetIntegrityError,
     BudgetReservation,
     BudgetScope,
+    BudgetTerminalProvenance,
     ReservationStatus,
     SpendLedger,
     TimedResourceBudget,
@@ -88,6 +89,7 @@ _E2B_CREDENTIAL_FINGERPRINT_DOMAIN = b"wmh-e2b-credential-v1\0"
 _E2B_API_KEY_ENV = "E2B_API_KEY"
 _E2B_BUILD_STATUS_POLL_INTERVAL_S = 2.0
 _E2B_RECONCILIATION_REQUEST_TIMEOUT_S = 30
+_EXACT_BUILD_PROVENANCE_NAMESPACE = "wmh.e2b.exact-build.v1"
 _ASYNC_KILL_DELAYS_S = (0.0, 0.1, 0.5)
 _COMPONENT_IDENTITY = re.compile(r"[A-Za-z0-9_.-]{1,512}\Z")
 _RESOURCE_IDENTITY = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
@@ -384,6 +386,36 @@ _ExactE2BBuildAttribution = Annotated[
 ]
 
 
+class _ExactE2BBuildTerminalIdentity(BaseModel):
+    """Every immutable build and provider identity bound to its terminal spend event."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    reservation_id: str = Field(min_length=1)
+    policy_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ledger_identity: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    meter_id: str = Field(min_length=1)
+    scope: BudgetScope
+    build_config_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    environment_id: str = Field(min_length=1, max_length=512)
+    build_context_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    template_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
+    build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
+    cpu_count: int = Field(ge=1)
+    memory_mb: int = Field(ge=1)
+    provider: Literal["e2b"] = "e2b"
+    provider_account_identity: str = Field(pattern=r"^[A-Za-z0-9_.:@/-]{1,256}$")
+    provider_credential_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    provider_spend_limit_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    provider_trust_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    provider_verifier_key_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")
+
+    @property
+    def digest(self) -> str:
+        return _digest(cast("JsonObject", self.model_dump(mode="json")))
+
+
 class ExactE2BBuildRecord(BaseModel):
     """Durable immutable E2B build selected for one environment definition."""
 
@@ -408,6 +440,39 @@ class ExactE2BBuildRecord(BaseModel):
     def exact_template_ref(self) -> str:
         """Return the exact E2B template/build reference used for every create."""
         return f"{self.template_id}:{self.build_id}"
+
+
+def _exact_build_terminal_provenance(
+    record: ExactE2BBuildRecord,
+) -> BudgetTerminalProvenance:
+    attribution = record.cost_attribution
+    if not isinstance(attribution, BudgetedE2BBuildAttribution):
+        raise BudgetIntegrityError("preexisting E2B builds have no study settlement provenance")
+    statement = attribution.provider_spend_limit.statement
+    identity = _ExactE2BBuildTerminalIdentity(
+        reservation_id=attribution.reservation_id,
+        policy_digest=attribution.policy_digest,
+        ledger_identity=attribution.ledger_identity,
+        meter_id=attribution.meter_id,
+        scope=attribution.scope,
+        build_config_digest=record.build_config_digest,
+        environment_id=record.environment_id,
+        build_context_digest=record.build_context_digest,
+        template_id=record.template_id,
+        build_id=record.build_id,
+        cpu_count=record.cpu_count,
+        memory_mb=record.memory_mb,
+        provider=statement.provider,
+        provider_account_identity=statement.account_identity,
+        provider_credential_fingerprint=statement.credential_fingerprint,
+        provider_spend_limit_digest=attribution.provider_spend_limit.digest,
+        provider_trust_digest=attribution.provider_spend_limit_trust_digest,
+        provider_verifier_key_id=attribution.provider_spend_limit_trust.key_id,
+    )
+    return BudgetTerminalProvenance(
+        namespace=_EXACT_BUILD_PROVENANCE_NAMESPACE,
+        digest=identity.digest,
+    )
 
 
 class _E2BBuildRef(BaseModel):
@@ -1204,7 +1269,6 @@ async def _prepare_exact_e2b_build_locked(
         # Transport/cancellation failures intentionally leave an IDENTIFIED journal and RESERVED
         # ledger entry. A later invocation resumes status polling by immutable IDs without another
         # upload or build trigger.
-        _settle_build_reservation(account, attempt)
         record = ExactE2BBuildRecord(
             build_config_digest=config_digest,
             environment_id=spec.environment_id,
@@ -1215,6 +1279,7 @@ async def _prepare_exact_e2b_build_locked(
             memory_mb=spec.memory_mb,
             cost_attribution=attempt.cost_attribution,
         )
+        _settle_build_reservation(account, attempt, record=record)
         _write_build_record(record_path, record)
         _unlink_registry_path(attempt_path)
         return record
@@ -1674,12 +1739,23 @@ def _forfeit_build_reservation(
 def _settle_build_reservation(
     account: TimedResourceBudgetAccount,
     attempt: _ExactE2BBuildAttempt,
+    *,
+    record: ExactE2BBuildRecord,
 ) -> None:
     if attempt.dispatch_started_at is None:
         raise BudgetIntegrityError("E2B identified build has no dispatch timestamp")
     meter = account.policy.meters[account.meter_id]
     if not isinstance(meter, TimedResourceCostMeter):
         raise BudgetIntegrityError("E2B build account does not name a timed resource meter")
+    if (
+        attempt.provider_build is None
+        or record.build_config_digest != attempt.build_config_digest
+        or record.template_id != attempt.provider_build.template_id
+        or record.build_id != attempt.provider_build.build_id
+        or record.cost_attribution != attempt.cost_attribution
+    ):
+        raise BudgetIntegrityError("E2B build record differs from its resumable attempt")
+    terminal_provenance = _exact_build_terminal_provenance(record)
     ledger = open_shared_spend_ledger(
         account.ledger_path,
         account.policy,
@@ -1698,6 +1774,10 @@ def _settle_build_reservation(
             or not isinstance(reservation.usage_quantity, int)
         ):
             raise BudgetIntegrityError("settled E2B build reservation evidence is inconsistent")
+        if ledger.settlement_provenance(reservation.reservation_id) != terminal_provenance:
+            raise BudgetIntegrityError(
+                "settled E2B build reservation has different terminal provenance"
+            )
         return
     if getattr(reservation, "status", None) is not ReservationStatus.RESERVED:
         raise BudgetIntegrityError("E2B build reservation is not open for settlement")
@@ -1716,6 +1796,7 @@ def _settle_build_reservation(
         charged_nano_usd=meter.charge_nano_usd(billed_seconds=billed_seconds),
         usage_quantity=billed_seconds,
         usage_unit="billing_second",
+        terminal_provenance=terminal_provenance,
     )
 
 
@@ -1978,6 +2059,10 @@ def _verify_build_budget_attribution(
         or reservation.usage_quantity is None
     ):
         raise BudgetIntegrityError("E2B build cost attribution is not a settled timed reservation")
+    if ledger.settlement_provenance(reservation.reservation_id) != (
+        _exact_build_terminal_provenance(record)
+    ):
+        raise BudgetIntegrityError("E2B build cost attribution has different terminal provenance")
 
 
 def _open_build_lock(path: Path) -> int:

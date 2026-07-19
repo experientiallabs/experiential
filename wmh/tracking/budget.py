@@ -438,6 +438,20 @@ class BudgetReservation(BaseModel):
     breach_kind: BudgetBreachKind | None = None
 
 
+class BudgetTerminalProvenance(BaseModel):
+    """Domain-separated digest bound into one append-only terminal settlement."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    namespace: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
+    digest: str = Field(pattern=_DIGEST_PATTERN)
+
+
 class BudgetSnapshot(BaseModel):
     """Atomic exposure summary used by operator gates and call admission."""
 
@@ -480,6 +494,7 @@ class _BudgetSettled(BaseModel):
     usage_unit: str | None = Field(default=None, min_length=1)
     status: Literal[ReservationStatus.SETTLED, ReservationStatus.BREACHED]
     breach_kind: BudgetBreachKind | None = None
+    terminal_provenance: BudgetTerminalProvenance | None = None
 
     @model_validator(mode="after")
     def _validate_breach(self) -> Self:
@@ -692,6 +707,7 @@ class SpendLedger:
         usage_quantity: int | None = None,
         usage_unit: str | None = None,
         breach_kind: BudgetBreachKind | None = None,
+        terminal_provenance: BudgetTerminalProvenance | None = None,
     ) -> BudgetReservation:
         """Settle exact usage, recording and raising after any ceiling breach."""
         if charged_nano_usd < 0:
@@ -707,6 +723,7 @@ class SpendLedger:
                 ReservationStatus.BREACHED if breach_kind is not None else ReservationStatus.SETTLED
             ),
             breach_kind=breach_kind,
+            terminal_provenance=terminal_provenance,
         )
         breached = False
         resolved_breach = breach_kind
@@ -799,6 +816,23 @@ class SpendLedger:
                 self._verified_reservations[reservation_id].model_copy(deep=True)
                 for reservation_id in sorted(self._verified_reservations)
             ]
+
+    def settlement_provenance(
+        self,
+        reservation_id: str,
+    ) -> BudgetTerminalProvenance | None:
+        """Return the append-only provenance attached to one settled reservation, if any."""
+        matches = [
+            event.action.terminal_provenance
+            for event in self.events()
+            if isinstance(event.action, _BudgetSettled)
+            and event.action.reservation_id == reservation_id
+        ]
+        if len(matches) > 1:
+            raise BudgetIntegrityError("budget reservation has duplicate settlement provenance")
+        if not matches or matches[0] is None:
+            return None
+        return matches[0].model_copy(deep=True)
 
     def events(self) -> list[BudgetEvent]:
         """Return the append-only audit events after verifying each serialized entry."""
@@ -2343,6 +2377,13 @@ def _budget_event_dump(
             raise BudgetIntegrityError("budget opened event serialization is malformed")
         action = dict(raw_action)
         action["policy"] = _budget_policy_dump(event.action.policy)
+        payload["action"] = action
+    elif isinstance(event.action, _BudgetSettled) and event.action.terminal_provenance is None:
+        raw_action = payload.get("action")
+        if not isinstance(raw_action, dict):
+            raise BudgetIntegrityError("budget settled event serialization is malformed")
+        action = dict(raw_action)
+        action.pop("terminal_provenance", None)
         payload["action"] = action
     return payload
 

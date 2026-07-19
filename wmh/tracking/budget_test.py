@@ -42,6 +42,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetReservation,
     BudgetScope,
+    BudgetTerminalProvenance,
     ExternalSpendAuthority,
     ProviderCostMeter,
     ReservationStatus,
@@ -633,6 +634,63 @@ def test_unbound_external_authority_preserves_legacy_digest_and_reopens(
 
     assert reopened.policy == policy
     assert reopened.ledger_identity == authority.ledger_identity
+
+
+def test_settlement_terminal_provenance_is_audited_and_legacy_compatible(
+    tmp_path: Path,
+) -> None:
+    policy = _policy()
+    provenance = BudgetTerminalProvenance(
+        namespace="wmh.test.resource.v1",
+        digest="sha256:" + "7" * 64,
+    )
+    bound_path = tmp_path / "bound.sqlite3"
+    bound = SpendLedger(bound_path, policy)
+    bound.reserve(
+        _scope(),
+        meter_id="worker",
+        max_nano_usd=60,
+        reservation_id="bound",
+    )
+    bound.settle(
+        "bound",
+        charged_nano_usd=20,
+        input_tokens=0,
+        output_tokens=4,
+        terminal_provenance=provenance,
+    )
+
+    assert bound.settlement_provenance("bound") == provenance
+    with sqlite3.connect(bound_path) as connection:
+        [bound_event_json] = connection.execute(
+            "SELECT entry_json FROM budget_events WHERE sequence = 3"
+        ).fetchone()
+    assert provenance.namespace in bound_event_json
+    assert provenance.digest in bound_event_json
+    reopened_bound = SpendLedger(bound_path, policy, allow_create=False)
+    assert reopened_bound.settlement_provenance("bound") == provenance
+
+    legacy_path = tmp_path / "legacy-settlement.sqlite3"
+    legacy = SpendLedger(legacy_path, policy)
+    legacy.reserve(
+        _scope(),
+        meter_id="worker",
+        max_nano_usd=60,
+        reservation_id="legacy",
+    )
+    legacy.settle(
+        "legacy",
+        charged_nano_usd=20,
+        input_tokens=0,
+        output_tokens=4,
+    )
+    with sqlite3.connect(legacy_path) as connection:
+        [legacy_event_json] = connection.execute(
+            "SELECT entry_json FROM budget_events WHERE sequence = 3"
+        ).fetchone()
+    assert "terminal_provenance" not in legacy_event_json
+    reopened_legacy = SpendLedger(legacy_path, policy, allow_create=False)
+    assert reopened_legacy.settlement_provenance("legacy") is None
 
 
 def test_orphaned_timed_resource_join_is_exact_and_conservative(tmp_path: Path) -> None:

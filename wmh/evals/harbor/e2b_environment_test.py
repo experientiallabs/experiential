@@ -548,6 +548,55 @@ def test_build_record_reuse_resolves_attributed_meter_from_shared_ledger_authori
     assert record.cost_attribution.meter_id == "build"
     assert record.cost_attribution.scope.phase == "preparation"
 
+    attribution = record.cost_attribution
+    provider_attestation = attribution.provider_spend_limit
+    provider_statement = provider_attestation.statement
+    provider_mutation = attribution.model_copy(
+        update={
+            "provider_spend_limit": provider_attestation.model_copy(
+                update={
+                    "statement": provider_statement.model_copy(
+                        update={"credential_fingerprint": "sha256:" + "4" * 64}
+                    )
+                }
+            )
+        }
+    )
+    terminal_identity_mutations = (
+        record.model_copy(update={"build_config_digest": "sha256:" + "1" * 64}),
+        record.model_copy(update={"environment_id": "environment-replayed"}),
+        record.model_copy(update={"build_context_digest": "sha256:" + "2" * 64}),
+        record.model_copy(update={"template_id": "template-replayed"}),
+        record.model_copy(update={"build_id": "build-replayed"}),
+        record.model_copy(update={"cpu_count": record.cpu_count + 1}),
+        record.model_copy(update={"memory_mb": record.memory_mb + 1}),
+        record.model_copy(
+            update={
+                "cost_attribution": attribution.model_copy(
+                    update={"reservation_id": "reservation-replayed"}
+                )
+            }
+        ),
+        record.model_copy(update={"cost_attribution": provider_mutation}),
+    )
+    terminal_provenance = mod._exact_build_terminal_provenance(record)
+    assert all(
+        mod._exact_build_terminal_provenance(mutated) != terminal_provenance
+        for mutated in terminal_identity_mutations
+    )
+
+    replayed_record = record.model_copy(
+        update={
+            "template_id": "template-replayed",
+            "build_id": "build-replayed",
+        }
+    )
+    with pytest.raises(BudgetIntegrityError, match="terminal provenance"):
+        mod._verify_build_budget_attribution(
+            replayed_record,
+            expected_authority=task_account,
+        )
+
     foreign_policy = _resource_account(tmp_path / "foreign-policy")
     with pytest.raises(BudgetIntegrityError, match="study authority"):
         mod.require_exact_e2b_build_record(
@@ -998,6 +1047,75 @@ def test_identified_background_build_polling_resumes_without_redispatch(
     [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
     assert reservation.status is ReservationStatus.SETTLED
     assert not attempt_path.exists()
+
+
+def test_settled_build_resumes_record_persistence_without_redispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _environment(tmp_path)
+    environment_dir = tmp_path / "environment"
+    jobs_dir = tmp_path / "jobs"
+    account = _build_resource_account(tmp_path)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    starts = 0
+    writes = 0
+
+    async def start(**_kwargs: object) -> BuildInfo:
+        nonlocal starts
+        starts += 1
+        return BuildInfo(
+            template_id="template-settled-resume",
+            build_id="build-settled-resume",
+            name="name",
+            alias="alias",
+        )
+
+    original_write = mod._write_build_record
+
+    def fail_first_record_write(path: Path, record: mod.ExactE2BBuildRecord) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise RuntimeError("injected record persistence failure")
+        original_write(path, record)
+
+    monkeypatch.setattr(mod, "_start_exact_template_build", start)
+    monkeypatch.setattr(mod, "_write_build_record", fail_first_record_write)
+
+    async def prepare() -> mod.ExactE2BBuildRecord:
+        return await mod.prepare_exact_e2b_build(
+            jobs_dir=jobs_dir,
+            environment_dir=environment_dir,
+            spec=spec,
+            budget_account=account,
+            provider_spend_limit=_spend_limit(account),
+            provider_spend_limit_trust=_spend_limit_trust(),
+        )
+
+    with pytest.raises(RuntimeError, match="record persistence failure"):
+        asyncio.run(prepare())
+    ledger = SpendLedger(account.ledger_path, account.policy)
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert ledger.settlement_provenance(reservation.reservation_id) is not None
+    [attempt_path] = (jobs_dir / mod._BUILD_REGISTRY_DIR).glob("*.attempt.json")
+    assert attempt_path.exists()
+
+    record = asyncio.run(prepare())
+
+    assert record.exact_template_ref == "template-settled-resume:build-settled-resume"
+    assert starts == 1
+    assert writes == 2
+    assert not attempt_path.exists()
+    assert ledger.settlement_provenance(reservation.reservation_id) == (
+        mod._exact_build_terminal_provenance(record)
+    )
 
 
 def test_prehandle_failure_adopts_one_exact_build_without_redispatch(
