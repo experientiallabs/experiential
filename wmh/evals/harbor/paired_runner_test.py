@@ -908,6 +908,7 @@ def _e2b_budget_runtime(
                         input_nano_usd_per_token=1,
                         output_nano_usd_per_token=5,
                     ),
+                    tariff_provenance=_TARIFF_PROVENANCE,
                 )
                 for route in routes
             },
