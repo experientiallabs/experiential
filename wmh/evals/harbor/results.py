@@ -17,6 +17,7 @@ from harbor.models.trial.result import ExceptionInfo, TrialResult
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from wmh.evals.benchmark import (
+    MAX_BENCHMARK_TASK_INSTRUCTION_CHARS,
     BenchmarkCandidateFailureReason,
     BenchmarkCandidateOutcome,
     BenchmarkCandidateStage,
@@ -115,6 +116,15 @@ _CANDIDATE_OUTCOME_METADATA_KEYS = frozenset(
         "terminal_reason",
     }
 )
+_TASK_ENVIRONMENT_DIGEST_KEY = "task_environment_digest"
+_TASK_ENVIRONMENT_ATTESTATION_KEY = "task_environment_attestation"
+_MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class _TrustedRunEvidence:
+    candidate_outcome: BenchmarkCandidateOutcome
+    task_environment_digest: str | None
 
 
 class HarborTrialManifestEntry(BaseModel):
@@ -125,6 +135,7 @@ class HarborTrialManifestEntry(BaseModel):
     task_identity: str = Field(min_length=1)
     task_checksum: str = Field(min_length=1)
     task_source: str | None
+    task_instruction: str = Field(max_length=MAX_BENCHMARK_TASK_INSTRUCTION_CHARS)
     trial_lock_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
     @field_validator("trial_name")
@@ -282,6 +293,7 @@ def _load_manifest_entry(
                 task_identity=entry.task_identity,
                 task_checksum=entry.task_checksum,
                 source=entry.task_source,
+                task_instruction=entry.task_instruction,
                 status=BenchmarkTrialStatus.INCOMPLETE,
             ),
             HarborTrialLocator(
@@ -316,12 +328,12 @@ def _load_manifest_entry(
     _validate_locked_config(result.config, trial_lock)
     _validate_trial_job_provenance(result.config, root=root, job_id=job_id)
     _validate_trial_identity(result, entry)
-    candidate_outcome = _validate_run_identity(
+    run_evidence = _validate_run_identity(
         result,
         manifest.identity,
         manifest.agent_config_digest,
     )
-    return _convert_trial(result, entry, candidate_outcome), locator
+    return _convert_trial(result, entry, run_evidence), locator
 
 
 def _load_incomplete_trial(
@@ -338,6 +350,7 @@ def _load_incomplete_trial(
             task_identity=entry.task_identity,
             task_checksum=entry.task_checksum,
             source=entry.task_source,
+            task_instruction=entry.task_instruction,
             status=BenchmarkTrialStatus.INCOMPLETE,
         )
     if not config_path.is_file():
@@ -363,6 +376,7 @@ def _load_incomplete_trial(
         task_identity=entry.task_identity,
         task_checksum=entry.task_checksum,
         source=entry.task_source,
+        task_instruction=entry.task_instruction,
         status=BenchmarkTrialStatus.INCOMPLETE,
     )
 
@@ -427,7 +441,7 @@ def _validate_run_identity(
     result: TrialResult,
     expected: BenchmarkRunIdentity,
     expected_agent_config_digest: str,
-) -> BenchmarkCandidateOutcome:
+) -> _TrustedRunEvidence:
     actual_agent = result.agent_info
     if actual_agent.name != expected.agent_name or actual_agent.version != expected.agent_version:
         raise ValueError(
@@ -460,6 +474,7 @@ def _validate_run_identity(
         step.agent_result for step in result.step_results or [] if step.agent_result is not None
     )
     outcomes: list[BenchmarkCandidateOutcome] = []
+    environment_digests: list[str] = []
     for context in contexts:
         metadata = context.metadata or {}
         candidate_hash = metadata.get("harness_hash")
@@ -473,13 +488,68 @@ def _validate_run_identity(
             raise ValueError(
                 f"manifest expected runner image {expected.runner_image!r}, found {runner_image!r}"
             )
+        environment_digests.append(
+            _parse_task_environment_attestation(
+                metadata,
+                expected_backend=expected.task_environment.value,
+            )
+        )
         outcomes.append(_parse_candidate_outcome(metadata))
     if not outcomes:
-        return BenchmarkCandidateOutcome()
+        return _TrustedRunEvidence(
+            candidate_outcome=BenchmarkCandidateOutcome(),
+            task_environment_digest=None,
+        )
     first = outcomes[0]
     if any(outcome != first for outcome in outcomes[1:]):
         raise ValueError("Harbor step contexts contain inconsistent candidate outcome metadata")
-    return first
+    first_environment_digest = environment_digests[0]
+    if any(digest != first_environment_digest for digest in environment_digests[1:]):
+        raise ValueError("Harbor step contexts contain inconsistent task environment metadata")
+    return _TrustedRunEvidence(
+        candidate_outcome=first,
+        task_environment_digest=first_environment_digest,
+    )
+
+
+def _parse_task_environment_attestation(
+    metadata: dict[str, object],
+    *,
+    expected_backend: str,
+) -> str:
+    digest = metadata.get(_TASK_ENVIRONMENT_DIGEST_KEY)
+    attestation = metadata.get(_TASK_ENVIRONMENT_ATTESTATION_KEY)
+    if not isinstance(digest, str) or not _is_sha256_digest(digest):
+        raise ValueError("Harbor agent metadata omits a valid task environment digest")
+    if not isinstance(attestation, dict):
+        raise ValueError("Harbor agent metadata omits task environment attestation evidence")
+    if attestation.get("schema_version") != 1 or attestation.get("backend") != expected_backend:
+        raise ValueError("Harbor task environment attestation names the wrong backend or schema")
+    try:
+        canonical = json.dumps(
+            attestation,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    except (TypeError, ValueError):
+        raise ValueError("Harbor task environment attestation is not canonical JSON") from None
+    if len(canonical) > _MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES:
+        raise ValueError("Harbor task environment attestation exceeds its evidence limit")
+    actual = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    if actual != digest:
+        raise ValueError("Harbor task environment attestation does not match its digest")
+    return digest
+
+
+def _is_sha256_digest(value: str) -> bool:
+    encoded = value.removeprefix("sha256:")
+    return (
+        value.startswith("sha256:")
+        and len(encoded) == 64
+        and all(character in "0123456789abcdef" for character in encoded)
+    )
 
 
 def _parse_candidate_outcome(metadata: dict[str, object]) -> BenchmarkCandidateOutcome:
@@ -571,7 +641,7 @@ def _validate_agent_config_identity(
 def _convert_trial(
     result: TrialResult,
     entry: HarborTrialManifestEntry,
-    candidate_outcome: BenchmarkCandidateOutcome,
+    run_evidence: _TrustedRunEvidence,
 ) -> BenchmarkTrialResult:
     error = _convert_exception(result.exception_info)
     has_rewards = result.verifier_result is not None and result.verifier_result.rewards is not None
@@ -598,10 +668,12 @@ def _convert_trial(
         task_identity=entry.task_identity,
         task_checksum=entry.task_checksum,
         source=entry.task_source,
+        task_instruction=entry.task_instruction,
+        task_environment_digest=run_evidence.task_environment_digest,
         status=status,
         rewards=rewards,
         error=error,
-        candidate_outcome=candidate_outcome,
+        candidate_outcome=run_evidence.candidate_outcome,
         usage=BenchmarkUsage(
             input_tokens=n_input,
             input_tokens_status=_usage_status(
@@ -683,6 +755,7 @@ def _malformed_trial(
         task_identity=entry.task_identity,
         task_checksum=entry.task_checksum,
         source=entry.task_source,
+        task_instruction=entry.task_instruction,
         status=BenchmarkTrialStatus.INFRASTRUCTURE_ERROR,
         error=BenchmarkError(
             kind=BenchmarkFailureKind.MALFORMED_RESULT,

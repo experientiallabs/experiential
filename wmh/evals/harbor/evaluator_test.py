@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +39,30 @@ from wmh.evals.harbor.results import (
 )
 from wmh.harness.pi_runner import pi_node_baseline
 from wmh.providers.base import ProviderConfig, ProviderKind
+
+_TASK_ENVIRONMENT_ATTESTATION = {
+    "schema_version": 1,
+    "backend": "docker",
+    "daemon_platform": "linux/amd64",
+    "services": [
+        {
+            "service": "main",
+            "replica": 1,
+            "image_id": "sha256:" + "c" * 64,
+            "image_platform": "linux/amd64",
+        }
+    ],
+}
+_TASK_ENVIRONMENT_DIGEST = (
+    "sha256:"
+    + hashlib.sha256(
+        json.dumps(
+            _TASK_ENVIRONMENT_ATTESTATION,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+)
 
 
 def _write_task(
@@ -331,6 +357,7 @@ def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_key
     assert len(manifest.entries) == 4
     assert {entry.cell.task_name for entry in manifest.entries} == {"shared-task"}
     assert {entry.task_source for entry in manifest.entries} == {"dataset-a", "dataset-b"}
+    assert {entry.task_instruction for entry in manifest.entries} == {"Solve the task.\n"}
     assert len({entry.cell.task_key for entry in manifest.entries}) == 2
     for source in ("dataset-a", "dataset-b"):
         assert sorted(
@@ -664,7 +691,7 @@ def _materialize_job(
             config=trial_config,
             agent_info=AgentInfo(
                 name="wmh-pi",
-                version="0.1.0",
+                version=mod.WMH_PI_AGENT_VERSION,
                 model_info=ModelInfo(name="model", provider="bedrock"),
             ),
             agent_result=AgentContext(
@@ -673,6 +700,8 @@ def _materialize_job(
                 metadata={
                     "harness_hash": candidate_hash,
                     "runner_image": mod.PI_CONTAINER_IMAGE,
+                    "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
+                    "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
                 },
             ),
             verifier_result=VerifierResult(rewards={"score": 1}),
@@ -753,6 +782,26 @@ def test_complete_matching_job_is_reused_without_rerunning_completed_trials(
     assert remaining == [0]
     assert resumed.result == first.result
     assert readiness_images == [mod.PI_CONTAINER_IMAGE]
+
+
+def test_agent_runtime_version_change_rejects_stale_completed_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    candidate = pi_node_baseline("candidate")
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+
+    async def first_run(job: Job) -> None:
+        _materialize_completed_job(job, candidate.execution_hash)
+
+    monkeypatch.setattr(Job, "run", first_run)
+    asyncio.run(evaluator.evaluate(candidate))
+
+    monkeypatch.setattr(mod, "WMH_PI_AGENT_VERSION", "next-runtime-version")
+    with pytest.raises(mod.StaleHarborJobError, match="manifest"):
+        asyncio.run(evaluator.evaluate(candidate))
 
 
 @pytest.mark.parametrize("tamper", ["malformed", "mismatched"])
@@ -1122,6 +1171,7 @@ def test_existing_trial_evidence_must_be_regular_files(
         task_identity="task",
         task_checksum="sha256:" + "a" * 64,
         task_source="dataset",
+        task_instruction="Instruction for task.",
         trial_lock_digest=trial_config_digest,
     )
     manifest = HarborTrialManifest(
@@ -1220,6 +1270,80 @@ def test_multi_step_task_is_rejected_before_manifest_or_run(
         asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
     assert not (tmp_path / "jobs" / "evaluation" / mod._MANIFEST_FILENAME).exists()
+
+
+@pytest.mark.parametrize("linked_name", ["instruction.md", "task.toml"])
+def test_local_task_host_read_symlink_is_rejected_before_harbor_job_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    linked_name: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    sentinel = "host-secret-sentinel-must-not-surface"
+    outside = tmp_path / f"outside-{linked_name}"
+    outside.write_text(
+        f"# {sentinel}\n" if linked_name == "task.toml" else sentinel,
+        encoding="utf-8",
+    )
+    linked = task_dir / linked_name
+    linked.unlink()
+    linked.symlink_to(outside)
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("unsafe task tree must fail before Harbor inspects it")
+
+    monkeypatch.setattr(Job, "create", classmethod(unexpected_create))
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="symbolic link") as caught:
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
+    assert sentinel not in str(caught.value)
+    assert not (tmp_path / "jobs" / "evaluation" / mod._MANIFEST_FILENAME).exists()
+
+
+@pytest.mark.parametrize("unsafe_entry", ["task-root", "instruction.md", "task.toml"])
+def test_unselected_local_sibling_is_preflighted_before_harbor_scans_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_entry: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "selected")
+    sibling = _write_task(dataset, "unselected")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "task.toml").write_text("", encoding="utf-8")
+    (outside / "instruction.md").write_text("host-secret-sentinel", encoding="utf-8")
+    if unsafe_entry == "task-root":
+        for path in sorted(sibling.rglob("*"), reverse=True):
+            if path.is_dir():
+                path.rmdir()
+            else:
+                path.unlink()
+        sibling.rmdir()
+        sibling.symlink_to(outside, target_is_directory=True)
+    else:
+        linked = sibling / unsafe_entry
+        linked.unlink()
+        linked.symlink_to(outside / unsafe_entry)
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("unsafe sibling must fail before Harbor scans local tasks")
+
+    monkeypatch.setattr(Job, "create", classmethod(unexpected_create))
+    spec = _spec(tmp_path, dataset).model_copy(
+        update={
+            "datasets": [
+                DatasetConfig(path=dataset, task_names=["selected"]),
+            ]
+        }
+    )
+    evaluator = mod.HarborEvaluator(spec, _provider())
+
+    with pytest.raises(mod.UnsupportedHarborTaskError, match="symbolic link"):
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
 
 @pytest.mark.parametrize("keep_dockerfile", [False, True])

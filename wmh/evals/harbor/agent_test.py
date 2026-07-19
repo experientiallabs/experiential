@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -12,6 +15,7 @@ from typing import cast
 import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
+from harbor.models.environment_type import EnvironmentType
 
 import wmh.evals.harbor.agent as mod
 from wmh.core.types import JsonObject
@@ -25,6 +29,33 @@ from wmh.harness.pi_runner import (
 )
 from wmh.harness.runner_link import TokenUsage
 from wmh.providers.base import ProviderConfig, ProviderKind
+
+_TASK_ENVIRONMENT_ATTESTATION = cast(
+    "JsonObject",
+    {
+        "schema_version": 1,
+        "backend": "docker",
+        "daemon_platform": "linux/amd64",
+        "services": [
+            {
+                "service": "main",
+                "replica": 1,
+                "image_id": "sha256:" + "c" * 64,
+                "image_platform": "linux/amd64",
+            }
+        ],
+    },
+)
+_TASK_ENVIRONMENT_DIGEST = (
+    "sha256:"
+    + hashlib.sha256(
+        json.dumps(
+            _TASK_ENVIRONMENT_ATTESTATION,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+)
 
 
 class _Provider:
@@ -62,12 +93,17 @@ class _Environment:
 def _agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> mod.WmhPiAgent:
     monkeypatch.setattr(mod, "get_provider", lambda _config: _Provider())
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
-    return mod.WmhPiAgent(
+    agent = mod.WmhPiAgent(
         logs_dir=tmp_path / "agent",
         model_name="bedrock/model",
         harness=cast("JsonObject", pi_node_baseline("candidate").model_dump(mode="json")),
         provider_config=cast("JsonObject", config.model_dump(mode="json")),
     )
+    agent._task_environment_attestation = mod._TaskEnvironmentAttestation(
+        digest=_TASK_ENVIRONMENT_DIGEST,
+        evidence=_TASK_ENVIRONMENT_ATTESTATION,
+    )
+    return agent
 
 
 def _deadline(seconds: float = 300.0) -> mod.ToolExecutionDeadline:
@@ -127,6 +163,298 @@ def test_agent_rejects_environment_injection_before_task_execution(
         )
 
     assert secret not in str(caught.value)
+
+
+def test_setup_attests_all_local_compose_images_without_ephemeral_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+
+    class DockerEnvironment(_Environment):
+        @staticmethod
+        def type() -> EnvironmentType:
+            return EnvironmentType.DOCKER
+
+        async def _run_docker_compose_command(
+            self,
+            command: list[str],
+            check: bool = True,
+            timeout_sec: int | None = None,
+            stdin_data: bytes | None = None,
+            on_output: object | None = None,
+        ) -> ExecResult:
+            _ = check, timeout_sec, stdin_data, on_output
+            assert command == ["ps", "--all", "--quiet"]
+            return ExecResult(stdout="b" * 64 + "\n" + "a" * 64 + "\n", return_code=0)
+
+    async def host_command(*command: str) -> str:
+        joined = " ".join(command)
+        if command[1] == "info":
+            return "linux/amd64\n"
+        if command[1:3] == ("container", "inspect"):
+            container_id = command[-1]
+            if container_id == "a" * 64:
+                return "main\t1\tsha256:" + "1" * 64 + "\trunning\thealthy\n"
+            return "proxy\t1\tsha256:" + "2" * 64 + "\trunning\tnone\n"
+        if command[1:3] == ("image", "inspect"):
+            return "linux/amd64\n"
+        raise AssertionError(f"unexpected host command: {joined}")
+
+    monkeypatch.setattr(mod, "_run_host_command", host_command)
+    asyncio.run(agent.setup(cast("BaseEnvironment", DockerEnvironment())))
+
+    attestation = agent._task_environment_attestation
+    assert attestation is not None
+    assert attestation.evidence["services"] == [
+        {
+            "service": "main",
+            "replica": 1,
+            "image_id": "sha256:" + "1" * 64,
+            "image_platform": "linux/amd64",
+        },
+        {
+            "service": "proxy",
+            "replica": 1,
+            "image_id": "sha256:" + "2" * 64,
+            "image_platform": "linux/amd64",
+        },
+    ]
+    assert "a" * 64 not in json.dumps(attestation.evidence)
+    assert "b" * 64 not in json.dumps(attestation.evidence)
+
+
+def test_local_attestation_binds_compose_replica_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DockerEnvironment(_Environment):
+        def __init__(self, container_ids: tuple[str, ...]) -> None:
+            super().__init__()
+            self.container_ids = container_ids
+
+        @staticmethod
+        def type() -> EnvironmentType:
+            return EnvironmentType.DOCKER
+
+        async def _run_docker_compose_command(
+            self,
+            command: list[str],
+            check: bool = True,
+            timeout_sec: int | None = None,
+            stdin_data: bytes | None = None,
+            on_output: object | None = None,
+        ) -> ExecResult:
+            _ = command, check, timeout_sec, stdin_data, on_output
+            return ExecResult(stdout="\n".join(self.container_ids) + "\n", return_code=0)
+
+    first_id = "a" * 64
+    second_id = "b" * 64
+
+    async def host_command(*command: str) -> str:
+        if command[1] == "info" or command[1:3] == ("image", "inspect"):
+            return "linux/amd64\n"
+        replica = "1" if command[-1] == first_id else "2"
+        return f"main\t{replica}\tsha256:{'1' * 64}\trunning\thealthy\n"
+
+    monkeypatch.setattr(mod, "_run_host_command", host_command)
+    one = asyncio.run(
+        mod._attest_task_environment(cast("BaseEnvironment", DockerEnvironment((first_id,))))
+    )
+    two = asyncio.run(
+        mod._attest_task_environment(
+            cast("BaseEnvironment", DockerEnvironment((first_id, second_id)))
+        )
+    )
+
+    assert one.digest != two.digest
+
+
+@pytest.mark.parametrize(
+    ("status", "health"),
+    [("exited", "none"), ("running", "unhealthy")],
+)
+def test_local_attestation_rejects_non_running_or_unhealthy_service(
+    status: str,
+    health: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "a" * 64
+
+    class DockerEnvironment(_Environment):
+        async def _run_docker_compose_command(
+            self,
+            command: list[str],
+            check: bool = True,
+            timeout_sec: int | None = None,
+            stdin_data: bytes | None = None,
+            on_output: object | None = None,
+        ) -> ExecResult:
+            _ = command, check, timeout_sec, stdin_data, on_output
+            return ExecResult(stdout=container_id + "\n", return_code=0)
+
+    async def host_command(*command: str) -> str:
+        if command[1] == "info" or command[1:3] == ("image", "inspect"):
+            return "linux/amd64\n"
+        return f"main\t1\tsha256:{'1' * 64}\t{status}\t{health}\n"
+
+    monkeypatch.setattr(mod, "_run_host_command", host_command)
+
+    with pytest.raises(RuntimeError, match="not running and healthy"):
+        asyncio.run(mod._attest_docker_environment(DockerEnvironment()))
+
+
+def test_setup_attests_e2b_template_build_resources_and_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+
+    class Sandbox:
+        async def get_info(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                template_id="template-immutable",
+                cpu_count=4,
+                memory_mb=8192,
+                started_at=datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
+            )
+
+    class E2BEnvironment(_Environment):
+        _sandbox = Sandbox()
+        _template_name = "mutable-alias-not-hashed"
+
+        @staticmethod
+        def type() -> EnvironmentType:
+            return EnvironmentType.E2B
+
+        async def exec(
+            self,
+            command: str,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: int | None = None,
+            user: str | int | None = None,
+        ) -> ExecResult:
+            _ = cwd, env, user
+            assert command == "/bin/uname -s && /bin/uname -m"
+            assert timeout_sec == mod._ENVIRONMENT_ATTESTATION_TIMEOUT_S
+            return ExecResult(stdout="Linux\nx86_64\n", return_code=0)
+
+    async def tags(_template_id: str) -> tuple[tuple[str, str, datetime], ...]:
+        return (
+            (
+                "default",
+                "build-immutable",
+                datetime(2026, 7, 18, 11, 59, tzinfo=UTC),
+            ),
+        )
+
+    monkeypatch.setattr(mod, "_get_e2b_template_tags", tags)
+    asyncio.run(agent.setup(cast("BaseEnvironment", E2BEnvironment())))
+
+    attestation = agent._task_environment_attestation
+    assert attestation is not None
+    assert attestation.evidence == {
+        "schema_version": 1,
+        "backend": "e2b",
+        "template_id": "template-immutable",
+        "build_id": "build-immutable",
+        "platform": "linux/x86_64",
+        "cpu_count": 4,
+        "memory_mb": 8192,
+    }
+    assert "mutable-alias-not-hashed" not in json.dumps(attestation.evidence)
+
+
+def test_setup_rejects_e2b_default_tag_repointed_after_sandbox_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+    started_at = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+
+    class Sandbox:
+        async def get_info(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                template_id="template-immutable",
+                cpu_count=2,
+                memory_mb=4096,
+                started_at=started_at,
+            )
+
+    class E2BEnvironment(_Environment):
+        _sandbox = Sandbox()
+
+        @staticmethod
+        def type() -> EnvironmentType:
+            return EnvironmentType.E2B
+
+    async def tags(_template_id: str) -> tuple[tuple[str, str, datetime], ...]:
+        return (("default", "repointed-build", started_at + timedelta(seconds=1)),)
+
+    monkeypatch.setattr(mod, "_get_e2b_template_tags", tags)
+
+    with pytest.raises(mod.WmhPiEnvironmentError, match="attestation failed"):
+        asyncio.run(agent.setup(cast("BaseEnvironment", E2BEnvironment())))
+
+
+def test_setup_attestation_failure_is_sanitized_environment_infrastructure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+    secret = "host-path-secret-sentinel"
+
+    async def fail(_environment: BaseEnvironment) -> mod._TaskEnvironmentAttestation:
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(mod, "_attest_task_environment", fail)
+
+    with pytest.raises(mod.WmhPiEnvironmentError, match="attestation failed") as caught:
+        asyncio.run(agent.setup(cast("BaseEnvironment", _Environment())))
+
+    assert secret not in str(caught.value)
+
+
+def test_cancelled_host_attestation_kills_and_reaps_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.killed = False
+            self.waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            self.waited = True
+            return -9
+
+    async def scenario() -> None:
+        process = Process()
+
+        async def create(*_args: object, **_kwargs: object) -> Process:
+            return process
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", create)
+        task = asyncio.create_task(mod._run_host_command("docker", "info"))
+        await process.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.killed is True
+        assert process.waited is True
+
+    asyncio.run(scenario())
 
 
 def test_tool_executor_bridges_bash_read_and_write_without_plaintext_content() -> None:
@@ -459,6 +787,8 @@ def test_success_populates_usage_and_backend_identity(
     assert context.metadata["candidate_failure"] is False
     assert context.metadata["runner_image"] == mod.PI_CONTAINER_IMAGE
     assert context.metadata["harness_hash"] == agent._harness.execution_hash
+    assert context.metadata["task_environment_digest"] == _TASK_ENVIRONMENT_DIGEST
+    assert context.metadata["task_environment_attestation"] == _TASK_ENVIRONMENT_ATTESTATION
 
 
 def test_infrastructure_error_does_not_persist_raw_provider_secret(

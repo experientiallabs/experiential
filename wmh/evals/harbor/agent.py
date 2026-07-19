@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import shlex
 import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Final, cast
+from typing import Final, Protocol, cast
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -49,8 +53,13 @@ _TOOL_COMMAND_BYTES = 32 * 1024
 _TOOL_PATH_BYTES = 4 * 1024
 _TOOL_CONTENT_BYTES = 64 * 1024
 _RUNNER_CLEANUP_TIMEOUT_S = 30.0
+_ENVIRONMENT_ATTESTATION_TIMEOUT_S = 30
+_MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES = 64 * 1024
+_MAX_ENVIRONMENT_CONTAINERS = 64
 _TRACE_FILE = "wmh-events.jsonl"
-WMH_PI_AGENT_VERSION: Final = "0.1.0"
+# Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
+# completed artifacts cannot be reused across evaluator behavior changes.
+WMH_PI_AGENT_VERSION: Final = "0.2.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_HEAD_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _BOUNDED_EXEC_SCRIPT = f"""\
@@ -98,6 +107,38 @@ class WmhPiCleanupError(RuntimeError):
 
 class _CandidateToolArgumentError(ValueError):
     """Candidate-supplied tool arguments failed a bounded validation rule."""
+
+
+@dataclass(frozen=True)
+class _TaskEnvironmentAttestation:
+    digest: str
+    evidence: JsonObject
+
+
+class _DockerEnvironmentView(Protocol):
+    async def _run_docker_compose_command(
+        self,
+        command: list[str],
+        check: bool = True,
+        timeout_sec: int | None = None,
+        stdin_data: bytes | None = None,
+        on_output: object | None = None,
+    ) -> ExecResult: ...
+
+
+class _E2BSandboxInfoView(Protocol):
+    template_id: str
+    cpu_count: int
+    memory_mb: int
+    started_at: datetime
+
+
+class _E2BSandboxView(Protocol):
+    async def get_info(self) -> _E2BSandboxInfoView: ...
+
+
+class _E2BEnvironmentView(Protocol):
+    _sandbox: _E2BSandboxView | None
 
 
 class HarborToolExecutor:
@@ -320,6 +361,7 @@ class WmhPiAgent(BaseAgent):
         self._provider = provider
         self._runner_image = runner_image
         self._turn_timeout_s = turn_timeout_s
+        self._task_environment_attestation: _TaskEnvironmentAttestation | None = None
 
     @staticmethod
     def name() -> str:
@@ -329,8 +371,13 @@ class WmhPiAgent(BaseAgent):
         return WMH_PI_AGENT_VERSION
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        """No task-side setup is required because pi runs in its own isolated container."""
-        _ = environment
+        """Freeze the immutable environment actually started for this trial."""
+        try:
+            self._task_environment_attestation = await _attest_task_environment(environment)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - environment details may contain credentials or paths
+            raise WmhPiEnvironmentError("task environment attestation failed") from None
 
     async def run(
         self,
@@ -339,11 +386,16 @@ class WmhPiAgent(BaseAgent):
         context: AgentContext,
     ) -> None:
         """Run one pi turn, preserving candidate failures for Harbor's native verifier."""
+        attestation = self._task_environment_attestation
+        if attestation is None:
+            raise WmhPiEnvironmentError("task environment attestation is unavailable")
         identity_metadata = cast(
             "JsonObject",
             {
                 "harness_hash": self._harness.execution_hash,
                 "runner_image": self._runner_image,
+                "task_environment_digest": attestation.digest,
+                "task_environment_attestation": attestation.evidence,
             },
         )
         _populate_context(context, TokenUsage(), identity_metadata)
@@ -446,6 +498,270 @@ class WmhPiAgent(BaseAgent):
                 temporary_path.unlink(missing_ok=True)
         except OSError:
             raise WmhPiRunnerError("WMH pi trace persistence failed") from None
+
+
+async def _attest_task_environment(
+    environment: BaseEnvironment,
+) -> _TaskEnvironmentAttestation:
+    environment_type = environment.type()
+    backend = getattr(environment_type, "value", environment_type)
+    if backend == "docker":
+        evidence = await _attest_docker_environment(cast("_DockerEnvironmentView", environment))
+    elif backend == "e2b":
+        evidence = await _attest_e2b_environment(
+            environment,
+            cast("_E2BEnvironmentView", environment),
+        )
+    else:
+        raise RuntimeError("unsupported task environment backend")
+    canonical = json.dumps(
+        evidence,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    if len(canonical) > _MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES:
+        raise RuntimeError("task environment attestation exceeds its evidence limit")
+    return _TaskEnvironmentAttestation(
+        digest="sha256:" + hashlib.sha256(canonical).hexdigest(),
+        evidence=evidence,
+    )
+
+
+async def _attest_docker_environment(
+    environment: _DockerEnvironmentView,
+) -> JsonObject:
+    result = await environment._run_docker_compose_command(
+        ["ps", "--all", "--quiet"],
+        timeout_sec=_ENVIRONMENT_ATTESTATION_TIMEOUT_S,
+    )
+    container_ids = _bounded_lines(result.stdout, label="Docker Compose container identities")
+    if not container_ids or len(container_ids) > _MAX_ENVIRONMENT_CONTAINERS:
+        raise RuntimeError("Docker Compose returned an invalid container set")
+    if len(set(container_ids)) != len(container_ids):
+        raise RuntimeError("Docker Compose returned duplicate container identities")
+    if any(re.fullmatch(r"[0-9a-f]{12,64}", value) is None for value in container_ids):
+        raise RuntimeError("Docker Compose returned an invalid container identity")
+
+    daemon_platform = _single_platform(
+        await _run_host_command(
+            "docker",
+            "info",
+            "--format",
+            "{{.OSType}}/{{.Architecture}}",
+        ),
+        label="Docker daemon platform",
+    )
+    services: list[tuple[str, int, str, str]] = []
+    replicas: set[tuple[str, int]] = set()
+    for container_id in container_ids:
+        identity = await _run_host_command(
+            "docker",
+            "container",
+            "inspect",
+            "--format",
+            '{{index .Config.Labels "com.docker.compose.service"}}\t'
+            '{{index .Config.Labels "com.docker.compose.container-number"}}\t'
+            "{{.Image}}\t{{.State.Status}}\t"
+            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+            container_id,
+        )
+        parts = identity.strip().split("\t")
+        if len(parts) != 5:
+            raise RuntimeError("Docker returned malformed container identity evidence")
+        service, raw_replica, image_id, status, health = parts
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", service) is None:
+            raise RuntimeError("Docker returned an invalid Compose service identity")
+        if re.fullmatch(r"[1-9][0-9]{0,5}", raw_replica) is None:
+            raise RuntimeError("Docker returned an invalid Compose replica identity")
+        replica = int(raw_replica)
+        replica_key = (service, replica)
+        if replica_key in replicas:
+            raise RuntimeError("Docker returned a duplicate Compose replica identity")
+        replicas.add(replica_key)
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+            raise RuntimeError("Docker returned a mutable or invalid image identity")
+        if status != "running" or health not in {"none", "healthy"}:
+            raise RuntimeError("Docker Compose service is not running and healthy")
+        image_platform = _single_platform(
+            await _run_host_command(
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Os}}/{{.Architecture}}",
+                image_id,
+            ),
+            label="Docker image platform",
+        )
+        services.append((service, replica, image_id, image_platform))
+
+    return cast(
+        "JsonObject",
+        {
+            "schema_version": 1,
+            "backend": "docker",
+            "daemon_platform": daemon_platform,
+            "services": [
+                {
+                    "service": service,
+                    "replica": replica,
+                    "image_id": image_id,
+                    "image_platform": image_platform,
+                }
+                for service, replica, image_id, image_platform in sorted(services)
+            ],
+        },
+    )
+
+
+async def _attest_e2b_environment(
+    environment: BaseEnvironment,
+    view: _E2BEnvironmentView,
+) -> JsonObject:
+    sandbox = view._sandbox
+    if sandbox is None:
+        raise RuntimeError("E2B sandbox is unavailable")
+    info = await sandbox.get_info()
+    template_id = _bounded_identity(info.template_id, label="E2B template identity")
+    cpu_count = info.cpu_count
+    memory_mb = info.memory_mb
+    if (
+        isinstance(cpu_count, bool)
+        or not isinstance(cpu_count, int)
+        or cpu_count < 1
+        or isinstance(memory_mb, bool)
+        or not isinstance(memory_mb, int)
+        or memory_mb < 1
+    ):
+        raise RuntimeError("E2B returned invalid sandbox resource evidence")
+    tags = await _get_e2b_template_tags(template_id)
+    default_tags = [
+        (build_id, created_at) for tag, build_id, created_at in tags if tag == "default"
+    ]
+    if len(default_tags) != 1:
+        raise RuntimeError("E2B template default tag did not resolve to one immutable build")
+    raw_build_id, tag_created_at = default_tags[0]
+    if (
+        not isinstance(info.started_at, datetime)
+        or info.started_at.tzinfo is None
+        or not isinstance(tag_created_at, datetime)
+        or tag_created_at.tzinfo is None
+        or tag_created_at > info.started_at
+    ):
+        raise RuntimeError("E2B template tag changed after the sandbox started")
+    build_id = _bounded_identity(raw_build_id, label="E2B build identity")
+    platform_result = await environment.exec(
+        "/bin/uname -s && /bin/uname -m",
+        timeout_sec=_ENVIRONMENT_ATTESTATION_TIMEOUT_S,
+    )
+    if platform_result.return_code != 0:
+        raise RuntimeError("E2B sandbox platform attestation failed")
+    platform_lines = _bounded_lines(
+        platform_result.stdout,
+        label="E2B sandbox platform",
+    )
+    if len(platform_lines) != 2:
+        raise RuntimeError("E2B returned malformed sandbox platform evidence")
+    platform = "/".join(part.lower() for part in platform_lines)
+    if re.fullmatch(r"[a-z0-9_.-]{1,64}/[a-z0-9_.-]{1,64}", platform) is None:
+        raise RuntimeError("E2B returned invalid sandbox platform evidence")
+    return cast(
+        "JsonObject",
+        {
+            "schema_version": 1,
+            "backend": "e2b",
+            "template_id": template_id,
+            "build_id": build_id,
+            "platform": platform,
+            "cpu_count": cpu_count,
+            "memory_mb": memory_mb,
+        },
+    )
+
+
+async def _get_e2b_template_tags(
+    template_id: str,
+) -> tuple[tuple[str, str, datetime], ...]:
+    from e2b import AsyncTemplate
+
+    tags = await AsyncTemplate.get_tags(template_id)
+    return tuple((tag.tag, tag.build_id, tag.created_at) for tag in tags)
+
+
+async def _run_host_command(*command: str) -> str:
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=_ENVIRONMENT_ATTESTATION_TIMEOUT_S,
+        )
+    except TimeoutError:
+        await _kill_and_wait_process(process)
+        raise RuntimeError("task environment host attestation command timed out") from None
+    except asyncio.CancelledError:
+        await _kill_and_wait_process(process)
+        raise
+    if process.returncode != 0:
+        raise RuntimeError("task environment host attestation command failed")
+    if len(stdout) > _MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES:
+        raise RuntimeError("task environment host attestation output exceeds its limit")
+    try:
+        return stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise RuntimeError("task environment host attestation output is not UTF-8") from None
+
+
+async def _kill_and_wait_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    cleanup = asyncio.create_task(process.wait())
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    await cleanup
+
+
+def _bounded_lines(value: str | None, *, label: str) -> list[str]:
+    if value is None:
+        return []
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise RuntimeError(f"{label} is not valid UTF-8") from None
+    if len(encoded) > _MAX_ENVIRONMENT_ATTESTATION_OUTPUT_BYTES:
+        raise RuntimeError(f"{label} exceeds its evidence limit")
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if any(len(line.encode()) > 512 for line in lines):
+        raise RuntimeError(f"{label} contains an oversized value")
+    return lines
+
+
+def _single_platform(value: str, *, label: str) -> str:
+    lines = _bounded_lines(value, label=label)
+    if len(lines) != 1:
+        raise RuntimeError(f"{label} must contain one value")
+    platform = lines[0].lower()
+    if re.fullmatch(r"[a-z0-9_.-]{1,64}/[a-z0-9_.-]{1,64}", platform) is None:
+        raise RuntimeError(f"{label} is invalid")
+    return platform
+
+
+def _bounded_identity(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,512}", value) is None:
+        raise RuntimeError(f"{label} is invalid")
+    return value
 
 
 async def _cancel_and_wait_runner(runner_factory: LocalContainerRunnerFactory) -> None:

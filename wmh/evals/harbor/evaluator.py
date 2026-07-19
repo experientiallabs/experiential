@@ -36,7 +36,9 @@ from harbor.registry.client.package import PackageDatasetClient
 from harbor.tasks.client import TaskIdType
 from pydantic import ValidationError
 
+from wmh.core.text import normalize_durable_text
 from wmh.evals.benchmark import (
+    MAX_BENCHMARK_TASK_INSTRUCTION_CHARS,
     BenchmarkCell,
     BenchmarkRunIdentity,
     BenchmarkTaskEnvironment,
@@ -70,6 +72,8 @@ from wmh.harness.pi_local import (
 from wmh.providers.base import ProviderConfig
 
 _MANIFEST_FILENAME = "wmh-manifest.json"
+_MAX_TASK_HOST_TEXT_BYTES = 1024 * 1024
+_MAX_EXTRA_INSTRUCTION_FILES = 16
 _JOB_ROOT_FILES = frozenset(
     {_MANIFEST_FILENAME, "config.json", "job.log", "lock.json", "result.json"}
 )
@@ -114,16 +118,18 @@ class _PreparedTrial:
     task_identity: str
     task_checksum: str
     task_source: str | None
+    task_instruction: str
     trial_lock_digest: str
 
     @property
-    def immutable_key(self) -> tuple[str, str, str, str, str | None, str]:
+    def immutable_key(self) -> tuple[str, str, str, str, str | None, str, str]:
         return (
             self.task_key,
             self.task_name,
             self.task_identity,
             self.task_checksum,
             self.task_source,
+            self.task_instruction,
             self.trial_lock_digest,
         )
 
@@ -180,6 +186,7 @@ class HarborEvaluator:
             expected_agent_digest=agent_digest,
             expected_job_config=job_config,
         )
+        _preflight_local_task_trees(job_config)
         await asyncio.to_thread(_preflight_task_environment, job_config)
         await self._ensure_runner_ready()
 
@@ -198,11 +205,11 @@ class HarborEvaluator:
                 raise ValueError(
                     "Harbor resolved zero trials; refusing to publish an empty evaluation"
                 )
-            job_lock = _build_prepared_job_lock(job)
             tasks = _load_and_validate_tasks(
                 job,
                 environment_backend=self._spec.environment_backend,
             )
+            job_lock = _build_prepared_job_lock(job)
             prepared_trials = _prepare_trials(
                 job,
                 job_lock,
@@ -393,6 +400,95 @@ def _build_prepared_job_lock(job: Job) -> JobLock:
     return lock
 
 
+def _preflight_local_task_trees(config: JobConfig) -> None:
+    """Reject unsafe local task paths before Harbor can inspect task configuration."""
+    for dataset in config.datasets:
+        if not dataset.is_local():
+            continue
+        if dataset.path is None:
+            raise RuntimeError("local Harbor dataset is missing its path")
+        root = dataset.path.expanduser()
+        if root.is_symlink():
+            raise UnsupportedHarborTaskError(
+                f"local dataset root cannot be a symbolic link: {root}"
+            )
+        if not root.is_dir():
+            continue
+        for task_dir in sorted(root.iterdir(), key=lambda path: path.name):
+            if task_dir.is_symlink():
+                raise UnsupportedHarborTaskError(
+                    f"local task root cannot be a symbolic link: {task_dir}"
+                )
+            if not task_dir.is_dir():
+                continue
+            config_path = task_dir / "task.toml"
+            if not (config_path.exists() or config_path.is_symlink()):
+                continue
+            _validate_task_tree_for_host_reads(task_dir, extra_instruction_paths=())
+
+
+def _validate_task_tree_for_host_reads(
+    task_dir: Path,
+    *,
+    extra_instruction_paths: tuple[Path, ...] | list[Path],
+) -> None:
+    """Require a regular, symlink-free task tree before trusted host reads or hashes it."""
+    requested_root = task_dir.expanduser()
+    if requested_root.is_symlink():
+        raise UnsupportedHarborTaskError(
+            f"Harbor task root cannot be a symbolic link: {requested_root}"
+        )
+    if not requested_root.is_dir():
+        raise UnsupportedHarborTaskError(f"Harbor task root is not a directory: {requested_root}")
+    for path in requested_root.rglob("*"):
+        if path.is_symlink():
+            raise UnsupportedHarborTaskError(
+                f"Harbor task tree cannot contain a symbolic link: {path}"
+            )
+        if not path.is_dir() and not path.is_file():
+            raise UnsupportedHarborTaskError(
+                f"Harbor task tree can contain only regular files and directories: {path}"
+            )
+
+    root = requested_root.resolve()
+    _require_bounded_host_text_file(root / "task.toml", label="task configuration")
+    _require_bounded_host_text_file(root / "instruction.md", label="task instruction")
+    if len(extra_instruction_paths) > _MAX_EXTRA_INSTRUCTION_FILES:
+        raise UnsupportedHarborTaskError(
+            "Harbor task has too many extra instruction files for bounded host ingestion"
+        )
+    for path in extra_instruction_paths:
+        requested = path.expanduser()
+        if requested.is_symlink():
+            raise UnsupportedHarborTaskError(
+                f"extra task instruction cannot be a symbolic link: {requested}"
+            )
+        try:
+            resolved = requested.resolve(strict=True)
+        except OSError as exc:
+            raise UnsupportedHarborTaskError(
+                f"extra task instruction is unavailable: {requested}"
+            ) from exc
+        if not resolved.is_relative_to(root):
+            raise UnsupportedHarborTaskError(
+                f"extra task instruction must remain inside the task root: {requested}"
+            )
+        _require_bounded_host_text_file(resolved, label="extra task instruction")
+
+
+def _require_bounded_host_text_file(path: Path, *, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise UnsupportedHarborTaskError(f"{label} must be a regular file: {path}")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise UnsupportedHarborTaskError(f"{label} is unavailable: {path}") from exc
+    if size > _MAX_TASK_HOST_TEXT_BYTES:
+        raise UnsupportedHarborTaskError(
+            f"{label} exceeds the {_MAX_TASK_HOST_TEXT_BYTES}-byte host-read limit: {path}"
+        )
+
+
 def harbor_run_config_digest(spec: HarborJobSpec, agent_config_digest: str) -> str:
     """Hash logical run semantics and controlled concurrency without leaking host paths.
 
@@ -439,6 +535,10 @@ def _load_and_validate_tasks(
             raise RuntimeError(
                 f"Harbor did not retain the prepared task {task_id.get_name()!r}"
             ) from None
+        _validate_task_tree_for_host_reads(
+            download.path,
+            extra_instruction_paths=trial_config.extra_instruction_paths,
+        )
         task = Task(
             download.path,
             extra_instruction_paths=trial_config.extra_instruction_paths,
@@ -523,10 +623,23 @@ def _prepare_trials(
                 task_identity=task_identity,
                 task_checksum=trial_lock.task.digest,
                 task_source=trial_lock.task.source,
+                task_instruction=_bound_task_instruction(task.instruction),
                 trial_lock_digest=harbor_trial_lock_digest(trial_lock),
             )
         )
     return prepared_trials
+
+
+def _bound_task_instruction(instruction: str) -> str:
+    """Retain deterministic proposer evidence without growing the trusted manifest unboundedly."""
+    normalized = normalize_durable_text(instruction)
+    if len(normalized) <= MAX_BENCHMARK_TASK_INSTRUCTION_CHARS:
+        return normalized
+    marker = f"\n...[task instruction truncated; original_chars={len(normalized)}]...\n"
+    retained = MAX_BENCHMARK_TASK_INSTRUCTION_CHARS - len(marker)
+    head = retained // 2
+    tail = retained - head
+    return normalized[:head] + marker + normalized[-tail:]
 
 
 def _build_manifest(
@@ -555,6 +668,7 @@ def _build_manifest(
                 task_identity=prepared.task_identity,
                 task_checksum=prepared.task_checksum,
                 task_source=prepared.task_source,
+                task_instruction=prepared.task_instruction,
                 trial_lock_digest=prepared.trial_lock_digest,
             )
         )
@@ -597,10 +711,10 @@ def _restore_manifest_trial_names(
         entry for entry in manifest.entries if entry.trial_name not in completed_names
     ]
     prepared_by_key: defaultdict[
-        tuple[str, str, str, str, str | None, str], list[_PreparedTrial]
+        tuple[str, str, str, str, str | None, str, str], list[_PreparedTrial]
     ] = defaultdict(list)
     entries_by_key: defaultdict[
-        tuple[str, str, str, str, str | None, str], list[HarborTrialManifestEntry]
+        tuple[str, str, str, str, str | None, str, str], list[HarborTrialManifestEntry]
     ] = defaultdict(list)
     for prepared in remaining_prepared:
         prepared_by_key[prepared.immutable_key].append(prepared)
@@ -635,13 +749,14 @@ def _restore_manifest_trial_names(
 
 def _manifest_entry_immutable_key(
     entry: HarborTrialManifestEntry,
-) -> tuple[str, str, str, str, str | None, str]:
+) -> tuple[str, str, str, str, str | None, str, str]:
     return (
         entry.cell.task_key,
         entry.cell.task_name,
         entry.task_identity,
         entry.task_checksum,
         entry.task_source,
+        entry.task_instruction,
         entry.trial_lock_digest,
     )
 

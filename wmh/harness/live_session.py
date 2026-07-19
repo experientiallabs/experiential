@@ -177,6 +177,8 @@ class LiveSession:
         else:
             self._worker_fn = None
         self._actions_per_turn = actions_per_turn
+        if turn_cap < 1:
+            raise ValueError("turn_cap must be >= 1")
         self._turn_cap = turn_cap
         if max_output_tokens < 1:
             raise ValueError("max_output_tokens must be >= 1")
@@ -194,6 +196,8 @@ class LiveSession:
         self._closed = False
         self._failure_message: str | None = None
         self._actions_this_turn = 0
+        self._llm_calls_this_message = 0
+        self._has_user_message = False
         self._aborting = False
         self._pending_ping: str | None = None
         self.worker_usage = TokenUsage()
@@ -302,6 +306,8 @@ class LiveSession:
                 return
             if isinstance(intent, _UserMessage):
                 self._actions_this_turn = 0
+                self._llm_calls_this_message = 0
+                self._has_user_message = True
                 # NB: do not clear `_aborting` here — a new message can be drained before
                 # the cancelled turn's in-flight submit frame is read, and clearing now
                 # would let that stale submit emit. The runner's next `state` frame (the
@@ -346,6 +352,8 @@ class LiveSession:
     def _answer_llm(self, frame: JsonObject) -> None:
         req_id = frame.get("req_id")
         body = frame.get("openai_body")
+        if not self._reserve_llm_call(req_id):
+            return
         if self._worker_fn is None:
             self._emit("error", {"message": "live session has no worker configured"})
             self._safe_send(
@@ -353,8 +361,21 @@ class LiveSession:
             )
             return
         try:
-            request_body = dict(body) if isinstance(body, dict) else {}
-            request_body["temperature"] = self._temperature
+            # The runner owns conversation and tool policy, but the trusted host owns every
+            # generation/compute control. An allowlist prevents candidate source from smuggling
+            # provider-specific extras such as ``n`` or reasoning effort through ChatRequest's
+            # intentionally forward-compatible extra-field support.
+            request_body = (
+                {key: body[key] for key in ("messages", "tools", "tool_choice") if key in body}
+                if isinstance(body, dict)
+                else {}
+            )
+            request_body.update(
+                {
+                    "temperature": self._temperature,
+                    "max_completion_tokens": self._max_output_tokens,
+                }
+            )
             request = ChatRequest.model_validate(request_body)
             completion = self._worker_fn(request)
             self._meter(completion)
@@ -366,8 +387,29 @@ class LiveSession:
             self._emit("error", {"message": f"worker LLM error: {exc}"})
             self._safe_send({"type": "llm_response", "req_id": req_id, "error": str(exc)})
 
+    def _reserve_llm_call(self, req_id: JsonValue) -> bool:
+        if not self._has_user_message:
+            message = "worker LLM request arrived before a user message"
+            self._emit("error", {"message": message})
+            self._safe_send({"type": "llm_response", "req_id": req_id, "error": message})
+            return False
+        if self._llm_calls_this_message >= self._turn_cap:
+            message = f"worker LLM call budget exhausted ({self._turn_cap} calls)"
+            self._aborting = True
+            self._emit("error", {"message": message})
+            self._safe_send({"type": "llm_response", "req_id": req_id, "error": message})
+            self._safe_send({"type": "abort", "reason": "llm_call_budget_exhausted"})
+            return False
+        self._llm_calls_this_message += 1
+        return True
+
     def _answer_tool(self, frame: JsonObject) -> None:
         req_id = frame.get("req_id")
+        if not self._has_user_message:
+            message = "tool request arrived before a user message"
+            self._emit("error", {"message": message})
+            self._respond_tool(req_id, message, is_error=True)
+            return
         name = frame.get("name")
         name = name if isinstance(name, str) else ""
         args = frame.get("arguments")

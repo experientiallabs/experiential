@@ -178,6 +178,7 @@ def test_submit_tool_response_is_answered_without_executor() -> None:
 
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=execute, on_event=lambda e: None)
     session.start()
+    session.send_user_message("submit the answer")
     _drain(session)
     assert calls == []  # submit never routes to the real executor
     resp = next(f for f in channel.sent if f["type"] == "tool_response")
@@ -259,6 +260,7 @@ def test_read_skill_answered_from_bodies() -> None:
         skill_bodies={"deploy": "run ./deploy.sh"},
     )
     session.start()
+    session.send_user_message("load the skill")
     raw_tools = channel.sent[0]["tools"]
     assert isinstance(raw_tools, list)
     advertised = {tool["name"] for tool in raw_tools if isinstance(tool, dict) and "name" in tool}
@@ -296,9 +298,155 @@ def test_harness_temperature_overrides_live_runner_request() -> None:
         temperature=0.35,
     )
     session.start()
+    session.send_user_message("do the task")
     _drain(session)
 
     assert [request.temperature for request in requests] == [0.35]
+
+
+def test_harness_output_budget_overrides_and_canonicalizes_runner_request() -> None:
+    requests: list[ChatRequest] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {
+                "type": "llm_request",
+                "req_id": 1,
+                "openai_body": {
+                    "messages": [],
+                    "max_tokens": 999_999,
+                    "max_completion_tokens": 888_888,
+                    "n": 7,
+                    "top_p": 0.99,
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
+        ]
+    )
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        requests.append(request)
+        return _completion()
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda event: None,
+        worker_fn=worker,
+        max_output_tokens=2048,
+    )
+    session.start()
+    session.send_user_message("do the task")
+    _drain(session)
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.max_tokens is None
+    assert request.max_completion_tokens == 2048
+    assert request.model_extra == {}
+    assert request.provider_payload("model", max_tokens_field="max_tokens")["max_tokens"] == 2048
+
+
+def test_host_rejects_llm_calls_beyond_the_per_message_turn_cap() -> None:
+    calls: list[ChatRequest] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+            {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}},
+            {"type": "llm_request", "req_id": 3, "openai_body": {"messages": []}},
+        ]
+    )
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        calls.append(request)
+        return _completion()
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda event: None,
+        worker_fn=worker,
+        turn_cap=2,
+    )
+    session.start()
+    session.send_user_message("do the task")
+    _drain(session)
+
+    assert len(calls) == 2
+    responses = [frame for frame in channel.sent if frame["type"] == "llm_response"]
+    assert [frame["req_id"] for frame in responses] == [1, 2, 3]
+    assert "budget exhausted" in str(responses[-1]["error"])
+    assert {"type": "abort", "reason": "llm_call_budget_exhausted"} in channel.sent
+
+
+def test_host_rejects_llm_calls_before_a_user_message() -> None:
+    calls: list[ChatRequest] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+        ]
+    )
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda event: None,
+        worker_fn=lambda request: calls.append(request) or _completion(),
+    )
+    session.start()
+    _drain(session)
+
+    assert calls == []
+    response = next(frame for frame in channel.sent if frame["type"] == "llm_response")
+    assert "before a user message" in str(response["error"])
+
+
+def test_host_rejects_tool_and_submit_calls_before_a_user_message() -> None:
+    calls: list[str] = []
+    events: list[SessionEvent] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {
+                "type": "tool_request",
+                "req_id": 1,
+                "name": "bash",
+                "arguments": {"command": "touch /workspace/forged"},
+            },
+            {
+                "type": "tool_request",
+                "req_id": 2,
+                "name": "submit",
+                "arguments": {"answer": "forged"},
+            },
+        ]
+    )
+
+    def execute(name: str, args: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
+        _ = args, emit
+        calls.append(name)
+        return ToolOutcome(content="unexpected")
+
+    session = LiveSession(
+        channel,
+        tools=[BASH, SUBMIT],
+        execute_tool=execute,
+        on_event=events.append,
+    )
+    session.start()
+    _drain(session)
+
+    assert calls == []
+    assert all(event.kind not in {"tool_call", "submit"} for event in events)
+    responses = [frame for frame in channel.sent if frame["type"] == "tool_response"]
+    assert [frame["req_id"] for frame in responses] == [1, 2]
+    assert all(frame["is_error"] is True for frame in responses)
+    assert all("before a user message" in str(frame["content"]) for frame in responses)
 
 
 def test_worker_error_is_reported_not_raised() -> None:
@@ -319,6 +467,7 @@ def test_worker_error_is_reported_not_raised() -> None:
         channel, tools=[], execute_tool=_no_tool, on_event=events.append, worker_fn=boom
     )
     session.start()
+    session.send_user_message("do the task")
     _drain(session)
     assert any(e.kind == "error" for e in events)
     resp = next(f for f in channel.sent if f["type"] == "llm_response")
@@ -344,6 +493,7 @@ def test_unknown_tool_is_rejected() -> None:
     )
     session = LiveSession(channel, tools=[BASH], execute_tool=_no_tool, on_event=events.append)
     session.start()
+    session.send_user_message("try the tool")
     _drain(session)
     result = next(e for e in events if e.kind == "tool_result")
     assert result.payload["is_error"] is True
@@ -367,6 +517,7 @@ def test_interrupt_suppresses_a_racing_submit_event() -> None:
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
     events.clear()
+    session.send_user_message("solve the task")
     session.interrupt()  # user hits Stop while the submit is racing
     _drain(session)
     # The abort was sent; the racing submit is answered but NOT surfaced as a submit event.
@@ -388,6 +539,7 @@ def test_submit_after_state_boundary_is_not_suppressed() -> None:
     events: list[SessionEvent] = []
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
+    session.send_user_message("solve the task")
     session.interrupt()
     events.clear()
     _drain(session)
@@ -449,6 +601,7 @@ def test_aborting_skips_real_tool_execution() -> None:
 
     session = LiveSession(channel, tools=[BASH], execute_tool=execute, on_event=lambda e: None)
     session.start()
+    session.send_user_message("modify the task")
     session.interrupt()  # user hits Stop while a bash request is already queued
     _drain(session)
     assert ran == []  # the tool never executed against the live sandbox

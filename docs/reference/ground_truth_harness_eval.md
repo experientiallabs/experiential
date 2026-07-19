@@ -230,6 +230,77 @@ host variable references in task and verifier environment maps, Docker Compose s
 Compose environment files. The audit reports variable names and source locations only. It never
 resolves or logs credential values.
 
+### Python scoring boundary
+
+`HarborHarnessScorer` is the synchronous bridge from one explicit Harbor task selection to the
+generic harness-search score contract. The dataset selection and `task_ids` must be the same
+ordered, literal list. Globs, exclusions, random task limits, request-time subsets, and
+request-time attempt changes are rejected. Scored search accepts only local dataset paths that WMH
+can inspect before Harbor job creation. Harbor 0.18 dereferences symlinks while copying remote/Git
+tasks, before WMH can validate the downloaded tree, so registry, package, and remote acquisition
+remain evaluator-only until a symlink-preserving acquisition boundary lands. Dataset-qualified task
+keys from a frozen qualification
+manifest bind each selection to its Harbor source, identity, and task checksum across candidates.
+Qualification also freezes the executed environment definition. Local runs attest the Docker
+daemon platform plus every Compose service's immutable image ID and image platform. Ephemeral
+container, trial, and project identities are deliberately excluded. Every scored attempt must
+reproduce the per-task qualification digest.
+
+Harbor 0.18 does not expose the immutable E2B build ID that `Sandbox.create` actually resolved.
+Looking up the mutable `default` tag after sandbox creation cannot close the alias race, even when
+the current tag and sandbox timestamps are retained. The evaluator therefore keeps E2B selectable
+for acceleration and parity diagnostics, but `HarborHarnessScorer` rejects E2B scored search until
+the integration creates sandboxes from an immutable build reference and surfaces that identity.
+
+```python
+from harbor.models.job.config import DatasetConfig
+
+from wmh.evals.harbor.config import HarborJobSpec
+from wmh.evals.harbor.scorer import HarborHarnessScorer
+from wmh.harness.scoring import ScoreRequest
+
+task_ids = ("task-a", "task-b")
+# Dataset-qualified task keys come from the frozen Harbor qualification manifest.
+qualified_task_keys = {
+    trial.task_identity: trial.cell.task_key for trial in qualification.result.trials
+}
+task_keys = tuple(qualified_task_keys[task_id] for task_id in task_ids)
+qualified_environment_digests = {}
+for task_id in task_ids:
+    digests = {
+        trial.task_environment_digest
+        for trial in qualification.result.trials
+        if trial.task_identity == task_id
+    }
+    if None in digests or len(digests) != 1:
+        raise ValueError(f"qualification did not freeze one environment for {task_id!r}")
+    qualified_environment_digests[task_id] = digests.pop()
+task_environment_digests = tuple(
+    qualified_environment_digests[task_id] for task_id in task_ids
+)
+job = HarborJobSpec(
+    job_name="discovery",
+    jobs_dir=".wmh/evals/harbor",
+    datasets=[DatasetConfig(path="/frozen/tasks", task_names=list(task_ids))],
+    n_attempts=2,
+)
+with HarborHarnessScorer(
+    job_spec=job,
+    provider_config=worker_provider,
+    reference_harness=baseline,
+    task_ids=task_ids,
+    task_keys=task_keys,
+    task_environment_digests=task_environment_digests,
+    reward_key="reward",
+) as scorer:
+    report = scorer.score(candidate, request=ScoreRequest(purpose="full"))
+```
+
+When this scorer is passed to `search_harness`, set `screen_proposals=False` and
+`confirm_narrow_vetoes=False`. Every candidate then receives exactly the frozen matrix. The
+reference harness fixes runtime kind, turns, output tokens, temperature, effective tools, and the
+per-turn deadline. A candidate that changes that compute envelope is ineligible.
+
 This static check is a narrow credential boundary, not proof that an arbitrary Harbor task is safe.
 A malicious Dockerfile, Compose mount, image, script, or verifier can attack the host through other
 channels. Every scored dataset must therefore be frozen by content, reviewed as executable code,
@@ -755,6 +826,8 @@ The reusable evaluation slice provides:
 - immutable run manifests, task-lock digests, stale-run rejection, and strict result ingestion;
 - an exclusive per-job resume lease and atomic replacement of Harbor's live root result;
 - a benchmark-neutral `wmh harness eval` command and canonical result JSON;
+- a synchronous `HarborHarnessScorer` that requires an exact literal task matrix, rejects compute
+  drift, and projects only complete binary verifier evidence into generic harness scores;
 - typed completed, failed, unknown, and cancelled candidate evidence without arbitrary Harbor
   metadata passthrough;
 - pre-environment rejection of task-authored imports of credential-like host variables;
@@ -793,8 +866,18 @@ The following remain required work before experiment launch:
   host devices, Docker socket access, build SSH forwarding, and any `HOST_*_PATH` or equivalent
   evidence-path escape; apply it before provider or E2B credentials are loaded and before any paid
   local task starts;
-- add deadline-aware provider calls, an explicitly frozen paper-strength timeout stack, and a
-  probed Azure/Bedrock failure taxonomy;
+- add deadline-aware, interruptible provider calls, prove provider and Harbor subprocess cleanup,
+  freeze the timeout stack, and probe the Azure/Bedrock failure taxonomy;
+- classify candidate-authored request, context, and tool-schema 4xx failures as candidate zero
+  while retaining authentication, routing, transport, throttling, and service failures as
+  infrastructure; otherwise one invalid proposal can veto the optimizer;
+- classify candidate-caused task-container destruction or resource exhaustion as candidate zero,
+  with separate run-health evidence for ambiguous failures, instead of treating every task-tool
+  transport exception as infrastructure;
+- create E2B sandboxes from an immutable build reference and surface the exact resolved build ID
+  before admitting E2B scores; keep E2B acceleration diagnostic-only until that boundary lands;
+- make remote, registry, and package task acquisition preserve symlinks for pre-read validation,
+  or keep scored search restricted to preflighted local dataset paths;
 - add and fund a generic Claude Code control only if making a matched headline-uplift claim;
 - perform real local/E2B parity canaries on a machine with Docker and valid E2B credentials;
 - run leakage audits and the paid Azure/Bedrock matrices.

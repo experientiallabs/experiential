@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 RewardValue = float | int
 Rewards = dict[str, RewardValue]
 _SHA256_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+MAX_BENCHMARK_TASK_INSTRUCTION_CHARS = 8_000
 
 
 class BenchmarkTaskEnvironment(StrEnum):
@@ -256,6 +257,14 @@ class BenchmarkTrialResult(BaseModel):
     task_identity: str = Field(min_length=1)
     task_checksum: str = Field(min_length=1)
     source: str | None = None
+    task_instruction: str = Field(default="", max_length=MAX_BENCHMARK_TASK_INSTRUCTION_CHARS)
+    task_environment_digest: str | None = Field(
+        default=None,
+        pattern=_SHA256_DIGEST_PATTERN,
+        description=(
+            "Opaque digest of the immutable executed task-environment definition and bytes"
+        ),
+    )
     status: BenchmarkTrialStatus
     rewards: Rewards | None = None
     error: BenchmarkError | None = None

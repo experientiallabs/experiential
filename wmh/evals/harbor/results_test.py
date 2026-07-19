@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -41,6 +43,29 @@ _NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 _TASK_CHECKSUM = "sha256:" + "b" * 64
 _TASK_SOURCE = "example-benchmark"
 _HARNESS = pi_node_baseline("candidate")
+_TASK_ENVIRONMENT_ATTESTATION = {
+    "schema_version": 1,
+    "backend": "docker",
+    "daemon_platform": "linux/amd64",
+    "services": [
+        {
+            "service": "main",
+            "replica": 1,
+            "image_id": "sha256:" + "c" * 64,
+            "image_platform": "linux/amd64",
+        }
+    ],
+}
+_TASK_ENVIRONMENT_DIGEST = (
+    "sha256:"
+    + hashlib.sha256(
+        json.dumps(
+            _TASK_ENVIRONMENT_ATTESTATION,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+)
 
 
 def _agent_config() -> AgentConfig:
@@ -138,6 +163,8 @@ def _trial(
             metadata={
                 "harness_hash": _HARNESS.execution_hash,
                 "runner_image": "runner-image",
+                "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
+                "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
                 **(candidate_metadata or {}),
             },
         ),
@@ -225,6 +252,7 @@ def _manifest_entry(
         task_identity=task_name,
         task_checksum=_TASK_CHECKSUM,
         task_source=_TASK_SOURCE,
+        task_instruction=f"Instruction for {task_name}.",
         trial_lock_digest=resolved_trial_lock_digest,
     )
 
@@ -246,6 +274,9 @@ def test_load_uses_exact_manifest_and_preserves_rewards_usage_and_missing_cells(
         ("failed", 1, failed.trial_name),
         ("missing", 1, "missing__harbor"),
     )
+    for entry in manifest.entries:
+        if entry.cell.task_name == "scored":
+            entry.task_instruction = "Score this task."
 
     loaded = load_harbor_job_result(job_dir, manifest)
     result = loaded.result
@@ -256,6 +287,10 @@ def test_load_uses_exact_manifest_and_preserves_rewards_usage_and_missing_cells(
     assert result.n_infrastructure_errors == 1
     assert result.n_incomplete == 1
     trials = {trial.cell.task_name: trial for trial in result.trials}
+    assert trials["scored"].task_instruction == "Score this task."
+    assert trials["scored"].task_environment_digest == _TASK_ENVIRONMENT_DIGEST
+    assert trials["failed"].task_environment_digest == _TASK_ENVIRONMENT_DIGEST
+    assert trials["missing"].task_environment_digest is None
     manifest_config_digests = {
         entry.cell.task_name: entry.trial_lock_digest for entry in manifest.entries
     }
@@ -631,11 +666,50 @@ def test_malformed_candidate_outcome_metadata_is_rejected(
         load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
 
 
+@pytest.mark.parametrize(
+    ("candidate_metadata", "message"),
+    [
+        ({"task_environment_digest": None}, "valid task environment digest"),
+        (
+            {"task_environment_digest": "sha256:" + "f" * 64},
+            "does not match its digest",
+        ),
+        (
+            {
+                "task_environment_attestation": {
+                    **_TASK_ENVIRONMENT_ATTESTATION,
+                    "backend": "e2b",
+                }
+            },
+            "wrong backend or schema",
+        ),
+    ],
+)
+def test_task_environment_attestation_must_be_complete_bound_and_backend_correct(
+    tmp_path: Path,
+    candidate_metadata: dict[str, object],
+    message: str,
+) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        rewards={"reward": 1},
+        candidate_metadata=candidate_metadata,
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    with pytest.raises(ValueError, match=message):
+        load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
+
+
 def test_inconsistent_step_candidate_outcomes_are_rejected(tmp_path: Path) -> None:
     trial = _trial(tmp_path, "task", rewards={"reward": 1})
     identity = {
         "harness_hash": _HARNESS.execution_hash,
         "runner_image": "runner-image",
+        "task_environment_digest": _TASK_ENVIRONMENT_DIGEST,
+        "task_environment_attestation": _TASK_ENVIRONMENT_ATTESTATION,
     }
     trial.agent_result = None
     trial.step_results = [
@@ -950,6 +1024,7 @@ def test_manifest_rejects_duplicate_and_traversing_cells() -> None:
         task_identity="task",
         task_checksum=_TASK_CHECKSUM,
         task_source=_TASK_SOURCE,
+        task_instruction="Instruction for task.",
         trial_lock_digest=trial_config_digest,
     )
     with pytest.raises(ValidationError, match="duplicate manifest benchmark cell"):
@@ -972,6 +1047,7 @@ def test_manifest_rejects_duplicate_and_traversing_cells() -> None:
             task_identity="task",
             task_checksum=_TASK_CHECKSUM,
             task_source=_TASK_SOURCE,
+            task_instruction="Instruction for task.",
             trial_lock_digest=trial_config_digest,
         )
 
