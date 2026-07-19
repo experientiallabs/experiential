@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import wmh.evals.study_journal as mod
 from wmh.evals.study_journal import (
     STUDY_PHASES,
     ExternalPublicationReceipt,
@@ -299,3 +300,173 @@ def test_create_fsyncs_the_parent_after_creating_the_journal_directory(
     _store(tmp_path)
 
     assert parent_identity in fsynced_identities
+
+
+def test_create_requires_an_existing_parent_directory(tmp_path: Path) -> None:
+    journal = tmp_path / "missing" / "journal"
+
+    with pytest.raises(OSError, match="parent directory does not exist"):
+        StudyJournalStore.create(
+            journal,
+            study_id="study-1",
+            publisher_configuration_digest=_Publisher.configuration_digest,
+        )
+
+    assert not journal.parent.exists()
+
+
+def test_create_rejects_a_copied_genesis_directory_swap_before_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = tmp_path / "journal"
+    original_directory = tmp_path / "original-journal"
+    real_open = mod._open_private_directory
+    swapped = False
+
+    def swap_then_open(
+        path: Path,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == journal and not swapped:
+            swapped = True
+            journal.rename(original_directory)
+            journal.mkdir(mode=0o700)
+            replacement_genesis = journal / "study-journal.json"
+            replacement_genesis.write_bytes(
+                (original_directory / "study-journal.json").read_bytes()
+            )
+            replacement_genesis.chmod(0o600)
+        return real_open(path, expected_identity=expected_identity)
+
+    monkeypatch.setattr(mod, "_open_private_directory", swap_then_open)
+
+    with pytest.raises(OSError, match="replaced during create"):
+        StudyJournalStore.create(
+            journal,
+            study_id="study-1",
+            publisher_configuration_digest=_Publisher.configuration_digest,
+        )
+
+    assert swapped is True
+    assert (original_directory / "study-journal.json").is_file()
+
+
+def test_directory_inode_lease_cannot_be_bypassed_by_lock_path_replacement(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    mutable_lock_path = store.directory / ".study-journal.lock"
+    mutable_lock_path.write_text("old", encoding="utf-8")
+    mutable_lock_path.chmod(0o600)
+
+    with store.locked():
+        mutable_lock_path.unlink()
+        mutable_lock_path.write_text("replacement", encoding="utf-8")
+        mutable_lock_path.chmod(0o600)
+        with pytest.raises(RuntimeError, match="already locked"):
+            with store.locked():
+                pytest.fail("a second directory lease must not enter")
+
+
+def test_temporary_cleanup_failure_never_masks_the_primary_publish_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    real_unlink = os.unlink
+
+    def fail_record_write(_descriptor: int, _payload: bytes) -> int:
+        raise OSError("forced record write failure")
+
+    def fail_temporary_unlink(
+        path: str | bytes,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if str(path).startswith(".tmp-"):
+            raise OSError("forced temporary unlink failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "write", fail_record_write)
+    monkeypatch.setattr(os, "unlink", fail_temporary_unlink)
+
+    with pytest.raises(OSError, match="forced record write failure") as captured:
+        append_study_phase(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            payload_digest=_digest("plan"),
+            publisher=publisher,
+        )
+
+    notes = getattr(captured.value, "__notes__", [])
+    assert any("forced temporary unlink failure" in note for note in notes)
+    assert not (store.directory / "000-preparation_planned.json").exists()
+
+
+def test_descriptor_close_failure_never_masks_the_primary_journal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    real_close = os.close
+
+    def fail_close(candidate: int) -> None:
+        if candidate == descriptor:
+            raise OSError("forced journal descriptor close failure")
+        real_close(candidate)
+
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(os, "close", fail_close)
+            with pytest.raises(ValueError, match="primary journal failure") as captured:
+                with mod._managed_descriptor(descriptor):
+                    raise ValueError("primary journal failure")
+    finally:
+        real_close(descriptor)
+
+    notes = getattr(captured.value, "__notes__", [])
+    assert any("forced journal descriptor close failure" in note for note in notes)
+
+
+def test_temporary_unlink_is_followed_by_a_directory_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    directory_identity = (store.directory.stat().st_dev, store.directory.stat().st_ino)
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+
+    def record_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == directory_identity:
+            events.append("directory-fsync")
+        real_fsync(descriptor)
+
+    def record_unlink(
+        path: str | bytes,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if str(path).startswith(".tmp-"):
+            events.append("temporary-unlink")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "unlink", record_unlink)
+
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+
+    unlink_index = events.index("temporary-unlink")
+    assert "directory-fsync" in events[unlink_index + 1 :]

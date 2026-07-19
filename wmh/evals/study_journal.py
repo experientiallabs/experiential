@@ -18,14 +18,13 @@ from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, model_validator
 
-from wmh.core.file_lease import exclusive_posix_file_lease_at
+from wmh.core.file_lease import exclusive_posix_directory_lease
 from wmh.core.text import validate_durable_text
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _JOURNAL_VERSION: Literal["1"] = "1"
 _RECORD_VERSION: Literal["1"] = "1"
 _GENESIS_FILE = "study-journal.json"
-_LOCK_FILE = ".study-journal.lock"
 _MAX_RECORD_BYTES = 64 * 1024
 _RECORD_PATTERN = re.compile(r"^(?P<sequence>[0-9]{3})-(?P<phase>[a-z_]+)\.json$")
 
@@ -210,7 +209,7 @@ class StudyJournalStore:
     ) -> None:
         self._directory = Path(os.path.abspath(Path(directory).expanduser()))
         directory_descriptor = _open_private_directory(self._directory)
-        try:
+        with _managed_descriptor(directory_descriptor):
             self._directory_identity = _private_directory_identity(
                 os.fstat(directory_descriptor)
             )
@@ -218,8 +217,6 @@ class StudyJournalStore:
                 _read_regular_file_at(directory_descriptor, _GENESIS_FILE)
             )
             _require_directory_binding(self._directory, self._directory_identity)
-        finally:
-            os.close(directory_descriptor)
         if self._genesis.study_id != study_id:
             raise ValueError("study journal belongs to a different study")
         if self._genesis.publisher_configuration_digest != publisher_configuration_digest:
@@ -239,33 +236,40 @@ class StudyJournalStore:
             study_id=study_id,
             publisher_configuration_digest=publisher_configuration_digest,
         )
-        created = False
-        try:
-            path.mkdir(parents=True, mode=0o700)
-            created = True
-        except FileExistsError:
-            pass
-        if created:
-            _fsync_parent_directory(path)
-        directory_identity = _validate_private_directory(path)
-        directory_descriptor = _open_private_directory(
-            path,
-            expected_identity=directory_identity,
-        )
-        try:
-            _publish_regular_file_once_at(
-                directory_descriptor,
-                _GENESIS_FILE,
-                _canonical_json_bytes(genesis.model_dump(mode="json")),
+        _validate_leaf_name(path.name)
+        parent_descriptor = _open_parent_directory(path)
+        with _managed_descriptor(parent_descriptor):
+            created = False
+            try:
+                os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            directory_descriptor = _open_private_directory_at(
+                parent_descriptor,
+                path.name,
             )
-            _require_directory_binding(path, directory_identity)
-        finally:
-            os.close(directory_descriptor)
-        return cls(
-            path,
-            study_id=study_id,
-            publisher_configuration_digest=publisher_configuration_digest,
-        )
+            with _managed_descriptor(directory_descriptor):
+                directory_identity = _private_directory_identity(
+                    os.fstat(directory_descriptor)
+                )
+                _require_directory_binding(path, directory_identity)
+                if created:
+                    os.fsync(parent_descriptor)
+                _publish_regular_file_once_at(
+                    directory_descriptor,
+                    _GENESIS_FILE,
+                    _canonical_json_bytes(genesis.model_dump(mode="json")),
+                )
+                _require_directory_binding(path, directory_identity)
+                store = cls(
+                    path,
+                    study_id=study_id,
+                    publisher_configuration_digest=publisher_configuration_digest,
+                )
+                if store._directory_identity != directory_identity:
+                    raise OSError("study journal directory was replaced during create")
+                return store
 
     @property
     def directory(self) -> Path:
@@ -284,12 +288,13 @@ class StudyJournalStore:
             self._directory,
             expected_identity=self._directory_identity,
         )
-        try:
-            with exclusive_posix_file_lease_at(
+        with _managed_descriptor(directory_descriptor):
+            with exclusive_posix_directory_lease(
                 directory_descriptor,
-                _LOCK_FILE,
                 unsupported_error=RuntimeError("study journal requires POSIX file locking"),
-                irregular_file_error=OSError("study journal lock must be a regular file"),
+                irregular_directory_error=OSError(
+                    "study journal lease must name its pinned directory"
+                ),
                 contention_error=RuntimeError("study journal is already locked"),
             ):
                 _require_directory_binding(self._directory, self._directory_identity)
@@ -305,8 +310,6 @@ class StudyJournalStore:
                     raise
                 else:
                     _require_directory_binding(self._directory, self._directory_identity)
-        finally:
-            os.close(directory_descriptor)
 
 
 def load_study_journal(
@@ -471,8 +474,53 @@ def _open_private_directory(
             raise OSError("study journal directory was replaced or changed")
         _require_directory_binding(path, identity)
         return descriptor
-    except BaseException:
-        os.close(descriptor)
+    except BaseException as primary_error:
+        _close_descriptor_preserving_error(descriptor, primary_error=primary_error)
+        raise
+
+
+def _open_parent_directory(path: Path) -> int:
+    try:
+        descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except FileNotFoundError:
+        raise OSError("study journal parent directory does not exist") from None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise OSError("study journal parent path must be a directory") from exc
+        raise
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("study journal parent path must be a directory")
+        return descriptor
+    except BaseException as primary_error:
+        _close_descriptor_preserving_error(descriptor, primary_error=primary_error)
+        raise
+
+
+def _open_private_directory_at(parent_descriptor: int, name: str) -> int:
+    _validate_leaf_name(name)
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+    except FileNotFoundError:
+        raise OSError("study journal directory does not exist") from None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise OSError(
+                "study journal path must be a directory, not a symlink or file"
+            ) from exc
+        raise
+    try:
+        _private_directory_identity(os.fstat(descriptor))
+        return descriptor
+    except BaseException as primary_error:
+        _close_descriptor_preserving_error(descriptor, primary_error=primary_error)
         raise
 
 
@@ -485,15 +533,29 @@ def _require_directory_binding(path: Path, expected_identity: tuple[int, int]) -
         raise OSError("study journal directory was replaced or changed")
 
 
-def _fsync_parent_directory(path: Path) -> None:
-    descriptor = os.open(
-        path.parent,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
+@contextmanager
+def _managed_descriptor(descriptor: int) -> Iterator[int]:
+    primary_error: BaseException | None = None
     try:
-        os.fsync(descriptor)
+        yield descriptor
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        _close_descriptor_preserving_error(descriptor, primary_error=primary_error)
+
+
+def _close_descriptor_preserving_error(
+    descriptor: int,
+    *,
+    primary_error: BaseException | None,
+) -> None:
+    try:
         os.close(descriptor)
+    except OSError as cleanup_error:
+        if primary_error is None:
+            raise
+        primary_error.add_note(f"study journal descriptor close also failed: {cleanup_error}")
 
 
 def _read_regular_file_at(directory_descriptor: int, name: str) -> bytes:
@@ -508,7 +570,7 @@ def _read_regular_file_at(directory_descriptor: int, name: str) -> bytes:
         if exc.errno == errno.ELOOP:
             raise OSError("study journal record must be a regular file") from exc
         raise
-    try:
+    with _managed_descriptor(descriptor):
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError("study journal record must be a regular file")
@@ -530,8 +592,6 @@ def _read_regular_file_at(directory_descriptor: int, name: str) -> bytes:
         if len(payload) > _MAX_RECORD_BYTES:
             raise OSError("study journal record exceeds its size limit")
         return payload
-    finally:
-        os.close(descriptor)
 
 
 def _publish_regular_file_once_at(
@@ -549,14 +609,13 @@ def _publish_regular_file_once_at(
         0o600,
         dir_fd=directory_descriptor,
     )
+    primary_error: BaseException | None = None
     try:
-        try:
+        with _managed_descriptor(descriptor):
             offset = 0
             while offset < len(payload):
                 offset += os.write(descriptor, payload[offset:])
             os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
         try:
             os.link(
                 temporary,
@@ -571,11 +630,42 @@ def _publish_regular_file_once_at(
                     "study journal file already exists with different content"
                 ) from None
         os.fsync(directory_descriptor)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        try:
-            os.unlink(temporary, dir_fd=directory_descriptor)
-        except FileNotFoundError:
-            pass
+        _remove_temporary_file_at(
+            directory_descriptor,
+            temporary,
+            primary_error=primary_error,
+        )
+
+
+def _remove_temporary_file_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    primary_error: BaseException | None,
+) -> None:
+    cleanup_error: OSError | None = None
+    try:
+        os.unlink(name, dir_fd=directory_descriptor)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        cleanup_error = error
+    try:
+        os.fsync(directory_descriptor)
+    except OSError as error:
+        if cleanup_error is None:
+            cleanup_error = error
+        else:
+            cleanup_error.add_note(f"temporary-file directory fsync also failed: {error}")
+    if cleanup_error is None:
+        return
+    if primary_error is None:
+        raise cleanup_error
+    primary_error.add_note(f"study journal temporary-file cleanup also failed: {cleanup_error}")
 
 
 def _validate_leaf_name(name: str) -> None:
