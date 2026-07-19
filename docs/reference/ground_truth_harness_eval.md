@@ -278,6 +278,11 @@ The stable evidence labels this quantity as `provider_reported_total`; it is roo
 not a claim about currently free bytes. Missing or malformed metrics fail
 closed and use the ordinary owner-bound sandbox cleanup path.
 
+The exact E2B adapter preserves Harbor's full-day sandbox lease because one environment spans
+setup, agent execution, and shared verification. Its timed-resource account reserves that complete
+provider TTL before create, then settles only the observed lifetime after cleanup. This prevents an
+individually valid agent or verifier timeout from expiring the shared environment between phases.
+
 Local Docker has no portable per-container disk quota in this adapter. For a task storage request,
 WMH runs the same sanitized writable-inode and POSIX `df -Pk` probe used by command health checks and
 requires that the task's current filesystem report at least the requested available KiB. The stable

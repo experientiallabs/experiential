@@ -132,6 +132,16 @@ def _resource_account(
     )
 
 
+def test_exact_task_lease_preserves_harbors_full_day_e2b_horizon() -> None:
+    resource_class = mod.ExactE2BEnvironment._task_resource_class(
+        cpu_count=2,
+        memory_mb=1024,
+    )
+
+    assert mod._TASK_LEASE_TIMEOUT_S == 86_400
+    assert resource_class.provider_ttl_seconds == 86_400
+
+
 def _build_resource_account(
     tmp_path: Path,
     *,
@@ -1923,7 +1933,7 @@ def test_exact_create_binds_build_policy_and_terminal_cleanup_receipt(
     create_call = calls[0]
     assert create_call["template"] == "template-immutable:build-immutable"
     assert create_call["secure"] is True
-    assert create_call["timeout"] == 3600
+    assert create_call["timeout"] == 86_400
     assert create_call["request_timeout"] == 30
     assert create_call["lifecycle"] == {"on_timeout": "kill", "auto_resume": False}
     assert create_call["volume_mounts"] is None
@@ -2209,8 +2219,8 @@ def test_exact_create_rejects_an_expired_fixed_lease_and_kills_known_resource(
 
     async def create(**kwargs: object) -> _Sandbox:
         sandbox = _sandbox_for_create(kwargs)
-        sandbox._info.started_at -= timedelta(hours=2)
-        sandbox._info.end_at -= timedelta(hours=2)
+        sandbox._info.started_at -= timedelta(hours=25)
+        sandbox._info.end_at -= timedelta(hours=25)
         return sandbox
 
     reaped: list[str] = []

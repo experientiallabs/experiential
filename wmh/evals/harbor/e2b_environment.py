@@ -75,7 +75,11 @@ if TYPE_CHECKING:
 EXACT_E2B_ENVIRONMENT_IMPORT_PATH = "wmh.evals.harbor.e2b_environment:ExactE2BEnvironment"
 TASK_E2B_LEASE_FILE = "wmh-task-e2b-lease.json"
 _BUILD_REGISTRY_DIR = ".wmh-e2b-builds"
-_TASK_LEASE_TIMEOUT_S = 3_600
+# Harbor keeps one task environment alive through agent setup, the agent phase, and shared
+# verification. Preserve Harbor's full-day E2B horizon so a valid long-running task cannot lose its
+# environment between those independently bounded phases. The timed-resource reservation prices
+# this entire provider TTL before create, while settlement uses observed lifetime after cleanup.
+_TASK_LEASE_TIMEOUT_S = 86_400
 _PLATFORM_PROBE_TIMEOUT_S = 10
 _PROVIDER_CLOCK_SKEW_S = 30
 _TEMPLATE_BUILD_WAIT_TIMEOUT_S = 3_600
