@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 Role = Literal["user", "assistant"]
 ChatMaxTokensField = Literal["max_completion_tokens", "max_tokens"]
@@ -220,6 +220,33 @@ class ChatChoice(BaseModel):
     finish_reason: str | None = None
 
 
+class ChatProviderReceipt(BaseModel):
+    """Sanitized evidence for one provider-accepted structured generation request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    provider: str = Field(min_length=1, max_length=64)
+    provider_request_id: str = Field(min_length=1, max_length=512)
+    response_id: str | None = Field(default=None, min_length=1, max_length=512)
+    requested_model: str = Field(min_length=1, max_length=2_048)
+    response_model: str | None = Field(default=None, min_length=1, max_length=2_048)
+    system_fingerprint: str | None = Field(default=None, min_length=1, max_length=512)
+    request_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int = Field(ge=1)
+    max_tokens_field: str = Field(min_length=1, max_length=64)
+    seed_supplied: bool
+    cache_config_supplied: bool
+    started_at_unix_s: float = Field(ge=0.0)
+    finished_at_unix_s: float = Field(ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_time_order(self) -> ChatProviderReceipt:
+        if self.finished_at_unix_s < self.started_at_unix_s:
+            raise ValueError("provider receipt cannot finish before it starts")
+        return self
+
+
 class ChatResponse(BaseModel):
     """Structured completion returned to the agent runtime."""
 
@@ -227,7 +254,10 @@ class ChatResponse(BaseModel):
 
     choices: list[ChatChoice]
     usage: ChatUsage | None = None
+    id: str | None = None
     model: str | None = None
+    system_fingerprint: str | None = None
+    provider_receipt: ChatProviderReceipt | None = None
 
     def token_usage(self) -> TokenUsage:
         """Project provider usage onto the waterfall's canonical counters."""
@@ -239,8 +269,8 @@ class ChatResponse(BaseModel):
         )
 
     def wire_payload(self) -> JsonObject:
-        """Serialize the response back to the OpenAI-compatible pi bridge."""
-        return self.model_dump(mode="json", exclude_none=True)
+        """Serialize only agent-visible response fields back to the pi bridge."""
+        return self.model_dump(mode="json", exclude_none=True, exclude={"provider_receipt"})
 
 
 class ChatResult(BaseModel):

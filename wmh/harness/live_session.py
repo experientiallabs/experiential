@@ -70,6 +70,7 @@ DEFAULT_TURN_CAP = 60
 EventKind = Literal[
     "user_message",
     "assistant_message",
+    "provider_receipt",
     "tool_call",
     "tool_output",
     "tool_result",
@@ -197,6 +198,7 @@ class LiveSession:
         self._failure_message: str | None = None
         self._actions_this_turn = 0
         self._llm_calls_this_message = 0
+        self._successful_llm_calls_this_message = 0
         self._has_user_message = False
         self._aborting = False
         self._pending_ping: str | None = None
@@ -307,6 +309,7 @@ class LiveSession:
             if isinstance(intent, _UserMessage):
                 self._actions_this_turn = 0
                 self._llm_calls_this_message = 0
+                self._successful_llm_calls_this_message = 0
                 self._has_user_message = True
                 # NB: do not clear `_aborting` here — a new message can be drained before
                 # the cancelled turn's in-flight submit frame is read, and clearing now
@@ -379,6 +382,7 @@ class LiveSession:
             request = ChatRequest.model_validate(request_body)
             completion = self._worker_fn(request)
             self._meter(completion)
+            self._emit_provider_receipt(completion)
             self._emit_assistant(completion)
             self._safe_send(
                 {"type": "llm_response", "req_id": req_id, "completion": completion.wire_payload()}
@@ -504,8 +508,17 @@ class LiveSession:
         if isinstance(text, str) and text.strip():
             self._emit("assistant_message", {"text": text})
 
+    def _emit_provider_receipt(self, completion: ChatResponse) -> None:
+        receipt = completion.provider_receipt
+        if receipt is None:
+            return
+        payload = cast("JsonObject", receipt.model_dump(mode="json"))
+        payload["turn_call_index"] = self._successful_llm_calls_this_message
+        self._emit("provider_receipt", payload)
+
     def _meter(self, completion: ChatResponse) -> None:
         self.worker_usage.calls += 1
+        self._successful_llm_calls_this_message += 1
         reported = completion.token_usage()
         self.worker_usage.input_tokens += reported.input_tokens
         self.worker_usage.output_tokens += reported.output_tokens

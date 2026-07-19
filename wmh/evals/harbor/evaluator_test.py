@@ -368,6 +368,7 @@ def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_key
         "provider_config": _provider().model_dump(mode="json"),
         "runner_image": mod.PI_CONTAINER_IMAGE,
         "turn_timeout_s": 300.0,
+        "require_provider_receipts": True,
     }
 
 

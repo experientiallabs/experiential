@@ -28,10 +28,17 @@ class _FakeChatResponse:
     def __init__(self, content: str, usage: _FakeUsage) -> None:
         self.choices = [_FakeChoice(content)]
         self.usage = usage
+        self._request_id = "provider-request-azure-1"
+        self.id = "completion-azure-1"
+        self.model = "gpt-5.5-2026-06-01"
+        self.system_fingerprint = "fp-azure-1"
 
     def model_dump(self, *, mode: str) -> dict[str, object]:
         assert mode == "json"
         return {
+            "id": self.id,
+            "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [
                 {
                     "index": 0,
@@ -128,7 +135,7 @@ def test_structured_chat_applies_model_temperature_capability(
     chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(1, 1)))
     monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
 
-    provider.complete_chat(
+    response = provider.complete_chat(
         ChatRequest.model_validate(
             {
                 "messages": [{"role": "user", "content": "go"}],
@@ -139,6 +146,14 @@ def test_structured_chat_applies_model_temperature_capability(
     )
 
     assert ("temperature" in chat.last_kwargs) is expects_temperature
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.provider == "azure"
+    assert response.provider_receipt.provider_request_id == "provider-request-azure-1"
+    assert response.provider_receipt.response_id == "completion-azure-1"
+    assert response.provider_receipt.requested_model == "gpt55-deploy"
+    assert response.provider_receipt.response_model == "gpt-5.5-2026-06-01"
+    assert response.provider_receipt.system_fingerprint == "fp-azure-1"
+    assert response.provider_receipt.temperature == (0.3 if expects_temperature else None)
 
 
 def test_missing_deployment_raises(monkeypatch: pytest.MonkeyPatch) -> None:

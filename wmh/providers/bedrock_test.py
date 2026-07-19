@@ -39,6 +39,7 @@ class _StubConverseClient:
             "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
             "stopReason": "end_turn",
             "usage": {"inputTokens": 2, "outputTokens": 1},
+            "ResponseMetadata": {"RequestId": f"request-{len(self.requests)}"},
         }
 
 
@@ -114,10 +115,20 @@ def test_structured_chat_normalizes_temperature_for_unsupported_model() -> None:
         }
     )
 
-    provider.complete_chat(request)
+    response = provider.complete_chat(request)
 
     assert request.temperature == 0.3  # normalization does not mutate the reusable request
     assert stub.requests[0]["inferenceConfig"] == {"maxTokens": 64}
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.provider == "bedrock"
+    assert response.provider_receipt.provider_request_id == "request-1"
+    assert response.provider_receipt.response_id is None
+    assert response.provider_receipt.requested_model == "us.anthropic.claude-opus-4-8"
+    assert response.provider_receipt.response_model is None
+    assert response.provider_receipt.temperature is None
+    inference_config = cast("dict[str, object]", stub.requests[0]["inferenceConfig"])
+    assert response.provider_receipt.max_tokens == inference_config["maxTokens"]
+    assert response.provider_receipt.max_tokens_field == "inferenceConfig.maxTokens"
 
 
 def test_structured_chat_preserves_temperature_for_supported_model() -> None:
@@ -131,7 +142,7 @@ def test_structured_chat_preserves_temperature_for_supported_model() -> None:
     stub = _StubConverseClient()
     provider._client = cast("BaseClient", stub)
 
-    provider.complete_chat(
+    response = provider.complete_chat(
         ChatRequest.model_validate(
             {
                 "messages": [{"role": "user", "content": "hi"}],
@@ -142,3 +153,39 @@ def test_structured_chat_preserves_temperature_for_supported_model() -> None:
     )
 
     assert stub.requests[0]["inferenceConfig"] == {"maxTokens": 64, "temperature": 0.3}
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.temperature == 0.3
+    inference_config = cast("dict[str, object]", stub.requests[0]["inferenceConfig"])
+    assert response.provider_receipt.max_tokens == inference_config["maxTokens"]
+    assert response.provider_receipt.seed_supplied is False
+    assert response.provider_receipt.cache_config_supplied is False
+
+
+def test_structured_chat_without_request_metadata_remains_usable_without_receipt() -> None:
+    class MissingRequestIdClient(_StubConverseClient):
+        def converse(self, **kwargs: object) -> dict[str, object]:
+            response = super().converse(**kwargs)
+            response.pop("ResponseMetadata")
+            return response
+
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-sonnet-4-6",
+            model="us.anthropic.claude-sonnet-4-6",
+        )
+    )
+    stub = MissingRequestIdClient()
+    provider._client = cast("BaseClient", stub)
+
+    response = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
+    assert response.choices[0].message.content == "ok"
+    assert response.provider_receipt is None

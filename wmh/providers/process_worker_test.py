@@ -44,6 +44,22 @@ _COMPLETION = {
         }
     ],
     "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+    "provider_receipt": {
+        "provider": "bedrock",
+        "provider_request_id": "request-1",
+        "response_id": None,
+        "requested_model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "response_model": None,
+        "system_fingerprint": None,
+        "request_digest": "sha256:" + "a" * 64,
+        "temperature": 0.7,
+        "max_tokens": 32,
+        "max_tokens_field": "inferenceConfig.maxTokens",
+        "seed_supplied": False,
+        "cache_config_supplied": False,
+        "started_at_unix_s": 10.0,
+        "finished_at_unix_s": 11.0,
+    },
 }
 
 
@@ -230,6 +246,9 @@ def test_worker_round_trips_a_structured_completion(
     assert response.choices[0].message.content == "done"
     assert response.token_usage().input_tokens == 3
     assert response.token_usage().output_tokens == 2
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.provider_request_id == "request-1"
+    assert response.provider_receipt.response_id is None
     worker.close()
     _assert_reaped(process)
 

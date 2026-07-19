@@ -134,7 +134,12 @@ class _Environment:
         self.uploads.append((source_path, target_path))
 
 
-def _agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> mod.WmhPiAgent:
+def _agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    require_provider_receipts: bool = False,
+) -> mod.WmhPiAgent:
     monkeypatch.setattr(mod, "ProviderProcessWorker", _ProviderWorker)
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
     agent = mod.WmhPiAgent(
@@ -142,6 +147,7 @@ def _agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> mod.WmhPiAgent:
         model_name="bedrock/model",
         harness=cast("JsonObject", pi_node_baseline("candidate").model_dump(mode="json")),
         provider_config=cast("JsonObject", config.model_dump(mode="json")),
+        require_provider_receipts=require_provider_receipts,
     )
     agent._task_environment_attestation = mod._TaskEnvironmentAttestation(
         digest=_TASK_ENVIRONMENT_DIGEST,
@@ -163,6 +169,38 @@ def _healthy_disk_result(*, available_kib: int | None = None) -> ExecResult:
 
 def _deadline(seconds: float = 300.0) -> mod.TurnDeadline:
     return mod.TurnDeadline.after(seconds)
+
+
+def _provider_receipt_payload(
+    *,
+    call_index: int = 1,
+    provider: str = "bedrock",
+    requested_model: str = "model",
+    provider_request_id: str | None = None,
+    response_id: str | None = None,
+    response_model: str | None = None,
+    system_fingerprint: str | None = None,
+) -> JsonObject:
+    return cast(
+        "JsonObject",
+        {
+            "provider": provider,
+            "provider_request_id": provider_request_id or f"provider-request-{call_index}",
+            "response_id": response_id,
+            "requested_model": requested_model,
+            "response_model": response_model,
+            "system_fingerprint": system_fingerprint,
+            "request_digest": "sha256:" + "a" * 64,
+            "temperature": None,
+            "max_tokens": 64,
+            "max_tokens_field": "inferenceConfig.maxTokens",
+            "seed_supplied": False,
+            "cache_config_supplied": False,
+            "started_at_unix_s": 10.0,
+            "finished_at_unix_s": 11.0,
+            "turn_call_index": call_index,
+        },
+    )
 
 
 @pytest.mark.parametrize("turn_timeout_s", [float("nan"), float("inf"), float("-inf")])
@@ -1033,6 +1071,133 @@ def test_success_populates_usage_and_backend_identity(
     assert context.metadata["task_environment_digest"] == _TASK_ENVIRONMENT_DIGEST
     assert context.metadata["task_environment_attestation"] == _TASK_ENVIRONMENT_ATTESTATION
     assert context.metadata["run_health"] == "valid"
+
+
+def test_confirmation_rejects_missing_receipt_as_infrastructure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch, require_provider_receipts=True)
+    result = PiTurnResult(
+        answer="done",
+        terminal_reason="completed",
+        events=(SessionEvent(kind="submit", payload={"answer": "done"}),),
+        worker_usage=TokenUsage(input_tokens=11, output_tokens=5, calls=1),
+    )
+    monkeypatch.setattr(mod, "run_pi_turn", lambda *_args, **_kwargs: result)
+    context = AgentContext()
+
+    with pytest.raises(mod.WmhPiProviderReceiptError, match="receipt is invalid"):
+        asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), context))
+
+    assert context.n_input_tokens == 11
+    assert context.n_output_tokens == 5
+    assert context.metadata is not None
+    assert context.metadata["infrastructure_failure"] is True
+    assert context.metadata["infrastructure_failure_kind"] == "provider_receipt"
+    assert context.metadata["run_health"] == "infrastructure_failure"
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (),
+        (
+            SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload()),
+            SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload()),
+        ),
+        (
+            SessionEvent(
+                kind="provider_receipt",
+                payload=_provider_receipt_payload(call_index=2),
+            ),
+        ),
+        (
+            SessionEvent(
+                kind="provider_receipt",
+                payload=_provider_receipt_payload(provider="azure"),
+            ),
+        ),
+        (
+            SessionEvent(
+                kind="provider_receipt",
+                payload=_provider_receipt_payload(requested_model="other-model"),
+            ),
+        ),
+    ],
+)
+def test_confirmation_receipt_trace_rejects_missing_extra_noncontiguous_or_mismatched(
+    events: tuple[SessionEvent, ...],
+) -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+
+    with pytest.raises(mod.PiInfrastructureError) as caught:
+        mod._require_complete_provider_receipt_trace(
+            events,
+            TokenUsage(calls=1),
+            config,
+        )
+
+    assert caught.value.kind is mod.PiInfrastructureFailureKind.PROVIDER_RECEIPT
+
+
+def test_confirmation_receipt_trace_accepts_exact_contiguous_frozen_evidence() -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    events = (
+        SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload(call_index=1)),
+        SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload(call_index=2)),
+    )
+
+    mod._require_complete_provider_receipt_trace(events, TokenUsage(calls=2), config)
+
+
+def test_confirmation_receipt_trace_rejects_reused_provider_request_identity() -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    events = (
+        SessionEvent(
+            kind="provider_receipt",
+            payload=_provider_receipt_payload(
+                call_index=1,
+                provider_request_id="reused-request",
+            ),
+        ),
+        SessionEvent(
+            kind="provider_receipt",
+            payload=_provider_receipt_payload(
+                call_index=2,
+                provider_request_id="reused-request",
+            ),
+        ),
+    )
+
+    with pytest.raises(mod.PiInfrastructureError) as caught:
+        mod._require_complete_provider_receipt_trace(events, TokenUsage(calls=2), config)
+
+    assert caught.value.kind is mod.PiInfrastructureFailureKind.PROVIDER_RECEIPT
+
+
+def test_openai_receipt_response_identity_must_match_completion() -> None:
+    config = ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5")
+    payload = _provider_receipt_payload(
+        provider="openai",
+        requested_model="gpt-5.5",
+        response_id="different-completion",
+        response_model="gpt-5.5-served",
+        system_fingerprint="fp-1",
+    )
+    payload.pop("turn_call_index")
+    response = ChatResponse.model_validate(
+        {
+            "id": "completion-1",
+            "model": "gpt-5.5-served",
+            "system_fingerprint": "fp-1",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "provider_receipt": payload,
+        }
+    )
+
+    with pytest.raises(ValueError, match="response id disagrees"):
+        mod._validate_provider_response_receipt(response, config)
 
 
 def test_infrastructure_error_does_not_persist_raw_provider_secret(

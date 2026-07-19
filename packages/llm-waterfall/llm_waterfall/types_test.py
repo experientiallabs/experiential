@@ -121,3 +121,32 @@ def test_structured_response_preserves_tool_calls_and_usage() -> None:
     assert response.choices[0].message.tool_calls is not None
     assert response.choices[0].message.tool_calls[0].function.name == "bash"
     assert response.token_usage().input_tokens == 10
+
+
+def test_provider_receipt_is_strict_and_excluded_from_agent_wire_payload() -> None:
+    response = ChatResponse.model_validate(
+        {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "provider_receipt": {
+                "provider": "bedrock",
+                "provider_request_id": "request-1",
+                "response_id": None,
+                "requested_model": "us.example.model",
+                "response_model": None,
+                "system_fingerprint": None,
+                "request_digest": "sha256:" + "a" * 64,
+                "temperature": 0.7,
+                "max_tokens": 4_096,
+                "max_tokens_field": "inferenceConfig.maxTokens",
+                "seed_supplied": False,
+                "cache_config_supplied": False,
+                "started_at_unix_s": 10.0,
+                "finished_at_unix_s": 11.0,
+            },
+        }
+    )
+
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.provider_request_id == "request-1"
+    assert response.provider_receipt.response_id is None
+    assert "provider_receipt" not in response.wire_payload()

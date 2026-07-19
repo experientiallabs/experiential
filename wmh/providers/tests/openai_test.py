@@ -34,10 +34,17 @@ class _FakeChatResponse:
     def __init__(self, content: str, usage: _FakeUsage) -> None:
         self.choices = [_FakeChoice(content)]
         self.usage = usage
+        self._request_id = "provider-request-openai-1"
+        self.id = "completion-openai-1"
+        self.model = "gpt-5.5-2026-06-01"
+        self.system_fingerprint = "fp-openai-1"
 
     def model_dump(self, *, mode: str) -> dict[str, object]:
         assert mode == "json"
         return {
+            "id": self.id,
+            "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [
                 {
                     "index": 0,
@@ -263,7 +270,7 @@ def test_structured_chat_applies_temperature_capability_before_wire(
     fake = _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([])))
     monkeypatch.setattr(provider, "_get_client", lambda: fake)
 
-    provider.complete_chat(
+    response = provider.complete_chat(
         ChatRequest.model_validate(
             {
                 "messages": [{"role": "user", "content": "go"}],
@@ -274,3 +281,36 @@ def test_structured_chat_applies_temperature_capability_before_wire(
     )
 
     assert ("temperature" in chat.last_kwargs) is expects_temperature
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.provider == "openai"
+    assert response.provider_receipt.provider_request_id == "provider-request-openai-1"
+    assert response.provider_receipt.response_id == "completion-openai-1"
+    assert response.provider_receipt.requested_model == "gpt-5.5"
+    assert response.provider_receipt.response_model == "gpt-5.5-2026-06-01"
+    assert response.provider_receipt.temperature == (0.3 if expects_temperature else None)
+
+
+def test_structured_chat_without_transport_request_id_remains_usable_without_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_response = _FakeChatResponse("ok", _FakeUsage(1, 1))
+    del raw_response._request_id
+    chat = _FakeChatCompletions(raw_response)
+    provider = OpenAIProvider(_config())
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    response = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "go"}],
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
+    assert response.choices[0].message.content == "ok"
+    assert response.provider_receipt is None

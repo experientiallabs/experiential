@@ -164,10 +164,13 @@ class HarborEvaluator:
         *,
         runner_image: str = PI_CONTAINER_IMAGE,
         turn_timeout_s: float = 300.0,
+        require_provider_receipts: bool = True,
     ) -> None:
         validate_pi_container_image(runner_image)
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
+        if not isinstance(require_provider_receipts, bool):
+            raise ValueError("require_provider_receipts must be a boolean")
         validated_spec = HarborJobSpec.model_validate(spec.model_dump())
         _validate_job_name(validated_spec.job_name)
         self._spec = validated_spec.model_copy(
@@ -176,6 +179,7 @@ class HarborEvaluator:
         self._provider_config = provider_config.model_copy(deep=True)
         self._runner_image = runner_image
         self._turn_timeout_s = turn_timeout_s
+        self._require_provider_receipts = require_provider_receipts
         self._runner_ready = False
 
     async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
@@ -284,6 +288,7 @@ class HarborEvaluator:
                 "provider_config": self._provider_config.model_dump(mode="json"),
                 "runner_image": self._runner_image,
                 "turn_timeout_s": self._turn_timeout_s,
+                "require_provider_receipts": self._require_provider_receipts,
             },
         )
 

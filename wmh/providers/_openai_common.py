@@ -6,12 +6,14 @@ chat-completion and embedding wire formats are identical, so that logic lives he
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from openai import BadRequestError
 
 from wmh.providers.base import Completion, Message, TokenUsage
+from wmh.providers.receipt import build_chat_provider_receipt
 
 if TYPE_CHECKING:
     from openai.types import CreateEmbeddingResponse
@@ -102,6 +104,7 @@ def complete_chat(
     model: str,
     request: ChatRequest,
     *,
+    provider: str,
     max_tokens_field: ChatMaxTokensField,
 ) -> ChatResponse:
     """Run a validated structured request against an OpenAI-compatible SDK resource."""
@@ -109,8 +112,42 @@ def complete_chat(
     # package models its evolving request surface as a large TypedDict union, so the narrow cast
     # preserves forward-compatible extra fields without leaking Any into the public contract.
     resource = cast("Any", chat_completions)
-    response = resource.create(**request.provider_payload(model, max_tokens_field=max_tokens_field))
-    return ChatResponse.model_validate(response.model_dump(mode="json"))
+    payload = request.provider_payload(model, max_tokens_field=max_tokens_field)
+    started_at = time.time()
+    raw_response = resource.create(**payload)
+    finished_at = time.time()
+    response = ChatResponse.model_validate(raw_response.model_dump(mode="json"))
+    provider_request_id = getattr(raw_response, "_request_id", None)
+    max_tokens_value = payload.get(max_tokens_field)
+    temperature = payload.get("temperature")
+    if (
+        not isinstance(provider_request_id, str)
+        or not provider_request_id
+        or not response.id
+        or not response.model
+        or isinstance(max_tokens_value, bool)
+        or not isinstance(max_tokens_value, int)
+    ):
+        return response
+    if temperature is not None and (
+        isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+    ):
+        return response
+    receipt = build_chat_provider_receipt(
+        provider=provider,
+        provider_request_id=provider_request_id,
+        response_id=response.id,
+        requested_model=model,
+        response_model=response.model,
+        system_fingerprint=response.system_fingerprint,
+        request_payload=payload,
+        temperature=float(temperature) if temperature is not None else None,
+        max_tokens=max_tokens_value,
+        max_tokens_field=max_tokens_field,
+        started_at_unix_s=started_at,
+        finished_at_unix_s=finished_at,
+    )
+    return response.model_copy(update={"provider_receipt": receipt})
 
 
 def embed(

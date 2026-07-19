@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import TYPE_CHECKING, TypedDict, cast
 
-from wmh.core.types import JsonValue
+from wmh.core.types import JsonObject, JsonValue
 from wmh.providers._bedrock_chat import converse_request, converse_response
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -19,6 +20,7 @@ from wmh.providers.base import (
     normalize_chat_temperature,
     verify_via_ping,
 )
+from wmh.providers.receipt import build_chat_provider_receipt
 
 if TYPE_CHECKING:
     from botocore.client import BaseClient
@@ -163,8 +165,44 @@ class BedrockProvider:
             request,
             forward_temperature=self._forward_temperature,
         )
-        raw = self._get_client().converse(**converse_request(normalized, self.config.model))
-        return converse_response(raw, self.config.model)
+        wire_request = converse_request(normalized, self.config.model)
+        started_at = time.time()
+        raw = self._get_client().converse(**wire_request)
+        finished_at = time.time()
+        raw_mapping = cast("dict[str, object]", raw)
+        response_metadata = raw_mapping.get("ResponseMetadata")
+        provider_request_id = (
+            response_metadata.get("RequestId") if isinstance(response_metadata, dict) else None
+        )
+        inference_config = wire_request.get("inferenceConfig")
+        if not isinstance(inference_config, dict):
+            raise ValueError("Bedrock Converse request is missing inferenceConfig")
+        max_tokens = inference_config.get("maxTokens")
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            raise ValueError("Bedrock Converse request is missing inferenceConfig.maxTokens")
+        temperature = inference_config.get("temperature")
+        if temperature is not None and (
+            isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+        ):
+            raise ValueError("Bedrock Converse request has an invalid inferenceConfig.temperature")
+        response = converse_response(raw, self.config.model)
+        if not isinstance(provider_request_id, str) or not provider_request_id:
+            return response
+        receipt = build_chat_provider_receipt(
+            provider=self.config.kind.value,
+            provider_request_id=provider_request_id,
+            response_id=None,
+            requested_model=self.config.model,
+            response_model=None,
+            system_fingerprint=None,
+            request_payload=cast("JsonObject", wire_request),
+            temperature=float(temperature) if temperature is not None else None,
+            max_tokens=max_tokens,
+            max_tokens_field="inferenceConfig.maxTokens",
+            started_at_unix_s=started_at,
+            finished_at_unix_s=finished_at,
+        )
+        return response.model_copy(update={"provider_receipt": receipt})
 
     def _complete_converse(
         self,

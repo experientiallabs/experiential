@@ -95,6 +95,7 @@ class OpenAIProvider:
             self._get_client().chat.completions,
             self.config.model,
             request,
+            provider=self.config.kind.value,
             max_tokens_field=self.config.resolved_chat_max_tokens_field(),
         )
 

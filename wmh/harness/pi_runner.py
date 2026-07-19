@@ -113,6 +113,12 @@ class DeadlineAwareWorker(Protocol):
     ) -> ChatResponse: ...
 
 
+class ChatResponseValidator(Protocol):
+    """Validate trusted response evidence before it enters a live session."""
+
+    def __call__(self, response: ChatResponse, /) -> None: ...
+
+
 class PiRunnerFactory(Protocol):
     """Open one pi runner channel and own its cleanup."""
 
@@ -178,6 +184,7 @@ class PiInfrastructureFailureKind(StrEnum):
 
     PROVIDER = "provider"
     PROVIDER_DEADLINE = "provider_deadline"
+    PROVIDER_RECEIPT = "provider_receipt"
     TASK_ENVIRONMENT = "task_environment"
     TASK_ENVIRONMENT_CONFIRMATION_REQUIRED = "task_environment_confirmation_required"
 
@@ -198,6 +205,9 @@ class PiInfrastructureError(RuntimeError):
             PiInfrastructureFailureKind.PROVIDER_DEADLINE: (
                 "pi turn worker provider deadline expired"
             ),
+            PiInfrastructureFailureKind.PROVIDER_RECEIPT: (
+                "pi turn worker provider receipt is invalid"
+            ),
             PiInfrastructureFailureKind.TASK_ENVIRONMENT: "pi turn tool executor failed",
             PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED: (
                 "pi turn task environment requires confirmation"
@@ -212,6 +222,7 @@ class PiInfrastructureError(RuntimeError):
             or {
                 PiInfrastructureFailureKind.PROVIDER: PiRunHealth.INFRASTRUCTURE_FAILURE,
                 PiInfrastructureFailureKind.PROVIDER_DEADLINE: (PiRunHealth.INFRASTRUCTURE_FAILURE),
+                PiInfrastructureFailureKind.PROVIDER_RECEIPT: (PiRunHealth.INFRASTRUCTURE_FAILURE),
                 PiInfrastructureFailureKind.TASK_ENVIRONMENT: PiRunHealth.AMBIGUOUS,
                 PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED: (
                     PiRunHealth.AMBIGUOUS
@@ -328,6 +339,7 @@ def run_pi_turn(
     runner_factory: PiRunnerFactory,
     timeout_s: float = DEFAULT_PI_TURN_TIMEOUT_S,
     provider_call_timeout_s: float = DEFAULT_PROVIDER_CALL_TIMEOUT_S,
+    response_validator: ChatResponseValidator | None = None,
 ) -> PiTurnResult:
     """Run one instruction through the document's pi harness and return its observed event trace.
 
@@ -390,7 +402,7 @@ def run_pi_turn(
             infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
             raise RuntimeError("worker provider unavailable")
         try:
-            return worker_fn(request, turn_deadline.bounded_by(provider_call_timeout_s))
+            response = worker_fn(request, turn_deadline.bounded_by(provider_call_timeout_s))
         except ProviderWorkerDeadlineExceeded as exc:
             if exc.source is RequestDeadlineSource.CALLER_BUDGET:
                 turn_deadline_exceeded = True
@@ -416,6 +428,15 @@ def run_pi_turn(
                 raise RuntimeError("candidate worker request rejected") from None
             infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
             raise RuntimeError("worker provider unavailable") from None
+        if response_validator is not None:
+            try:
+                response_validator(response)
+            except Exception:  # noqa: BLE001 - receipt detail stays on the trusted host
+                infrastructure_failure = PiInfrastructureError(
+                    PiInfrastructureFailureKind.PROVIDER_RECEIPT
+                )
+                raise RuntimeError("worker provider receipt is invalid") from None
+        return response
 
     def checked_execute_tool(
         name: str,

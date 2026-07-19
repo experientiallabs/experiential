@@ -18,6 +18,7 @@ from concurrent.futures import Future
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, cast
 
@@ -25,6 +26,7 @@ from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import MCPServerConfig
+from llm_waterfall import ChatProviderReceipt, ChatResponse
 
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
@@ -47,7 +49,7 @@ from wmh.harness.pi_runner import (
     run_pi_turn,
 )
 from wmh.harness.runner_link import Channel, TokenUsage
-from wmh.providers.base import ProviderConfig
+from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.process_worker import (
     ProviderProcessWorker,
     ProviderWorkerCleanupError,
@@ -71,7 +73,7 @@ _MIN_TASK_FREE_DISK_KIB = 128 * 1024
 _TRACE_FILE = "wmh-events.jsonl"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.3.0"
+WMH_PI_AGENT_VERSION: Final = "0.4.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -124,6 +126,10 @@ class WmhPiProviderError(RuntimeError):
 
 class WmhPiProviderDeadlineError(RuntimeError):
     """The host-side provider exceeded its evaluator-owned hard deadline."""
+
+
+class WmhPiProviderReceiptError(RuntimeError):
+    """Provider evidence was missing or inconsistent with the frozen configuration."""
 
 
 class WmhPiEnvironmentError(RuntimeError):
@@ -556,6 +562,7 @@ class WmhPiAgent(BaseAgent):
         provider_config: JsonObject,
         runner_image: str = PI_CONTAINER_IMAGE,
         turn_timeout_s: float = 300.0,
+        require_provider_receipts: bool = False,
     ) -> None:
         if extra_env:
             raise ValueError(
@@ -579,9 +586,12 @@ class WmhPiAgent(BaseAgent):
         validate_pi_container_image(runner_image)
         if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
             raise ValueError("turn_timeout_s must be finite and positive")
+        if not isinstance(require_provider_receipts, bool):
+            raise ValueError("require_provider_receipts must be a boolean")
         self._provider_config = config.model_copy(deep=True)
         self._runner_image = runner_image
         self._turn_timeout_s = turn_timeout_s
+        self._require_provider_receipts = require_provider_receipts
         self._task_environment_attestation: _TaskEnvironmentAttestation | None = None
 
     @staticmethod
@@ -652,6 +662,8 @@ class WmhPiAgent(BaseAgent):
                 self._harness,
                 instruction,
                 self._turn_timeout_s,
+                self._provider_config,
+                self._require_provider_receipts,
             )
         )
         try:
@@ -824,6 +836,8 @@ def _run_isolated_turn(
     harness: HarnessDoc,
     instruction: str,
     timeout_s: float,
+    provider_config: ProviderConfig,
+    require_provider_receipts: bool,
 ) -> PiTurnResult:
     """Own the disposable provider lifecycle for one synchronous pi turn."""
     try:
@@ -833,16 +847,127 @@ def _run_isolated_turn(
     except (ProviderWorkerFailure, ProviderWorkerUnavailable):
         raise PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER) from None
     try:
-        return run_pi_turn(
-            harness,
-            instruction,
-            execute_tool=executor,
-            worker_fn=provider_worker.complete_chat,
-            runner_factory=runner_factory,
-            timeout_s=timeout_s,
-        )
+        try:
+            result = run_pi_turn(
+                harness,
+                instruction,
+                execute_tool=executor,
+                worker_fn=provider_worker.complete_chat,
+                runner_factory=runner_factory,
+                timeout_s=timeout_s,
+                response_validator=(
+                    partial(
+                        _validate_provider_response_receipt,
+                        provider_config=provider_config,
+                    )
+                    if require_provider_receipts
+                    else None
+                ),
+            )
+        except (PiCandidateError, PiInfrastructureError) as exc:
+            if require_provider_receipts:
+                _require_complete_provider_receipt_trace(
+                    exc.events,
+                    exc.worker_usage,
+                    provider_config,
+                )
+            raise
+        if require_provider_receipts:
+            _require_complete_provider_receipt_trace(
+                result.events,
+                result.worker_usage,
+                provider_config,
+            )
+        return result
     finally:
         provider_worker.close()
+
+
+def _validate_provider_response_receipt(
+    response: ChatResponse,
+    provider_config: ProviderConfig,
+) -> None:
+    """Require response evidence to agree with the immutable provider target."""
+    receipt = response.provider_receipt
+    if receipt is None:
+        raise ValueError("provider receipt is missing")
+    _validate_provider_receipt_identity(receipt, provider_config)
+    if provider_config.kind is ProviderKind.BEDROCK:
+        if response.model != provider_config.model:
+            raise ValueError("Bedrock response model disagrees with the frozen provider model")
+        return
+    if receipt.response_id != response.id:
+        raise ValueError("provider receipt response id disagrees with the completion")
+    if receipt.response_model != response.model:
+        raise ValueError("provider receipt response model disagrees with the completion")
+    if receipt.system_fingerprint != response.system_fingerprint:
+        raise ValueError("provider receipt fingerprint disagrees with the completion")
+
+
+def _validate_provider_receipt_identity(
+    receipt: ChatProviderReceipt,
+    provider_config: ProviderConfig,
+) -> None:
+    """Validate receipt routing against the frozen provider configuration."""
+    expected_model = (
+        provider_config.deployment
+        if provider_config.kind is ProviderKind.AZURE_OPENAI
+        else provider_config.model
+    )
+    if not expected_model:
+        raise ValueError("frozen provider configuration has no request model")
+    if receipt.provider != provider_config.kind.value:
+        raise ValueError("provider receipt disagrees with the frozen provider")
+    if receipt.requested_model != expected_model:
+        raise ValueError("provider receipt disagrees with the frozen request model")
+    if provider_config.kind is ProviderKind.BEDROCK:
+        if receipt.response_id is not None:
+            raise ValueError("Bedrock provider receipt must not contain a response id")
+        if receipt.response_model is not None or receipt.system_fingerprint is not None:
+            raise ValueError("Bedrock provider receipt contains unsupported response metadata")
+    elif receipt.response_id is None or receipt.response_model is None:
+        raise ValueError("OpenAI-compatible provider receipt is missing response identity")
+
+
+def _require_complete_provider_receipt_trace(
+    events: tuple[SessionEvent, ...],
+    usage: TokenUsage,
+    provider_config: ProviderConfig,
+) -> None:
+    """Reconcile one receipt event with every successfully metered provider call."""
+    receipt_events = tuple(event for event in events if event.kind == "provider_receipt")
+    if len(receipt_events) != usage.calls:
+        raise PiInfrastructureError(
+            PiInfrastructureFailureKind.PROVIDER_RECEIPT,
+            events=events,
+            worker_usage=usage,
+        )
+    provider_request_ids: set[str] = set()
+    for expected_index, event in enumerate(receipt_events, start=1):
+        payload = dict(event.payload)
+        call_index = payload.pop("turn_call_index", None)
+        if (
+            isinstance(call_index, bool)
+            or not isinstance(call_index, int)
+            or call_index != expected_index
+        ):
+            raise PiInfrastructureError(
+                PiInfrastructureFailureKind.PROVIDER_RECEIPT,
+                events=events,
+                worker_usage=usage,
+            )
+        try:
+            receipt = ChatProviderReceipt.model_validate(payload)
+            _validate_provider_receipt_identity(receipt, provider_config)
+            if receipt.provider_request_id in provider_request_ids:
+                raise ValueError("provider request identity was reused")
+            provider_request_ids.add(receipt.provider_request_id)
+        except Exception:  # noqa: BLE001 - trace contents never enter the persisted error text
+            raise PiInfrastructureError(
+                PiInfrastructureFailureKind.PROVIDER_RECEIPT,
+                events=events,
+                worker_usage=usage,
+            ) from None
 
 
 async def _attest_task_environment(
@@ -1360,6 +1485,8 @@ def _typed_infrastructure_error(error: Exception) -> RuntimeError:
             return WmhPiProviderError("WMH pi worker provider failed")
         if error.kind is PiInfrastructureFailureKind.PROVIDER_DEADLINE:
             return WmhPiProviderDeadlineError("WMH pi worker provider deadline expired")
+        if error.kind is PiInfrastructureFailureKind.PROVIDER_RECEIPT:
+            return WmhPiProviderReceiptError("WMH pi worker provider receipt is invalid")
         if error.kind is PiInfrastructureFailureKind.TASK_ENVIRONMENT_CONFIRMATION_REQUIRED:
             return WmhPiEnvironmentConfirmationRequiredError(
                 "WMH pi task environment needs a fresh confirmation attempt"

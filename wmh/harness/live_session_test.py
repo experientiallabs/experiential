@@ -29,7 +29,10 @@ class ScriptedChannel:
 
 
 def _completion(
-    text: str = "", tool_calls: list | None = None, usage: dict | None = None
+    text: str = "",
+    tool_calls: list | None = None,
+    usage: dict | None = None,
+    provider_receipt: dict | None = None,
 ) -> ChatResponse:
     msg: JsonObject = {"role": "assistant", "content": text}
     if tool_calls is not None:
@@ -38,7 +41,28 @@ def _completion(
     completion: JsonObject = {"choices": [choice]}
     if usage is not None:
         completion["usage"] = usage
+    if provider_receipt is not None:
+        completion["provider_receipt"] = provider_receipt
     return ChatResponse.model_validate(completion)
+
+
+def _provider_receipt() -> JsonObject:
+    return {
+        "provider": "bedrock",
+        "provider_request_id": "request-1",
+        "response_id": None,
+        "requested_model": "us.example.model",
+        "response_model": None,
+        "system_fingerprint": None,
+        "request_digest": "sha256:" + "a" * 64,
+        "temperature": 0.7,
+        "max_tokens": 16_384,
+        "max_tokens_field": "inferenceConfig.maxTokens",
+        "seed_supplied": False,
+        "cache_config_supplied": False,
+        "started_at_unix_s": 10.0,
+        "finished_at_unix_s": 11.0,
+    }
 
 
 def _drain(session: LiveSession) -> None:
@@ -302,6 +326,71 @@ def test_harness_temperature_overrides_live_runner_request() -> None:
     _drain(session)
 
     assert [request.temperature for request in requests] == [0.35]
+
+
+def test_provider_receipt_is_emitted_to_trace_but_not_exposed_to_runner() -> None:
+    events: list[SessionEvent] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+        ]
+    )
+    receipt = _provider_receipt()
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=events.append,
+        worker_fn=lambda request: _completion("ok", provider_receipt=receipt),
+    )
+
+    session.start()
+    session.send_user_message("do the task")
+    _drain(session)
+
+    provider_events = [event for event in events if event.kind == "provider_receipt"]
+    assert len(provider_events) == 1
+    assert provider_events[0].payload == {**receipt, "turn_call_index": 1}
+    response = next(frame for frame in channel.sent if frame["type"] == "llm_response")
+    completion = response["completion"]
+    assert isinstance(completion, dict)
+    assert "provider_receipt" not in completion
+
+
+def test_provider_receipt_indices_count_only_successful_provider_calls() -> None:
+    events: list[SessionEvent] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+            {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}},
+        ]
+    )
+    attempts = 0
+
+    def worker(_request: ChatRequest) -> ChatResponse:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("provider unavailable")
+        return _completion("ok", provider_receipt=_provider_receipt())
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=events.append,
+        worker_fn=worker,
+    )
+
+    session.start()
+    session.send_user_message("do the task")
+    _drain(session)
+
+    provider_events = [event for event in events if event.kind == "provider_receipt"]
+    assert session.worker_usage.calls == 1
+    assert provider_events[0].payload["turn_call_index"] == 1
 
 
 def test_harness_output_budget_overrides_and_canonicalizes_runner_request() -> None:

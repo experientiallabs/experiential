@@ -333,6 +333,38 @@ def test_run_pi_turn_keeps_worker_failures_infrastructure_typed() -> None:
     assert "worker provider unavailable" in str(channel.sent)
 
 
+def test_run_pi_turn_types_response_evidence_rejection_as_infrastructure() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+    secret = "receipt-secret-sentinel"
+
+    def reject_response(_response: ChatResponse) -> None:
+        raise ValueError(secret)
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiInfrastructureError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=lambda _request, _deadline: _completion(),
+            response_validator=reject_response,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER_RECEIPT
+    assert secret not in str(caught.value)
+    assert secret not in str(channel.sent)
+    assert "worker provider receipt is invalid" in str(channel.sent)
+
+
 @pytest.mark.parametrize(
     ("module", "code", "message", "parameter"),
     [
