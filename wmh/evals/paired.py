@@ -720,6 +720,26 @@ def _jackknife_student_t_inference(
     design: PairedEvaluationDesign,
     alpha: float,
 ) -> _JackknifeStudentTInference:
+    """Compute the model-based leave-one-semantic-group-out diagnostic.
+
+    The point estimate remains the equal-task mean. Each deleted estimate
+    removes one complete score-independent semantic group and renormalizes by
+    the number of remaining tasks. The usual delete-one-group jackknife
+    variance and Student-t reference distribution are diagnostic only; they
+    do not enter the finite-sample primary decision.
+
+    Args:
+        task_deltas: Complete task-level deltas in the design's canonical order.
+        design: Frozen task roster and semantic-group assignment.
+        alpha: One-sided diagnostic tail probability.
+
+    Returns:
+        Jackknife standard error, degrees of freedom, p-value, and lower bound.
+
+    Raises:
+        ValueError: If deltas do not fill the roster or fewer than two nonempty
+            deletion groups remain available.
+    """
     if len(task_deltas) != len(design.tasks):
         raise ValueError("jackknife task deltas must match the frozen design")
     task_values = dict(zip(design.task_ids, task_deltas, strict=True))
@@ -767,6 +787,24 @@ def _jackknife_student_t_lower_bound(
     degrees_of_freedom: int,
     alpha: float,
 ) -> float:
+    """Return a clipped one-sided Student-t lower endpoint.
+
+    A zero standard error yields the point estimate exactly. Otherwise the
+    endpoint subtracts the one-sided Student-t critical value times the
+    jackknife standard error and clips the result to the reward-delta range.
+
+    Args:
+        estimate: Equal-task point estimate in the reward-delta range.
+        standard_error: Nonnegative jackknife standard error.
+        degrees_of_freedom: Positive number of semantic groups minus one.
+        alpha: One-sided tail probability strictly between zero and one.
+
+    Returns:
+        Lower endpoint clipped to ``[-1, 1]``.
+
+    Raises:
+        ValueError: If alpha, standard error, or degrees of freedom are invalid.
+    """
     if not 0.0 < alpha < 1.0:
         raise ValueError("jackknife Student-t alpha must be between zero and one")
     if standard_error < 0.0 or not math.isfinite(standard_error):

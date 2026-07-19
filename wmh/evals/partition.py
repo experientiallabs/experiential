@@ -35,6 +35,7 @@ _PRIVATE_TOKEN_PATTERN = r"^[0-9a-f]{64}$"
 _MAX_CONTROL_RECORD_BYTES = 64 * 1024
 _CONTROL_RECORD_MODE = 0o600
 _CONTROL_STORE_MODE = 0o700
+_UNIFORM_INDEX_MAX_ATTEMPTS = 65_536
 
 
 class PartitionTask(BaseModel):
@@ -1174,7 +1175,25 @@ def _within_target(vector: _CountVector, target: _CountVector) -> bool:
 
 
 def _uniform_index(*, seed: str, upper_bound: int) -> int:
-    """Map a CSPRNG seed to an unbiased index using hash-stream rejection sampling."""
+    """Map a CSPRNG seed to an unbiased index with bounded rejection sampling.
+
+    Each attempt consumes a domain-separated deterministic hash stream large
+    enough to cover ``upper_bound``. Values in the incomplete high interval
+    are rejected, so every returned residue has exactly the same number of
+    preimages. The fixed attempt cap makes an adversarial or corrupted hash
+    stream fail closed instead of blocking partition initialization forever.
+
+    Args:
+        seed: Private frozen seed for the deterministic hash stream.
+        upper_bound: Exclusive positive upper bound for the sampled index.
+
+    Returns:
+        An unbiased integer in ``range(upper_bound)``.
+
+    Raises:
+        ValueError: If ``upper_bound`` is not a positive integer.
+        RuntimeError: If no sample is admitted within the frozen attempt cap.
+    """
     if isinstance(upper_bound, bool) or not isinstance(upper_bound, int) or upper_bound < 1:
         raise ValueError("partition index upper bound must be a positive integer")
     if upper_bound == 1:
@@ -1182,8 +1201,7 @@ def _uniform_index(*, seed: str, upper_bound: int) -> int:
     byte_count = (upper_bound.bit_length() + 7) // 8
     sample_space = 1 << (8 * byte_count)
     acceptance_limit = sample_space - sample_space % upper_bound
-    attempt = 0
-    while True:
+    for attempt in range(_UNIFORM_INDEX_MAX_ATTEMPTS):
         sample = bytearray()
         block = 0
         while len(sample) < byte_count:
@@ -1199,7 +1217,7 @@ def _uniform_index(*, seed: str, upper_bound: int) -> int:
         value = int.from_bytes(sample[:byte_count], "big")
         if value < acceptance_limit:
             return value % upper_bound
-        attempt += 1
+    raise RuntimeError("partition uniform index exhausted its frozen attempt bound")
 
 
 def _selection_rank_commitment(*, seed: str, feasible_count: int, rank: int) -> str:

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import wmh.evals.partition as partition_module
 from wmh.evals.partition import (
     BenchmarkPartitionManifest,
     PartitionControlScope,
@@ -140,6 +141,26 @@ def test_uniform_partition_space_exhaustively_unranks_each_feasible_subset_once(
     for group_id in ("easy-a", "easy-b", "medium-a", "medium-b"):
         assert observed[group_id] == 2
         assert space.discovery_inclusion_probability(group_id) == Fraction(2, 5)
+
+
+def test_uniform_index_fails_closed_after_a_bounded_rejection_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def reject_every_sample(*_parts: str) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls > 3:
+            raise AssertionError("uniform index sampled beyond its frozen attempt bound")
+        return b"\xff" * 32
+
+    monkeypatch.setattr(partition_module, "_UNIFORM_INDEX_MAX_ATTEMPTS", 3, raising=False)
+    monkeypatch.setattr(partition_module, "_digest_bytes", reject_every_sample)
+
+    with pytest.raises(RuntimeError, match="attempt bound"):
+        partition_module._uniform_index(seed="rejection-stream", upper_bound=3)
+    assert calls == 3
 
 
 def test_manifest_persists_uniform_selection_evidence_and_exact_probabilities(
