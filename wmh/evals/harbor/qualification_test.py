@@ -989,12 +989,15 @@ def test_e2b_partial_resume_reuses_completed_task_without_second_launch(
     _write_task(dataset, "task-b")
     budget = _e2b_budget_runtime(tmp_path)
     builds_by_task: dict[str, ExactE2BBuildRecord] = {}
+    build_calls: list[str] = []
+    unavailable_build_record = {"missing"}
 
     async def prepare_build(
         *,
         spec: ExactE2BBuildSpec,
         **_kwargs: object,
     ) -> ExactE2BBuildRecord:
+        build_calls.append(spec.digest)
         record = _budgeted_build_record(
             spec=spec,
             budget=budget,
@@ -1004,7 +1007,13 @@ def test_e2b_partial_resume_reuses_completed_task_without_second_launch(
         builds_by_task.update({"task-a": record, "task-b": record})
         return record
 
+    def require_build(**_kwargs: object) -> ExactE2BBuildRecord:
+        if unavailable_build_record:
+            raise RuntimeError("synthetic missing terminal build record")
+        return builds_by_task["task-a"]
+
     monkeypatch.setattr(mod, "prepare_exact_e2b_build", prepare_build)
+    monkeypatch.setattr(mod, "require_exact_e2b_build_record", require_build)
     starts: list[str] = []
     stops: list[str] = []
     failures = {"task-b"}
@@ -1026,9 +1035,20 @@ def test_e2b_partial_resume_reuses_completed_task_without_second_launch(
     assert stops == starts
     failures.clear()
 
+    with pytest.raises(
+        mod.HarborRosterQualificationDriftError,
+        match="terminal exact build",
+    ):
+        asyncio.run(qualifier.qualify())
+
+    assert len(build_calls) == 1
+    assert starts == ["task-a", "task-b"]
+    unavailable_build_record.clear()
+
     roster = asyncio.run(qualifier.qualify())
 
     assert tuple(task.task_id for task in roster.tasks) == ("task-a", "task-b")
+    assert len(build_calls) == 1
     assert starts == ["task-a", "task-b", "task-b"]
     assert stops == starts
 

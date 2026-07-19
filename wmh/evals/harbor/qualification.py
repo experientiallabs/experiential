@@ -572,7 +572,14 @@ class HarborRosterQualifier:
                         roster = self._load_complete_roster(commitment)
                         self._validate_complete_e2b_builds(roster)
                         return roster
-                    build_records = await self._prepare_e2b_builds(resolved)
+                    resumed_evidence = self._load_resumed_task_evidence(
+                        resolved,
+                        commitment=commitment,
+                    )
+                    build_records = await self._prepare_e2b_builds(
+                        resolved,
+                        resumed_evidence=resumed_evidence,
+                    )
                     evidence: list[_QualifiedTaskEvidence] = []
                     for item in resolved:
                         evidence.append(
@@ -779,9 +786,19 @@ class HarborRosterQualifier:
     async def _prepare_e2b_builds(
         self,
         tasks: tuple[_ResolvedQualificationTask, ...],
+        *,
+        resumed_evidence: Mapping[str, _QualifiedTaskEvidence],
     ) -> dict[str, ExactE2BBuildRecord]:
         budget = self._runtime.budget
         if budget is None:
+            for item in tasks:
+                evidence = resumed_evidence.get(item.commitment.task_id)
+                if evidence is not None:
+                    self._validate_resumed_task_evidence(
+                        item,
+                        evidence=evidence,
+                        build_records={},
+                    )
             return {}
         unique: dict[str, tuple[ExactE2BBuildSpec, Path]] = {}
         for item in tasks:
@@ -792,12 +809,27 @@ class HarborRosterQualifier:
                 unique[spec.digest] = spec, environment_dir
             elif current[0] != spec:
                 raise RuntimeError("equal E2B build digests resolved to different specifications")
-        if len(unique) > 1 and self._e2b_spend_limit_provider is None:
+        records: dict[str, ExactE2BBuildRecord] = {}
+        for item in tasks:
+            evidence = resumed_evidence.get(item.commitment.task_id)
+            if evidence is None:
+                continue
+            spec = cast("ExactE2BBuildSpec", item.build_spec)
+            record = records.get(spec.digest)
+            if record is None:
+                record = self._load_resumed_e2b_build(spec)
+                records[spec.digest] = record
+            self._validate_resumed_task_evidence(
+                item,
+                evidence=evidence,
+                build_records=records,
+            )
+        missing = {digest: value for digest, value in unique.items() if digest not in records}
+        if len(missing) > 1 and self._e2b_spend_limit_provider is None:
             raise BudgetIntegrityError(
                 "multiple E2B builds require a fresh provider spend-limit supplier"
             )
-        records: dict[str, ExactE2BBuildRecord] = {}
-        for digest, (spec, environment_dir) in sorted(unique.items()):
+        for digest, (spec, environment_dir) in sorted(missing.items()):
             build_class = exact_e2b_build_resource_class(
                 cpu_count=spec.cpu_count,
                 memory_mb=spec.memory_mb,
@@ -819,6 +851,55 @@ class HarborRosterQualifier:
                 raise BudgetIntegrityError("qualification excludes preexisting E2B builds")
             records[digest] = record
         return records
+
+    def _load_resumed_e2b_build(self, spec: ExactE2BBuildSpec) -> ExactE2BBuildRecord:
+        """Load one terminal exact build without allowing a replacement dispatch."""
+        budget = cast("HarborRosterQualificationBudgetRuntime", self._runtime.budget)
+        build_class = exact_e2b_build_resource_class(
+            cpu_count=spec.cpu_count,
+            memory_mb=spec.memory_mb,
+        )
+        try:
+            account = budget.build_account_for(
+                build_class,
+                operation_id=self._operation_id,
+            )
+            return require_exact_e2b_build_record(
+                jobs_dir=self._runtime.jobs_dir,
+                environment_id=spec.environment_id,
+                build_context_digest=spec.build_context_digest,
+                docker_image=spec.docker_image,
+                cpu_count=spec.cpu_count,
+                memory_mb=spec.memory_mb,
+                expected_budget_authority=account,
+                allow_preexisting_outside_study=False,
+            )
+        except (BudgetIntegrityError, OSError, RuntimeError, ValueError) as exc:
+            raise HarborRosterQualificationDriftError(
+                "qualified task build evidence cannot be rebound to its terminal exact build"
+            ) from exc
+
+    def _load_resumed_task_evidence(
+        self,
+        tasks: tuple[_ResolvedQualificationTask, ...],
+        *,
+        commitment: _PreparedRosterCommitment,
+    ) -> dict[str, _QualifiedTaskEvidence]:
+        """Load every stored task result before any restart can dispatch paid work."""
+        resumed: dict[str, _QualifiedTaskEvidence] = {}
+        for item in tasks:
+            evidence = _read_model(
+                self._evidence_path(item.commitment),
+                _QualifiedTaskEvidence,
+            )
+            if evidence is None:
+                continue
+            if evidence.prepared_commitment_digest != commitment.commitment_digest:
+                raise HarborRosterQualificationDriftError(
+                    "qualified task evidence belongs to a different prepared roster"
+                )
+            resumed[item.commitment.task_id] = evidence
+        return resumed
 
     async def _spend_limit_for_build(
         self,
@@ -1110,8 +1191,12 @@ class HarborRosterQualifier:
                 )
             if identity.build_config_digest in validated:
                 continue
-            account = budget.task_account_for(
-                resource_class,
+            build_class = exact_e2b_build_resource_class(
+                cpu_count=identity.cpu_count,
+                memory_mb=identity.memory_mb,
+            )
+            account = budget.build_account_for(
+                build_class,
                 operation_id=self._operation_id,
             )
             record = require_exact_e2b_build_record(
