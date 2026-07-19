@@ -241,6 +241,11 @@ class HarnessOptimizationProtocol(BaseModel):
         budget_policy_digest: str,
     ) -> HarnessOptimizationProtocol:
         """Freeze the public contract from a still-private benchmark partition."""
+        expected_roster_digest = _partition_roster_digest(partition)
+        if provenance.roster_digest != expected_roster_digest:
+            raise ValueError(
+                "benchmark provenance roster_digest differs from the frozen partition roster"
+            )
         return cls(
             experiment_id=experiment_id,
             protocol_id=protocol_id,
@@ -353,6 +358,8 @@ class FrozenHarnessOptimizationCandidate(BaseModel):
             raise ValueError("candidate freeze record differs from the optimization protocol")
         if self.freeze_record.candidate_execution_digest != self.candidate.execution_digest:
             raise ValueError("candidate freeze record differs from the selected harness")
+        if self.freeze_record.selection_evidence_digest != self.checkpoint_payload_digest:
+            raise ValueError("candidate freeze record differs from the selection checkpoint")
         return self
 
 
@@ -406,6 +413,8 @@ class HarnessOptimizationOutcome(BaseModel):
     baseline_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
     candidate_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
     panel_delta: float = Field(ge=-1.0, le=1.0)
+    minimum_required_panel_delta: float = Field(ge=-1.0, le=1.0)
+    panel_passed: bool
     members: tuple[HarnessOptimizationMemberOutcome, ...]
     passed: bool
 
@@ -416,8 +425,11 @@ class HarnessOptimizationOutcome(BaseModel):
         names = tuple(item.panel_member for item in self.members)
         if names != tuple(sorted(set(names))):
             raise ValueError("optimization outcome members must be unique and canonical")
-        if self.passed != all(item.passed for item in self.members):
-            raise ValueError("optimization outcome decision differs from its member decisions")
+        expected_panel = self.panel_delta >= self.minimum_required_panel_delta
+        if self.panel_passed != expected_panel:
+            raise ValueError("optimization outcome panel decision differs from its threshold")
+        if self.passed != (self.panel_passed and all(item.passed for item in self.members)):
+            raise ValueError("optimization outcome decision differs from its frozen decisions")
         return self
 
 
@@ -436,7 +448,7 @@ def prepare_harness_optimization_study(
 
 
 def run_harness_optimization_search(
-    prepared: PreparedHarnessOptimizationStudy,
+    discovery: HarnessOptimizationDiscoveryContract,
     *,
     scorer: HarnessScorer,
     proposer: DeltaProposer,
@@ -445,11 +457,11 @@ def run_harness_optimization_search(
     on_note: Callable[[str], None] | None = None,
     on_proposal: Callable[[ProposalRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
-    on_checkpoint: Callable[[SearchCheckpoint], None] | None = None,
+    on_checkpoint: Callable[[SearchCheckpoint], None],
     should_cancel: Callable[[], bool] | None = None,
 ) -> SearchResult:
     """Run the predeclared discovery search without any held-out scorer or adaptive matrix."""
-    study = PreparedHarnessOptimizationStudy.model_validate(prepared.model_dump(mode="json"))
+    study = HarnessOptimizationDiscoveryContract.model_validate(discovery.model_dump(mode="json"))
     _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
     plan = study.protocol.search
     return search_harness(
@@ -491,15 +503,17 @@ def freeze_harness_optimization_candidate(
         candidate,
         policy=study.protocol.candidate_policy,
     )
+    checkpoint_payload_digest = "sha256:" + state.payload_sha256
     freeze_record = freeze_confirmation_candidate(
         control_store,
         manifest=study.partition,
         candidate_execution_digest=candidate.execution_digest,
         confirmation_protocol_digest=study.protocol.digest,
+        selection_evidence_digest=checkpoint_payload_digest,
     )
     return FrozenHarnessOptimizationCandidate(
         protocol_digest=study.protocol.digest,
-        checkpoint_payload_digest="sha256:" + state.payload_sha256,
+        checkpoint_payload_digest=checkpoint_payload_digest,
         baseline=study.baseline.model_copy(deep=True),
         candidate=candidate,
         freeze_record=freeze_record,
@@ -605,13 +619,15 @@ def summarize_harness_optimization_outcome(
         baseline_execution_digest=study.baseline.execution_digest,
         candidate_execution_digest=study.candidate.execution_digest,
         panel_delta=result.analysis.panel_delta,
+        minimum_required_panel_delta=study.protocol.confirmation.minimum_panel_delta,
+        panel_passed=result.analysis.panel_lift_passed,
         members=members,
-        passed=result.analysis.passed,
+        passed=result.analysis.panel_lift_passed and result.analysis.passed,
     )
 
 
 def _validate_search_component_bindings(
-    prepared: PreparedHarnessOptimizationStudy,
+    prepared: HarnessOptimizationDiscoveryContract,
     *,
     scorer: HarnessScorer,
     proposer: DeltaProposer,
@@ -711,3 +727,8 @@ def _canonical_digest(value: object) -> str:
         allow_nan=False,
     )
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _partition_roster_digest(partition: BenchmarkPartitionManifest) -> str:
+    """Derive the provenance roster identity from the exact split input records."""
+    return _canonical_digest([task.model_dump(mode="json") for task in partition.tasks])
