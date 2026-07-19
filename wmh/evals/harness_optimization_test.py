@@ -630,6 +630,39 @@ def test_search_phase_guard_rejects_before_the_scorer_or_proposer_can_run(
     assert scorer.score_calls == 0
 
 
+def test_discovery_authorization_cannot_start_a_second_fresh_search(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    checkpoints: list[SearchCheckpoint] = []
+
+    run_harness_optimization_search(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=discovery_authorization,
+        on_checkpoint=checkpoints.append,
+    )
+    first_call_count = scorer.score_calls
+
+    with pytest.raises(ValueError, match="already started"):
+        run_harness_optimization_search(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=discovery_authorization,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert scorer.score_calls == first_call_count
+
+
 def test_protocol_rejects_a_caller_asserted_roster_digest(tmp_path: Path) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")

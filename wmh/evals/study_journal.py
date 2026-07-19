@@ -9,12 +9,12 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, Protocol, Self
+from typing import Literal, Protocol, Self, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, model_validator
 
@@ -28,7 +28,9 @@ _GENESIS_FILE = "study-journal.json"
 _PENDING_FILE = "pending-phase.json"
 _MAX_RECORD_BYTES = 64 * 1024
 _RECORD_PATTERN = re.compile(r"^(?P<sequence>[0-9]{3})-(?P<phase>[a-z_]+)\.json$")
+_RUN_CLAIM_PATTERN = re.compile(r"^run-claim-(?P<phase>[a-z_]+)\.json$")
 _TEMPORARY_PATTERN = re.compile(r"^\.tmp-(?P<target>.+)-(?P<nonce>[0-9a-f]{32})$")
+_ResultT = TypeVar("_ResultT")
 
 
 class StudyPhase(StrEnum):
@@ -187,6 +189,28 @@ class StudyPhaseRecord(BaseModel):
     def digest(self) -> str:
         """Return the chain identity used by the next phase."""
         return self.record_digest
+
+
+class StudyRunClaim(BaseModel):
+    """Durable one-run identity admitted under an exact phase authorization."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    claim_version: Literal["1"] = "1"
+    journal_genesis_digest: str = Field(pattern=_DIGEST_PATTERN)
+    study_id: str = Field(min_length=1, max_length=512)
+    phase: StudyPhase
+    authorization_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
+    run_id: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _validate_claim(self) -> Self:
+        for field in ("study_id", "run_id"):
+            value = getattr(self, field)
+            if value != value.strip():
+                raise ValueError(f"study run {field} cannot have surrounding whitespace")
+            validate_durable_text(value, field=f"study run {field}")
+        return self
 
 
 class ExternalCommitmentPublisher(Protocol):
@@ -454,6 +478,85 @@ def append_study_phase(
         return record
 
 
+def claim_study_run(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    authorization_payload_digest: str,
+    run_id: str,
+    publisher: ExternalCommitmentPublisher,
+    resume: bool,
+) -> StudyRunClaim:
+    """Claim one phase run once, admitting later calls only as exact resumes."""
+    requested_phase = StudyPhase(phase)
+    proposed = StudyRunClaim(
+        journal_genesis_digest=store.genesis.digest,
+        study_id=store.genesis.study_id,
+        phase=requested_phase,
+        authorization_payload_digest=authorization_payload_digest,
+        run_id=run_id,
+    )
+    with store.locked() as directory_descriptor:
+        records = _load_records_locked(store, directory_descriptor)
+        pending = _load_pending_locked(store, directory_descriptor, records)
+        _verify_external_chain_locked(
+            store,
+            directory_descriptor,
+            publisher,
+            records,
+            pending,
+        )
+        _require_current_phase_locked(
+            records,
+            requested_phase,
+            payload_digest=authorization_payload_digest,
+        )
+        claim_name = _run_claim_name(requested_phase)
+        try:
+            existing_payload = _read_regular_file_at(directory_descriptor, claim_name)
+        except FileNotFoundError:
+            existing_payload = None
+        if existing_payload is None:
+            if resume:
+                raise ValueError("study run cannot resume before its durable claim exists")
+            _publish_regular_file_once_at(
+                directory_descriptor,
+                claim_name,
+                _canonical_json_bytes(proposed.model_dump(mode="json")),
+            )
+            return proposed
+        existing = _validate_run_claim_payload(store, claim_name, existing_payload)
+        if existing != proposed:
+            raise ValueError("study phase is already claimed by a different run authorization")
+        if not resume:
+            raise ValueError("study run already started; supply its exact durable checkpoint")
+        return existing
+
+
+def call_in_study_phase(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    payload_digest: str | None,
+    publisher: ExternalCommitmentPublisher,
+    operation: Callable[[], _ResultT],
+) -> _ResultT:
+    """Hold the journal lease from exact phase verification through one side effect."""
+    requested_phase = StudyPhase(phase)
+    with store.locked() as directory_descriptor:
+        records = _load_records_locked(store, directory_descriptor)
+        pending = _load_pending_locked(store, directory_descriptor, records)
+        _verify_external_chain_locked(
+            store,
+            directory_descriptor,
+            publisher,
+            records,
+            pending,
+        )
+        _require_current_phase_locked(records, requested_phase, payload_digest=payload_digest)
+        return operation()
+
+
 def _load_records_locked(
     store: StudyJournalStore,
     directory_descriptor: int,
@@ -461,6 +564,13 @@ def _load_records_locked(
     record_names: list[tuple[int, StudyPhase, str]] = []
     for name in os.listdir(directory_descriptor):
         if name in {_GENESIS_FILE, _PENDING_FILE}:
+            continue
+        if _RUN_CLAIM_PATTERN.fullmatch(name) is not None:
+            _validate_run_claim_payload(
+                store,
+                name,
+                _read_regular_file_at(directory_descriptor, name),
+            )
             continue
         match = _RECORD_PATTERN.fullmatch(name)
         if match is None:
@@ -559,6 +669,51 @@ def _verify_external_chain_locked(
 
 def _record_name(sequence: int, phase: StudyPhase) -> str:
     return f"{sequence:03d}-{phase.value}.json"
+
+
+def _run_claim_name(phase: StudyPhase) -> str:
+    return f"run-claim-{phase.value}.json"
+
+
+def _validate_run_claim_payload(
+    store: StudyJournalStore,
+    name: str,
+    payload: bytes,
+) -> StudyRunClaim:
+    match = _RUN_CLAIM_PATTERN.fullmatch(name)
+    if match is None:
+        raise ValueError("study run claim filename is not canonical")
+    try:
+        filename_phase = StudyPhase(match.group("phase"))
+        claim = StudyRunClaim.model_validate_json(payload)
+    except ValueError as exc:
+        raise ValueError("study run claim is invalid") from exc
+    if payload != _canonical_json_bytes(claim.model_dump(mode="json")):
+        raise ValueError("study run claim is not canonical")
+    if (
+        claim.phase is not filename_phase
+        or name != _run_claim_name(claim.phase)
+        or claim.journal_genesis_digest != store.genesis.digest
+        or claim.study_id != store.genesis.study_id
+    ):
+        raise ValueError("study run claim belongs to another journal or phase")
+    return claim
+
+
+def _require_current_phase_locked(
+    records: tuple[StudyPhaseRecord, ...],
+    expected: StudyPhase,
+    *,
+    payload_digest: str | None,
+) -> StudyPhaseRecord:
+    actual = records[-1].commitment.phase if records else None
+    if actual is not expected:
+        actual_label = actual.value if actual is not None else "unstarted"
+        raise ValueError(f"current study phase is {actual_label}, required {expected.value}")
+    record = records[-1]
+    if payload_digest is not None and record.commitment.payload_digest != payload_digest:
+        raise ValueError("current study phase carries different authorization evidence")
+    return record
 
 
 def _allowed_next_phases(
@@ -847,6 +1002,8 @@ def _is_valid_temporary_name(name: str) -> bool:
         return False
     target = match.group("target")
     if target in {_GENESIS_FILE, _PENDING_FILE}:
+        return True
+    if _RUN_CLAIM_PATTERN.fullmatch(target) is not None:
         return True
     record_match = _RECORD_PATTERN.fullmatch(target)
     if record_match is None:

@@ -23,7 +23,10 @@ from wmh.evals.study_journal import (
     StudyJournalStore,
     StudyPhase,
     StudyPhaseRecord,
+    StudyRunClaim,
     append_study_phase,
+    call_in_study_phase,
+    claim_study_run,
     load_study_journal,
 )
 
@@ -274,6 +277,24 @@ class StudyLifecycleController:
             raise ValueError("current study phase carries different authorization evidence")
         return record
 
+    def claim_run(
+        self,
+        expected: StudyPhase,
+        run_id: str,
+        *,
+        payload_digest: str,
+        resume: bool,
+    ) -> StudyRunClaim:
+        """Durably admit one exact run or an exact checkpoint-backed resume."""
+        return claim_study_run(
+            self._store,
+            phase=expected,
+            authorization_payload_digest=payload_digest,
+            run_id=run_id,
+            publisher=self._publisher,
+            resume=resume,
+        )
+
     def call_in_phase(
         self,
         expected: StudyPhase,
@@ -282,5 +303,10 @@ class StudyLifecycleController:
         payload_digest: str | None = None,
     ) -> _ResultT:
         """Invoke one side effect only after externally reverifying its required phase."""
-        self.require_current_phase(expected, payload_digest=payload_digest)
-        return operation()
+        return call_in_study_phase(
+            self._store,
+            phase=expected,
+            payload_digest=payload_digest,
+            publisher=self._publisher,
+            operation=operation,
+        )
