@@ -177,6 +177,61 @@ def _build_resource_account(
     )
 
 
+def _shared_task_and_build_accounts(
+    tmp_path: Path,
+) -> tuple[TimedResourceBudgetAccount, TimedResourceBudgetAccount]:
+    build_class = mod.exact_e2b_build_resource_class(cpu_count=2, memory_mb=1024)
+    task_class = mod.ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024)
+    trust = _spend_limit_trust()
+    build_meter = TimedResourceCostMeter(
+        resource_type=build_class.role.value,
+        resource_class_digest=build_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=build_class.max_host_observation_seconds,
+        external_spend_authority=ExternalSpendAuthority(
+            provider="e2b",
+            account_identity=trust.account_identity,
+            verifier_digest=trust.digest,
+        ),
+    )
+    task_meter = TimedResourceCostMeter(
+        resource_type=task_class.role.value,
+        resource_class_digest=task_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=task_class.max_host_observation_seconds,
+    )
+    preparation_limit = build_meter.maximum_charge_nano_usd() * 3
+    search_limit = task_meter.maximum_charge_nano_usd() * 3
+    policy = BudgetPolicy(
+        study_id="shared-task-build-ledger",
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
+        hard_limit_nano_usd=preparation_limit + search_limit,
+        phase_limits_nano_usd={
+            "preparation": preparation_limit,
+            "search": search_limit,
+        },
+        meters={"build": build_meter, "task": task_meter},
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "shared-budget.sqlite3", policy)
+    build_account = authority.timed_resource_account(
+        scope=BudgetScope(
+            phase="preparation",
+            category="task-environment-build",
+            run_id="pre-open-roster",
+        ),
+        meter_id="build",
+    )
+    task_account = authority.timed_resource_account(
+        scope=BudgetScope(
+            phase="search",
+            category="task-environment",
+            run_id="scored-task",
+        ),
+        meter_id="task",
+    )
+    return build_account, task_account
+
+
 def _spend_limit(
     account: TimedResourceBudgetAccount,
     *,
@@ -441,6 +496,96 @@ def test_content_keyed_build_registry_reuses_only_completed_exact_ids(
     [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
     assert reservation.status is ReservationStatus.SETTLED
     assert reservation.reservation_id == second_record.cost_attribution.reservation_id
+
+
+def test_build_record_reuse_resolves_attributed_meter_from_shared_ledger_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _environment(tmp_path)
+    environment_dir = tmp_path / "environment"
+    jobs_dir = tmp_path / "jobs"
+    build_account, task_account = _shared_task_and_build_accounts(tmp_path)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+
+    async def build_once(**_kwargs: object) -> BuildInfo:
+        return BuildInfo(
+            template_id="template-shared-ledger",
+            build_id="build-shared-ledger",
+            name="name",
+            alias="alias",
+        )
+
+    monkeypatch.setattr(mod, "_start_exact_template_build", build_once)
+    record = asyncio.run(
+        mod.prepare_exact_e2b_build(
+            jobs_dir=jobs_dir,
+            environment_dir=environment_dir,
+            spec=spec,
+            budget_account=build_account,
+            provider_spend_limit=_spend_limit(build_account),
+            provider_spend_limit_trust=_spend_limit_trust(),
+        )
+    )
+
+    loaded = mod.require_exact_e2b_build_record(
+        jobs_dir=jobs_dir,
+        environment_id=spec.environment_id,
+        build_context_digest=spec.build_context_digest,
+        docker_image=spec.docker_image,
+        cpu_count=spec.cpu_count,
+        memory_mb=spec.memory_mb,
+        expected_budget_authority=task_account,
+    )
+
+    assert loaded == record
+    assert isinstance(record.cost_attribution, mod.BudgetedE2BBuildAttribution)
+    assert record.cost_attribution.meter_id == "build"
+    assert record.cost_attribution.scope.phase == "preparation"
+
+    foreign_policy = _resource_account(tmp_path / "foreign-policy")
+    with pytest.raises(BudgetIntegrityError, match="study authority"):
+        mod.require_exact_e2b_build_record(
+            jobs_dir=jobs_dir,
+            environment_id=spec.environment_id,
+            build_context_digest=spec.build_context_digest,
+            docker_image=spec.docker_image,
+            cpu_count=spec.cpu_count,
+            memory_mb=spec.memory_mb,
+            expected_budget_authority=foreign_policy,
+        )
+
+    foreign_authority = bootstrap_budget_ledger(
+        tmp_path / "foreign-ledger.sqlite3",
+        task_account.policy,
+    )
+    foreign_ledger_account = foreign_authority.timed_resource_account(
+        scope=task_account.scope,
+        meter_id=task_account.meter_id,
+    )
+    with pytest.raises(BudgetIntegrityError, match="study authority"):
+        mod.require_exact_e2b_build_record(
+            jobs_dir=jobs_dir,
+            environment_id=spec.environment_id,
+            build_context_digest=spec.build_context_digest,
+            docker_image=spec.docker_image,
+            cpu_count=spec.cpu_count,
+            memory_mb=spec.memory_mb,
+            expected_budget_authority=foreign_ledger_account,
+        )
+
+    invalid_attribution = record.cost_attribution.model_copy(update={"scope": task_account.scope})
+    invalid_record = record.model_copy(update={"cost_attribution": invalid_attribution})
+    with pytest.raises(BudgetIntegrityError, match="settled timed reservation"):
+        mod._verify_build_budget_attribution(
+            invalid_record,
+            expected_authority=task_account,
+        )
 
 
 def test_concurrent_build_registry_serializes_before_publishing_exact_ids(

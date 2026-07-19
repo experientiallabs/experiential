@@ -596,6 +596,45 @@ def test_external_spend_authority_is_immutable_policy_authority() -> None:
         assert mutated_policy.policy_digest != policy.policy_digest
 
 
+def test_unbound_external_authority_preserves_legacy_digest_and_reopens(
+    tmp_path: Path,
+) -> None:
+    policy = BudgetPolicy(
+        study_id="legacy-timed-resource",
+        manifest_digest="sha256:" + "a" * 64,
+        hard_limit_nano_usd=100,
+        phase_limits_nano_usd={"search": 100},
+        meters={
+            "runner": TimedResourceCostMeter(
+                resource_type="agent_runner",
+                resource_class_digest="sha256:" + "b" * 64,
+                nano_usd_per_second=2,
+                billing_quantum_seconds=60,
+                max_billing_seconds=120,
+            )
+        },
+    )
+    expected_digest = "sha256:27406f282ffd8a014471b6d13d33160e79c0075bb3bd728c17d4c484c4438bcb"
+
+    assert policy.policy_digest == expected_digest
+    ledger_path = tmp_path / "legacy.sqlite3"
+    authority = bootstrap_budget_ledger(ledger_path, policy)
+    with sqlite3.connect(ledger_path) as connection:
+        [policy_json] = connection.execute(
+            "SELECT policy_json FROM budget_metadata WHERE id = 1"
+        ).fetchone()
+        [entry_json] = connection.execute(
+            "SELECT entry_json FROM budget_events WHERE sequence = 1"
+        ).fetchone()
+    assert "external_spend_authority" not in policy_json
+    assert "external_spend_authority" not in entry_json
+
+    reopened = SpendLedger(ledger_path, policy, allow_create=False)
+
+    assert reopened.policy == policy
+    assert reopened.ledger_identity == authority.ledger_identity
+
+
 def test_orphaned_timed_resource_join_is_exact_and_conservative(tmp_path: Path) -> None:
     resource = TimedResourceCostMeter(
         resource_type="agent_runner",

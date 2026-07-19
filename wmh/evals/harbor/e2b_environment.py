@@ -1905,14 +1905,29 @@ def _verify_build_budget_attribution(
         return
     if expected_authority is None:
         raise BudgetIntegrityError("budgeted E2B build record requires the study budget authority")
-    account = TimedResourceBudgetAccount.model_validate(expected_authority.model_dump())
+    shared_authority = TimedResourceBudgetAccount.model_validate(expected_authority.model_dump())
     if (
-        attribution.policy_digest != account.policy.policy_digest
-        or attribution.ledger_identity != account.ledger_identity
-        or attribution.meter_id != account.meter_id
-        or attribution.scope != account.scope
+        attribution.policy_digest != shared_authority.policy.policy_digest
+        or attribution.ledger_identity != shared_authority.ledger_identity
     ):
         raise BudgetIntegrityError("E2B build cost attribution differs from study authority")
+    ledger = open_shared_spend_ledger(
+        shared_authority.ledger_path,
+        shared_authority.policy,
+        expected_ledger_identity=shared_authority.ledger_identity,
+    )
+    try:
+        account = TimedResourceBudgetAccount(
+            ledger_path=shared_authority.ledger_path,
+            ledger_identity=shared_authority.ledger_identity,
+            policy=shared_authority.policy,
+            scope=attribution.scope,
+            meter_id=attribution.meter_id,
+        )
+    except ValueError:
+        raise BudgetIntegrityError(
+            "E2B build cost attribution names an invalid budget account"
+        ) from None
     statement = attribution.provider_spend_limit.statement
     meter = _require_e2b_external_spend_authority(
         account,
@@ -1946,11 +1961,6 @@ def _verify_build_budget_attribution(
         or meter.max_billing_seconds < build_class.max_host_observation_seconds
     ):
         raise BudgetIntegrityError("E2B build cost attribution names the wrong timed meter")
-    ledger = open_shared_spend_ledger(
-        account.ledger_path,
-        account.policy,
-        expected_ledger_identity=account.ledger_identity,
-    )
     matches = [
         reservation
         for reservation in ledger.reservations()

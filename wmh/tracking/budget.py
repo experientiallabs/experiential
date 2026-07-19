@@ -312,7 +312,7 @@ class BudgetPolicy(BaseModel):
     @property
     def policy_digest(self) -> str:
         """Return the canonical digest that binds every ledger open."""
-        return _digest_json(self.model_dump(mode="json"))
+        return _digest_json(_budget_policy_dump(self))
 
 
 class BudgetAccount(BaseModel):
@@ -923,7 +923,7 @@ class SpendLedger:
                         _SCHEMA_VERSION,
                         ledger_nonce,
                         self._policy.policy_digest,
-                        _canonical_json(self._policy.model_dump(mode="json")),
+                        _canonical_json(_budget_policy_dump(self._policy)),
                     ),
                 )
                 self._ledger_nonce = ledger_nonce
@@ -1148,7 +1148,7 @@ class SpendLedger:
         event = BudgetEvent.model_validate({**unsigned, "digest": digest})
         connection.execute(
             "INSERT INTO budget_events (sequence, digest, entry_json) VALUES (?, ?, ?)",
-            (sequence, digest, _canonical_json(event.model_dump(mode="json"))),
+            (sequence, digest, _canonical_json(_budget_event_dump(event, include_digest=True))),
         )
         return event
 
@@ -2320,13 +2320,49 @@ def _open_reconstructed(
 
 
 def _event_digest(event: BudgetEvent) -> str:
-    unsigned = event.model_dump(mode="json", exclude={"digest"})
-    return _digest_json(unsigned)
+    return _digest_json(_budget_event_dump(event, include_digest=False))
 
 
 def _event_dump(value: Mapping[str, object]) -> dict[str, object]:
     event = BudgetEvent.model_validate({**value, "digest": _ZERO_DIGEST})
-    return event.model_dump(mode="json", exclude={"digest"})
+    return cast("dict[str, object]", _budget_event_dump(event, include_digest=False))
+
+
+def _budget_event_dump(
+    event: BudgetEvent,
+    *,
+    include_digest: bool,
+) -> dict[str, JsonValue]:
+    """Serialize an event while preserving legacy unbound timed-meter bytes."""
+    payload = cast("dict[str, JsonValue]", event.model_dump(mode="json"))
+    if not include_digest:
+        payload.pop("digest")
+    if isinstance(event.action, _BudgetOpened):
+        raw_action = payload.get("action")
+        if not isinstance(raw_action, dict):
+            raise BudgetIntegrityError("budget opened event serialization is malformed")
+        action = dict(raw_action)
+        action["policy"] = _budget_policy_dump(event.action.policy)
+        payload["action"] = action
+    return payload
+
+
+def _budget_policy_dump(policy: BudgetPolicy) -> dict[str, JsonValue]:
+    """Omit only an unbound new authority field from otherwise exact policy JSON."""
+    payload = cast("dict[str, JsonValue]", policy.model_dump(mode="json"))
+    raw_meters = payload.get("meters")
+    if not isinstance(raw_meters, dict):
+        raise BudgetIntegrityError("budget policy meter serialization is malformed")
+    meters: dict[str, JsonValue] = {}
+    for meter_id, raw_meter in raw_meters.items():
+        if not isinstance(raw_meter, dict):
+            raise BudgetIntegrityError("budget policy meter serialization is malformed")
+        meter = dict(raw_meter)
+        if meter.get("kind") == "timed_resource" and meter.get("external_spend_authority") is None:
+            meter.pop("external_spend_authority", None)
+        meters[meter_id] = meter
+    payload["meters"] = meters
+    return payload
 
 
 def _digest_json(value: object) -> str:
