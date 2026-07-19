@@ -28,7 +28,7 @@ PARTITION_MANIFEST_VERSION: Literal["2"] = "2"
 PARTITION_SELECTION_ALGORITHM: Literal["uniform-feasible-subsets-v1"] = (
     "uniform-feasible-subsets-v1"
 )
-_CANDIDATE_FREEZE_RECORD_VERSION: Literal["1"] = "1"
+_CANDIDATE_FREEZE_RECORD_VERSION: Literal["2"] = "2"
 _CONFIRMATION_OPENING_RECORD_VERSION: Literal["1"] = "1"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _PRIVATE_TOKEN_PATTERN = r"^[0-9a-f]{64}$"
@@ -152,11 +152,12 @@ class CandidateFreezeRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    record_version: Literal["1"] = _CANDIDATE_FREEZE_RECORD_VERSION
+    record_version: Literal["2"] = _CANDIDATE_FREEZE_RECORD_VERSION
     partition_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation_commitment: str = Field(pattern=_DIGEST_PATTERN)
     candidate_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation_protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    selection_evidence_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
 
     @property
     def digest(self) -> str:
@@ -453,6 +454,7 @@ def freeze_confirmation_candidate(
     manifest: BenchmarkPartitionManifest,
     candidate_execution_digest: str,
     confirmation_protocol_digest: str,
+    selection_evidence_digest: str | None = None,
 ) -> CandidateFreezeRecord:
     """Persist the sole candidate and protocol allowed to open one confirmation split."""
     manifest = _revalidate_partition_manifest(manifest)
@@ -461,6 +463,7 @@ def freeze_confirmation_candidate(
         confirmation_commitment=manifest.confirmation_commitment,
         candidate_execution_digest=candidate_execution_digest,
         confirmation_protocol_digest=confirmation_protocol_digest,
+        selection_evidence_digest=selection_evidence_digest,
     )
     record_name = _candidate_freeze_record_name(manifest.digest)
     with control_store._locked_directory() as directory_descriptor:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -53,6 +54,17 @@ from wmh.providers.base import ProviderConfig, ProviderKind
 
 def _digest(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+def _roster_digest(manifest: BenchmarkPartitionManifest) -> str:
+    payload = json.dumps(
+        [task.model_dump(mode="json") for task in manifest.tasks],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _partition(tmp_path: Path) -> tuple[PartitionControlStore, BenchmarkPartitionManifest]:
@@ -196,6 +208,7 @@ def _protocol(
     baseline: HarnessDoc,
     *,
     proposer_configuration_id: str = "proposer-config",
+    roster_digest: str | None = None,
 ) -> HarnessOptimizationProtocol:
     panel = tuple(
         PairedPanelPlan(panel_member=member, attempts=15) for member in ("glm", "haiku", "opus")
@@ -219,7 +232,7 @@ def _protocol(
             adapter_version="0.18.0",
             dataset="terminal-benchmark",
             dataset_revision="revision-1",
-            roster_digest=_digest("roster"),
+            roster_digest=roster_digest or _roster_digest(manifest),
         ),
         partition=manifest,
         baseline=baseline,
@@ -274,7 +287,7 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
 
     checkpoints: list[SearchCheckpoint] = []
     result = run_harness_optimization_search(
-        prepared,
+        prepared.discovery_contract(),
         scorer=scorer,
         proposer=proposer,
         on_checkpoint=checkpoints.append,
@@ -289,6 +302,14 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
     )
     assert frozen.candidate == result.best
     assert frozen.freeze_record.confirmation_protocol_digest == protocol.digest
+    assert frozen.freeze_record.selection_evidence_digest == frozen.checkpoint_payload_digest
+    with pytest.raises(ValueError, match="selection checkpoint"):
+        type(frozen).model_validate(
+            {
+                **frozen.model_dump(mode="json"),
+                "checkpoint_payload_digest": _digest("different-checkpoint"),
+            }
+        )
 
     opened = open_harness_optimization_confirmation(
         control_store,
@@ -322,7 +343,7 @@ def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
     )
     checkpoints: list[SearchCheckpoint] = []
     run_harness_optimization_search(
-        prepared,
+        prepared.discovery_contract(),
         scorer=scorer,
         proposer=proposer,
         on_checkpoint=checkpoints.append,
@@ -348,9 +369,21 @@ def test_search_rejects_runtime_component_drift_before_scoring(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="task matrix"):
         run_harness_optimization_search(
-            prepared,
+            prepared.discovery_contract(),
             scorer=scorer,
             proposer=_CodeProposer(),
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+
+def test_protocol_rejects_a_caller_asserted_roster_digest(tmp_path: Path) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    with pytest.raises(ValueError, match="roster_digest"):
+        _protocol(
+            manifest,
+            baseline,
+            roster_digest=_digest("caller-asserted-roster"),
         )
 
 
@@ -372,12 +405,29 @@ def test_compact_outcome_requires_every_predeclared_lane_to_pass() -> None:
         baseline_execution_digest=_digest("baseline"),
         candidate_execution_digest=_digest("candidate"),
         panel_delta=0.04,
+        minimum_required_panel_delta=0.03,
+        panel_passed=True,
         members=members,
         passed=True,
     )
     assert outcome.passed
 
-    with pytest.raises(ValueError, match="member decisions"):
+    with pytest.raises(ValueError, match="frozen decisions"):
         HarnessOptimizationOutcome.model_validate(
             {**outcome.model_dump(mode="json"), "passed": False}
+        )
+
+    panel_failure = HarnessOptimizationOutcome.model_validate(
+        {
+            **outcome.model_dump(mode="json"),
+            "panel_delta": 0.02,
+            "panel_passed": False,
+            "passed": False,
+        }
+    )
+    assert not panel_failure.passed
+
+    with pytest.raises(ValueError, match="frozen decisions"):
+        HarnessOptimizationOutcome.model_validate(
+            {**panel_failure.model_dump(mode="json"), "passed": True}
         )
