@@ -35,35 +35,40 @@ class ModelRole(BaseModel):
 class ModelsSettings(BaseModel):
     """Role-based model defaults for this project (`.wmh/settings.toml`, `[models.<role>]`).
 
-    Four roles keep the surface small: `worker` does quality-critical generation (scenario
+    Five roles keep the surface small: `worker` does quality-critical generation (scenario
     synthesis, cluster naming, agent rollouts); `judge` grades (checklist judging, inline
     validity gates) and should be a different model family from `worker` so the grader carries
     no self-preference bias toward the generator's outputs; `summary` does high-volume cheap
     extraction (trace facets/digests); `meta` is the harness-search delta proposer, which
     needs a long-context, long-output model (one proposal holds every harness surface in its
-    prompt and replies with a complete replacement surface). Unset `judge`/`summary` fall back
-    to `worker`; explicit CLI flags override everything.
+    prompt and replies with a complete replacement surface); `agent` is the agent-under-test
+    whose harness `wmh harness create` searches. Set it to optimize a harness for a model
+    distinct from the world model's serve provider (e.g. a small self-hosted agent against a
+    frontier-served world model). Unset `judge`/`summary` fall back to `worker`; each command
+    documents which explicit model flags and opt-in roles it uses.
     """
 
     worker: ModelRole | None = None
     judge: ModelRole | None = None
     summary: ModelRole | None = None
     meta: ModelRole | None = None
+    agent: ModelRole | None = None
 
     def resolve(self, role: str) -> ModelRole | None:
         """The configured role, with unset `judge`/`summary` falling back to `worker`.
 
-        `meta` deliberately does NOT fall back to `worker`: the scenario worker is picked for
-        generation quality per token, not for the proposer's long-context/long-output needs,
-        so an unset `meta` returns None and the caller keeps its own default (`wmh harness
-        create` uses the world model's provider).
+        `meta` and `agent` deliberately do NOT fall back to `worker`: each is picked for a
+        need the scenario worker does not serve (the proposer's long-context/long-output
+        surface; the agent-under-test's own identity), so when unset they return None and the
+        caller keeps its own default (`wmh harness create` and closed-loop eval use the world
+        model's provider for the opt-in roles when unset).
         """
-        if role not in ("worker", "judge", "summary", "meta"):
+        if role not in ("worker", "judge", "summary", "meta", "agent"):
             raise ValueError(
-                f"unknown model role {role!r}; expected worker, judge, summary, or meta"
+                f"unknown model role {role!r}; expected worker, judge, summary, meta, or agent"
             )
         configured: ModelRole | None = getattr(self, role)
-        if role == "meta":
+        if role in ("meta", "agent"):
             return configured
         return configured or self.worker
 

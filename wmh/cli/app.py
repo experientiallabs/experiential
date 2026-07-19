@@ -885,9 +885,10 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmh eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
       default mode).
     - `wmh eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
-      as its environment; `--harness-backend e2b` moves the pi-node harness process into pooled
-      E2B sandboxes (the env stays the world model, all cells in parallel); score task success
-      against gold assertions (see docs/reference/closed_loop.md).
+      as its environment. `[models.agent]` selects a distinct agent provider when configured;
+      otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
+      pi-node harness process into pooled E2B sandboxes while the environment stays the world
+      model. Score task success against gold assertions (see docs/reference/closed_loop.md).
     - `wmh eval list`: list named suites under `examples/<task>/evals/`.
     - `wmh eval run <suite>`: run a suite and save a local JSON result.
     - `wmh eval results optional-suite`: summarize local suite results.

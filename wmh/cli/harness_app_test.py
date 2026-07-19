@@ -9,6 +9,7 @@ advertises. Flag validation, task loading, and the harness store are real.
 from __future__ import annotations
 
 import importlib
+import shlex
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 # The Typer object `harness_app` shadows the submodule name on plain attribute access; go
 # through importlib to monkeypatch module globals (same pattern as app_test.py).
 harness_app_module = importlib.import_module("wmh.cli.harness_app")
+model_roles_module = importlib.import_module("wmh.cli.model_roles")
 
 runner = CliRunner()
 
@@ -146,19 +148,45 @@ def test_create_e2b_wires_backend_flags_and_still_loads_the_world_model(
     assert "9 rollouts" in flat
     assert "pooled E2B sandboxes" in flat
     assert "world model" in flat and "wm-alpha" in flat
-    assert "--harness-backend e2b" in flat  # the run-it hint carries the backend through
+    expected = shlex.join(
+        [
+            "wmh",
+            "eval",
+            _tasks_file(tmp_path),
+            "--mode",
+            "closed-loop",
+            "--name",
+            "wm-alpha",
+            "--root",
+            str(tmp_path / ".wmh"),
+            "--k",
+            "3",
+            "--harness",
+            "made@1",
+            "--harness-backend",
+            "e2b",
+            "--eval-concurrency",
+            "4",
+            "--e2b-template",
+            "tmpl-x",
+        ]
+    )
+    assert expected in flat
+    assert "wmh eval closed-loop" not in flat
 
 
 def test_create_default_local_loads_the_world_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("WMH_E2B_TEMPLATE", raising=False)  # --e2b-template defaults from it
+    project_root = tmp_path / "project with spaces"
+    project_root.mkdir()
     recorder = _CreateRecorder()
     wm = object()
     monkeypatch.setattr(harness_app_module, "create_harness", recorder)
     loads = _patch_load(monkeypatch, wm, _Provider())
 
-    result = _invoke(tmp_path)
+    result = _invoke(project_root)
 
     assert result.exit_code == 0, result.output
     assert loads == [None]  # default: resolve the only built model
@@ -170,6 +198,24 @@ def test_create_default_local_loads_the_world_model(
     flat = " ".join(result.output.split())
     assert "world model" in flat and "wm-alpha" in flat
     assert "sandbox" not in flat  # no sandbox note on the local path
+    expected = shlex.join(
+        [
+            "wmh",
+            "eval",
+            _tasks_file(project_root),
+            "--mode",
+            "closed-loop",
+            "--name",
+            "wm-alpha",
+            "--root",
+            str(project_root / ".wmh"),
+            "--k",
+            "3",
+            "--harness",
+            "made@1",
+        ]
+    )
+    assert expected in flat
     assert "--harness-backend" not in flat  # and the run-it hint stays plain
 
 
@@ -196,13 +242,11 @@ def test_create_meta_role_from_settings_drives_the_proposer(
         root,
     )
     meta_sentinel = _Provider()
-    configs: list[ProviderConfig] = []
 
-    def fake_get_provider(config: ProviderConfig) -> _Provider:
-        configs.append(config)
+    def fake_get_provider(_config: ProviderConfig) -> _Provider:
         return meta_sentinel
 
-    monkeypatch.setattr(harness_app_module, "get_provider", fake_get_provider)
+    monkeypatch.setattr(model_roles_module, "get_provider", fake_get_provider)
 
     result = _invoke(tmp_path)
 
@@ -211,48 +255,65 @@ def test_create_meta_role_from_settings_drives_the_proposer(
     assert call["provider"] is anchored  # agent + judge stay on the world model's provider
     assert isinstance(call["proposer"], ProviderDeltaProposer)
     assert call["proposer"].provider is meta_sentinel
-    [config] = configs
-    assert config.kind is ProviderKind.AZURE_OPENAI
-    assert config.model == "gpt-5.5"
-    assert config.deployment == "gpt-5-5"
-    # A bare azure meta role still runs: the Azure provider refuses a None api_version,
-    # so the default applies when settings do not pin one.
-    assert config.api_version == "2024-05-01-preview"
     flat = " ".join(result.output.split())
     assert "proposer: gpt-5.5 from settings models.meta" in flat  # the banner names it
 
 
-def test_create_meta_role_api_version_override_wins(
+def test_create_agent_role_from_settings_drives_the_agent_under_test(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An explicit api_version in [models.meta] overrides the azure default."""
+    """`[models.agent]` selects the agent-under-test provider, distinct from the world model."""
     recorder = _CreateRecorder()
+    anchored = _Provider()  # the world model's serve provider
     monkeypatch.setattr(harness_app_module, "create_harness", recorder)
-    _patch_load(monkeypatch, object(), _Provider())
+    _patch_load(monkeypatch, object(), anchored)
     save_settings(
         ProjectSettings(
             models=ModelsSettings(
-                meta=ModelRole(
-                    provider="azure",
-                    model="gpt-5.5",
-                    endpoint="https://x.example",
-                    deployment="gpt-5-5",
-                    api_version="2025-01-01",
+                agent=ModelRole(
+                    provider="openai",
+                    model="Qwen/Qwen3.5-9B",
+                    endpoint="http://127.0.0.1:8002/v1",
                 )
             )
         ),
         tmp_path / ".wmh",
     )
-    configs: list[ProviderConfig] = []
-    monkeypatch.setattr(
-        harness_app_module, "get_provider", lambda config: configs.append(config) or _Provider()
-    )
+    agent_sentinel = _Provider()
+
+    def fake_get_provider(_config: ProviderConfig) -> _Provider:
+        return agent_sentinel
+
+    monkeypatch.setattr(model_roles_module, "get_provider", fake_get_provider)
 
     result = _invoke(tmp_path)
 
     assert result.exit_code == 0, result.output
-    [config] = configs
-    assert config.api_version == "2025-01-01"
+    [call] = recorder.calls
+    # The agent-under-test is the configured provider; the proposer (meta unset) and judge
+    # keep the world model's provider.
+    assert call["provider"] is agent_sentinel
+    assert isinstance(call["proposer"], ProviderDeltaProposer)
+    assert call["proposer"].provider is anchored
+    flat = " ".join(result.output.split())
+    assert "agent-under-test: Qwen/Qwen3.5-9B from settings models.agent" in flat
+
+
+def test_create_agent_defaults_to_the_world_model_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without `[models.agent]` the agent-under-test stays on the world model's provider."""
+    recorder = _CreateRecorder()
+    anchored = _Provider()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), anchored)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    [call] = recorder.calls
+    assert call["provider"] is anchored
+    assert "models.agent" not in result.output
 
 
 def test_create_meta_defaults_to_the_world_model_provider(

@@ -6,20 +6,22 @@ default). `init` writes the baseline as v1; `list`/`show` inspect what exists; `
 for a better harness by **inverting the world model** — delta variants are scored closed-loop
 against it and gated on non-regression, so the environment model the traces built now steers what
 the agent's scaffold should be. Run one closed-loop with
-`wmh eval closed-loop <tasks> --harness <name>[@ref]`.
+`wmh eval <tasks> --mode closed-loop --harness <name>[@ref]`.
 """
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
+from wmh.cli.model_roles import resolve_opt_in_model_provider
 from wmh.config import ARTIFACT_DIR, WorldModelStore
-from wmh.config.settings import load_settings
 from wmh.config.store import validate_name
 from wmh.engine import load_world_model
 from wmh.engine.world_model import WorldModel
@@ -30,8 +32,7 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
 from wmh.harness.proposer import ProviderDeltaProposer
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
-from wmh.providers.base import Provider, ProviderConfig, ProviderKind
-from wmh.providers.registry import get_provider
+from wmh.providers.base import Provider
 
 harness_app = typer.Typer(
     help="Named, versioned agent harnesses (.wmh/harnesses): create, init, list, show.",
@@ -152,13 +153,14 @@ def create(
     An LLM meta-agent proposes typed deltas against the harness document (surface-keyed ops with
     preconditions), each applied child is scored closed-loop (k passes per task) and gated on
     non-regression (regression suite, then full split, then the optional held-out split). The
-    The proposer's model resolves from `.wmh/settings.toml` `[models.meta]` when set (pick a
-    long-context, long-output model; a proposal carries whole replacement surfaces), and falls
-    back to the world model's provider otherwise. The
-    environment is ALWAYS the world-model simulation; `--harness-backend` only picks where the
-    harness PROCESS runs: `local` (the default) keeps it in/from this process, `e2b` runs the
-    real pi agent inside pooled E2B sandboxes (pi-node seeds only), its tool calls still answered
-    by the world model host-side — all (task, attempt) cells in parallel unless
+    agent-under-test resolves from `.wmh/settings.toml` `[models.agent]` when set and otherwise
+    uses the world model's provider. The proposer's model resolves from `[models.meta]` when set;
+    use a long-context, long-output model because a proposal carries whole replacement surfaces.
+    Otherwise the proposer also uses the world model's provider. The environment is ALWAYS the
+    world-model simulation; `--harness-backend` only picks where the harness PROCESS runs:
+    `local` (the default) keeps it in/from this process, `e2b` runs the real pi agent inside
+    pooled E2B sandboxes (pi-node seeds only), its tool calls still answered by the world model
+    host-side, with all (task, attempt) cells in parallel unless
     --eval-concurrency caps them. The champion is saved as a new immutable version with the
     `champion` alias. Interactive at a TTY: missing inputs are prompted for (the backend stays
     flag-only).
@@ -194,7 +196,8 @@ def create(
     seed_doc = _resolve_seed(store, seed)
     # The world model IS the environment on every backend, so it is always required.
     world_model, provider, model_name = _load_world_model(model, root)
-    meta_provider, meta_model = _meta_provider_from_settings(root, provider)
+    meta_provider, meta_model = resolve_opt_in_model_provider(root, "meta", provider)
+    agent_provider, agent_model = resolve_opt_in_model_provider(root, "agent", provider)
 
     candidate_count = iterations * proposal_batch_size
     rollouts = (candidate_count + 1) * k * len(tasks)
@@ -209,12 +212,17 @@ def create(
     meta_note = (
         f" (proposer: {meta_model} from settings models.meta)" if meta_model is not None else ""
     )
+    agent_note = (
+        f" (agent-under-test: {agent_model} from settings models.agent)"
+        if agent_model is not None
+        else ""
+    )
     _console.print(
         f"searching from [bold]{seed_doc.name}[/bold] against world model "
         f"[bold]{model_name}[/bold]: {iterations} iteration(s), "
         f"{proposal_batch_size} proposal(s)/iteration, k={k}, {len(tasks)} task(s) "
         f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
-        f"{meta_note}{backend_note}"
+        f"{meta_note}{agent_note}{backend_note}"
     )
     if interactive and not yes and not Confirm.ask("Proceed?", default=True):
         raise typer.Exit(0)
@@ -255,7 +263,7 @@ def create(
         seed_doc,
         tasks,
         world_model,
-        provider,
+        agent_provider,
         ProviderDeltaProposer(meta_provider),
         GoldJudge(provider),
         iterations=iterations,
@@ -276,9 +284,30 @@ def create(
         f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
         f"{selected} selected, {result.skipped} skipped -> {store.dir_for(name)}"
     )
-    backend_hint = " --harness-backend e2b" if harness_backend == "e2b" else ""
+    run_argv = [
+        "wmh",
+        "eval",
+        tasks_file,
+        "--mode",
+        "closed-loop",
+        "--name",
+        model_name,
+        "--root",
+        root,
+        "--k",
+        str(k),
+        "--harness",
+        f"{name}@{saved.version}",
+    ]
+    if harness_backend == "e2b":
+        run_argv.extend(("--harness-backend", "e2b"))
+    if eval_concurrency is not None:
+        run_argv.extend(("--eval-concurrency", str(eval_concurrency)))
+    if harness_backend == "e2b" and e2b_template is not None:
+        run_argv.extend(("--e2b-template", e2b_template))
     _console.print(
-        f"  run it: [bold]wmh eval closed-loop {tasks_file} --harness {name}{backend_hint}[/bold]"
+        f"  run it: [bold]{escape(shlex.join(run_argv))}[/bold]",
+        soft_wrap=True,
     )
     if archive_out:
         Path(archive_out).write_text(result.archive.model_dump_json(indent=2), encoding="utf-8")
@@ -300,47 +329,6 @@ def _resolve_seed(store: HarnessStore, seed: str | None) -> HarnessDoc:
         return store.load(base, ref or None)
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-
-
-# Azure OpenAI chat completions need an API version on every call; when the meta role
-# does not pin one in settings, this current stable version applies (override with
-# `api_version` under [models.meta]).
-_DEFAULT_AZURE_API_VERSION = "2024-05-01-preview"
-
-
-def _meta_provider_from_settings(root: str, fallback: Provider) -> tuple[Provider, str | None]:
-    """The delta proposer's provider: `[models.meta]` from settings, else the fallback.
-
-    The meta role is opt-in (see `ModelsSettings.resolve`): users who want a specific
-    long-context proposer set it in `.wmh/settings.toml`; everyone else keeps the world
-    model's provider, the pre-roles behavior. Returns the provider plus the configured model
-    name (None when falling back) for the run banner.
-    """
-    configured = load_settings(root).models.resolve("meta")
-    if configured is None:
-        return fallback, None
-    try:
-        kind = ProviderKind(configured.provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in ProviderKind)
-        raise typer.BadParameter(
-            f"settings [models.meta] has unknown provider {configured.provider!r}; "
-            f"choose one of: {kinds}"
-        ) from None
-    api_version = configured.api_version
-    if api_version is None and kind is ProviderKind.AZURE_OPENAI:
-        # The Azure provider refuses to run without one; a bare [models.meta] azure entry
-        # must still produce usable proposals, not a proposer error every iteration.
-        api_version = _DEFAULT_AZURE_API_VERSION
-    config = ProviderConfig(
-        kind=kind,
-        model=configured.model,
-        region=configured.region,
-        endpoint=configured.endpoint,
-        deployment=configured.deployment,
-        api_version=api_version,
-    )
-    return get_provider(config), configured.model
 
 
 def _load_world_model(name: str | None, root: str) -> tuple[WorldModel, Provider, str]:
@@ -373,4 +361,6 @@ def init_harness(
     _console.print(
         f"[green]wrote[/green] {name} v{doc.version} (champion) -> {store.dir_for(name)}"
     )
-    _console.print(f"run it: [bold]wmh eval closed-loop <tasks.jsonl> --harness {name}[/bold]")
+    _console.print(
+        f"run it: [bold]wmh eval <tasks.jsonl> --mode closed-loop --harness {name}[/bold]"
+    )

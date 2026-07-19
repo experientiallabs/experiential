@@ -15,6 +15,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from wmh.cli.model_roles import resolve_opt_in_model_provider
 from wmh.config import WorldModelStore
 from wmh.engine import load_world_model
 from wmh.evals.agreement import compute_agreement
@@ -45,7 +46,9 @@ def run_closed_loop(
     `--harness <name>[@ref]` runs a stored harness version (ref = version or alias; default is
     the champion alias); without it the built-in baseline loop runs. `max_turns=None` means "the
     harness's own cap" (or the default for the baseline); an explicit value overrides either —
-    never silently ignored. The environment is ALWAYS the world-model simulation;
+    never silently ignored. `[models.agent]` selects the agent model for either path; when unset,
+    the agent shares the world model's provider. The environment is ALWAYS the world-model
+    simulation;
     `--harness-backend e2b` only moves the pi-node harness PROCESS into pooled E2B sandboxes
     (tool calls stay answered by the world model host-side), running all (task, attempt) cells
     at once unless `--eval-concurrency` caps them.
@@ -65,6 +68,7 @@ def run_closed_loop(
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     world_model, provider = load_world_model(model_dir)
+    agent_provider, agent_model = resolve_opt_in_model_provider(root, "agent", provider)
 
     loaded_harness = _load_harness(harness, root)
     if loaded_harness is None and harness_backend == "e2b":
@@ -77,13 +81,22 @@ def run_closed_loop(
         if loaded_harness is not None
         else "baseline"
     )
+    agent_identity = (
+        f"{agent_provider.config.kind.value}:{agent_model}" if agent_model is not None else None
+    )
+    report_agent_label = (
+        f"{agent_label}[agent={agent_identity}]" if agent_identity is not None else agent_label
+    )
+    agent_note = (
+        f" using agent model [bold]{agent_identity}[/bold]" if agent_identity is not None else ""
+    )
     versus = (
         f"world model [bold]{model_dir.name}[/bold]"
         if harness_backend == "local"
         else f"world model [bold]{model_dir.name}[/bold] (pi harness in pooled E2B sandboxes)"
     )
     console.print(
-        f"closed-loop: harness [bold]{agent_label}[/bold] vs {versus} "
+        f"closed-loop: harness [bold]{agent_label}[/bold]{agent_note} vs {versus} "
         f"on {len(tasks)} task(s), k={k}…"
     )
 
@@ -112,21 +125,21 @@ def run_closed_loop(
             loaded_harness = _with_max_turns(loaded_harness, max_turns)
         try:
             runtime = loaded_harness.runtime(
-                provider,
+                agent_provider,
                 backend=harness_backend,
                 e2b_template=e2b_template,
             )
         except ValueError as exc:  # e.g. e2b on a non-pi-node harness -> usage error
             raise typer.BadParameter(str(exc)) from exc
     else:
-        runtime = AgentRuntime(provider, max_turns=max_turns or DEFAULT_MAX_TURNS)
+        runtime = AgentRuntime(agent_provider, max_turns=max_turns or DEFAULT_MAX_TURNS)
     try:
         evaluation = ClosedLoopEval(
             tasks,
             world_model,
-            provider,
+            agent_provider,
             GoldJudge(provider),
-            label=f"{agent_label}@{model_dir.name}",
+            label=f"{report_agent_label}@{model_dir.name}",
             k=k,
             concurrency=(
                 eval_concurrency

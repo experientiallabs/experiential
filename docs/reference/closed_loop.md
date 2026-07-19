@@ -16,11 +16,27 @@ wmh eval tasks.jsonl --mode closed-loop --name <world-model> --k 3 --out sim_rep
 - `tasks.jsonl` — one task per line: `{"task_id": ..., "instruction": ..., "gold": ["...", ...]}`.
   `gold` is a list of plain-English assertions that define success (post-conditions on the final
   state, checked semantically).
-- The **agent is fixed** (a minimal 4-tool loop: `bash`, `read_file`, `write_file`, `submit`) so any
-  score movement is attributable to the world model, not the agent.
+- The agent scaffold is fixed for a run. Without `--harness`, it is a minimal 4-tool loop:
+  `bash`, `read_file`, `write_file`, and `submit`. Pass `--harness <name>[@ref]` to evaluate a
+  stored harness version.
+- By default, the agent and world model share a provider. Configure `[models.agent]` in
+  `.wmh/settings.toml` to evaluate with a distinct agent provider. `wmh harness create` and the
+  reproduction command it prints resolve the same role.
 - Every task runs **k=3 passes** (the repo's eval-reporting convention); the score is the fraction of
   passes whose transcript satisfies every gold assertion, judged by an LLM judge that never trusts
   the agent's own claim of success.
+
+For example, a self-hosted OpenAI-compatible agent can be pinned independently of the world model:
+
+```toml
+[models.agent]
+provider = "openai"
+model = "Qwen/Qwen3.5-9B"
+endpoint = "http://127.0.0.1:8002/v1"
+```
+
+The configured provider kind and model are included in the saved report label. Keep the full
+settings file with experiment artifacts when endpoint or deployment identity matters.
 
 ## Comparing two reports (`wmh eval agreement`)
 

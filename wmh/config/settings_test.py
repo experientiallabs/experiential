@@ -104,6 +104,19 @@ def test_meta_role_resolves_when_configured_and_never_falls_back_to_worker() -> 
     assert ModelsSettings(worker=worker, meta=meta).resolve("meta") is meta
 
 
+def test_agent_role_resolves_when_configured_and_never_falls_back_to_worker() -> None:
+    """The agent-under-test role is opt-in: unset agent means the caller's default.
+
+    `wmh harness create` optimizes a harness for a specific agent model, which may differ
+    from the world model's serve model; an unset agent must keep the world-model-provider
+    default rather than silently inheriting the scenario worker.
+    """
+    worker = ModelRole(provider="azure", model="gpt-5.4")
+    agent = ModelRole(provider="openai", model="Qwen/Qwen3.5-9B", endpoint="http://x/v1")
+    assert ModelsSettings(worker=worker).resolve("agent") is None
+    assert ModelsSettings(worker=worker, agent=agent).resolve("agent") is agent
+
+
 def test_meta_role_round_trips_through_toml(tmp_path: Path) -> None:
     root = tmp_path / ".wmh"
     settings = ProjectSettings(

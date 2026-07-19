@@ -15,16 +15,18 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from wmh.cli import app
+from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmh.evals.closed_loop import ClosedLoopReport, TaskOutcome
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.pi_e2b import E2BPiRuntime
-from wmh.harness.runtime import RunResult, Runtime
+from wmh.harness.runtime import AgentRuntime, RunResult, Runtime
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 eval_cl_module = importlib.import_module("wmh.cli.eval_closed_loop")
+model_roles_module = importlib.import_module("wmh.cli.model_roles")
 
 runner = CliRunner()
 
@@ -34,7 +36,8 @@ _Progress = Callable[[str, int, GoldVerdict], None] | None
 class _Provider:
     """A do-nothing provider: scoring is faked, so no LLM role is ever exercised."""
 
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+    def __init__(self, config: ProviderConfig | None = None) -> None:
+        self.config = config or ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
 
     def complete(self, system: str, messages: list[Message], **kw: object) -> Completion:
         raise NotImplementedError
@@ -101,13 +104,14 @@ def _invoke(tmp_path: Path, *extra: str) -> Result:
 def _patch_seams(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> object:
     """Fake the world-model store/loader and `ClosedLoopEval`, recording the eval's wiring."""
     wm = object()
+    world_provider = _Provider()
 
     class _FakeEval:
         def __init__(
             self,
             tasks: list[TaskSpec],
             world_model: object,
-            provider: object,
+            agent_provider: object,
             judge: GoldJudge,
             *,
             label: str,
@@ -119,6 +123,7 @@ def _patch_seams(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> ob
             seen.update(
                 {
                     "world_model": world_model,
+                    "agent_provider": agent_provider,
                     "label": label,
                     "concurrency": concurrency,
                     "runtime": runtime,
@@ -131,8 +136,9 @@ def _patch_seams(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> ob
             return _report(self._label, self._k)
 
     monkeypatch.setattr(eval_cl_module, "WorldModelStore", _FakeStore)
-    monkeypatch.setattr(eval_cl_module, "load_world_model", lambda d: (wm, _Provider()))
+    monkeypatch.setattr(eval_cl_module, "load_world_model", lambda d: (wm, world_provider))
     monkeypatch.setattr(eval_cl_module, "ClosedLoopEval", _FakeEval)
+    seen["world_provider"] = world_provider
     return wm
 
 
@@ -146,11 +152,58 @@ def test_eval_local_default_scores_the_world_model_sequentially(
 
     assert result.exit_code == 0, result.output
     assert seen["world_model"] is wm
+    assert seen["agent_provider"] is seen["world_provider"]
+    runtime = seen["runtime"]
+    assert isinstance(runtime, AgentRuntime)
+    assert runtime._provider is seen["world_provider"]
     assert seen["label"] == "baseline@wm-alpha"  # the label always names the model
     assert seen["concurrency"] == 1  # local default: the sequential loop, unchanged
     flat = " ".join(result.output.split())
     assert "world model" in flat and "wm-alpha" in flat
     assert "OVERALL" in result.output
+
+
+def test_eval_agent_role_from_settings_drives_the_agent_under_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`[models.agent]` must survive the create-to-eval reproduction path."""
+    seen: dict[str, object] = {}
+    _patch_seams(monkeypatch, seen)
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                agent=ModelRole(
+                    provider="openai",
+                    model="Qwen/Qwen3.5-9B",
+                    endpoint="http://127.0.0.1:8002/v1",
+                )
+            )
+        ),
+        tmp_path / ".wmh",
+    )
+    agent_sentinel = _Provider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI,
+            model="Qwen/Qwen3.5-9B",
+            endpoint="http://127.0.0.1:8002/v1",
+        )
+    )
+
+    def fake_get_provider(_config: ProviderConfig) -> _Provider:
+        return agent_sentinel
+
+    monkeypatch.setattr(model_roles_module, "get_provider", fake_get_provider)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["agent_provider"] is agent_sentinel
+    runtime = seen["runtime"]
+    assert isinstance(runtime, AgentRuntime)
+    assert runtime._provider is agent_sentinel
+    assert seen["label"] == "baseline[agent=openai:Qwen/Qwen3.5-9B]@wm-alpha"
+    flat = " ".join(result.output.split())
+    assert "agent model openai:Qwen/Qwen3.5-9B" in flat
 
 
 def test_eval_always_requires_a_world_model(tmp_path: Path) -> None:
