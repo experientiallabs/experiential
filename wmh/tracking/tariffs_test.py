@@ -139,9 +139,9 @@ def test_caller_supplied_tariff_freezes_an_exact_azure_responses_route() -> None
     )
     tariff = ProviderTokenTariff.from_usd_per_million(
         provider_config=config,
-        input_usd="5",
-        output_usd="30",
-        source_locator="https://azure.microsoft.com/pricing/details/cognitive-services/openai-service/",
+        input_usd="1",
+        output_usd="2",
+        source_locator="https://example.test/immutable-azure-price-record",
         source_snapshot_digest="sha256:" + "a" * 64,
         verified_on=date(2026, 7, 19),
         effective_on=date(2026, 7, 1),
@@ -155,8 +155,8 @@ def test_caller_supplied_tariff_freezes_an_exact_azure_responses_route() -> None
 
     assert meter.provider_config == config
     assert meter.price == TokenPriceCeiling(
-        input_nano_usd_per_token=5_000,
-        output_nano_usd_per_token=30_000,
+        input_nano_usd_per_token=1_000,
+        output_nano_usd_per_token=2_000,
     )
     assert meter.input_overhead_tokens == 16_384
     assert meter.tariff_provenance == tariff.provenance
@@ -176,8 +176,8 @@ def test_azure_tariff_cannot_be_rebound_to_a_different_deployment() -> None:
     )
     tariff = ProviderTokenTariff.from_usd_per_million(
         provider_config=config,
-        input_usd="5",
-        output_usd="30",
+        input_usd="1",
+        output_usd="2",
         source_locator="https://example.test/immutable-azure-price-record",
         source_snapshot_digest="sha256:" + "a" * 64,
         verified_on=date(2026, 7, 19),
@@ -307,8 +307,8 @@ def test_azure_tariff_route_rejects_endpoint_credential_channels(endpoint: str) 
     with pytest.raises(ValidationError, match="without credentials, query, or fragment"):
         ProviderTokenTariff.from_usd_per_million(
             provider_config=config,
-            input_usd="5",
-            output_usd="30",
+            input_usd="1",
+            output_usd="2",
             source_locator="https://example.test/immutable-azure-price-record",
             source_snapshot_digest="sha256:" + "a" * 64,
             verified_on=date(2026, 7, 19),
