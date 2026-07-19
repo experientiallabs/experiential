@@ -466,6 +466,14 @@ def paired_primary_decision_passed(
     synthetic block records. It is equivalent to ``analyze_paired_outcomes(...).passed``
     for a complete matrix with the supplied task means.
     """
+    return all(paired_member_primary_decisions(design, task_deltas_by_member))
+
+
+def paired_member_primary_decisions(
+    design: PairedEvaluationDesign,
+    task_deltas_by_member: tuple[tuple[float, ...], ...],
+) -> tuple[bool, ...]:
+    """Evaluate each exact frozen v5 member decision in panel order."""
     if len(task_deltas_by_member) != len(design.panel_members):
         raise ValueError("primary decision rows must exactly match the frozen lane set")
     if any(len(row) != len(design.task_ids) for row in task_deltas_by_member):
@@ -476,15 +484,40 @@ def paired_primary_decision_passed(
         for delta in row
     ):
         raise ValueError("primary decision task deltas must be finite and in [-1, 1]")
-    return all(
-        fmean(row) >= design.minimum_equal_task_member_delta
-        and _bounded_mean_exact_rejects(
-            row,
-            null_mean=0.0,
+    return tuple(
+        paired_member_primary_decision_passed(design, panel_member, row)
+        for panel_member, row in zip(
+            design.panel_members,
+            task_deltas_by_member,
+            strict=True,
+        )
+    )
+
+
+def paired_member_primary_decision_passed(
+    design: PairedEvaluationDesign,
+    panel_member: str,
+    task_deltas: tuple[float, ...],
+) -> bool:
+    """Evaluate one lane's exact primary decision from only that lane's marginal.
+
+    The all-lane intersection-union rejection event is a subset of every member
+    rejection event. Under a DGP where this lane's marginal is invariant to the
+    other lanes' nuisance effects, this decision therefore supplies the exact
+    memberwise conservative upper-bound event with all other decisions set to pass.
+    """
+    if panel_member not in design.panel_members:
+        raise ValueError("primary decision member is not in the frozen lane set")
+    if len(task_deltas) != len(design.task_ids):
+        raise ValueError("primary decision row must exactly match the frozen task roster")
+    if any(not math.isfinite(delta) or not -1.0 <= delta <= 1.0 for delta in task_deltas):
+        raise ValueError("primary decision task deltas must be finite and in [-1, 1]")
+    return fmean(task_deltas) >= design.minimum_equal_task_member_delta and (
+        _bounded_mean_positive_lower_bound_passed(
+            task_deltas,
             alpha=design.alpha,
             bets=design.primary_e_value_bets,
         )
-        for row in task_deltas_by_member
     )
 
 
@@ -517,12 +550,14 @@ def analyze_paired_outcomes(
     AM-GM again yield an e-value. Failure of this stricter sensitivity is
     inconclusive and does not alter the primary decision.
 
-    Every lane must clear its own unadjusted ``alpha`` primary bound. This
-    intersection-union rule controls the all-lanes claim at ``alpha`` without lane
-    independence or multiplicity correction. Every lane must also clear the frozen
-    observed equal-task effect floor. Jackknife Student-t, its Bonferroni variant,
-    and label swapping are explicitly model-based secondary diagnostics and make no
-    finite-sample alpha-control claim.
+    Every lane must clear its own unadjusted ``alpha`` primary bound. The decision
+    uses exact rejection at a zero null rather than reparsing the downward-rounded
+    float endpoint, which can be nonpositive when a positive endpoint is below float
+    resolution. This intersection-union rule controls the all-lanes claim at
+    ``alpha`` without lane independence or multiplicity correction. Every lane must
+    also clear the frozen observed equal-task effect floor. Jackknife Student-t, its
+    Bonferroni variant, and label swapping are explicitly model-based secondary
+    diagnostics and make no finite-sample alpha-control claim.
 
     Validity additionally requires a fixed horizon and frozen bets; complete,
     score-blind admission of every planned pair; no score-adaptive missingness or
@@ -554,10 +589,6 @@ def analyze_paired_outcomes(
         member: tuple(task_member_deltas[(task, member)] for task in design.task_ids)
         for member in design.panel_members
     }
-    primary_decision_passed = paired_primary_decision_passed(
-        design,
-        tuple(member_task_deltas[member] for member in design.panel_members),
-    )
     member_semantic_observations = {
         member: _semantic_group_observations(
             design,
@@ -633,9 +664,14 @@ def analyze_paired_outcomes(
         delta >= design.minimum_equal_task_member_delta
         for delta in equal_task_member_deltas.values()
     )
-    member_primary_bounds_passed = all(value > 0.0 for value in primary_lower_bounds.values())
-    if primary_decision_passed != (equal_task_member_lifts_passed and member_primary_bounds_passed):
-        raise RuntimeError("exact primary rejection and inverted lower bound disagree")
+    member_primary_bounds_passed = all(
+        _bounded_mean_positive_lower_bound_passed(
+            member_task_deltas[member],
+            alpha=design.alpha,
+            bets=design.primary_e_value_bets,
+        )
+        for member in design.panel_members
+    )
     member_semantic_cluster_sensitivity_bounds_positive = all(
         value > 0.0 for value in semantic_cluster_sensitivity_lower_bounds.values()
     )
@@ -1216,6 +1252,23 @@ def _bounded_mean_exact_rejects(
         observation_scales=observation_scales,
     )
     return e_value * Fraction.from_float(alpha) > 1
+
+
+def _bounded_mean_positive_lower_bound_passed(
+    task_deltas: tuple[float, ...],
+    *,
+    alpha: float,
+    bets: tuple[BoundedMeanBet, ...],
+    observation_scales: tuple[Fraction, ...] | None = None,
+) -> bool:
+    """Decide positivity from exact rejection, not a rounded float endpoint."""
+    return _bounded_mean_exact_rejects(
+        task_deltas,
+        null_mean=0.0,
+        alpha=alpha,
+        bets=bets,
+        observation_scales=observation_scales,
+    )
 
 
 def _fraction_to_float_ceiling(value: Fraction) -> float:

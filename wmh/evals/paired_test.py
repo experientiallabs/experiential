@@ -9,6 +9,7 @@ from fractions import Fraction
 import pytest
 from pydantic import ValidationError
 
+import wmh.evals.paired as paired_analysis
 from wmh.evals.paired import (
     BoundedMeanBet,
     PairedArm,
@@ -171,6 +172,42 @@ def test_primary_bounded_mean_passes_strong_fixed_roster_effect() -> None:
         tuple(tuple(0.1 for _task in design.task_ids) for _member in design.panel_members),
     )
     assert compact is report.passed
+
+
+def test_primary_decision_does_not_depend_on_rounded_bound_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    design = _design(
+        task_ids=("task-a", "task-b", "task-c", "task-d", "task-e"),
+        attempts=1,
+    )
+    task_deltas = tuple(1.0 for _task in design.task_ids)
+    assert (
+        paired_primary_decision_passed(
+            design,
+            tuple(task_deltas for _member in design.panel_members),
+        )
+        is True
+    )
+    monkeypatch.setattr(
+        paired_analysis,
+        "_bounded_mean_lower_bound",
+        lambda *_args, **_kwargs: 0.0,
+    )
+
+    outcomes = [
+        PairedBlockOutcome(
+            block=block,
+            baseline_reward=0.0,
+            candidate_reward=1.0,
+        )
+        for block in design.blocks
+    ]
+    report = analyze_paired_outcomes(design, outcomes)
+
+    assert all(value <= 0.0 for value in report.primary_lower_bounds.values())
+    assert report.member_primary_bounds_passed is True
+    assert report.passed is True
 
 
 def test_primary_iut_uses_unadjusted_alpha_for_every_lane() -> None:

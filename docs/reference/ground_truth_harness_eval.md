@@ -545,16 +545,41 @@ discovery complement means this result also does not identify the selected candi
 over all 89 tasks.
 
 Use a locked simulator that generates the complete task vectors and runs the exact production
-analysis, including the observed effect floor and all-lane intersection-union decision. It must
-produce the predeclared number of `weak-null` and `target-alternative` replicates with no optional
-stopping. The executable power gate rejects missing, duplicate, extra, or simulation-digest-drifted
-replicates. It uses preregistered one-sided exact Clopper-Pearson bounds certified outward by
-directed-rounding, high-precision binomial tail sums; SciPy quantiles are only initial guesses. The
-weak-null rejection-rate upper bound must not exceed the maximum type-I error, and the
-target-alternative rejection-rate lower bound must reach the requested power. Its durable report
-embeds the full frozen gate design, binds the complete canonical trial evidence by digest, and binds
-all counts, rates, bounds, and decisions with a report digest. Reloading must recompute and validate
-every derived value. Passing supports only that frozen MDE and data-generating assumptions.
+analysis, including the observed effect floor and all-lane intersection-union decision. Its target
+alternative uses one deterministic semantic-group effect assignment for the fixed roster. That
+assignment is shared across lanes and every replicate; each lane's additive scale is solved against
+the realized fixed assignment so its clipped equal-task effect reaches the declared target within a
+forward machine-precision bound. A positive target may never collapse to zero. Task and lane
+outcomes are sampled independently conditional on those frozen probabilities. Randomly
+redrawing semantic-group effects per replicate would change the fixed-roster estimand and is not
+permitted.
+
+It must produce the predeclared number of memberwise `weak-null` configurations and
+`target-alternative` replicates with no optional stopping. Let `R_m` be lane `m`'s exact primary
+rejection event and `R = intersection_m R_m` the all-lane decision. For every designated null lane
+`j`, `R` is a subset of `R_j`, so `P(R) <= P(R_j)`. The frozen DGP also makes lane `j`'s marginal
+invariant to every other lane's nuisance effect through independent conditional lane sampling and
+fixed lane-specific probabilities. The memberwise null simulator therefore draws only lane `j` at
+its zero-effect boundary and records `R_j`, conceptually setting every other Boolean member decision
+to pass. This is a conservative upper bound on the composite-null IUT rejection probability, not a
+claim that any finite other-lane effect makes a stochastic decision pass surely. If other-lane
+nuisance can alter the designated lane's marginal, this bound and the power gate are invalid. The
+manifest freezes this contract as `memberwise-marginal-conservative-upper-bound-v1` with
+`all-other-member-decisions-pass`. The executable power gate
+rejects missing, duplicate, extra, or simulation-digest-drifted replicates. It uses preregistered
+one-sided exact Clopper-Pearson bounds certified outward by directed-rounding, high-precision
+binomial tail sums; SciPy quantiles are only initial guesses. It allocates the Monte Carlo error
+across all memberwise nulls with directed-downward floating-point division, records that exact
+allocation, takes their worst simultaneous upper bound, and requires that bound not to exceed the
+maximum type-I error. The target-alternative rejection-rate lower bound must reach the requested
+power. Its durable report embeds the full public-safe simulation manifest in the frozen gate design
+and cross-validates its digest, complete lane-null roster, numerical runtime, target effect,
+evaluation-design digest, and replication horizon. It binds the complete canonical
+trial evidence by digest, and binds every memberwise count and bound plus the aggregate counts,
+rates, bounds, and decisions with a report digest. Reloading must recompute and validate every
+derived value under the exact frozen runtime, executable, source, and schema identities. The report
+is durable but deliberately environment-bound; transfer to a different environment fails closed.
+Passing supports only that frozen MDE and data-generating assumptions.
 
 Three percentage points and 80% power remain desired planning values, not established operating
 characteristics. Do not call the current design powered for 3 points until the locked simulation
@@ -586,18 +611,26 @@ private experiment control store. Creating
 portable simulation identity. It also binds the exact v5 evaluation-design digest, lane attempts,
 bet mixture, effect floor, DGP and effect atoms, residual attempt ICC, seed, fixed replication
 horizon, deterministic chunk size, simulator schema, and simulator and paired-analysis source
-bytes.
+bytes. The identity additionally freezes the exact Python implementation and version, executable
+digest, cache tag, operating-system release and build, machine, NumPy, SciPy, Pydantic, and
+Pydantic-core versions and installed-distribution `RECORD` digests, and explicit RNG, clipped-effect
+solver, and Clopper-Pearson certifier implementation identities. Chunk generation and gate
+evaluation fail closed if the current numerical runtime or executable source/schema differs.
 
-Run every prescribed null and target chunk with `run_paired_power_chunk`, or use
-`resume_paired_power_simulation` for atomic local checkpoints. Chunk identities derive from the
-frozen scenario and inclusive replicate range. Merge rejects missing, duplicate, extra, or
-digest-drifted ranges. The merged `PairedPowerTrialArtifact` stores complete decision bitsets and
-chunk digests but no task identities, strata, group names, baseline rates, or outcomes. Persist and
-reload it with `write_paired_power_trial_artifact` and `load_paired_power_trial_artifact`; the loaded
-compact artifact can be passed directly to `evaluate_paired_power_gate` without expanding 100,000
-Pydantic trial records. The gate streams the bitsets into the same canonical per-replicate evidence
-identity used by expanded trials, so either representation produces the same evidence and report
-digests.
+Run every prescribed memberwise null and target chunk with `run_paired_power_chunk`, or use
+`resume_paired_power_simulation` for local checkpoints. Chunk identities derive from the frozen
+scenario, null member where applicable, and inclusive replicate range. Merge rejects missing,
+duplicate, extra, or digest-drifted ranges. Resume opens every directory component without following
+symlinks and holds the final directory descriptor, requires the current user to own a mode-`0700`
+checkpoint directory and mode-`0600` regular artifacts,
+rejects symlinks and special files without blocking, detects inode replacement during reads, and
+publishes each chunk immutably with an exclusive same-directory link. Existing artifact names are
+never overwritten. The merged `PairedPowerTrialArtifact` stores complete decision bitsets and chunk
+digests but no task identities, strata, group names, baseline rates, or outcomes. Persist and reload
+it with `write_paired_power_trial_artifact` and `load_paired_power_trial_artifact`; the loaded compact
+artifact can be passed directly to `evaluate_paired_power_gate` without expanding all Pydantic trial
+records. The gate streams the bitsets into the same canonical per-replicate evidence identity used
+by expanded trials, so either representation produces the same evidence and report digests.
 
 The checked-in tests use only a four-task synthetic profile and are explicitly not study evidence.
 Generate the scored 50,000-replication artifact per scenario only after the private 59-task design
@@ -781,10 +814,12 @@ For the one-sided null `theta_m <= u`, each preregistered bet fraction `f` uses
 lane e-value. Complete task vectors may have different distributions. Under the weak equal-task
 null, mutual task independence factors the expectation and AM-GM bounds it by one. The reported
 primary p-value is `min(1, 1/E(0))`. Inverting `E(u) > 1/alpha` gives a conservatively rounded
-one-sided lower bound. Each lane uses the unadjusted one-sided alpha of 0.05. The all-lanes claim is
-an intersection-union test: every lane lower bound must exceed zero, so no cross-lane independence
-or alpha division is required. Every lane's observed `D_m` must also meet the separately frozen 3
-percentage-point floor.
+one-sided lower bound. Compute the pass decision from the exact rational rejection
+`E(0) * alpha > 1`, not by reparsing the downward-rounded float endpoint: a mathematically positive
+endpoint can be too small for a positive float representation. Each lane uses the unadjusted
+one-sided alpha of 0.05. The all-lanes claim is an intersection-union test: every lane must reject
+its zero null, so no cross-lane independence or alpha division is required. Every lane's observed
+`D_m` must also meet the separately frozen 3 percentage-point floor.
 
 Report a dependence sensitivity using the predeclared semantic groups. For group `g`, let `X_g,m`
 be its task mean, `w_g = n_g/N`, `w_max = max_g w_g`, and `c_g = w_g/w_max`. Its bet factor is
@@ -824,8 +859,9 @@ candidate failure, or low score.
 
 The main success criteria are:
 
-1. every lane has a positive one-sided primary lower bound on its fixed-roster conditional expected
-   rerun delta, using unadjusted alpha 0.05 through the all-lane intersection-union rule;
+1. every lane exactly rejects its zero null, implying a positive one-sided primary bound on its
+   fixed-roster conditional expected rerun delta, using unadjusted alpha 0.05 through the all-lane
+   intersection-union rule;
 2. every lane's observed equal-task delta is at least 3 percentage points; this is an effect-size
    floor, not by itself a powered 3 point claim;
 3. the locked simulator's exact Monte Carlo gate passes at its predeclared MDE. A 3 point, 80% power
