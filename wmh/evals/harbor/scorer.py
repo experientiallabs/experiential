@@ -220,6 +220,31 @@ class HarborHarnessScorer:
         return self._task_ids
 
     @property
+    def configuration_id(self) -> str:
+        """Return an opaque digest of the exact scorer and task-matrix configuration."""
+        payload = {
+            "schema_version": 1,
+            "implementation": f"{type(self).__module__}.{type(self).__qualname__}",
+            "job_spec": self._job_spec.model_dump(mode="json"),
+            "provider_config": self._provider_config.model_dump(mode="json"),
+            "task_ids": list(self._task_ids),
+            "task_keys": list(self._task_keys),
+            "task_environment_digests": list(self._task_environment_digests),
+            "reward_key": self._reward_key,
+            "runner_image": self._runner_image,
+            "compute_envelope": self._compute_envelope.model_dump(mode="json"),
+            "agent_version": WMH_PI_AGENT_VERSION,
+        }
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @property
     def default_attempts(self) -> int:
         """Return the immutable number of attempts in every scored task cell."""
         return self._job_spec.n_attempts

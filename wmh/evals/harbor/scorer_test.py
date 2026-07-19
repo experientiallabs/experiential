@@ -367,6 +367,27 @@ def test_projects_exact_binary_task_means_and_bounded_evidence(
     assert captured[0][0].environment_backend is HarborEnvironmentBackend.LOCAL
 
 
+def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Path) -> None:
+    baseline = _scorer(tmp_path).configuration_id
+
+    assert _scorer(tmp_path).configuration_id == baseline
+    assert _scorer(tmp_path, reward_key="other-reward").configuration_id != baseline
+    assert (
+        _scorer(
+            tmp_path,
+            provider_config=_provider().model_copy(update={"model": "other-worker"}),
+        ).configuration_id
+        != baseline
+    )
+    assert (
+        _scorer(
+            tmp_path,
+            task_keys=("sha256:" + "e" * 64, _TASK_KEYS[1]),
+        ).configuration_id
+        != baseline
+    )
+
+
 def test_score_job_identity_binds_full_candidate_route_and_qualification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

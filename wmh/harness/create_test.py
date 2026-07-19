@@ -10,8 +10,10 @@ fails a run based on the submitted answer, so seed and child scores can genuinel
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -27,9 +29,12 @@ from wmh.harness.create import (
     CreateResult,
     HarnessSearchCancelled,
     ProposalRecord,
+    SearchCheckpoint,
     create_harness,
+    load_search_checkpoint,
     search_harness,
     select_failure_cluster,
+    write_search_checkpoint,
 )
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta
 from wmh.harness.doc import HarnessDoc
@@ -189,7 +194,9 @@ class _NeutralScorer:
     """A ground-truth-like scorer with no world-model dependencies."""
 
     capabilities = ScoreCapabilities()
+    configuration_id = "neutral-scorer-v1"
     default_attempts = 2
+    task_ids = ("ground-truth-task",)
 
     def __init__(self) -> None:
         self.requests: list[tuple[str, ScoreRequest]] = []
@@ -230,6 +237,8 @@ class _NeutralScorer:
 class _EvidenceRecordingProposer:
     """Return one deterministic delta and retain the scorer evidence."""
 
+    configuration_id = "evidence-proposer-v1"
+
     def __init__(self) -> None:
         self.evidence: list[str] = []
         self.archives: list[tuple[str, HarnessScoreArchive]] = []
@@ -265,6 +274,339 @@ class _EvidenceRecordingProposer:
     def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
         del delta, stage
         self.feedback.append(content)
+
+
+class _HistoryProposer(_EvidenceRecordingProposer):
+    """Derive unique deterministic proposals only from the complete judged history."""
+
+    configuration_id = "history-proposer-v1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.history_ids: list[list[str]] = []
+        self.resumed: tuple[int, list[str]] | None = None
+
+    def resume_from_history(
+        self,
+        *,
+        completed_iteration: int,
+        proposal_records: list[ProposalRecord],
+    ) -> None:
+        self.resumed = (
+            completed_iteration,
+            [record.delta_id for record in proposal_records if record.delta_id is not None],
+        )
+
+    def propose_batch(
+        self,
+        parent: HarnessDoc,
+        trigger: FailureSignature,
+        evidence: str,
+        *,
+        history: list[HarnessDelta],
+        count: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[HarnessDelta | ProposalFailure | None]:
+        del evidence, should_cancel
+        assert count == 1
+        self.history_ids.append([delta.delta_id for delta in history])
+        prompt = f"{_CAREFUL_PROMPT} Revision {len(history) + 1}."
+        proposal = parse_delta(parent, trigger, _meta_reply(parent, prompt))
+        assert proposal is not None
+        return [proposal]
+
+
+def _interrupt_after_iteration(
+    checkpoints: list[SearchCheckpoint],
+    *,
+    iteration: int,
+) -> Callable[[SearchCheckpoint], None]:
+    """Capture committed checkpoints and simulate a process failure at one boundary."""
+
+    def _callback(checkpoint: SearchCheckpoint) -> None:
+        checkpoints.append(checkpoint)
+        if checkpoint.completed_iteration == iteration:
+            raise RuntimeError("simulated checkpoint interruption")
+
+    return _callback
+
+
+def test_search_harness_resumes_exactly_from_a_committed_iteration() -> None:
+    seed = HarnessDoc.baseline("seed")
+    checkpoints: list[SearchCheckpoint] = []
+    interrupted_scorer = _NeutralScorer()
+
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            seed,
+            interrupted_scorer,
+            _HistoryProposer(),
+            iterations=3,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=1),
+        )
+
+    committed = checkpoints[-1]
+    assert committed.completed_iteration == 1
+    assert committed.champion_doc_hash != seed.doc_hash
+    assert set(committed.docs) == set(committed.reports)
+    assert len(committed.docs) == 2
+    assert len(committed.archive.deltas) == 1
+    assert len(committed.proposal_records) == 1
+    assert committed.failure_cluster_expansions[0].count == 1
+    assert [request.purpose for _, request in interrupted_scorer.requests] == ["seed", "full"]
+
+    resumed_scorer = _NeutralScorer()
+    resumed_proposer = _HistoryProposer()
+    resumed = search_harness(
+        "winner",
+        seed,
+        resumed_scorer,
+        resumed_proposer,
+        iterations=3,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        resume_from=committed,
+    )
+    uninterrupted_proposer = _HistoryProposer()
+    uninterrupted = search_harness(
+        "winner",
+        seed,
+        _NeutralScorer(),
+        uninterrupted_proposer,
+        iterations=3,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+    )
+
+    assert resumed == uninterrupted
+    assert [request.purpose for _, request in resumed_scorer.requests] == ["full", "full"]
+    assert resumed_proposer.resumed == (1, [committed.archive.deltas[0].delta_id])
+    assert [len(history) for history in resumed_proposer.history_ids] == [1, 2]
+    assert [len(history) for history in uninterrupted_proposer.history_ids] == [0, 1, 2]
+
+
+def test_search_harness_rejects_resume_configuration_drift_before_scoring() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=0),
+        )
+
+    scorer = _NeutralScorer()
+    with pytest.raises(ValueError, match="search checkpoint configuration drift"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=2,
+            proposal_batch_size=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[-1],
+        )
+
+    assert scorer.requests == []
+    assert scorer.before_proposal_calls == 0
+
+
+def test_search_harness_rejects_resume_scorer_matrix_drift_before_scoring() -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=0),
+        )
+
+    scorer = _NeutralScorer()
+    scorer.task_ids = ("drifted-task",)
+    with pytest.raises(ValueError, match="search checkpoint configuration drift"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[-1],
+        )
+    assert scorer.requests == []
+
+
+def test_search_harness_fails_before_proposals_when_required_state_cannot_export() -> None:
+    class MissingDurableExport(_HistoryProposer):
+        configuration_id = "missing-durable-export-v1"
+        durable_state_required = True
+
+    scorer = _NeutralScorer()
+    with pytest.raises(RuntimeError, match="exposes no export_search_state"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            MissingDurableExport(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=lambda checkpoint: None,
+        )
+
+    assert [request.purpose for _, request in scorer.requests] == ["seed"]
+    assert scorer.before_proposal_calls == 0
+
+
+def test_search_harness_preserves_evaluation_id_collisions_across_resume() -> None:
+    class CollidingCheckpointScorer(_NeutralScorer):
+        configuration_id = "colliding-scorer-v1"
+
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            if request.purpose == "full":
+                return report.model_copy(update={"evaluation_id": "shared-candidate-evaluation"})
+            return report
+
+    checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            CollidingCheckpointScorer(),
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=1),
+        )
+
+    assert any(
+        record.evaluation_id == "shared-candidate-evaluation"
+        for record in checkpoints[-1].evaluation_records
+    )
+    with pytest.raises(ValueError, match="shared-candidate-evaluation.*different report"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            CollidingCheckpointScorer(),
+            _HistoryProposer(),
+            iterations=2,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            resume_from=checkpoints[-1],
+        )
+
+
+def test_search_checkpoint_file_rejects_corruption(tmp_path: Path) -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=0),
+        )
+    path = tmp_path / "search-checkpoint.json"
+    write_search_checkpoint(path, checkpoints[-1])
+    assert load_search_checkpoint(path) == checkpoints[-1]
+
+    content = json.loads(path.read_text())
+    content["configuration"]["name"] = "corrupted-name"
+    path.write_text(json.dumps(content))
+    with pytest.raises(ValueError, match="checkpoint payload digest"):
+        load_search_checkpoint(path)
+
+    adversarial = checkpoints[-1].model_dump(mode="json")
+    adversarial["evaluation_records"] = []
+    payload = {key: value for key, value in adversarial.items() if key != "payload_sha256"}
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    adversarial["payload_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+    path.write_text(json.dumps(adversarial))
+    with pytest.raises(ValueError, match="missing a discovery evaluation identity"):
+        load_search_checkpoint(path)
+
+    completed: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(completed, iteration=1),
+        )
+    drifted_counts = completed[-1].model_dump(mode="json")
+    drifted_counts["failure_cluster_expansions"][0]["count"] = 2
+    count_payload = {key: value for key, value in drifted_counts.items() if key != "payload_sha256"}
+    count_canonical = json.dumps(
+        count_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    drifted_counts["payload_sha256"] = hashlib.sha256(count_canonical.encode()).hexdigest()
+    path.write_text(json.dumps(drifted_counts))
+    with pytest.raises(ValueError, match="expansion counts do not match history"):
+        load_search_checkpoint(path)
+
+
+def test_search_checkpoint_atomic_replace_preserves_last_commit_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoints: list[SearchCheckpoint] = []
+    with pytest.raises(RuntimeError, match="simulated checkpoint interruption"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=_interrupt_after_iteration(checkpoints, iteration=0),
+        )
+    path = tmp_path / "search-checkpoint.json"
+    write_search_checkpoint(path, checkpoints[-1])
+
+    def _fail_replace(source: Path, target: Path) -> None:
+        del source, target
+        raise OSError("simulated atomic replacement failure")
+
+    monkeypatch.setattr(create_module.os, "replace", _fail_replace)
+    with pytest.raises(OSError, match="simulated atomic replacement failure"):
+        write_search_checkpoint(path, checkpoints[-1])
+
+    assert load_search_checkpoint(path) == checkpoints[-1]
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:

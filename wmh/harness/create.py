@@ -23,13 +23,19 @@ reproducible as its providers because proposals and rollouts sample real models 
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import os
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isclose
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, cast
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from wmh.core.types import JsonObject
 from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import DEFAULT_K, ClosedLoopReport, evaluate_closed_loop
 from wmh.evals.gold import GoldJudge
@@ -193,6 +199,402 @@ class SearchResult(BaseModel):
     confirmations: int = 0
     iterations: int = 0
     proposal_batch_size: int = 1
+
+
+class SearchScorerConfiguration(BaseModel):
+    """Stable scorer and task-matrix identity required for exact search continuation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    implementation: str = Field(min_length=1, max_length=1_024)
+    configuration_id: str = Field(min_length=1, max_length=1_024)
+    task_ids: tuple[str, ...] = Field(min_length=1)
+    default_attempts: int = Field(ge=1)
+    capabilities: ScoreCapabilities
+
+    @model_validator(mode="after")
+    def _validate_task_ids(self) -> SearchScorerConfiguration:
+        if len(set(self.task_ids)) != len(self.task_ids):
+            raise ValueError("checkpoint scorer task_ids must be unique")
+        if any(not task_id or len(task_id) > 512 for task_id in self.task_ids):
+            raise ValueError("checkpoint scorer task_ids must contain 1 to 512 characters")
+        return self
+
+
+class SearchProposerConfiguration(BaseModel):
+    """Stable proposer identity bound into a resumable search configuration."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    implementation: str = Field(min_length=1, max_length=1_024)
+    configuration_id: str = Field(min_length=1, max_length=1_024)
+    durable_state_required: bool = False
+
+
+class SearchConfiguration(BaseModel):
+    """Every behavior-affecting input that must remain fixed across resume."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    seed_doc_hash: str = Field(min_length=1)
+    seed_execution_hash: str = Field(min_length=1)
+    iterations: int = Field(ge=0)
+    proposal_batch_size: int = Field(ge=1)
+    screen_proposals: bool
+    confirm_narrow_vetoes: bool
+    discovery_scorer: SearchScorerConfiguration
+    holdout_scorer: SearchScorerConfiguration | None = None
+    proposer: SearchProposerConfiguration
+
+
+class FailureClusterExpansionRecord(BaseModel):
+    """Serializable count for one parent-scoped failure-cluster selection key."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    parent_doc_hash: str = Field(min_length=1)
+    mechanism: str = Field(min_length=1)
+    task_ids: tuple[str, ...]
+    count: int = Field(ge=1)
+
+    @property
+    def key(self) -> FailureClusterKey:
+        """Return the in-memory selection key represented by this record."""
+        return self.parent_doc_hash, self.mechanism, self.task_ids
+
+
+class SearchEvaluationRecord(BaseModel):
+    """Content identity committed to one scorer-issued evaluation identifier."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evaluation_id: str = Field(min_length=1, max_length=512)
+    harness_execution_hash: str = Field(min_length=1)
+    scorer_tier: ScoreArchiveTier
+    request: ScoreRequest
+    report_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SearchCheckpoint(BaseModel):
+    """Checksummed host-only state committed at a complete iteration boundary.
+
+    ``proposer_state`` may contain audit-only scorer evidence. Persist checkpoints outside every
+    agent-visible project root and restore them only through the host-side proposer hook.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["wmh.search-checkpoint.v1"] = "wmh.search-checkpoint.v1"
+    configuration: SearchConfiguration
+    completed_iteration: int = Field(ge=0)
+    docs: dict[str, HarnessDoc]
+    reports: dict[str, HarnessScoreReport]
+    holdout_reports: dict[str, HarnessScoreReport]
+    archive: DeltaArchive
+    champion_doc_hash: str = Field(min_length=1)
+    best_full_score: float = Field(ge=0.0, le=1.0)
+    suite: list[str]
+    proposal_records: list[ProposalRecord]
+    skipped: int = Field(ge=0)
+    screened: int = Field(ge=0)
+    confirmations: int = Field(ge=0)
+    failure_cluster_expansions: list[FailureClusterExpansionRecord]
+    evaluation_records: list[SearchEvaluationRecord]
+    proposer_state: JsonObject | None = None
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_checkpoint(self) -> SearchCheckpoint:
+        expected_digest = _search_checkpoint_payload_sha256(self)
+        if not hmac.compare_digest(self.payload_sha256, expected_digest):
+            raise ValueError("search checkpoint payload digest does not match its serialized state")
+        if self.completed_iteration > self.configuration.iterations:
+            raise ValueError("completed_iteration exceeds the configured search iterations")
+        if self.archive.seed.doc_hash != self.configuration.seed_doc_hash:
+            raise ValueError("checkpoint archive seed does not match the configured seed")
+        if self.archive.seed.execution_hash != self.configuration.seed_execution_hash:
+            raise ValueError("checkpoint archive seed execution does not match configuration")
+        for doc_hash, doc in self.docs.items():
+            if doc_hash != doc.doc_hash:
+                raise ValueError(f"checkpoint document key {doc_hash!r} does not match its hash")
+        if self.configuration.seed_doc_hash not in self.docs:
+            raise ValueError("checkpoint documents do not contain the configured seed")
+        if self.champion_doc_hash not in self.docs or self.champion_doc_hash not in self.reports:
+            raise ValueError("checkpoint champion is missing its document or discovery report")
+        if set(self.reports) != set(self.docs):
+            raise ValueError("checkpoint documents and discovery reports must have exact keys")
+        if not set(self.holdout_reports).issubset(self.docs):
+            raise ValueError("checkpoint holdout reports contain an unknown document")
+        discovery_task_ids = set(self.configuration.discovery_scorer.task_ids)
+        for report in self.reports.values():
+            if set(report.per_task) != discovery_task_ids:
+                raise ValueError("checkpoint discovery report task matrix drifted")
+            if report.attempts != self.configuration.discovery_scorer.default_attempts:
+                raise ValueError("checkpoint discovery report attempt matrix drifted")
+        if self.configuration.holdout_scorer is None:
+            if self.holdout_reports:
+                raise ValueError("checkpoint has holdout reports without a holdout scorer")
+        else:
+            holdout_task_ids = set(self.configuration.holdout_scorer.task_ids)
+            for report in self.holdout_reports.values():
+                if set(report.per_task) != holdout_task_ids:
+                    raise ValueError("checkpoint holdout report task matrix drifted")
+                if report.attempts != self.configuration.holdout_scorer.default_attempts:
+                    raise ValueError("checkpoint holdout report attempt matrix drifted")
+            if self.configuration.seed_doc_hash not in self.holdout_reports:
+                raise ValueError("checkpoint is missing the holdout seed report")
+        champion_report = self.reports[self.champion_doc_hash]
+        if not isclose(champion_report.score, self.best_full_score, abs_tol=_TIE_EPS):
+            raise ValueError("checkpoint champion score does not match best_full_score")
+        if self.suite != sorted(set(self.suite)):
+            raise ValueError("checkpoint suite must be sorted and unique")
+        if not set(self.suite).issubset(discovery_task_ids):
+            raise ValueError("checkpoint suite contains a task outside the discovery matrix")
+        if any(not champion_report.per_task[task_id].passed for task_id in self.suite):
+            raise ValueError("checkpoint champion regressed a task in the locked suite")
+        if self.archive.reconstruct(self.champion_doc_hash).doc_hash != self.champion_doc_hash:
+            raise ValueError("checkpoint champion is not reconstructable from accepted history")
+        checkpoint_delta_ids = [delta.delta_id for delta in self.archive.deltas]
+        recorded_delta_ids = [
+            record.delta_id for record in self.proposal_records if record.delta_id is not None
+        ]
+        if checkpoint_delta_ids != recorded_delta_ids:
+            raise ValueError("checkpoint delta archive does not match ordered proposal records")
+        if any(delta.verdict is None for delta in self.archive.deltas):
+            raise ValueError("checkpoint delta archive contains an unresolved proposal")
+        if self.proposal_records != sorted(
+            self.proposal_records,
+            key=lambda record: (record.iteration, record.proposal_index),
+        ):
+            raise ValueError("checkpoint proposal records are not in stable proposal order")
+        records_by_iteration: dict[int, list[ProposalRecord]] = {}
+        for record in self.proposal_records:
+            records_by_iteration.setdefault(record.iteration, []).append(record)
+        expected_iterations = set(range(1, self.completed_iteration + 1))
+        if set(records_by_iteration) != expected_iterations:
+            raise ValueError("checkpoint proposal records do not cover every completed iteration")
+        expected_indexes = list(range(1, self.configuration.proposal_batch_size + 1))
+        for records in records_by_iteration.values():
+            if sorted(record.proposal_index for record in records) != expected_indexes:
+                raise ValueError("checkpoint proposal records do not cover the configured batch")
+        expected_expansions: dict[FailureClusterKey, int] = {}
+        selected_parent_hash = self.configuration.seed_doc_hash
+        for iteration in range(1, self.completed_iteration + 1):
+            records = records_by_iteration[iteration]
+            triggers = [record.trigger for record in records]
+            if any(trigger != triggers[0] for trigger in triggers[1:]) or triggers[0] is None:
+                raise ValueError("checkpoint iteration records disagree on their failure trigger")
+            trigger = triggers[0]
+            assert trigger is not None
+            if trigger.task_ids and any(
+                record.outcome in {"screened", "scored"} for record in records
+            ):
+                key = _failure_cluster_key(selected_parent_hash, trigger)
+                expected_expansions[key] = expected_expansions.get(key, 0) + 1
+            selected = [record for record in records if record.selected]
+            if len(selected) > 1:
+                raise ValueError("checkpoint iteration selects more than one proposal")
+            if selected:
+                selected_hash = selected[0].candidate_doc_hash
+                if selected_hash is None:
+                    raise ValueError("checkpoint selected proposal has no candidate document")
+                selected_parent_hash = selected_hash
+        if selected_parent_hash != self.champion_doc_hash:
+            raise ValueError("checkpoint selected proposal lineage does not reach the champion")
+        skipped = sum(
+            record.outcome in {"invalid", "unusable", "proposer_error"}
+            for record in self.proposal_records
+        )
+        screened = sum(record.outcome == "screened" for record in self.proposal_records)
+        if self.skipped != skipped or self.screened != screened:
+            raise ValueError("checkpoint proposal counters do not match proposal records")
+        confirmations = sum(
+            record.outcome == "scored"
+            and record.reason is not None
+            and "confirmation re-run (" in record.reason
+            for record in self.proposal_records
+        )
+        if self.confirmations != confirmations:
+            raise ValueError("checkpoint confirmation counter does not match proposal records")
+        expansion_keys = [record.key for record in self.failure_cluster_expansions]
+        if len(set(expansion_keys)) != len(expansion_keys):
+            raise ValueError("checkpoint contains duplicate failure-cluster expansion keys")
+        if any(
+            record.parent_doc_hash not in self.reports for record in self.failure_cluster_expansions
+        ):
+            raise ValueError("checkpoint failure-cluster expansion names an unknown parent")
+        actual_expansions = {record.key: record.count for record in self.failure_cluster_expansions}
+        if actual_expansions != expected_expansions:
+            raise ValueError("checkpoint failure-cluster expansion counts do not match history")
+        evaluation_ids = [record.evaluation_id for record in self.evaluation_records]
+        if len(set(evaluation_ids)) != len(evaluation_ids):
+            raise ValueError("checkpoint contains duplicate evaluation identity records")
+        evaluations_by_id = {record.evaluation_id: record for record in self.evaluation_records}
+        for doc_hash, report in self.reports.items():
+            record = evaluations_by_id.get(report.evaluation_id)
+            if record is None:
+                raise ValueError("checkpoint is missing a discovery evaluation identity")
+            if (
+                record.scorer_tier is not ScoreArchiveTier.DISCOVERY
+                or record.harness_execution_hash != self.docs[doc_hash].execution_hash
+                or record.report_fingerprint != _score_report_fingerprint(report)
+            ):
+                raise ValueError("checkpoint discovery evaluation identity drifted")
+        for doc_hash, report in self.holdout_reports.items():
+            record = evaluations_by_id.get(report.evaluation_id)
+            if record is None:
+                raise ValueError("checkpoint is missing a holdout evaluation identity")
+            if (
+                record.scorer_tier is not ScoreArchiveTier.HOLDOUT
+                or record.harness_execution_hash != self.docs[doc_hash].execution_hash
+                or record.report_fingerprint != _score_report_fingerprint(report)
+            ):
+                raise ValueError("checkpoint holdout evaluation identity drifted")
+        if self.configuration.proposer.durable_state_required and self.proposer_state is None:
+            raise ValueError("checkpoint is missing required durable proposer state")
+        return self
+
+
+_JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
+
+
+def _canonical_json_object(value: JsonObject) -> str:
+    """Render one JSON object with a platform-independent byte representation."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _checkpoint_payload(checkpoint: SearchCheckpoint) -> JsonObject:
+    return cast(
+        "JsonObject",
+        checkpoint.model_dump(mode="json", exclude={"payload_sha256"}),
+    )
+
+
+def _checkpoint_payload_digest(payload: JsonObject) -> str:
+    canonical = _canonical_json_object(payload)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _search_checkpoint_payload_sha256(checkpoint: SearchCheckpoint) -> str:
+    return _checkpoint_payload_digest(_checkpoint_payload(checkpoint))
+
+
+def _build_search_checkpoint(
+    *,
+    configuration: SearchConfiguration,
+    completed_iteration: int,
+    docs: dict[str, HarnessDoc],
+    reports: dict[str, HarnessScoreReport],
+    holdout_reports: dict[str, HarnessScoreReport],
+    archive: DeltaArchive,
+    champion_doc_hash: str,
+    best_full_score: float,
+    suite: list[str],
+    proposal_records: list[ProposalRecord],
+    skipped: int,
+    screened: int,
+    confirmations: int,
+    failure_cluster_expansions: dict[FailureClusterKey, int],
+    evaluation_records: dict[str, SearchEvaluationRecord],
+    proposer_state: JsonObject | None,
+) -> SearchCheckpoint:
+    """Detach live state, checksum it, and validate the complete resume invariant set."""
+    unchecked = SearchCheckpoint.model_construct(
+        schema_version="wmh.search-checkpoint.v1",
+        configuration=configuration.model_copy(deep=True),
+        completed_iteration=completed_iteration,
+        docs={doc_hash: doc.model_copy(deep=True) for doc_hash, doc in docs.items()},
+        reports={doc_hash: report.model_copy(deep=True) for doc_hash, report in reports.items()},
+        holdout_reports={
+            doc_hash: report.model_copy(deep=True) for doc_hash, report in holdout_reports.items()
+        },
+        archive=archive.model_copy(deep=True),
+        champion_doc_hash=champion_doc_hash,
+        best_full_score=best_full_score,
+        suite=list(suite),
+        proposal_records=[record.model_copy(deep=True) for record in proposal_records],
+        skipped=skipped,
+        screened=screened,
+        confirmations=confirmations,
+        failure_cluster_expansions=[
+            FailureClusterExpansionRecord(
+                parent_doc_hash=key[0],
+                mechanism=key[1],
+                task_ids=key[2],
+                count=count,
+            )
+            for key, count in sorted(failure_cluster_expansions.items())
+        ],
+        evaluation_records=[
+            evaluation_records[evaluation_id].model_copy(deep=True)
+            for evaluation_id in sorted(evaluation_records)
+        ],
+        proposer_state=proposer_state,
+        payload_sha256="0" * 64,
+    )
+    payload = _checkpoint_payload(unchecked)
+    payload["payload_sha256"] = _checkpoint_payload_digest(payload)
+    return SearchCheckpoint.model_validate(payload)
+
+
+def write_search_checkpoint(path: str | Path, checkpoint: SearchCheckpoint) -> None:
+    """Atomically replace one host-only checkpoint and fsync content plus directory metadata."""
+    validated = SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = (
+        json.dumps(
+            validated.model_dump(mode="json"),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        directory_descriptor = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_search_checkpoint(path: str | Path) -> SearchCheckpoint:
+    """Read one checkpoint, rejecting truncated, corrupted, or schema-invalid state."""
+    target = Path(path).expanduser()
+    raw = _JSON_OBJECT_ADAPTER.validate_json(target.read_text(encoding="utf-8"))
+    persisted_digest = raw.get("payload_sha256")
+    if not isinstance(persisted_digest, str):
+        raise ValueError("search checkpoint is missing its payload digest")
+    payload = dict(raw)
+    del payload["payload_sha256"]
+    expected_digest = _checkpoint_payload_digest(payload)
+    if not hmac.compare_digest(persisted_digest, expected_digest):
+        raise ValueError("search checkpoint payload digest does not match the file contents")
+    return SearchCheckpoint.model_validate(raw)
 
 
 @dataclass
@@ -367,6 +769,154 @@ def _score_report_fingerprint(report: HarnessScoreReport) -> str:
     return hashlib.blake2b(content.encode("utf-8"), digest_size=32).hexdigest()
 
 
+def _component_implementation(component: object) -> str:
+    component_type = type(component)
+    return f"{component_type.__module__}.{component_type.__qualname__}"
+
+
+def _component_configuration_id(component: object, *, role: str) -> str:
+    configuration_id = getattr(component, "configuration_id", None)
+    if not isinstance(configuration_id, str) or not configuration_id:
+        raise ValueError(
+            f"search checkpointing requires {role}.configuration_id to be a stable, "
+            "non-empty opaque identity"
+        )
+    return configuration_id
+
+
+def _scorer_task_ids(scorer: HarnessScorer, *, role: str) -> tuple[str, ...]:
+    task_ids = getattr(scorer, "task_ids", None)
+    if not isinstance(task_ids, (tuple, list)) or not all(
+        isinstance(task_id, str) for task_id in task_ids
+    ):
+        raise ValueError(
+            f"search checkpointing requires {role}.task_ids to expose its exact task matrix"
+        )
+    return tuple(task_ids)
+
+
+def _scorer_configuration(
+    scorer: HarnessScorer,
+    *,
+    role: str,
+) -> SearchScorerConfiguration:
+    return SearchScorerConfiguration(
+        implementation=_component_implementation(scorer),
+        configuration_id=_component_configuration_id(scorer, role=role),
+        task_ids=_scorer_task_ids(scorer, role=role),
+        default_attempts=scorer.default_attempts,
+        capabilities=scorer.capabilities.model_copy(deep=True),
+    )
+
+
+def _search_configuration(
+    *,
+    name: str,
+    seed_doc: HarnessDoc,
+    scorer: HarnessScorer,
+    proposer: DeltaProposer,
+    iterations: int,
+    proposal_batch_size: int,
+    screen_proposals: bool,
+    holdout_scorer: HarnessScorer | None,
+    confirm_narrow_vetoes: bool,
+) -> SearchConfiguration:
+    return SearchConfiguration(
+        name=name,
+        seed_doc_hash=seed_doc.doc_hash,
+        seed_execution_hash=seed_doc.execution_hash,
+        iterations=iterations,
+        proposal_batch_size=proposal_batch_size,
+        screen_proposals=screen_proposals,
+        confirm_narrow_vetoes=confirm_narrow_vetoes,
+        discovery_scorer=_scorer_configuration(scorer, role="scorer"),
+        holdout_scorer=(
+            _scorer_configuration(holdout_scorer, role="holdout_scorer")
+            if holdout_scorer is not None
+            else None
+        ),
+        proposer=SearchProposerConfiguration(
+            implementation=_component_implementation(proposer),
+            configuration_id=_component_configuration_id(proposer, role="proposer"),
+            durable_state_required=bool(getattr(proposer, "durable_state_required", False)),
+        ),
+    )
+
+
+def _validate_resume_configuration(
+    persisted: SearchConfiguration,
+    current: SearchConfiguration,
+) -> None:
+    if persisted == current:
+        return
+    changed = [
+        field_name
+        for field_name in SearchConfiguration.model_fields
+        if getattr(persisted, field_name) != getattr(current, field_name)
+    ]
+    raise ValueError("search checkpoint configuration drift; changed fields=" + ", ".join(changed))
+
+
+def _validated_checkpoint_copy(checkpoint: SearchCheckpoint) -> SearchCheckpoint:
+    """Revalidate a potentially nested-mutated in-memory checkpoint before using it."""
+    return SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
+
+
+def _resume_proposer_history(
+    proposer: DeltaProposer,
+    *,
+    completed_iteration: int,
+    proposal_records: list[ProposalRecord],
+) -> None:
+    resume = getattr(proposer, "resume_from_history", None)
+    if resume is None:
+        return
+    if not callable(resume):
+        raise ValueError("proposer.resume_from_history must be callable")
+    resume(
+        completed_iteration=completed_iteration,
+        proposal_records=[record.model_copy(deep=True) for record in proposal_records],
+    )
+
+
+def _export_proposer_state(
+    proposer: DeltaProposer,
+    *,
+    required: bool,
+) -> JsonObject | None:
+    export = getattr(proposer, "export_search_state", None)
+    if export is None:
+        if required:
+            raise RuntimeError(
+                "proposer requires durable state but exposes no export_search_state callback"
+            )
+        return None
+    if not callable(export):
+        raise ValueError("proposer.export_search_state must be callable")
+    state = _JSON_OBJECT_ADAPTER.validate_python(export())
+    return _JSON_OBJECT_ADAPTER.validate_json(_canonical_json_object(state))
+
+
+def _restore_proposer_state(
+    proposer: DeltaProposer,
+    state: JsonObject | None,
+    *,
+    required: bool,
+) -> None:
+    if state is None:
+        if required:
+            raise RuntimeError("search checkpoint is missing required durable proposer state")
+        return
+    restore = getattr(proposer, "restore_search_state", None)
+    if not callable(restore):
+        raise RuntimeError(
+            "checkpoint contains durable proposer state but proposer exposes no "
+            "restore_search_state callback"
+        )
+    detached = _JSON_OBJECT_ADAPTER.validate_json(_canonical_json_object(state))
+    restore(detached)
+
+
 def search_harness(
     name: str,
     seed_doc: HarnessDoc,
@@ -378,10 +928,12 @@ def search_harness(
     screen_proposals: bool = True,
     holdout_scorer: HarnessScorer | None = None,
     confirm_narrow_vetoes: bool = True,
+    resume_from: SearchCheckpoint | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
     on_proposal: Callable[[ProposalRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
+    on_checkpoint: Callable[[SearchCheckpoint], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> SearchResult:
     """Search over harness deltas using normalized scores from an injected evaluator.
@@ -400,6 +952,8 @@ def search_harness(
         screen_proposals: Whether to prefilter each child on its trigger task subset.
         holdout_scorer: Optional independent evaluator used as a third gate tier.
         confirm_narrow_vetoes: Whether capable scorers remeasure narrow gate vetoes.
+        resume_from: A validated checkpoint from a complete prior iteration.
+        on_checkpoint: Durable checkpoint callback. Exceptions abort before the next batch.
 
     Returns:
         The champion, normalized reports, and complete delta audit record.
@@ -450,7 +1004,28 @@ def search_harness(
         if holdout_seed_error is not None:
             raise ValueError(f"holdout seed is not eligible for scoring: {holdout_seed_error}")
 
-    evaluations_by_id: dict[str, tuple[str, str, str]] = {}
+    checkpointing = resume_from is not None or on_checkpoint is not None
+    configuration = (
+        _search_configuration(
+            name=name,
+            seed_doc=seed_doc,
+            scorer=scorer,
+            proposer=proposer,
+            iterations=iterations,
+            proposal_batch_size=proposal_batch_size,
+            screen_proposals=screen_proposals,
+            holdout_scorer=holdout_scorer,
+            confirm_narrow_vetoes=confirm_narrow_vetoes,
+        )
+        if checkpointing
+        else None
+    )
+    resumed = _validated_checkpoint_copy(resume_from) if resume_from is not None else None
+    if resumed is not None:
+        assert configuration is not None
+        _validate_resume_configuration(resumed.configuration, configuration)
+
+    evaluations_by_id: dict[str, SearchEvaluationRecord] = {}
 
     def _check_cancelled() -> None:
         if should_cancel is not None and should_cancel():
@@ -497,10 +1072,12 @@ def search_harness(
             raise ValueError(
                 f"scorer returned the wrong task set; missing={missing}, extra={extra}"
             )
-        evaluation_record = (
-            doc.execution_hash,
-            request.model_dump_json(),
-            _score_report_fingerprint(report),
+        evaluation_record = SearchEvaluationRecord(
+            evaluation_id=report.evaluation_id,
+            harness_execution_hash=doc.execution_hash,
+            scorer_tier=scorer_tier,
+            request=request,
+            report_fingerprint=_score_report_fingerprint(report),
         )
         prior_record = evaluations_by_id.get(report.evaluation_id)
         if prior_record is not None and prior_record != evaluation_record:
@@ -531,44 +1108,132 @@ def search_harness(
         _check_cancelled()
         return report
 
-    docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
-    reports: dict[str, HarnessScoreReport] = {}
-    holdout_reports: dict[str, HarnessScoreReport] = {}
-    archive = DeltaArchive(seed=seed_doc)
-    failure_cluster_expansions: dict[FailureClusterKey, int] = {}
-    skipped = 0
-    screened = 0
-    confirmations = 0
+    if resumed is None:
+        docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
+        reports: dict[str, HarnessScoreReport] = {}
+        holdout_reports: dict[str, HarnessScoreReport] = {}
+        archive = DeltaArchive(seed=seed_doc)
+        failure_cluster_expansions: dict[FailureClusterKey, int] = {}
+        skipped = 0
+        screened = 0
+        confirmations = 0
 
-    seed_report = _score(
-        scorer,
-        seed_doc,
-        scorer_tier=ScoreArchiveTier.DISCOVERY,
-        purpose="seed",
-    )
-    if not seed_report.per_task:
-        raise ValueError("seed score report contains no tasks")
-    discovery_task_ids = frozenset(seed_report.per_task)
-    reports[seed_doc.doc_hash] = seed_report
-    holdout_task_ids: frozenset[str] | None = None
-    if holdout_scorer is not None:
-        seed_holdout = _score(
-            holdout_scorer,
+        seed_report = _score(
+            scorer,
             seed_doc,
-            scorer_tier=ScoreArchiveTier.HOLDOUT,
-            purpose="holdout",
+            scorer_tier=ScoreArchiveTier.DISCOVERY,
+            purpose="seed",
         )
-        if not seed_holdout.per_task:
-            raise ValueError("holdout seed score report contains no tasks")
-        holdout_task_ids = frozenset(seed_holdout.per_task)
-        holdout_reports[seed_doc.doc_hash] = seed_holdout
-    if on_progress is not None:
-        on_progress(0, seed_doc.name, seed_report.score, True)
+        if not seed_report.per_task:
+            raise ValueError("seed score report contains no tasks")
+        discovery_task_ids = frozenset(seed_report.per_task)
+        if configuration is not None and discovery_task_ids != frozenset(
+            configuration.discovery_scorer.task_ids
+        ):
+            raise ValueError("scorer seed task matrix does not match scorer.task_ids")
+        reports[seed_doc.doc_hash] = seed_report
+        holdout_task_ids: frozenset[str] | None = None
+        if holdout_scorer is not None:
+            seed_holdout = _score(
+                holdout_scorer,
+                seed_doc,
+                scorer_tier=ScoreArchiveTier.HOLDOUT,
+                purpose="holdout",
+            )
+            if not seed_holdout.per_task:
+                raise ValueError("holdout seed score report contains no tasks")
+            holdout_task_ids = frozenset(seed_holdout.per_task)
+            if configuration is not None:
+                assert configuration.holdout_scorer is not None
+                if holdout_task_ids != frozenset(configuration.holdout_scorer.task_ids):
+                    raise ValueError(
+                        "holdout seed task matrix does not match holdout_scorer.task_ids"
+                    )
+            holdout_reports[seed_doc.doc_hash] = seed_holdout
+        if on_progress is not None:
+            on_progress(0, seed_doc.name, seed_report.score, True)
 
-    champion_hash = seed_doc.doc_hash
-    best_full = seed_report.score
-    suite = sorted(task_id for task_id, task in seed_report.per_task.items() if task.passed)
-    proposal_records: list[ProposalRecord] = []
+        champion_hash = seed_doc.doc_hash
+        best_full = seed_report.score
+        suite = sorted(task_id for task_id, task in seed_report.per_task.items() if task.passed)
+        proposal_records: list[ProposalRecord] = []
+        next_iteration = 1
+    else:
+        if resumed.archive.seed != seed_doc:
+            raise ValueError("search checkpoint seed document does not match seed_doc")
+        docs = {doc_hash: doc.model_copy(deep=True) for doc_hash, doc in resumed.docs.items()}
+        reports = {
+            doc_hash: report.model_copy(deep=True) for doc_hash, report in resumed.reports.items()
+        }
+        holdout_reports = {
+            doc_hash: report.model_copy(deep=True)
+            for doc_hash, report in resumed.holdout_reports.items()
+        }
+        archive = resumed.archive.model_copy(deep=True)
+        failure_cluster_expansions = {
+            record.key: record.count for record in resumed.failure_cluster_expansions
+        }
+        evaluations_by_id.update(
+            {
+                record.evaluation_id: record.model_copy(deep=True)
+                for record in resumed.evaluation_records
+            }
+        )
+        skipped = resumed.skipped
+        screened = resumed.screened
+        confirmations = resumed.confirmations
+        champion_hash = resumed.champion_doc_hash
+        best_full = resumed.best_full_score
+        suite = list(resumed.suite)
+        proposal_records = [record.model_copy(deep=True) for record in resumed.proposal_records]
+        discovery_task_ids = frozenset(resumed.configuration.discovery_scorer.task_ids)
+        holdout_task_ids = (
+            frozenset(resumed.configuration.holdout_scorer.task_ids)
+            if resumed.configuration.holdout_scorer is not None
+            else None
+        )
+        next_iteration = resumed.completed_iteration + 1
+        _restore_proposer_state(
+            proposer,
+            resumed.proposer_state,
+            required=resumed.configuration.proposer.durable_state_required,
+        )
+        _resume_proposer_history(
+            proposer,
+            completed_iteration=resumed.completed_iteration,
+            proposal_records=proposal_records,
+        )
+
+    def _emit_checkpoint(completed_iteration: int) -> None:
+        if on_checkpoint is None:
+            return
+        assert configuration is not None
+        proposer_state = _export_proposer_state(
+            proposer,
+            required=configuration.proposer.durable_state_required,
+        )
+        checkpoint = _build_search_checkpoint(
+            configuration=configuration,
+            completed_iteration=completed_iteration,
+            docs=docs,
+            reports=reports,
+            holdout_reports=holdout_reports,
+            archive=archive,
+            champion_doc_hash=champion_hash,
+            best_full_score=best_full,
+            suite=suite,
+            proposal_records=proposal_records,
+            skipped=skipped,
+            screened=screened,
+            confirmations=confirmations,
+            failure_cluster_expansions=failure_cluster_expansions,
+            evaluation_records=evaluations_by_id,
+            proposer_state=proposer_state,
+        )
+        on_checkpoint(checkpoint)
+
+    if resumed is None:
+        _emit_checkpoint(0)
 
     def _stage_dead(records: list[ProposalRecord], record: ProposalRecord) -> None:
         records.append(record)
@@ -580,7 +1245,7 @@ def search_harness(
             )
         )
 
-    for iteration_index in range(1, iterations + 1):
+    for iteration_index in range(next_iteration, iterations + 1):
         _check_cancelled()
         scorer.before_proposal_batch()
         if holdout_scorer is not None and holdout_scorer is not scorer:
@@ -1097,6 +1762,7 @@ def search_harness(
                 reports[champion_hash].score,
                 winner is not None,
             )
+        _emit_checkpoint(iteration_index)
 
     _check_cancelled()
     best = docs[champion_hash].model_copy(update={"name": name, "version": 0})

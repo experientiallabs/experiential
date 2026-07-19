@@ -250,6 +250,57 @@ def test_private_project_files_are_reconstructed_by_a_fresh_host_project() -> No
     assert reconstructed.read_private_text("score-archives/record.json") == '{"committed": true}'
 
 
+def test_project_search_state_restores_visible_and_private_roots_without_disclosure() -> None:
+    source = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+    source.write_text("proposals/iteration-0001/proposal-01.json", '{"public": true}')
+    source.write_private_text(
+        "score-archives/holdout/manifest.json",
+        '{"hidden": true}',
+    )
+    state = source.export_search_state()
+
+    restored_sandbox = _Sandbox()
+    restored = AgentProject(
+        restored_sandbox,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+    restored.restore_search_state(state)
+
+    assert restored.read_text("proposals/iteration-0001/proposal-01.json") == ('{"public": true}')
+    assert restored.read_private_text("score-archives/holdout/manifest.json") == (
+        '{"hidden": true}'
+    )
+    assert (
+        restored_sandbox.files.values[
+            "/home/user/project/proposals/iteration-0001/proposal-01.json"
+        ]
+        == '{"public": true}'
+    )
+    assert (
+        restored_sandbox.files.values[
+            "/home/user/project.wmh-internal/score-archives/holdout/manifest.json"
+        ]
+        == '{"hidden": true}'
+    )
+    assert not any(
+        value == '{"hidden": true}'
+        for path, value in restored_sandbox.files.values.items()
+        if path.startswith("/home/user/project/")
+    )
+    outcome = restored._execute_tool(  # noqa: SLF001 - enforce the actual visibility boundary
+        "read_file",
+        {"path": ("/home/user/project.wmh-internal/score-archives/holdout/manifest.json")},
+        lambda stream, data: None,
+    )
+    assert outcome.is_error is True
+    assert "escapes project workspace" in outcome.content
+
+
 def test_project_grants_agent_writes_to_exact_files_only() -> None:
     """A turn grant contains agent writes without constraining trusted host writes."""
     sandbox = _Sandbox()

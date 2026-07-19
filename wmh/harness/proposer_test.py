@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from typing import cast
 
 import pytest
@@ -12,6 +13,7 @@ from llm_waterfall import ChatResponse
 from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProjectRun
+from wmh.core.types import JsonObject
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.mutate import parse_delta
@@ -141,6 +143,20 @@ class _Project:
     def read_private_text(self, path: str) -> str:
         return self.private_files[path]
 
+    def export_search_state(self) -> JsonObject:
+        return {
+            "visible_files": dict(self.files),
+            "private_files": dict(self.private_files),
+        }
+
+    def restore_search_state(self, state: JsonObject) -> None:
+        visible = state.get("visible_files")
+        private = state.get("private_files")
+        assert isinstance(visible, dict)
+        assert isinstance(private, dict)
+        self.files = {str(path): str(content) for path, content in visible.items()}
+        self.private_files = {str(path): str(content) for path, content in private.items()}
+
     def run(
         self,
         agent: HarnessDoc,
@@ -157,6 +173,13 @@ class _Project:
         for index, output in enumerate(self.outputs, start=1):
             self.files[f"proposals/{iteration_dir}/proposal-{index:02d}.json"] = output
         return AgentProjectRun(answer="done", events=(), worker_usage=TokenUsage())
+
+
+@dataclass(frozen=True)
+class _ResumeRecord:
+    iteration: int
+    proposal_index: int
+    delta_id: str | None
 
 
 def _manifest_content(project: _Project, path: str) -> tuple[dict[str, object], list[str]]:
@@ -720,6 +743,54 @@ def test_project_proposer_complete_evaluation_identity_is_idempotent_and_immutab
     reconstructed.propose_batch(harness, _trigger(), "inspect failures", history=[], count=1)
     parent_index = json.loads(project.files["context/iteration-0001/parent-evaluations.json"])
     assert len(parent_index["report_manifests"]) == 1
+
+
+def test_project_proposer_checkpoint_restores_private_archives_and_iteration_links() -> None:
+    parent = HarnessDoc.baseline("parent")
+    first_project = _Project([_payload(parent, "first revision")])
+    first = ProjectDeltaProposer(first_project, meta_agent(), _Provider("unused"))
+    [proposal] = first.propose_batch(
+        parent,
+        _trigger(),
+        "inspect failures",
+        history=[],
+        count=1,
+    )
+    assert isinstance(proposal, HarnessDelta)
+    child = apply_delta(parent, proposal, "child")
+    first.record_harness_evaluation(
+        child,
+        archive=_score_archive(
+            "holdout-private",
+            tier=ScoreArchiveTier.HOLDOUT,
+            purpose="holdout",
+        ),
+    )
+    state = first.export_search_state()
+
+    restored_project = _Project([_payload(child, "second revision")])
+    restored = ProjectDeltaProposer(restored_project, meta_agent(), _Provider("unused"))
+    restored.restore_search_state(state)
+    restored.resume_from_history(
+        completed_iteration=1,
+        proposal_records=[_ResumeRecord(iteration=1, proposal_index=1, delta_id=proposal.delta_id)],
+    )
+    restored.propose_batch(
+        child,
+        _trigger(),
+        "inspect next failure",
+        history=[proposal],
+        count=1,
+    )
+
+    assert restored_project.private_files == first_project.private_files
+    assert "context/iteration-0002/history.json" in restored_project.files
+    _manifest, chunks = _manifest_content(
+        restored_project,
+        "context/iteration-0002/history.json",
+    )
+    [history] = json.loads("".join(chunks))
+    assert history["proposal_file"].endswith("/proposals/iteration-0001/proposal-01.json")
 
 
 def test_project_proposer_recovers_post_manifest_cancellation_without_identity_overwrite() -> None:

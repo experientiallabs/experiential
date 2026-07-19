@@ -7,7 +7,9 @@ import json
 import math
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol, cast
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from wmh.agents.project import AgentProjectRun
 from wmh.core.types import JsonObject
@@ -21,11 +23,12 @@ from wmh.harness.scoring import (
     canonical_score_json,
     render_task_score_archive,
 )
-from wmh.providers.base import Provider, ToolCallingProvider
+from wmh.providers.base import Provider, ProviderConfig, ToolCallingProvider
 
 _CONTEXT_CONTENT_CHUNK_CHARS = 12_000
 _MAX_PROJECT_REPAIR_TURNS = 2
 _SUPPORTED_RUNTIME_KINDS = frozenset({"kit-python", "pi-node"})
+_JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,20 @@ class _ProposalValidation:
     raw_files: dict[int, str]
     child_hashes: dict[int, str]
     errors: dict[int, str]
+
+
+class _ProjectProposerState(BaseModel):
+    """Host-only project and proposer state required after process or sandbox death."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["wmh.project-proposer-state.v1"] = "wmh.project-proposer-state.v1"
+    configuration_id: str = Field(min_length=1)
+    iteration: int = Field(ge=0)
+    evaluation_dirs: dict[str, str]
+    proposal_files: dict[str, str]
+    parent_manifests: dict[str, JsonObject]
+    project_state: JsonObject
 
 
 class AgentProject(Protocol):
@@ -77,6 +94,14 @@ class DeltaProposer(Protocol):
     ) -> list[HarnessDelta | ProposalFailure | None]: ...
 
 
+class _ProposalHistoryRecord(Protocol):
+    """Minimal committed proposal identity used to restore project file locations."""
+
+    iteration: int
+    proposal_index: int
+    delta_id: str | None
+
+
 @dataclass(frozen=True)
 class ProposalFailure:
     """One proposal slot whose provider or agent call failed."""
@@ -96,6 +121,19 @@ class ProviderDeltaProposer:
     def provider(self) -> Provider:
         """Return the provider used for direct proposal calls."""
         return self._provider
+
+    @property
+    def configuration_id(self) -> str:
+        """Return an opaque identity for the direct proposal model configuration."""
+        payload = {
+            "schema_version": 1,
+            "implementation": f"{type(self).__module__}.{type(self).__qualname__}",
+            "provider_implementation": (
+                f"{type(self._provider).__module__}.{type(self._provider).__qualname__}"
+            ),
+            "provider_config": self._provider.config.model_dump(mode="json"),
+        }
+        return _content_digest(_canonical_json(payload))
 
     def propose_batch(
         self,
@@ -133,6 +171,7 @@ class ProjectDeltaProposer:
     """Wire a normal agent in a persistent project into harness search."""
 
     score_archive_required = True
+    durable_state_required = True
 
     def __init__(
         self,
@@ -151,6 +190,107 @@ class ProjectDeltaProposer:
         self._parent_manifests: dict[str, JsonObject] = {}
         self._should_cancel: Callable[[], bool] | None = None
         self._preserve_runtime_kind = preserve_runtime_kind
+
+    @property
+    def configuration_id(self) -> str:
+        """Return an opaque identity for the project, meta agent, and provider route."""
+        provider_config = getattr(self._provider, "config", None)
+        if not isinstance(provider_config, ProviderConfig):
+            raise ValueError(
+                "checkpointed project proposal search requires a provider with ProviderConfig"
+            )
+        payload = {
+            "schema_version": 1,
+            "implementation": f"{type(self).__module__}.{type(self).__qualname__}",
+            "project_implementation": (
+                f"{type(self._project).__module__}.{type(self._project).__qualname__}"
+            ),
+            "project_workspace": self._project.workspace,
+            "agent": self._agent.model_dump(mode="json"),
+            "provider_implementation": (
+                f"{type(self._provider).__module__}.{type(self._provider).__qualname__}"
+            ),
+            "provider_config": provider_config.model_dump(mode="json"),
+            "preserve_runtime_kind": self._preserve_runtime_kind,
+        }
+        return _content_digest(_canonical_json(payload))
+
+    def export_search_state(self) -> JsonObject:
+        """Export public and host-only project state without crossing their visibility roots."""
+        export_project = getattr(self._project, "export_search_state", None)
+        if not callable(export_project):
+            raise RuntimeError(
+                "checkpointed project proposal search requires AgentProject.export_search_state"
+            )
+        project_state = _JSON_OBJECT_ADAPTER.validate_python(export_project())
+        state = _ProjectProposerState(
+            configuration_id=self.configuration_id,
+            iteration=self._iteration,
+            evaluation_dirs=dict(self._evaluation_dirs),
+            proposal_files=dict(self._proposal_files),
+            parent_manifests={
+                doc_hash: _JSON_OBJECT_ADAPTER.validate_json(_canonical_json(manifest))
+                for doc_hash, manifest in self._parent_manifests.items()
+            },
+            project_state=project_state,
+        )
+        return cast("JsonObject", state.model_dump(mode="json"))
+
+    def restore_search_state(self, raw_state: JsonObject) -> None:
+        """Restore a host checkpoint into a fresh project before any proposer turn runs."""
+        state = _ProjectProposerState.model_validate(raw_state)
+        if state.configuration_id != self.configuration_id:
+            raise ValueError("project proposer durable state configuration does not match")
+        restore_project = getattr(self._project, "restore_search_state", None)
+        if not callable(restore_project):
+            raise RuntimeError(
+                "checkpointed project proposal search requires AgentProject.restore_search_state"
+            )
+        if self._iteration not in (0, state.iteration):
+            raise ValueError("project proposer already contains a different iteration state")
+        restore_project(state.project_state)
+        self._iteration = state.iteration
+        self._evaluation_dirs = dict(state.evaluation_dirs)
+        self._proposal_files = dict(state.proposal_files)
+        self._parent_manifests = {
+            doc_hash: _JSON_OBJECT_ADAPTER.validate_json(_canonical_json(manifest))
+            for doc_hash, manifest in state.parent_manifests.items()
+        }
+        self._should_cancel = None
+
+    def resume_from_history(
+        self,
+        *,
+        completed_iteration: int,
+        proposal_records: list[_ProposalHistoryRecord],
+    ) -> None:
+        """Restore iteration numbering and durable proposal links from committed records."""
+        if self._iteration not in (0, completed_iteration):
+            raise ValueError(
+                "project proposer iteration does not match the resumed search checkpoint"
+            )
+        self._iteration = completed_iteration
+        expected_proposals: dict[str, str] = {}
+        expected_evaluations: dict[str, str] = {}
+        for record in proposal_records:
+            if record.iteration > completed_iteration or record.delta_id is None:
+                continue
+            iteration_dir = f"iteration-{record.iteration:04d}"
+            proposal_file = (
+                f"{self._project.workspace}/proposals/{iteration_dir}/"
+                f"proposal-{record.proposal_index:02d}.json"
+            )
+            evaluation_dir = f"evaluations/{iteration_dir}/proposal-{record.proposal_index:02d}"
+            expected_proposals.setdefault(record.delta_id, proposal_file)
+            expected_evaluations.setdefault(record.delta_id, evaluation_dir)
+        for delta_id, proposal_file in expected_proposals.items():
+            evaluation_dir = expected_evaluations[delta_id]
+            existing_proposal = self._proposal_files.setdefault(delta_id, proposal_file)
+            existing_evaluation = self._evaluation_dirs.setdefault(delta_id, evaluation_dir)
+            if existing_proposal != proposal_file or existing_evaluation != evaluation_dir:
+                raise ValueError(
+                    f"delta {delta_id!r} maps to conflicting committed proposal records"
+                )
 
     def propose_batch(
         self,

@@ -8,7 +8,9 @@ import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Protocol
+from typing import Literal, Protocol, cast
+
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
@@ -68,6 +70,28 @@ class AgentProjectRun:
     answer: str
     events: tuple[SessionEvent, ...]
     worker_usage: TokenUsage
+
+
+class AgentProjectState(BaseModel):
+    """Host-owned export with agent-visible and private roots kept structurally separate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["wmh.agent-project-state.v1"] = "wmh.agent-project-state.v1"
+    visible_files: dict[str, str]
+    private_files: dict[str, str]
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> AgentProjectState:
+        for label, files in (
+            ("visible", self.visible_files),
+            ("private", self.private_files),
+        ):
+            for path in files:
+                candidate = PurePosixPath(path)
+                if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
+                    raise ValueError(f"{label} project state contains unsafe path {path!r}")
+        return self
 
 
 class _ProjectAgentTurnError(RuntimeError):
@@ -228,6 +252,36 @@ class AgentProject:
             raise
         self._private_file_contents[relative] = content
         return content
+
+    def export_search_state(self) -> JsonObject:
+        """Export the authoritative mirrors for host-side durable checkpoint storage."""
+        if self._closing:
+            raise RuntimeError("cannot export a closed project")
+        state = AgentProjectState(
+            visible_files=dict(sorted(self._file_contents.items())),
+            private_files=dict(sorted(self._private_file_contents.items())),
+        )
+        return cast("JsonObject", state.model_dump(mode="json"))
+
+    def restore_search_state(self, raw_state: JsonObject) -> None:
+        """Restore a checkpoint into an empty or byte-identical project filesystem.
+
+        Private files replay only beneath the host-only sibling root. They are never copied into
+        the agent-visible workspace or admitted through project tools.
+        """
+        if self._closing:
+            raise RuntimeError("cannot restore a closed project")
+        if self._active_event_sink is not None:
+            raise RuntimeError("cannot restore project state during an active agent turn")
+        state = AgentProjectState.model_validate(raw_state)
+        if self._file_contents and self._file_contents != state.visible_files:
+            raise ValueError("cannot restore over different agent-visible project state")
+        if self._private_file_contents and self._private_file_contents != state.private_files:
+            raise ValueError("cannot restore over different private project state")
+        self._close_agent_session()
+        self._file_contents = dict(state.visible_files)
+        self._private_file_contents = dict(state.private_files)
+        self._initialize_sandbox(self._sandbox)
 
     def run(
         self,
