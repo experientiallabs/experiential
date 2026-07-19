@@ -29,9 +29,9 @@ from harbor.publisher.packager import Packager
 from harbor.utils.logger import logger as harbor_logger
 
 import wmh.evals.harbor.evaluator as mod
+from wmh.core import file_lease as _file_lease
 from wmh.core.types import JsonObject
 from wmh.evals.benchmark import BenchmarkCell, BenchmarkTaskEnvironment
-from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import (
     HarborEnvironmentBackend,
     HarborJobSpec,

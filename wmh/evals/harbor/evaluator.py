@@ -44,6 +44,7 @@ from harbor.tasks.client import TaskIdType
 from harbor.trial.network_policy import resolve_trial_network_plan
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, ValidationError
 
+from wmh.core.file_lease import exclusive_posix_file_lease
 from wmh.core.text import normalize_durable_text
 from wmh.core.types import JsonObject
 from wmh.evals.benchmark import (
@@ -52,7 +53,6 @@ from wmh.evals.benchmark import (
     BenchmarkRunIdentity,
     BenchmarkTaskEnvironment,
 )
-from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION, WmhPiAgent
 from wmh.evals.harbor.config import (
     SUPPORTED_HARBOR_VERSION,

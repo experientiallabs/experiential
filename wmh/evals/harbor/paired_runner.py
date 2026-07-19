@@ -37,6 +37,7 @@ from pydantic import (
     model_validator,
 )
 
+from wmh.core.file_lease import exclusive_posix_file_lease
 from wmh.core.text import validate_durable_text
 from wmh.evals.benchmark import (
     BenchmarkCandidateStatus,
@@ -47,7 +48,6 @@ from wmh.evals.benchmark import (
     BenchmarkTrialStatus,
     BenchmarkUsageStatus,
 )
-from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION
 from wmh.evals.harbor.config import (
     SUPPORTED_HARBOR_VERSION,
