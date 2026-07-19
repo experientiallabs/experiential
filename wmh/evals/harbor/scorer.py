@@ -12,7 +12,6 @@ from pathlib import Path
 from statistics import fmean
 from typing import Self
 
-from llm_waterfall import ChatProviderReceipt
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 
@@ -36,7 +35,10 @@ from wmh.evals.benchmark import (
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.evaluator import HarborEvaluator, harbor_run_expectation
-from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
+from wmh.evals.harbor.receipt_trace import (
+    ProviderReceiptTrace,
+    validate_provider_receipt_trace,
+)
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.live_session import EventKind
@@ -105,8 +107,7 @@ class _EvaluationCellIdentity(BaseModel):
 class _TraceEvidence:
     text: str
     digest: str
-    provider_receipts: tuple[ChatProviderReceipt, ...]
-    provider_call_indexes: tuple[int, ...]
+    provider_receipt_trace: ProviderReceiptTrace
 
 
 @dataclass(frozen=True)
@@ -118,8 +119,7 @@ class AdmittedHarborTrial:
     score: float
     trace_text: str
     trace_digest: str
-    provider_receipts: tuple[ChatProviderReceipt, ...]
-    provider_receipt_call_indexes: tuple[int, ...]
+    provider_receipt_trace: ProviderReceiptTrace
 
 
 class HarborHarnessScorer:
@@ -741,7 +741,9 @@ def admit_harbor_matrix(
                 provider_config=provider_config,
                 compute_envelope=compute_envelope,
             )
-            request_ids = {receipt.provider_request_id for receipt in trace.provider_receipts}
+            request_ids = {
+                receipt.provider_request_id for receipt in trace.provider_receipt_trace.receipts
+            }
             if provider_request_ids.intersection(request_ids):
                 raise ValueError("Harbor provider request identity was reused across trials")
             provider_request_ids.update(request_ids)
@@ -752,8 +754,7 @@ def admit_harbor_matrix(
                     score=score,
                     trace_text=trace.text,
                     trace_digest=trace.digest,
-                    provider_receipts=trace.provider_receipts,
-                    provider_receipt_call_indexes=trace.provider_call_indexes,
+                    provider_receipt_trace=trace.provider_receipt_trace,
                 )
             )
         ordered[task_id] = scored
@@ -812,8 +813,7 @@ def _read_trace(
         return _TraceEvidence(
             text="(trace unavailable)",
             digest="missing",
-            provider_receipts=(),
-            provider_call_indexes=(),
+            provider_receipt_trace=ProviderReceiptTrace(receipts=(), call_indexes=()),
         )
     if not trace_path.is_file():
         raise ValueError(f"Harbor trace must be a regular file: {relative_path}")
@@ -868,8 +868,7 @@ def _read_trace(
     return _TraceEvidence(
         text=normalize_durable_text(canonical) if canonical else "(trace contained no events)",
         digest="sha256:" + hashlib.sha256(payload).hexdigest(),
-        provider_receipts=receipt_trace.receipts,
-        provider_call_indexes=receipt_trace.call_indexes,
+        provider_receipt_trace=receipt_trace,
     )
 
 

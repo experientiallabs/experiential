@@ -23,8 +23,10 @@ from wmh.evals.benchmark import (
     BenchmarkRunResult,
     BenchmarkTrialResult,
     BenchmarkTrialStatus,
+    BenchmarkUsage,
 )
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
 from wmh.evals.paired import PairedArm, PairedEvaluationDesign, PairedPanelPlan
 from wmh.evals.partition import ConfirmationPartition, PartitionTask
@@ -269,6 +271,7 @@ def _loaded_result(
             status=BenchmarkCandidateStatus.COMPLETED,
         ),
         run_health=BenchmarkRunHealth.VALID,
+        usage=BenchmarkUsage(calls=1),
     )
     job_dir = spec.jobs_dir / spec.job_name
     trial_dir = Path("trial")
@@ -383,6 +386,12 @@ def _install_fake_evaluator(
 
     monkeypatch.setattr(mod, "HarborEvaluator", FakeEvaluator)
     return calls, maximum
+
+
+def _refresh_arm_admission_digest(arm: dict[str, Any]) -> None:
+    arm["admission_digest"] = mod._canonical_digest(
+        cast("Any", {key: value for key, value in arm.items() if key != "admission_digest"})
+    )
 
 
 def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
@@ -678,7 +687,7 @@ def test_provider_receipt_contract_distinguishes_bedrock_and_openai_evidence() -
         started_at_unix_s=1.0,
         finished_at_unix_s=2.0,
     )
-    with pytest.raises(ValueError, match="differs from frozen response identity"):
+    with pytest.raises(ValueError, match="missing response identity"):
         mod._validate_provider_receipt_for_route(
             invalid_receipt,
             route=route,
@@ -688,41 +697,50 @@ def test_provider_receipt_contract_distinguishes_bedrock_and_openai_evidence() -
 
 
 def test_canonical_receipt_trace_preserves_exact_turn_call_indexes() -> None:
-    trace = "\n".join(
-        json.dumps(event, sort_keys=True, separators=(",", ":"))
-        for event in (
-            _receipt_event(request_id="request-1", call_index=1),
-            _receipt_event(request_id="request-2", call_index=2),
-        )
+    events = (
+        _receipt_event(request_id="request-1", call_index=1),
+        _receipt_event(request_id="request-2", call_index=2),
     )
-    receipts, call_indexes = mod._provider_receipts_from_trace(trace)
+    trace = validate_provider_receipt_trace(
+        (cast("dict[str, object]", event["payload"]) for event in events),
+        expected_calls=2,
+        provider_config=_provider(),
+        requested_temperature=pi_node_baseline("limits").temperature(),
+        max_tokens=pi_node_baseline("limits").max_output_tokens(),
+    )
 
-    assert all(isinstance(receipt, mod.ChatProviderReceipt) for receipt in receipts)
-    assert tuple(receipt.provider_request_id for receipt in receipts) == (
+    assert all(isinstance(receipt, mod.ChatProviderReceipt) for receipt in trace.receipts)
+    assert tuple(receipt.provider_request_id for receipt in trace.receipts) == (
         "request-1",
         "request-2",
     )
-    assert call_indexes == (1, 2)
+    assert trace.call_indexes == (1, 2)
 
-    noncontiguous = "\n".join(
-        json.dumps(event, sort_keys=True, separators=(",", ":"))
-        for event in (
-            _receipt_event(request_id="request-1", call_index=1),
-            _receipt_event(request_id="request-2", call_index=3),
-        )
+    noncontiguous = (
+        _receipt_event(request_id="request-1", call_index=1),
+        _receipt_event(request_id="request-2", call_index=3),
     )
-    with pytest.raises(ValueError, match="call indexes are not exact"):
-        mod._provider_receipts_from_trace(noncontiguous)
+    with pytest.raises(ValueError, match="not exact and contiguous"):
+        validate_provider_receipt_trace(
+            (cast("dict[str, object]", event["payload"]) for event in noncontiguous),
+            expected_calls=2,
+            provider_config=_provider(),
+            requested_temperature=pi_node_baseline("limits").temperature(),
+            max_tokens=pi_node_baseline("limits").max_output_tokens(),
+        )
 
-    duplicate = "\n".join(
-        json.dumps(event, sort_keys=True, separators=(",", ":"))
-        for event in (
-            _receipt_event(request_id="request-1", call_index=1),
-            _receipt_event(request_id="request-1", call_index=2),
-        )
+    duplicate = (
+        _receipt_event(request_id="request-1", call_index=1),
+        _receipt_event(request_id="request-1", call_index=2),
     )
-    with pytest.raises(ValueError, match="repeats a provider request ID"):
-        mod._provider_receipts_from_trace(duplicate)
+    with pytest.raises(ValueError, match="reused within one trial"):
+        validate_provider_receipt_trace(
+            (cast("dict[str, object]", event["payload"]) for event in duplicate),
+            expected_calls=2,
+            provider_config=_provider(),
+            requested_temperature=pi_node_baseline("limits").temperature(),
+            max_tokens=pi_node_baseline("limits").max_output_tokens(),
+        )
 
 
 def test_multi_host_execution_requires_durable_coordinator(tmp_path: Path) -> None:
@@ -941,8 +959,7 @@ def test_realistic_trace_without_provider_authored_receipt_fails_closed(
             )
         )
     assert any(
-        "lacks provider-authored request receipts" in str(error)
-        for _, error in captured.value.failures
+        "invalid provider-call evidence" in str(error) for _, error in captured.value.failures
     )
 
 
@@ -1046,6 +1063,50 @@ def test_report_json_reload_recomputes_every_binding_and_analysis(
         mutate(payload)
         with pytest.raises(ValueError):
             mod.PairedHarborRunReport.model_validate(payload)
+
+
+def test_reload_enforces_exact_call_count_controls_and_report_wide_request_uniqueness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    report = asyncio.run(
+        _runner(tmp_path, candidate, baseline=baseline).run(
+            baseline=baseline,
+            candidate=candidate,
+        )
+    )
+    canonical = cast("dict[str, Any]", report.model_dump(mode="json"))
+
+    wrong_count = copy.deepcopy(canonical["evidence"][0]["first"])
+    wrong_count["trial"]["usage"]["calls"] = 2
+    _refresh_arm_admission_digest(wrong_count)
+    with pytest.raises(ValueError, match="receipt count differs"):
+        mod.PairedHarborArmEvidence.model_validate(wrong_count)
+
+    unavailable_count = copy.deepcopy(canonical["evidence"][0]["first"])
+    unavailable_count["trial"]["usage"]["calls"] = None
+    unavailable_count["trial"]["usage"]["calls_status"] = "unavailable"
+    _refresh_arm_admission_digest(unavailable_count)
+    with pytest.raises(ValueError, match="lacks an exact provider call count"):
+        mod.PairedHarborArmEvidence.model_validate(unavailable_count)
+
+    altered_controls = copy.deepcopy(canonical)
+    altered_arm = altered_controls["evidence"][0]["first"]
+    altered_arm["provider_receipts"][0]["temperature"] = 0.1
+    _refresh_arm_admission_digest(altered_arm)
+    with pytest.raises(ValueError, match="frozen temperature"):
+        mod.PairedHarborRunReport.model_validate(altered_controls)
+
+    reused_request = copy.deepcopy(canonical)
+    first_id = reused_request["evidence"][0]["first"]["provider_receipts"][0]["provider_request_id"]
+    second_arm = reused_request["evidence"][0]["second"]
+    second_arm["provider_receipts"][0]["provider_request_id"] = first_id
+    _refresh_arm_admission_digest(second_arm)
+    with pytest.raises(ValueError, match="reuses a provider request ID"):
+        mod.PairedHarborRunReport.model_validate(reused_request)
 
 
 def test_same_host_operations_share_global_route_and_task_capacity(

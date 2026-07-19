@@ -38,6 +38,7 @@ from wmh.evals.benchmark import (
     BenchmarkCandidateStatus,
     BenchmarkRunIdentity,
     BenchmarkTrialResult,
+    BenchmarkUsageStatus,
 )
 from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION
@@ -72,6 +73,7 @@ from wmh.evals.partition import ConfirmationPartition
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE, validate_pi_container_image
 from wmh.providers.base import ProviderConfig
+from wmh.providers.receipt import validate_chat_provider_receipt
 
 PAIRED_HARBOR_PROTOCOL_VERSION: Literal["2"] = "2"
 PAIRED_HARBOR_RUN_VERSION: Literal["3"] = "3"
@@ -602,6 +604,15 @@ class PairedHarborArmEvidence(BaseModel):
             self.trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
             and self.trial.candidate_outcome.stage is BenchmarkCandidateStage.SETUP
         )
+        if (
+            self.trial.usage.calls is None
+            or self.trial.usage.calls_status is not BenchmarkUsageStatus.EXACT
+        ):
+            raise ValueError("paired Harbor evidence lacks an exact provider call count")
+        if len(self.provider_receipts) != self.trial.usage.calls:
+            raise ValueError(
+                "paired Harbor receipt count differs from the successful provider call count"
+            )
         if not self.provider_receipts and not no_call_candidate_setup_failure:
             raise ValueError(
                 "paired Harbor evidence lacks provider-authored request receipts; configured "
@@ -1306,9 +1317,8 @@ class PairedHarborRunner:
                 f"Harbor task {block.task_id!r} content differs from frozen qualification"
             )
         run_identity = PairedHarborRunIdentity.model_validate(loaded.result.identity.model_dump())
-        provider_receipts, provider_receipt_call_indexes = _provider_receipts_from_trace(
-            item.trace_text
-        )
+        provider_receipts = item.provider_receipt_trace.receipts
+        provider_receipt_call_indexes = item.provider_receipt_trace.call_indexes
         for receipt in provider_receipts:
             _validate_provider_receipt_for_route(
                 receipt,
@@ -1702,43 +1712,6 @@ def _enter_first_available_lease(stack: ExitStack, paths: tuple[Path, ...]) -> N
     raise last_error
 
 
-def _provider_receipts_from_trace(
-    trace_text: str,
-) -> tuple[tuple[ChatProviderReceipt, ...], tuple[int, ...]]:
-    receipts: list[ChatProviderReceipt] = []
-    call_indexes: list[int] = []
-    for line in trace_text.splitlines():
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(raw, dict) or raw.get("kind") != "provider_receipt":
-            continue
-        payload = raw.get("payload")
-        if not isinstance(payload, dict):
-            raise ValueError("paired Harbor provider receipt payload is not an object")
-        receipt_payload = dict(payload)
-        call_index = receipt_payload.pop("turn_call_index", None)
-        if isinstance(call_index, bool) or not isinstance(call_index, int) or call_index < 1:
-            raise ValueError("paired Harbor provider receipt call index is invalid")
-        receipts.append(ChatProviderReceipt.model_validate(receipt_payload))
-        call_indexes.append(call_index)
-    if tuple(call_indexes) != tuple(range(1, len(receipts) + 1)):
-        raise ValueError("paired Harbor provider receipt call indexes are not exact")
-    request_ids = [receipt.provider_request_id for receipt in receipts]
-    if len(request_ids) != len(set(request_ids)):
-        raise ValueError("paired Harbor trace repeats a provider request ID")
-    return tuple(receipts), tuple(call_indexes)
-
-
-def _requested_model(config: ProviderConfig) -> str:
-    if config.kind.value == "azure":
-        if config.deployment is None:
-            raise ValueError("paired Azure route requires an explicit deployment")
-        return config.deployment
-    return config.model
-
-
 def _validate_provider_receipt_for_route(
     receipt: ChatProviderReceipt,
     *,
@@ -1747,28 +1720,13 @@ def _validate_provider_receipt_for_route(
     temperature: float,
 ) -> None:
     config = route.provider_config
-    expected_max_tokens_field = (
-        "inferenceConfig.maxTokens"
-        if config.kind.value == "bedrock"
-        else config.resolved_chat_max_tokens_field()
+    validate_chat_provider_receipt(
+        receipt,
+        provider_config=config,
+        requested_temperature=temperature,
+        max_tokens=max_output_tokens,
     )
-    if (
-        receipt.provider != config.kind.value
-        or receipt.requested_model != _requested_model(config)
-        or receipt.temperature != temperature
-        or receipt.max_tokens != max_output_tokens
-        or receipt.max_tokens_field != expected_max_tokens_field
-        or receipt.seed_supplied
-        or receipt.cache_config_supplied
-    ):
-        raise ValueError("paired Harbor provider receipt differs from frozen route controls")
     if config.kind.value == "bedrock":
-        if (
-            receipt.response_id is not None
-            or receipt.response_model is not None
-            or receipt.system_fingerprint is not None
-        ):
-            raise ValueError("paired Bedrock receipt contains unsupported response identity")
         return
     if (
         receipt.response_id is None
