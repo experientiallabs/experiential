@@ -71,10 +71,10 @@ from wmh.evals.paired import (
     PairedBlock,
     PairedBlockOutcome,
     PairedEvaluationDesign,
-    PairedEvaluationDesignTemplate,
     PairedTaskPlan,
     analyze_paired_outcomes,
 )
+from wmh.evals.paired_commitment import PairedEvaluationDesignTemplate
 from wmh.evals.partition import (
     BenchmarkPartitionManifest,
     CandidateFreezeRecord,

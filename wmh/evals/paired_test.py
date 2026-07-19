@@ -15,7 +15,6 @@ from wmh.evals.paired import (
     PairedArm,
     PairedBlockOutcome,
     PairedEvaluationDesign,
-    PairedEvaluationDesignTemplate,
     PairedPanelPlan,
     PairedTaskPlan,
     _bounded_mean_interval,
@@ -27,6 +26,7 @@ from wmh.evals.paired import (
     analyze_paired_outcomes,
     paired_primary_decision_passed,
 )
+from wmh.evals.paired_commitment import PairedEvaluationDesignTemplate
 
 
 def _design(

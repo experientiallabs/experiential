@@ -38,10 +38,10 @@ from wmh.evals.paired import (
     BoundedMeanBet,
     PairedArm,
     PairedEvaluationDesign,
-    PairedEvaluationDesignTemplate,
     PairedPanelPlan,
     PairedTaskPlan,
 )
+from wmh.evals.paired_commitment import PairedEvaluationDesignTemplate
 from wmh.evals.partition import (
     BenchmarkPartitionManifest,
     ConfirmationPartition,
