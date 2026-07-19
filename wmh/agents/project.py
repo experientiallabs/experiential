@@ -78,6 +78,14 @@ _RECOVERABLE_SESSION_MARKERS = (
 _EXACT_E2B_TEMPLATE = re.compile(r"[A-Za-z0-9_.-]{1,512}:[A-Za-z0-9_.-]{1,512}\Z")
 _PROJECT_LEASE_FILE = re.compile(r"[0-9a-f]{32}\.json\Z")
 _MAX_PROJECT_LEASE_FILES = 4096
+_PROJECT_CREATE_RETRY_DELAYS_S = (1.0, 3.0, 9.0)
+_PROJECT_CREATE_HORIZON_S = int(
+    E2B_CREATE_REQUEST_TIMEOUT_S * (len(_PROJECT_CREATE_RETRY_DELAYS_S) + 1)
+    + sum(_PROJECT_CREATE_RETRY_DELAYS_S)
+)
+_PROJECT_PROVIDER_CLOCK_SKEW_S = 30
+_E2B_RATE_REFUSAL_PREFIX = "429: Rate limit exceeded, please try again later."
+_ProjectCreateOutcome = Literal["not_dispatched", "rejected", "unknown"]
 
 
 class ChannelFactory(Protocol):
@@ -130,6 +138,13 @@ class _ProjectResourceLease:
     reservation: TimedResourceReservation | None
 
 
+def _is_definitive_e2b_rate_refusal(error: Exception) -> bool:
+    """Return whether E2B proved this create was rejected before allocating a sandbox."""
+    return type(error).__name__ == "RateLimitException" and str(error).startswith(
+        _E2B_RATE_REFUSAL_PREFIX
+    )
+
+
 class _BudgetedProjectSandboxFactory:
     """Create each proposer-project lease once under the shared experiment hard cap."""
 
@@ -167,7 +182,7 @@ class _BudgetedProjectSandboxFactory:
             cpu_count=cpu_count,
             memory_mb=memory_mb,
             provider_ttl_seconds=self._provider_ttl_seconds,
-            create_request_timeout_seconds=E2B_CREATE_REQUEST_TIMEOUT_S,
+            create_request_timeout_seconds=_PROJECT_CREATE_HORIZON_S,
             cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
         )
         # Construction validates the meter role, class digest, and full host horizon before any
@@ -186,9 +201,14 @@ class _BudgetedProjectSandboxFactory:
             lease_id=lease_id,
             owner_id=self._owner_id,
             config_digest=self._config_digest,
+            provider_expiry_horizon_s=(
+                _PROJECT_CREATE_HORIZON_S
+                + self._provider_ttl_seconds
+                + _PROJECT_PROVIDER_CLOCK_SKEW_S
+            ),
         )
         reservation: TimedResourceReservation | None = None
-        create_dispatched = False
+        create_outcome: _ProjectCreateOutcome = "not_dispatched"
         try:
             reservation = TimedResourceBudget(
                 self._account,
@@ -211,14 +231,25 @@ class _BudgetedProjectSandboxFactory:
                 lifecycle={"on_timeout": "kill", "auto_resume": False},
                 request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
             )
-            create_dispatched = True
-            sandbox = factory()
+            for attempt in range(len(_PROJECT_CREATE_RETRY_DELAYS_S) + 1):
+                create_outcome = "unknown"
+                try:
+                    sandbox = factory()
+                except Exception as error:  # noqa: BLE001 - only an exact SDK refusal retries
+                    if not _is_definitive_e2b_rate_refusal(error):
+                        raise
+                    create_outcome = "rejected"
+                    if attempt == len(_PROJECT_CREATE_RETRY_DELAYS_S):
+                        raise
+                    time.sleep(_PROJECT_CREATE_RETRY_DELAYS_S[attempt])
+                    continue
+                break
         except BaseException:
             self._retire_failed_creation(
                 ledger,
                 lease_id=lease_id,
                 reservation=reservation,
-                create_dispatched=create_dispatched,
+                create_outcome=create_outcome,
             )
             raise
         resource_id = getattr(sandbox, "sandbox_id", None)
@@ -289,7 +320,9 @@ class _BudgetedProjectSandboxFactory:
                     )
                 ),
                 orphan_expiry_horizon_s=(
-                    E2B_CREATE_REQUEST_TIMEOUT_S + self._provider_ttl_seconds + 30
+                    _PROJECT_CREATE_HORIZON_S
+                    + self._provider_ttl_seconds
+                    + _PROJECT_PROVIDER_CLOCK_SKEW_S
                 ),
             )
 
@@ -351,17 +384,21 @@ class _BudgetedProjectSandboxFactory:
         *,
         lease_id: str,
         reservation: TimedResourceReservation | None,
-        create_dispatched: bool,
+        create_outcome: _ProjectCreateOutcome,
     ) -> None:
         budget_error: Exception | None = None
         if reservation is not None:
             try:
                 reservation.forfeit(
-                    failure_type=("CreateUnknown" if create_dispatched else "PreDispatchFailure")
+                    failure_type={
+                        "not_dispatched": "PreDispatchFailure",
+                        "rejected": "CreateRejected",
+                        "unknown": "CreateUnknown",
+                    }[create_outcome]
                 )
             except Exception as error:  # noqa: BLE001 - cleanup still runs after ledger failure
                 budget_error = error
-        if create_dispatched:
+        if create_outcome == "unknown":
             try:
                 self._orphan_reaper(lease_id)
             except BaseException:
