@@ -99,6 +99,7 @@ class _FakeEnvironment:
         stops: list[str],
         fail_start: set[str],
         fail_stop: set[str],
+        requested_storage_mb: int | None,
     ) -> None:
         self.environment_name = environment_name
         self.trial_paths = trial_paths
@@ -107,6 +108,7 @@ class _FakeEnvironment:
         self.stops = stops
         self.fail_start = fail_start
         self.fail_stop = fail_stop
+        self.requested_storage_mb = requested_storage_mb
 
     def type(self) -> EnvironmentType:
         if self.backend is HarborEnvironmentBackend.LOCAL:
@@ -182,6 +184,7 @@ def _install_fake_environments(
         **kwargs: object,
     ) -> _FakeEnvironment:
         constructor_kwargs.append({"environment_name": environment_name, **kwargs})
+        task_env_config = cast("Any", kwargs["task_env_config"])
         return _FakeEnvironment(
             environment_name=environment_name,
             trial_paths=trial_paths,
@@ -190,6 +193,7 @@ def _install_fake_environments(
             stops=stops,
             fail_start=failures,
             fail_stop=cleanup_failures,
+            requested_storage_mb=task_env_config.storage_mb,
         )
 
     async def attest(environment: _FakeEnvironment) -> HarborTaskEnvironmentAttestation:
@@ -200,7 +204,9 @@ def _install_fake_environments(
                 "schema_version": 2,
                 "backend": "docker",
                 "daemon_platform": "linux/x86_64",
-                "requested_storage_mb": None,
+                "requested_storage_mb": environment.requested_storage_mb,
+                "storage_capacity_scope": "shared_task_filesystem_available",
+                "storage_provider_enforced": False,
                 "storage_requirement_satisfied": True,
                 "services": [
                     {
@@ -225,8 +231,12 @@ def _install_fake_environments(
                 "platform": "linux/x86_64",
                 "cpu_count": build.cpu_count,
                 "memory_mb": build.memory_mb,
-                "requested_storage_mb": build.storage_mb,
-                "observed_storage_mb": max(build.storage_mb or 0, 20_480),
+                "requested_storage_mb": environment.requested_storage_mb,
+                "observed_storage_mb": (
+                    None
+                    if environment.requested_storage_mb is None
+                    else max(environment.requested_storage_mb, 20_480)
+                ),
                 "envd_version": "0.2.1",
                 "internet_access": True,
                 "lease_timeout_s": 3600,
@@ -597,7 +607,6 @@ def _budgeted_build_record(
         build_id=build_id,
         cpu_count=spec.cpu_count,
         memory_mb=spec.memory_mb,
-        storage_mb=spec.storage_mb,
         cost_attribution=BudgetedE2BBuildAttribution(
             policy_digest=budget.policy.policy_digest,
             ledger_identity=budget.ledger_identity,
@@ -615,7 +624,11 @@ def _budgeted_build_record(
     )
 
 
-def _fake_e2b_attestation_evidence(build: ExactE2BBuildRecord) -> dict[str, Any]:
+def _fake_e2b_attestation_evidence(
+    build: ExactE2BBuildRecord,
+    *,
+    requested_storage_mb: int | None,
+) -> dict[str, Any]:
     return {
         "schema_version": 3,
         "backend": "e2b",
@@ -627,8 +640,10 @@ def _fake_e2b_attestation_evidence(build: ExactE2BBuildRecord) -> dict[str, Any]
         "platform": "linux/x86_64",
         "cpu_count": build.cpu_count,
         "memory_mb": build.memory_mb,
-        "requested_storage_mb": build.storage_mb,
-        "observed_storage_mb": max(build.storage_mb or 0, 20_480),
+        "requested_storage_mb": requested_storage_mb,
+        "observed_storage_mb": (
+            None if requested_storage_mb is None else max(requested_storage_mb, 20_480)
+        ),
         "envd_version": "0.2.1",
         "internet_access": True,
         "lease_timeout_s": 3600,
@@ -672,7 +687,7 @@ def test_e2b_qualification_dedupes_builds_and_binds_launch_accounts(
 ) -> None:
     dataset = tmp_path / "dataset"
     _write_task(dataset, "task-a", storage_mb=10_240)
-    _write_task(dataset, "task-b", storage_mb=10_240)
+    _write_task(dataset, "task-b", storage_mb=15_360)
     budget = _e2b_budget_runtime(tmp_path)
     build_calls: list[ExactE2BBuildSpec] = []
     builds_by_task: dict[str, ExactE2BBuildRecord] = {}
@@ -699,7 +714,10 @@ def test_e2b_qualification_dedupes_builds_and_binds_launch_accounts(
 
     async def attest(environment: _FakeEnvironment) -> HarborTaskEnvironmentAttestation:
         build = next(iter(builds_by_task.values()))
-        evidence = _fake_e2b_attestation_evidence(build)
+        evidence = _fake_e2b_attestation_evidence(
+            build,
+            requested_storage_mb=environment.requested_storage_mb,
+        )
         return HarborTaskEnvironmentAttestation.from_evidence(evidence)
 
     constructor_kwargs = _install_fake_environments(
@@ -727,10 +745,9 @@ def test_e2b_qualification_dedupes_builds_and_binds_launch_accounts(
     assert stops == starts
     assert len({task.e2b_build_config_digest for task in roster.tasks}) == 1
     assert all(task.task_resource_class is not None for task in roster.tasks)
-    assert all(
-        task.e2b_build_identity is not None and task.e2b_build_identity.storage_mb == 10_240
-        for task in roster.tasks
-    )
+    assert tuple(task.requested_storage_mb for task in roster.tasks) == (10_240, 15_360)
+    assert tuple(task.observed_storage_mb for task in roster.tasks) == (20_480, 20_480)
+    assert all(task.e2b_launch_config_digest == "sha256:" + "2" * 64 for task in roster.tasks)
     assert all(
         cast("Any", kwargs["config"]).kwargs["resource_budget_bindings"]
         for kwargs in constructor_kwargs

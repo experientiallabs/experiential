@@ -115,7 +115,6 @@ class QualifiedE2BBuildIdentity(BaseModel):
     docker_image: str | None = Field(default=None, min_length=1, max_length=2_048)
     cpu_count: int = Field(ge=1)
     memory_mb: int = Field(ge=1)
-    storage_mb: int | None = Field(default=None, ge=1)
     template_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
     build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
 
@@ -127,7 +126,6 @@ class QualifiedE2BBuildIdentity(BaseModel):
             docker_image=self.docker_image,
             cpu_count=self.cpu_count,
             memory_mb=self.memory_mb,
-            storage_mb=self.storage_mb,
         )
         if self.build_config_digest != spec.digest:
             raise ValueError("qualified E2B build config digest is inconsistent")
@@ -147,6 +145,9 @@ class QualifiedHarborTask(BaseModel):
     task_key: str = Field(pattern=_DIGEST_PATTERN)
     task_environment_digest: str = Field(pattern=_DIGEST_PATTERN)
     environment_backend: HarborEnvironmentBackend
+    requested_storage_mb: int | None = Field(default=None, ge=1)
+    observed_storage_mb: int | None = Field(default=None, ge=1)
+    e2b_launch_config_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     e2b_build_config_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     e2b_build_record_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     task_resource_class_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
@@ -164,6 +165,7 @@ class QualifiedHarborTask(BaseModel):
     @model_validator(mode="after")
     def _require_backend_qualification(self) -> Self:
         e2b_fields = (
+            self.e2b_launch_config_digest,
             self.e2b_build_config_digest,
             self.e2b_build_record_digest,
             self.task_resource_class_digest,
@@ -173,6 +175,8 @@ class QualifiedHarborTask(BaseModel):
         if self.environment_backend is HarborEnvironmentBackend.LOCAL:
             if any(value is not None for value in e2b_fields):
                 raise ValueError("local task qualification cannot carry E2B build identities")
+            if self.observed_storage_mb is not None:
+                raise ValueError("local task qualification cannot carry E2B storage metrics")
         elif any(value is None for value in e2b_fields):
             raise ValueError(
                 "E2B task qualification requires exact build and resource class identities"
@@ -193,6 +197,14 @@ class QualifiedHarborTask(BaseModel):
                 or self.task_resource_class.memory_mb != self.e2b_build_identity.memory_mb
             ):
                 raise ValueError("E2B task build and launch resource identities differ")
+            if self.requested_storage_mb is None:
+                if self.observed_storage_mb is not None:
+                    raise ValueError("unrequested E2B storage cannot have observed capacity")
+            elif (
+                self.observed_storage_mb is None
+                or self.observed_storage_mb < self.requested_storage_mb
+            ):
+                raise ValueError("E2B observed storage is below the requested minimum")
         return self
 
 
@@ -1916,7 +1928,6 @@ class PairedHarborRunner:
             docker_image=identity.docker_image,
             cpu_count=identity.cpu_count,
             memory_mb=identity.memory_mb,
-            storage_mb=identity.storage_mb,
             expected_budget_authority=task_resource_accounts[0],
             allow_preexisting_outside_study=False,
         )
@@ -1925,7 +1936,6 @@ class PairedHarborRunner:
             or record.digest != identity.build_record_digest
             or record.template_id != identity.template_id
             or record.build_id != identity.build_id
-            or record.storage_mb != identity.storage_mb
         ):
             raise ValueError("scored E2B task build differs from full-roster qualification")
 
@@ -2330,8 +2340,12 @@ def _validate_backend_trial_evidence(
         if (
             not isinstance(attestation, dict)
             or attestation.get("backend") != "e2b"
+            or attestation.get("launch_config_digest")
+            != qualification.e2b_launch_config_digest
             or attestation.get("build_config_digest") != qualification.e2b_build_config_digest
             or attestation.get("build_record_digest") != qualification.e2b_build_record_digest
+            or attestation.get("requested_storage_mb") != qualification.requested_storage_mb
+            or attestation.get("observed_storage_mb") != qualification.observed_storage_mb
         ):
             raise ValueError("paired Harbor E2B task build differs from full-roster qualification")
     runner_attestation = trial.runner_environment_attestation

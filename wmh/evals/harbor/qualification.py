@@ -429,6 +429,7 @@ class _QualifiedTaskEvidence(BaseModel):
                 or self.cleanup_receipt is not None
                 or self.task_environment_attestation.get("storage_requirement_satisfied")
                 is not True
+                or requested_storage != self.qualification.requested_storage_mb
                 or (
                     requested_storage is not None
                     and (
@@ -442,6 +443,7 @@ class _QualifiedTaskEvidence(BaseModel):
         else:
             build = self.qualification.e2b_build_identity
             resource_class = self.qualification.task_resource_class
+            requested_storage = self.task_environment_attestation.get("requested_storage_mb")
             observed_storage = self.task_environment_attestation.get("observed_storage_mb")
             if (
                 backend != "e2b"
@@ -455,11 +457,10 @@ class _QualifiedTaskEvidence(BaseModel):
                 or self.task_environment_attestation.get("environment_id") != build.environment_id
                 or self.task_environment_attestation.get("cpu_count") != resource_class.cpu_count
                 or self.task_environment_attestation.get("memory_mb") != resource_class.memory_mb
-                or self.task_environment_attestation.get("requested_storage_mb") != build.storage_mb
-                or isinstance(observed_storage, bool)
-                or not isinstance(observed_storage, int)
-                or observed_storage < 1
-                or (build.storage_mb is not None and observed_storage < build.storage_mb)
+                or self.task_environment_attestation.get("launch_config_digest")
+                != self.qualification.e2b_launch_config_digest
+                or requested_storage != self.qualification.requested_storage_mb
+                or observed_storage != self.qualification.observed_storage_mb
             ):
                 raise ValueError("E2B qualification attestation differs from its exact build")
             receipt = self.cleanup_receipt
@@ -713,7 +714,6 @@ class HarborRosterQualifier:
             docker_image=task.config.environment.docker_image,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
-            storage_mb=task.config.environment.storage_mb,
         )
         task_class = ExactE2BEnvironment._task_resource_class(
             cpu_count=cpu_count,
@@ -973,6 +973,7 @@ class HarborRosterQualifier:
             "task_key": item.commitment.task_key,
             "task_environment_digest": attestation.digest,
             "environment_backend": self._plan.environment_backend,
+            "requested_storage_mb": attestation.evidence.get("requested_storage_mb"),
         }
         if item.build_spec is None:
             return QualifiedHarborTask(**common)
@@ -986,12 +987,17 @@ class HarborRosterQualifier:
             docker_image=item.build_spec.docker_image,
             cpu_count=record.cpu_count,
             memory_mb=record.memory_mb,
-            storage_mb=record.storage_mb,
             template_id=record.template_id,
             build_id=record.build_id,
         )
         return QualifiedHarborTask(
             **common,
+            observed_storage_mb=cast(
+                "int | None", attestation.evidence.get("observed_storage_mb")
+            ),
+            e2b_launch_config_digest=cast(
+                "str", attestation.evidence.get("launch_config_digest")
+            ),
             e2b_build_config_digest=record.build_config_digest,
             e2b_build_record_digest=record.digest,
             task_resource_class_digest=resource_class.digest,
@@ -1070,7 +1076,6 @@ class HarborRosterQualifier:
                 docker_image=identity.docker_image,
                 cpu_count=identity.cpu_count,
                 memory_mb=identity.memory_mb,
-                storage_mb=identity.storage_mb,
                 expected_budget_authority=account,
                 allow_preexisting_outside_study=False,
             )
@@ -1079,7 +1084,6 @@ class HarborRosterQualifier:
                 or record.digest != identity.build_record_digest
                 or record.template_id != identity.template_id
                 or record.build_id != identity.build_id
-                or record.storage_mb != identity.storage_mb
             ):
                 raise HarborRosterQualificationDriftError(
                     "published E2B roster build record drifted"
