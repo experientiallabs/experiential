@@ -14,8 +14,8 @@ iteration's champion:
   the champion on tasks the proposer never saw evidence from.
 
 Ties pass every gate tier: with k passes per task, scores are coarse, and "no worse" is the
-eligibility contract. When multiple siblings are eligible, full success wins, then assertion
-fraction, then lower proposal index. Every proposed delta, whether selected, rejected, or invalid
+eligibility contract. When multiple siblings are eligible, full success wins, then secondary
+score, then lower proposal index. Every proposed delta, whether selected, rejected, or invalid
 before eval, is recorded in the archive with its verdict. The run as a whole is only as
 reproducible as its providers because proposals and rollouts sample real models at temperature.
 """

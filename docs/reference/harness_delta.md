@@ -99,7 +99,7 @@ class GateRecord(BaseModel):
     full_delta: float            # full split: child − best-seen        (tier 2)
     full_secondary_delta: float   # secondary score when full score ties
     holdout_delta: float | None  # held-out split: child − champion     (tier 3; None = no holdout)
-    holdout_secondary_delta: float | None
+    holdout_secondary_delta: float | None  # secondary score when held-out score ties
     accepted: bool
     reason: str                  # accept/reject reasoning, incl. the expected-effect audit
 
