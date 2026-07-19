@@ -14,6 +14,7 @@ from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProjectRun
 from wmh.core.types import JsonObject
+from wmh.harness import proposer as proposer_module
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.mutate import parse_delta
@@ -59,6 +60,13 @@ def _payload(parent: HarnessDoc, content: str) -> str:
                 }
             ],
         }
+    )
+
+
+def test_missing_private_file_detection_does_not_swallow_unrelated_not_found_errors() -> None:
+    assert proposer_module._is_missing_file_error(RuntimeError("ENOENT: no such file"))
+    assert not proposer_module._is_missing_file_error(
+        RuntimeError("provider route was not found during transport")
     )
 
 

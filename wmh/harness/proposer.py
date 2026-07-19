@@ -809,7 +809,7 @@ def _is_missing_file_error(error: Exception) -> bool:
         return True
     error_name = type(error).__name__.lower()
     text = str(error).lower()
-    return "notfound" in error_name or "not found" in text or "no such file" in text
+    return "notfound" in error_name or "no such file" in text or "enoent" in text
 
 
 def _content_digest(content: str) -> str:

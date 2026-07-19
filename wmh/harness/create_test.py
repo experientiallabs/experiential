@@ -483,6 +483,24 @@ def test_checkpointed_search_requires_an_independently_configured_holdout() -> N
     assert holdout.requests == []
 
 
+def test_checkpoint_emission_reports_missing_internal_configuration_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(create_module, "_search_configuration", lambda **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="requires a resolved search configuration"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _HistoryProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+
 def test_checkpointed_search_requires_disjoint_discovery_and_holdout_tasks() -> None:
     class DistinctRouteSameTasks(_NeutralScorer):
         configuration_id = "distinct-route-same-tasks-v1"

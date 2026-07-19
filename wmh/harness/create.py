@@ -1270,7 +1270,8 @@ def search_harness(
     def _emit_checkpoint(completed_iteration: int) -> None:
         if on_checkpoint is None:
             return
-        assert configuration is not None
+        if configuration is None:
+            raise RuntimeError("on_checkpoint requires a resolved search configuration")
         proposer_state = _export_proposer_state(
             proposer,
             required=configuration.proposer.durable_state_required,
