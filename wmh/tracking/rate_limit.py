@@ -378,7 +378,7 @@ def _read_state(path: Path) -> _ExternalDispatchRateState:
     try:
         metadata = path.stat()
         if (
-            not path.is_file()
+            not stat.S_ISREG(metadata.st_mode)
             or metadata.st_size > _MAX_STATE_BYTES
             or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
@@ -399,7 +399,11 @@ def _persist_state(path: Path, state: _ExternalDispatchRateState) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=".wmh-rate-", dir=path.parent)
     temporary_path = Path(temporary)
     try:
-        os.fchmod(descriptor, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+        except BaseException:
+            os.close(descriptor)
+            raise
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(frozen.model_dump_json().encode())
             handle.flush()

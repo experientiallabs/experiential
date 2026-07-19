@@ -7,6 +7,7 @@ import os
 import tempfile
 from contextlib import AbstractContextManager
 from pathlib import Path
+from typing import TypedDict
 
 import typer
 from click import ClickException
@@ -43,6 +44,10 @@ _MAX_RUNNER_SPEC_BYTES = 64 * 1024
 
 class ConcurrentHarnessOutputError(RuntimeError):
     """Another process already holds the exclusive lease for a canonical output."""
+
+
+class _CreateRateKwargs(TypedDict, total=False):
+    create_rate_authority: ExternalDispatchRateAuthority
 
 
 def register(app: typer.Typer) -> None:
@@ -355,28 +360,20 @@ def eval_harness(
         create_rate_policy=(E2B_SANDBOX_CREATE_RATE_POLICY if requires_create_rate else None),
         allow_preexisting_e2b_builds=allow_preexisting_e2b_builds,
     )
+    create_rate_kwargs: _CreateRateKwargs = {}
+    if create_rate_authority is not None:
+        create_rate_kwargs["create_rate_authority"] = create_rate_authority
     try:
-        if create_rate_authority is None:
-            evaluator = HarborEvaluator(
-                spec,
-                provider_config,
-                runner_spec=runner_spec,
-                turn_timeout_s=turn_timeout_s,
-                budget_account=budget_account,
-                task_resource_budget_accounts=task_resource_budget_accounts,
-                runner_resource_budget_account=runner_resource_budget_account,
-            )
-        else:
-            evaluator = HarborEvaluator(
-                spec,
-                provider_config,
-                runner_spec=runner_spec,
-                turn_timeout_s=turn_timeout_s,
-                budget_account=budget_account,
-                task_resource_budget_accounts=task_resource_budget_accounts,
-                runner_resource_budget_account=runner_resource_budget_account,
-                create_rate_authority=create_rate_authority,
-            )
+        evaluator = HarborEvaluator(
+            spec,
+            provider_config,
+            runner_spec=runner_spec,
+            turn_timeout_s=turn_timeout_s,
+            budget_account=budget_account,
+            task_resource_budget_accounts=task_resource_budget_accounts,
+            runner_resource_budget_account=runner_resource_budget_account,
+            **create_rate_kwargs,
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     output_path = _validate_output_path(

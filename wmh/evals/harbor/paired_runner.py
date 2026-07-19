@@ -17,7 +17,7 @@ from contextlib import (
     asynccontextmanager,
 )
 from pathlib import Path
-from typing import Literal, Protocol, Self
+from typing import Literal, Protocol, Self, TypedDict
 
 from harbor.models.job.config import DatasetConfig
 from llm_waterfall import ChatProviderReceipt
@@ -113,6 +113,11 @@ from wmh.tracking.rate_limit import (
     bind_external_dispatch_rate_authority,
     validate_e2b_sandbox_create_rate_policy,
 )
+
+
+class _CreateRateKwargs(TypedDict, total=False):
+    create_rate_authority: ExternalDispatchRateAuthority
+
 
 PAIRED_HARBOR_PROTOCOL_VERSION: Literal["9"] = "9"
 PAIRED_HARBOR_RUN_VERSION: Literal["10"] = "10"
@@ -2345,31 +2350,21 @@ class PairedHarborRunner:
             arm=arm,
             run_id=job_name,
         )
-        if self._create_rate_authority is None:
-            evaluator = HarborEvaluator(
-                spec,
-                route.provider_config.model_copy(deep=True),
-                runner_spec=plan.runner_spec,
-                turn_timeout_s=plan.turn_timeout_s,
-                require_provider_receipts=True,
-                session=evaluator_session,
-                budget_account=provider_account,
-                task_resource_budget_accounts=task_resource_accounts,
-                runner_resource_budget_account=runner_resource_account,
-            )
-        else:
-            evaluator = HarborEvaluator(
-                spec,
-                route.provider_config.model_copy(deep=True),
-                runner_spec=plan.runner_spec,
-                turn_timeout_s=plan.turn_timeout_s,
-                require_provider_receipts=True,
-                session=evaluator_session,
-                budget_account=provider_account,
-                task_resource_budget_accounts=task_resource_accounts,
-                runner_resource_budget_account=runner_resource_account,
-                create_rate_authority=self._create_rate_authority,
-            )
+        create_rate_kwargs: _CreateRateKwargs = {}
+        if self._create_rate_authority is not None:
+            create_rate_kwargs["create_rate_authority"] = self._create_rate_authority
+        evaluator = HarborEvaluator(
+            spec,
+            route.provider_config.model_copy(deep=True),
+            runner_spec=plan.runner_spec,
+            turn_timeout_s=plan.turn_timeout_s,
+            require_provider_receipts=True,
+            session=evaluator_session,
+            budget_account=provider_account,
+            task_resource_budget_accounts=task_resource_accounts,
+            runner_resource_budget_account=runner_resource_account,
+            **create_rate_kwargs,
+        )
         loaded = await evaluator.evaluate(harness)
         validate_harbor_run_identity(
             loaded.result,

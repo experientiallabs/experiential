@@ -201,6 +201,39 @@ def test_rate_authority_rejects_relative_host_path() -> None:
         ExternalDispatchRateAuthority.bootstrap(Path("rate.json"), _policy())
 
 
+def test_state_persist_closes_temporary_descriptor_when_chmod_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = rate_limit._ExternalDispatchRateState.freeze(  # noqa: SLF001
+        policy_digest=_policy().digest,
+        ledger_identity="sha256:" + "1" * 64,
+        sequence=0,
+        last_admitted_at_unix_ns=None,
+    )
+    observed: list[int] = []
+    closed: list[int] = []
+    real_close = os.close
+
+    def fail_fchmod(descriptor: int, _mode: int) -> None:
+        observed.append(descriptor)
+        raise OSError("synthetic chmod failure")
+
+    def record_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(rate_limit.os, "fchmod", fail_fchmod)
+    monkeypatch.setattr(rate_limit.os, "close", record_close)
+
+    with pytest.raises(OSError, match="synthetic chmod failure"):
+        rate_limit._persist_state(tmp_path / "rate.json", state)  # noqa: SLF001
+
+    assert observed and closed == observed
+    with pytest.raises(OSError):
+        os.fstat(observed[0])
+
+
 def test_e2b_create_policy_is_exact_and_rejects_provider_limit_drift() -> None:
     assert validate_e2b_sandbox_create_rate_policy(_policy()) == _policy()
 
