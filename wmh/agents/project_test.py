@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,7 @@ from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
     BudgetExceededError,
+    BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
     ReservationStatus,
@@ -1439,18 +1441,25 @@ class _AttestedProjectSandbox(_Sandbox):
         return self.info
 
 
+class RateLimitException(RuntimeError):
+    """Pinned E2B SDK 429 shape used without importing the optional SDK in tests."""
+
+
 def _project_resource_account(
     tmp_path: Path,
     *,
     timeout: int = 60,
     hard_limit: int | None = None,
+    create_horizon: int | None = None,
 ) -> TimedResourceBudgetAccount:
     resource_class = TimedResourceClass(
         role=TimedResourceRole.PROPOSER_PROJECT,
         cpu_count=2,
         memory_mb=2048,
         provider_ttl_seconds=timeout,
-        create_request_timeout_seconds=project_module.E2B_CREATE_REQUEST_TIMEOUT_S,
+        create_request_timeout_seconds=(
+            project_module._PROJECT_CREATE_HORIZON_S if create_horizon is None else create_horizon
+        ),
         cleanup_horizon_seconds=project_module.E2B_CLEANUP_HORIZON_S,
     )
     meter = TimedResourceCostMeter(
@@ -1570,6 +1579,25 @@ def test_budgeted_project_rejects_timeout_above_provider_maximum(tmp_path: Path)
         )
 
 
+def test_budgeted_project_requires_budget_for_the_full_retry_horizon(tmp_path: Path) -> None:
+    account = _project_resource_account(
+        tmp_path,
+        create_horizon=project_module.E2B_CREATE_REQUEST_TIMEOUT_S,
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="meter class differs"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+        )
+
+    assert not (tmp_path / "leases").exists()
+
+
 def test_project_budget_denial_never_dispatches_or_reaps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1643,6 +1671,170 @@ def test_project_ambiguous_create_uses_explicit_key_and_forfeits_full_ceiling(
     assert reservation.status is ReservationStatus.FORFEITED
     assert reservation.charged_nano_usd == reservation.max_nano_usd
     assert reaped == [(reservation.reservation_id, "explicit-key")]
+
+
+def test_budgeted_project_retries_definitive_e2b_rate_refusal_under_one_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    create_calls = 0
+    create_metadata: list[dict[str, str]] = []
+    sleeps: list[float] = []
+    reaped: list[str] = []
+
+    def rate_limited_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        frozen = dict(kwargs)
+
+        def create() -> _AttestedProjectSandbox:
+            nonlocal create_calls
+            create_calls += 1
+            create_metadata.append(dict(cast("dict[str, str]", frozen["metadata"])))
+            if create_calls < 3:
+                raise RateLimitException(
+                    "429: Rate limit exceeded, please try again later. - capacity"
+                )
+            return _AttestedProjectSandbox(frozen, sandbox_id="rate-retry-success")
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", rate_limited_factory)
+    monkeypatch.setattr(project_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        project_module,
+        "reap_e2b_runner_lease",
+        lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
+    )
+
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        resource_budget_account=account,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+    )
+    project.close()
+
+    assert create_calls == 3
+    assert sleeps == [1.0, 3.0]
+    assert len({metadata["wmh_runner_lease"] for metadata in create_metadata}) == 1
+    assert len({metadata["wmh_runner_owner"] for metadata in create_metadata}) == 1
+    assert reaped == []
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    [lease_path] = (tmp_path / "leases").glob("*.json")
+    lease_record = json.loads(lease_path.read_text())
+    assert lease_record["state"] == "retired"
+    created_at = datetime.fromisoformat(lease_record["created_at"])
+    provider_expiry_at = datetime.fromisoformat(lease_record["provider_expiry_at"])
+    assert provider_expiry_at - created_at == timedelta(
+        seconds=(
+            project_module._PROJECT_CREATE_HORIZON_S
+            + 60
+            + project_module._PROJECT_PROVIDER_CLOCK_SKEW_S
+        )
+    )
+
+
+def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    create_calls = 0
+    sleeps: list[float] = []
+    reaped: list[str] = []
+
+    def rate_limited_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        def create() -> _Sandbox:
+            nonlocal create_calls
+            create_calls += 1
+            raise RateLimitException("429: Rate limit exceeded, please try again later.")
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", rate_limited_factory)
+    monkeypatch.setattr(project_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        project_module,
+        "reap_e2b_runner_lease",
+        lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
+    )
+
+    with pytest.raises(RateLimitException, match="Rate limit exceeded"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+        )
+
+    assert create_calls == 4
+    assert sleeps == [1.0, 3.0, 9.0]
+    assert reaped == []
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "CreateRejected"
+    [lease_path] = (tmp_path / "leases").glob("*.json")
+    assert json.loads(lease_path.read_text())["state"] == "retired"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("503 capacity unavailable"),
+        RuntimeError("429 too many requests"),
+        RateLimitException("429: Unauthorized"),
+        RuntimeError("invalid template configuration"),
+        TimeoutError("create request timed out"),
+    ],
+    ids=["capacity-503", "untyped-429", "spoofed-rate-limit", "config", "timeout"],
+)
+def test_budgeted_project_never_retries_unproven_create_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    create_calls = 0
+    sleeps: list[float] = []
+    reaped: list[str] = []
+
+    def failed_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        def create() -> _Sandbox:
+            nonlocal create_calls
+            create_calls += 1
+            raise error
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", failed_factory)
+    monkeypatch.setattr(project_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        project_module,
+        "reap_e2b_runner_lease",
+        lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
+    )
+
+    with pytest.raises(type(error), match=re.escape(str(error))):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+        )
+
+    assert create_calls == 1
+    assert sleeps == []
+    assert len(reaped) == 1
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "CreateUnknown"
 
 
 @pytest.mark.parametrize("failed_activation", [1, 2])
