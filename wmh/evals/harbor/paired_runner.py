@@ -1571,14 +1571,14 @@ class PairedHarborRunner:
                 raise ValueError(
                     f"paired budget meter for {member!r} differs from its provider route"
                 )
-        selected_task_classes = {
+        qualified_task_classes = {
             task.task_resource_class_digest
-            for task in self._protocol.opened_selection.tasks
+            for task in self._protocol.qualification_roster.tasks
             if task.task_resource_class_digest is not None
         }
-        if set(self._budget_runtime.task_resource_meter_by_class_digest) != selected_task_classes:
+        if set(self._budget_runtime.task_resource_meter_by_class_digest) != qualified_task_classes:
             raise ValueError(
-                "paired task resource meters differ from opened E2B qualification classes"
+                "paired task resource meters differ from full-roster E2B qualification classes"
             )
         runner_spec = self._protocol.execution_plan.runner_spec
         if isinstance(runner_spec, LocalPiRunnerSpec):

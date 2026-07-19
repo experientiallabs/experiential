@@ -55,6 +55,7 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     ProviderCostMeter,
     SpendLedger,
+    TimedResourceClass,
     TimedResourceCostMeter,
     TokenPriceCeiling,
     bootstrap_budget_ledger,
@@ -444,10 +445,17 @@ def _e2b_budget_runtime(
     tmp_path: Path,
     routes: tuple[mod.PairedHarborPanelRoute, ...],
     runner_spec: E2BPiRunnerSpec,
+    *,
+    task_classes: tuple[TimedResourceClass, ...] | None = None,
 ) -> mod.PairedHarborBudgetRuntime:
-    task_class = ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024)
+    task_classes = task_classes or (
+        ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024),
+    )
     runner_class = e2b_runner_resource_class(runner_spec)
     provider_meters = {route.panel_member: f"worker-{route.panel_member}" for route in routes}
+    task_meters = {
+        task_class.digest: f"task-e2b-{index}" for index, task_class in enumerate(task_classes)
+    }
     policy = BudgetPolicy(
         study_id="paired-e2b-test",
         manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
@@ -464,12 +472,15 @@ def _e2b_budget_runtime(
                 )
                 for route in routes
             },
-            "task-e2b": TimedResourceCostMeter(
-                resource_type=task_class.role.value,
-                resource_class_digest=task_class.digest,
-                nano_usd_per_second=1,
-                max_billing_seconds=task_class.max_host_observation_seconds,
-            ),
+            **{
+                task_meters[task_class.digest]: TimedResourceCostMeter(
+                    resource_type=task_class.role.value,
+                    resource_class_digest=task_class.digest,
+                    nano_usd_per_second=1,
+                    max_billing_seconds=task_class.max_host_observation_seconds,
+                )
+                for task_class in task_classes
+            },
             "runner-e2b": TimedResourceCostMeter(
                 resource_type=runner_class.role.value,
                 resource_class_digest=runner_class.digest,
@@ -486,12 +497,17 @@ def _e2b_budget_runtime(
         policy=policy,
         phase="confirmation",
         provider_meter_by_panel_member=provider_meters,
-        task_resource_meter_by_class_digest={task_class.digest: "task-e2b"},
+        task_resource_meter_by_class_digest=task_meters,
         runner_resource_meter_id="runner-e2b",
     )
 
 
-def _e2b_runner(tmp_path: Path, candidate: HarnessDoc) -> mod.PairedHarborRunner:
+def _e2b_runner(
+    tmp_path: Path,
+    candidate: HarnessDoc,
+    *,
+    qualifications: tuple[mod.QualifiedHarborTask, ...] | None = None,
+) -> mod.PairedHarborRunner:
     baseline = pi_node_baseline("baseline")
     routes = (
         mod.PairedHarborPanelRoute(
@@ -507,9 +523,10 @@ def _e2b_runner(tmp_path: Path, candidate: HarnessDoc) -> mod.PairedHarborRunner
         environment_backend=HarborEnvironmentBackend.E2B,
         runner_spec=runner_spec,
     )
+    roster_tasks = qualifications or _e2b_qualifications()
     roster = mod.PrequalifiedHarborRoster(
         execution_plan_digest=plan.digest,
-        tasks=_e2b_qualifications(),
+        tasks=roster_tasks,
     )
     selection = mod.OpenedHarborExecutionSelection.project(
         execution_plan=plan,
@@ -517,7 +534,19 @@ def _e2b_runner(tmp_path: Path, candidate: HarnessDoc) -> mod.PairedHarborRunner
         confirmation=_confirmation(candidate),
         design=_design(),
     )
-    budget = _e2b_budget_runtime(tmp_path, routes, runner_spec)
+    task_classes = tuple(
+        {
+            task.task_resource_class.digest: task.task_resource_class
+            for task in roster_tasks
+            if task.task_resource_class is not None
+        }.values()
+    )
+    budget = _e2b_budget_runtime(
+        tmp_path,
+        routes,
+        runner_spec,
+        task_classes=task_classes,
+    )
     protocol = mod.PairedHarborProtocol.freeze(
         design=_design(),
         confirmation=_confirmation(candidate),
@@ -1105,6 +1134,58 @@ def test_e2b_execution_requires_prequalified_e2b_tasks(tmp_path: Path) -> None:
     e2b = _spec(tmp_path).model_copy(update={"environment_backend": HarborEnvironmentBackend.E2B})
     with pytest.raises(ValueError, match="full roster backend differs"):
         _runner(tmp_path, candidate, job_spec=e2b)
+
+
+def test_e2b_budget_bindings_cover_full_prequalified_roster(tmp_path: Path) -> None:
+    selected = _e2b_qualifications()
+    discovery_class = ExactE2BEnvironment._task_resource_class(
+        cpu_count=4,
+        memory_mb=2048,
+    )
+    discovery_spec = ExactE2BBuildSpec(
+        environment_id="discovery-only-environment",
+        build_context_digest="sha256:" + "4" * 64,
+        docker_image="registry.example/discovery@sha256:" + "7" * 64,
+        cpu_count=discovery_class.cpu_count,
+        memory_mb=discovery_class.memory_mb,
+    )
+    discovery_build = mod.QualifiedE2BBuildIdentity(
+        build_config_digest=discovery_spec.digest,
+        build_record_digest="sha256:" + "3" * 64,
+        environment_id=discovery_spec.environment_id,
+        build_context_digest=discovery_spec.build_context_digest,
+        docker_image=discovery_spec.docker_image,
+        cpu_count=discovery_spec.cpu_count,
+        memory_mb=discovery_spec.memory_mb,
+        template_id="discovery-template",
+        build_id="discovery-build",
+    )
+    full_roster = selected + (
+        mod.QualifiedHarborTask(
+            task_id="task-discovery-only",
+            dataset_id="terminalbench2",
+            content_digest="sha256:" + "1" * 64,
+            task_key="sha256:" + "2" * 64,
+            task_environment_digest="sha256:" + "3" * 64,
+            environment_backend=HarborEnvironmentBackend.E2B,
+            e2b_build_config_digest=discovery_build.build_config_digest,
+            e2b_build_record_digest=discovery_build.build_record_digest,
+            task_resource_class_digest=discovery_class.digest,
+            e2b_build_identity=discovery_build,
+            task_resource_class=discovery_class,
+        ),
+    )
+
+    runner = _e2b_runner(
+        tmp_path,
+        _candidate(),
+        qualifications=full_roster,
+    )
+
+    assert set(runner._budget_runtime.task_resource_meter_by_class_digest) == {
+        task.task_resource_class_digest for task in full_roster
+    }
+    assert set(runner._qualifications) == set(_TASK_IDS)
 
 
 def test_runtime_host_paths_do_not_change_frozen_protocol(tmp_path: Path) -> None:
