@@ -2480,6 +2480,8 @@ def orphaned_timed_resource_requires_reap(
 class BudgetedProvider:
     """Reserve a conservative ceiling around every provider completion call."""
 
+    paid_request_attempts: Literal[1] = 1
+
     def __init__(
         self,
         provider: Provider,
@@ -2487,6 +2489,8 @@ class BudgetedProvider:
         *,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
+        if isinstance(provider, BudgetedProvider):
+            raise TypeError("BudgetedProvider cannot wrap another BudgetedProvider")
         if (
             not isinstance(provider, ToolCallingProvider)
             or getattr(provider, "paid_request_attempts", None) != 1
@@ -2503,6 +2507,12 @@ class BudgetedProvider:
             raise ValueError("budget account provider config differs from the wrapped provider")
         self._provider = cast("SingleDispatchProvider", provider)
         self._account = validated_account
+        self._budget_binding = BudgetAccountBinding(
+            policy_digest=validated_account.policy.policy_digest,
+            ledger_identity=validated_account.ledger_identity,
+            scope=validated_account.scope,
+            meter_id=validated_account.meter_id,
+        )
         self._meter = meter
         self._ledger = open_shared_spend_ledger(
             self._account.ledger_path,
@@ -2519,6 +2529,17 @@ class BudgetedProvider:
     def budget_ledger_identity(self) -> str:
         """Return the durable authority shared by every paid surface in one experiment."""
         return self._ledger.ledger_identity
+
+    @property
+    def budget_binding(self) -> BudgetAccountBinding:
+        """Return the path-free identity of this provider's exact budget account."""
+        return BudgetAccountBinding.model_validate(self._budget_binding.model_dump())
+
+    @property
+    def wrapped_provider_implementation(self) -> str:
+        """Return the underlying dispatch implementation without wrapper identity churn."""
+        provider_type = type(self._provider)
+        return f"{provider_type.__module__}.{provider_type.__qualname__}"
 
     @property
     def budget_policy_digest(self) -> str:

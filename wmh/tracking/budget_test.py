@@ -1645,6 +1645,27 @@ def _budgeted_provider(
     return BudgetedProvider(provider, account, id_factory=lambda: next(ids)), ledger
 
 
+def test_budgeted_provider_exposes_exact_binding_and_rejects_nested_wrapper(
+    tmp_path: Path,
+) -> None:
+    provider, _ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(chat_usage=ChatUsage(prompt_tokens=1, completion_tokens=1)),
+        ids=iter(["inner"]),
+    )
+
+    assert provider.paid_request_attempts == 1
+    assert provider.budget_binding.policy_digest == provider.budget_policy_digest
+    assert provider.budget_binding.ledger_identity == provider.budget_ledger_identity
+    assert provider.wrapped_provider_implementation.endswith("._FakeToolProvider")
+    with pytest.raises(TypeError, match="cannot wrap another BudgetedProvider"):
+        BudgetedProvider(
+            provider,
+            provider._account,  # noqa: SLF001 - exact nested-wrapper rejection contract
+            id_factory=lambda: "outer",
+        )
+
+
 def test_budgeted_provider_reserves_before_call_and_settles_exact_usage(tmp_path: Path) -> None:
     provider, ledger = _budgeted_provider(
         tmp_path,

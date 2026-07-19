@@ -25,6 +25,7 @@ from wmh.tracking.budget import (
     bind_timed_resource_account,
     open_shared_spend_ledger,
 )
+from wmh.tracking.rate_limit import ExternalDispatchRateBinding
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
@@ -99,17 +100,19 @@ class SearchCostBinding(BaseModel):
 
     The binding deliberately contains no ledger path. It freezes the complete hard policy,
     durable ledger identity, attribution phase and run, component identities, provider routes,
-    and any timed resource classes before a paid component is called.
+    any timed resource classes, and the shared external dispatch authority before a paid
+    component is called.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["wmh.search-cost-binding.v1"] = "wmh.search-cost-binding.v1"
+    schema_version: Literal["wmh.search-cost-binding.v2"] = "wmh.search-cost-binding.v2"
     declared_hard_limit_nano_usd: int = Field(gt=0)
     policy: BudgetPolicy
     ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
     phase: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    external_dispatch_rate_binding: ExternalDispatchRateBinding | None = None
     proposer: SearchComponentCostBinding
     scorer: SearchComponentCostBinding
     holdout_scorer: SearchComponentCostBinding | None = None
@@ -125,6 +128,13 @@ class SearchCostBinding(BaseModel):
     @classmethod
     def _detach_component(cls, value: object) -> object:
         if isinstance(value, SearchComponentCostBinding):
+            return value.model_dump()
+        return value
+
+    @field_validator("external_dispatch_rate_binding", mode="before")
+    @classmethod
+    def _detach_dispatch_rate_binding(cls, value: object) -> object:
+        if isinstance(value, ExternalDispatchRateBinding):
             return value.model_dump()
         return value
 
@@ -331,6 +341,7 @@ def search_component_requires_cost_binding(component: object) -> bool:
     proposal code can run.
     """
     marker_names = (
+        "requires_search_cost_binding",
         "search_cost_binding",
         "budget_account",
         "_budget_account",
@@ -380,6 +391,12 @@ def validate_search_cost_components(
             frozen.holdout_scorer,
             label="holdout_scorer",
         )
+    _validate_shared_dispatch_rate_binding(
+        frozen,
+        proposer=proposer,
+        scorer=scorer,
+        holdout_scorer=holdout_scorer,
+    )
 
 
 def _validate_component_binding(
@@ -399,6 +416,30 @@ def _validate_component_binding(
     validated = SearchComponentCostBinding.model_validate(actual.model_dump())
     if validated != expected:
         raise ValueError(f"{label} cost binding differs from the frozen search cost binding")
+
+
+def _validate_shared_dispatch_rate_binding(
+    binding: SearchCostBinding,
+    *,
+    proposer: object,
+    scorer: object,
+    holdout_scorer: object | None,
+) -> None:
+    """Require every external dispatch consumer to expose one shared authority identity."""
+    components = (proposer, scorer) + (() if holdout_scorer is None else (holdout_scorer,))
+    actual_bindings: list[ExternalDispatchRateBinding] = []
+    for component in components:
+        raw = getattr(component, "create_rate_binding", None)
+        if raw is None:
+            continue
+        actual_bindings.append(ExternalDispatchRateBinding.model_validate(raw))
+    expected = binding.external_dispatch_rate_binding
+    if expected is None:
+        if actual_bindings:
+            raise ValueError("search cost binding omits the shared external dispatch authority")
+        return
+    if not actual_bindings or any(actual != expected for actual in actual_bindings):
+        raise ValueError("search components differ from the shared external dispatch authority")
 
 
 def _audit_runtime_state(

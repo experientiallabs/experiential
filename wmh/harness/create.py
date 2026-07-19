@@ -196,6 +196,7 @@ class SearchResult(BaseModel):
     best: HarnessDoc
     best_score: float
     archive: DeltaArchive
+    search_cost_binding: SearchCostBinding | None = None
     reports: dict[str, HarnessScoreReport] = Field(default_factory=dict)
     holdout_reports: dict[str, HarnessScoreReport] = Field(default_factory=dict)
     suite: list[str] = Field(default_factory=list)
@@ -1884,6 +1885,7 @@ def search_harness(
         best=best,
         best_score=reports[champion_hash].score,
         archive=archive,
+        search_cost_binding=frozen_cost_binding,
         reports={doc_hash: report.model_copy(deep=True) for doc_hash, report in reports.items()},
         holdout_reports={
             doc_hash: report.model_copy(deep=True) for doc_hash, report in holdout_reports.items()

@@ -14,6 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from wmh.agents.project import AgentProjectRun
 from wmh.core.types import JsonObject
+from wmh.harness.cost import (
+    SearchComponentCostBinding,
+    SearchComponentCostRuntime,
+    SearchComponentRole,
+    TimedResourceCostBinding,
+)
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta
@@ -25,6 +31,8 @@ from wmh.harness.scoring import (
     render_task_score_archive,
 )
 from wmh.providers.base import Provider, ProviderConfig, ToolCallingProvider
+from wmh.tracking.budget import BudgetedProvider, bind_budget_account
+from wmh.tracking.rate_limit import ExternalDispatchRateBinding
 
 _CONTEXT_CONTENT_CHUNK_CHARS = 12_000
 _MAX_PROJECT_REPAIR_TURNS = 2
@@ -173,6 +181,7 @@ class ProjectDeltaProposer:
 
     score_archive_required = True
     durable_state_required = True
+    requires_search_cost_binding = True
 
     def __init__(
         self,
@@ -181,25 +190,31 @@ class ProjectDeltaProposer:
         provider: ToolCallingProvider,
         *,
         preserve_runtime_kind: bool = False,
+        cost_runtime: SearchComponentCostRuntime | None = None,
     ) -> None:
         self._project = project
         self._agent = agent
         self._provider = provider
+        self._cost_runtime = cost_runtime
         self._iteration = 0
         self._evaluation_dirs: dict[str, str] = {}
         self._proposal_files: dict[str, str] = {}
         self._parent_manifests: dict[str, JsonObject] = {}
         self._should_cancel: Callable[[], bool] | None = None
         self._preserve_runtime_kind = preserve_runtime_kind
+        if cost_runtime is not None:
+            self._provider = self._bind_cost_runtime(cost_runtime)
+        elif self.requires_search_cost_binding:
+            raise ValueError("ProjectDeltaProposer requires a complete search cost runtime")
         project_policy = getattr(project, "budget_policy_digest", None)
-        provider_policy = getattr(provider, "budget_policy_digest", None)
+        provider_policy = getattr(self._provider, "budget_policy_digest", None)
         if (project_policy is None) != (provider_policy is None):
             raise ValueError("proposer project and provider must both use one hard-budget policy")
         if project_policy is not None:
             if provider_policy != project_policy:
                 raise ValueError("proposer project and provider must share one hard-budget policy")
             project_ledger = getattr(project, "budget_ledger_path", None)
-            provider_ledger = getattr(provider, "budget_ledger_path", None)
+            provider_ledger = getattr(self._provider, "budget_ledger_path", None)
             if (
                 project_ledger is None
                 or provider_ledger is None
@@ -208,29 +223,72 @@ class ProjectDeltaProposer:
             ):
                 raise ValueError("proposer project and provider must share one hard-budget ledger")
 
-    @property
-    def configuration_id(self) -> str:
-        """Return an opaque identity for the project, meta agent, and provider route."""
-        provider_config = getattr(self._provider, "config", None)
+    @classmethod
+    def configuration_id_for(
+        cls,
+        *,
+        project_type: type[object],
+        project_workspace: str,
+        agent: HarnessDoc,
+        provider: ToolCallingProvider,
+        preserve_runtime_kind: bool = False,
+        project_create_rate_binding: ExternalDispatchRateBinding | None = None,
+    ) -> str:
+        """Compute the proposer identity before creating its paid project resource."""
+        provider_config = getattr(provider, "config", None)
         if not isinstance(provider_config, ProviderConfig):
             raise ValueError(
                 "checkpointed project proposal search requires a provider with ProviderConfig"
             )
+        if not project_workspace or project_workspace != project_workspace.rstrip("/"):
+            raise ValueError("project proposer workspace must be non-empty and canonical")
+        frozen_rate_binding = (
+            None
+            if project_create_rate_binding is None
+            else ExternalDispatchRateBinding.model_validate(
+                project_create_rate_binding.model_dump()
+            )
+        )
         payload = {
             "schema_version": 1,
-            "implementation": f"{type(self).__module__}.{type(self).__qualname__}",
-            "project_implementation": (
-                f"{type(self._project).__module__}.{type(self._project).__qualname__}"
-            ),
-            "project_workspace": self._project.workspace,
-            "agent": self._agent.model_dump(mode="json"),
-            "provider_implementation": (
-                f"{type(self._provider).__module__}.{type(self._provider).__qualname__}"
-            ),
+            "implementation": f"{cls.__module__}.{cls.__qualname__}",
+            "project_implementation": f"{project_type.__module__}.{project_type.__qualname__}",
+            "project_workspace": project_workspace,
+            "agent": agent.model_dump(mode="json"),
+            "provider_implementation": _provider_implementation(provider),
             "provider_config": provider_config.model_dump(mode="json"),
-            "preserve_runtime_kind": self._preserve_runtime_kind,
+            "preserve_runtime_kind": preserve_runtime_kind,
+            "project_create_rate_binding": (
+                None if frozen_rate_binding is None else frozen_rate_binding.model_dump(mode="json")
+            ),
         }
         return _content_digest(_canonical_json(payload))
+
+    @property
+    def configuration_id(self) -> str:
+        """Return an opaque identity for the project, meta agent, and provider route."""
+        raw_rate_binding = getattr(self._project, "create_rate_binding", None)
+        rate_binding = (
+            None
+            if raw_rate_binding is None
+            else ExternalDispatchRateBinding.model_validate(raw_rate_binding)
+        )
+        return type(self).configuration_id_for(
+            project_type=type(self._project),
+            project_workspace=self._project.workspace,
+            agent=self._agent,
+            provider=self._provider,
+            preserve_runtime_kind=self._preserve_runtime_kind,
+            project_create_rate_binding=rate_binding,
+        )
+
+    @property
+    def create_rate_binding(self) -> ExternalDispatchRateBinding | None:
+        """Return the project sandbox's shared external dispatch authority identity."""
+        raw = getattr(self._project, "create_rate_binding", None)
+        if raw is None:
+            return None
+        return ExternalDispatchRateBinding.model_validate(raw)
 
     def export_search_state(self) -> JsonObject:
         """Export public and host-only project state without crossing their visibility roots."""
@@ -319,6 +377,7 @@ class ProjectDeltaProposer:
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[HarnessDelta | ProposalFailure | None]:
         """Run one meta-agent turn that writes ``count`` proposal files."""
+        self._revalidate_cost_runtime()
         if count < 1:
             raise ValueError(f"proposal count must be positive, got {count}")
         self._should_cancel = should_cancel
@@ -626,6 +685,77 @@ class ProjectDeltaProposer:
                 )
         return proposals
 
+    def _bind_cost_runtime(
+        self,
+        runtime: SearchComponentCostRuntime,
+    ) -> BudgetedProvider:
+        """Validate and attach every proposer cost account before the first project turn."""
+        binding = self._validate_component_cost_runtime(runtime)
+        provider_binding = binding.providers[0]
+        provider_config = getattr(self._provider, "config", None)
+        if provider_config != provider_binding.provider_config:
+            raise ValueError("project proposer provider config differs from its cost binding")
+        if isinstance(self._provider, BudgetedProvider):
+            if self._provider.budget_binding != provider_binding.account:
+                raise ValueError("project proposer provider account differs from its cost binding")
+            wrapped = self._provider
+        else:
+            account = runtime.provider_account(provider_binding)
+            wrapped = BudgetedProvider(cast("Provider", self._provider), account)
+        self.search_cost_binding = binding
+        return wrapped
+
+    def _revalidate_cost_runtime(self) -> None:
+        """Reaudit exact proposer accounts before any project or provider dispatch."""
+        runtime = self._cost_runtime
+        if runtime is None:
+            return
+        binding = self._validate_component_cost_runtime(runtime)
+        provider_binding = binding.providers[0]
+        if not isinstance(self._provider, BudgetedProvider):
+            raise RuntimeError("cost-bound project proposer lost its budgeted provider")
+        if self._provider.budget_binding != provider_binding.account:
+            raise ValueError("project proposer provider account differs from its cost binding")
+        account = runtime.provider_account(provider_binding)
+        if self._provider.budget_binding != bind_budget_account(account):
+            raise ValueError("project proposer provider account changed after construction")
+
+    def _validate_component_cost_runtime(
+        self,
+        runtime: SearchComponentCostRuntime,
+    ) -> SearchComponentCostBinding:
+        if not isinstance(runtime, SearchComponentCostRuntime):
+            raise TypeError(
+                "ProjectDeltaProposer cost_runtime must be a SearchComponentCostRuntime"
+            )
+        binding = SearchComponentCostBinding.model_validate(runtime.binding.model_dump())
+        if binding.role is not SearchComponentRole.PROPOSER:
+            raise ValueError("ProjectDeltaProposer cost runtime must use the proposer role")
+        if binding.configuration_id != self.configuration_id:
+            raise ValueError("ProjectDeltaProposer configuration_id differs from its cost runtime")
+        if len(binding.providers) != 1:
+            raise ValueError(
+                "ProjectDeltaProposer cost runtime must bind exactly one provider account"
+            )
+        if len(binding.timed_resources) != 1:
+            raise ValueError(
+                "ProjectDeltaProposer cost runtime must bind exactly one project resource account"
+            )
+        project_binding = getattr(self._project, "search_cost_binding", None)
+        if not isinstance(project_binding, SearchComponentCostBinding):
+            raise ValueError("cost-bound proposer project search cost binding is missing")
+        if SearchComponentCostBinding.model_validate(project_binding.model_dump()) != binding:
+            raise ValueError("project search cost binding differs from proposer cost runtime")
+        resource_binding = getattr(self._project, "timed_resource_binding", None)
+        if not isinstance(resource_binding, TimedResourceCostBinding):
+            raise ValueError("cost-bound proposer project timed resource binding is missing")
+        if (
+            TimedResourceCostBinding.model_validate(resource_binding.model_dump())
+            != binding.timed_resources[0]
+        ):
+            raise ValueError("project timed resource account differs from proposer cost runtime")
+        return binding
+
     def record_harness_evaluation(
         self,
         harness: HarnessDoc,
@@ -827,6 +957,14 @@ def _is_missing_file_error(error: Exception) -> bool:
     error_name = type(error).__name__.lower()
     text = str(error).lower()
     return "notfound" in error_name or "not found" in text or "no such file" in text
+
+
+def _provider_implementation(provider: ToolCallingProvider) -> str:
+    """Return the paid dispatch implementation without budget-wrapper identity churn."""
+    if isinstance(provider, BudgetedProvider):
+        return provider.wrapped_provider_implementation
+    provider_type = type(provider)
+    return f"{provider_type.__module__}.{provider_type.__qualname__}"
 
 
 def _content_digest(content: str) -> str:

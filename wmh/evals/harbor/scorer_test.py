@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import sqlite3
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,8 +29,20 @@ from wmh.evals.benchmark import (
     BenchmarkUsage,
 )
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
-from wmh.evals.harbor.e2b_environment import ExactE2BEnvironment
+from wmh.evals.harbor.e2b_environment import ExactE2BBuildSpec, ExactE2BEnvironment
+from wmh.evals.harbor.qualification_types import (
+    QualifiedE2BBuildIdentity,
+    QualifiedHarborTask,
+)
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
+from wmh.harness.cost import (
+    ProviderCostBinding,
+    SearchComponentCostBinding,
+    SearchComponentRole,
+    SearchCostBinding,
+    SearchCostRuntime,
+    TimedResourceCostBinding,
+)
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.pi_runner import pi_node_baseline
 from wmh.harness.pi_runner_backend import (
@@ -44,20 +58,91 @@ from wmh.tracking._testing import (
     synthetic_tariff_provenance,
 )
 from wmh.tracking.budget import (
-    BudgetAccount,
     BudgetPolicy,
     BudgetScope,
-    TimedResourceBudgetAccount,
+    TimedResourceClass,
     TimedResourceCostMeter,
+    bind_budget_account,
+    bind_timed_resource_account,
     bootstrap_budget_ledger,
 )
-from wmh.tracking.rate_limit import E2B_SANDBOX_CREATE_RATE_POLICY
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+)
 
 _TASK_IDS = ("alpha", "beta")
 _TASK_KEYS = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
 _TASK_ENVIRONMENT_DIGESTS = ("sha256:" + "c" * 64, "sha256:" + "d" * 64)
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RUNNER = LocalPiRunnerSpec()
+
+
+def _qualified_tasks(
+    *,
+    task_ids: tuple[str, ...] = _TASK_IDS,
+    task_keys: tuple[str, ...] = _TASK_KEYS,
+    task_environment_digests: tuple[str, ...] = _TASK_ENVIRONMENT_DIGESTS,
+) -> tuple[QualifiedHarborTask, ...]:
+    if len(task_keys) != len(task_ids):
+        raise ValueError("task_keys must contain exactly one key per task_id")
+    if len(task_environment_digests) != len(task_ids):
+        raise ValueError("task_environment_digests must contain exactly one digest per task_id")
+    return tuple(
+        QualifiedHarborTask(
+            task_id=task_id,
+            dataset_id="terminalbench2",
+            content_digest="sha256:" + f"{index + 1:x}" * 64,
+            task_key=task_key,
+            task_environment_digest=environment_digest,
+            environment_backend=HarborEnvironmentBackend.LOCAL,
+        )
+        for index, (task_id, task_key, environment_digest) in enumerate(
+            zip(task_ids, task_keys, task_environment_digests, strict=True)
+        )
+    )
+
+
+def _e2b_qualified_tasks(
+    task_class: TimedResourceClass,
+) -> tuple[QualifiedHarborTask, ...]:
+    build_spec = ExactE2BBuildSpec(
+        environment_id="qualified-environment",
+        build_context_digest="sha256:" + "6" * 64,
+        docker_image="registry.example/task@sha256:" + "9" * 64,
+        cpu_count=task_class.cpu_count,
+        memory_mb=task_class.memory_mb,
+    )
+    build_identity = QualifiedE2BBuildIdentity(
+        build_config_digest=build_spec.digest,
+        build_record_digest="sha256:" + "8" * 64,
+        environment_id=build_spec.environment_id,
+        build_context_digest=build_spec.build_context_digest,
+        docker_image=build_spec.docker_image,
+        cpu_count=build_spec.cpu_count,
+        memory_mb=build_spec.memory_mb,
+        template_id="task-template",
+        build_id="task-build",
+    )
+    return tuple(
+        QualifiedHarborTask(
+            task_id=task_id,
+            dataset_id="terminalbench2",
+            content_digest="sha256:" + f"{index + 1:x}" * 64,
+            task_key=task_key,
+            task_environment_digest=environment_digest,
+            environment_backend=HarborEnvironmentBackend.E2B,
+            e2b_launch_config_digest="sha256:" + "7" * 64,
+            e2b_build_config_digest=build_identity.build_config_digest,
+            e2b_build_record_digest=build_identity.build_record_digest,
+            task_resource_class_digest=task_class.digest,
+            e2b_build_identity=build_identity,
+            task_resource_class=task_class,
+        )
+        for index, (task_id, task_key, environment_digest) in enumerate(
+            zip(_TASK_IDS, _TASK_KEYS, _TASK_ENVIRONMENT_DIGESTS, strict=True)
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -74,6 +159,16 @@ class _ResultOptions:
     candidate_damage_error: bool = False
     failure_kind: BenchmarkFailureKind = BenchmarkFailureKind.ENVIRONMENT
     runner_environment_digest: str | None = _RUNNER.attestation.digest
+    receipt_response_model: str | None = None
+    receipt_system_fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
+class _BuildRecordStub:
+    build_config_digest: str
+    digest: str
+    template_id: str
+    build_id: str
 
 
 def _provider() -> ProviderConfig:
@@ -81,6 +176,16 @@ def _provider() -> ProviderConfig:
         kind=ProviderKind.BEDROCK,
         model="worker-model",
         region="us-west-2",
+    )
+
+
+def _azure_provider() -> ProviderConfig:
+    return ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.4-mini",
+        deployment="worker-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
     )
 
 
@@ -126,20 +231,36 @@ def _candidate_failure(
     )
 
 
-def _provider_receipt_record(task_id: str, attempt: int) -> dict[str, object]:
+def _provider_receipt_record(
+    task_id: str,
+    attempt: int,
+    *,
+    provider_config: ProviderConfig,
+    response_model: str | None,
+    system_fingerprint: str | None,
+) -> dict[str, object]:
+    is_bedrock = provider_config.kind is ProviderKind.BEDROCK
     return {
         "kind": "provider_receipt",
         "payload": {
-            "provider": "bedrock",
+            "provider": provider_config.kind.value,
             "provider_request_id": f"provider-request-{task_id}-{attempt}",
-            "response_id": None,
-            "requested_model": "worker-model",
-            "response_model": None,
-            "system_fingerprint": None,
+            "response_id": None if is_bedrock else f"response-{task_id}-{attempt}",
+            "requested_model": (
+                provider_config.model
+                if provider_config.deployment is None
+                else provider_config.deployment
+            ),
+            "response_model": response_model,
+            "system_fingerprint": system_fingerprint,
             "request_digest": "sha256:" + "f" * 64,
-            "temperature": 0.7,
+            "temperature": (0.7 if provider_config.resolved_chat_forward_temperature() else None),
             "max_tokens": 4_096,
-            "max_tokens_field": "inferenceConfig.maxTokens",
+            "max_tokens_field": (
+                "inferenceConfig.maxTokens"
+                if is_bedrock
+                else provider_config.resolved_chat_max_tokens_field()
+            ),
             "seed_supplied": False,
             "cache_config_supplied": False,
             "started_at_unix_s": 10.0,
@@ -170,7 +291,10 @@ def _loaded_result(
     provider_config: ProviderConfig | None = None,
     runner_spec: PiRunnerBackendSpec = _RUNNER,
     turn_timeout_s: float = 300.0,
+    receipt_response_model: str | None = "served-model",
+    receipt_system_fingerprint: str | None = None,
 ) -> LoadedHarborJobResult:
+    resolved_provider = provider_config or _provider()
     environment_digest_by_task = dict(zip(_TASK_IDS, task_environment_digests, strict=True))
     selected_rewards = rewards or {
         ("alpha", 1): 1.0,
@@ -241,7 +365,17 @@ def _loaded_result(
             trace_path = absolute_trial_dir / "wmh-events.jsonl"
             trace_path.unlink(missing_ok=True)
             trace_records = [
-                _provider_receipt_record(task_id, attempt),
+                _provider_receipt_record(
+                    task_id,
+                    attempt,
+                    provider_config=resolved_provider,
+                    response_model=(
+                        None
+                        if resolved_provider.kind is ProviderKind.BEDROCK
+                        else receipt_response_model
+                    ),
+                    system_fingerprint=receipt_system_fingerprint,
+                ),
                 {
                     "kind": "assistant_message",
                     "payload": {"text": f"answer-{task_id}-{attempt}{trace_suffix}"},
@@ -268,7 +402,7 @@ def _loaded_result(
             identity=mod.harbor_run_expectation(
                 candidate=candidate,
                 spec=spec,
-                provider_config=provider_config or _provider(),
+                provider_config=resolved_provider,
                 runner_spec=runner_spec,
                 turn_timeout_s=turn_timeout_s,
             ).identity,
@@ -285,8 +419,24 @@ def _install_fake_evaluator(
     tmp_path: Path,
     *,
     result_options: _ResultOptions | None = None,
-) -> list[tuple[HarborJobSpec, ProviderConfig, PiRunnerBackendSpec, float]]:
-    captured: list[tuple[HarborJobSpec, ProviderConfig, PiRunnerBackendSpec, float]] = []
+) -> list[
+    tuple[
+        HarborJobSpec,
+        ProviderConfig,
+        PiRunnerBackendSpec,
+        float,
+        tuple[QualifiedHarborTask, ...],
+    ]
+]:
+    captured: list[
+        tuple[
+            HarborJobSpec,
+            ProviderConfig,
+            PiRunnerBackendSpec,
+            float,
+            tuple[QualifiedHarborTask, ...],
+        ]
+    ] = []
     options = result_options or _ResultOptions()
 
     class FakeEvaluator:
@@ -297,8 +447,9 @@ def _install_fake_evaluator(
             *,
             runner_spec: PiRunnerBackendSpec,
             turn_timeout_s: float,
+            qualified_tasks: tuple[QualifiedHarborTask, ...],
         ) -> None:
-            captured.append((spec, provider_config, runner_spec, turn_timeout_s))
+            captured.append((spec, provider_config, runner_spec, turn_timeout_s, qualified_tasks))
             self._spec = spec
             self._provider_config = provider_config
             self._runner_spec = runner_spec
@@ -324,10 +475,32 @@ def _install_fake_evaluator(
                 provider_config=self._provider_config,
                 runner_spec=self._runner_spec,
                 turn_timeout_s=self._turn_timeout_s,
+                receipt_response_model=options.receipt_response_model,
+                receipt_system_fingerprint=options.receipt_system_fingerprint,
             )
 
     monkeypatch.setattr(mod, "HarborEvaluator", FakeEvaluator)
     return captured
+
+
+def test_scorer_passes_exact_qualification_evidence_to_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _install_fake_evaluator(monkeypatch, tmp_path)
+    qualified_tasks = _qualified_tasks()
+
+    with _scorer(tmp_path) as scorer:
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+    assert len(captured) == 1
+    assert captured[0][4] == qualified_tasks
+
+
+class _UnbudgetedTestHarborHarnessScorer(mod.HarborHarnessScorer):
+    """Exercise score projection with fake evaluators that cannot dispatch paid work."""
+
+    requires_search_cost_binding = False
 
 
 def _scorer(
@@ -342,22 +515,49 @@ def _scorer(
     reward_key: str = "reward",
     runner_spec: PiRunnerBackendSpec = _RUNNER,
     turn_timeout_s: float = 300.0,
+    response_identity: mod.ProviderResponseIdentity | None = None,
 ) -> mod.HarborHarnessScorer:
-    return mod.HarborHarnessScorer(
+    return _UnbudgetedTestHarborHarnessScorer(
         job_spec=job_spec or _spec(tmp_path),
         provider_config=provider_config or _provider(),
         reference_harness=reference_harness or pi_node_baseline("baseline"),
-        task_ids=task_ids,
-        task_keys=task_keys,
-        task_environment_digests=task_environment_digests,
+        qualified_tasks=_qualified_tasks(
+            task_ids=task_ids,
+            task_keys=task_keys,
+            task_environment_digests=task_environment_digests,
+        ),
         reward_key=reward_key,
         runner_spec=runner_spec,
         turn_timeout_s=turn_timeout_s,
+        response_identity=response_identity,
     )
 
 
 def _full_request() -> ScoreRequest:
     return ScoreRequest(purpose="full")
+
+
+def test_production_scorer_rejects_missing_cost_runtime_before_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evaluator_constructed = False
+
+    class ForbiddenEvaluator:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            nonlocal evaluator_constructed
+            evaluator_constructed = True
+
+    monkeypatch.setattr(mod, "HarborEvaluator", ForbiddenEvaluator)
+    with pytest.raises(ValueError, match="complete search cost runtime"):
+        mod.HarborHarnessScorer(
+            job_spec=_spec(tmp_path),
+            provider_config=_provider(),
+            reference_harness=pi_node_baseline("baseline"),
+            qualified_tasks=_qualified_tasks(),
+            reward_key="reward",
+        )
+    assert evaluator_constructed is False
 
 
 def test_projects_exact_binary_task_means_and_bounded_evidence(
@@ -393,6 +593,72 @@ def test_projects_exact_binary_task_means_and_bounded_evidence(
     assert captured[0][0].environment_backend is HarborEnvironmentBackend.LOCAL
 
 
+@pytest.mark.parametrize(
+    ("response_model", "system_fingerprint"),
+    [
+        ("retargeted-model", "fp-exact"),
+        ("served-model", "fp-drifted"),
+    ],
+)
+def test_scorer_rejects_served_model_or_fingerprint_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_model: str,
+    system_fingerprint: str,
+) -> None:
+    _install_fake_evaluator(
+        monkeypatch,
+        tmp_path,
+        result_options=_ResultOptions(
+            receipt_response_model=response_model,
+            receipt_system_fingerprint=system_fingerprint,
+        ),
+    )
+    response_identity = mod.ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-model",
+        system_fingerprint="fp-exact",
+    )
+
+    with (
+        _scorer(
+            tmp_path,
+            provider_config=_azure_provider(),
+            response_identity=response_identity,
+        ) as scorer,
+        pytest.raises(ValueError, match="invalid provider-call evidence"),
+    ):
+        scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+
+def test_scorer_accepts_exact_served_model_and_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_evaluator(
+        monkeypatch,
+        tmp_path,
+        result_options=_ResultOptions(
+            receipt_response_model="served-model",
+            receipt_system_fingerprint="fp-exact",
+        ),
+    )
+    response_identity = mod.ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-model",
+        system_fingerprint="fp-exact",
+    )
+
+    with _scorer(
+        tmp_path,
+        provider_config=_azure_provider(),
+        response_identity=response_identity,
+    ) as scorer:
+        report = scorer.score(pi_node_baseline("candidate"), request=_full_request())
+
+    assert report.run_health is ScoreRunHealth.VALID
+
+
 def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Path) -> None:
     baseline = _scorer(tmp_path).configuration_id
 
@@ -412,6 +678,55 @@ def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Pat
         ).configuration_id
         != baseline
     )
+    first_identity = mod.ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-model",
+        system_fingerprint="fp-first",
+    )
+    second_identity = first_identity.model_copy(update={"system_fingerprint": "fp-second"})
+    assert (
+        _scorer(
+            tmp_path,
+            provider_config=_azure_provider(),
+            response_identity=first_identity,
+        ).configuration_id
+        != _scorer(
+            tmp_path,
+            provider_config=_azure_provider(),
+            response_identity=second_identity,
+        ).configuration_id
+    )
+
+
+def test_openai_shaped_scorer_requires_precommitted_response_identity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="exact provider response identity"):
+        _scorer(tmp_path, provider_config=_azure_provider())
+
+
+def test_configuration_plan_is_path_free_across_host_relocation(tmp_path: Path) -> None:
+    first = _scorer(tmp_path / "first-host")
+    second = _scorer(tmp_path / "second-host")
+
+    assert first.plan == second.plan
+    assert first.configuration_id == second.configuration_id
+    serialized = first.plan.model_dump_json()
+    assert str(tmp_path) not in serialized
+    assert "jobs_dir" not in serialized
+
+
+def test_configuration_plan_rejects_host_absolute_artifact_paths(tmp_path: Path) -> None:
+    spec = _spec(tmp_path).model_copy(
+        update={"artifact_paths": [str((tmp_path / "host-artifact").resolve())]}
+    )
+
+    with pytest.raises(ValueError, match="artifact_paths must be project-relative"):
+        mod.harbor_harness_score_plan(
+            job_spec=spec,
+            provider_config=_provider(),
+            reference_harness=pi_node_baseline("baseline"),
+            qualified_tasks=_qualified_tasks(),
+            reward_key="reward",
+        )
 
 
 def test_scorer_rejects_e2b_runner_lease_without_turn_cleanup_margin(
@@ -469,14 +784,38 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
         cpu_count=2,
         memory_mb=1024,
     )
+    qualified_tasks = _e2b_qualified_tasks(task_class)
+    build_identity = qualified_tasks[0].e2b_build_identity
+    assert build_identity is not None
     runner_class = e2b_runner_resource_class(runner_spec)
     provider_config = _provider()
+    e2b_spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
+    reference = pi_node_baseline("baseline")
+    rate_authority = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+    plan = mod.harbor_harness_score_plan(
+        job_spec=e2b_spec,
+        provider_config=provider_config,
+        reference_harness=reference,
+        qualified_tasks=qualified_tasks,
+        reward_key="reward",
+        runner_spec=runner_spec,
+        create_rate_binding=rate_authority.binding,
+    )
     policy = BudgetPolicy(
         study_id="scorer-e2b",
-        manifest_digest="sha256:" + "7" * 64,
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
         hard_limit_nano_usd=100_000,
         phase_limits_nano_usd={"search": 100_000},
         meters={
+            "proposer": synthetic_provider_cost_meter(
+                provider_config=provider_config,
+                provenance=synthetic_tariff_provenance(provider_config),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=1,
+            ),
             "worker": synthetic_provider_cost_meter(
                 provider_config=provider_config,
                 provenance=synthetic_tariff_provenance(provider_config),
@@ -497,31 +836,86 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
             ),
         },
     )
-    scope = BudgetScope(phase="search", category="scorer", run_id="test-run")
+    proposer_scope = BudgetScope(phase="search", category="proposer", run_id="test-run")
+    scorer_scope = BudgetScope(phase="search", category="scorer", run_id="test-run")
     ledger_path = (tmp_path / "budget.sqlite3").resolve()
-    ledger_identity = bootstrap_budget_ledger(ledger_path, policy).ledger_identity
-    provider_account = BudgetAccount(
-        ledger_path=ledger_path,
-        ledger_identity=ledger_identity,
-        policy=policy,
-        scope=scope,
+    authority = bootstrap_budget_ledger(ledger_path, policy)
+    proposer_account = authority.provider_account(
+        scope=proposer_scope,
+        meter_id="proposer",
+    )
+    provider_account = authority.provider_account(
+        scope=scorer_scope,
         meter_id="worker",
     )
-    task_account = TimedResourceBudgetAccount(
-        ledger_path=ledger_path,
-        ledger_identity=ledger_identity,
-        policy=policy,
-        scope=scope,
+    task_account = authority.timed_resource_account(
+        scope=scorer_scope,
         meter_id="task",
     )
-    runner_account = TimedResourceBudgetAccount(
-        ledger_path=ledger_path,
-        ledger_identity=ledger_identity,
-        policy=policy,
-        scope=scope,
+    runner_account = authority.timed_resource_account(
+        scope=scorer_scope,
         meter_id="runner",
     )
+    binding = SearchCostBinding(
+        declared_hard_limit_nano_usd=policy.hard_limit_nano_usd,
+        policy=policy,
+        ledger_identity=authority.ledger_identity,
+        phase="search",
+        run_id="test-run",
+        proposer=SearchComponentCostBinding(
+            role=SearchComponentRole.PROPOSER,
+            configuration_id="unused-proposer",
+            scope_category="proposer",
+            providers=(
+                ProviderCostBinding(
+                    component_configuration_id="unused-proposer",
+                    provider_config=provider_config,
+                    account=bind_budget_account(proposer_account),
+                ),
+            ),
+        ),
+        scorer=SearchComponentCostBinding(
+            role=SearchComponentRole.SCORER,
+            configuration_id=plan.configuration_id,
+            scope_category="scorer",
+            providers=(
+                ProviderCostBinding(
+                    component_configuration_id=plan.configuration_id,
+                    provider_config=provider_config,
+                    account=bind_budget_account(provider_account),
+                ),
+            ),
+            timed_resources=(
+                TimedResourceCostBinding(
+                    component_configuration_id=plan.configuration_id,
+                    resource_type=task_class.role.value,
+                    resource_class_digest=task_class.digest,
+                    account=bind_timed_resource_account(task_account),
+                ),
+                TimedResourceCostBinding(
+                    component_configuration_id=plan.configuration_id,
+                    resource_type=runner_class.role.value,
+                    resource_class_digest=runner_class.digest,
+                    account=bind_timed_resource_account(runner_account),
+                ),
+            ),
+        ),
+    )
+    runtime = SearchCostRuntime(authority=authority, binding=binding).for_component(
+        SearchComponentRole.SCORER
+    )
     captured: dict[str, object] = {}
+    current_build_record = [
+        _BuildRecordStub(
+            build_config_digest=build_identity.build_config_digest,
+            digest=build_identity.build_record_digest,
+            template_id=build_identity.template_id,
+            build_id=build_identity.build_id,
+        )
+    ]
+
+    def require_build(**_kwargs: object) -> _BuildRecordStub:
+        return current_build_record[0]
 
     class CapturingEvaluator:
         def __init__(
@@ -536,27 +930,26 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
             raise RuntimeError("captured")
 
     monkeypatch.setattr(mod, "HarborEvaluator", CapturingEvaluator)
-    e2b_spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
+    monkeypatch.setattr(mod, "require_exact_e2b_build_record", require_build)
     scorer = mod.HarborHarnessScorer(
         job_spec=e2b_spec,
         provider_config=provider_config,
-        reference_harness=pi_node_baseline("baseline"),
-        task_ids=_TASK_IDS,
-        task_keys=_TASK_KEYS,
-        task_environment_digests=_TASK_ENVIRONMENT_DIGESTS,
+        reference_harness=reference,
+        qualified_tasks=qualified_tasks,
         reward_key="reward",
         runner_spec=runner_spec,
-        budget_account=provider_account,
-        task_resource_budget_accounts=(task_account,),
-        runner_resource_budget_account=runner_account,
+        cost_runtime=runtime,
+        create_rate_authority=rate_authority,
     )
 
-    with scorer, pytest.raises(RuntimeError, match="captured"):
+    with pytest.raises(RuntimeError, match="captured"):
         scorer.score(pi_node_baseline("candidate"), request=_full_request())
 
     assert captured["budget_account"] == provider_account
     assert captured["task_resource_budget_accounts"] == (task_account,)
     assert captured["runner_resource_budget_account"] == runner_account
+    assert captured["create_rate_authority"] is rate_authority
+    assert scorer.search_cost_binding == runtime.binding
     assert {
         provider_account.policy.policy_digest,
         task_account.policy.policy_digest,
@@ -567,6 +960,30 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
         task_account.ledger_path,
         runner_account.ledger_path,
     } == {ledger_path}
+
+    captured_before_corruption = dict(captured)
+    current_build_record[0] = _BuildRecordStub(
+        build_config_digest=build_identity.build_config_digest,
+        digest=build_identity.build_record_digest,
+        template_id="replacement-template",
+        build_id=build_identity.build_id,
+    )
+    with pytest.raises(ValueError, match="differs from its qualification evidence"):
+        scorer.score(pi_node_baseline("candidate-build-drift"), request=_full_request())
+    assert captured == captured_before_corruption
+    current_build_record[0] = _BuildRecordStub(
+        build_config_digest=build_identity.build_config_digest,
+        digest=build_identity.build_record_digest,
+        template_id=build_identity.template_id,
+        build_id=build_identity.build_id,
+    )
+    with sqlite3.connect(runtime.authority.ledger_path) as connection:
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute("UPDATE budget_metadata SET schema_version = 1 WHERE id = 1")
+    with pytest.raises(RuntimeError, match="unsupported budget schema version"):
+        scorer.score(pi_node_baseline("candidate-2"), request=_full_request())
+    assert captured == captured_before_corruption
+    scorer.close()
 
 
 def test_score_job_identity_binds_full_candidate_route_and_qualification(
@@ -589,7 +1006,14 @@ def test_score_job_identity_binds_full_candidate_route_and_qualification(
 
     azure = ProviderConfig(kind=ProviderKind.AZURE_OPENAI, model="worker-model")
     with (
-        _scorer(tmp_path, provider_config=azure) as route_scorer,
+        _scorer(
+            tmp_path,
+            provider_config=azure,
+            response_identity=mod.ProviderResponseIdentity(
+                provider=ProviderKind.AZURE_OPENAI,
+                response_model="served-worker-model",
+            ),
+        ) as route_scorer,
         _scorer(
             tmp_path,
             task_environment_digests=(
@@ -1270,14 +1694,77 @@ def test_candidate_compute_envelope_is_frozen_while_source_may_change(tmp_path: 
     scorer.close()
 
 
-def test_e2b_task_scoring_uses_the_trusted_exact_build_environment_adapter(
+def test_e2b_score_plan_accepts_trusted_exact_build_environment_evidence(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_fake_evaluator(monkeypatch, tmp_path)
     spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
-    with _scorer(tmp_path, job_spec=spec) as scorer:
-        assert scorer.environment_backend is HarborEnvironmentBackend.E2B
+    authority = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+    task_class = ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024)
+
+    plan = mod.harbor_harness_score_plan(
+        job_spec=spec,
+        provider_config=_provider(),
+        reference_harness=pi_node_baseline("baseline"),
+        qualified_tasks=_e2b_qualified_tasks(task_class),
+        reward_key="reward",
+        create_rate_binding=authority.binding,
+    )
+
+    assert plan.environment_backend is HarborEnvironmentBackend.E2B
+    assert plan.task_environment_digests == _TASK_ENVIRONMENT_DIGESTS
+    assert plan.task_resource_classes == (task_class, task_class)
+
+
+def test_e2b_score_plan_rejects_local_task_qualification(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
+    authority = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+
+    with pytest.raises(ValueError, match="task backends differ"):
+        mod.harbor_harness_score_plan(
+            job_spec=spec,
+            provider_config=_provider(),
+            reference_harness=pi_node_baseline("baseline"),
+            qualified_tasks=_qualified_tasks(),
+            reward_key="reward",
+            create_rate_binding=authority.binding,
+        )
+
+
+def test_e2b_score_plan_rejects_conflicting_identity_for_one_build_config(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
+    authority = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+    task_class = ExactE2BEnvironment._task_resource_class(cpu_count=2, memory_mb=1024)
+    tasks = list(_e2b_qualified_tasks(task_class))
+    identity = tasks[1].e2b_build_identity
+    assert identity is not None
+    tasks[1] = tasks[1].model_copy(
+        update={
+            "e2b_build_identity": identity.model_copy(
+                update={"template_id": "replacement-template"}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="conflicting immutable builds"):
+        mod.harbor_harness_score_plan(
+            job_spec=spec,
+            provider_config=_provider(),
+            reference_harness=pi_node_baseline("baseline"),
+            qualified_tasks=tuple(tasks),
+            reward_key="reward",
+            create_rate_binding=authority.binding,
+        )
 
 
 def test_runner_cleanup_on_success_error_and_construction_failure(
@@ -1351,7 +1838,7 @@ def test_constructor_requires_exact_explicit_unique_task_selection(tmp_path: Pat
         _scorer(tmp_path, task_keys=(_TASK_KEYS[0],))
     with pytest.raises(ValueError, match="one digest per task_id"):
         _scorer(tmp_path, task_environment_digests=(_TASK_ENVIRONMENT_DIGESTS[0],))
-    with pytest.raises(ValueError, match="qualification manifest"):
+    with pytest.raises(ValueError, match="pattern"):
         _scorer(tmp_path, task_keys=(_TASK_KEYS[0], "not-a-digest"))
     remote = _spec(tmp_path).model_copy(
         update={

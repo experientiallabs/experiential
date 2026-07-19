@@ -19,6 +19,12 @@ from typing import Literal, Protocol, cast
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from wmh.core.types import JsonObject
+from wmh.harness.cost import (
+    SearchComponentCostBinding,
+    SearchComponentCostRuntime,
+    SearchComponentRole,
+    TimedResourceCostBinding,
+)
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
     E2B_CLEANUP_HORIZON_S,
@@ -56,6 +62,8 @@ from wmh.tracking.budget import (
 )
 from wmh.tracking.rate_limit import (
     ExternalDispatchRateAuthority,
+    ExternalDispatchRateBinding,
+    bind_external_dispatch_rate_authority,
     validate_e2b_sandbox_create_rate_policy,
 )
 
@@ -186,7 +194,8 @@ class _BudgetedProjectSandboxFactory:
     def __init__(
         self,
         *,
-        account: TimedResourceBudgetAccount,
+        cost_runtime: SearchComponentCostRuntime,
+        component_configuration_id: str,
         ledger_dir: Path,
         timeout: float,
         template: str,
@@ -197,7 +206,7 @@ class _BudgetedProjectSandboxFactory:
         orphan_reaper: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
         self._create_rate_authority = _validate_project_create_rate_authority(create_rate_authority)
-        if not math.isfinite(timeout) or timeout <= 0 or not timeout.is_integer():
+        if not math.isfinite(timeout) or timeout <= 0 or not float(timeout).is_integer():
             raise ValueError("project sandbox timeout must be a positive whole number of seconds")
         if timeout > E2B_MAX_SANDBOX_TIMEOUT_S:
             raise ValueError("project sandbox timeout exceeds the E2B provider maximum")
@@ -205,7 +214,11 @@ class _BudgetedProjectSandboxFactory:
             raise ValueError("project sandbox template must pin an exact template and build ID")
         if not ledger_dir.is_absolute():
             raise ValueError("project resource lease ledger directory must be absolute")
-        self._account = TimedResourceBudgetAccount.model_validate(account.model_dump())
+        self._create_rate_binding = bind_external_dispatch_rate_authority(
+            self._create_rate_authority
+        )
+        self._cost_runtime = cost_runtime
+        self._component_configuration_id = component_configuration_id
         self._ledger_dir = ledger_dir
         self._provider_ttl_seconds = int(timeout)
         self._template = template
@@ -222,15 +235,31 @@ class _BudgetedProjectSandboxFactory:
             create_request_timeout_seconds=_PROJECT_CREATE_HORIZON_S,
             cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
         )
-        # Construction validates the meter role, class digest, and full host horizon before any
-        # filesystem or provider side effect.
-        TimedResourceBudget(self._account, resource_class=self._resource_class)
+        # Resolve the exact path-free account before any filesystem or provider side effect.
+        self._resource_binding, _account = _project_resource_account(
+            cost_runtime,
+            configuration_id=component_configuration_id,
+            resource_class=self._resource_class,
+        )
         self._config_digest = self._digest_config()
         self._owner_id = runner_owner_id(uuid.uuid4().hex)
         self._live: dict[int, _ProjectResourceLease] = {}
+        self._proved_retired: set[int] = set()
 
     def __call__(self) -> SandboxHandle:
-        self._reconcile_orphans()
+        if (
+            bind_external_dispatch_rate_authority(self._create_rate_authority)
+            != self._create_rate_binding
+        ):
+            raise ValueError("project create-rate authority changed after construction")
+        resource_binding, account = _project_resource_account(
+            self._cost_runtime,
+            configuration_id=self._component_configuration_id,
+            resource_class=self._resource_class,
+        )
+        if resource_binding != self._resource_binding:
+            raise ValueError("project timed resource binding changed after construction")
+        self._reconcile_orphans(account)
         create_deadline_s = time.monotonic() + _PROJECT_CREATE_HORIZON_S
         lease_id = uuid.uuid4().hex
         ledger = RunnerLeaseLedger(self._ledger_dir / f"{lease_id}.json")
@@ -249,7 +278,7 @@ class _BudgetedProjectSandboxFactory:
         create_outcome: _ProjectCreateOutcome = "not_dispatched"
         try:
             reservation = TimedResourceBudget(
-                self._account,
+                account,
                 resource_class=self._resource_class,
                 id_factory=lambda: lease_id,
             ).reserve()
@@ -332,11 +361,28 @@ class _BudgetedProjectSandboxFactory:
                 lease.reservation = None
             lease.ledger.retire()
         except BaseException:
-            lease.ledger.cleanup_failed(resource_id if isinstance(resource_id, str) else None)
+            self._finish_proved_retirement(sandbox, lease)
             raise
         self._live.pop(id(sandbox), None)
+        self._proved_retired.add(id(sandbox))
 
-    def _reconcile_orphans(self) -> None:
+    def retirement_proved(self, sandbox: SandboxHandle) -> bool:
+        """Return whether this factory already proved provider-side sandbox absence."""
+        return id(sandbox) in self._proved_retired
+
+    def _finish_proved_retirement(
+        self,
+        sandbox: SandboxHandle,
+        lease: _ProjectResourceLease,
+    ) -> None:
+        """Forget a killed lease while preserving its accounting error for the caller."""
+        lease.reservation = None
+        with contextlib.suppress(Exception):
+            lease.ledger.retire()
+        self._live.pop(id(sandbox), None)
+        self._proved_retired.add(id(sandbox))
+
+    def _reconcile_orphans(self, account: TimedResourceBudgetAccount) -> None:
         if self._ledger_dir.is_symlink():
             raise RuntimeError("project resource lease directory cannot be a symbolic link")
         self._ledger_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -358,7 +404,7 @@ class _BudgetedProjectSandboxFactory:
                 orphan_reaper=self._orphan_reaper,
                 orphan_budget_reconciler=lambda reservation_id: (
                     orphaned_timed_resource_requires_reap(
-                        self._account,
+                        account,
                         reservation_id=reservation_id,
                     )
                 ),
@@ -471,9 +517,37 @@ class _BudgetedProjectSandboxFactory:
             "timeout_action": "kill",
             "auto_resume": False,
             "volume_mounts": False,
+            "create_rate_binding": self._create_rate_binding.model_dump(mode="json"),
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _project_resource_account(
+    runtime: SearchComponentCostRuntime,
+    *,
+    configuration_id: str,
+    resource_class: TimedResourceClass,
+) -> tuple[TimedResourceCostBinding, TimedResourceBudgetAccount]:
+    """Reaudit the exact proposer project account before one E2B create dispatch."""
+    if not isinstance(runtime, SearchComponentCostRuntime):
+        raise TypeError("AgentProject cost_runtime must be a SearchComponentCostRuntime")
+    binding = SearchComponentCostBinding.model_validate(runtime.binding.model_dump())
+    if binding.role is not SearchComponentRole.PROPOSER:
+        raise ValueError("AgentProject cost runtime must use the proposer role")
+    if binding.configuration_id != configuration_id:
+        raise ValueError("AgentProject component configuration_id differs from its cost runtime")
+    if len(binding.timed_resources) != 1:
+        raise ValueError("AgentProject cost runtime must bind exactly one timed resource account")
+    resource_binding = binding.timed_resources[0]
+    if (
+        resource_binding.resource_type != resource_class.role.value
+        or resource_binding.resource_class_digest != resource_class.digest
+    ):
+        raise ValueError("AgentProject resource class differs from its cost runtime")
+    account = runtime.timed_resource_account(resource_binding)
+    TimedResourceBudget(account, resource_class=resource_class)
+    return resource_binding, account
 
 
 class AgentProject:
@@ -495,8 +569,12 @@ class AgentProject:
         sandbox_factory: SandboxFactory | None = None,
         sandbox_opener: Callable[[SandboxFactory], SandboxHandle] = create_sandbox,
         sandbox_retirer: Callable[[SandboxHandle], None] = kill_sandbox,
+        sandbox_retirement_proved: Callable[[SandboxHandle], bool] | None = None,
         budget_policy_digest: str | None = None,
         budget_ledger_path: Path | None = None,
+        search_cost_binding: SearchComponentCostBinding | None = None,
+        timed_resource_binding: TimedResourceCostBinding | None = None,
+        create_rate_binding: ExternalDispatchRateBinding | None = None,
         owns_sandbox: bool = True,
     ) -> None:
         self._sandbox = sandbox
@@ -511,8 +589,12 @@ class AgentProject:
         self._sandbox_factory = sandbox_factory if owns_sandbox else None
         self._sandbox_opener = sandbox_opener
         self._sandbox_retirer = sandbox_retirer
+        self._sandbox_retirement_proved = sandbox_retirement_proved
         self._budget_policy_digest = budget_policy_digest
         self._budget_ledger_path = budget_ledger_path
+        self._search_cost_binding = search_cost_binding
+        self._timed_resource_binding = timed_resource_binding
+        self._create_rate_binding = create_rate_binding
         self._owns_sandbox = owns_sandbox
         self._active_sandbox_started_at = time.monotonic()
         self._retired_sandbox_seconds = 0.0
@@ -539,6 +621,7 @@ class AgentProject:
         # fails so a reused live session cannot inherit the preceding turn's authority.
         self._active_writable_files: frozenset[str] | None = None
         self._retired_worker_usage = TokenUsage()
+        self._pending_accounting_failures: list[BaseException] = []
         try:
             self._initialize_sandbox(self._sandbox)
         except Exception as error:
@@ -557,7 +640,8 @@ class AgentProject:
         template: str,
         cpu_count: int,
         memory_mb: int,
-        resource_budget_account: TimedResourceBudgetAccount,
+        cost_runtime: SearchComponentCostRuntime,
+        component_configuration_id: str,
         lease_ledger_dir: Path,
         create_rate_authority: ExternalDispatchRateAuthority,
         api_key: str | None = None,
@@ -567,8 +651,27 @@ class AgentProject:
         validated_rate_authority = _validate_project_create_rate_authority(create_rate_authority)
         if metadata:
             raise ValueError("project sandbox provider metadata is controlled by WMH")
+        if not math.isfinite(timeout) or timeout <= 0 or not float(timeout).is_integer():
+            raise ValueError("project sandbox timeout must be a positive whole number of seconds")
+        if timeout > E2B_MAX_SANDBOX_TIMEOUT_S:
+            raise ValueError("project sandbox timeout exceeds the E2B provider maximum")
+        create_rate_binding = bind_external_dispatch_rate_authority(validated_rate_authority)
+        resource_class = TimedResourceClass(
+            role=TimedResourceRole.PROPOSER_PROJECT,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            provider_ttl_seconds=int(timeout),
+            create_request_timeout_seconds=_PROJECT_CREATE_HORIZON_S,
+            cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
+        )
+        resource_binding, resource_account = _project_resource_account(
+            cost_runtime,
+            configuration_id=component_configuration_id,
+            resource_class=resource_class,
+        )
         factory = _BudgetedProjectSandboxFactory(
-            account=resource_budget_account,
+            cost_runtime=cost_runtime,
+            component_configuration_id=component_configuration_id,
             ledger_dir=lease_ledger_dir,
             timeout=timeout,
             template=template,
@@ -583,8 +686,12 @@ class AgentProject:
             sandbox_factory=factory,
             sandbox_opener=lambda opener: opener(),
             sandbox_retirer=factory.retire,
-            budget_policy_digest=resource_budget_account.policy.policy_digest,
-            budget_ledger_path=resource_budget_account.ledger_path.expanduser().resolve(),
+            sandbox_retirement_proved=factory.retirement_proved,
+            budget_policy_digest=resource_account.policy.policy_digest,
+            budget_ledger_path=resource_account.ledger_path.expanduser().resolve(),
+            search_cost_binding=cost_runtime.binding,
+            timed_resource_binding=resource_binding,
+            create_rate_binding=create_rate_binding,
         )
 
     @property
@@ -596,6 +703,27 @@ class AgentProject:
     def budget_ledger_path(self) -> Path | None:
         """Return the trusted host-only ledger join for the proposer provider."""
         return self._budget_ledger_path
+
+    @property
+    def search_cost_binding(self) -> SearchComponentCostBinding | None:
+        """Return the path-free proposer accounts used by every owned project lease."""
+        if self._search_cost_binding is None:
+            return None
+        return SearchComponentCostBinding.model_validate(self._search_cost_binding.model_dump())
+
+    @property
+    def timed_resource_binding(self) -> TimedResourceCostBinding | None:
+        """Return the exact timed resource account used for every project lease."""
+        if self._timed_resource_binding is None:
+            return None
+        return TimedResourceCostBinding.model_validate(self._timed_resource_binding.model_dump())
+
+    @property
+    def create_rate_binding(self) -> ExternalDispatchRateBinding | None:
+        """Return the path-free shared E2B create-rate authority identity."""
+        if self._create_rate_binding is None:
+            return None
+        return ExternalDispatchRateBinding.model_validate(self._create_rate_binding.model_dump())
 
     def write_text(self, path: str, content: str) -> None:
         """Write one project-relative file without allowing path traversal."""
@@ -982,11 +1110,15 @@ class AgentProject:
 
         leases = list(self._live_sandboxes.values())
         failures: list[SandboxCleanupError] = []
+        accounting_failures: list[BaseException] = []
         for sandbox, _started_at in leases:
             try:
                 self._retire_sandbox(sandbox)
             except SandboxCleanupError as error:
                 failures.append(error)
+            except BaseException as error:  # noqa: BLE001 - finish every external cleanup
+                accounting_failures.append(error)
+        self._pending_accounting_failures.extend(accounting_failures)
         if failures:
             raise SandboxCleanupError(
                 "failed to prove cleanup for "
@@ -995,6 +1127,8 @@ class AgentProject:
                 resource="meta_project_sandbox",
                 sandbox_usage=self.usage(),
             ) from failures[0]
+        if self._pending_accounting_failures:
+            raise self._pending_accounting_failures.pop(0)
         self._finished_at = time.monotonic()
 
     def __enter__(self) -> AgentProject:
@@ -1111,7 +1245,17 @@ class AgentProject:
         lease = self._live_sandboxes.get(id(sandbox))
         if lease is None:
             return
-        self._sandbox_retirer(sandbox)
+        try:
+            self._sandbox_retirer(sandbox)
+        except BaseException:
+            proved = self._sandbox_retirement_proved
+            if proved is not None and proved(sandbox):
+                self._forget_retired_sandbox(sandbox)
+            raise
+        self._forget_retired_sandbox(sandbox)
+
+    def _forget_retired_sandbox(self, sandbox: SandboxHandle) -> None:
+        """Stop metering one lease after its retirement is proved."""
         retired_at = time.monotonic()
         _handle, started_at = self._live_sandboxes.pop(id(sandbox))
         self._retired_sandbox_seconds += max(0.0, retired_at - started_at)

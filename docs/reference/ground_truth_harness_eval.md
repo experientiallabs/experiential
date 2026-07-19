@@ -295,26 +295,19 @@ from harbor.models.job.config import DatasetConfig
 
 from wmh.evals.harbor.config import HarborJobSpec
 from wmh.evals.harbor.scorer import HarborHarnessScorer
-from wmh.harness.scoring import ScoreRequest
+from wmh.harness.cost import SearchComponentRole
+from wmh.harness.create import search_harness
+from wmh.providers.receipt import ProviderResponseIdentity
 
 task_ids = ("task-a", "task-b")
-# Dataset-qualified task keys come from the frozen Harbor qualification manifest.
-qualified_task_keys = {
-    trial.task_identity: trial.cell.task_key for trial in qualification.result.trials
-}
-task_keys = tuple(qualified_task_keys[task_id] for task_id in task_ids)
-qualified_environment_digests = {}
-for task_id in task_ids:
-    digests = {
-        trial.task_environment_digest
-        for trial in qualification.result.trials
-        if trial.task_identity == task_id
-    }
-    if None in digests or len(digests) != 1:
-        raise ValueError(f"qualification did not freeze one environment for {task_id!r}")
-    qualified_environment_digests[task_id] = digests.pop()
-task_environment_digests = tuple(
-    qualified_environment_digests[task_id] for task_id in task_ids
+# Use the exact QualifiedHarborTask objects published by roster qualification. They are the single
+# source of task IDs, content keys, environment digests, E2B build IDs, and resource classes.
+qualified_by_id = {task.task_id: task for task in qualification_roster.tasks}
+qualified_tasks = tuple(qualified_by_id[task_id] for task_id in task_ids)
+worker_response_identity = ProviderResponseIdentity(
+    provider=worker_provider.kind,
+    response_model=expected_response_model,
+    system_fingerprint=expected_system_fingerprint,
 )
 job = HarborJobSpec(
     job_name="discovery",
@@ -325,19 +318,42 @@ job = HarborJobSpec(
 with HarborHarnessScorer(
     job_spec=job,
     provider_config=worker_provider,
+    response_identity=worker_response_identity,
     reference_harness=baseline,
-    task_ids=task_ids,
-    task_keys=task_keys,
-    task_environment_digests=task_environment_digests,
+    qualified_tasks=qualified_tasks,
     reward_key="reward",
+    cost_runtime=search_cost_runtime.for_component(SearchComponentRole.SCORER),
 ) as scorer:
-    report = scorer.score(candidate, request=ScoreRequest(purpose="full"))
+    result = search_harness(
+        "discovery",
+        baseline,
+        scorer,
+        proposer,
+        iterations=5,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        cost_binding=search_cost_runtime.binding,
+    )
 ```
 
 When this scorer is passed to `search_harness`, set `screen_proposals=False` and
 `confirm_narrow_vetoes=False`. Every candidate then receives exactly the frozen matrix. The
 reference harness fixes runtime kind, turns, output tokens, temperature, effective tools, and the
 per-turn deadline. A candidate that changes that compute envelope is ineligible.
+
+The score plan also freezes provider-reported route evidence. Azure and OpenAI routes must name the
+exact served response model before search, plus the system fingerprint when that endpoint exposes
+one. Bedrock Converse exposes neither field, so its committed response identity contains explicit
+null values. Receipt drift is rejected before a scored arm is admitted.
+
+`environment_backend="local"` selects local task and pi-runner infrastructure only. Azure or
+Bedrock inference remains paid and still requires the same complete `SearchCostBinding` and shared
+durable budget authority as E2B execution.
+
+When any search component creates E2B resources, the top-level cost binding also commits one
+path-free external dispatch-rate binding. Pass the corresponding authority to the proposer
+`AgentProject` and every E2B scorer. Project sandboxes, task environments, and pi runners then
+acquire from the same durable four-per-second gate before each provider create.
 
 The local policy prevents Harbor from building task Dockerfiles or consuming task-authored Compose
 host capabilities, but it is not proof that an arbitrary container image or verifier is safe.

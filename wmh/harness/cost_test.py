@@ -19,6 +19,10 @@ from wmh.harness.cost import (
     validate_search_cost_components,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
+    synthetic_tariff_provenance,
+)
 from wmh.tracking.budget import (
     BudgetIntegrityError,
     BudgetLedgerAuthority,
@@ -26,10 +30,14 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     TimedResourceCostMeter,
-    TokenPriceCeiling,
     bind_budget_account,
     bind_timed_resource_account,
     bootstrap_budget_ledger,
+)
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRateBinding,
 )
 
 
@@ -38,7 +46,7 @@ def _digest(value: str) -> str:
 
 
 def _provider_config(model: str) -> ProviderConfig:
-    return ProviderConfig(kind=ProviderKind.BEDROCK, model=model)
+    return ProviderConfig(kind=ProviderKind.BEDROCK, model=model, region="test-region")
 
 
 def _policy(label: str) -> BudgetPolicy:
@@ -48,19 +56,17 @@ def _policy(label: str) -> BudgetPolicy:
         hard_limit_nano_usd=15_000_000_000,
         phase_limits_nano_usd={"search": 15_000_000_000},
         meters={
-            "proposer-provider": ProviderCostMeter(
-                provider_config=_provider_config("proposer-model"),
-                price=TokenPriceCeiling(
-                    input_nano_usd_per_token=1,
-                    output_nano_usd_per_token=2,
-                ),
+            "proposer-provider": synthetic_provider_cost_meter(
+                provider_config=(proposer_config := _provider_config("proposer-model")),
+                provenance=synthetic_tariff_provenance(proposer_config),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=2,
             ),
-            "scorer-provider": ProviderCostMeter(
-                provider_config=_provider_config("scorer-model"),
-                price=TokenPriceCeiling(
-                    input_nano_usd_per_token=2,
-                    output_nano_usd_per_token=4,
-                ),
+            "scorer-provider": synthetic_provider_cost_meter(
+                provider_config=(scorer_config := _provider_config("scorer-model")),
+                provenance=synthetic_tariff_provenance(scorer_config),
+                input_nano_usd_per_token=2,
+                output_nano_usd_per_token=4,
             ),
             "proposer-project": TimedResourceCostMeter(
                 resource_type="proposer_project",
@@ -416,8 +422,10 @@ class _BoundComponent:
         self,
         configuration_id: str,
         binding: SearchComponentCostBinding | None,
+        create_rate_binding: ExternalDispatchRateBinding | None = None,
     ) -> None:
         self.configuration_id = configuration_id
+        self.create_rate_binding = create_rate_binding
         if binding is not None:
             self.search_cost_binding = binding
 
@@ -446,4 +454,56 @@ def test_component_validation_requires_exact_exposed_bindings(tmp_path: Path) ->
             binding,
             proposer=_BoundComponent("spoofed-id", binding.proposer),
             scorer=scorer,
+        )
+
+
+def test_component_validation_requires_one_shared_external_dispatch_authority(
+    tmp_path: Path,
+) -> None:
+    first = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "first-rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+    second = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "second-rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+    binding = _revalidate(
+        _binding(_authority(tmp_path, "shared-rate")),
+        external_dispatch_rate_binding=first.binding.model_dump(mode="json"),
+    )
+    proposer = _BoundComponent(
+        "proposer-v1",
+        binding.proposer,
+        create_rate_binding=first.binding,
+    )
+    scorer = _BoundComponent(
+        "scorer-v1",
+        binding.scorer,
+        create_rate_binding=first.binding,
+    )
+
+    validate_search_cost_components(binding, proposer=proposer, scorer=scorer)
+
+    with pytest.raises(ValueError, match="shared external dispatch authority"):
+        validate_search_cost_components(
+            binding,
+            proposer=proposer,
+            scorer=_BoundComponent(
+                "scorer-v1",
+                binding.scorer,
+                create_rate_binding=second.binding,
+            ),
+        )
+
+    without_rate = _binding(_authority(tmp_path, "missing-shared-rate"))
+    with pytest.raises(ValueError, match="omits the shared external dispatch authority"):
+        validate_search_cost_components(
+            without_rate,
+            proposer=_BoundComponent(
+                "proposer-v1",
+                without_rate.proposer,
+                create_rate_binding=first.binding,
+            ),
+            scorer=_BoundComponent("scorer-v1", without_rate.scorer),
         )

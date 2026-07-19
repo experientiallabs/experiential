@@ -61,11 +61,13 @@ from wmh.harness.scoring import (
 )
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
+from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
+    synthetic_tariff_provenance,
+)
 from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
-    ProviderCostMeter,
-    TokenPriceCeiling,
     bind_budget_account,
     bootstrap_budget_ledger,
 )
@@ -358,19 +360,23 @@ def _rehash_checkpoint_payload(payload: dict[str, object]) -> None:
 
 
 def _search_cost_binding(tmp_path: Path, *, label: str) -> SearchCostBinding:
-    provider_config = ProviderConfig(kind=ProviderKind.BEDROCK, model="budgeted-model")
+    provider_config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="budgeted-model",
+        region="test-region",
+    )
+    tariff_provenance = synthetic_tariff_provenance(provider_config)
     policy = BudgetPolicy(
         study_id=f"search-{label}",
         manifest_digest="sha256:" + hashlib.sha256(label.encode()).hexdigest(),
         hard_limit_nano_usd=1_000_000,
         phase_limits_nano_usd={"search": 1_000_000},
         meters={
-            role: ProviderCostMeter(
+            role: synthetic_provider_cost_meter(
                 provider_config=provider_config,
-                price=TokenPriceCeiling(
-                    input_nano_usd_per_token=1,
-                    output_nano_usd_per_token=1,
-                ),
+                provenance=tariff_provenance,
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=1,
             )
             for role in ("proposer", "scorer")
         },
@@ -475,6 +481,15 @@ class _NeverCalledBudgetMarkerScorer(_NeutralScorer):
         raise AssertionError("budget-marked scorer was called before omission rejection")
 
 
+class _PaidDispatchScorer(_NeverCalledBudgetMarkerScorer):
+    """Declare a paid dispatch even before its exact account is attached."""
+
+    requires_search_cost_binding = True
+
+    def __init__(self) -> None:
+        _NeutralScorer.__init__(self)
+
+
 @pytest.mark.parametrize("bound_role", ["proposer", "scorer", "holdout_scorer"])
 def test_cost_bound_component_requires_top_level_binding_before_component_calls(
     tmp_path: Path,
@@ -526,6 +541,23 @@ def test_budget_account_marker_requires_top_level_binding_before_component_calls
     assert scorer.requests == []
 
 
+def test_paid_dispatch_marker_requires_top_level_binding_before_component_calls() -> None:
+    scorer = _PaidDispatchScorer()
+
+    with pytest.raises(ValueError, match="scorer exposes budgeted cost state"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _HistoryProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+    assert scorer.requests == []
+
+
 def test_budgeted_search_rejects_unbound_components_before_scoring(tmp_path: Path) -> None:
     scorer = _NeutralScorer()
     with pytest.raises(ValueError, match="proposer.search_cost_binding"):
@@ -541,6 +573,29 @@ def test_budgeted_search_rejects_unbound_components_before_scoring(tmp_path: Pat
         )
 
     assert scorer.requests == []
+
+
+def test_search_result_retains_full_path_free_cost_contract_without_checkpointing(
+    tmp_path: Path,
+) -> None:
+    binding = _search_cost_binding(tmp_path, label="result-provenance")
+
+    result = search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        _CostBoundScorer(binding.scorer),
+        _CostBoundProposer(binding.proposer),
+        iterations=0,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        cost_binding=binding,
+    )
+
+    retained = result.search_cost_binding
+    assert retained is not None
+    assert retained == binding
+    assert retained.digest == binding.digest
+    assert str(tmp_path) not in retained.model_dump_json()
 
 
 def test_search_checkpoint_binds_cost_provenance_and_rejects_drift(

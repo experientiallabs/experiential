@@ -61,6 +61,7 @@ from wmh.evals.harbor.e2b_environment import (
     require_exact_e2b_build_record,
     validate_exact_e2b_task_resource_requests,
 )
+from wmh.evals.harbor.qualification_types import QualifiedHarborTask
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
     HarborTrialManifestEntry,
@@ -110,7 +111,7 @@ _TASK_SNAPSHOT_ROOT = ".wmh-task-snapshots"
 _JOB_ROOT_FILES = frozenset(
     {_MANIFEST_FILENAME, "config.json", "job.log", "lock.json", "result.json"}
 )
-HARBOR_EVALUATOR_VERSION = "2"
+HARBOR_EVALUATOR_VERSION = "3"
 
 
 class StaleHarborJobError(RuntimeError):
@@ -388,6 +389,7 @@ class HarborEvaluator:
         task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
         runner_resource_budget_account: TimedResourceBudgetAccount | None = None,
         create_rate_authority: ExternalDispatchRateAuthority | None = None,
+        qualified_tasks: tuple[QualifiedHarborTask, ...] | None = None,
     ) -> None:
         validated_runner = _coerce_runner_spec(
             runner_spec=runner_spec,
@@ -406,6 +408,24 @@ class HarborEvaluator:
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
         self._session = session
+        self._qualified_tasks = (
+            None
+            if qualified_tasks is None
+            else tuple(
+                QualifiedHarborTask.model_validate(task.model_dump()) for task in qualified_tasks
+            )
+        )
+        if self._qualified_tasks is not None:
+            if not self._qualified_tasks:
+                raise ValueError("qualified_tasks must be non-empty when supplied")
+            qualified_task_ids = tuple(task.task_id for task in self._qualified_tasks)
+            if len(set(qualified_task_ids)) != len(qualified_task_ids):
+                raise ValueError("qualified task IDs must be unique")
+            if any(
+                task.environment_backend is not self._spec.environment_backend
+                for task in self._qualified_tasks
+            ):
+                raise ValueError("qualified task backend differs from Harbor evaluator")
         self._budget_policy_digest: str | None = None
         self._budget_binding: BudgetAccountBinding | None = None
         self._task_resource_budget_bindings: tuple[BudgetAccountBinding, ...] = ()
@@ -575,6 +595,11 @@ class HarborEvaluator:
                 environment_backend=self._spec.environment_backend,
                 agent_config_digest=agent_digest,
             )
+            if self._qualified_tasks is not None:
+                _validate_prepared_task_qualification(
+                    prepared_tasks,
+                    qualified_tasks=self._qualified_tasks,
+                )
             prepared_trials = [item.identity for item in prepared_tasks]
             if existing_manifest is not None:
                 _validate_existing_job_lock(job_dir, job_lock)
@@ -1773,6 +1798,29 @@ def prepare_harbor_job_tasks(
         ),
         job_lock,
     )
+
+
+def _validate_prepared_task_qualification(
+    prepared_tasks: tuple[PreparedHarborTask, ...],
+    *,
+    qualified_tasks: tuple[QualifiedHarborTask, ...],
+) -> None:
+    """Reconcile qualified task content after snapshotting and before any trial dispatch."""
+    qualified_by_id = {task.task_id: task for task in qualified_tasks}
+    if len(qualified_by_id) != len(qualified_tasks):
+        raise ValueError("qualified task IDs must be unique")
+    prepared_task_ids = {item.identity.task_identity for item in prepared_tasks}
+    if prepared_task_ids != set(qualified_by_id):
+        raise ValueError("prepared Harbor tasks differ from qualification evidence")
+    for item in prepared_tasks:
+        identity = item.identity
+        qualification = qualified_by_id[identity.task_identity]
+        # ``task_key`` binds Harbor's dataset source identity, task identity, and checksum.
+        if (
+            identity.task_checksum != qualification.content_digest
+            or identity.task_key != qualification.task_key
+        ):
+            raise ValueError("prepared Harbor task differs from qualification evidence")
 
 
 def _prepare_trials(

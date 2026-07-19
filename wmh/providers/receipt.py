@@ -7,11 +7,12 @@ import hashlib
 import json
 import time
 from collections.abc import Mapping, Sequence
-from typing import TypeAlias
+from typing import Self, TypeAlias
 
 from llm_waterfall import ChatProviderReceipt
-from pydantic import JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from wmh.core.text import validate_durable_text
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 ProviderRequestScalar: TypeAlias = None | bool | int | float | str | bytes
@@ -19,6 +20,42 @@ ProviderRequestValue: TypeAlias = (
     ProviderRequestScalar | Sequence["ProviderRequestValue"] | Mapping[str, "ProviderRequestValue"]
 )
 ProviderRequestPayload: TypeAlias = "Mapping[str, ProviderRequestValue]"
+
+
+class ProviderResponseIdentity(BaseModel):
+    """Frozen provider-reported model identity required from every scored receipt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: ProviderKind
+    response_model: str | None = Field(default=None, min_length=1)
+    system_fingerprint: str | None = Field(default=None, min_length=1)
+
+    @field_validator("response_model", "system_fingerprint")
+    @classmethod
+    def _require_canonical_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip():
+            raise ValueError("provider response identity cannot have surrounding whitespace")
+        validate_durable_text(value, field="provider response identity")
+        return value
+
+    @model_validator(mode="after")
+    def _require_provider_evidence_shape(self) -> Self:
+        if self.provider is ProviderKind.BEDROCK:
+            if self.response_model is not None or self.system_fingerprint is not None:
+                raise ValueError(
+                    "Bedrock Converse does not return a served model or system fingerprint"
+                )
+        elif self.provider in {ProviderKind.AZURE_OPENAI, ProviderKind.OPENAI}:
+            if self.response_model is None:
+                raise ValueError("OpenAI-shaped scored routes require an expected response model")
+        else:
+            raise ValueError(
+                "scored provider receipts currently support Bedrock and OpenAI-shaped routes"
+            )
+        return self
 
 
 def build_chat_provider_receipt(
@@ -165,6 +202,7 @@ def validate_chat_provider_receipt(
     provider_config: ProviderConfig,
     requested_temperature: float,
     max_tokens: int,
+    response_identity: ProviderResponseIdentity | None = None,
 ) -> None:
     """Validate independently observable receipt fields against one frozen request route.
 
@@ -178,6 +216,16 @@ def validate_chat_provider_receipt(
         ProviderKind.AZURE_OPENAI,
     }:
         raise ValueError("configured provider does not support chat provider receipts")
+    frozen_response_identity = (
+        None
+        if response_identity is None
+        else ProviderResponseIdentity.model_validate(response_identity.model_dump())
+    )
+    if (
+        frozen_response_identity is not None
+        and frozen_response_identity.provider is not provider_config.kind
+    ):
+        raise ValueError("provider response identity disagrees with the frozen provider")
     expected_temperature = (
         requested_temperature if provider_config.resolved_chat_forward_temperature() else None
     )
@@ -209,8 +257,24 @@ def validate_chat_provider_receipt(
             raise ValueError("Bedrock provider receipt must not contain a response id")
         if receipt.response_model is not None or receipt.system_fingerprint is not None:
             raise ValueError("Bedrock provider receipt contains unsupported response metadata")
+        if frozen_response_identity is not None:
+            _validate_provider_response_identity(receipt, frozen_response_identity)
         return
     if receipt.response_id is None or receipt.response_model is None:
         raise ValueError("OpenAI-compatible provider receipt is missing response identity")
     if receipt.provider_request_id == receipt.response_id:
         raise ValueError("provider request identity was conflated with the response identity")
+    if frozen_response_identity is not None:
+        _validate_provider_response_identity(receipt, frozen_response_identity)
+
+
+def _validate_provider_response_identity(
+    receipt: ChatProviderReceipt,
+    response_identity: ProviderResponseIdentity,
+) -> None:
+    """Require provider-reported routing evidence to match its frozen scored route."""
+    if (
+        receipt.response_model != response_identity.response_model
+        or receipt.system_fingerprint != response_identity.system_fingerprint
+    ):
+        raise ValueError("provider receipt differs from the frozen response identity")

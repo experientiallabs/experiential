@@ -40,6 +40,7 @@ from wmh.evals.harbor.e2b_environment import (
     freeze_exact_e2b_build_spec,
     register_exact_e2b_build_record,
 )
+from wmh.evals.harbor.qualification_types import QualifiedHarborTask
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
     HarborTrialManifestEntry,
@@ -782,6 +783,40 @@ def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_key
         "turn_timeout_s": 300.0,
         "require_provider_receipts": True,
     }
+
+
+def test_qualified_task_content_drift_is_rejected_before_trial_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    dispatched = False
+
+    async def unexpected_run(_job: Job) -> None:
+        nonlocal dispatched
+        dispatched = True
+
+    monkeypatch.setattr(Job, "run", unexpected_run)
+    evaluator = mod.HarborEvaluator(
+        _spec(tmp_path, dataset),
+        _provider(),
+        qualified_tasks=(
+            QualifiedHarborTask(
+                task_id="shared-task",
+                dataset_id="terminalbench2",
+                content_digest="sha256:" + "a" * 64,
+                task_key="sha256:" + "b" * 64,
+                task_environment_digest=_TASK_ENVIRONMENT_DIGEST,
+                environment_backend=HarborEnvironmentBackend.LOCAL,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="qualification evidence"):
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
+    assert dispatched is False
 
 
 def test_runner_readiness_failure_precedes_harbor_job_and_task_work(

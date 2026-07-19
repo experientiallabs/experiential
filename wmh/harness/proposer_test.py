@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,10 +17,22 @@ from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProjectRun
 from wmh.core.types import JsonObject
+from wmh.harness.cost import (
+    ProviderCostBinding,
+    SearchComponentCostBinding,
+    SearchComponentCostRuntime,
+    SearchComponentRole,
+    SearchCostBinding,
+    SearchCostRuntime,
+    TimedResourceCostBinding,
+)
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmh.harness.mutate import parse_delta
-from wmh.harness.proposer import ProjectDeltaProposer, ProposalFailure, ProviderDeltaProposer
+from wmh.harness.proposer import (
+    ProjectDeltaProposer as _ProductionProjectDeltaProposer,
+)
+from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runtime import HarnessSearchCancelled, TokenUsage
 from wmh.harness.scoring import (
     HarnessScoreArchive,
@@ -37,6 +51,24 @@ from wmh.providers.base import (
     ProviderKind,
     ToolCallingProvider,
     VerifyResult,
+)
+from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
+    synthetic_tariff_provenance,
+)
+from wmh.tracking.budget import (
+    BudgetedProvider,
+    BudgetIntegrityError,
+    BudgetPolicy,
+    BudgetScope,
+    TimedResourceCostMeter,
+    bind_budget_account,
+    bind_timed_resource_account,
+    bootstrap_budget_ledger,
+)
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
 )
 
 
@@ -87,7 +119,8 @@ def _proposal_failure_reason(proposal: object) -> str:
 
 
 class _Provider:
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m", region="test-region")
+    paid_request_attempts = 1
 
     def __init__(self, reply: str) -> None:
         self.reply = reply
@@ -107,6 +140,12 @@ class _Provider:
     def complete_chat(self, request: object) -> ChatResponse:
         del request
         raise AssertionError("fake project never calls the provider")
+
+
+class ProjectDeltaProposer(_ProductionProjectDeltaProposer):
+    """Exercise proposal projection with fake projects and providers that cannot spend."""
+
+    requires_search_cost_binding = False
 
 
 class _FlakyProvider(_Provider):
@@ -174,6 +213,194 @@ class _Project:
         for index, output in enumerate(self.outputs, start=1):
             self.files[f"proposals/{iteration_dir}/proposal-{index:02d}.json"] = output
         return AgentProjectRun(answer="done", events=(), worker_usage=TokenUsage())
+
+
+class _CostBoundProject(_Project):
+    def __init__(
+        self,
+        outputs: list[str],
+        runtime: SearchComponentCostRuntime,
+    ) -> None:
+        super().__init__(outputs)
+        self.search_cost_binding = runtime.binding
+        [self.timed_resource_binding] = runtime.binding.timed_resources
+        self.budget_policy_digest = runtime.authority.policy.policy_digest
+        self.budget_ledger_path = runtime.authority.ledger_path
+        self.observed_provider: ToolCallingProvider | None = None
+
+    def run(
+        self,
+        agent: HarnessDoc,
+        provider: ToolCallingProvider,
+        instruction: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+        writable_files: Collection[str] | None = None,
+    ) -> AgentProjectRun:
+        self.observed_provider = provider
+        return super().run(
+            agent,
+            provider,
+            instruction,
+            should_cancel=should_cancel,
+            writable_files=writable_files,
+        )
+
+
+def _cost_digest(character: str) -> str:
+    return "sha256:" + character * 64
+
+
+def _proposer_cost_runtime(
+    tmp_path: Path,
+    *,
+    configuration_id: str,
+    provider_config: ProviderConfig | None = None,
+) -> SearchComponentCostRuntime:
+    proposer_provider = provider_config or _Provider.config
+    policy = BudgetPolicy(
+        study_id="project-proposer-cost-wiring",
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"search": 1_000_000},
+        meters={
+            "proposer-provider": synthetic_provider_cost_meter(
+                provider_config=proposer_provider,
+                provenance=synthetic_tariff_provenance(proposer_provider),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=1,
+            ),
+            "scorer-provider": synthetic_provider_cost_meter(
+                provider_config=_Provider.config,
+                provenance=synthetic_tariff_provenance(_Provider.config),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=1,
+            ),
+            "project-sandbox": TimedResourceCostMeter(
+                resource_type="proposer_project",
+                resource_class_digest=_cost_digest("b"),
+                nano_usd_per_second=1,
+                max_billing_seconds=30,
+            ),
+        },
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "proposer-cost.sqlite3", policy)
+    proposer_scope = BudgetScope(phase="search", category="proposer", run_id="optimizer-run")
+    scorer_scope = BudgetScope(phase="search", category="scorer", run_id="optimizer-run")
+    proposer_account = authority.provider_account(
+        scope=proposer_scope,
+        meter_id="proposer-provider",
+    )
+    project_account = authority.timed_resource_account(
+        scope=proposer_scope,
+        meter_id="project-sandbox",
+    )
+    scorer_account = authority.provider_account(
+        scope=scorer_scope,
+        meter_id="scorer-provider",
+    )
+    binding = SearchCostBinding(
+        declared_hard_limit_nano_usd=policy.hard_limit_nano_usd,
+        policy=policy,
+        ledger_identity=authority.ledger_identity,
+        phase="search",
+        run_id="optimizer-run",
+        proposer=SearchComponentCostBinding(
+            role=SearchComponentRole.PROPOSER,
+            configuration_id=configuration_id,
+            scope_category="proposer",
+            providers=(
+                ProviderCostBinding(
+                    component_configuration_id=configuration_id,
+                    provider_config=proposer_provider,
+                    account=bind_budget_account(proposer_account),
+                ),
+            ),
+            timed_resources=(
+                TimedResourceCostBinding(
+                    component_configuration_id=configuration_id,
+                    resource_type="proposer_project",
+                    resource_class_digest=_cost_digest("b"),
+                    account=bind_timed_resource_account(project_account),
+                ),
+            ),
+        ),
+        scorer=SearchComponentCostBinding(
+            role=SearchComponentRole.SCORER,
+            configuration_id="unused-scorer",
+            scope_category="scorer",
+            providers=(
+                ProviderCostBinding(
+                    component_configuration_id="unused-scorer",
+                    provider_config=_Provider.config,
+                    account=bind_budget_account(scorer_account),
+                ),
+            ),
+        ),
+    )
+    return SearchCostRuntime(authority=authority, binding=binding).for_component(
+        SearchComponentRole.PROPOSER
+    )
+
+
+def test_project_proposer_binds_exact_runtime_and_reaudits_before_project_dispatch(
+    tmp_path: Path,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    raw_provider = _Provider(_payload(parent, "cost-bound"))
+    agent = meta_agent()
+    configuration_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        agent=agent,
+        provider=raw_provider,
+    )
+    runtime = _proposer_cost_runtime(tmp_path, configuration_id=configuration_id)
+    project = _CostBoundProject([_payload(parent, "cost-bound")], runtime)
+    proposer = ProjectDeltaProposer(project, agent, raw_provider, cost_runtime=runtime)
+
+    with sqlite3.connect(runtime.authority.ledger_path) as connection:
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute("UPDATE budget_metadata SET schema_version = 1 WHERE id = 1")
+
+    with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=1)
+
+    assert proposer.search_cost_binding == runtime.binding
+    assert isinstance(proposer._provider, BudgetedProvider)  # noqa: SLF001
+    assert project.runs == 0
+    assert project.files == {}
+    assert raw_provider.calls == 0
+
+
+def test_project_proposer_configuration_binds_create_rate_authority(tmp_path: Path) -> None:
+    provider = _Provider("unused")
+    agent = meta_agent()
+    first = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "first-rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+    second = ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "second-rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+
+    first_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        agent=agent,
+        provider=provider,
+        project_create_rate_binding=first.binding,
+    )
+    second_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        agent=agent,
+        provider=provider,
+        project_create_rate_binding=second.binding,
+    )
+
+    assert first_id != second_id
 
 
 @dataclass(frozen=True)
@@ -286,6 +513,18 @@ def _parent_surface_manifests(project: _Project, root_path: str) -> list[dict[st
         json.loads(project.files[str(item["manifest_file"]).removeprefix(f"{project.workspace}/")])
         for item in index
     ]
+
+
+def test_production_project_proposer_rejects_missing_cost_runtime_before_effects() -> None:
+    project = _Project([])
+    provider = _Provider("unused")
+
+    with pytest.raises(ValueError, match="complete search cost runtime"):
+        _ProductionProjectDeltaProposer(project, meta_agent(), provider)
+
+    assert project.runs == 0
+    assert project.files == {}
+    assert provider.calls == 0
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from llm_waterfall import ChatProviderReceipt
 
 from wmh.providers.base import ProviderConfig
-from wmh.providers.receipt import validate_chat_provider_receipt
+from wmh.providers.receipt import ProviderResponseIdentity, validate_chat_provider_receipt
 
 _EXPLICIT_NULLABLE_FIELDS = frozenset(
     {
@@ -35,6 +35,7 @@ def validate_provider_receipt_trace(
     provider_config: ProviderConfig,
     requested_temperature: float,
     max_tokens: int,
+    response_identity: ProviderResponseIdentity | None = None,
 ) -> ProviderReceiptTrace:
     """Require exact cardinality, order, route controls, and per-trace request uniqueness."""
     if (
@@ -68,6 +69,7 @@ def validate_provider_receipt_trace(
             provider_config=provider_config,
             requested_temperature=requested_temperature,
             max_tokens=max_tokens,
+            response_identity=response_identity,
         )
         if receipt.provider_request_id in provider_request_ids:
             raise ValueError("provider request identity was reused within one trial")

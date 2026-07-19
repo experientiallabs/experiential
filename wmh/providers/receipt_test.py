@@ -5,8 +5,99 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+import wmh.providers.receipt as mod
 from wmh.core.types import JsonObject
+from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.receipt import build_chat_provider_receipt
+
+
+def test_response_identity_contract_distinguishes_bedrock_and_openai_routes() -> None:
+    assert mod.ProviderResponseIdentity(provider=ProviderKind.BEDROCK) == (
+        mod.ProviderResponseIdentity(
+            provider=ProviderKind.BEDROCK,
+            response_model=None,
+            system_fingerprint=None,
+        )
+    )
+    with pytest.raises(ValidationError, match="does not return"):
+        mod.ProviderResponseIdentity(
+            provider=ProviderKind.BEDROCK,
+            response_model="fabricated-model",
+        )
+    with pytest.raises(ValidationError, match="require an expected response model"):
+        mod.ProviderResponseIdentity(provider=ProviderKind.AZURE_OPENAI)
+
+    identity = mod.ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="glm-served-model",
+        system_fingerprint="fp-123",
+    )
+
+    assert identity.response_model == "glm-served-model"
+    assert identity.system_fingerprint == "fp-123"
+
+
+def test_receipt_validation_requires_frozen_served_model_and_fingerprint() -> None:
+    provider = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.4-mini",
+        deployment="worker-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    identity = mod.ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="gpt-5.4-mini-2026-06-01",
+        system_fingerprint="fp-exact",
+    )
+    common = {
+        "provider": ProviderKind.AZURE_OPENAI.value,
+        "provider_request_id": "request-1",
+        "response_id": "response-1",
+        "requested_model": "worker-deployment",
+        "request_payload": {},
+        "temperature": None,
+        "max_tokens": 4_096,
+        "max_tokens_field": provider.resolved_chat_max_tokens_field(),
+        "started_at_unix_s": 10.0,
+        "finished_at_unix_s": 11.0,
+    }
+    valid = build_chat_provider_receipt(
+        **common,
+        response_model=identity.response_model,
+        system_fingerprint=identity.system_fingerprint,
+    )
+    mod.validate_chat_provider_receipt(
+        valid,
+        provider_config=provider,
+        requested_temperature=0.7,
+        max_tokens=4_096,
+        response_identity=identity,
+    )
+
+    for field, value in (
+        ("response_model", "retargeted-model"),
+        ("system_fingerprint", "fp-drifted"),
+    ):
+        receipt = valid.model_copy(update={field: value})
+        with pytest.raises(ValueError, match="frozen response identity"):
+            mod.validate_chat_provider_receipt(
+                receipt,
+                provider_config=provider,
+                requested_temperature=0.7,
+                max_tokens=4_096,
+                response_identity=identity,
+            )
+
+    omitted_fingerprint = identity.model_copy(update={"system_fingerprint": None})
+    with pytest.raises(ValueError, match="frozen response identity"):
+        mod.validate_chat_provider_receipt(
+            valid,
+            provider_config=provider,
+            requested_temperature=0.7,
+            max_tokens=4_096,
+            response_identity=omitted_fingerprint,
+        )
 
 
 def test_receipt_hashes_full_wire_payload_and_detects_sampling_controls() -> None:

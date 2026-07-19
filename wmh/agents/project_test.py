@@ -19,14 +19,23 @@ from wmh.agents.meta import meta_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
 from wmh.harness import e2b_sandbox as e2b_sandbox_module
+from wmh.harness.cost import (
+    ProviderCostBinding,
+    SearchComponentCostBinding,
+    SearchComponentCostRuntime,
+    SearchComponentRole,
+    SearchCostBinding,
+    SearchCostRuntime,
+    TimedResourceCostBinding,
+)
 from wmh.harness.doc import TOOL_POLICY_ID, HarnessDoc
-from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
+from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxHandle, SandboxUsage
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
+    BudgetBreachError,
     BudgetExceededError,
-    BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
     ReservationStatus,
@@ -35,6 +44,8 @@ from wmh.tracking.budget import (
     TimedResourceClass,
     TimedResourceCostMeter,
     TimedResourceRole,
+    bind_budget_account,
+    bind_timed_resource_account,
     bootstrap_budget_ledger,
 )
 from wmh.tracking.rate_limit import (
@@ -43,6 +54,7 @@ from wmh.tracking.rate_limit import (
     ExternalDispatchRateAuthority,
     ExternalDispatchRatePolicy,
 )
+from wmh.tracking.tariffs import catalog_provider_token_tariff, provider_cost_meter
 
 
 class _Files:
@@ -62,6 +74,13 @@ class _Files:
     ) -> str:
         del request_timeout, gzip
         return self.values[path]
+
+
+def _rate_authority(tmp_path: Path) -> ExternalDispatchRateAuthority:
+    return ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / "e2b-create-rate.json").resolve(),
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
 
 
 class _Output:
@@ -1324,6 +1343,73 @@ def test_project_failed_close_keeps_usage_live_and_retries_every_lease(
     project.close()
 
 
+def test_project_close_attempts_every_lease_after_accounting_failure() -> None:
+    first = _Sandbox()
+    second = _Sandbox()
+    retired: list[SandboxHandle] = []
+    fail_first = True
+
+    def retire(sandbox: SandboxHandle) -> None:
+        nonlocal fail_first
+        retired.append(sandbox)
+        cast("_Sandbox", sandbox).killed = True
+        if sandbox is first and fail_first:
+            fail_first = False
+            raise RuntimeError("injected accounting failure")
+
+    project = AgentProject(first, sandbox_retirer=retire)
+    project._live_sandboxes[id(second)] = (  # noqa: SLF001 - multi-lease cleanup contract
+        second,
+        project_module.time.monotonic(),
+    )
+    project._sandbox_count += 1  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="injected accounting failure"):
+        project.close()
+
+    assert retired == [first, second]
+    assert first.killed is True
+    assert second.killed is True
+
+
+def test_project_close_preserves_accounting_failure_behind_cleanup_retry() -> None:
+    accounting = _Sandbox()
+    cleanup = _Sandbox()
+    cleanup_attempts = 0
+
+    def retire(sandbox: SandboxHandle) -> None:
+        nonlocal cleanup_attempts
+        target = cast("_Sandbox", sandbox)
+        if sandbox is accounting:
+            target.killed = True
+            raise BudgetBreachError("terminal settlement breach")
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise SandboxCleanupError("cleanup still unproved")
+        target.killed = True
+
+    project = AgentProject(
+        accounting,
+        sandbox_retirer=retire,
+        sandbox_retirement_proved=lambda sandbox: cast("_Sandbox", sandbox).killed,
+    )
+    project._live_sandboxes[id(cleanup)] = (  # noqa: SLF001 - multi-lease cleanup contract
+        cleanup,
+        project_module.time.monotonic(),
+    )
+    project._sandbox_count += 1  # noqa: SLF001
+
+    with pytest.raises(SandboxCleanupError, match="1 of 2"):
+        project.close()
+    with pytest.raises(BudgetBreachError, match="terminal settlement breach"):
+        project.close()
+    project.close()
+
+    assert accounting.killed is True
+    assert cleanup.killed is True
+    assert project._live_sandboxes == {}  # noqa: SLF001
+
+
 def test_project_retains_old_and_replacement_leases_after_failed_retirement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1493,13 +1579,17 @@ def _project_rate_authority(
     )
 
 
-def _project_resource_account(
+_PROJECT_CONFIGURATION_ID = "project-proposer-v1"
+
+
+def _project_cost_runtime(
     tmp_path: Path,
     *,
+    component_configuration_id: str,
     timeout: int = 60,
     hard_limit: int | None = None,
     create_horizon: int | None = None,
-) -> TimedResourceBudgetAccount:
+) -> tuple[SearchComponentCostRuntime, TimedResourceBudgetAccount]:
     resource_class = TimedResourceClass(
         role=TimedResourceRole.PROPOSER_PROJECT,
         cpu_count=2,
@@ -1510,37 +1600,181 @@ def _project_resource_account(
         ),
         cleanup_horizon_seconds=project_module.E2B_CLEANUP_HORIZON_S,
     )
-    meter = TimedResourceCostMeter(
+    resource_meter = TimedResourceCostMeter(
         resource_type=resource_class.role.value,
         resource_class_digest=resource_class.digest,
         nano_usd_per_second=1,
         max_billing_seconds=resource_class.max_host_observation_seconds,
     )
-    limit = meter.maximum_charge_nano_usd() * 3 if hard_limit is None else hard_limit
+    limit = resource_meter.maximum_charge_nano_usd() * 3 if hard_limit is None else hard_limit
+    provider_config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model_type="claude-haiku-4-5",
+        model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        region="us-east-1",
+    )
+    provider_meter = provider_cost_meter(catalog_provider_token_tariff(provider_config))
     policy = BudgetPolicy(
-        study_id="project-resource-test",
-        manifest_digest=("sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest()),
+        study_id="project-cost-runtime-test",
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
         hard_limit_nano_usd=limit,
         phase_limits_nano_usd={"search": limit},
-        meters={"project": meter},
+        meters={
+            "proposer-provider": provider_meter,
+            "scorer-provider": provider_meter,
+            "project": resource_meter,
+        },
     )
-    ledger_path = (tmp_path / "budget.sqlite3").resolve()
-    return TimedResourceBudgetAccount(
-        ledger_path=ledger_path,
-        ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
-        policy=policy,
-        scope=BudgetScope(phase="search", category="proposer", run_id="test-run"),
+    authority = bootstrap_budget_ledger((tmp_path / "cost-runtime.sqlite3").resolve(), policy)
+    proposer_scope = BudgetScope(phase="search", category="proposer", run_id="test-run")
+    scorer_scope = BudgetScope(phase="search", category="scorer", run_id="test-run")
+    proposer_provider = authority.provider_account(
+        scope=proposer_scope,
+        meter_id="proposer-provider",
+    )
+    project_resource = authority.timed_resource_account(
+        scope=proposer_scope,
         meter_id="project",
     )
+    scorer_provider = authority.provider_account(
+        scope=scorer_scope,
+        meter_id="scorer-provider",
+    )
+    binding = SearchCostBinding(
+        declared_hard_limit_nano_usd=policy.hard_limit_nano_usd,
+        policy=policy,
+        ledger_identity=authority.ledger_identity,
+        phase="search",
+        run_id="test-run",
+        proposer=SearchComponentCostBinding(
+            role=SearchComponentRole.PROPOSER,
+            configuration_id=component_configuration_id,
+            scope_category="proposer",
+            providers=(
+                ProviderCostBinding(
+                    component_configuration_id=component_configuration_id,
+                    provider_config=provider_config,
+                    account=bind_budget_account(proposer_provider),
+                ),
+            ),
+            timed_resources=(
+                TimedResourceCostBinding(
+                    component_configuration_id=component_configuration_id,
+                    resource_type=resource_class.role.value,
+                    resource_class_digest=resource_class.digest,
+                    account=bind_timed_resource_account(project_resource),
+                ),
+            ),
+        ),
+        scorer=SearchComponentCostBinding(
+            role=SearchComponentRole.SCORER,
+            configuration_id="unused-scorer",
+            scope_category="scorer",
+            providers=(
+                ProviderCostBinding(
+                    component_configuration_id="unused-scorer",
+                    provider_config=provider_config,
+                    account=bind_budget_account(scorer_provider),
+                ),
+            ),
+        ),
+    )
+    return (
+        SearchCostRuntime(authority=authority, binding=binding).for_component(
+            SearchComponentRole.PROPOSER
+        ),
+        project_resource,
+    )
+
+
+def test_cost_bound_project_rejects_binding_drift_before_external_or_filesystem_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id="expected-proposer",
+    )
+    factory_calls = 0
+
+    def unexpected_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("cost binding drift must fail before sandbox factory construction")
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", unexpected_factory)
+    lease_dir = (tmp_path / "leases").resolve()
+
+    with pytest.raises(ValueError, match="configuration_id differs"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            cost_runtime=runtime,
+            component_configuration_id="drifted-proposer",
+            lease_ledger_dir=lease_dir,
+            create_rate_authority=_rate_authority(tmp_path),
+        )
+
+    assert factory_calls == 0
+    assert not lease_dir.exists()
+
+
+def test_cost_bound_project_requires_create_rate_authority_before_external_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
+    factory_calls = 0
+
+    def unexpected_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("missing rate authority must fail before provider setup")
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", unexpected_factory)
+    lease_dir = (tmp_path / "leases").resolve()
+
+    with pytest.raises(ValueError, match="create-rate authority"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
+            lease_ledger_dir=lease_dir,
+            create_rate_authority=cast("ExternalDispatchRateAuthority", None),
+        )
+
+    assert factory_calls == 0
+    assert not lease_dir.exists()
 
 
 def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_metered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     create_calls: list[dict[str, object]] = []
     sandboxes: list[_AttestedProjectSandbox] = []
+    rate_authority = _rate_authority(tmp_path)
+    acquired_sequences: list[int] = []
+    acquire = rate_authority.acquire
+
+    def acquire_rate_permit(*, timeout_seconds: float | None = None) -> object:
+        permit = acquire(timeout_seconds=timeout_seconds)
+        acquired_sequences.append(permit.sequence)
+        return permit
+
+    monkeypatch.setattr(rate_authority, "acquire", acquire_rate_permit)
 
     def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
         frozen = dict(kwargs)
@@ -1562,9 +1796,10 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
         template="template-immutable:build-immutable",
         cpu_count=2,
         memory_mb=2048,
-        resource_budget_account=account,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
-        create_rate_authority=_project_rate_authority(tmp_path),
+        create_rate_authority=rate_authority,
         api_key="explicit-secret-key",
     )
 
@@ -1572,6 +1807,8 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     project.close()
 
     assert len(create_calls) == len(sandboxes) == 2
+    assert acquired_sequences == [1, 2]
+    assert project.create_rate_binding == rate_authority.binding
     assert all(call["allow_internet_access"] is False for call in create_calls)
     assert all(
         call["lifecycle"] == {"on_timeout": "kill", "auto_resume": False} for call in create_calls
@@ -1587,12 +1824,101 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     assert all(item.status is ReservationStatus.SETTLED for item in reservations)
 
 
+def test_cost_bound_project_forgets_killed_lease_after_terminal_settlement_breach(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
+    created: list[_AttestedProjectSandbox] = []
+
+    def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        sandbox = _AttestedProjectSandbox(dict(kwargs), sandbox_id="terminal-breach")
+        created.append(sandbox)
+        return lambda: sandbox
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_rate_authority(tmp_path),
+    )
+    factory = cast("project_module._BudgetedProjectSandboxFactory", project._sandbox_factory)  # noqa: SLF001
+    [lease] = factory._live.values()  # noqa: SLF001 - force a terminal horizon breach
+    assert lease.reservation is not None
+    lease.reservation._started_at_s -= 10_000  # noqa: SLF001
+
+    with pytest.raises(BudgetBreachError, match="exceeded its"):
+        project.close()
+
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.BREACHED
+    assert created[0].killed is True
+    assert project._live_sandboxes == {}  # noqa: SLF001
+    assert factory._live == {}  # noqa: SLF001
+    project.close()
+
+
+def test_cost_bound_project_forgets_killed_lease_after_accounting_integrity_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
+    created: list[_AttestedProjectSandbox] = []
+
+    def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        sandbox = _AttestedProjectSandbox(dict(kwargs), sandbox_id="accounting-error")
+        created.append(sandbox)
+        return lambda: sandbox
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_rate_authority(tmp_path),
+    )
+    factory = cast("project_module._BudgetedProjectSandboxFactory", project._sandbox_factory)  # noqa: SLF001
+    [lease] = factory._live.values()  # noqa: SLF001 - inject post-kill accounting failure
+    assert lease.reservation is not None
+
+    def fail_settlement() -> None:
+        raise RuntimeError("injected accounting integrity error")
+
+    monkeypatch.setattr(lease.reservation, "settle", fail_settlement)
+
+    with pytest.raises(RuntimeError, match="injected accounting integrity error"):
+        project.close()
+
+    assert created[0].killed is True
+    assert project._live_sandboxes == {}  # noqa: SLF001
+    assert factory._live == {}  # noqa: SLF001
+    project.close()
+
+
 def test_budgeted_project_accepts_sdk_lifecycle_mapping(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The E2B SDK exposes SandboxInfo.lifecycle as a TypedDict at runtime."""
-    account = _project_resource_account(tmp_path)
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
 
     def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
         sandbox = _AttestedProjectSandbox(dict(kwargs), sandbox_id="project-sdk-shape")
@@ -1605,7 +1931,8 @@ def test_budgeted_project_accepts_sdk_lifecycle_mapping(
         template="template-immutable:build-immutable",
         cpu_count=2,
         memory_mb=2048,
-        resource_budget_account=account,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
         create_rate_authority=_project_rate_authority(tmp_path),
         api_key="explicit-secret-key",
@@ -1615,7 +1942,11 @@ def test_budgeted_project_accepts_sdk_lifecycle_mapping(
 
 
 def test_budgeted_project_rejects_timeout_above_provider_maximum(tmp_path: Path) -> None:
-    account = _project_resource_account(tmp_path, timeout=86_401)
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        timeout=86_401,
+    )
 
     with pytest.raises(ValueError, match="provider maximum"):
         AgentProject.create(
@@ -1623,7 +1954,8 @@ def test_budgeted_project_rejects_timeout_above_provider_maximum(tmp_path: Path)
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=_project_rate_authority(tmp_path),
             api_key="explicit-secret-key",
@@ -1634,7 +1966,10 @@ def test_agent_project_requires_host_rate_authority_before_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     dispatches = 0
     reaped: list[str] = []
 
@@ -1660,7 +1995,8 @@ def test_agent_project_requires_host_rate_authority_before_effects(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
         )
 
@@ -1671,11 +2007,15 @@ def test_agent_project_requires_host_rate_authority_before_effects(
 
 
 def test_budgeted_factory_rejects_missing_rate_authority_before_effects(tmp_path: Path) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
 
     with pytest.raises(ValueError, match="create-rate authority"):
         project_module._BudgetedProjectSandboxFactory(
-            account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             ledger_dir=(tmp_path / "leases").resolve(),
             timeout=60,
             template="template-immutable:build-immutable",
@@ -1693,7 +2033,10 @@ def test_agent_project_rejects_wrong_rate_policy_before_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     wrong_policy = ExternalDispatchRatePolicy(
         provider="e2b",
         operation="sandbox_create",
@@ -1716,13 +2059,15 @@ def test_agent_project_rejects_wrong_rate_policy_before_effects(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=authority,
         )
     with pytest.raises(ValueError, match="frozen four-per-second policy"):
         project_module._BudgetedProjectSandboxFactory(
-            account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             ledger_dir=(tmp_path / "leases").resolve(),
             timeout=60,
             template="template-immutable:build-immutable",
@@ -1738,18 +2083,20 @@ def test_agent_project_rejects_wrong_rate_policy_before_effects(
 
 
 def test_budgeted_project_requires_budget_for_the_full_retry_horizon(tmp_path: Path) -> None:
-    account = _project_resource_account(
+    runtime, _account = _project_cost_runtime(
         tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
         create_horizon=project_module.E2B_CREATE_REQUEST_TIMEOUT_S,
     )
 
-    with pytest.raises(BudgetIntegrityError, match="meter class differs"):
+    with pytest.raises(ValueError, match="resource class differs"):
         AgentProject.create(
             timeout=60,
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=_project_rate_authority(tmp_path),
         )
@@ -1761,7 +2108,11 @@ def test_project_budget_denial_never_dispatches_or_reaps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path, hard_limit=1)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        hard_limit=1,
+    )
     creates = 0
     reaped: list[tuple[str, str | None]] = []
 
@@ -1783,7 +2134,8 @@ def test_project_budget_denial_never_dispatches_or_reaps(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=_project_rate_authority(tmp_path),
             api_key="explicit-key",
@@ -1800,7 +2152,10 @@ def test_project_ambiguous_create_uses_explicit_key_and_forfeits_full_ceiling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     reaped: list[tuple[str, str | None]] = []
 
     def ambiguous_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
@@ -1822,7 +2177,8 @@ def test_project_ambiguous_create_uses_explicit_key_and_forfeits_full_ceiling(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=_project_rate_authority(tmp_path),
             api_key="explicit-key",
@@ -1838,7 +2194,10 @@ def test_budgeted_project_retries_definitive_e2b_rate_refusal_under_one_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     create_calls = 0
     create_metadata: list[dict[str, str]] = []
     sleeps: list[float] = []
@@ -1883,7 +2242,8 @@ def test_budgeted_project_retries_definitive_e2b_rate_refusal_under_one_lease(
         template="template-immutable:build-immutable",
         cpu_count=2,
         memory_mb=2048,
-        resource_budget_account=account,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
         create_rate_authority=authority,
     )
@@ -1923,7 +2283,10 @@ def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     create_calls = 0
     sleeps: list[float] = []
     reaped: list[str] = []
@@ -1951,7 +2314,8 @@ def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=authority,
         )
@@ -1971,7 +2335,10 @@ def test_budgeted_project_never_dispatches_a_retry_past_the_absolute_create_hori
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     authority = _project_rate_authority(tmp_path)
     clock = _ProjectCreateClock()
     gate_calls = 0
@@ -2019,7 +2386,8 @@ def test_budgeted_project_never_dispatches_a_retry_past_the_absolute_create_hori
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=authority,
         )
@@ -2057,7 +2425,10 @@ def test_budgeted_project_never_retries_unproven_create_errors(
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     create_calls = 0
     sleeps: list[float] = []
     reaped: list[str] = []
@@ -2084,7 +2455,8 @@ def test_budgeted_project_never_retries_unproven_create_errors(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=_project_rate_authority(tmp_path),
         )
@@ -2103,7 +2475,10 @@ def test_project_activation_failure_kills_and_terminates_budget_and_lease(
     monkeypatch: pytest.MonkeyPatch,
     failed_activation: int,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     created: list[_AttestedProjectSandbox] = []
     original_activate = project_module.RunnerLeaseLedger.activate
     activation_calls = 0
@@ -2139,7 +2514,8 @@ def test_project_activation_failure_kills_and_terminates_budget_and_lease(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=_project_rate_authority(tmp_path),
         )
@@ -2159,7 +2535,10 @@ def test_project_creation_fails_closed_on_network_or_volume_attestation_drift(
     network_drift: bool,
     volume_drift: bool,
 ) -> None:
-    account = _project_resource_account(tmp_path)
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
     created: list[_AttestedProjectSandbox] = []
 
     def drifted_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
@@ -2185,7 +2564,8 @@ def test_project_creation_fails_closed_on_network_or_volume_attestation_drift(
             template="template-immutable:build-immutable",
             cpu_count=2,
             memory_mb=2048,
-            resource_budget_account=account,
+            cost_runtime=runtime,
+            component_configuration_id=_PROJECT_CONFIGURATION_ID,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
             create_rate_authority=_project_rate_authority(tmp_path),
         )

@@ -49,16 +49,17 @@ from wmh.evals.harbor.config import (
     HarborEnvironmentBackend,
     HarborJobSpec,
 )
-from wmh.evals.harbor.e2b_environment import (
-    ExactE2BBuildSpec,
-    require_exact_e2b_build_record,
-)
+from wmh.evals.harbor.e2b_environment import require_exact_e2b_build_record
 from wmh.evals.harbor.evaluator import (
     HARBOR_EVALUATOR_VERSION,
     HarborEvaluator,
     HarborEvaluatorSession,
     harbor_run_expectation,
 )
+from wmh.evals.harbor.qualification_types import (
+    QualifiedE2BBuildIdentity as QualifiedE2BBuildIdentity,
+)
+from wmh.evals.harbor.qualification_types import QualifiedHarborTask
 from wmh.evals.harbor.scorer import (
     HarborAgentComputeEnvelope,
     admit_harbor_matrix,
@@ -93,7 +94,7 @@ from wmh.harness.pi_runner_backend import (
     e2b_runner_resource_class,
 )
 from wmh.providers.base import ProviderConfig
-from wmh.providers.receipt import validate_chat_provider_receipt
+from wmh.providers.receipt import ProviderResponseIdentity, validate_chat_provider_receipt
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetIntegrityError,
@@ -101,7 +102,6 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     TimedResourceBudgetAccount,
-    TimedResourceClass,
     TimedResourceCostMeter,
     TimedResourceRole,
     open_shared_spend_ledger,
@@ -128,111 +128,6 @@ _LEGACY_PAIR_STATE_VERSION_ERROR = (
     "paired Harbor pair state version 2 predates evidence binding and cannot be resumed; "
     "start a new operation_id"
 )
-
-
-class QualifiedE2BBuildIdentity(BaseModel):
-    """Exact prequalified E2B build identity required again before scored launch."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    build_config_digest: str = Field(pattern=_DIGEST_PATTERN)
-    build_record_digest: str = Field(pattern=_DIGEST_PATTERN)
-    environment_id: str = Field(min_length=1, max_length=512)
-    build_context_digest: str = Field(pattern=_DIGEST_PATTERN)
-    docker_image: str | None = Field(default=None, min_length=1, max_length=2_048)
-    cpu_count: int = Field(ge=1)
-    memory_mb: int = Field(ge=1)
-    template_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
-    build_id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,512}$")
-
-    @model_validator(mode="after")
-    def _bind_build_spec(self) -> Self:
-        spec = ExactE2BBuildSpec(
-            environment_id=self.environment_id,
-            build_context_digest=self.build_context_digest,
-            docker_image=self.docker_image,
-            cpu_count=self.cpu_count,
-            memory_mb=self.memory_mb,
-        )
-        if self.build_config_digest != spec.digest:
-            raise ValueError("qualified E2B build config digest is inconsistent")
-        if self.template_id == self.build_id:
-            raise ValueError("qualified E2B template and build identities must differ")
-        return self
-
-
-class QualifiedHarborTask(BaseModel):
-    """Pre-run immutable identities for one qualified Harbor task environment."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    task_id: str = Field(min_length=1, max_length=512)
-    dataset_id: str = Field(min_length=1, max_length=512)
-    content_digest: str = Field(pattern=_DIGEST_PATTERN)
-    task_key: str = Field(pattern=_DIGEST_PATTERN)
-    task_environment_digest: str = Field(pattern=_DIGEST_PATTERN)
-    environment_backend: HarborEnvironmentBackend
-    requested_storage_mb: int | None = Field(default=None, ge=1)
-    observed_storage_mb: int | None = Field(default=None, ge=1)
-    e2b_launch_config_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
-    e2b_build_config_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
-    e2b_build_record_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
-    task_resource_class_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
-    e2b_build_identity: QualifiedE2BBuildIdentity | None = None
-    task_resource_class: TimedResourceClass | None = None
-
-    @field_validator("task_id", "dataset_id")
-    @classmethod
-    def _require_canonical_task_id(cls, value: str) -> str:
-        if value != value.strip():
-            raise ValueError("qualified task and dataset IDs cannot have surrounding whitespace")
-        validate_durable_text(value, field="qualified Harbor task or dataset id")
-        return value
-
-    @model_validator(mode="after")
-    def _require_backend_qualification(self) -> Self:
-        e2b_fields = (
-            self.e2b_launch_config_digest,
-            self.e2b_build_config_digest,
-            self.e2b_build_record_digest,
-            self.task_resource_class_digest,
-            self.e2b_build_identity,
-            self.task_resource_class,
-        )
-        if self.environment_backend is HarborEnvironmentBackend.LOCAL:
-            if any(value is not None for value in e2b_fields):
-                raise ValueError("local task qualification cannot carry E2B build identities")
-            if self.observed_storage_mb is not None:
-                raise ValueError("local task qualification cannot carry E2B storage metrics")
-        elif any(value is None for value in e2b_fields):
-            raise ValueError(
-                "E2B task qualification requires exact build and resource class identities"
-            )
-        else:
-            assert self.e2b_build_identity is not None
-            assert self.task_resource_class is not None
-            if (
-                self.e2b_build_config_digest != self.e2b_build_identity.build_config_digest
-                or self.e2b_build_record_digest != self.e2b_build_identity.build_record_digest
-                or self.task_resource_class_digest != self.task_resource_class.digest
-            ):
-                raise ValueError("E2B task qualification identities are inconsistent")
-            if self.task_resource_class.role is not TimedResourceRole.TASK_ENVIRONMENT:
-                raise ValueError("E2B task qualification names the wrong resource role")
-            if (
-                self.task_resource_class.cpu_count != self.e2b_build_identity.cpu_count
-                or self.task_resource_class.memory_mb != self.e2b_build_identity.memory_mb
-            ):
-                raise ValueError("E2B task build and launch resource identities differ")
-            if self.requested_storage_mb is None:
-                if self.observed_storage_mb is not None:
-                    raise ValueError("unrequested E2B storage cannot have observed capacity")
-            elif (
-                self.observed_storage_mb is None
-                or self.observed_storage_mb < self.requested_storage_mb
-            ):
-                raise ValueError("E2B observed storage is below the requested minimum")
-        return self
 
 
 class PrequalifiedHarborRoster(BaseModel):
@@ -414,6 +309,15 @@ class PairedHarborPanelRoute(BaseModel):
                 "paired scored receipts currently support Bedrock and OpenAI-shaped routes"
             )
         return self
+
+    @property
+    def response_identity(self) -> ProviderResponseIdentity:
+        """Return the shared exact receipt contract for this provider route."""
+        return ProviderResponseIdentity(
+            provider=self.provider_config.kind,
+            response_model=self.expected_response_model,
+            system_fingerprint=self.expected_system_fingerprint,
+        )
 
 
 class PairedHarborSlicePolicy(BaseModel):
@@ -2940,6 +2844,7 @@ class PairedHarborRunner:
             budget_account=provider_account,
             task_resource_budget_accounts=task_resource_accounts,
             runner_resource_budget_account=runner_resource_account,
+            qualified_tasks=(qualification,),
             **create_rate_kwargs,
         )
         loaded = await evaluator.evaluate(harness)
@@ -2961,6 +2866,7 @@ class PairedHarborRunner:
             attempts=1,
             reward_key=plan.reward_key,
             provider_config=route.provider_config,
+            response_identity=route.response_identity,
             compute_envelope=plan.compute_envelope,
         )[block.task_id]
         if len(admitted) != 1:
@@ -3984,18 +3890,8 @@ def _validate_provider_receipt_for_route(
         provider_config=config,
         requested_temperature=temperature,
         max_tokens=max_output_tokens,
+        response_identity=route.response_identity,
     )
-    if config.kind.value == "bedrock":
-        return
-    if (
-        receipt.response_id is None
-        or receipt.response_model != route.expected_response_model
-        or (
-            route.expected_system_fingerprint is not None
-            and receipt.system_fingerprint != route.expected_system_fingerprint
-        )
-    ):
-        raise ValueError("paired OpenAI receipt differs from frozen response identity")
 
 
 def _confirmation_candidate_digest(confirmation: ConfirmationPartition) -> str:

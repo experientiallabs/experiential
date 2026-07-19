@@ -1361,6 +1361,7 @@ def _install_fake_evaluator(
             budget_account: BudgetAccount,
             task_resource_budget_accounts: tuple[object, ...],
             runner_resource_budget_account: object | None,
+            qualified_tasks: tuple[mod.QualifiedHarborTask, ...],
         ) -> None:
             assert isinstance(runner_spec, LocalPiRunnerSpec)
             assert turn_timeout_s == 300.0
@@ -1368,6 +1369,8 @@ def _install_fake_evaluator(
             assert isinstance(session, mod.HarborEvaluatorSession)
             assert task_resource_budget_accounts == ()
             assert runner_resource_budget_account is None
+            assert len(qualified_tasks) == 1
+            assert qualified_tasks[0].task_id in {"task-a", "task-b"}
             self._spec = spec
             self._provider = provider_config
             self._budget_policy_digest = budget_account.policy.policy_digest
