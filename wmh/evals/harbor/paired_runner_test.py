@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import multiprocessing
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import pytest
 from harbor.models.job.config import DatasetConfig
@@ -49,6 +51,12 @@ _RETRY_POLICY_DIGEST = "sha256:" + "5" * 64
 _BUDGET_POLICY_DIGEST = "sha256:" + "6" * 64
 
 
+class _ProcessEvent(Protocol):
+    def set(self) -> None: ...
+
+    def is_set(self) -> bool: ...
+
+
 def _candidate() -> HarnessDoc:
     baseline = pi_node_baseline("candidate")
     surfaces = list(baseline.surfaces)
@@ -80,7 +88,8 @@ def _confirmation(candidate: HarnessDoc) -> ConfirmationPartition:
     return ConfirmationPartition(
         partition_version="1",
         partition_manifest_digest="sha256:" + "3" * 64,
-        candidate_hash=candidate.execution_digest,
+        candidate_execution_digest=candidate.execution_digest,
+        confirmation_protocol_digest="sha256:" + "7" * 64,
         tasks=tuple(
             PartitionTask(
                 task_id=task_id,
@@ -91,6 +100,8 @@ def _confirmation(candidate: HarnessDoc) -> ConfirmationPartition:
             for task_id in _TASK_IDS
         ),
         confirmation_commitment="sha256:" + "4" * 64,
+        candidate_freeze_digest="sha256:" + "8" * 64,
+        opening_record_digest="sha256:" + "9" * 64,
     )
 
 
@@ -100,6 +111,62 @@ def _provider() -> ProviderConfig:
         model="worker-model",
         region="us-west-2",
     )
+
+
+def _receipt_event(
+    *,
+    request_id: str,
+    call_index: int = 1,
+    provider: str = "bedrock",
+    requested_model: str = "worker-model",
+) -> dict[str, object]:
+    receipt = mod.ChatProviderReceipt(
+        provider=provider,
+        provider_request_id=request_id,
+        response_id=None,
+        requested_model=requested_model,
+        response_model=None,
+        system_fingerprint=None,
+        request_digest="sha256:" + "2" * 64,
+        temperature=pi_node_baseline("limits").temperature(),
+        max_tokens=pi_node_baseline("limits").max_output_tokens(),
+        max_tokens_field="inferenceConfig.maxTokens",
+        seed_supplied=False,
+        cache_config_supplied=False,
+        started_at_unix_s=1.0,
+        finished_at_unix_s=2.0,
+    )
+    return {
+        "kind": "provider_receipt",
+        "payload": {**receipt.model_dump(mode="json"), "turn_call_index": call_index},
+    }
+
+
+def _hold_local_block_lease(
+    jobs_dir: str,
+    ready: _ProcessEvent,
+    release: _ProcessEvent,
+) -> None:
+    block = mod.PairedBlock(
+        task_id="task-a",
+        panel_member="worker",
+        attempt=1,
+        first_arm=PairedArm.BASELINE,
+    )
+    coordinator = mod._LocalPairedHarborLeaseCoordinator(Path(jobs_dir))
+
+    async def hold() -> None:
+        async with coordinator.block_lease(
+            protocol_digest="sha256:" + "a" * 64,
+            block=block,
+            max_concurrent_blocks=1,
+            max_concurrent_route_blocks=1,
+        ):
+            ready.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+
+    asyncio.run(hold())
 
 
 def _spec(tmp_path: Path) -> HarborJobSpec:
@@ -135,6 +202,10 @@ def _runner(
     candidate: HarnessDoc,
     *,
     baseline: HarnessDoc | None = None,
+    operation_id: str = "offline-test-operation",
+    generation_id: int = 1,
+    multi_host: bool = False,
+    durable_coordinator: mod.PairedHarborLeaseCoordinator | None = None,
     **updates: object,
 ) -> mod.PairedHarborRunner:
     baseline = baseline or pi_node_baseline("baseline")
@@ -162,8 +233,10 @@ def _runner(
     return mod.PairedHarborRunner(
         protocol=protocol,
         job_spec=protocol_values["job_spec"],  # type: ignore[arg-type]
-        operation_id="offline-test-operation",
-        generation_id=1,
+        operation_id=operation_id,
+        generation_id=generation_id,
+        multi_host=multi_host,
+        durable_coordinator=durable_coordinator,
     )
 
 
@@ -200,28 +273,30 @@ def _loaded_result(
     job_dir = spec.jobs_dir / spec.job_name
     trial_dir = Path("trial")
     (job_dir / trial_dir).mkdir(parents=True, exist_ok=True)
-    receipt = mod.PairedProviderCallReceipt(
-        call_index=1,
-        provider_request_id="provider-" + spec.job_name,
+    (job_dir / trial_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    receipt = mod.ChatProviderReceipt(
         provider=provider.kind.value,
-        provider_config_digest=mod._canonical_digest(provider.model_dump(mode="json")),
+        provider_request_id="provider-" + spec.job_name,
+        response_id=None,
         requested_model=provider.model,
-        route_evidence_kind="aws_response_metadata",
         response_model=None,
         system_fingerprint=None,
-        wire_config_digest=mod.paired_provider_wire_config_digest(
-            provider_config=provider,
-            requested_model=provider.model,
-            temperature=None,
-            max_output_tokens=pi_node_baseline("limits").max_output_tokens(),
-        ),
-        temperature=None,
-        max_output_tokens=pi_node_baseline("limits").max_output_tokens(),
+        request_digest="sha256:" + "2" * 64,
+        temperature=pi_node_baseline("limits").temperature(),
+        max_tokens=pi_node_baseline("limits").max_output_tokens(),
+        max_tokens_field="inferenceConfig.maxTokens",
+        seed_supplied=False,
+        cache_config_supplied=False,
+        started_at_unix_s=1.0,
+        finished_at_unix_s=2.0,
     )
     (job_dir / trial_dir / "wmh-events.jsonl").write_text(
         '{"kind":"assistant_message","payload":{"text":"done"}}\n'
         + json.dumps(
-            {"kind": "provider_receipt", "payload": receipt.model_dump(mode="json")},
+            {
+                "kind": "provider_receipt",
+                "payload": {**receipt.model_dump(mode="json"), "turn_call_index": 1},
+            },
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -275,10 +350,12 @@ def _install_fake_evaluator(
             *,
             runner_image: str,
             turn_timeout_s: float,
+            require_provider_receipts: bool,
             session: object,
         ) -> None:
             assert runner_image == PI_CONTAINER_IMAGE
             assert turn_timeout_s == 300.0
+            assert require_provider_receipts is True
             assert isinstance(session, mod.HarborEvaluatorSession)
             self._spec = spec
             self._provider = provider_config
@@ -356,9 +433,7 @@ def test_job_names_are_deterministic_and_bind_each_arm(
         )
     )
     first_names = [
-        item.job_name
-        for evidence in first.evidence
-        for item in (evidence.first, evidence.second)
+        item.job_name for evidence in first.evidence for item in (evidence.first, evidence.second)
     ]
 
     second_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
@@ -381,7 +456,7 @@ def test_rejects_candidate_opening_and_compute_envelope_mismatches(tmp_path: Pat
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
     wrong_opening = _confirmation(candidate).model_copy(
-        update={"candidate_hash": "sha256:" + "9" * 64}
+        update={"candidate_execution_digest": "sha256:" + "9" * 64}
     )
 
     with pytest.raises(ValueError, match="confirmation opening"):
@@ -443,7 +518,7 @@ def test_constructor_rejects_qualification_or_route_drift(tmp_path: Path) -> Non
         _runner(tmp_path, candidate, panel_routes=duplicate_routes)
 
 
-def test_collects_block_failures_without_returning_partial_analysis(
+def test_first_block_failure_stops_scheduling_and_returns_no_partial_analysis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -453,15 +528,70 @@ def test_collects_block_failures_without_returning_partial_analysis(
 
     with pytest.raises(mod.PairedHarborMatrixError) as captured:
         asyncio.run(
-            _runner(tmp_path, candidate, baseline=baseline).run(
+            _runner(
+                tmp_path,
+                candidate,
+                baseline=baseline,
+                max_concurrent_blocks=1,
+            ).run(
                 baseline=baseline,
                 candidate=candidate,
             )
         )
 
     assert captured.value.failures
-    assert len(calls) >= len(_design().blocks)
+    assert len(calls) == 1
     assert "synthetic infrastructure failure" not in str(captured.value)
+
+
+def test_fatal_block_failure_cancels_other_reserved_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    both_started = asyncio.Event()
+    calls: list[str] = []
+    cancelled: list[str] = []
+
+    class CancellingEvaluator:
+        def __init__(
+            self,
+            spec: HarborJobSpec,
+            provider_config: ProviderConfig,
+            **_kwargs: object,
+        ) -> None:
+            self._spec = spec
+            self._provider = provider_config
+
+        async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
+            calls.append(self._spec.job_name)
+            is_failure = len(calls) == 1
+            if len(calls) == 2:
+                both_started.set()
+            await both_started.wait()
+            if is_failure:
+                raise RuntimeError("synthetic fatal block")
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.append(self._spec.job_name)
+                raise
+            return _loaded_result(self._spec, self._provider, harness, reward=0.0)
+
+    monkeypatch.setattr(mod, "HarborEvaluator", CancellingEvaluator)
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(
+            _runner(
+                tmp_path,
+                candidate,
+                baseline=baseline,
+                max_concurrent_blocks=2,
+            ).run(baseline=baseline, candidate=candidate)
+        )
+
+    assert len(calls) == 2
+    assert len(cancelled) == 1
 
 
 def test_schedule_has_both_first_arm_directions() -> None:
@@ -496,17 +626,13 @@ def test_protocol_digest_is_path_independent_and_binds_nonsecret_execution_input
     )
     assert changed.digest != first.digest
 
-    changed_budget = first.model_copy(
-        update={"budget_policy_digest": "sha256:" + "7" * 64}
-    )
+    changed_budget = first.model_copy(update={"budget_policy_digest": "sha256:" + "7" * 64})
     assert changed_budget.digest != first.digest
 
 
 def test_rejects_scored_e2b_even_when_job_shape_is_otherwise_exact(tmp_path: Path) -> None:
     candidate = _candidate()
-    e2b = _spec(tmp_path).model_copy(
-        update={"environment_backend": HarborEnvironmentBackend.E2B}
-    )
+    e2b = _spec(tmp_path).model_copy(update={"environment_backend": HarborEnvironmentBackend.E2B})
     with pytest.raises(ValueError, match="scored paired E2B is unsupported"):
         _runner(tmp_path, candidate, job_spec=e2b)
 
@@ -536,20 +662,72 @@ def test_provider_receipt_contract_distinguishes_bedrock_and_openai_evidence() -
     )
     assert route.expected_response_model == "glm-served-model"
 
-    with pytest.raises(ValueError, match="OpenAI response receipt requires"):
-        mod.PairedProviderCallReceipt(
-            call_index=1,
-            provider_request_id="response-id",
-            provider=ProviderKind.AZURE_OPENAI.value,
-            provider_config_digest="sha256:" + "1" * 64,
-            requested_model="glm-deployment",
-            route_evidence_kind="openai_response",
-            response_model=None,
-            system_fingerprint=None,
-            wire_config_digest="sha256:" + "2" * 64,
-            temperature=None,
+    invalid_receipt = mod.ChatProviderReceipt(
+        provider=ProviderKind.AZURE_OPENAI.value,
+        provider_request_id="request-id",
+        response_id="response-id",
+        requested_model="glm-deployment",
+        response_model=None,
+        system_fingerprint=None,
+        request_digest="sha256:" + "2" * 64,
+        temperature=pi_node_baseline("limits").temperature(),
+        max_tokens=1_000,
+        max_tokens_field="max_completion_tokens",
+        seed_supplied=False,
+        cache_config_supplied=False,
+        started_at_unix_s=1.0,
+        finished_at_unix_s=2.0,
+    )
+    with pytest.raises(ValueError, match="differs from frozen response identity"):
+        mod._validate_provider_receipt_for_route(
+            invalid_receipt,
+            route=route,
             max_output_tokens=1_000,
+            temperature=pi_node_baseline("limits").temperature(),
         )
+
+
+def test_canonical_receipt_trace_preserves_exact_turn_call_indexes() -> None:
+    trace = "\n".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":"))
+        for event in (
+            _receipt_event(request_id="request-1", call_index=1),
+            _receipt_event(request_id="request-2", call_index=2),
+        )
+    )
+    receipts, call_indexes = mod._provider_receipts_from_trace(trace)
+
+    assert all(isinstance(receipt, mod.ChatProviderReceipt) for receipt in receipts)
+    assert tuple(receipt.provider_request_id for receipt in receipts) == (
+        "request-1",
+        "request-2",
+    )
+    assert call_indexes == (1, 2)
+
+    noncontiguous = "\n".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":"))
+        for event in (
+            _receipt_event(request_id="request-1", call_index=1),
+            _receipt_event(request_id="request-2", call_index=3),
+        )
+    )
+    with pytest.raises(ValueError, match="call indexes are not exact"):
+        mod._provider_receipts_from_trace(noncontiguous)
+
+    duplicate = "\n".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":"))
+        for event in (
+            _receipt_event(request_id="request-1", call_index=1),
+            _receipt_event(request_id="request-1", call_index=2),
+        )
+    )
+    with pytest.raises(ValueError, match="repeats a provider request ID"):
+        mod._provider_receipts_from_trace(duplicate)
+
+
+def test_multi_host_execution_requires_durable_coordinator(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires a durable lease coordinator"):
+        _runner(tmp_path, _candidate(), multi_host=True)
 
 
 def test_job_and_pair_generation_identities_bind_operation_generation_and_block(
@@ -608,9 +786,124 @@ def test_partial_existing_pair_is_rejected_before_any_provider_call(
     )
     (runner._job_spec.jobs_dir / one_arm).mkdir(parents=True)
 
-    with pytest.raises(mod.PartialPairedHarborReuseError, match="only one pre-existing arm"):
+    with pytest.raises(
+        mod.PartialPairedHarborReuseError,
+        match="arm artifacts without durable pair state",
+    ):
         asyncio.run(runner.run(baseline=baseline, candidate=candidate))
     assert calls == []
+
+
+def test_two_arm_directories_without_pair_state_are_rejected_before_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(tmp_path, candidate, baseline=baseline)
+    block = runner._protocol.design.blocks[0]
+    for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE):
+        name = mod.paired_harbor_job_name(
+            protocol_digest=runner._protocol.digest,
+            operation_id="offline-test-operation",
+            generation_id=1,
+            block=block,
+            arm=arm,
+        )
+        (runner._job_spec.jobs_dir / name).mkdir(parents=True)
+
+    with pytest.raises(
+        mod.PartialPairedHarborReuseError,
+        match="arm artifacts without durable pair state",
+    ):
+        asyncio.run(runner.run(baseline=baseline, candidate=candidate))
+    assert calls == []
+
+
+def test_failed_pair_with_both_arm_directories_requires_new_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    failed_calls: list[str] = []
+
+    class IncompleteSecondArmEvaluator:
+        def __init__(
+            self,
+            spec: HarborJobSpec,
+            provider_config: ProviderConfig,
+            **_kwargs: object,
+        ) -> None:
+            self._spec = spec
+            self._provider = provider_config
+
+        async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
+            failed_calls.append(self._spec.job_name)
+            if len(failed_calls) == 2:
+                (self._spec.jobs_dir / self._spec.job_name).mkdir(parents=True)
+                raise RuntimeError("synthetic incomplete second arm")
+            return _loaded_result(self._spec, self._provider, harness, reward=0.0)
+
+    monkeypatch.setattr(mod, "HarborEvaluator", IncompleteSecondArmEvaluator)
+    first_generation = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(first_generation.run(baseline=baseline, candidate=candidate))
+    assert len(failed_calls) == 2
+    first_block = first_generation._protocol.design.blocks[0]
+    failed_state = mod._read_pair_generation_state(first_generation._pair_state_path(first_block))
+    assert failed_state.status == "failed"
+    assert all(
+        (first_generation._job_spec.jobs_dir / name).exists()
+        for name in (
+            failed_state.baseline_job_name,
+            failed_state.candidate_job_name,
+        )
+    )
+
+    replay_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    with pytest.raises(mod.PartialPairedHarborReuseError, match="is 'failed'"):
+        asyncio.run(first_generation.run(baseline=baseline, candidate=candidate))
+    assert replay_calls == []
+
+    next_generation = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        operation_id="offline-test-operation",
+        generation_id=2,
+        max_concurrent_blocks=1,
+    )
+    report = asyncio.run(next_generation.run(baseline=baseline, candidate=candidate))
+    assert len(replay_calls) == 2 * len(_design().blocks)
+    assert report.generation_id == 2
+
+
+def test_complete_state_with_incomplete_arm_is_rejected_before_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(tmp_path, candidate, baseline=baseline)
+    report = asyncio.run(runner.run(baseline=baseline, candidate=candidate))
+    incomplete_job = runner._job_spec.jobs_dir / report.evidence[0].second.job_name
+    (incomplete_job / "trial" / "result.json").unlink()
+
+    replay_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    with pytest.raises(
+        mod.PartialPairedHarborReuseError,
+        match="contains an incomplete arm trial",
+    ):
+        asyncio.run(runner.run(baseline=baseline, candidate=candidate))
+    assert replay_calls == []
 
 
 def test_realistic_trace_without_provider_authored_receipt_fails_closed(
@@ -667,9 +960,7 @@ def test_report_json_reload_recomputes_every_binding_and_analysis(
         )
     )
     canonical = cast("dict[str, Any]", report.model_dump(mode="json"))
-    assert mod.PairedHarborRunReport.model_validate_json(
-        json.dumps(canonical)
-    ) == report
+    assert mod.PairedHarborRunReport.model_validate_json(json.dumps(canonical)) == report
 
     mutations = []
 
@@ -684,16 +975,12 @@ def test_report_json_reload_recomputes_every_binding_and_analysis(
     mutations.append(change_task)
 
     def change_cell_config(payload: dict[str, Any]) -> None:
-        payload["evidence"][0]["first"]["trial"]["cell"]["config_digest"] = (
-            "sha256:" + "7" * 64
-        )
+        payload["evidence"][0]["first"]["trial"]["cell"]["config_digest"] = "sha256:" + "7" * 64
 
     mutations.append(change_cell_config)
 
     def change_environment(payload: dict[str, Any]) -> None:
-        payload["evidence"][0]["first"]["trial"]["task_environment_digest"] = (
-            "sha256:" + "8" * 64
-        )
+        payload["evidence"][0]["first"]["trial"]["task_environment_digest"] = "sha256:" + "8" * 64
 
     mutations.append(change_environment)
 
@@ -714,31 +1001,33 @@ def test_report_json_reload_recomputes_every_binding_and_analysis(
     mutations.append(change_analysis)
 
     def duplicate_request_id(payload: dict[str, Any]) -> None:
-        first_id = payload["evidence"][0]["first"]["provider_receipts"][0][
-            "provider_request_id"
-        ]
-        payload["evidence"][0]["second"]["provider_receipts"][0][
-            "provider_request_id"
-        ] = first_id
+        first_id = payload["evidence"][0]["first"]["provider_receipts"][0]["provider_request_id"]
+        payload["evidence"][0]["second"]["provider_receipts"][0]["provider_request_id"] = first_id
 
     mutations.append(duplicate_request_id)
 
+    def change_receipt_index(payload: dict[str, Any]) -> None:
+        payload["evidence"][0]["first"]["provider_receipt_call_indexes"][0] = 2
+
+    mutations.append(change_receipt_index)
+
+    def change_receipt_provider(payload: dict[str, Any]) -> None:
+        payload["evidence"][0]["first"]["provider_receipts"][0]["provider"] = "azure"
+
+    mutations.append(change_receipt_provider)
+
     def fabricate_bedrock_response_model(payload: dict[str, Any]) -> None:
-        payload["evidence"][0]["first"]["provider_receipts"][0][
-            "response_model"
-        ] = "unfrozen-model"
+        payload["evidence"][0]["first"]["provider_receipts"][0]["response_model"] = "unfrozen-model"
 
     mutations.append(fabricate_bedrock_response_model)
 
     def add_seed(payload: dict[str, Any]) -> None:
-        payload["evidence"][0]["first"]["provider_receipts"][0]["seed"] = 7
+        payload["evidence"][0]["first"]["provider_receipts"][0]["seed_supplied"] = True
 
     mutations.append(add_seed)
 
     def change_temperature(payload: dict[str, Any]) -> None:
-        payload["evidence"][0]["first"]["provider_receipts"][0][
-            "temperature"
-        ] = 0.7
+        payload["evidence"][0]["first"]["provider_receipts"][0]["temperature"] = 0.1
 
     mutations.append(change_temperature)
 
@@ -757,6 +1046,110 @@ def test_report_json_reload_recomputes_every_binding_and_analysis(
         mutate(payload)
         with pytest.raises(ValueError):
             mod.PairedHarborRunReport.model_validate(payload)
+
+
+def test_same_host_operations_share_global_route_and_task_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    route = mod.PairedHarborPanelRoute(
+        panel_member="worker",
+        provider_config=_provider(),
+        max_concurrent_blocks=1,
+    )
+    active = 0
+    maximum = 0
+
+    class CapacityEvaluator:
+        def __init__(
+            self,
+            spec: HarborJobSpec,
+            provider_config: ProviderConfig,
+            **_kwargs: object,
+        ) -> None:
+            self._spec = spec
+            self._provider = provider_config
+
+        async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            try:
+                await asyncio.sleep(0.005)
+                reward = float(harness.execution_digest == candidate.execution_digest)
+                return _loaded_result(
+                    self._spec,
+                    self._provider,
+                    harness,
+                    reward=reward,
+                )
+            finally:
+                active -= 1
+
+    monkeypatch.setattr(mod, "HarborEvaluator", CapacityEvaluator)
+    first = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        operation_id="operation-a",
+        panel_routes=(route,),
+        max_concurrent_blocks=1,
+    )
+    second = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        operation_id="operation-b",
+        panel_routes=(route,),
+        max_concurrent_blocks=1,
+    )
+
+    async def run_both() -> None:
+        await asyncio.gather(
+            first.run(baseline=baseline, candidate=candidate),
+            second.run(baseline=baseline, candidate=candidate),
+        )
+
+    asyncio.run(run_both())
+    assert maximum == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="local file leases require POSIX")
+def test_local_block_capacity_is_enforced_across_processes(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    first_ready = context.Event()
+    first_release = context.Event()
+    second_ready = context.Event()
+    second_release = context.Event()
+    first = context.Process(
+        target=_hold_local_block_lease,
+        args=(str(tmp_path / "jobs"), first_ready, first_release),
+    )
+    second = context.Process(
+        target=_hold_local_block_lease,
+        args=(str(tmp_path / "jobs"), second_ready, second_release),
+    )
+    try:
+        first.start()
+        assert first_ready.wait(timeout=5)
+        second.start()
+        assert not second_ready.wait(timeout=0.2)
+        first_release.set()
+        assert second_ready.wait(timeout=5)
+        second_release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+    finally:
+        first_release.set()
+        second_release.set()
+        for process in (first, second):
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
 
 
 def test_scheduler_is_bounded_route_fair_and_serializes_each_task(

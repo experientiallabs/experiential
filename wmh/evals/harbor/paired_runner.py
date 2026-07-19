@@ -7,17 +7,27 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import (
+    AbstractAsyncContextManager,
+    AbstractContextManager,
+    ExitStack,
+    asynccontextmanager,
+)
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Protocol, Self
 
 from harbor.models.job.config import DatasetConfig
+from llm_waterfall import ChatProviderReceipt
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     JsonValue,
     StrictInt,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -63,8 +73,8 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE, validate_pi_container_image
 from wmh.providers.base import ProviderConfig
 
-PAIRED_HARBOR_PROTOCOL_VERSION: Literal["1"] = "1"
-PAIRED_HARBOR_RUN_VERSION: Literal["2"] = "2"
+PAIRED_HARBOR_PROTOCOL_VERSION: Literal["2"] = "2"
+PAIRED_HARBOR_RUN_VERSION: Literal["3"] = "3"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -108,12 +118,6 @@ class PairedHarborPanelRoute(BaseModel):
     provider_config: ProviderConfig
     expected_response_model: str | None = Field(default=None, min_length=1)
     expected_system_fingerprint: str | None = Field(default=None, min_length=1)
-    expected_temperature: float | None = Field(
-        default=None,
-        ge=0.0,
-        le=2.0,
-        allow_inf_nan=False,
-    )
     max_concurrent_blocks: StrictInt = Field(default=1, ge=1)
 
     @field_validator("provider_config", mode="after")
@@ -149,13 +153,6 @@ class PairedHarborPanelRoute(BaseModel):
             raise ValueError("route concurrency cannot be boolean")
         return value
 
-    @field_validator("expected_temperature", mode="before")
-    @classmethod
-    def _reject_boolean_temperature(cls, value: float | None) -> float | None:
-        if isinstance(value, bool):
-            raise ValueError("expected_temperature cannot be boolean")
-        return value
-
     @model_validator(mode="after")
     def _require_honest_response_identity(self) -> Self:
         if self.provider_config.kind.value == "bedrock":
@@ -172,73 +169,6 @@ class PairedHarborPanelRoute(BaseModel):
         else:
             raise ValueError(
                 "paired scored receipts currently support Bedrock and OpenAI-shaped routes"
-            )
-        return self
-
-
-class PairedProviderCallReceipt(BaseModel):
-    """Provider-authored evidence for one successful worker-model request.
-
-    The contract is intentionally stricter than today's provider plumbing. In particular, an
-    inferred configured model is not an observed model and no host-generated UUID can substitute
-    for the provider's request ID. Bedrock therefore binds its exact requested model and AWS
-    response metadata while leaving ``response_model`` empty; OpenAI-shaped routes retain the
-    response model and system fingerprint. Paired admission remains unavailable until adapters
-    populate these fields from their raw responses.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    receipt_version: Literal["1"] = "1"
-    call_index: StrictInt = Field(ge=1)
-    provider_request_id: str = Field(min_length=1, max_length=512)
-    provider: str = Field(min_length=1)
-    provider_config_digest: str = Field(pattern=_DIGEST_PATTERN)
-    requested_model: str = Field(min_length=1)
-    route_evidence_kind: Literal["aws_response_metadata", "openai_response"]
-    response_model: str | None = Field(default=None, min_length=1)
-    system_fingerprint: str | None = Field(default=None, min_length=1)
-    wire_config_digest: str = Field(pattern=_DIGEST_PATTERN)
-    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
-    max_output_tokens: StrictInt = Field(ge=1)
-    seed: None = None
-    cache_config: None = None
-
-    @field_validator("call_index", "max_output_tokens", mode="before")
-    @classmethod
-    def _reject_boolean_counts(cls, value: int) -> int:
-        if isinstance(value, bool):
-            raise ValueError("provider receipt counts cannot be boolean")
-        return value
-
-    @field_validator(
-        "provider_request_id",
-        "provider",
-        "requested_model",
-        "response_model",
-        "system_fingerprint",
-    )
-    @classmethod
-    def _require_canonical_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if value != value.strip():
-            raise ValueError("provider receipt strings cannot have surrounding whitespace")
-        validate_durable_text(value, field="provider receipt")
-        return value
-
-    @model_validator(mode="after")
-    def _validate_route_evidence(self) -> Self:
-        if self.route_evidence_kind == "aws_response_metadata":
-            if self.provider != "bedrock":
-                raise ValueError("AWS response metadata receipt requires a Bedrock route")
-            if self.response_model is not None or self.system_fingerprint is not None:
-                raise ValueError(
-                    "Bedrock receipt cannot claim response model or system fingerprint evidence"
-                )
-        elif self.provider not in {"azure", "openai"} or self.response_model is None:
-            raise ValueError(
-                "OpenAI response receipt requires an OpenAI-shaped route and response model"
             )
         return self
 
@@ -373,7 +303,7 @@ class PairedHarborProtocol(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    protocol_version: Literal["1"] = PAIRED_HARBOR_PROTOCOL_VERSION
+    protocol_version: Literal["2"] = PAIRED_HARBOR_PROTOCOL_VERSION
     design: PairedEvaluationDesign
     design_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation: ConfirmationPartition
@@ -462,9 +392,7 @@ class PairedHarborProtocol(BaseModel):
             for member in self.design.panel_members
             for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE)
         )
-        actual_keys = tuple(
-            (item.panel_member, item.arm) for item in self.arm_route_expectations
-        )
+        actual_keys = tuple((item.panel_member, item.arm) for item in self.arm_route_expectations)
         if actual_keys != expected_keys:
             raise ValueError("paired Harbor arm-route expectations are incomplete or unordered")
         route_by_member = {route.panel_member: route for route in self.panel_routes}
@@ -553,10 +481,7 @@ class PairedHarborProtocol(BaseModel):
         )
         qualifications = tuple(
             sorted(
-                (
-                    QualifiedHarborTask.model_validate(task.model_dump())
-                    for task in qualified_tasks
-                ),
+                (QualifiedHarborTask.model_validate(task.model_dump()) for task in qualified_tasks),
                 key=lambda item: item.task_id,
             )
         )
@@ -644,7 +569,8 @@ class PairedHarborArmEvidence(BaseModel):
     run_identity: PairedHarborRunIdentity
     trial: BenchmarkTrialResult
     trace_digest: str = Field(min_length=1)
-    provider_receipts: tuple[PairedProviderCallReceipt, ...]
+    provider_receipts: tuple[ChatProviderReceipt, ...]
+    provider_receipt_call_indexes: tuple[StrictInt, ...]
     verifier_reward: float | None = Field(default=None, ge=0.0, le=1.0)
     analysis_score: float = Field(ge=0.0, le=1.0)
     admission_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -653,9 +579,7 @@ class PairedHarborArmEvidence(BaseModel):
     @classmethod
     def _require_binary_scores(cls, value: float | None) -> float | None:
         if value is not None and (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or value not in (0, 1)
+            isinstance(value, bool) or not isinstance(value, (int, float)) or value not in (0, 1)
         ):
             raise ValueError("paired Harbor evidence scores must be binary")
         return None if value is None else float(value)
@@ -683,8 +607,7 @@ class PairedHarborArmEvidence(BaseModel):
                 "paired Harbor evidence lacks provider-authored request receipts; configured "
                 "routes are not proof of independent worker calls"
             )
-        call_indexes = tuple(receipt.call_index for receipt in self.provider_receipts)
-        if call_indexes != tuple(range(1, len(self.provider_receipts) + 1)):
+        if self.provider_receipt_call_indexes != tuple(range(1, len(self.provider_receipts) + 1)):
             raise ValueError("paired Harbor provider receipt call indexes are not exact")
         request_ids = [receipt.provider_request_id for receipt in self.provider_receipts]
         if len(request_ids) != len(set(request_ids)):
@@ -733,7 +656,7 @@ class PairedHarborRunReport(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    run_version: Literal["2"]
+    run_version: Literal["3"]
     protocol: PairedHarborProtocol
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
@@ -761,12 +684,8 @@ class PairedHarborRunReport(BaseModel):
         if tuple(item.block for item in self.evidence) != expected_blocks:
             raise ValueError("paired Harbor evidence does not contain the exact frozen blocks")
 
-        qualification_by_id = {
-            task.task_id: task for task in self.protocol.qualified_tasks
-        }
-        route_by_member = {
-            route.panel_member: route for route in self.protocol.panel_routes
-        }
+        qualification_by_id = {task.task_id: task for task in self.protocol.qualified_tasks}
+        route_by_member = {route.panel_member: route for route in self.protocol.panel_routes}
         job_names: list[str] = []
         provider_request_ids: list[str] = []
         for item in self.evidence:
@@ -790,9 +709,7 @@ class PairedHarborRunReport(BaseModel):
                 if arm_evidence.job_name != expected_name:
                     raise ValueError("paired Harbor evidence has a noncanonical job name")
                 job_names.append(arm_evidence.job_name)
-                expected_hash, expected_digest = self.protocol.harness_identity(
-                    arm_evidence.arm
-                )
+                expected_hash, expected_digest = self.protocol.harness_identity(arm_evidence.arm)
                 if (
                     arm_evidence.harness_execution_hash != expected_hash
                     or arm_evidence.harness_execution_digest != expected_digest
@@ -804,44 +721,13 @@ class PairedHarborRunReport(BaseModel):
                 )
                 if arm_evidence.run_identity != expected_route.run_identity:
                     raise ValueError("paired Harbor evidence has provider or runtime drift")
-                expected_provider_digest = _canonical_digest(
-                    route.provider_config.model_dump(mode="json")
-                )
-                expected_requested_model = _requested_model(route.provider_config)
-                expected_wire_config_digest = paired_provider_wire_config_digest(
-                    provider_config=route.provider_config,
-                    requested_model=expected_requested_model,
-                    temperature=route.expected_temperature,
-                    max_output_tokens=self.protocol.compute_envelope.max_output_tokens,
-                )
                 for receipt in arm_evidence.provider_receipts:
-                    if (
-                        receipt.provider != route.provider_config.kind.value
-                        or receipt.provider_config_digest != expected_provider_digest
-                        or receipt.requested_model != expected_requested_model
-                        or receipt.temperature != route.expected_temperature
-                        or receipt.max_output_tokens
-                        != self.protocol.compute_envelope.max_output_tokens
-                        or receipt.wire_config_digest != expected_wire_config_digest
-                    ):
-                        raise ValueError(
-                            "paired Harbor provider receipt differs from frozen route controls"
-                        )
-                    if route.provider_config.kind.value == "bedrock":
-                        if receipt.route_evidence_kind != "aws_response_metadata":
-                            raise ValueError("paired Bedrock receipt lacks AWS response metadata")
-                    elif (
-                        receipt.route_evidence_kind != "openai_response"
-                        or receipt.response_model != route.expected_response_model
-                        or (
-                            route.expected_system_fingerprint is not None
-                            and receipt.system_fingerprint
-                            != route.expected_system_fingerprint
-                        )
-                    ):
-                        raise ValueError(
-                            "paired OpenAI receipt differs from frozen response identity"
-                        )
+                    _validate_provider_receipt_for_route(
+                        receipt,
+                        route=route,
+                        max_output_tokens=self.protocol.compute_envelope.max_output_tokens,
+                        temperature=self.protocol.compute_envelope.temperature,
+                    )
                     provider_request_ids.append(receipt.provider_request_id)
                 trial = arm_evidence.trial
                 if (
@@ -850,8 +736,7 @@ class PairedHarborRunReport(BaseModel):
                     or trial.cell.task_key != qualification.task_key
                     or trial.cell.attempt != 1
                     or trial.task_checksum != qualification.content_digest
-                    or trial.task_environment_digest
-                    != qualification.task_environment_digest
+                    or trial.task_environment_digest != qualification.task_environment_digest
                 ):
                     raise ValueError("paired Harbor evidence differs from task qualification")
                 verifier_reward, score = harbor_trial_analysis_values(
@@ -897,11 +782,179 @@ class PairedHarborMatrixError(RuntimeError):
 
 
 class PartialPairedHarborReuseError(RuntimeError):
-    """Only one arm exists for a generation, so the pair cannot be safely resumed."""
+    """A pair generation is incomplete or failed and cannot be safely resumed."""
 
 
 class ConcurrentPairedHarborRunError(RuntimeError):
     """The same local operation generation is already executing."""
+
+
+class PairedHarborLeaseContentionError(RuntimeError):
+    """A same-host block lease slot is currently held by another operation."""
+
+
+class PairedHarborPairStateError(RuntimeError):
+    """Durable pair-generation state is missing, inconsistent, or unsafe to resume."""
+
+
+class _StopPairedHarborWorkers(RuntimeError):
+    """Internal TaskGroup signal that cancels work after the first fatal block."""
+
+
+class PairedHarborPairGenerationState(BaseModel):
+    """Crash-durable state proving whether both arms completed as one generation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    state_version: Literal["1"] = "1"
+    protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    operation_id: str = Field(min_length=1, max_length=256)
+    generation_id: StrictInt = Field(ge=1)
+    pair_generation_id: str = Field(pattern=_DIGEST_PATTERN)
+    block: PairedBlock
+    baseline_job_name: str = Field(min_length=1)
+    candidate_job_name: str = Field(min_length=1)
+    status: Literal["running", "complete", "failed"]
+    baseline_admission_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    candidate_admission_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    state_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @model_validator(mode="after")
+    def _validate_state(self) -> Self:
+        expected_pair_id = paired_harbor_pair_generation_id(
+            protocol_digest=self.protocol_digest,
+            operation_id=self.operation_id,
+            generation_id=self.generation_id,
+            block=self.block,
+        )
+        if self.pair_generation_id != expected_pair_id:
+            raise ValueError("paired Harbor state has the wrong pair generation identity")
+        expected_names = {
+            arm: paired_harbor_job_name(
+                protocol_digest=self.protocol_digest,
+                operation_id=self.operation_id,
+                generation_id=self.generation_id,
+                block=self.block,
+                arm=arm,
+            )
+            for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE)
+        }
+        if (
+            self.baseline_job_name != expected_names[PairedArm.BASELINE]
+            or self.candidate_job_name != expected_names[PairedArm.CANDIDATE]
+        ):
+            raise ValueError("paired Harbor state has noncanonical arm job names")
+        admission_digests = (
+            self.baseline_admission_digest,
+            self.candidate_admission_digest,
+        )
+        if self.status == "complete":
+            if any(digest is None for digest in admission_digests):
+                raise ValueError("complete paired Harbor state lacks both arm admissions")
+        elif any(digest is not None for digest in admission_digests):
+            raise ValueError("non-complete paired Harbor state cannot carry arm admissions")
+        expected_digest = _canonical_digest(self.model_dump(mode="json", exclude={"state_digest"}))
+        if self.state_digest != expected_digest:
+            raise ValueError("paired Harbor state digest is inconsistent")
+        return self
+
+
+class PairedHarborLeaseCoordinator(Protocol):
+    """Runtime lease interface; multi-host implementations must be durably coordinated."""
+
+    def operation_lease(
+        self,
+        *,
+        protocol_digest: str,
+        operation_id: str,
+        generation_id: int,
+    ) -> AbstractAsyncContextManager[None]: ...
+
+    def block_lease(
+        self,
+        *,
+        protocol_digest: str,
+        block: PairedBlock,
+        max_concurrent_blocks: int,
+        max_concurrent_route_blocks: int,
+    ) -> AbstractAsyncContextManager[None]: ...
+
+
+class _LocalPairedHarborLeaseCoordinator:
+    """Globally keyed same-host leases shared by all operations using one jobs directory."""
+
+    def __init__(self, jobs_dir: Path, *, poll_interval_s: float = 0.01) -> None:
+        self._lease_dir = jobs_dir / ".wmh-paired-leases"
+        self._poll_interval_s = poll_interval_s
+
+    @asynccontextmanager
+    async def operation_lease(
+        self,
+        *,
+        protocol_digest: str,
+        operation_id: str,
+        generation_id: int,
+    ) -> AsyncIterator[None]:
+        token = _lease_token(
+            "operation",
+            protocol_digest,
+            operation_id,
+            str(generation_id),
+        )
+        with exclusive_posix_file_lease(
+            self._lease_dir / "operations" / f"{token}.lock",
+            unsupported_error=RuntimeError(
+                "paired Harbor local operation leases require POSIX; use a durable coordinator"
+            ),
+            irregular_file_error=OSError("paired Harbor operation lease is not a regular file"),
+            contention_error=ConcurrentPairedHarborRunError(
+                "paired Harbor operation generation is already running locally"
+            ),
+        ):
+            yield
+
+    @asynccontextmanager
+    async def block_lease(
+        self,
+        *,
+        protocol_digest: str,
+        block: PairedBlock,
+        max_concurrent_blocks: int,
+        max_concurrent_route_blocks: int,
+    ) -> AsyncIterator[None]:
+        global_paths = self._slot_paths(
+            "global",
+            (protocol_digest,),
+            max_concurrent_blocks,
+        )
+        route_paths = self._slot_paths(
+            "route",
+            (protocol_digest, block.panel_member),
+            max_concurrent_route_blocks,
+        )
+        task_path = self._lease_path("task", protocol_digest, block.task_id)
+        while True:
+            stack = ExitStack()
+            try:
+                _enter_first_available_lease(stack, global_paths)
+                _enter_first_available_lease(stack, route_paths)
+                stack.enter_context(_block_file_lease(task_path))
+            except PairedHarborLeaseContentionError:
+                stack.close()
+                await asyncio.sleep(self._poll_interval_s)
+                continue
+            try:
+                yield
+            finally:
+                stack.close()
+            return
+
+    def _slot_paths(self, kind: str, parts: tuple[str, ...], count: int) -> tuple[Path, ...]:
+        token = _lease_token(kind, *parts)
+        return tuple(self._lease_dir / kind / f"{token}-{slot}.lock" for slot in range(count))
+
+    def _lease_path(self, kind: str, *parts: str) -> Path:
+        return self._lease_dir / kind / f"{_lease_token(kind, *parts)}.lock"
 
 
 class _FairBlockScheduler:
@@ -910,8 +963,7 @@ class _FairBlockScheduler:
     def __init__(self, protocol: PairedHarborProtocol) -> None:
         self._routes = protocol.design.panel_members
         self._route_caps = {
-            route.panel_member: route.max_concurrent_blocks
-            for route in protocol.panel_routes
+            route.panel_member: route.max_concurrent_blocks for route in protocol.panel_routes
         }
         self._pending: dict[str, list[tuple[int, PairedBlock]]] = {
             member: [] for member in self._routes
@@ -923,12 +975,15 @@ class _FairBlockScheduler:
         self._active_by_route = Counter[str]()
         self._active_tasks: set[str] = set()
         self._cursor = 0
+        self._aborted = False
         self._condition = asyncio.Condition()
 
     async def acquire(self) -> tuple[int, PairedBlock] | None:
         """Reserve the next route-fair eligible block, or finish after all releases."""
         async with self._condition:
             while True:
+                if self._aborted:
+                    return None
                 selected = self._select_eligible()
                 if selected is not None:
                     index, block = selected
@@ -942,6 +997,15 @@ class _FairBlockScheduler:
                 if self._pending_count == 0 and self._active_count == 0:
                     return None
                 await self._condition.wait()
+
+    async def abort(self) -> None:
+        """Prevent any pending block from being scheduled after the first fatal failure."""
+        async with self._condition:
+            self._aborted = True
+            self._pending_count = 0
+            for queue in self._pending.values():
+                queue.clear()
+            self._condition.notify_all()
 
     async def release(self, block: PairedBlock) -> None:
         """Release route/task capacity after one reserved block terminates."""
@@ -970,11 +1034,10 @@ class _FairBlockScheduler:
 class PairedHarborRunner:
     """Execute a frozen protocol without score retries or unbounded task creation.
 
-    Reusing a complete arm pair in the same operation generation is admitted by Harbor's exact
-    manifests. A lone pre-existing arm is rejected. Authorizing a new generation after an
-    infrastructure failure still requires an external durable ledger that atomically records the
-    failed whole pair, budget reservation, and retry decision; this local runner deliberately does
-    not invent that authority.
+    Reusing a complete arm pair requires both Harbor evidence and crash-durable pair state. Any
+    running, failed, missing, or incomplete state rejects same-generation reuse. Authorizing the
+    next generation after an infrastructure failure still requires an external durable ledger that
+    records budget and retry authority; this runner only guarantees that both new arm jobs execute.
     """
 
     def __init__(
@@ -984,6 +1047,8 @@ class PairedHarborRunner:
         job_spec: HarborJobSpec,
         operation_id: str,
         generation_id: int,
+        multi_host: bool = False,
+        durable_coordinator: PairedHarborLeaseCoordinator | None = None,
     ) -> None:
         self._protocol = PairedHarborProtocol.model_validate(protocol.model_dump())
         self._operation_id = _validate_operation_id(operation_id)
@@ -992,6 +1057,12 @@ class PairedHarborRunner:
         if generation_id < 1:
             raise ValueError("generation_id must be a positive integer")
         self._generation_id = generation_id
+        if not isinstance(multi_host, bool):
+            raise ValueError("multi_host must be a boolean")
+        if multi_host and durable_coordinator is None:
+            raise ValueError(
+                "paired Harbor multi-host execution requires a durable lease coordinator"
+            )
 
         spec = HarborJobSpec.model_validate(job_spec.model_dump())
         spec = spec.model_copy(
@@ -1006,12 +1077,11 @@ class PairedHarborRunner:
         if actual_template != self._protocol.job_template:
             raise ValueError("runtime Harbor job template differs from frozen protocol")
         self._job_spec = spec
-        self._routes = {
-            route.panel_member: route for route in self._protocol.panel_routes
-        }
-        self._qualifications = {
-            task.task_id: task for task in self._protocol.qualified_tasks
-        }
+        self._lease_coordinator = durable_coordinator or _LocalPairedHarborLeaseCoordinator(
+            spec.jobs_dir
+        )
+        self._routes = {route.panel_member: route for route in self._protocol.panel_routes}
+        self._qualifications = {task.task_id: task for task in self._protocol.qualified_tasks}
 
     async def run(
         self,
@@ -1038,36 +1108,36 @@ class PairedHarborRunner:
         if reconstructed != self._protocol:
             raise ValueError("runtime inputs do not reconstruct the frozen paired Harbor protocol")
 
-        lock_path = self._operation_lock_path()
-        with exclusive_posix_file_lease(
-            lock_path,
-            unsupported_error=RuntimeError(
-                "paired Harbor local operation leases require POSIX; use a durable coordinator"
-            ),
-            irregular_file_error=OSError("paired Harbor operation lease is not a regular file"),
-            contention_error=ConcurrentPairedHarborRunError(
-                "paired Harbor operation generation is already running locally"
-            ),
+        async with self._lease_coordinator.operation_lease(
+            protocol_digest=self._protocol.digest,
+            operation_id=self._operation_id,
+            generation_id=self._generation_id,
         ):
             self._reject_partial_pair_reuse()
             evidence = await self._run_fair_matrix(
                 baseline=baseline,
                 candidate=candidate,
             )
-
-        analysis = analyze_paired_outcomes(
-            self._protocol.design,
-            [item.outcome for item in evidence],
-        )
-        return PairedHarborRunReport(
-            run_version=PAIRED_HARBOR_RUN_VERSION,
-            protocol=self._protocol,
-            protocol_digest=self._protocol.digest,
-            operation_id=self._operation_id,
-            generation_id=self._generation_id,
-            evidence=evidence,
-            analysis=analysis,
-        )
+            try:
+                analysis = analyze_paired_outcomes(
+                    self._protocol.design,
+                    [item.outcome for item in evidence],
+                )
+                return PairedHarborRunReport(
+                    run_version=PAIRED_HARBOR_RUN_VERSION,
+                    protocol=self._protocol,
+                    protocol_digest=self._protocol.digest,
+                    operation_id=self._operation_id,
+                    generation_id=self._generation_id,
+                    evidence=evidence,
+                    analysis=analysis,
+                )
+            except BaseException:
+                for item in evidence:
+                    self._fail_pair_generation(
+                        _read_pair_generation_state(self._pair_state_path(item.block))
+                    )
+                raise
 
     async def _run_fair_matrix(
         self,
@@ -1097,8 +1167,10 @@ class PairedHarborRunner:
                     )
                 except asyncio.CancelledError:
                     raise
-                except BaseException as error:  # noqa: BLE001 - aggregate exact failed cells
+                except Exception as error:  # noqa: BLE001 - retain the exact failed block
                     failures.append((block, error))
+                    await scheduler.abort()
+                    raise _StopPairedHarborWorkers from None
                 finally:
                     await asyncio.shield(scheduler.release(block))
 
@@ -1106,7 +1178,12 @@ class PairedHarborRunner:
             self._protocol.max_concurrent_blocks,
             len(self._protocol.design.blocks),
         )
-        await asyncio.gather(*(worker() for _ in range(worker_count)))
+        try:
+            async with asyncio.TaskGroup() as workers:
+                for _ in range(worker_count):
+                    workers.create_task(worker())
+        except* _StopPairedHarborWorkers:
+            pass
         if failures:
             failures.sort(key=lambda item: self._protocol.design.blocks.index(item[0]))
             raise PairedHarborMatrixError(failures)
@@ -1123,40 +1200,57 @@ class PairedHarborRunner:
         candidate: HarnessDoc,
         evaluator_session: HarborEvaluatorSession,
     ) -> PairedHarborBlockEvidence:
-        harnesses = {
-            PairedArm.BASELINE: baseline,
-            PairedArm.CANDIDATE: candidate,
-        }
-        first = await self._evaluate_arm(
-            block,
-            arm=block.first_arm,
-            harness=harnesses[block.first_arm],
-            evaluator_session=evaluator_session,
-        )
-        second_arm = _other_arm(block.first_arm)
-        second = await self._evaluate_arm(
-            block,
-            arm=second_arm,
-            harness=harnesses[second_arm],
-            evaluator_session=evaluator_session,
-        )
-        scores = {first.arm: first.analysis_score, second.arm: second.analysis_score}
-        return PairedHarborBlockEvidence(
+        route = self._routes[block.panel_member]
+        async with self._lease_coordinator.block_lease(
+            protocol_digest=self._protocol.digest,
             block=block,
-            pair_generation_id=paired_harbor_pair_generation_id(
-                protocol_digest=self._protocol.digest,
-                operation_id=self._operation_id,
-                generation_id=self._generation_id,
-                block=block,
-            ),
-            first=first,
-            second=second,
-            outcome=PairedBlockOutcome(
-                block=block,
-                baseline_reward=scores[PairedArm.BASELINE],
-                candidate_reward=scores[PairedArm.CANDIDATE],
-            ),
-        )
+            max_concurrent_blocks=self._protocol.max_concurrent_blocks,
+            max_concurrent_route_blocks=route.max_concurrent_blocks,
+        ):
+            pair_state = self._begin_pair_generation(block)
+            harnesses = {
+                PairedArm.BASELINE: baseline,
+                PairedArm.CANDIDATE: candidate,
+            }
+            try:
+                first = await self._evaluate_arm(
+                    block,
+                    arm=block.first_arm,
+                    harness=harnesses[block.first_arm],
+                    evaluator_session=evaluator_session,
+                )
+                second_arm = _other_arm(block.first_arm)
+                second = await self._evaluate_arm(
+                    block,
+                    arm=second_arm,
+                    harness=harnesses[second_arm],
+                    evaluator_session=evaluator_session,
+                )
+                scores = {
+                    first.arm: first.analysis_score,
+                    second.arm: second.analysis_score,
+                }
+                evidence = PairedHarborBlockEvidence(
+                    block=block,
+                    pair_generation_id=paired_harbor_pair_generation_id(
+                        protocol_digest=self._protocol.digest,
+                        operation_id=self._operation_id,
+                        generation_id=self._generation_id,
+                        block=block,
+                    ),
+                    first=first,
+                    second=second,
+                    outcome=PairedBlockOutcome(
+                        block=block,
+                        baseline_reward=scores[PairedArm.BASELINE],
+                        candidate_reward=scores[PairedArm.CANDIDATE],
+                    ),
+                )
+                self._complete_pair_generation(pair_state, evidence)
+                return evidence
+            except BaseException:
+                self._fail_pair_generation(pair_state)
+                raise
 
     async def _evaluate_arm(
         self,
@@ -1181,6 +1275,7 @@ class PairedHarborRunner:
             route.provider_config.model_copy(deep=True),
             runner_image=self._protocol.runner_image,
             turn_timeout_s=self._protocol.turn_timeout_s,
+            require_provider_receipts=True,
             session=evaluator_session,
         )
         loaded = await evaluator.evaluate(harness)
@@ -1210,10 +1305,17 @@ class PairedHarborRunner:
             raise ValueError(
                 f"Harbor task {block.task_id!r} content differs from frozen qualification"
             )
-        run_identity = PairedHarborRunIdentity.model_validate(
-            loaded.result.identity.model_dump()
+        run_identity = PairedHarborRunIdentity.model_validate(loaded.result.identity.model_dump())
+        provider_receipts, provider_receipt_call_indexes = _provider_receipts_from_trace(
+            item.trace_text
         )
-        provider_receipts = _provider_receipts_from_trace(item.trace_text)
+        for receipt in provider_receipts:
+            _validate_provider_receipt_for_route(
+                receipt,
+                route=route,
+                max_output_tokens=self._protocol.compute_envelope.max_output_tokens,
+                temperature=self._protocol.compute_envelope.temperature,
+            )
         draft = PairedHarborArmEvidence.model_construct(
             arm=arm,
             job_name=job_name,
@@ -1223,6 +1325,7 @@ class PairedHarborRunner:
             trial=item.trial,
             trace_digest=item.trace_digest,
             provider_receipts=provider_receipts,
+            provider_receipt_call_indexes=provider_receipt_call_indexes,
             verifier_reward=item.verifier_reward,
             analysis_score=item.score,
             admission_digest="sha256:" + "0" * 64,
@@ -1239,6 +1342,7 @@ class PairedHarborRunner:
             trial=item.trial,
             trace_digest=item.trace_digest,
             provider_receipts=provider_receipts,
+            provider_receipt_call_indexes=provider_receipt_call_indexes,
             verifier_reward=item.verifier_reward,
             analysis_score=item.score,
             admission_digest=admission_digest,
@@ -1269,31 +1373,153 @@ class PairedHarborRunner:
             deep=True,
         )
 
+    def _begin_pair_generation(self, block: PairedBlock) -> PairedHarborPairGenerationState:
+        state = self._inspect_pair_generation(block, create=True)
+        if state is None:
+            raise RuntimeError("paired Harbor pair state was not created")
+        return state
+
+    def _inspect_pair_generation(
+        self,
+        block: PairedBlock,
+        *,
+        create: bool,
+    ) -> PairedHarborPairGenerationState | None:
+        path = self._pair_state_path(block)
+        names = self._arm_job_names(block)
+        job_paths = tuple(self._job_spec.jobs_dir / name for name in names.values())
+        job_exists = tuple(os.path.lexists(path) for path in job_paths)
+        if not os.path.lexists(path):
+            if any(job_exists):
+                raise PartialPairedHarborReuseError(
+                    "paired Harbor generation has arm artifacts without durable pair state for "
+                    f"{block.task_id}/{block.panel_member}/{block.attempt}; allocate a new "
+                    "ledger-authorized generation and rerun both arms"
+                )
+            if not create:
+                return None
+            state = self._pair_state(block, status="running")
+            _create_pair_generation_state(path, state)
+            return state
+
+        state = _read_pair_generation_state(path)
+        expected_identity = self._pair_state(block, status="running")
+        identity_fields = (
+            "protocol_digest",
+            "operation_id",
+            "generation_id",
+            "pair_generation_id",
+            "block",
+            "baseline_job_name",
+            "candidate_job_name",
+        )
+        if any(
+            getattr(state, field) != getattr(expected_identity, field) for field in identity_fields
+        ):
+            raise PairedHarborPairStateError(
+                "paired Harbor generation state does not match the requested block"
+            )
+        if state.status != "complete":
+            raise PartialPairedHarborReuseError(
+                f"paired Harbor generation is {state.status!r} for "
+                f"{block.task_id}/{block.panel_member}/{block.attempt}; allocate a new "
+                "ledger-authorized generation and rerun both arms"
+            )
+        if job_exists != (True, True):
+            raise PartialPairedHarborReuseError(
+                "complete paired Harbor state is missing one or both arm jobs for "
+                f"{block.task_id}/{block.panel_member}/{block.attempt}; allocate a new "
+                "ledger-authorized generation and rerun both arms"
+            )
+        for job_path in job_paths:
+            _require_completed_arm_job(job_path)
+        return state
+
+    def _complete_pair_generation(
+        self,
+        current: PairedHarborPairGenerationState,
+        evidence: PairedHarborBlockEvidence,
+    ) -> None:
+        admissions = {item.arm: item.admission_digest for item in (evidence.first, evidence.second)}
+        for job_name in self._arm_job_names(evidence.block).values():
+            _require_completed_arm_job(self._job_spec.jobs_dir / job_name)
+        completed = self._pair_state(
+            evidence.block,
+            status="complete",
+            baseline_admission_digest=admissions[PairedArm.BASELINE],
+            candidate_admission_digest=admissions[PairedArm.CANDIDATE],
+        )
+        if current.status == "complete":
+            if current != completed:
+                raise PairedHarborPairStateError(
+                    "reloaded paired Harbor admissions differ from durable complete state"
+                )
+            return
+        if current.status != "running":
+            raise PairedHarborPairStateError(
+                "only a running paired Harbor generation can become complete"
+            )
+        _replace_pair_generation_state(self._pair_state_path(evidence.block), completed)
+
+    def _fail_pair_generation(self, current: PairedHarborPairGenerationState) -> None:
+        failed = self._pair_state(current.block, status="failed")
+        _replace_pair_generation_state(self._pair_state_path(current.block), failed)
+
+    def _pair_state(
+        self,
+        block: PairedBlock,
+        *,
+        status: Literal["running", "complete", "failed"],
+        baseline_admission_digest: str | None = None,
+        candidate_admission_digest: str | None = None,
+    ) -> PairedHarborPairGenerationState:
+        names = self._arm_job_names(block)
+        payload = {
+            "state_version": "1",
+            "protocol_digest": self._protocol.digest,
+            "operation_id": self._operation_id,
+            "generation_id": self._generation_id,
+            "pair_generation_id": paired_harbor_pair_generation_id(
+                protocol_digest=self._protocol.digest,
+                operation_id=self._operation_id,
+                generation_id=self._generation_id,
+                block=block,
+            ),
+            "block": block.model_dump(mode="json"),
+            "baseline_job_name": names[PairedArm.BASELINE],
+            "candidate_job_name": names[PairedArm.CANDIDATE],
+            "status": status,
+            "baseline_admission_digest": baseline_admission_digest,
+            "candidate_admission_digest": candidate_admission_digest,
+        }
+        return PairedHarborPairGenerationState.model_validate(
+            {**payload, "state_digest": _canonical_digest(payload)}
+        )
+
+    def _arm_job_names(self, block: PairedBlock) -> dict[PairedArm, str]:
+        return {
+            arm: paired_harbor_job_name(
+                protocol_digest=self._protocol.digest,
+                operation_id=self._operation_id,
+                generation_id=self._generation_id,
+                block=block,
+                arm=arm,
+            )
+            for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE)
+        }
+
+    def _pair_state_path(self, block: PairedBlock) -> Path:
+        pair_id = paired_harbor_pair_generation_id(
+            protocol_digest=self._protocol.digest,
+            operation_id=self._operation_id,
+            generation_id=self._generation_id,
+            block=block,
+        ).removeprefix("sha256:")
+        return self._job_spec.jobs_dir / ".wmh-paired-state" / f"{pair_id}.json"
+
     def _reject_partial_pair_reuse(self) -> None:
         for block in self._protocol.design.blocks:
-            names = tuple(
-                paired_harbor_job_name(
-                    protocol_digest=self._protocol.digest,
-                    operation_id=self._operation_id,
-                    generation_id=self._generation_id,
-                    block=block,
-                    arm=arm,
-                )
-                for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE)
-            )
-            exists = tuple(os.path.lexists(self._job_spec.jobs_dir / name) for name in names)
-            if exists[0] != exists[1]:
-                raise PartialPairedHarborReuseError(
-                    "paired Harbor generation contains only one pre-existing arm for "
-                    f"{block.task_id}/{block.panel_member}/{block.attempt}; allocate a new "
-                    "ledger-authorized generation for a whole-pair infrastructure retry"
-                )
-
-    def _operation_lock_path(self) -> Path:
-        token = hashlib.sha256(
-            f"{self._protocol.digest}\0{self._operation_id}\0{self._generation_id}".encode()
-        ).hexdigest()
-        return self._job_spec.jobs_dir / ".wmh-paired-leases" / f"{token}.lock"
+            self._inspect_pair_generation(block, create=False)
 
 
 def paired_harbor_job_name(
@@ -1354,8 +1580,133 @@ def paired_harbor_pair_generation_id(
     )
 
 
-def _provider_receipts_from_trace(trace_text: str) -> tuple[PairedProviderCallReceipt, ...]:
-    receipts: list[PairedProviderCallReceipt] = []
+def _create_pair_generation_state(
+    path: Path,
+    state: PairedHarborPairGenerationState,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = state.model_dump_json(indent=2) + "\n"
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError as exc:
+        raise PairedHarborPairStateError(
+            "paired Harbor pair state was concurrently created"
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _replace_pair_generation_state(
+    path: Path,
+    state: PairedHarborPairGenerationState,
+) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborPairStateError(f"paired Harbor pair state must be a regular file: {path}")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(state.model_dump_json(indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _read_pair_generation_state(path: Path) -> PairedHarborPairGenerationState:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborPairStateError(f"paired Harbor pair state must be a regular file: {path}")
+    try:
+        return PairedHarborPairGenerationState.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor pair state is unreadable or invalid: {path}"
+        ) from exc
+
+
+def _require_completed_arm_job(job_path: Path) -> None:
+    if job_path.is_symlink() or not job_path.is_dir():
+        raise PartialPairedHarborReuseError(
+            f"paired Harbor complete state has an unsafe arm job directory: {job_path}"
+        )
+    trial_dirs = tuple(
+        child for child in job_path.iterdir() if child.is_dir() and not child.is_symlink()
+    )
+    if not trial_dirs:
+        raise PartialPairedHarborReuseError(
+            f"paired Harbor complete state has no materialized trial: {job_path}"
+        )
+    incomplete = tuple(
+        trial_dir
+        for trial_dir in trial_dirs
+        if (trial_dir / "result.json").is_symlink() or not (trial_dir / "result.json").is_file()
+    )
+    if incomplete:
+        raise PartialPairedHarborReuseError(
+            "paired Harbor complete state contains an incomplete arm trial; allocate a new "
+            "ledger-authorized generation and rerun both arms"
+        )
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _lease_token(kind: str, *parts: str) -> str:
+    payload = "\0".join((kind, *parts)).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _block_file_lease(path: Path) -> AbstractContextManager[None]:
+    return exclusive_posix_file_lease(
+        path,
+        unsupported_error=RuntimeError(
+            "paired Harbor block leases require POSIX; use a durable coordinator"
+        ),
+        irregular_file_error=OSError("paired Harbor block lease is not a regular file"),
+        contention_error=PairedHarborLeaseContentionError(
+            "paired Harbor block lease capacity is currently exhausted"
+        ),
+    )
+
+
+def _enter_first_available_lease(stack: ExitStack, paths: tuple[Path, ...]) -> None:
+    last_error: PairedHarborLeaseContentionError | None = None
+    for path in paths:
+        try:
+            stack.enter_context(_block_file_lease(path))
+        except PairedHarborLeaseContentionError as exc:
+            last_error = exc
+            continue
+        return
+    if last_error is None:
+        raise RuntimeError("paired Harbor lease capacity must contain at least one slot")
+    raise last_error
+
+
+def _provider_receipts_from_trace(
+    trace_text: str,
+) -> tuple[tuple[ChatProviderReceipt, ...], tuple[int, ...]]:
+    receipts: list[ChatProviderReceipt] = []
+    call_indexes: list[int] = []
     for line in trace_text.splitlines():
         try:
             raw = json.loads(line)
@@ -1363,8 +1714,21 @@ def _provider_receipts_from_trace(trace_text: str) -> tuple[PairedProviderCallRe
             continue
         if not isinstance(raw, dict) or raw.get("kind") != "provider_receipt":
             continue
-        receipts.append(PairedProviderCallReceipt.model_validate(raw.get("payload")))
-    return tuple(receipts)
+        payload = raw.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("paired Harbor provider receipt payload is not an object")
+        receipt_payload = dict(payload)
+        call_index = receipt_payload.pop("turn_call_index", None)
+        if isinstance(call_index, bool) or not isinstance(call_index, int) or call_index < 1:
+            raise ValueError("paired Harbor provider receipt call index is invalid")
+        receipts.append(ChatProviderReceipt.model_validate(receipt_payload))
+        call_indexes.append(call_index)
+    if tuple(call_indexes) != tuple(range(1, len(receipts) + 1)):
+        raise ValueError("paired Harbor provider receipt call indexes are not exact")
+    request_ids = [receipt.provider_request_id for receipt in receipts]
+    if len(request_ids) != len(set(request_ids)):
+        raise ValueError("paired Harbor trace repeats a provider request ID")
+    return tuple(receipts), tuple(call_indexes)
 
 
 def _requested_model(config: ProviderConfig) -> str:
@@ -1375,65 +1739,54 @@ def _requested_model(config: ProviderConfig) -> str:
     return config.model
 
 
-def paired_provider_wire_config_digest(
+def _validate_provider_receipt_for_route(
+    receipt: ChatProviderReceipt,
     *,
-    provider_config: ProviderConfig,
-    requested_model: str,
-    temperature: float | None,
+    route: PairedHarborPanelRoute,
     max_output_tokens: int,
-) -> str:
-    """Hash exact non-message provider controls required by paired admission.
-
-    Provider adapters must compute this from the normalized request they actually send, after
-    model capability handling. The explicit null seed/cache fields prevent an implementation from
-    silently treating their omission from the digest as permission to configure them.
-    """
-    if not requested_model or requested_model != requested_model.strip():
-        raise ValueError("requested_model must be a non-empty canonical string")
-    if isinstance(temperature, bool) or (
-        temperature is not None
-        and (not math.isfinite(temperature) or not 0.0 <= temperature <= 2.0)
-    ):
-        raise ValueError("temperature must be null or finite within [0, 2]")
-    if (
-        isinstance(max_output_tokens, bool)
-        or not isinstance(max_output_tokens, int)
-        or max_output_tokens < 1
-    ):
-        raise ValueError("max_output_tokens must be a positive integer")
-    return _canonical_digest(
-        {
-            "schema_version": 1,
-            "provider_config": provider_config.model_dump(mode="json"),
-            "requested_model": requested_model,
-            "temperature": temperature,
-            "max_output_tokens": max_output_tokens,
-            "seed": None,
-            "cache_config": None,
-        }
+    temperature: float,
+) -> None:
+    config = route.provider_config
+    expected_max_tokens_field = (
+        "inferenceConfig.maxTokens"
+        if config.kind.value == "bedrock"
+        else config.resolved_chat_max_tokens_field()
     )
+    if (
+        receipt.provider != config.kind.value
+        or receipt.requested_model != _requested_model(config)
+        or receipt.temperature != temperature
+        or receipt.max_tokens != max_output_tokens
+        or receipt.max_tokens_field != expected_max_tokens_field
+        or receipt.seed_supplied
+        or receipt.cache_config_supplied
+    ):
+        raise ValueError("paired Harbor provider receipt differs from frozen route controls")
+    if config.kind.value == "bedrock":
+        if (
+            receipt.response_id is not None
+            or receipt.response_model is not None
+            or receipt.system_fingerprint is not None
+        ):
+            raise ValueError("paired Bedrock receipt contains unsupported response identity")
+        return
+    if (
+        receipt.response_id is None
+        or receipt.response_model != route.expected_response_model
+        or (
+            route.expected_system_fingerprint is not None
+            and receipt.system_fingerprint != route.expected_system_fingerprint
+        )
+    ):
+        raise ValueError("paired OpenAI receipt differs from frozen response identity")
 
 
 def _confirmation_candidate_digest(confirmation: ConfirmationPartition) -> str:
-    for field in ("candidate_execution_digest", "candidate_hash"):
-        value = getattr(confirmation, field, None)
-        if isinstance(value, str) and _is_sha256_digest(value):
-            return value
-    raise ValueError("confirmation opening lacks a canonical candidate execution digest")
+    return confirmation.candidate_execution_digest
 
 
 def _confirmation_protocol_digest(confirmation: ConfirmationPartition) -> str:
-    supplied = getattr(confirmation, "confirmation_protocol_digest", None)
-    if supplied is not None:
-        if not _is_sha256_digest(supplied):
-            raise ValueError("confirmation_protocol_digest must be canonical sha256")
-        return supplied
-    return _canonical_digest(
-        {
-            "schema_version": 1,
-            "confirmation": confirmation.model_dump(mode="json"),
-        }
-    )
+    return confirmation.confirmation_protocol_digest
 
 
 def _task_execution_identity(trial: BenchmarkTrialResult) -> tuple[object, ...]:
