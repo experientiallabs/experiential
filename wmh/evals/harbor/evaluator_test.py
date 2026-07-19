@@ -551,6 +551,40 @@ def test_run_config_digest_binds_semantics_and_concurrency_but_not_paths(tmp_pat
     ) != mod.harbor_run_config_digest(artifact_variant, agent_digest)
 
 
+def test_reasoning_effort_is_explicit_in_agent_config_and_run_identity(tmp_path: Path) -> None:
+    provider = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model_type="claude-opus-4-6",
+        model="us.anthropic.claude-opus-4-6-v1",
+        reasoning_effort="max",
+    )
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, tmp_path / "dataset"), provider)
+    candidate = pi_node_baseline("candidate")
+    agent = evaluator._build_agent(candidate)
+    agent_digest = harbor_agent_config_digest(agent)
+    identity = evaluator._run_identity(candidate, run_config_digest="sha256:" + "a" * 64)
+
+    serialized_provider = agent.kwargs["provider_config"]
+    assert isinstance(serialized_provider, dict)
+    assert serialized_provider["reasoning_effort"] == "max"
+    assert identity.reasoning_effort == "max"
+
+    unconfigured = mod.HarborEvaluator(
+        _spec(tmp_path, tmp_path / "dataset"),
+        provider.model_copy(update={"reasoning_effort": None}),
+    )
+    unconfigured_agent = unconfigured._build_agent(candidate)
+    unconfigured_identity = unconfigured._run_identity(
+        candidate,
+        run_config_digest="sha256:" + "b" * 64,
+    )
+    serialized_unconfigured = unconfigured_agent.kwargs["provider_config"]
+    assert isinstance(serialized_unconfigured, dict)
+    assert serialized_unconfigured["reasoning_effort"] is None
+    assert unconfigured_identity.reasoning_effort is None
+    assert harbor_agent_config_digest(unconfigured_agent) != agent_digest
+
+
 def test_evaluator_builds_and_hashes_the_final_agent_concurrency(tmp_path: Path) -> None:
     spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
         update={"n_concurrent_trials": 4, "agent_n_concurrent": 2},

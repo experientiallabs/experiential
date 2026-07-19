@@ -31,6 +31,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from llm_waterfall import ChatRequest
+from llm_waterfall.types import ChatMessage
 from pydantic import JsonValue
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
@@ -137,6 +138,25 @@ class _Episode:
 _params_schema = params_schema
 
 
+def _completion_delta(message: ChatMessage) -> dict[str, JsonValue]:
+    """Serialize one provider reply through Pi's OpenAI-compatible SSE bridge."""
+    content = message.content if isinstance(message.content, str) else ""
+    delta: dict[str, JsonValue] = {"role": "assistant", "content": content}
+    if message.reasoning_details:
+        delta["reasoning_details"] = [
+            detail.model_dump(mode="json") for detail in message.reasoning_details
+        ]
+    if message.tool_calls:
+        delta["tool_calls"] = [
+            {
+                "index": i,
+                **tool_call.model_dump(mode="json"),
+            }
+            for i, tool_call in enumerate(message.tool_calls)
+        ]
+    return delta
+
+
 class _ShimServer(ThreadingHTTPServer):
     """A threading HTTP server that carries the current episode for its handlers."""
 
@@ -208,16 +228,7 @@ class _ShimHandler(BaseHTTPRequestHandler):
             completion = self._ep.provider.complete_chat(self._ep.worker_request(body))
             choice = completion.choices[0]
             message = choice.message
-            content = message.content if isinstance(message.content, str) else ""
-            delta: dict[str, JsonValue] = {"role": "assistant", "content": content}
-            if message.tool_calls:
-                delta["tool_calls"] = [
-                    {
-                        "index": i,
-                        **tool_call.model_dump(mode="json"),
-                    }
-                    for i, tool_call in enumerate(message.tool_calls)
-                ]
+            delta = _completion_delta(message)
             first = {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
             last = {
                 "choices": [

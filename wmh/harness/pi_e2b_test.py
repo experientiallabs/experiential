@@ -79,6 +79,10 @@ def test_all_pi_llm_bridges_forward_opaque_reasoning_details() -> None:
     for filename in ("runner_stdio.ts", "runner_live.ts", "runner_service.ts"):
         source = (entry / filename).read_text(encoding="utf-8")
         assert "delta.reasoning_details = msg.reasoning_details" in source
+    local_source = (
+        Path(pi_e2b_module.__file__).with_name("pi_runtime.py").read_text(encoding="utf-8")
+    )
+    assert 'delta["reasoning_details"]' in local_source
 
 
 def test_all_pi_llm_bridges_forward_usage_for_context_accounting() -> None:

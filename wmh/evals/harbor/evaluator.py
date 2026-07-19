@@ -422,6 +422,7 @@ class HarborEvaluator:
             agent_version=WMH_PI_AGENT_VERSION,
             provider=self._provider_config.kind.value,
             model_name=self._provider_config.model,
+            reasoning_effort=self._provider_config.reasoning_effort,
             task_environment=environment,
             runner_image=self._runner_image,
             run_config_digest=run_config_digest,

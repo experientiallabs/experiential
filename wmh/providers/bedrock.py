@@ -6,12 +6,12 @@ import json
 import time
 from typing import TYPE_CHECKING, TypedDict, cast
 
+from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall.bedrock_chat import bedrock_converse_request, bedrock_converse_response
+
 from wmh.core.types import JsonObject, JsonValue
-from wmh.providers._bedrock_chat import converse_request, converse_response
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
-    ChatRequest,
-    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -134,6 +134,13 @@ class BedrockProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
+        if self.config.reasoning_effort is not None:
+            return self._complete_reasoning(
+                system,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         if _is_nova(self.config.model):
             return self._complete_nova(
                 system, messages, temperature=temperature, max_tokens=max_tokens
@@ -165,7 +172,11 @@ class BedrockProvider:
             request,
             forward_temperature=self._forward_temperature,
         )
-        wire_request = converse_request(normalized, self.config.model)
+        wire_request = bedrock_converse_request(
+            normalized,
+            self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
         started_at = time.time()
         raw = self._get_client().converse(**wire_request)
         finished_at = time.time()
@@ -185,7 +196,7 @@ class BedrockProvider:
             isinstance(temperature, bool) or not isinstance(temperature, (int, float))
         ):
             raise ValueError("Bedrock Converse request has an invalid inferenceConfig.temperature")
-        response = converse_response(raw, self.config.model)
+        response = bedrock_converse_response(raw, self.config.model)
         if not isinstance(provider_request_id, str) or not provider_request_id:
             return response
         receipt = build_chat_provider_receipt(
@@ -203,6 +214,35 @@ class BedrockProvider:
             finished_at_unix_s=finished_at,
         )
         return response.model_copy(update={"provider_receipt": receipt})
+
+    def _complete_reasoning(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Completion:
+        """Complete through Converse so configured adaptive reasoning cannot be ignored."""
+        request = ChatRequest.model_validate(
+            {
+                "messages": [
+                    *([{"role": "system", "content": system}] if system else []),
+                    *[{"role": message.role, "content": message.content} for message in messages],
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        )
+        response = self.complete_chat(request)
+        choice = response.choices[0]
+        return Completion(
+            text=str(choice.message.content or ""),
+            usage=TokenUsage(
+                input_tokens=response.token_usage().input_tokens,
+                output_tokens=response.token_usage().output_tokens,
+            ),
+        )
 
     def _complete_converse(
         self,

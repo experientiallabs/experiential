@@ -13,6 +13,7 @@ from llm_waterfall.types import (
     EmbeddingsUnsupported,
     Message,
     TokenUsage,
+    ToolCallingUnsupported,
 )
 
 if TYPE_CHECKING:
@@ -96,6 +97,11 @@ class OpenAIAdapter:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full OpenAI-compatible tool-calling request through this backend."""
+        if any(message.reasoning_details for message in request.messages):
+            raise ToolCallingUnsupported(
+                "OpenAI-compatible chat completions cannot replay provider-bound reasoning "
+                "details; use the originating backend for this tool-call history"
+            )
         payload = request.provider_payload(
             self._request_model(), max_tokens_field=self.backend.chat_max_tokens_field
         )

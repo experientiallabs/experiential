@@ -9,10 +9,13 @@ field name. This module is the single stateless bridge between those contracts.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, cast
 
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatReasoningDetail, ChatRequest, ChatResponse
 from pydantic import JsonValue
+
+_RESPONSES_REASONING_ENVELOPE_FORMAT = "openai.responses.output.v1"
 
 
 def responses_request(
@@ -43,7 +46,7 @@ def responses_request(
     """
     payload: dict[str, object] = {
         "model": model,
-        "input": _responses_input(request),
+        "input": _responses_input(request, model),
         # pi asks its OpenAI-compatible endpoint for a stream. The Python runtime needs one
         # complete Response object, so the provider boundary deliberately terminates streaming.
         "stream": False,
@@ -96,7 +99,10 @@ def responses_request(
     return payload
 
 
-def responses_response(raw: dict[str, object]) -> ChatResponse:
+def responses_response(
+    raw: dict[str, object],
+    requested_model: str | None = None,
+) -> ChatResponse:
     """Translate one native Responses object into the structured chat response contract.
 
     Args:
@@ -112,8 +118,9 @@ def responses_response(raw: dict[str, object]) -> ChatResponse:
 
     text_parts: list[str] = []
     tool_calls: list[dict[str, object]] = []
-    reasoning_details: list[dict[str, str]] = []
-    pending_reasoning: list[dict[str, object]] = []
+    native_items: list[dict[str, object]] = []
+    has_message = False
+    has_reasoning = False
     recognized_output = False
     output = raw.get("output")
     if not isinstance(output, list):
@@ -125,33 +132,45 @@ def responses_response(raw: dict[str, object]) -> ChatResponse:
         _require_completed_output_item(item)
         item_type = item.get("type")
         if item_type == "reasoning":
-            pending_reasoning.append(item)
+            _validated_reasoning_item(item)
+            has_reasoning = True
         elif item_type == "message":
             recognized_output = True
+            has_message = True
             _append_message_text(item, text_parts)
         elif item_type == "function_call":
             recognized_output = True
-            tool_call = _chat_tool_call(item)
-            call_id = cast("str", tool_call["id"])
-            if pending_reasoning:
-                reasoning_details.append(_encrypted_reasoning_detail(pending_reasoning, call_id))
-            pending_reasoning.clear()
-            tool_calls.append(tool_call)
+            tool_calls.append(_chat_tool_call(item))
         else:
             raise ValueError(f"unsupported Responses output item type {item_type!r}")
+        # ``raw`` came from SDK JSON mode. Preserve each validated native item exactly so a
+        # stateless tool-result turn can replay provider state in its original order, including
+        # message ``phase`` and output-item status fields.
+        native_items.append(dict(item))
     if not recognized_output:
         raise ValueError("Responses API completed without a message or function call")
 
     message: dict[str, object] = {
         "role": "assistant",
-        "content": "".join(text_parts),
+        "content": "".join(text_parts) if has_message else None,
     }
     if tool_calls:
         message["tool_calls"] = tool_calls
-    if reasoning_details:
+    if has_reasoning and tool_calls:
+        response_model = raw.get("model")
+        origin_model = response_model if isinstance(response_model, str) else requested_model
+        if not isinstance(origin_model, str) or not origin_model:
+            raise ValueError("Responses reasoning output is missing its originating model")
+        first_call_id = cast("str", tool_calls[0]["id"])
         # Pi's OpenAI-completions parser stores each opaque detail on the matching tool call's
         # thoughtSignature and re-emits it in the next request's assistant message.
-        message["reasoning_details"] = reasoning_details
+        message["reasoning_details"] = [
+            {
+                "type": "reasoning.encrypted",
+                "id": first_call_id,
+                "data": _encode_responses_snapshot(native_items, origin_model),
+            }
+        ]
 
     response: dict[str, object] = {
         "choices": [
@@ -215,10 +234,10 @@ def complete_chat(
         )
     )
     raw = cast("dict[str, object]", sdk_response.model_dump(mode="json"))
-    return responses_response(raw)
+    return responses_response(raw, model)
 
 
-def _responses_input(request: ChatRequest) -> list[dict[str, object]]:
+def _responses_input(request: ChatRequest, model: str) -> list[dict[str, object]]:
     """Translate ordered chat history into stateless Responses input items."""
     items: list[dict[str, object]] = []
     for message in request.messages:
@@ -234,20 +253,21 @@ def _responses_input(request: ChatRequest) -> list[dict[str, object]]:
             )
             continue
 
+        if message.reasoning_details:
+            if message.role != "assistant":
+                raise ValueError("Responses reasoning details must belong to an assistant message")
+            items.extend(_signed_responses_snapshot(message, model))
+            continue
+
         text = _chat_text(message.content)
-        if text is not None:
+        # Pi represents a tool-only assistant turn with empty content. Responses emitted no
+        # message item in that case, so do not manufacture one during stateless replay.
+        if text is not None and (text or not message.tool_calls):
             items.append({"role": message.role, "content": text})
 
         if message.role != "assistant" and message.tool_calls:
             raise ValueError("Responses function calls must belong to an assistant message")
-        reasoning_by_call = _reasoning_items_by_call(message)
-        replayed_reasoning_ids: set[str] = set()
         for tool_call in message.tool_calls or []:
-            for reasoning in reasoning_by_call.get(tool_call.id, []):
-                reasoning_id = cast("str", reasoning["id"])
-                if reasoning_id not in replayed_reasoning_ids:
-                    items.append(reasoning)
-                    replayed_reasoning_ids.add(reasoning_id)
             items.append(
                 {
                     "type": "function_call",
@@ -259,42 +279,106 @@ def _responses_input(request: ChatRequest) -> list[dict[str, object]]:
     return items
 
 
-def _reasoning_items_by_call(message: object) -> dict[str, list[dict[str, object]]]:
-    """Decode Pi's opaque thought signatures into validated Responses reasoning items."""
-    extras = getattr(message, "model_extra", None)
-    if not isinstance(extras, dict) or extras.get("reasoning_details") is None:
-        return {}
-    details = extras["reasoning_details"]
-    if not isinstance(details, list):
-        raise ValueError("Responses reasoning_details must be an array")
+def _signed_responses_snapshot(message: object, model: str) -> list[dict[str, object]]:
+    """Decode and validate one exact provider-output snapshot before stateless replay."""
+    details = getattr(message, "reasoning_details", None)
+    if not isinstance(details, list) or len(details) != 1:
+        raise ValueError("signed Responses assistant message requires exactly one reasoning detail")
+    detail = details[0]
+    if not isinstance(detail, ChatReasoningDetail):
+        raise ValueError("Responses reasoning detail must be an object")
     calls = getattr(message, "tool_calls", None) or []
-    call_ids = {call.id for call in calls}
-    by_call: dict[str, list[dict[str, object]]] = {}
-    for detail_value in details:
-        detail = _object_dict(detail_value)
-        if detail is None:
-            raise ValueError("Responses reasoning detail must be an object")
-        if detail.get("type") != "reasoning.encrypted":
-            continue
-        call_id = detail.get("id")
-        data = detail.get("data")
-        if not isinstance(call_id, str) or call_id not in call_ids:
-            raise ValueError("encrypted Responses reasoning detail has no matching tool call")
-        if not isinstance(data, str):
-            raise ValueError("encrypted Responses reasoning detail data must be JSON text")
-        try:
-            decoded = json.loads(data)
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                "encrypted Responses reasoning detail contains invalid JSON"
-            ) from error
-        decoded_items = decoded if isinstance(decoded, list) else [decoded]
-        if not decoded_items:
-            raise ValueError("encrypted Responses reasoning detail contains no reasoning items")
-        by_call.setdefault(call_id, []).extend(
-            _validated_reasoning_item(item) for item in decoded_items
+    if detail.id not in {call.id for call in calls}:
+        raise ValueError("encrypted Responses reasoning detail has no matching tool call")
+    try:
+        decoded = json.loads(detail.data)
+    except json.JSONDecodeError as error:
+        raise ValueError("encrypted Responses reasoning envelope contains invalid JSON") from error
+    envelope = _object_dict(decoded)
+    if envelope is None or set(envelope) != {"format", "provider", "model", "output"}:
+        raise ValueError("invalid or foreign Responses reasoning envelope")
+    if (
+        envelope.get("format") != _RESPONSES_REASONING_ENVELOPE_FORMAT
+        or envelope.get("provider") != "openai_responses"
+    ):
+        raise ValueError("invalid or foreign Responses reasoning envelope")
+    origin_model = envelope.get("model")
+    if not isinstance(origin_model, str) or _openai_model_family(origin_model) != (
+        _openai_model_family(model)
+    ):
+        raise ValueError("Responses reasoning envelope belongs to a different model")
+    output = envelope.get("output")
+    if not isinstance(output, list) or not output:
+        raise ValueError("Responses reasoning envelope output must be a non-empty array")
+
+    native_items: list[dict[str, object]] = []
+    text_parts: list[str] = []
+    snapshot_calls: list[dict[str, object]] = []
+    has_message = False
+    has_reasoning = False
+    for item_value in output:
+        item = _object_dict(item_value)
+        if item is None:
+            raise ValueError("Responses reasoning envelope output item must be an object")
+        _require_completed_output_item(item)
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            _validated_reasoning_item(item)
+            has_reasoning = True
+        elif item_type == "message":
+            _append_message_text(item, text_parts)
+            has_message = True
+        elif item_type == "function_call":
+            snapshot_calls.append(_chat_tool_call(item))
+        else:
+            raise ValueError(f"unsupported Responses output item type {item_type!r}")
+        native_items.append(dict(item))
+    if not has_reasoning or not snapshot_calls:
+        raise ValueError("Responses reasoning envelope must contain reasoning and a function call")
+    if detail.id != snapshot_calls[0]["id"]:
+        raise ValueError("Responses reasoning detail must identify the snapshot's first tool call")
+    current_calls = [
+        {
+            "id": call.id,
+            "type": call.type,
+            "function": {
+                "name": call.function.name,
+                "arguments": call.function.arguments,
+            },
+        }
+        for call in calls
+    ]
+    snapshot_text = "".join(text_parts) if has_message else None
+    current_text = _chat_text(getattr(message, "content", None))
+    # Pi's streaming parser materializes tool-only assistant content as "" even when the native
+    # Responses output had no message item. Treat those two empty representations as equivalent.
+    if (snapshot_text or None) != (current_text or None) or snapshot_calls != current_calls:
+        raise ValueError("assistant message does not match its signed Responses snapshot")
+    return native_items
+
+
+def _encode_responses_snapshot(items: list[dict[str, object]], model: str) -> str:
+    """Encode ordered Responses output items into Pi's opaque reasoning-detail field."""
+    try:
+        return json.dumps(
+            {
+                "format": _RESPONSES_REASONING_ENVELOPE_FORMAT,
+                "provider": "openai_responses",
+                "model": _openai_model_family(model),
+                "output": items,
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
         )
-    return by_call
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Responses output cannot be serialized safely") from exc
+
+
+def _openai_model_family(model: str) -> str:
+    """Normalize a dated OpenAI snapshot to its stable alias for encrypted-state binding."""
+    match = re.fullmatch(r"(.+)-\d{4}-\d{2}-\d{2}", model)
+    return match.group(1) if match is not None else model
 
 
 def _chat_text(content: JsonValue) -> str | None:
@@ -384,16 +468,6 @@ def _validated_reasoning_item(value: object) -> dict[str, object]:
         "id": item_id,
         "summary": summary,
         "encrypted_content": encrypted_content,
-    }
-
-
-def _encrypted_reasoning_detail(items: list[dict[str, object]], call_id: str) -> dict[str, str]:
-    """Pack ordered native reasoning items into Pi's one thoughtSignature per tool call."""
-    validated = [_validated_reasoning_item(item) for item in items]
-    return {
-        "type": "reasoning.encrypted",
-        "id": call_id,
-        "data": json.dumps(validated, separators=(",", ":"), sort_keys=True),
     }
 
 

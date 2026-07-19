@@ -6,6 +6,8 @@ import threading
 
 import pytest
 
+from llm_waterfall.adapters.openai import OpenAIAdapter
+from llm_waterfall.bedrock_chat import bedrock_converse_request, bedrock_converse_response
 from llm_waterfall.pricing import ModelPrice
 from llm_waterfall.types import (
     Backend,
@@ -75,6 +77,50 @@ class FakeAdapter:
         return f"embedder-of-{self.backend.model}"
 
 
+class _ReplayAwareBedrockAdapter(FakeAdapter):
+    """Fake SDK edge that still runs the production Bedrock request preflight."""
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        bedrock_converse_request(
+            request,
+            self.backend.model,
+            reasoning_effort=self.backend.reasoning_effort,
+        )
+        return super().complete_chat(request)
+
+
+def _signed_bedrock_replay_request() -> ChatRequest:
+    response = bedrock_converse_response(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "reasoningContent": {
+                                "reasoningText": {"text": "inspect", "signature": "sig"}
+                            }
+                        },
+                        {
+                            "toolUse": {
+                                "toolUseId": "call-1",
+                                "name": "read_file",
+                                "input": {},
+                            }
+                        },
+                    ],
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 0, "outputTokens": 0},
+        },
+        "us.anthropic.claude-opus-4-6-v1",
+    )
+    return ChatRequest.model_validate(
+        {"messages": [response.choices[0].message.model_dump(mode="json", exclude_none=True)]}
+    )
+
+
 def _waterfall(
     scripts: dict[str, list[object]],
     *,
@@ -125,6 +171,45 @@ def test_structured_chat_uses_the_same_failover_and_attribution() -> None:
     assert result.model_used == "fallback"
     assert result.response.choices[0].message.content == "structured"
     assert [attempt.outcome for attempt in result.attempts] == ["capacity_error", "ok"]
+
+
+def test_signed_bedrock_replay_cannot_fail_over_to_a_different_bedrock_model() -> None:
+    primary = Backend("bedrock", "us.anthropic.claude-opus-4-6-v1", reasoning_effort="max")
+    fallback = Backend("bedrock", "us.anthropic.claude-sonnet-4-6", reasoning_effort="high")
+    adapters = {
+        primary.model: _ReplayAwareBedrockAdapter(primary, [_Throttle()]),
+        fallback.model: _ReplayAwareBedrockAdapter(fallback, []),
+    }
+    waterfall = Waterfall(
+        [primary, fallback],
+        adapter_factory=lambda backend: adapters[backend.model],
+    )
+
+    with pytest.raises(ValueError, match="belongs to a different model"):
+        waterfall.complete_chat(_signed_bedrock_replay_request())
+
+    assert adapters[primary.model].calls == 1
+    assert adapters[fallback.model].calls == 0
+
+
+def test_signed_bedrock_replay_never_reaches_openai_fallback_sdk() -> None:
+    primary = Backend("bedrock", "us.anthropic.claude-opus-4-6-v1", reasoning_effort="max")
+    fallback = Backend("openai", "gpt-5.5")
+    primary_adapter = _ReplayAwareBedrockAdapter(primary, [_Throttle()])
+    fallback_adapter = OpenAIAdapter(fallback)
+    waterfall = Waterfall(
+        [primary, fallback],
+        adapter_factory=lambda backend: primary_adapter if backend is primary else fallback_adapter,
+    )
+
+    with pytest.raises(WaterfallExhausted) as exc_info:
+        waterfall.complete_chat(_signed_bedrock_replay_request())
+
+    assert [attempt.outcome for attempt in exc_info.value.attempts] == [
+        "capacity_error",
+        "unsupported",
+    ]
+    assert fallback_adapter._client is None  # noqa: SLF001 - proves no foreign SDK request
 
 
 def test_client_error_propagates_immediately() -> None:

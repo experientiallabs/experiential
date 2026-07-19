@@ -8,6 +8,7 @@ import typer
 
 from wmh.config.settings import load_settings
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+from wmh.providers.models import resolve_provider_model
 from wmh.providers.registry import get_provider
 
 OptInModelRole = Literal["agent", "meta"]
@@ -49,12 +50,15 @@ def resolve_opt_in_model_provider(
     api_version = configured.api_version
     if api_version is None and kind is ProviderKind.AZURE_OPENAI:
         api_version = _DEFAULT_AZURE_API_VERSION
+    model = resolve_provider_model(kind, configured.model)
     config = ProviderConfig(
         kind=kind,
-        model=configured.model,
+        model_type=model.model_type,
+        model=model.model_id,
         region=configured.region,
         endpoint=configured.endpoint,
         deployment=configured.deployment,
         api_version=api_version,
+        reasoning_effort=configured.reasoning_effort,
     )
     return get_provider(config), configured.model

@@ -16,6 +16,7 @@ from enum import StrEnum
 from statistics import fmean
 from typing import Self, TypeGuard
 
+from llm_waterfall import ReasoningEffort
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 RewardValue = float | int
@@ -280,6 +281,7 @@ class BenchmarkRunIdentity(BaseModel):
     agent_version: str = Field(min_length=1)
     provider: str = Field(min_length=1)
     model_name: str = Field(min_length=1)
+    reasoning_effort: ReasoningEffort | None = None
     task_environment: BenchmarkTaskEnvironment
     runner_image: str = Field(min_length=1)
     run_config_digest: str = Field(

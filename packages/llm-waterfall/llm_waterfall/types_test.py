@@ -34,6 +34,65 @@ def test_backend_is_frozen_and_hashable() -> None:
     assert hash(b) == hash(Backend("openai", "gpt-5.5"))
 
 
+def test_backend_accepts_only_supported_immutable_reasoning_effort() -> None:
+    backend = Backend(
+        "bedrock",
+        "us.anthropic.claude-opus-4-6-v1",
+        reasoning_effort="max",
+    )
+
+    assert backend.reasoning_effort == "max"
+    with pytest.raises(AttributeError):
+        backend.reasoning_effort = "low"  # ty: ignore[invalid-assignment]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "effort", "message"),
+    [
+        ("bedrock", "us.anthropic.claude-opus-4-7", "max", "Claude Opus 4.6"),
+        ("bedrock", "us.anthropic.claude-opus-4-6-v1", "none", "does not support effort"),
+        ("bedrock", "us.anthropic.claude-haiku-4-5", "high", "adaptive reasoning"),
+        ("openai", "gpt-5.5", "high", "only supported for Bedrock"),
+        ("bedrock", "us.anthropic.claude-opus-4-6-v1", "extreme", "reasoning effort"),
+    ],
+)
+def test_backend_rejects_unsupported_reasoning_config(
+    provider: str,
+    model: str,
+    effort: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Backend(provider, model, reasoning_effort=effort)  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "au.anthropic.claude-opus-4-6-v1",
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+            "us.anthropic.claude-opus-4-6-v1"
+        ),
+        ("arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-opus-4-6-v1"),
+    ],
+)
+def test_backend_accepts_supported_bedrock_profile_identifier_forms(model: str) -> None:
+    assert Backend("bedrock", model, reasoning_effort="max").reasoning_effort == "max"
+
+
+def test_backend_rejects_opaque_application_inference_profile() -> None:
+    with pytest.raises(ValueError, match="does not support adaptive reasoning"):
+        Backend(
+            "bedrock",
+            (
+                "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/"
+                "optimizer-proposer"
+            ),
+            reasoning_effort="max",
+        )
+
+
 def test_retry_policy_backoff_sequence() -> None:
     p = RetryPolicy(rounds=5, backoff_base_s=15.0, backoff_max_s=120.0)
     assert [p.backoff_before_round(n) for n in range(1, 6)] == [0.0, 15.0, 30.0, 60.0, 120.0]
@@ -150,3 +209,62 @@ def test_provider_receipt_is_strict_and_excluded_from_agent_wire_payload() -> No
     assert response.provider_receipt.provider_request_id == "request-1"
     assert response.provider_receipt.response_id is None
     assert "provider_receipt" not in response.wire_payload()
+
+
+def test_structured_message_validates_opaque_reasoning_details() -> None:
+    request = ChatRequest.model_validate(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "bash", "arguments": "{}"},
+                        }
+                    ],
+                    "reasoning_details": [
+                        {
+                            "type": "reasoning.encrypted",
+                            "id": "call-1",
+                            "data": '{"version":"test"}',
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    [message] = request.messages
+    assert message.reasoning_details is not None
+    assert message.reasoning_details[0].id == "call-1"
+    assert request.model_dump(mode="json")["messages"][0]["reasoning_details"][0]["data"] == (
+        '{"version":"test"}'
+    )
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"type": "unknown", "id": "call-1", "data": "x"},
+        {"type": "reasoning.encrypted", "id": "", "data": "x"},
+        {"type": "reasoning.encrypted", "id": "call-1", "data": ""},
+        {"type": "reasoning.encrypted", "id": "call-1", "data": "x", "extra": True},
+    ],
+)
+def test_structured_message_rejects_malformed_reasoning_details(
+    detail: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        ChatRequest.model_validate(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_details": [detail],
+                    }
+                ]
+            }
+        )

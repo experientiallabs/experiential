@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from llm_waterfall.reasoning import ReasoningEffort, validate_backend_reasoning_effort
+
 Role = Literal["user", "assistant"]
 ChatMaxTokensField = Literal["max_completion_tokens", "max_tokens"]
 
@@ -48,12 +50,14 @@ class Backend:
     # (and thus fail over) instead of hanging forever.
     read_timeout_s: float = 600.0
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
+    reasoning_effort: ReasoningEffort | None = None
 
     def __post_init__(self) -> None:
         if self.provider not in PROVIDERS:
             raise ValueError(
                 f"unknown provider {self.provider!r}; expected one of {', '.join(PROVIDERS)}"
             )
+        validate_backend_reasoning_effort(self.provider, self.model, self.reasoning_effort)
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,16 @@ class ChatToolCall(BaseModel):
     function: ChatFunctionCall
 
 
+class ChatReasoningDetail(BaseModel):
+    """One opaque signed reasoning payload associated with an assistant tool call."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["reasoning.encrypted"] = "reasoning.encrypted"
+    id: str = Field(min_length=1)
+    data: str = Field(min_length=1)
+
+
 class ChatMessage(BaseModel):
     """One structured chat turn, including tool calls and tool results."""
 
@@ -140,6 +154,7 @@ class ChatMessage(BaseModel):
     content: JsonValue = None
     tool_calls: list[ChatToolCall] | None = None
     tool_call_id: str | None = None
+    reasoning_details: list[ChatReasoningDetail] | None = None
 
 
 class ChatFunctionDefinition(BaseModel):

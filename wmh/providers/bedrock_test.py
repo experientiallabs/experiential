@@ -6,6 +6,10 @@ import io
 import json
 from typing import TYPE_CHECKING, cast
 
+import boto3
+import pytest
+from botocore.stub import Stubber
+
 from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
 from wmh.providers.bedrock import BedrockProvider, _is_nova
 
@@ -189,3 +193,223 @@ def test_structured_chat_without_request_metadata_remains_usable_without_receipt
 
     assert response.choices[0].message.content == "ok"
     assert response.provider_receipt is None
+
+
+def test_structured_chat_binds_adaptive_max_effort_and_omits_temperature() -> None:
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-opus-4-6",
+            model="us.anthropic.claude-opus-4-6-v1",
+            reasoning_effort="max",
+        )
+    )
+    stub = _StubConverseClient()
+    provider._client = cast("BaseClient", stub)
+
+    response = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.3,
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
+    assert stub.requests[0]["inferenceConfig"] == {"maxTokens": 64}
+    assert stub.requests[0]["additionalModelRequestFields"] == {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
+    }
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.temperature is None
+    assert response.provider_receipt.max_tokens == 64
+
+
+def test_structured_chat_rejects_forced_tool_choice_before_sdk_request() -> None:
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-opus-4-6",
+            model="us.anthropic.claude-opus-4-6-v1",
+            reasoning_effort="max",
+        )
+    )
+    stub = _StubConverseClient()
+    provider._client = cast("BaseClient", stub)
+
+    with pytest.raises(ValueError, match="only auto or none"):
+        provider.complete_chat(
+            ChatRequest.model_validate(
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {"type": "object"},
+                            }
+                        }
+                    ],
+                    "tool_choice": "required",
+                }
+            )
+        )
+
+    assert stub.requests == []
+
+
+def test_text_completion_cannot_silently_ignore_configured_reasoning() -> None:
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-opus-4-6",
+            model="us.anthropic.claude-opus-4-6-v1",
+            reasoning_effort="max",
+        )
+    )
+    stub = _StubConverseClient()
+    provider._client = cast("BaseClient", stub)
+
+    completion = provider.complete(
+        "be precise",
+        [Message(role="user", content="hi")],
+        temperature=0.2,
+        max_tokens=128,
+    )
+
+    assert completion.text == "ok"
+    assert stub.requests[0]["system"] == [{"text": "be precise"}]
+    assert stub.requests[0]["additionalModelRequestFields"] == {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
+    }
+
+
+def test_real_sdk_shape_accepts_adaptive_request_and_signed_multiturn_replay() -> None:
+    model = "us.anthropic.claude-opus-4-6-v1"
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-opus-4-6",
+            model=model,
+            reasoning_effort="max",
+            region="us-east-1",
+        )
+    )
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    provider._client = cast("BaseClient", client)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read a file",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    first_request = ChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "inspect"}],
+            "tools": tools,
+            "max_completion_tokens": 64,
+        }
+    )
+    signed_content = [
+        {
+            "reasoningContent": {
+                "reasoningText": {"text": "inspect first", "signature": "signature"}
+            }
+        },
+        {"reasoningContent": {"redactedContent": b"redacted"}},
+        {
+            "toolUse": {
+                "toolUseId": "call-1",
+                "name": "read_file",
+                "input": {"path": "README.md"},
+            }
+        },
+    ]
+    common = {
+        "modelId": model,
+        "inferenceConfig": {"maxTokens": 64},
+        "additionalModelRequestFields": {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+        },
+        "toolConfig": {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": "read_file",
+                        "description": "read a file",
+                        "inputSchema": {"json": {"type": "object"}},
+                    }
+                }
+            ]
+        },
+    }
+    stubber = Stubber(client)
+    stubber.add_response(
+        "converse",
+        {
+            "output": {"message": {"role": "assistant", "content": signed_content}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 3, "outputTokens": 4, "totalTokens": 7},
+            "metrics": {"latencyMs": 1},
+        },
+        {**common, "messages": [{"role": "user", "content": [{"text": "inspect"}]}]},
+    )
+
+    with stubber:
+        first = provider.complete_chat(first_request)
+        assistant = first.choices[0].message.model_dump(mode="json", exclude_none=True)
+        followup = ChatRequest.model_validate(
+            {
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    assistant,
+                    {"role": "tool", "tool_call_id": "call-1", "content": "contents"},
+                ],
+                "tools": tools,
+                "max_completion_tokens": 64,
+            }
+        )
+        stubber.add_response(
+            "converse",
+            {
+                "output": {"message": {"role": "assistant", "content": [{"text": "done"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 8, "outputTokens": 1, "totalTokens": 9},
+                "metrics": {"latencyMs": 1},
+            },
+            {
+                **common,
+                "messages": [
+                    {"role": "user", "content": [{"text": "inspect"}]},
+                    {"role": "assistant", "content": signed_content},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "toolResult": {
+                                    "toolUseId": "call-1",
+                                    "content": [{"text": "contents"}],
+                                }
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+        second = provider.complete_chat(followup)
+
+    assert second.choices[0].message.content == "done"

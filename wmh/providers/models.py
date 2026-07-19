@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from llm_waterfall import ChatMaxTokensField
+import re
+
+from llm_waterfall import ChatMaxTokensField, ReasoningEffort
+from llm_waterfall.reasoning import bedrock_base_model_id
 from pydantic import BaseModel, ConfigDict
 
 from wmh.providers.base import ProviderKind
@@ -27,6 +30,22 @@ class ProviderModel(BaseModel):
     model_id: str
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
     forward_temperature: bool = True
+    reasoning_efforts: tuple[ReasoningEffort, ...] = ()
+
+
+_OPENAI_GPT_54_55_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
+_OPENAI_PRO_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = ("medium", "high", "xhigh")
+_BEDROCK_ADAPTIVE_EFFORTS: tuple[ReasoningEffort, ...] = ("low", "medium", "high")
+_BEDROCK_OPUS_46_EFFORTS: tuple[ReasoningEffort, ...] = (
+    *_BEDROCK_ADAPTIVE_EFFORTS,
+    "max",
+)
 
 
 _MODELS: tuple[ProviderModel, ...] = (
@@ -59,24 +78,28 @@ _MODELS: tuple[ProviderModel, ...] = (
         model_type="gpt-5.5",
         model_id="gpt-5.5",
         forward_temperature=False,
+        reasoning_efforts=_OPENAI_GPT_54_55_REASONING_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.OPENAI_RESPONSES,
         model_type="gpt-5.5-pro",
         model_id="gpt-5.5-pro",
         forward_temperature=False,
+        reasoning_efforts=_OPENAI_PRO_REASONING_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.OPENAI_RESPONSES,
         model_type="gpt-5.4",
         model_id="gpt-5.4",
         forward_temperature=False,
+        reasoning_efforts=_OPENAI_GPT_54_55_REASONING_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.OPENAI_RESPONSES,
         model_type="gpt-5.4-mini",
         model_id="gpt-5.4-mini",
         forward_temperature=False,
+        reasoning_efforts=_OPENAI_GPT_54_55_REASONING_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.ANTHROPIC,
@@ -115,16 +138,19 @@ _MODELS: tuple[ProviderModel, ...] = (
         provider=ProviderKind.BEDROCK,
         model_type="claude-opus-4-7",
         model_id="us.anthropic.claude-opus-4-7",
+        reasoning_efforts=_BEDROCK_ADAPTIVE_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.BEDROCK,
         model_type="claude-opus-4-6",
         model_id="us.anthropic.claude-opus-4-6-v1",
+        reasoning_efforts=_BEDROCK_OPUS_46_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.BEDROCK,
         model_type="claude-sonnet-4-6",
         model_id="us.anthropic.claude-sonnet-4-6",
+        reasoning_efforts=_BEDROCK_ADAPTIVE_EFFORTS,
     ),
     ProviderModel(
         provider=ProviderKind.BEDROCK,
@@ -193,7 +219,29 @@ def resolve_provider_model(provider: ProviderKind, model: str) -> ProviderModel:
     for spec in _MODELS:
         if spec.provider is provider and model in (spec.model_type, spec.model_id):
             return spec
+        if (
+            provider is ProviderKind.OPENAI_RESPONSES
+            and spec.provider is provider
+            and _is_openai_snapshot(model, spec.model_id)
+        ):
+            return spec
+        if (
+            provider is ProviderKind.BEDROCK
+            and spec.provider is provider
+            and bedrock_base_model_id(model) == bedrock_base_model_id(spec.model_id)
+        ):
+            return spec
     return ProviderModel(provider=provider, model_type=model, model_id=model)
+
+
+def _is_openai_snapshot(model: str, alias: str) -> bool:
+    """Match only the documented ``alias-YYYY-MM-DD`` snapshot shape.
+
+    A raw prefix check would misclassify ``gpt-5.5-pro`` as a snapshot of ``gpt-5.5`` and grant
+    it the wrong effort capability.  Requiring the date suffix keeps model-family resolution
+    exact while supporting pinned experiment models.
+    """
+    return re.fullmatch(rf"{re.escape(alias)}-\d{{4}}-\d{{2}}-\d{{2}}", model) is not None
 
 
 def resolve_chat_max_tokens_field(

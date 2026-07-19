@@ -119,6 +119,50 @@ def test_complete_uses_responses_api_and_reasoning_effort(
     ]
 
 
+def test_gpt55_high_effort_is_provider_bound_on_text_and_structured_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeResponsesResponse(
+        "ok",
+        _FakeUsage(2, 1),
+        output=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "ok"}],
+            }
+        ],
+    )
+    responses = _FakeResponses(response)
+    provider = OpenAIResponsesProvider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI_RESPONSES,
+            model="gpt-5.5",
+            reasoning_effort="high",
+        )
+    )
+    fake = type("ResponsesOnlyClient", (), {"responses": responses})()
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    provider.complete("", [Message(role="user", content="propose")])
+    assert responses.last_kwargs["reasoning"] == {"effort": "high"}
+    assert "temperature" not in responses.last_kwargs
+
+    provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "propose"}],
+                "temperature": 0.3,
+                "top_p": 0.7,
+            }
+        )
+    )
+    assert responses.last_kwargs["reasoning"] == {"effort": "high"}
+    assert "temperature" not in responses.last_kwargs
+    assert "top_p" not in responses.last_kwargs
+
+
 def test_complete_default_max_tokens_is_8k(monkeypatch: pytest.MonkeyPatch) -> None:
     responses = _FakeResponses(_FakeResponsesResponse("ok", _FakeUsage(1, 2)))
     provider = OpenAIResponsesProvider(_config())

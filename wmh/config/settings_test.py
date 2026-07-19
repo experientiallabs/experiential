@@ -122,19 +122,21 @@ def test_meta_role_round_trips_through_toml(tmp_path: Path) -> None:
     settings = ProjectSettings(
         models=ModelsSettings(
             meta=ModelRole(
-                provider="azure",
-                model="gpt-5.5",
-                endpoint="https://x.example",
-                deployment="gpt-5-5",
+                provider="bedrock",
+                model="claude-opus-4-6",
+                region="us-east-2",
+                reasoning_effort="max",
             )
         )
     )
     save_settings(settings, root)
     loaded = load_settings(root)
     assert loaded.models.meta is not None
-    assert loaded.models.meta.model == "gpt-5.5"
-    assert loaded.models.meta.deployment == "gpt-5-5"
+    assert loaded.models.meta.model == "claude-opus-4-6"
+    assert loaded.models.meta.region == "us-east-2"
+    assert loaded.models.meta.reasoning_effort == "max"
     assert "[models.meta]" in settings_path(root).read_text(encoding="utf-8")
+    assert 'reasoning_effort = "max"' in settings_path(root).read_text(encoding="utf-8")
 
 
 def test_resolve_rejects_unknown_role() -> None:

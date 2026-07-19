@@ -138,6 +138,77 @@ def test_explicit_api_version_overrides_the_azure_default(
     assert config.api_version == "2025-01-01"
 
 
+def test_meta_role_resolves_canonical_bedrock_model_and_reasoning_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / ".wmh"
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                meta=ModelRole(
+                    provider="bedrock",
+                    model="claude-opus-4-6",
+                    region="us-east-2",
+                    reasoning_effort="max",
+                )
+            )
+        ),
+        root,
+    )
+    configs: list[ProviderConfig] = []
+
+    def fake_get_provider(config: ProviderConfig) -> _Provider:
+        configs.append(config)
+        return _Provider()
+
+    monkeypatch.setattr(model_roles_module, "get_provider", fake_get_provider)
+
+    _, configured_model = resolve_opt_in_model_provider(str(root), "meta", _Provider())
+
+    assert configured_model == "claude-opus-4-6"
+    [config] = configs
+    assert config.model_type == "claude-opus-4-6"
+    assert config.model == "us.anthropic.claude-opus-4-6-v1"
+    assert config.reasoning_effort == "max"
+
+
+def test_proposer_reasoning_setting_does_not_mutate_unset_agent_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The optimizer model is independent from the frozen pi worker route."""
+    root = tmp_path / ".wmh"
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                meta=ModelRole(
+                    provider="openai_responses",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                )
+            )
+        ),
+        root,
+    )
+    worker = _Provider()
+    captured: list[ProviderConfig] = []
+
+    def fake_get_provider(config: ProviderConfig) -> _Provider:
+        captured.append(config)
+        return _Provider()
+
+    monkeypatch.setattr(model_roles_module, "get_provider", fake_get_provider)
+
+    meta, configured_meta = resolve_opt_in_model_provider(str(root), "meta", worker)
+    agent, configured_agent = resolve_opt_in_model_provider(str(root), "agent", worker)
+
+    assert meta is not worker
+    assert configured_meta == "gpt-5.5"
+    assert captured[0].reasoning_effort == "high"
+    assert agent is worker
+    assert configured_agent is None
+    assert worker.config.reasoning_effort is None
+
+
 @pytest.mark.parametrize("role", ["agent", "meta"])
 def test_unknown_provider_names_the_configured_role(tmp_path: Path, role: OptInModelRole) -> None:
     root = tmp_path / ".wmh"

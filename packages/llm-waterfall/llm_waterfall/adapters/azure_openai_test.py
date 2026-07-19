@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from llm_waterfall.adapters.azure_openai import AzureOpenAIAdapter
-from llm_waterfall.types import Backend, Message
+from llm_waterfall.types import Backend, ChatRequest, Message, ToolCallingUnsupported
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -131,3 +131,34 @@ def test_embed_without_deployment_is_unsupported(fake_azure: list[_FakeAzureOpen
     adapter = AzureOpenAIAdapter(_backend())
     with pytest.raises(EmbeddingsUnsupported):
         adapter.embed(["x"])
+
+
+def test_provider_bound_reasoning_rejected_before_azure_client_creation(
+    fake_azure: list[_FakeAzureOpenAI],
+) -> None:
+    adapter = AzureOpenAIAdapter(_backend())
+    request = ChatRequest.model_validate(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+                    ],
+                    "reasoning_details": [
+                        {
+                            "type": "reasoning.encrypted",
+                            "id": "call-1",
+                            "data": "bedrock-envelope",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(ToolCallingUnsupported, match="originating backend"):
+        adapter.complete_chat(request)
+
+    assert fake_azure == []

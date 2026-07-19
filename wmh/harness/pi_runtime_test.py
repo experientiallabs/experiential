@@ -15,7 +15,7 @@ from wmh.harness.doc import (
     Surface,
     SurfaceKind,
 )
-from wmh.harness.pi_runtime import PiRuntime, _Episode, _params_schema
+from wmh.harness.pi_runtime import PiRuntime, _completion_delta, _Episode, _params_schema
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
@@ -102,6 +102,53 @@ def test_worker_request_uses_document_temperature() -> None:
         {"messages": [], "temperature": 1.75}
     )
     assert request.temperature == 0.35
+
+
+def test_local_pi_bridge_forwards_opaque_reasoning_details() -> None:
+    message = (
+        ChatResponse.model_validate(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "inspect",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {"name": "read_file", "arguments": "{}"},
+                                }
+                            ],
+                            "reasoning_details": [
+                                {
+                                    "type": "reasoning.encrypted",
+                                    "id": "call-1",
+                                    "data": "opaque-signed-snapshot",
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+        .choices[0]
+        .message
+    )
+
+    delta = _completion_delta(message)
+
+    assert delta["reasoning_details"] == [
+        {
+            "type": "reasoning.encrypted",
+            "id": "call-1",
+            "data": "opaque-signed-snapshot",
+        }
+    ]
+    tool_calls = delta["tool_calls"]
+    assert isinstance(tool_calls, list)
+    first_tool_call = tool_calls[0]
+    assert isinstance(first_tool_call, dict)
+    assert first_tool_call["id"] == "call-1"
 
 
 def test_read_skill_is_runtime_local_and_does_not_consume_environment_budget() -> None:

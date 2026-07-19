@@ -217,25 +217,43 @@ def test_responses_response_preserves_text_multiple_tools_usage_and_tier() -> No
         '{"path":"a"}',
         '{"path":"b"}',
     ]
-    details = choice.message.model_extra
-    assert details is not None
-    assert details["reasoning_details"] == [
+    assert choice.message.reasoning_details is not None
+    [detail] = choice.message.reasoning_details
+    assert detail.id == "call-a"
+    envelope = json.loads(detail.data)
+    assert envelope["format"] == "openai.responses.output.v1"
+    assert envelope["provider"] == "openai_responses"
+    assert envelope["model"] == "gpt-5.5"
+    assert envelope["output"] == [
         {
-            "type": "reasoning.encrypted",
-            "id": "call-a",
-            "data": json.dumps(
-                [
-                    {
-                        "type": "reasoning",
-                        "id": "reasoning-1",
-                        "summary": [],
-                        "encrypted_content": "ciphertext-1",
-                    }
-                ],
-                separators=(",", ":"),
-                sort_keys=True,
-            ),
-        }
+            "type": "reasoning",
+            "id": "reasoning-1",
+            "summary": [],
+            "encrypted_content": "ciphertext-1",
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {"type": "output_text", "text": "Checking "},
+                {"type": "output_text", "text": "both."},
+            ],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-a",
+            "name": "read_file",
+            "arguments": '{"path":"a"}',
+            "status": "completed",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-b",
+            "name": "read_file",
+            "arguments": '{"path":"b"}',
+            "status": "completed",
+        },
     ]
 
 
@@ -272,7 +290,8 @@ def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> No
                     "status": "completed",
                 },
             ],
-        }
+        },
+        "gpt-5.5",
     )
     wire_choices = first.wire_payload()["choices"]
     assert isinstance(wire_choices, list)
@@ -287,7 +306,10 @@ def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> No
     assert isinstance(detail, dict)
     data = detail["data"]
     assert isinstance(data, str)
-    assert [item["id"] for item in json.loads(data)] == ["reasoning-1", "reasoning-2"]
+    assert [item["id"] for item in json.loads(data)["output"] if item["type"] == "reasoning"] == [
+        "reasoning-1",
+        "reasoning-2",
+    ]
     request = ChatRequest.model_validate(
         {
             "messages": [
@@ -304,7 +326,6 @@ def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> No
 
     assert payload["input"] == [
         {"role": "user", "content": "inspect"},
-        {"role": "assistant", "content": ""},
         {
             "type": "reasoning",
             "id": "reasoning-1",
@@ -322,12 +343,14 @@ def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> No
             "call_id": "call-a",
             "name": "read_file",
             "arguments": '{"path":"a"}',
+            "status": "completed",
         },
         {
             "type": "function_call",
             "call_id": "call-b",
             "name": "read_file",
             "arguments": '{"path":"b"}',
+            "status": "completed",
         },
         {"type": "function_call_output", "call_id": "call-a", "output": "A"},
         {"type": "function_call_output", "call_id": "call-b", "output": "B"},
@@ -335,8 +358,8 @@ def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> No
     assert payload["include"] == ["reasoning.encrypted_content"]
 
 
-def test_duplicate_parallel_reasoning_details_replay_once() -> None:
-    """Pi/provider compatibility duplicates cannot multiply a large encrypted trace."""
+def test_duplicate_parallel_reasoning_details_fail_closed() -> None:
+    """A second opaque snapshot could reorder or replace provider-bound state."""
     reasoning = {
         "type": "reasoning",
         "id": "reasoning-1",
@@ -369,11 +392,103 @@ def test_duplicate_parallel_reasoning_details_replay_once() -> None:
         }
     )
 
+    with pytest.raises(ValueError, match="exactly one reasoning detail"):
+        responses_request(request, "gpt-5.5", reasoning_effort="high")
+
+
+def test_encrypted_snapshot_preserves_native_message_phase_and_item_order() -> None:
+    native_output = [
+        {
+            "type": "reasoning",
+            "id": "reasoning-1",
+            "summary": [],
+            "encrypted_content": "ciphertext-1",
+            "status": "completed",
+        },
+        {
+            "type": "message",
+            "id": "msg-1",
+            "role": "assistant",
+            "phase": "commentary",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "I will inspect."}],
+        },
+        {
+            "type": "function_call",
+            "id": "fc-1",
+            "call_id": "call-1",
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+            "status": "completed",
+        },
+    ]
+    first = responses_response(
+        {
+            "model": "gpt-5.5-2026-04-23",
+            "status": "completed",
+            "output": native_output,
+        },
+        "gpt-5.5",
+    )
+    assistant = first.choices[0].message.model_dump(mode="json", exclude_none=True)
+    request = ChatRequest.model_validate(
+        {
+            "messages": [
+                {"role": "user", "content": "inspect"},
+                assistant,
+                {"role": "tool", "tool_call_id": "call-1", "content": "contents"},
+            ]
+        }
+    )
+
     payload = responses_request(request, "gpt-5.5", reasoning_effort="high")
 
-    inputs = payload["input"]
-    assert isinstance(inputs, list)
-    assert sum(item == reasoning for item in inputs) == 1
+    assert payload["input"] == [
+        {"role": "user", "content": "inspect"},
+        *native_output,
+        {"type": "function_call_output", "call_id": "call-1", "output": "contents"},
+    ]
+
+
+def test_encrypted_snapshot_rejects_tampered_tool_call_and_foreign_model() -> None:
+    first = responses_response(
+        {
+            "model": "gpt-5.5-2026-04-23",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [],
+                    "encrypted_content": "ciphertext-1",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                    "status": "completed",
+                },
+            ],
+        },
+        "gpt-5.5",
+    )
+    assistant = first.choices[0].message.model_dump(mode="json", exclude_none=True)
+    tampered = json.loads(json.dumps(assistant))
+    tampered["tool_calls"][0]["function"]["arguments"] = '{"path":"secrets"}'
+
+    with pytest.raises(ValueError, match="does not match its signed Responses snapshot"):
+        responses_request(
+            ChatRequest.model_validate({"messages": [tampered]}),
+            "gpt-5.5",
+            reasoning_effort="high",
+        )
+    with pytest.raises(ValueError, match="belongs to a different model"):
+        responses_request(
+            ChatRequest.model_validate({"messages": [assistant]}),
+            "gpt-5.4",
+            reasoning_effort="high",
+        )
 
 
 @pytest.mark.parametrize("status", [None, "queued", "in_progress", "cancelled", "unknown"])

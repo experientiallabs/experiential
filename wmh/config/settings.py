@@ -7,7 +7,8 @@ import uuid
 from pathlib import Path
 
 import tomli_w
-from pydantic import BaseModel, Field, ValidationError
+from llm_waterfall import ReasoningEffort
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmh.config.config import ARTIFACT_DIR
 
@@ -24,12 +25,15 @@ class TelemetrySettings(BaseModel):
 class ModelRole(BaseModel):
     """One named model role: which provider/model handles this class of work."""
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     provider: str  # a ProviderKind value ("bedrock", "azure", "openai", ...)
     model: str
     region: str | None = None  # AWS Bedrock region
     endpoint: str | None = None  # Azure OpenAI / custom base URL
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version (azure roles get a default)
+    reasoning_effort: ReasoningEffort | None = None
 
 
 class ModelsSettings(BaseModel):

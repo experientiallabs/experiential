@@ -163,3 +163,67 @@ def test_structured_chat_preserves_filtered_stops(
     )
 
     assert response.choices[0].finish_reason == "content_filter"
+
+
+def test_reasoning_backend_applies_adaptive_fields_on_both_completion_surfaces(
+    fake_boto3: list[_FakeSession],
+) -> None:
+    adapter = BedrockAdapter(
+        Backend("bedrock", "us.anthropic.claude-opus-4-6-v1", reasoning_effort="max")
+    )
+
+    adapter.complete(
+        "be precise",
+        [Message(role="user", content="hi")],
+        temperature=0.2,
+        max_tokens=64,
+    )
+    adapter.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.2,
+                "max_completion_tokens": 32,
+            }
+        )
+    )
+
+    calls = fake_boto3[0].made_client.calls
+    assert len(calls) == 2
+    assert all(
+        call["additionalModelRequestFields"]
+        == {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+        }
+        for call in calls
+    )
+    assert calls[0]["inferenceConfig"] == {"maxTokens": 64}
+    assert calls[1]["inferenceConfig"] == {"maxTokens": 32}
+
+
+def test_reasoning_backend_rejects_forced_tool_choice_before_client_creation(
+    fake_boto3: list[_FakeSession],
+) -> None:
+    adapter = BedrockAdapter(
+        Backend("bedrock", "us.anthropic.claude-opus-4-6-v1", reasoning_effort="max")
+    )
+    request = ChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {"type": "object"},
+                    }
+                }
+            ],
+            "tool_choice": "required",
+        }
+    )
+
+    with pytest.raises(ValueError, match="only auto or none"):
+        adapter.complete_chat(request)
+
+    assert fake_boto3 == []

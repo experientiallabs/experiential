@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, Self, runtime_checkable
 
-from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
-from pydantic import BaseModel, Field
+from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse, ReasoningEffort
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ProviderKind(StrEnum):
@@ -76,6 +76,8 @@ class ProviderConfig(BaseModel):
     backend knobs below override. The env var names are documented in `wmh.config`.
     """
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     kind: ProviderKind
     # Canonical, provider-independent identity. ``model`` remains the exact
     # provider runtime id for SDK calls and old persisted configs.
@@ -88,10 +90,34 @@ class ProviderConfig(BaseModel):
     region: str | None = None  # AWS Bedrock region
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
-    reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
+    reasoning_effort: ReasoningEffort | None = None
     # The serialized default stays stable for persisted configs. When callers do not explicitly
     # set this field, built-in models resolve it from the canonical ProviderModel catalog.
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
+
+    @model_validator(mode="after")
+    def _validate_reasoning_effort(self) -> Self:
+        """Reject settings that the selected provider and model cannot honor."""
+        if self.reasoning_effort is None:
+            return self
+        from wmh.providers.models import resolve_provider_model
+
+        resolved = resolve_provider_model(self.kind, self.model)
+        if self.model_type is not None:
+            declared = resolve_provider_model(self.kind, self.model_type)
+            if declared.model_type != resolved.model_type:
+                raise ValueError(
+                    f"model_type {self.model_type!r} does not match runtime model "
+                    f"{self.model!r} for reasoning configuration"
+                )
+        if self.reasoning_effort not in resolved.reasoning_efforts:
+            if self.reasoning_effort == "max":
+                raise ValueError("reasoning effort 'max' is supported only by Claude Opus 4.6")
+            raise ValueError(
+                f"{self.kind.value}/{resolved.model_type} does not support reasoning effort "
+                f"{self.reasoning_effort!r}"
+            )
+        return self
 
     def resolved_chat_max_tokens_field(self) -> ChatMaxTokensField:
         """Return the output-token field accepted by this configured model."""

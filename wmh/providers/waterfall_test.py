@@ -126,6 +126,17 @@ def test_to_backend_resolves_model_chat_parameters() -> None:
     assert backend.chat_max_tokens_field == "max_tokens"
 
 
+def test_to_backend_preserves_reasoning_effort() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model_type="claude-opus-4-6",
+        model="us.anthropic.claude-opus-4-6-v1",
+        reasoning_effort="max",
+    )
+
+    assert to_backend(config).reasoning_effort == "max"
+
+
 def test_to_backend_rejects_kinds_without_real_adapters() -> None:
     # openai_responses has no package equivalent (the package speaks chat-completions).
     with pytest.raises(ValueError, match="no llm-waterfall backend"):
@@ -303,6 +314,27 @@ def test_fallback_config_preserves_custom_token_field(tmp_path: Path) -> None:
     assert isinstance(provider, WaterfallProvider)
     assert isinstance(provider._waterfall, Waterfall)
     assert provider._waterfall.backends[0].chat_max_tokens_field == "max_tokens"
+
+
+def test_fallback_config_preserves_reasoning_effort(tmp_path: Path) -> None:
+    path = tmp_path / "fallback.toml"
+    path.write_text(
+        '[[chain.c]]\nkind = "bedrock"\nmodel = "us.anthropic.claude-opus-4-6-v1"\n'
+        'reasoning_effort = "max"\n'
+    )
+
+    provider = provider_or_chain(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model="us.anthropic.claude-opus-4-6-v1",
+            reasoning_effort="max",
+        ),
+        path=path,
+    )
+
+    assert isinstance(provider, WaterfallProvider)
+    assert isinstance(provider._waterfall, Waterfall)
+    assert provider._waterfall.backends[0].reasoning_effort == "max"
 
 
 def test_azure_rung_maps_endpoint_deployment_and_key(

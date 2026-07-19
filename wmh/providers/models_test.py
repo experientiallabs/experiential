@@ -1,5 +1,9 @@
 """Tests for canonical model types and provider runtime ids."""
 
+import pytest
+from llm_waterfall import ReasoningEffort
+from pydantic import ValidationError
+
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.models import model_types_for_provider, resolve_provider_model
 
@@ -26,6 +30,168 @@ def test_opus_4_6_resolves_to_exact_bedrock_inference_profile() -> None:
     assert direct.model_id == "claude-opus-4-6"
     assert bedrock.model_id == "us.anthropic.claude-opus-4-6-v1"
     assert bedrock_runtime_id == bedrock
+
+
+def test_bedrock_cross_region_profile_resolves_to_same_model_contract() -> None:
+    us = resolve_provider_model(ProviderKind.BEDROCK, "us.anthropic.claude-opus-4-6-v1")
+    global_profile = resolve_provider_model(
+        ProviderKind.BEDROCK, "global.anthropic.claude-opus-4-6-v1"
+    )
+
+    assert global_profile == us
+
+
+@pytest.mark.parametrize(
+    "runtime_id",
+    [
+        "au.anthropic.claude-opus-4-6-v1",
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+            "us.anthropic.claude-opus-4-6-v1"
+        ),
+        ("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-6-v1"),
+    ],
+)
+def test_bedrock_profile_and_foundation_arns_resolve_to_model_contract(
+    runtime_id: str,
+) -> None:
+    expected = resolve_provider_model(ProviderKind.BEDROCK, "us.anthropic.claude-opus-4-6-v1")
+
+    assert resolve_provider_model(ProviderKind.BEDROCK, runtime_id) == expected
+
+
+def test_bedrock_opus_4_6_accepts_and_serializes_max_reasoning_effort() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model_type="claude-opus-4-6",
+        model="us.anthropic.claude-opus-4-6-v1",
+        reasoning_effort="max",
+    )
+
+    assert config.reasoning_effort == "max"
+    assert config.model_dump(mode="json")["reasoning_effort"] == "max"
+    with pytest.raises(ValidationError, match="frozen"):
+        config.reasoning_effort = "low"
+
+
+@pytest.mark.parametrize(
+    ("model", "accepted", "rejected"),
+    [
+        ("gpt-5.5", ("none", "high", "xhigh"), ("minimal", "max")),
+        ("gpt-5.5-pro", ("medium", "high", "xhigh"), ("none", "low", "max")),
+        ("gpt-5.4", ("none", "high", "xhigh"), ("minimal", "max")),
+        ("gpt-5.4-mini", ("none", "high", "xhigh"), ("minimal", "max")),
+    ],
+)
+def test_openai_responses_effort_capabilities_match_model_contract(
+    model: str,
+    accepted: tuple[ReasoningEffort, ...],
+    rejected: tuple[ReasoningEffort, ...],
+) -> None:
+    for effort in accepted:
+        assert (
+            ProviderConfig(
+                kind=ProviderKind.OPENAI_RESPONSES,
+                model=model,
+                reasoning_effort=effort,
+            ).reasoning_effort
+            == effort
+        )
+    for effort in rejected:
+        with pytest.raises(ValidationError, match="does not support reasoning effort|Opus 4.6"):
+            ProviderConfig(
+                kind=ProviderKind.OPENAI_RESPONSES,
+                model=model,
+                reasoning_effort=effort,
+            )
+
+
+def test_openai_responses_pinned_snapshot_keeps_alias_capabilities() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.OPENAI_RESPONSES,
+        model_type="gpt-5.5",
+        model="gpt-5.5-2026-04-23",
+        reasoning_effort="high",
+    )
+
+    assert config.reasoning_effort == "high"
+    assert (
+        resolve_provider_model(ProviderKind.OPENAI_RESPONSES, "gpt-5.5-pro-2026-04-23").model_type
+        == "gpt-5.5-pro"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "model_type", "model", "effort", "message"),
+    [
+        (
+            ProviderKind.BEDROCK,
+            "claude-opus-4-7",
+            "us.anthropic.claude-opus-4-7",
+            "max",
+            "Claude Opus 4.6",
+        ),
+        (
+            ProviderKind.BEDROCK,
+            "claude-haiku-4-5",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "high",
+            "does not support reasoning effort",
+        ),
+        (
+            ProviderKind.OPENAI,
+            "gpt-5.5",
+            "gpt-5.5",
+            "high",
+            "does not support reasoning effort",
+        ),
+    ],
+)
+def test_provider_config_rejects_unsupported_reasoning_effort(
+    kind: ProviderKind,
+    model_type: str,
+    model: str,
+    effort: ReasoningEffort,
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ProviderConfig(
+            kind=kind,
+            model_type=model_type,
+            model=model,
+            reasoning_effort=effort,
+        )
+
+
+def test_provider_config_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError, match="reasoning_mode"):
+        ProviderConfig.model_validate(
+            {
+                "kind": "bedrock",
+                "model": "us.anthropic.claude-opus-4-6-v1",
+                "reasoning_mode": "adaptive",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "model"),
+    [
+        ("claude-opus-4-6", "us.anthropic.claude-sonnet-4-6"),
+        ("claude-sonnet-4-6", "us.anthropic.claude-opus-4-6-v1"),
+    ],
+)
+def test_reasoning_config_rejects_mismatched_model_identity_and_runtime(
+    model_type: str,
+    model: str,
+) -> None:
+    with pytest.raises(ValidationError, match="does not match runtime model"):
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type=model_type,
+            model=model,
+            reasoning_effort="high",
+        )
 
 
 def test_model_catalog_owns_temperature_compatibility() -> None:

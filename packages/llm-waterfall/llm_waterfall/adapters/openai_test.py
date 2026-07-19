@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from llm_waterfall.adapters.openai import OpenAIAdapter
-from llm_waterfall.types import Backend, Message
+from llm_waterfall.types import Backend, ChatRequest, Message, ToolCallingUnsupported
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -94,3 +94,34 @@ def test_embed_default_model_and_dimensions(fake_openai: list[_FakeOpenAI]) -> N
     assert call["dimensions"] == 256
     assert vectors == [[0.5, 0.5]]
     assert usage.input_tokens == 4
+
+
+def test_provider_bound_reasoning_rejected_before_openai_client_creation(
+    fake_openai: list[_FakeOpenAI],
+) -> None:
+    adapter = OpenAIAdapter(Backend("openai", "gpt-5.5"))
+    request = ChatRequest.model_validate(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+                    ],
+                    "reasoning_details": [
+                        {
+                            "type": "reasoning.encrypted",
+                            "id": "call-1",
+                            "data": "bedrock-envelope",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(ToolCallingUnsupported, match="originating backend"):
+        adapter.complete_chat(request)
+
+    assert fake_openai == []
