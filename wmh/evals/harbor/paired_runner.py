@@ -71,10 +71,19 @@ from wmh.evals.paired import (
     PairedBlock,
     PairedBlockOutcome,
     PairedEvaluationDesign,
+    PairedEvaluationDesignTemplate,
     PairedTaskPlan,
     analyze_paired_outcomes,
 )
-from wmh.evals.partition import ConfirmationPartition
+from wmh.evals.partition import (
+    BenchmarkPartitionManifest,
+    CandidateFreezeRecord,
+    ConfirmationPartition,
+    DiscoveryPartition,
+    PartitionControlStore,
+    freeze_confirmation_candidate,
+    open_confirmation_once,
+)
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner_backend import (
     E2BPiRunnerSpec,
@@ -98,7 +107,7 @@ from wmh.tracking.budget import (
     validate_timed_resource_class,
 )
 
-PAIRED_HARBOR_PROTOCOL_VERSION: Literal["7"] = "7"
+PAIRED_HARBOR_PROTOCOL_VERSION: Literal["8"] = "8"
 PAIRED_HARBOR_RUN_VERSION: Literal["8"] = "8"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
@@ -765,6 +774,275 @@ class PairedHarborArmRouteExpectation(BaseModel):
         return self
 
 
+class HarborConfirmationExecutionCommitment(BaseModel):
+    """Control-plane statistical and execution semantics frozen before confirmation opens.
+
+    This record includes the complete qualification roster and is therefore host-private, not a
+    proposer-safe view. The statistical template itself remains task-blind.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    commitment_version: Literal["1"] = "1"
+    discovery: DiscoveryPartition
+    partition_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    confirmation_commitment: str = Field(pattern=_DIGEST_PATTERN)
+    design_template: PairedEvaluationDesignTemplate
+    design_template_digest: str = Field(pattern=_DIGEST_PATTERN)
+    baseline_execution_hash: str = Field(min_length=1)
+    baseline_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
+    candidate_execution_hash: str = Field(min_length=1)
+    candidate_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
+    panel_routes: tuple[PairedHarborPanelRoute, ...]
+    execution_plan: HarborExecutionPlan
+    execution_plan_digest: str = Field(pattern=_DIGEST_PATTERN)
+    qualification_roster: PrequalifiedHarborRoster
+    qualification_roster_digest: str = Field(pattern=_DIGEST_PATTERN)
+    max_concurrent_blocks: StrictInt = Field(ge=1)
+    same_task_concurrency: Literal[1] = 1
+    retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    budget_ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
+    budget_binding_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator("max_concurrent_blocks", mode="before")
+    @classmethod
+    def _reject_boolean_global_cap(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("global concurrency cannot be boolean")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_commitment(self) -> Self:
+        if (
+            self.partition_manifest_digest != self.discovery.partition_manifest_digest
+            or self.confirmation_commitment != self.discovery.confirmation_commitment
+        ):
+            raise ValueError("pre-open commitment differs from its sealed partition view")
+        if self.design_template_digest != self.design_template.digest:
+            raise ValueError("pre-open commitment design template digest is inconsistent")
+        if self.execution_plan_digest != self.execution_plan.digest:
+            raise ValueError("pre-open commitment execution plan digest is inconsistent")
+        if self.qualification_roster_digest != self.qualification_roster.digest:
+            raise ValueError("pre-open commitment qualification roster digest is inconsistent")
+        if self.qualification_roster.execution_plan_digest != self.execution_plan.digest:
+            raise ValueError("pre-open qualification roster differs from its execution plan")
+        if self.baseline_execution_digest == self.candidate_execution_digest:
+            raise ValueError("pre-open baseline and candidate must differ")
+        routes = tuple(route.panel_member for route in self.panel_routes)
+        if len(routes) != len(set(routes)):
+            raise ValueError("pre-open commitment has duplicate routes")
+        if routes != self.design_template.panel_members:
+            raise ValueError("pre-open panel routes differ from the statistical design")
+        backend_mismatch = [
+            task.task_id
+            for task in self.qualification_roster.tasks
+            if task.environment_backend is not self.execution_plan.environment_backend
+        ]
+        if backend_mismatch:
+            raise ValueError(
+                f"pre-open full roster backend differs for task(s): {backend_mismatch}"
+            )
+        self._validate_discovery_roster()
+        return self
+
+    def _validate_discovery_roster(self) -> None:
+        roster_by_id = {task.task_id: task for task in self.qualification_roster.tasks}
+        ordered_discovery_ids = tuple(task.task_id for task in self.discovery.tasks)
+        if not ordered_discovery_ids or ordered_discovery_ids != tuple(
+            sorted(set(ordered_discovery_ids))
+        ):
+            raise ValueError("pre-open discovery tasks must be unique and canonical")
+        ordered_strata = tuple(item.stratum for item in self.discovery.confirmation_strata)
+        if not ordered_strata or ordered_strata != tuple(sorted(set(ordered_strata))):
+            raise ValueError("pre-open confirmation strata must be unique and canonical")
+        discovery_ids = set(ordered_discovery_ids)
+        missing = sorted(discovery_ids - set(roster_by_id))
+        if missing:
+            raise ValueError(f"pre-open roster lacks discovery task(s): {missing}")
+        content_mismatch = [
+            task.task_id
+            for task in self.discovery.tasks
+            if roster_by_id[task.task_id].content_digest != task.content_digest
+        ]
+        if content_mismatch:
+            raise ValueError(
+                f"pre-open discovery qualification content differs for task(s): {content_mismatch}"
+            )
+        confirmation_count = sum(item.count for item in self.discovery.confirmation_strata)
+        if confirmation_count < 1:
+            raise ValueError("pre-open commitment requires held-out confirmation tasks")
+        if len(self.qualification_roster.tasks) != len(self.discovery.tasks) + confirmation_count:
+            raise ValueError(
+                "pre-open qualification roster size differs from the sealed partition counts"
+            )
+
+    @property
+    def digest(self) -> str:
+        """Return the protocol identity consumed by candidate freeze and opening."""
+        return _canonical_digest(self.model_dump(mode="json"))
+
+    @classmethod
+    def freeze(
+        cls,
+        *,
+        discovery: DiscoveryPartition,
+        design_template: PairedEvaluationDesignTemplate,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+        execution_plan: HarborExecutionPlan,
+        panel_routes: tuple[PairedHarborPanelRoute, ...],
+        qualification_roster: PrequalifiedHarborRoster,
+        max_concurrent_blocks: int,
+        retry_policy_digest: str,
+        budget_policy_digest: str,
+        budget_ledger_identity: str,
+        budget_binding_digest: str,
+    ) -> HarborConfirmationExecutionCommitment:
+        """Freeze every held-out execution choice before identities open to the optimizer."""
+        frozen_discovery = DiscoveryPartition.model_validate(discovery.model_dump())
+        frozen_template = PairedEvaluationDesignTemplate.model_validate(
+            design_template.model_dump()
+        )
+        frozen_plan = HarborExecutionPlan.model_validate(execution_plan.model_dump())
+        frozen_roster = PrequalifiedHarborRoster.model_validate(qualification_roster.model_dump())
+        routes = tuple(
+            sorted(
+                (
+                    PairedHarborPanelRoute.model_validate(route.model_dump())
+                    for route in panel_routes
+                ),
+                key=lambda route: route.panel_member,
+            )
+        )
+        baseline_envelope = harbor_agent_compute_envelope(
+            baseline,
+            turn_timeout_s=frozen_plan.turn_timeout_s,
+        )
+        candidate_envelope = harbor_agent_compute_envelope(
+            candidate,
+            turn_timeout_s=frozen_plan.turn_timeout_s,
+        )
+        if (
+            baseline_envelope != frozen_plan.compute_envelope
+            or candidate_envelope != frozen_plan.compute_envelope
+        ):
+            raise ValueError(
+                "pre-open Harbor arm changes the declared agent compute envelope; only harness "
+                "source may differ"
+            )
+        return cls(
+            discovery=frozen_discovery,
+            partition_manifest_digest=frozen_discovery.partition_manifest_digest,
+            confirmation_commitment=frozen_discovery.confirmation_commitment,
+            design_template=frozen_template,
+            design_template_digest=frozen_template.digest,
+            baseline_execution_hash=baseline.execution_hash,
+            baseline_execution_digest=baseline.execution_digest,
+            candidate_execution_hash=candidate.execution_hash,
+            candidate_execution_digest=candidate.execution_digest,
+            panel_routes=routes,
+            execution_plan=frozen_plan,
+            execution_plan_digest=frozen_plan.digest,
+            qualification_roster=frozen_roster,
+            qualification_roster_digest=frozen_roster.digest,
+            max_concurrent_blocks=max_concurrent_blocks,
+            retry_policy_digest=retry_policy_digest,
+            budget_policy_digest=budget_policy_digest,
+            budget_ledger_identity=budget_ledger_identity,
+            budget_binding_digest=budget_binding_digest,
+        )
+
+    def derive_design(self, confirmation: ConfirmationPartition) -> PairedEvaluationDesign:
+        """Validate the opening and deterministically bind its task IDs into the design."""
+        frozen = ConfirmationPartition.model_validate(confirmation.model_dump())
+        if (
+            frozen.partition_manifest_digest != self.partition_manifest_digest
+            or frozen.confirmation_commitment != self.confirmation_commitment
+            or frozen.candidate_execution_digest != self.candidate_execution_digest
+            or frozen.confirmation_protocol_digest != self.digest
+        ):
+            raise ValueError("confirmation opening differs from the pre-open commitment")
+        task_ids = tuple(task.task_id for task in frozen.tasks)
+        design = self.design_template.derive(task_ids=task_ids)
+        roster_by_id = {task.task_id: task for task in self.qualification_roster.tasks}
+        expected_ids = set(roster_by_id) - {task.task_id for task in self.discovery.tasks}
+        if set(task_ids) != expected_ids:
+            raise ValueError("opened confirmation tasks differ from the pre-open full roster")
+        confirmation_by_id = {task.task_id: task for task in frozen.tasks}
+        content_mismatch = [
+            task_id
+            for task_id in design.task_ids
+            if roster_by_id[task_id].content_digest != confirmation_by_id[task_id].content_digest
+        ]
+        if content_mismatch:
+            raise ValueError(
+                f"opened confirmation qualification content differs for task(s): {content_mismatch}"
+            )
+        return design
+
+    def derive_selection(
+        self,
+        confirmation: ConfirmationPartition,
+    ) -> OpenedHarborExecutionSelection:
+        """Project the only task selection admitted by this pre-open commitment."""
+        design = self.derive_design(confirmation)
+        return OpenedHarborExecutionSelection.project(
+            execution_plan=self.execution_plan,
+            roster=self.qualification_roster,
+            confirmation=confirmation,
+            design=design,
+        )
+
+
+def freeze_harbor_confirmation_candidate(
+    control_store: PartitionControlStore,
+    *,
+    manifest: BenchmarkPartitionManifest,
+    commitment: HarborConfirmationExecutionCommitment,
+) -> CandidateFreezeRecord:
+    """Freeze a candidate using the typed Harbor execution commitment as protocol identity."""
+    frozen = HarborConfirmationExecutionCommitment.model_validate(commitment.model_dump())
+    if (
+        manifest.digest != frozen.partition_manifest_digest
+        or manifest.confirmation_commitment != frozen.confirmation_commitment
+        or manifest.discovery_view() != frozen.discovery
+    ):
+        raise ValueError("partition manifest differs from the pre-open Harbor commitment")
+    record = freeze_confirmation_candidate(
+        control_store,
+        manifest=manifest,
+        candidate_execution_digest=frozen.candidate_execution_digest,
+        confirmation_protocol_digest=frozen.digest,
+    )
+    if record.confirmation_protocol_digest != frozen.digest:
+        raise ValueError("candidate freeze omitted the pre-open Harbor commitment")
+    return record
+
+
+def open_harbor_confirmation_once(
+    control_store: PartitionControlStore,
+    *,
+    manifest: BenchmarkPartitionManifest,
+    commitment: HarborConfirmationExecutionCommitment,
+) -> ConfirmationPartition:
+    """Open held-out identities only under the already-frozen typed commitment."""
+    frozen = HarborConfirmationExecutionCommitment.model_validate(commitment.model_dump())
+    if (
+        manifest.digest != frozen.partition_manifest_digest
+        or manifest.confirmation_commitment != frozen.confirmation_commitment
+        or manifest.discovery_view() != frozen.discovery
+    ):
+        raise ValueError("partition manifest differs from the pre-open Harbor commitment")
+    confirmation = open_confirmation_once(
+        control_store,
+        manifest=manifest,
+        confirmation_protocol_digest=frozen.digest,
+    )
+    frozen.derive_design(confirmation)
+    return confirmation
+
+
 class PairedHarborProtocol(BaseModel):
     """Frozen, benchmark-neutral inputs for one paired Harbor experiment.
 
@@ -776,7 +1054,9 @@ class PairedHarborProtocol(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    protocol_version: Literal["7"] = PAIRED_HARBOR_PROTOCOL_VERSION
+    protocol_version: Literal["8"] = PAIRED_HARBOR_PROTOCOL_VERSION
+    preopen_commitment: HarborConfirmationExecutionCommitment
+    preopen_commitment_digest: str = Field(pattern=_DIGEST_PATTERN)
     design: PairedEvaluationDesign
     design_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation: ConfirmationPartition
@@ -809,6 +1089,31 @@ class PairedHarborProtocol(BaseModel):
 
     @model_validator(mode="after")
     def _validate_protocol(self) -> Self:
+        if self.preopen_commitment_digest != self.preopen_commitment.digest:
+            raise ValueError("paired Harbor pre-open commitment digest is inconsistent")
+        expected_design = self.preopen_commitment.derive_design(self.confirmation)
+        if self.design != expected_design:
+            raise ValueError("paired Harbor design drifted from the pre-open commitment")
+        expected_selection = self.preopen_commitment.derive_selection(self.confirmation)
+        if self.opened_selection != expected_selection:
+            raise ValueError("paired Harbor selection drifted from the pre-open commitment")
+        commitment = self.preopen_commitment
+        if (
+            self.baseline_execution_hash != commitment.baseline_execution_hash
+            or self.baseline_execution_digest != commitment.baseline_execution_digest
+            or self.candidate_execution_hash != commitment.candidate_execution_hash
+            or self.candidate_execution_digest != commitment.candidate_execution_digest
+            or self.panel_routes != commitment.panel_routes
+            or self.execution_plan != commitment.execution_plan
+            or self.qualification_roster != commitment.qualification_roster
+            or self.max_concurrent_blocks != commitment.max_concurrent_blocks
+            or self.same_task_concurrency != commitment.same_task_concurrency
+            or self.retry_policy_digest != commitment.retry_policy_digest
+            or self.budget_policy_digest != commitment.budget_policy_digest
+            or self.budget_ledger_identity != commitment.budget_ledger_identity
+            or self.budget_binding_digest != commitment.budget_binding_digest
+        ):
+            raise ValueError("paired Harbor execution semantics drifted after pre-open commitment")
         if self.design_digest != self.design.digest:
             raise ValueError("paired Harbor protocol design digest differs from its design")
         if self.confirmation_protocol_digest != _confirmation_protocol_digest(self.confirmation):
@@ -823,13 +1128,13 @@ class PairedHarborProtocol(BaseModel):
             raise ValueError("paired Harbor qualification roster digest is inconsistent")
         if self.opened_selection_digest != self.opened_selection.digest:
             raise ValueError("paired Harbor opened selection digest is inconsistent")
-        expected_selection = OpenedHarborExecutionSelection.project(
+        projected_selection = OpenedHarborExecutionSelection.project(
             execution_plan=self.execution_plan,
             roster=self.qualification_roster,
             confirmation=self.confirmation,
             design=self.design,
         )
-        if self.opened_selection != expected_selection:
+        if self.opened_selection != projected_selection:
             raise ValueError(
                 "paired Harbor selection is not the deterministic full-roster projection"
             )
@@ -910,6 +1215,7 @@ class PairedHarborProtocol(BaseModel):
     def freeze(
         cls,
         *,
+        preopen_commitment: HarborConfirmationExecutionCommitment,
         design: PairedEvaluationDesign,
         confirmation: ConfirmationPartition,
         baseline: HarnessDoc,
@@ -932,6 +1238,9 @@ class PairedHarborProtocol(BaseModel):
         ):
             raise ValueError("max_concurrent_blocks must be a positive integer")
 
+        frozen_commitment = HarborConfirmationExecutionCommitment.model_validate(
+            preopen_commitment.model_dump()
+        )
         frozen_design = PairedEvaluationDesign.model_validate(design.model_dump())
         frozen_confirmation = ConfirmationPartition.model_validate(confirmation.model_dump())
         frozen_plan = HarborExecutionPlan.model_validate(execution_plan.model_dump())
@@ -939,6 +1248,8 @@ class PairedHarborProtocol(BaseModel):
         frozen_selection = OpenedHarborExecutionSelection.model_validate(
             opened_selection.model_dump()
         )
+        if frozen_design != frozen_commitment.derive_design(frozen_confirmation):
+            raise ValueError("paired Harbor design drifted from the pre-open commitment")
         expected_selection = OpenedHarborExecutionSelection.project(
             execution_plan=frozen_plan,
             roster=frozen_roster,
@@ -949,6 +1260,8 @@ class PairedHarborProtocol(BaseModel):
             raise ValueError(
                 "opened Harbor execution selection differs from the deterministic projection"
             )
+        if frozen_selection != frozen_commitment.derive_selection(frozen_confirmation):
+            raise ValueError("paired Harbor selection drifted from the pre-open commitment")
         routes = tuple(
             sorted(
                 (
@@ -1004,6 +1317,8 @@ class PairedHarborProtocol(BaseModel):
                     )
                 )
         return cls(
+            preopen_commitment=frozen_commitment,
+            preopen_commitment_digest=frozen_commitment.digest,
             design=frozen_design,
             design_digest=frozen_design.digest,
             confirmation=frozen_confirmation,
@@ -1622,6 +1937,7 @@ class PairedHarborRunner:
     ) -> PairedHarborRunReport:
         """Execute the exact frozen matrix; any non-admissible block invalidates the report."""
         reconstructed = PairedHarborProtocol.freeze(
+            preopen_commitment=self._protocol.preopen_commitment,
             design=self._protocol.design,
             confirmation=self._protocol.confirmation,
             baseline=baseline,

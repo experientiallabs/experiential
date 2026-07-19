@@ -38,10 +38,21 @@ from wmh.evals.paired import (
     BoundedMeanBet,
     PairedArm,
     PairedEvaluationDesign,
+    PairedEvaluationDesignTemplate,
     PairedPanelPlan,
     PairedTaskPlan,
 )
-from wmh.evals.partition import ConfirmationPartition, PartitionTask
+from wmh.evals.partition import (
+    BenchmarkPartitionManifest,
+    ConfirmationPartition,
+    DiscoveryPartition,
+    DiscoveryTask,
+    PartitionControlScope,
+    PartitionControlStore,
+    PartitionTask,
+    StratumCount,
+    initialize_partition_genesis,
+)
 from wmh.harness.doc import HarnessDoc, Surface
 from wmh.harness.pi_runner import pi_node_baseline
 from wmh.harness.pi_runner_backend import (
@@ -62,17 +73,21 @@ from wmh.tracking.budget import (
 )
 
 _TASK_IDS = ("task-a", "task-b")
+_FULL_TASK_IDS = (*_TASK_IDS, "task-discovery")
 _TASK_KEYS = {
     "task-a": "sha256:" + "a" * 64,
     "task-b": "sha256:" + "b" * 64,
+    "task-discovery": "sha256:" + "1" * 64,
 }
 _CONTENT_DIGESTS = {
     "task-a": "sha256:" + "c" * 64,
     "task-b": "sha256:" + "d" * 64,
+    "task-discovery": "sha256:" + "2" * 64,
 }
 _ENVIRONMENT_DIGESTS = {
     "task-a": "sha256:" + "e" * 64,
     "task-b": "sha256:" + "f" * 64,
+    "task-discovery": "sha256:" + "1" * 64,
 }
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RETRY_POLICY_DIGEST = "sha256:" + "5" * 64
@@ -111,12 +126,16 @@ def _design() -> PairedEvaluationDesign:
     )
 
 
-def _confirmation(candidate: HarnessDoc) -> ConfirmationPartition:
+def _confirmation(
+    candidate: HarnessDoc,
+    *,
+    confirmation_protocol_digest: str = "sha256:" + "7" * 64,
+) -> ConfirmationPartition:
     return ConfirmationPartition(
         partition_version="2",
         partition_manifest_digest="sha256:" + "3" * 64,
         candidate_execution_digest=candidate.execution_digest,
-        confirmation_protocol_digest="sha256:" + "7" * 64,
+        confirmation_protocol_digest=confirmation_protocol_digest,
         tasks=tuple(
             PartitionTask(
                 task_id=task_id,
@@ -129,6 +148,21 @@ def _confirmation(candidate: HarnessDoc) -> ConfirmationPartition:
         confirmation_commitment="sha256:" + "4" * 64,
         candidate_freeze_digest="sha256:" + "8" * 64,
         opening_record_digest="sha256:" + "9" * 64,
+    )
+
+
+def _discovery() -> DiscoveryPartition:
+    return DiscoveryPartition(
+        partition_version="1",
+        partition_manifest_digest="sha256:" + "3" * 64,
+        tasks=(
+            DiscoveryTask(
+                task_id="task-discovery",
+                content_digest=_CONTENT_DIGESTS["task-discovery"],
+            ),
+        ),
+        confirmation_strata=(StratumCount(stratum="held-out", count=2),),
+        confirmation_commitment="sha256:" + "4" * 64,
     )
 
 
@@ -222,7 +256,7 @@ def _qualifications() -> tuple[mod.QualifiedHarborTask, ...]:
             task_environment_digest=_ENVIRONMENT_DIGESTS[task_id],
             environment_backend=HarborEnvironmentBackend.LOCAL,
         )
-        for task_id in _TASK_IDS
+        for task_id in _FULL_TASK_IDS
     )
 
 
@@ -299,6 +333,170 @@ def test_confirmation_selection_is_a_deterministic_projection_of_full_roster() -
             roster=roster,
             confirmation=changed_confirmation,
             design=_design(),
+        )
+
+
+def test_preopen_commitment_derives_exact_design_and_selection_after_open(
+    tmp_path: Path,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    routes = (
+        mod.PairedHarborPanelRoute(
+            panel_member="worker",
+            provider_config=_provider(),
+            max_concurrent_blocks=2,
+        ),
+    )
+    plan = mod.HarborExecutionPlan.freeze(reference_harness=baseline, reward_key="reward")
+    roster = mod.PrequalifiedHarborRoster(
+        execution_plan_digest=plan.digest,
+        tasks=_qualifications(),
+    )
+    budget = _budget_runtime(tmp_path, routes)
+    commitment = mod.HarborConfirmationExecutionCommitment.freeze(
+        discovery=_discovery(),
+        design_template=PairedEvaluationDesignTemplate.from_design(_design()),
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=plan,
+        panel_routes=routes,
+        qualification_roster=roster,
+        max_concurrent_blocks=4,
+        retry_policy_digest=_RETRY_POLICY_DIGEST,
+        budget_policy_digest=budget.policy.policy_digest,
+        budget_ledger_identity=budget.ledger_identity,
+        budget_binding_digest=budget.binding_digest,
+    )
+    confirmation = _confirmation(
+        candidate,
+        confirmation_protocol_digest=commitment.digest,
+    )
+
+    design = commitment.derive_design(confirmation)
+    selection = commitment.derive_selection(confirmation)
+
+    assert design == _design()
+    assert selection.design_digest == design.digest
+    assert selection.task_ids == _TASK_IDS
+    assert commitment.partition_manifest_digest == confirmation.partition_manifest_digest
+    assert commitment.qualification_roster_digest == roster.digest
+
+    drifted_design = PairedEvaluationDesign.create(
+        task_ids=_TASK_IDS,
+        panel=_design().panel,
+        bounded_mean_bets=_design().bounded_mean_bets,
+        schedule_seed=_design().schedule_seed,
+        analysis_seed="drifted-after-open",
+        randomization_samples=_design().randomization_samples,
+        alpha=_design().alpha,
+        minimum_panel_delta=_design().minimum_panel_delta,
+        minimum_member_delta=_design().minimum_member_delta,
+        noninferiority_margin=_design().noninferiority_margin,
+    )
+    with pytest.raises(ValueError, match="design drifted from the pre-open commitment"):
+        mod.PairedHarborProtocol.freeze(
+            preopen_commitment=commitment,
+            design=drifted_design,
+            confirmation=confirmation,
+            baseline=baseline,
+            candidate=candidate,
+            execution_plan=plan,
+            panel_routes=routes,
+            qualification_roster=roster,
+            opened_selection=selection,
+            max_concurrent_blocks=4,
+            retry_policy_digest=_RETRY_POLICY_DIGEST,
+            budget_policy_digest=budget.policy.policy_digest,
+            budget_ledger_identity=budget.ledger_identity,
+            budget_binding_digest=budget.binding_digest,
+        )
+    with pytest.raises(ValueError, match="differs from the pre-open commitment"):
+        commitment.derive_design(_confirmation(candidate))
+
+
+def test_typed_commitment_digest_controls_candidate_freeze_and_one_shot_open(
+    tmp_path: Path,
+) -> None:
+    control_dir = tmp_path / "partition-control"
+    control_dir.mkdir(mode=0o700)
+    control_dir.chmod(0o700)
+    store = PartitionControlStore(control_dir)
+    partition_tasks = tuple(
+        PartitionTask(
+            task_id=task_id,
+            stratum="discovery-only" if task_id == "task-discovery" else "held-out",
+            group_id=task_id,
+            content_digest=_CONTENT_DIGESTS[task_id],
+        )
+        for task_id in _FULL_TASK_IDS
+    )
+    counts = {"discovery-only": 1, "held-out": 0}
+    genesis = initialize_partition_genesis(
+        store,
+        scope=PartitionControlScope(
+            experiment_id="paired-test",
+            protocol_id="typed-preopen-v1",
+        ),
+        tasks=partition_tasks,
+        discovery_counts=counts,
+    )
+    manifest = BenchmarkPartitionManifest.create(
+        tasks=partition_tasks,
+        discovery_counts=counts,
+        genesis=genesis,
+    )
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    routes = (
+        mod.PairedHarborPanelRoute(
+            panel_member="worker",
+            provider_config=_provider(),
+        ),
+    )
+    plan = mod.HarborExecutionPlan.freeze(reference_harness=baseline, reward_key="reward")
+    roster = mod.PrequalifiedHarborRoster(
+        execution_plan_digest=plan.digest,
+        tasks=_qualifications(),
+    )
+    budget = _budget_runtime(tmp_path, routes)
+    commitment = mod.HarborConfirmationExecutionCommitment.freeze(
+        discovery=manifest.discovery_view(),
+        design_template=PairedEvaluationDesignTemplate.from_design(_design()),
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=plan,
+        panel_routes=routes,
+        qualification_roster=roster,
+        max_concurrent_blocks=1,
+        retry_policy_digest=_RETRY_POLICY_DIGEST,
+        budget_policy_digest=budget.policy.policy_digest,
+        budget_ledger_identity=budget.ledger_identity,
+        budget_binding_digest=budget.binding_digest,
+    )
+
+    freeze = mod.freeze_harbor_confirmation_candidate(
+        store,
+        manifest=manifest,
+        commitment=commitment,
+    )
+    opened = mod.open_harbor_confirmation_once(
+        store,
+        manifest=manifest,
+        commitment=commitment,
+    )
+
+    assert freeze.confirmation_protocol_digest == commitment.digest
+    assert opened.confirmation_protocol_digest == commitment.digest
+    assert tuple(task.task_id for task in opened.tasks) == _TASK_IDS
+    assert commitment.derive_design(opened) == _design()
+
+    drifted = commitment.model_copy(update={"budget_binding_digest": "sha256:" + "f" * 64})
+    with pytest.raises(ValueError, match="already frozen"):
+        mod.freeze_harbor_confirmation_candidate(
+            store,
+            manifest=manifest,
+            commitment=drifted,
         )
 
 
@@ -388,6 +586,33 @@ def _budget_runtime(
     )
 
 
+def _preopen_commitment(
+    *,
+    baseline: HarnessDoc,
+    candidate: HarnessDoc,
+    design: PairedEvaluationDesign,
+    plan: mod.HarborExecutionPlan,
+    routes: tuple[mod.PairedHarborPanelRoute, ...],
+    roster: mod.PrequalifiedHarborRoster,
+    max_concurrent_blocks: int,
+    budget: mod.PairedHarborBudgetRuntime,
+) -> mod.HarborConfirmationExecutionCommitment:
+    return mod.HarborConfirmationExecutionCommitment.freeze(
+        discovery=_discovery(),
+        design_template=PairedEvaluationDesignTemplate.from_design(design),
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=plan,
+        panel_routes=routes,
+        qualification_roster=roster,
+        max_concurrent_blocks=max_concurrent_blocks,
+        retry_policy_digest=_RETRY_POLICY_DIGEST,
+        budget_policy_digest=budget.policy.policy_digest,
+        budget_ledger_identity=budget.ledger_identity,
+        budget_binding_digest=budget.binding_digest,
+    )
+
+
 def _e2b_runner_spec() -> E2BPiRunnerSpec:
     return E2BPiRunnerSpec(
         template_id="runner-template",
@@ -439,7 +664,7 @@ def _e2b_qualifications() -> tuple[mod.QualifiedHarborTask, ...]:
             e2b_build_identity=build,
             task_resource_class=task_class,
         )
-        for task_id in _TASK_IDS
+        for task_id in _FULL_TASK_IDS
     )
 
 
@@ -530,12 +755,6 @@ def _e2b_runner(
         execution_plan_digest=plan.digest,
         tasks=roster_tasks,
     )
-    selection = mod.OpenedHarborExecutionSelection.project(
-        execution_plan=plan,
-        roster=roster,
-        confirmation=_confirmation(candidate),
-        design=_design(),
-    )
     task_classes = tuple(
         {
             task.task_resource_class.digest: task.task_resource_class
@@ -549,9 +768,25 @@ def _e2b_runner(
         runner_spec,
         task_classes=task_classes,
     )
-    protocol = mod.PairedHarborProtocol.freeze(
+    commitment = _preopen_commitment(
+        baseline=baseline,
+        candidate=candidate,
         design=_design(),
-        confirmation=_confirmation(candidate),
+        plan=plan,
+        routes=routes,
+        roster=roster,
+        max_concurrent_blocks=1,
+        budget=budget,
+    )
+    confirmation = _confirmation(
+        candidate,
+        confirmation_protocol_digest=commitment.digest,
+    )
+    selection = commitment.derive_selection(confirmation)
+    protocol = mod.PairedHarborProtocol.freeze(
+        preopen_commitment=commitment,
+        design=_design(),
+        confirmation=confirmation,
         baseline=baseline,
         candidate=candidate,
         execution_plan=plan,
@@ -596,9 +831,9 @@ def _runner(
         ),
     )
     design = cast("PairedEvaluationDesign", updates.pop("design", _design()))
-    confirmation = cast(
-        "ConfirmationPartition",
-        updates.pop("confirmation", _confirmation(candidate)),
+    provided_confirmation = cast(
+        "ConfirmationPartition | None",
+        updates.pop("confirmation", None),
     )
     job_spec = cast("HarborJobSpec", updates.pop("job_spec", _spec(tmp_path)))
     routes = cast(
@@ -622,14 +857,32 @@ def _runner(
         execution_plan_digest=plan.digest,
         tasks=tuple(sorted(qualifications, key=lambda item: item.task_id)),
     )
+    budget_runtime = _budget_runtime(tmp_path, routes)
+    commitment = _preopen_commitment(
+        baseline=baseline,
+        candidate=candidate,
+        design=design,
+        plan=plan,
+        routes=routes,
+        roster=roster,
+        max_concurrent_blocks=max_concurrent_blocks,
+        budget=budget_runtime,
+    )
+    confirmation = (
+        _confirmation(candidate, confirmation_protocol_digest=commitment.digest)
+        if provided_confirmation is None
+        else provided_confirmation.model_copy(
+            update={"confirmation_protocol_digest": commitment.digest}
+        )
+    )
     selection = mod.OpenedHarborExecutionSelection.project(
         execution_plan=plan,
         roster=roster,
         confirmation=confirmation,
         design=design,
     )
-    budget_runtime = _budget_runtime(tmp_path, routes)
     protocol = mod.PairedHarborProtocol.freeze(
+        preopen_commitment=commitment,
         design=design,
         confirmation=confirmation,
         baseline=baseline,
@@ -836,7 +1089,7 @@ def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
     assert len(calls) == 2 * len(design.blocks)
     assert len(report.evidence) == len(design.blocks)
     assert report.run_version == "8"
-    assert report.protocol.protocol_version == "7"
+    assert report.protocol.protocol_version == "8"
     assert report.protocol.design_digest == design.digest
     assert report.protocol.baseline_execution_digest == baseline.execution_digest
     assert report.protocol.candidate_execution_digest == candidate.execution_digest
@@ -1070,18 +1323,37 @@ def test_protocol_digest_binds_budget_authority_and_nonsecret_execution_inputs(
     assert first.digest != second.digest
 
     changed_route = first.panel_routes[0].model_copy(update={"max_concurrent_blocks": 1})
-    changed = mod.PairedHarborProtocol.freeze(
-        design=_design(),
-        confirmation=_confirmation(candidate),
+    changed_commitment = mod.HarborConfirmationExecutionCommitment.freeze(
+        discovery=_discovery(),
+        design_template=PairedEvaluationDesignTemplate.from_design(_design()),
         baseline=baseline,
         candidate=candidate,
         execution_plan=first.execution_plan,
         panel_routes=(changed_route,),
         qualification_roster=first.qualification_roster,
-        opened_selection=first.opened_selection,
         max_concurrent_blocks=4,
         retry_policy_digest=_RETRY_POLICY_DIGEST,
-        budget_policy_digest=_BUDGET_POLICY_DIGEST,
+        budget_policy_digest=first.budget_policy_digest,
+        budget_ledger_identity=first.budget_ledger_identity,
+        budget_binding_digest=first.budget_binding_digest,
+    )
+    changed_confirmation = _confirmation(
+        candidate,
+        confirmation_protocol_digest=changed_commitment.digest,
+    )
+    changed = mod.PairedHarborProtocol.freeze(
+        preopen_commitment=changed_commitment,
+        design=_design(),
+        confirmation=changed_confirmation,
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=first.execution_plan,
+        panel_routes=(changed_route,),
+        qualification_roster=first.qualification_roster,
+        opened_selection=changed_commitment.derive_selection(changed_confirmation),
+        max_concurrent_blocks=4,
+        retry_policy_digest=_RETRY_POLICY_DIGEST,
+        budget_policy_digest=first.budget_policy_digest,
         budget_ledger_identity=first.budget_ledger_identity,
         budget_binding_digest=first.budget_binding_digest,
     )
@@ -1122,7 +1394,7 @@ def test_runner_rejects_protocol_ledger_fork_before_evaluator_construction(
     runner = _runner(tmp_path, candidate)
     forked = runner._protocol.model_copy(update={"budget_ledger_identity": "sha256:" + "f" * 64})
 
-    with pytest.raises(ValueError, match="frozen ledger identity"):
+    with pytest.raises(ValueError, match="pre-open commitment|frozen ledger identity"):
         mod.PairedHarborRunner(
             protocol=forked,
             runtime=runner._runtime,
@@ -1139,7 +1411,7 @@ def test_e2b_execution_requires_prequalified_e2b_tasks(tmp_path: Path) -> None:
 
 
 def test_e2b_budget_bindings_cover_full_prequalified_roster(tmp_path: Path) -> None:
-    selected = _e2b_qualifications()
+    selected = tuple(task for task in _e2b_qualifications() if task.task_id in _TASK_IDS)
     discovery_class = ExactE2BEnvironment._task_resource_class(
         cpu_count=4,
         memory_mb=2048,
@@ -1164,11 +1436,11 @@ def test_e2b_budget_bindings_cover_full_prequalified_roster(tmp_path: Path) -> N
     )
     full_roster = selected + (
         mod.QualifiedHarborTask(
-            task_id="task-discovery-only",
+            task_id="task-discovery",
             dataset_id="terminalbench2",
-            content_digest="sha256:" + "1" * 64,
-            task_key="sha256:" + "2" * 64,
-            task_environment_digest="sha256:" + "3" * 64,
+            content_digest=_CONTENT_DIGESTS["task-discovery"],
+            task_key=_TASK_KEYS["task-discovery"],
+            task_environment_digest=_ENVIRONMENT_DIGESTS["task-discovery"],
             environment_backend=HarborEnvironmentBackend.E2B,
             e2b_launch_config_digest="sha256:" + "6" * 64,
             e2b_build_config_digest=discovery_build.build_config_digest,

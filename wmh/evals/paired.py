@@ -274,6 +274,85 @@ class PairedEvaluationDesign(BaseModel):
         return self
 
 
+class PairedEvaluationDesignTemplate(BaseModel):
+    """Task-blind statistical inputs that deterministically open into a paired design."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    template_version: Literal["1"] = "1"
+    analysis_version: Literal["2"] = PAIRED_ANALYSIS_VERSION
+    panel: tuple[PairedPanelPlan, ...]
+    bounded_mean_bets: tuple[BoundedMeanBet, ...]
+    schedule_seed: str = Field(min_length=1)
+    analysis_seed: str = Field(min_length=1)
+    randomization_samples: StrictInt = Field(ge=999)
+    alpha: float = Field(default=0.05, gt=0.0, lt=1.0, allow_inf_nan=False)
+    minimum_panel_delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+    minimum_member_delta: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+    noninferiority_margin: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _validate_task_blind_inputs(self) -> Self:
+        derived = self.derive(task_ids=("wmh-template-validation-task",))
+        if (
+            derived.panel != self.panel
+            or derived.bounded_mean_bets != self.bounded_mean_bets
+            or derived.schedule_seed != self.schedule_seed
+            or derived.analysis_seed != self.analysis_seed
+            or derived.randomization_samples != self.randomization_samples
+            or derived.alpha != self.alpha
+            or derived.minimum_panel_delta != self.minimum_panel_delta
+            or derived.minimum_member_delta != self.minimum_member_delta
+            or derived.noninferiority_margin != self.noninferiority_margin
+        ):
+            raise ValueError("paired design template is not canonical")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return the task-blind design-input identity."""
+        return _canonical_digest(self.model_dump(mode="json"))
+
+    @property
+    def panel_members(self) -> tuple[str, ...]:
+        """Return the predeclared canonical panel identities."""
+        return tuple(plan.panel_member for plan in self.panel)
+
+    @classmethod
+    def from_design(
+        cls,
+        design: PairedEvaluationDesign,
+    ) -> PairedEvaluationDesignTemplate:
+        """Project a complete design onto only the inputs knowable before task opening."""
+        frozen = PairedEvaluationDesign.model_validate(design.model_dump())
+        return cls(
+            panel=frozen.panel,
+            bounded_mean_bets=frozen.bounded_mean_bets,
+            schedule_seed=frozen.schedule_seed,
+            analysis_seed=frozen.analysis_seed,
+            randomization_samples=frozen.randomization_samples,
+            alpha=frozen.alpha,
+            minimum_panel_delta=frozen.minimum_panel_delta,
+            minimum_member_delta=frozen.minimum_member_delta,
+            noninferiority_margin=frozen.noninferiority_margin,
+        )
+
+    def derive(self, *, task_ids: tuple[str, ...]) -> PairedEvaluationDesign:
+        """Derive the sole complete design admitted after held-out task IDs open."""
+        return PairedEvaluationDesign.create(
+            task_ids=task_ids,
+            panel=self.panel,
+            bounded_mean_bets=self.bounded_mean_bets,
+            schedule_seed=self.schedule_seed,
+            analysis_seed=self.analysis_seed,
+            randomization_samples=self.randomization_samples,
+            alpha=self.alpha,
+            minimum_panel_delta=self.minimum_panel_delta,
+            minimum_member_delta=self.minimum_member_delta,
+            noninferiority_margin=self.noninferiority_margin,
+        )
+
+
 class PairedBlockOutcome(BaseModel):
     """Admitted binary outcomes for both arms of one fresh-sandbox block."""
 
