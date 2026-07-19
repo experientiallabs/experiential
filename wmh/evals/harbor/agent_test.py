@@ -310,7 +310,7 @@ def test_tool_output_is_bounded_before_emission_and_structurally_at_exec() -> No
         assert outcome.truncated is True
         assert len(outcome.content) <= mod._TOOL_OUTPUT_CHARS
         assert sum(len(text) for _stream, text in emitted) <= mod._TOOL_OUTPUT_CHARS
-        assert all(len(text) <= mod._TOOL_STREAM_BYTES for _stream, text in emitted)
+        assert all(len(text) <= mod._TOOL_STREAM_CHARS for _stream, text in emitted)
         assert all(mod._TRUNCATION_MARKER in text for _stream, text in emitted)
         command, env, _timeout = environment.calls[0]
         assert command == mod._BOUNDED_EXEC_COMMAND

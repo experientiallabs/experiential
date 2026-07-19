@@ -44,7 +44,7 @@ from wmh.providers.base import ProviderConfig, ToolCallingProvider
 from wmh.providers.registry import get_provider
 
 _TOOL_OUTPUT_CHARS = 16_000
-_TOOL_STREAM_BYTES = _TOOL_OUTPUT_CHARS // 2
+_TOOL_STREAM_CHARS = _TOOL_OUTPUT_CHARS // 2
 _TOOL_COMMAND_BYTES = 32 * 1024
 _TOOL_PATH_BYTES = 4 * 1024
 _TOOL_CONTENT_BYTES = 64 * 1024
@@ -513,8 +513,8 @@ def _task_path(arguments: JsonObject) -> str:
 def _command_outcome(result: ExecResult, emit: OutputEmitter) -> ToolOutcome:
     stdout = result.stdout or ""
     stderr = result.stderr or ""
-    bounded_stdout, stdout_truncated = _bounded_text(stdout, _TOOL_STREAM_BYTES)
-    bounded_stderr, stderr_truncated = _bounded_text(stderr, _TOOL_STREAM_BYTES)
+    bounded_stdout, stdout_truncated = _bounded_text(stdout, _TOOL_STREAM_CHARS)
+    bounded_stderr, stderr_truncated = _bounded_text(stderr, _TOOL_STREAM_CHARS)
     if bounded_stdout:
         emit("stdout", bounded_stdout)
     if bounded_stderr:
