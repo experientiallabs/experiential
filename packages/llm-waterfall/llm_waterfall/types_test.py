@@ -66,6 +66,17 @@ def test_backend_rejects_unsupported_reasoning_config(
         Backend(provider, model, reasoning_effort=effort)  # ty: ignore[invalid-argument-type]
 
 
+def test_non_max_bedrock_model_error_does_not_recommend_max() -> None:
+    with pytest.raises(ValueError, match="choose low, medium, high") as error:
+        Backend(
+            "bedrock",
+            "us.anthropic.claude-sonnet-4-6",
+            reasoning_effort="xhigh",
+        )
+
+    assert "or max" not in str(error.value)
+
+
 @pytest.mark.parametrize(
     "model",
     [

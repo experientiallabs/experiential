@@ -40,9 +40,10 @@ def validate_backend_reasoning_effort(
     if validated == "max" and base_model != _BEDROCK_MAX_EFFORT_MODEL:
         raise ValueError("reasoning effort 'max' is supported only by Claude Opus 4.6")
     if validated in ("none", "minimal", "xhigh"):
+        max_clause = ", or max" if base_model == _BEDROCK_MAX_EFFORT_MODEL else ""
         raise ValueError(
             f"Bedrock adaptive reasoning does not support effort {validated!r}; "
-            "choose low, medium, high, or max"
+            f"choose low, medium, high{max_clause}"
         )
     return validated
 

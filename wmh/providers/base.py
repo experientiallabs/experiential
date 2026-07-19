@@ -111,7 +111,7 @@ class ProviderConfig(BaseModel):
                     f"{self.model!r} for reasoning configuration"
                 )
         if self.reasoning_effort not in resolved.reasoning_efforts:
-            if self.reasoning_effort == "max":
+            if self.reasoning_effort == "max" and self.kind is ProviderKind.BEDROCK:
                 raise ValueError("reasoning effort 'max' is supported only by Claude Opus 4.6")
             raise ValueError(
                 f"{self.kind.value}/{resolved.model_type} does not support reasoning effort "

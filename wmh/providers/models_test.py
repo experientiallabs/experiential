@@ -106,6 +106,17 @@ def test_openai_responses_effort_capabilities_match_model_contract(
             )
 
 
+def test_openai_responses_max_error_names_the_actual_model_contract() -> None:
+    with pytest.raises(ValidationError, match="openai_responses/gpt-5.5") as error:
+        ProviderConfig(
+            kind=ProviderKind.OPENAI_RESPONSES,
+            model="gpt-5.5",
+            reasoning_effort="max",
+        )
+
+    assert "Claude Opus" not in str(error.value)
+
+
 def test_openai_responses_pinned_snapshot_keeps_alias_capabilities() -> None:
     config = ProviderConfig(
         kind=ProviderKind.OPENAI_RESPONSES,
