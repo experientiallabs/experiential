@@ -257,6 +257,7 @@ class BudgetAccount(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     ledger_path: Path
+    ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
     policy: BudgetPolicy
     scope: BudgetScope
     meter_id: str = Field(min_length=1)
@@ -280,6 +281,7 @@ class TimedResourceBudgetAccount(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     ledger_path: Path
+    ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
     policy: BudgetPolicy
     scope: BudgetScope
     meter_id: str = Field(min_length=1)
@@ -305,6 +307,52 @@ class BudgetAccountBinding(BaseModel):
     ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
     scope: BudgetScope
     meter_id: str = Field(min_length=1)
+
+
+class BudgetLedgerAuthority(BaseModel):
+    """Explicitly bootstrapped durable ledger authority used to mint bound accounts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ledger_path: Path
+    ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
+    policy: BudgetPolicy
+
+    @model_validator(mode="after")
+    def _require_absolute_path(self) -> Self:
+        if not self.ledger_path.is_absolute():
+            raise ValueError("budget authority ledger_path must be absolute")
+        return self
+
+    def provider_account(
+        self,
+        *,
+        scope: BudgetScope,
+        meter_id: str,
+    ) -> BudgetAccount:
+        """Mint one provider account bound to this exact pre-existing ledger."""
+        return BudgetAccount(
+            ledger_path=self.ledger_path,
+            ledger_identity=self.ledger_identity,
+            policy=self.policy,
+            scope=scope,
+            meter_id=meter_id,
+        )
+
+    def timed_resource_account(
+        self,
+        *,
+        scope: BudgetScope,
+        meter_id: str,
+    ) -> TimedResourceBudgetAccount:
+        """Mint one timed-resource account bound to this exact pre-existing ledger."""
+        return TimedResourceBudgetAccount(
+            ledger_path=self.ledger_path,
+            ledger_identity=self.ledger_identity,
+            policy=self.policy,
+            scope=scope,
+            meter_id=meter_id,
+        )
 
 
 class BudgetReservation(BaseModel):
@@ -429,12 +477,19 @@ class SpendLedger:
         policy: BudgetPolicy,
         *,
         now: Callable[[], datetime] | None = None,
+        allow_create: bool = True,
     ) -> None:
         requested = Path(path).expanduser()
         if requested.is_symlink():
             raise BudgetIntegrityError("budget ledger path cannot be a symlink")
-        requested.parent.mkdir(parents=True, exist_ok=True)
+        if allow_create:
+            requested.parent.mkdir(parents=True, exist_ok=True)
+        elif not requested.parent.is_dir():
+            raise BudgetIntegrityError("budget ledger parent must exist after bootstrap")
         self.path = requested.parent.resolve() / requested.name
+        self._allow_create = allow_create
+        if not allow_create and not self.path.exists():
+            raise BudgetIntegrityError("budget ledger must be explicitly bootstrapped before use")
         if self.path.exists() and not stat.S_ISREG(self.path.stat(follow_symlinks=False).st_mode):
             raise BudgetIntegrityError("budget ledger path must be a regular file")
         self._policy = BudgetPolicy.model_validate(policy.model_dump())
@@ -930,10 +985,24 @@ class SpendLedger:
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         self._validate_file_identity()
-        connection = sqlite3.connect(
-            self.path,
-            timeout=_DEFAULT_BUSY_TIMEOUT_MS / 1000,
-        )
+        try:
+            if self._allow_create:
+                connection = sqlite3.connect(
+                    self.path,
+                    timeout=_DEFAULT_BUSY_TIMEOUT_MS / 1000,
+                )
+            else:
+                connection = sqlite3.connect(
+                    self.path.as_uri() + "?mode=rw",
+                    timeout=_DEFAULT_BUSY_TIMEOUT_MS / 1000,
+                    uri=True,
+                )
+        except sqlite3.OperationalError as exc:
+            if not self._allow_create:
+                raise BudgetIntegrityError(
+                    "budget ledger must exist and remain readable after bootstrap"
+                ) from exc
+            raise
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {_DEFAULT_BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys = ON")
@@ -980,7 +1049,53 @@ _REGISTERED_BUDGET_LOCK = threading.Lock()
 _REGISTERED_BUDGETS: dict[str, tuple[Path, BudgetPolicy, str]] = {}
 
 
-def open_shared_spend_ledger(path: str | Path, policy: BudgetPolicy) -> SpendLedger:
+def bootstrap_budget_ledger(
+    path: str | Path,
+    policy: BudgetPolicy,
+) -> BudgetLedgerAuthority:
+    """Create one new authoritative ledger and return identity-bound account authority.
+
+    Paid paths never call this function. Reusing an existing path is rejected so initialization
+    cannot silently bless a replacement file after a prior cap has been spent.
+    """
+    frozen_policy = BudgetPolicy.model_validate(policy.model_dump())
+    requested = Path(path).expanduser()
+    if requested.is_symlink():
+        raise BudgetIntegrityError("budget ledger path cannot be a symlink")
+    requested.parent.mkdir(parents=True, exist_ok=True)
+    canonical_path = requested.parent.resolve() / requested.name
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(canonical_path, flags, 0o600)
+    except FileExistsError:
+        raise BudgetIntegrityError(
+            "budget ledger path already exists; load its recorded authority instead"
+        ) from None
+    except OSError as exc:
+        raise BudgetIntegrityError("budget ledger could not be bootstrapped safely") from exc
+    else:
+        os.close(descriptor)
+    ledger = SpendLedger(canonical_path, frozen_policy, allow_create=False)
+    with _SHARED_LEDGER_LOCK:
+        existing = _SHARED_LEDGERS.get(canonical_path)
+        if existing is not None:
+            raise BudgetIntegrityError("budget ledger path was already opened in this process")
+        _SHARED_LEDGERS[canonical_path] = ledger
+    return BudgetLedgerAuthority(
+        ledger_path=canonical_path,
+        ledger_identity=ledger.ledger_identity,
+        policy=frozen_policy,
+    )
+
+
+def open_shared_spend_ledger(
+    path: str | Path,
+    policy: BudgetPolicy,
+    *,
+    expected_ledger_identity: str,
+) -> SpendLedger:
     """Fully audit one ledger once per process, then reuse its connectionless handle.
 
     Harbor creates an agent object per trial, but every object runs in the trusted evaluator
@@ -988,15 +1103,26 @@ def open_shared_spend_ledger(path: str | Path, policy: BudgetPolicy) -> SpendLed
     avoids quadratic full-log replay while every independently started process still performs a
     complete audit before its first paid call.
     """
+    if re.fullmatch(_DIGEST_PATTERN, expected_ledger_identity) is None:
+        raise BudgetIntegrityError("expected budget ledger identity is malformed")
+    frozen_policy = BudgetPolicy.model_validate(policy.model_dump())
     requested = Path(path).expanduser()
+    if requested.is_symlink() or not requested.parent.is_dir():
+        raise BudgetIntegrityError("budget ledger path is unavailable after bootstrap")
+    canonical_path = requested.parent.resolve() / requested.name
     with _SHARED_LEDGER_LOCK:
-        existing = _SHARED_LEDGERS.get(requested)
+        existing = _SHARED_LEDGERS.get(canonical_path)
         if existing is not None:
-            if existing.policy != policy:
+            if existing.policy != frozen_policy:
                 raise BudgetIntegrityError("shared budget ledger policy differs from requested")
+            existing.audit()
+            if existing.ledger_identity != expected_ledger_identity:
+                raise BudgetIntegrityError("budget account names a different ledger identity")
             return existing
-        ledger = SpendLedger(requested, policy)
-        _SHARED_LEDGERS[requested] = ledger
+        ledger = SpendLedger(canonical_path, frozen_policy, allow_create=False)
+        if ledger.ledger_identity != expected_ledger_identity:
+            raise BudgetIntegrityError("budget account names a different ledger identity")
+        _SHARED_LEDGERS[canonical_path] = ledger
         return ledger
 
 
@@ -1007,9 +1133,25 @@ def bind_budget_account(account: BudgetAccount) -> BudgetAccountBinding:
     frozen cap would let concurrent evaluators fork the budget and overspend it independently.
     """
     validated = BudgetAccount.model_validate(account.model_dump())
-    ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
-    canonical_path = ledger.path
+    requested = validated.ledger_path.expanduser()
+    canonical_candidate = requested.parent.resolve() / requested.name
     policy_digest = validated.policy.policy_digest
+    with _REGISTERED_BUDGET_LOCK:
+        existing = _REGISTERED_BUDGETS.get(policy_digest)
+        if existing is not None and existing[0] != canonical_candidate:
+            raise BudgetIntegrityError(
+                "budget policy digest is already registered to a different ledger path"
+            )
+        if existing is not None and existing[2] != validated.ledger_identity:
+            raise BudgetIntegrityError(
+                "budget policy digest is already registered to a different ledger identity"
+            )
+    ledger = open_shared_spend_ledger(
+        validated.ledger_path,
+        validated.policy,
+        expected_ledger_identity=validated.ledger_identity,
+    )
+    canonical_path = ledger.path
     with _REGISTERED_BUDGET_LOCK:
         existing = _REGISTERED_BUDGETS.get(policy_digest)
         if existing is not None and existing[0] != canonical_path:
@@ -1034,9 +1176,25 @@ def bind_timed_resource_account(
 ) -> BudgetAccountBinding:
     """Register one timed-resource ledger and return its path-free durable binding."""
     validated = TimedResourceBudgetAccount.model_validate(account.model_dump())
-    ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
-    canonical_path = ledger.path
+    requested = validated.ledger_path.expanduser()
+    canonical_candidate = requested.parent.resolve() / requested.name
     policy_digest = validated.policy.policy_digest
+    with _REGISTERED_BUDGET_LOCK:
+        existing = _REGISTERED_BUDGETS.get(policy_digest)
+        if existing is not None and existing[0] != canonical_candidate:
+            raise BudgetIntegrityError(
+                "budget policy digest is already registered to a different ledger path"
+            )
+        if existing is not None and existing[2] != validated.ledger_identity:
+            raise BudgetIntegrityError(
+                "budget policy digest is already registered to a different ledger identity"
+            )
+    ledger = open_shared_spend_ledger(
+        validated.ledger_path,
+        validated.policy,
+        expected_ledger_identity=validated.ledger_identity,
+    )
+    canonical_path = ledger.path
     with _REGISTERED_BUDGET_LOCK:
         existing = _REGISTERED_BUDGETS.get(policy_digest)
         if existing is not None and existing[0] != canonical_path:
@@ -1075,6 +1233,7 @@ def resolve_budget_account(binding: BudgetAccountBinding) -> BudgetAccount:
         raise BudgetIntegrityError("budget binding does not name a provider token meter")
     return BudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=validated.ledger_identity,
         policy=resolved_policy,
         scope=validated.scope,
         meter_id=validated.meter_id,
@@ -1100,6 +1259,7 @@ def resolve_timed_resource_account(
         raise BudgetIntegrityError("budget binding does not name a timed resource meter")
     return TimedResourceBudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=validated.ledger_identity,
         policy=resolved_policy,
         scope=validated.scope,
         meter_id=validated.meter_id,
@@ -1131,18 +1291,23 @@ class BudgetedProvider:
         if provider.config != meter.provider_config:
             raise ValueError("budget account provider config differs from the wrapped provider")
         self._provider = cast("SingleDispatchProvider", provider)
-        self._tool_provider = cast("SingleDispatchProvider", provider)
         self._account = validated_account
         self._meter = meter
         self._ledger = open_shared_spend_ledger(
             self._account.ledger_path,
             self._account.policy,
+            expected_ledger_identity=self._account.ledger_identity,
         )
         self._id_factory = id_factory or (lambda: str(uuid4()))
 
     @property
     def config(self) -> ProviderConfig:
         return self._provider.config
+
+    @property
+    def budget_ledger_identity(self) -> str:
+        """Return the durable authority shared by every paid surface in one experiment."""
+        return self._ledger.ledger_identity
 
     def complete(
         self,
@@ -1201,7 +1366,7 @@ class BudgetedProvider:
             max_output_tokens=output_ceiling,
         )
         try:
-            response = self._tool_provider.complete_chat(request)
+            response = self._provider.complete_chat(request)
         except Exception as error:
             self._forfeit_after_error(reservation_id, error)
             raise
@@ -1280,8 +1445,11 @@ class BudgetedProvider:
         )
 
     def _forfeit_after_error(self, reservation_id: str, error: Exception) -> None:
+        failure_type = type(error).__name__
+        if _FAILURE_CODE_PATTERN.fullmatch(failure_type) is None:
+            failure_type = "UnclassifiedError"
         try:
-            self._ledger.forfeit(reservation_id, failure_type=type(error).__name__)
+            self._ledger.forfeit(reservation_id, failure_type=failure_type)
         except Exception as ledger_error:
             raise ledger_error from error
 
@@ -1302,7 +1470,11 @@ class TimedResourceBudget:
             raise TypeError("TimedResourceBudget requires a timed resource meter")
         self._account = validated
         self._meter = meter
-        self._ledger = open_shared_spend_ledger(validated.ledger_path, validated.policy)
+        self._ledger = open_shared_spend_ledger(
+            validated.ledger_path,
+            validated.policy,
+            expected_ledger_identity=validated.ledger_identity,
+        )
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._monotonic = monotonic or _system_monotonic
 

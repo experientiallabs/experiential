@@ -49,7 +49,9 @@ from wmh.tracking.budget import (
     TokenPriceCeiling,
     bind_budget_account,
     bind_timed_resource_account,
+    bootstrap_budget_ledger,
     nano_usd_from_usd,
+    open_shared_spend_ledger,
     resolve_budget_account,
     resolve_timed_resource_account,
 )
@@ -83,6 +85,13 @@ def _scope(phase: str = "search", category: str = "worker") -> BudgetScope:
         lane="haiku",
         arm="candidate",
     )
+
+
+def _ledger_identity(path: Path, policy: BudgetPolicy) -> str:
+    absolute = path.resolve()
+    if absolute.exists():
+        return SpendLedger(absolute, policy, allow_create=False).ledger_identity
+    return bootstrap_budget_ledger(absolute, policy).ledger_identity
 
 
 class _ProcessBarrier(Protocol):
@@ -130,6 +139,16 @@ def _reserve_then_exit(path: str, policy_json: str) -> None:
     os._exit(0)
 
 
+def _bind_account_in_fresh_process(account_json: str, outcomes: object) -> None:
+    process_queue = cast("_StringQueue", outcomes)
+    try:
+        bind_budget_account(BudgetAccount.model_validate_json(account_json))
+    except BudgetIntegrityError as exc:
+        process_queue.put(str(exc))
+    else:
+        process_queue.put("bound")
+
+
 def test_currency_helpers_round_up_to_exact_nano_usd_ceiling() -> None:
     assert nano_usd_from_usd("15000") == 15_000_000_000_000
     assert TokenPriceCeiling.from_usd_per_million(
@@ -171,6 +190,16 @@ def test_budget_inputs_reject_unknown_fields_instead_of_using_defaults() -> None
     with pytest.raises(ValidationError, match="unexpected_cap"):
         BudgetPolicy.model_validate({**_policy().model_dump(mode="json"), "unexpected_cap": 1})
 
+    with pytest.raises(ValidationError, match="ledger_identity"):
+        BudgetAccount.model_validate(
+            {
+                "ledger_path": "/tmp/unbound-budget.sqlite3",
+                "policy": _policy().model_dump(mode="json"),
+                "scope": _scope().model_dump(mode="json"),
+                "meter_id": "worker",
+            }
+        )
+
 
 def test_independently_initialized_ledgers_have_distinct_durable_identities(
     tmp_path: Path,
@@ -183,12 +212,85 @@ def test_independently_initialized_ledgers_have_distinct_durable_identities(
     assert SpendLedger(first.path, policy).ledger_identity == first.ledger_identity
 
 
+def test_bootstrap_mints_bound_accounts_and_refuses_existing_paths(tmp_path: Path) -> None:
+    policy = _policy().model_copy(update={"study_id": "bootstrap-study"})
+    authority = bootstrap_budget_ledger(tmp_path / "budget.sqlite3", policy)
+    account = authority.provider_account(scope=_scope(), meter_id="worker")
+
+    assert account.ledger_identity == authority.ledger_identity
+    assert bind_budget_account(account).ledger_identity == authority.ledger_identity
+    with pytest.raises(BudgetIntegrityError, match="already exists"):
+        bootstrap_budget_ledger(authority.ledger_path, policy)
+
+
+def test_identity_bound_account_rejects_replaced_ledger_after_restart(tmp_path: Path) -> None:
+    policy = _policy(hard=100, search=100, final=0).model_copy(
+        update={"study_id": "replacement-study"}
+    )
+    authority = bootstrap_budget_ledger(tmp_path / "budget.sqlite3", policy)
+    account = authority.provider_account(scope=_scope(), meter_id="worker")
+    ledger = open_shared_spend_ledger(
+        authority.ledger_path,
+        policy,
+        expected_ledger_identity=authority.ledger_identity,
+    )
+    ledger.reserve(_scope(), meter_id="worker", max_nano_usd=100, reservation_id="spent")
+    authority.ledger_path.rename(tmp_path / "spent.sqlite3")
+    replacement = SpendLedger(authority.ledger_path, policy)
+    assert replacement.ledger_identity != authority.ledger_identity
+
+    context = multiprocessing.get_context("spawn")
+    outcomes = context.Queue()
+    process = context.Process(
+        target=_bind_account_in_fresh_process,
+        args=(account.model_dump_json(), outcomes),
+    )
+    process.start()
+    process.join(timeout=10)
+
+    assert process.exitcode == 0
+    assert "different ledger identity" in outcomes.get(timeout=1)
+    assert replacement.reservations() == []
+
+
+def test_one_policy_cannot_bind_two_bootstrapped_ledgers(tmp_path: Path) -> None:
+    policy = _policy().model_copy(update={"study_id": "two-ledger-study"})
+    first = bootstrap_budget_ledger(tmp_path / "first.sqlite3", policy)
+    second = bootstrap_budget_ledger(tmp_path / "second.sqlite3", policy)
+    bind_budget_account(first.provider_account(scope=_scope(), meter_id="worker"))
+
+    with pytest.raises(BudgetIntegrityError, match="different ledger path"):
+        bind_budget_account(second.provider_account(scope=_scope(), meter_id="worker"))
+
+
+def test_shared_ledger_cache_uses_canonical_parent_path(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    policy = _policy().model_copy(update={"study_id": "canonical-path-study"})
+    authority = bootstrap_budget_ledger(real_parent / "budget.sqlite3", policy)
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    first = open_shared_spend_ledger(
+        authority.ledger_path,
+        authority.policy,
+        expected_ledger_identity=authority.ledger_identity,
+    )
+    second = open_shared_spend_ledger(
+        alias_parent / "budget.sqlite3",
+        authority.policy,
+        expected_ledger_identity=authority.ledger_identity,
+    )
+
+    assert first is second
+
+
 def test_budget_binding_is_path_independent_and_resolves_only_registered_policy(
     tmp_path: Path,
 ) -> None:
     policy = _policy()
     account = BudgetAccount(
         ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        ledger_identity=_ledger_identity(tmp_path / "budget.sqlite3", policy),
         policy=policy,
         scope=_scope(),
         meter_id="worker",
@@ -241,6 +343,7 @@ def test_timed_resource_budget_reserves_ceiling_and_settles_billing_quantum(
     )
     account = TimedResourceBudgetAccount(
         ledger_path=(tmp_path / "resource.sqlite3").resolve(),
+        ledger_identity=_ledger_identity(tmp_path / "resource.sqlite3", policy),
         policy=policy,
         scope=_scope("confirmation", "sandbox"),
         meter_id="sandbox",
@@ -290,6 +393,7 @@ def test_provider_and_timed_resources_share_one_hard_cap(tmp_path: Path) -> None
     )
     account = TimedResourceBudgetAccount(
         ledger_path=ledger_path,
+        ledger_identity=ledger.ledger_identity,
         policy=policy,
         scope=_scope("confirmation", "sandbox"),
         meter_id="sandbox",
@@ -319,6 +423,7 @@ def test_timed_resource_binding_is_path_free_and_type_checked(tmp_path: Path) ->
     )
     account = TimedResourceBudgetAccount(
         ledger_path=(tmp_path / "binding.sqlite3").resolve(),
+        ledger_identity=_ledger_identity(tmp_path / "binding.sqlite3", policy),
         policy=policy,
         scope=_scope("confirmation", "sandbox"),
         meter_id="sandbox",
@@ -423,6 +528,7 @@ def test_timed_resource_reservation_retries_after_precommit_ledger_failure(
     )
     account = TimedResourceBudgetAccount(
         ledger_path=(tmp_path / "retry.sqlite3").resolve(),
+        ledger_identity=_ledger_identity(tmp_path / "retry.sqlite3", policy),
         policy=policy,
         scope=_scope(),
         meter_id="sandbox",
@@ -517,6 +623,7 @@ def test_timed_resource_under_reservation_is_rejected_during_replay(tmp_path: Pa
     TimedResourceBudget(
         TimedResourceBudgetAccount(
             ledger_path=path.resolve(),
+            ledger_identity=_ledger_identity(path, policy),
             policy=policy,
             scope=_scope(),
             meter_id="sandbox",
@@ -615,6 +722,7 @@ def test_timed_resource_failure_forfeits_full_ceiling_and_is_terminal(tmp_path: 
     )
     account = TimedResourceBudgetAccount(
         ledger_path=(tmp_path / "resource.sqlite3").resolve(),
+        ledger_identity=_ledger_identity(tmp_path / "resource.sqlite3", policy),
         policy=policy,
         scope=_scope(),
         meter_id="sandbox",
@@ -1052,6 +1160,7 @@ def _budgeted_provider(
     ledger = SpendLedger(path, policy)
     account = BudgetAccount(
         ledger_path=path,
+        ledger_identity=ledger.ledger_identity,
         policy=policy,
         scope=_scope(category="provider-call"),
         meter_id="worker",
@@ -1210,6 +1319,26 @@ def test_budgeted_provider_forfeits_partial_text_usage(tmp_path: Path) -> None:
     assert reservation.failure_type == "UsageUnavailable"
 
 
+def test_budgeted_provider_canonicalizes_invalid_exception_class_and_reraises_original(
+    tmp_path: Path,
+) -> None:
+    invalid_error_type = type("provider/error", (RuntimeError,), {})
+    original = invalid_error_type("provider failed")
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(error=original),
+        ids=iter(["invalid-error-name"]),
+    )
+
+    with pytest.raises(invalid_error_type) as captured:
+        provider.complete("system", [Message(role="user", content="hello")], max_tokens=10)
+
+    assert captured.value is original
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UnclassifiedError"
+
+
 def test_budgeted_provider_rejects_unbounded_chat_and_unpriced_embeddings(tmp_path: Path) -> None:
     provider, ledger = _budgeted_provider(
         tmp_path,
@@ -1243,6 +1372,7 @@ def test_budget_account_requires_an_absolute_cross_process_ledger_path() -> None
     with pytest.raises(ValueError, match="absolute"):
         BudgetAccount(
             ledger_path=Path("relative/budget.sqlite3"),
+            ledger_identity="sha256:" + "f" * 64,
             policy=_policy(),
             scope=_scope(),
             meter_id="worker",

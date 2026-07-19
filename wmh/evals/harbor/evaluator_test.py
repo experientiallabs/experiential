@@ -606,28 +606,31 @@ def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: P
         BudgetPolicy,
         BudgetScope,
         ProviderCostMeter,
-        SpendLedger,
         TokenPriceCeiling,
+        bootstrap_budget_ledger,
     )
 
     provider_config = _provider()
+    policy = BudgetPolicy(
+        study_id="study",
+        manifest_digest="sha256:" + "b" * 64,
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"search": 1_000_000},
+        meters={
+            "worker": ProviderCostMeter(
+                provider_config=provider_config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            )
+        },
+    )
+    ledger_path = (tmp_path / "budget.sqlite3").resolve()
     account = BudgetAccount(
-        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
-        policy=BudgetPolicy(
-            study_id="study",
-            manifest_digest="sha256:" + "b" * 64,
-            hard_limit_nano_usd=1_000_000,
-            phase_limits_nano_usd={"search": 1_000_000},
-            meters={
-                "worker": ProviderCostMeter(
-                    provider_config=provider_config,
-                    price=TokenPriceCeiling(
-                        input_nano_usd_per_token=1,
-                        output_nano_usd_per_token=5,
-                    ),
-                )
-            },
-        ),
+        ledger_path=ledger_path,
+        ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
+        policy=policy,
         scope=BudgetScope(
             phase="search",
             category="worker",
@@ -646,10 +649,7 @@ def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: P
     serialized_binding = agent.kwargs["budget_binding"]
     assert serialized_binding == {
         "policy_digest": account.policy.policy_digest,
-        "ledger_identity": SpendLedger(
-            account.ledger_path,
-            account.policy,
-        ).ledger_identity,
+        "ledger_identity": account.ledger_identity,
         "scope": account.scope.model_dump(mode="json"),
         "meter_id": account.meter_id,
     }

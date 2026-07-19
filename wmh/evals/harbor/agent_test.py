@@ -48,6 +48,7 @@ from wmh.tracking.budget import (
     ProviderCostMeter,
     TokenPriceCeiling,
     bind_budget_account,
+    bootstrap_budget_ledger,
 )
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
@@ -241,6 +242,9 @@ def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path
     )
     account = BudgetAccount(
         ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        ledger_identity=bootstrap_budget_ledger(
+            tmp_path / "budget.sqlite3", policy
+        ).ledger_identity,
         policy=policy,
         scope=BudgetScope(
             phase="search",

@@ -38,6 +38,7 @@ from wmh.tracking.budget import (
     BudgetScope,
     ProviderCostMeter,
     TokenPriceCeiling,
+    bootstrap_budget_ledger,
 )
 
 harness_eval_module = importlib.import_module("wmh.cli.harness_eval")
@@ -274,23 +275,26 @@ def _base_args(
 
 
 def _write_budget_account(path: Path, provider_config: ProviderConfig) -> BudgetAccount:
+    policy = BudgetPolicy(
+        study_id="cli-study",
+        manifest_digest="sha256:" + "c" * 64,
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"qualification": 1_000_000},
+        meters={
+            "worker": ProviderCostMeter(
+                provider_config=provider_config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            )
+        },
+    )
+    ledger_path = (path.parent / "spend.sqlite3").resolve()
     account = BudgetAccount(
-        ledger_path=(path.parent / "spend.sqlite3").resolve(),
-        policy=BudgetPolicy(
-            study_id="cli-study",
-            manifest_digest="sha256:" + "c" * 64,
-            hard_limit_nano_usd=1_000_000,
-            phase_limits_nano_usd={"qualification": 1_000_000},
-            meters={
-                "worker": ProviderCostMeter(
-                    provider_config=provider_config,
-                    price=TokenPriceCeiling(
-                        input_nano_usd_per_token=1,
-                        output_nano_usd_per_token=5,
-                    ),
-                )
-            },
-        ),
+        ledger_path=ledger_path,
+        ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
+        policy=policy,
         scope=BudgetScope(
             phase="qualification",
             category="worker",

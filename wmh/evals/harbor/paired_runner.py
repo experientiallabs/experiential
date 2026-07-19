@@ -79,17 +79,18 @@ from wmh.tracking.budget import (
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
+    open_shared_spend_ledger,
 )
 
-PAIRED_HARBOR_PROTOCOL_VERSION: Literal["2"] = "2"
-PAIRED_HARBOR_RUN_VERSION: Literal["3"] = "3"
+PAIRED_HARBOR_PROTOCOL_VERSION: Literal["3"] = "3"
+PAIRED_HARBOR_RUN_VERSION: Literal["4"] = "4"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
 class QualifiedHarborTask(BaseModel):
     """Pre-run immutable identities for one qualified Harbor task environment."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     task_id: str = Field(min_length=1, max_length=512)
     content_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -108,19 +109,19 @@ class QualifiedHarborTask(BaseModel):
 class PairedHarborProviderConfig(ProviderConfig):
     """Deep-frozen copy of the full nonsecret provider execution route."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class PairedHarborRunIdentity(BenchmarkRunIdentity):
     """Deep-frozen evaluator identity retained by protocol and evidence models."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class PairedHarborPanelRoute(BaseModel):
     """Opaque panel member bound to one exact nonsecret provider route and concurrency cap."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     panel_member: str = Field(min_length=1)
     provider_config: ProviderConfig
@@ -184,9 +185,10 @@ class PairedHarborPanelRoute(BaseModel):
 class PairedHarborBudgetRuntime(BaseModel):
     """Host-private ledger location and route meters for one frozen paired protocol."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     ledger_path: Path
+    ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
     policy: BudgetPolicy
     phase: str = Field(min_length=1)
     meter_by_panel_member: dict[str, str] = Field(min_length=1)
@@ -210,6 +212,11 @@ class PairedHarborBudgetRuntime(BaseModel):
         )
         if missing:
             raise ValueError(f"paired budget runtime names unknown meter(s): {missing}")
+        open_shared_spend_ledger(
+            self.ledger_path,
+            self.policy,
+            expected_ledger_identity=self.ledger_identity,
+        )
         return self
 
     def account_for(
@@ -223,6 +230,7 @@ class PairedHarborBudgetRuntime(BaseModel):
         meter_id = self.meter_by_panel_member[panel_member]
         return BudgetAccount(
             ledger_path=self.ledger_path,
+            ledger_identity=self.ledger_identity,
             policy=self.policy,
             scope=BudgetScope(
                 phase=self.phase,
@@ -243,7 +251,7 @@ class PairedHarborJobTemplate(BaseModel):
     ``QualifiedHarborTask``.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     template_version: Literal["1"] = "1"
     dataset_task_groups: tuple[tuple[str, ...], ...]
@@ -339,7 +347,7 @@ class PairedHarborJobTemplate(BaseModel):
 class PairedHarborArmRouteExpectation(BaseModel):
     """Frozen evaluator identity for one harness arm on one provider route."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     panel_member: str = Field(min_length=1)
     arm: PairedArm
@@ -363,9 +371,9 @@ class PairedHarborProtocol(BaseModel):
     and externally-owned retry and budget policies.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    protocol_version: Literal["2"] = PAIRED_HARBOR_PROTOCOL_VERSION
+    protocol_version: Literal["3"] = PAIRED_HARBOR_PROTOCOL_VERSION
     design: PairedEvaluationDesign
     design_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation: ConfirmationPartition
@@ -389,6 +397,7 @@ class PairedHarborProtocol(BaseModel):
     arm_route_expectations: tuple[PairedHarborArmRouteExpectation, ...]
     retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     budget_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    budget_ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
 
     @field_validator("max_concurrent_blocks", mode="before")
     @classmethod
@@ -518,6 +527,7 @@ class PairedHarborProtocol(BaseModel):
         max_concurrent_blocks: int = 1,
         retry_policy_digest: str,
         budget_policy_digest: str,
+        budget_ledger_identity: str,
     ) -> PairedHarborProtocol:
         """Construct a frozen protocol from concrete runtime inputs before execution."""
         validate_pi_container_image(runner_image)
@@ -617,13 +627,14 @@ class PairedHarborProtocol(BaseModel):
             arm_route_expectations=tuple(route_expectations),
             retry_policy_digest=retry_policy_digest,
             budget_policy_digest=budget_policy_digest,
+            budget_ledger_identity=budget_ledger_identity,
         )
 
 
 class PairedHarborArmEvidence(BaseModel):
     """Complete typed admission evidence for one arm of an external paired block."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     arm: PairedArm
     job_name: str = Field(min_length=1)
@@ -691,7 +702,7 @@ class PairedHarborArmEvidence(BaseModel):
 class PairedHarborBlockEvidence(BaseModel):
     """Both ordered Harbor executions and their admitted binary outcome."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     block: PairedBlock
     pair_generation_id: str = Field(pattern=_DIGEST_PATTERN)
@@ -727,9 +738,9 @@ class PairedHarborBlockEvidence(BaseModel):
 class PairedHarborRunReport(BaseModel):
     """Reload-safe paired execution evidence plus its predeclared statistical analysis."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    run_version: Literal["3"]
+    run_version: Literal["4"]
     protocol: PairedHarborProtocol
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
@@ -1131,6 +1142,8 @@ class PairedHarborRunner:
         self._budget_runtime = PairedHarborBudgetRuntime.model_validate(budget_runtime.model_dump())
         if self._budget_runtime.policy.policy_digest != self._protocol.budget_policy_digest:
             raise ValueError("paired budget runtime differs from the frozen policy digest")
+        if self._budget_runtime.ledger_identity != self._protocol.budget_ledger_identity:
+            raise ValueError("paired budget runtime differs from the frozen ledger identity")
         if not isinstance(multi_host, bool):
             raise ValueError("multi_host must be a boolean")
         if multi_host and durable_coordinator is None:
@@ -1190,6 +1203,7 @@ class PairedHarborRunner:
             max_concurrent_blocks=self._protocol.max_concurrent_blocks,
             retry_policy_digest=self._protocol.retry_policy_digest,
             budget_policy_digest=self._protocol.budget_policy_digest,
+            budget_ledger_identity=self._protocol.budget_ledger_identity,
         )
         if reconstructed != self._protocol:
             raise ValueError("runtime inputs do not reconstruct the frozen paired Harbor protocol")

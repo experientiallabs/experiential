@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import multiprocessing
 import os
@@ -42,7 +43,9 @@ from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     ProviderCostMeter,
+    SpendLedger,
     TokenPriceCeiling,
+    bootstrap_budget_ledger,
 )
 
 _TASK_IDS = ("task-a", "task-b")
@@ -216,7 +219,7 @@ def _budget_runtime(
     meter_by_member = {route.panel_member: f"worker-{route.panel_member}" for route in routes}
     policy = BudgetPolicy(
         study_id="paired-test",
-        manifest_digest="sha256:" + "a" * 64,
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
         hard_limit_nano_usd=1_000_000_000,
         phase_limits_nano_usd={"confirmation": 1_000_000_000},
         meters={
@@ -230,8 +233,15 @@ def _budget_runtime(
             for route in routes
         },
     )
+    ledger_path = (tmp_path / "budget.sqlite3").resolve()
+    ledger_identity = (
+        SpendLedger(ledger_path, policy, allow_create=False).ledger_identity
+        if ledger_path.exists()
+        else bootstrap_budget_ledger(ledger_path, policy).ledger_identity
+    )
     return mod.PairedHarborBudgetRuntime(
-        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
         policy=policy,
         phase="confirmation",
         meter_by_panel_member=meter_by_member,
@@ -273,6 +283,7 @@ def _runner(
     frozen_routes = cast("tuple[mod.PairedHarborPanelRoute, ...]", protocol_values["panel_routes"])
     budget_runtime = _budget_runtime(tmp_path, frozen_routes)
     protocol_values.setdefault("budget_policy_digest", budget_runtime.policy.policy_digest)
+    protocol_values.setdefault("budget_ledger_identity", budget_runtime.ledger_identity)
     protocol = mod.PairedHarborProtocol.freeze(**cast("Any", protocol_values))
     return mod.PairedHarborRunner(
         protocol=protocol,
@@ -665,7 +676,7 @@ def test_schedule_has_both_first_arm_directions() -> None:
     assert counts == {PairedArm.BASELINE: 2, PairedArm.CANDIDATE: 2}
 
 
-def test_protocol_digest_is_path_independent_and_binds_nonsecret_execution_inputs(
+def test_protocol_digest_binds_budget_authority_and_nonsecret_execution_inputs(
     tmp_path: Path,
 ) -> None:
     baseline = pi_node_baseline("baseline")
@@ -674,7 +685,9 @@ def test_protocol_digest_is_path_independent_and_binds_nonsecret_execution_input
     second = _runner(tmp_path / "host-b", candidate, baseline=baseline)._protocol
 
     assert first.job_template == second.job_template
-    assert first.digest == second.digest
+    assert first.budget_policy_digest != second.budget_policy_digest
+    assert first.budget_ledger_identity != second.budget_ledger_identity
+    assert first.digest != second.digest
 
     changed_route = first.panel_routes[0].model_copy(update={"max_concurrent_blocks": 1})
     changed = mod.PairedHarborProtocol.freeze(
@@ -689,11 +702,53 @@ def test_protocol_digest_is_path_independent_and_binds_nonsecret_execution_input
         max_concurrent_blocks=4,
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_policy_digest=_BUDGET_POLICY_DIGEST,
+        budget_ledger_identity=first.budget_ledger_identity,
     )
     assert changed.digest != first.digest
 
     changed_budget = first.model_copy(update={"budget_policy_digest": "sha256:" + "7" * 64})
     assert changed_budget.digest != first.digest
+    changed_ledger = first.model_copy(update={"budget_ledger_identity": "sha256:" + "8" * 64})
+    assert changed_ledger.digest != first.digest
+
+
+def test_paired_budget_runtime_and_protocol_reject_unknown_control_fields(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate()
+    runner = _runner(tmp_path, candidate)
+
+    with pytest.raises(ValueError, match="unexpected_budget_control"):
+        mod.PairedHarborBudgetRuntime.model_validate(
+            {
+                **runner._budget_runtime.model_dump(mode="json"),
+                "unexpected_budget_control": "ignore-the-cap",
+            }
+        )
+    with pytest.raises(ValueError, match="unexpected_budget_control"):
+        mod.PairedHarborProtocol.model_validate(
+            {
+                **runner._protocol.model_dump(mode="json"),
+                "unexpected_budget_control": "ignore-the-cap",
+            }
+        )
+
+
+def test_runner_rejects_protocol_ledger_fork_before_evaluator_construction(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate()
+    runner = _runner(tmp_path, candidate)
+    forked = runner._protocol.model_copy(update={"budget_ledger_identity": "sha256:" + "f" * 64})
+
+    with pytest.raises(ValueError, match="frozen ledger identity"):
+        mod.PairedHarborRunner(
+            protocol=forked,
+            job_spec=runner._job_spec,
+            operation_id="forked-ledger",
+            generation_id=1,
+            budget_runtime=runner._budget_runtime,
+        )
 
 
 def test_rejects_scored_e2b_even_when_job_shape_is_otherwise_exact(tmp_path: Path) -> None:
@@ -1495,6 +1550,7 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
         max_concurrent_blocks=2,
         retry_policy_digest=_RETRY_POLICY_DIGEST,
         budget_policy_digest=budget_runtime.policy.policy_digest,
+        budget_ledger_identity=budget_runtime.ledger_identity,
     )
 
     active_global = 0

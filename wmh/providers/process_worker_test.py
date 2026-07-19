@@ -30,6 +30,7 @@ from wmh.tracking.budget import (
     ReservationStatus,
     SpendLedger,
     TokenPriceCeiling,
+    bootstrap_budget_ledger,
 )
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="provider worker uses inherited sockets")
@@ -175,6 +176,9 @@ def test_worker_child_wraps_provider_with_registered_crash_safe_budget(
     )
     account = BudgetAccount(
         ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        ledger_identity=bootstrap_budget_ledger(
+            tmp_path / "budget.sqlite3", policy
+        ).ledger_identity,
         policy=policy,
         scope=BudgetScope(
             phase="confirmation",
