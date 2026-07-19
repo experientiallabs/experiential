@@ -44,13 +44,17 @@ viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # local runs stay sandbox-free — so it is an optional extra imported lazily
 # (wmh.harness.e2b_sandbox / wmh.harness.pi_e2b).
 e2b = ["e2b>=2.0"]
+# Context connectors (`wmh.connect`): the MCP client SDK backs the Notion connector's
+# remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
+# lazily (wmh.connect.notion), same contract as the e2b extra above.
+connectors = ["mcp>=1.27"]
 # dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
 # project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz,e2b]",
+    "world-model-harness[otel,viz,e2b,connectors]",
 ]
 
 [dependency-groups]

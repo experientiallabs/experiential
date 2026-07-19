@@ -59,6 +59,26 @@ print(obs.content)
 
 Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
+### Pull context from the tools you already use
+
+Traces show how your environment behaves; your team's tools hold what it knows. `wmh.connect`
+fetches issues, docs, mail, messages, events, or web search results from GitHub, Google, Slack,
+Notion, and Brave into one normalized `ContextItem` shape. It is a library: a host supplies a
+per-service access token and calls a connector's `pull`.
+
+```python
+from wmh.connect import ConnectorAuth, PullQuery, get_connector
+
+items = get_connector("github").pull(
+    ConnectorAuth(kind="token", access_token=token),
+    PullQuery(target="owner/repo", query="is:open", limit=20),
+)
+```
+
+The Notion path uses the optional `connectors` extra (`world-model-harness[connectors]`, the
+`mcp` SDK); everything else, and `import wmh.connect` itself, works without it. See
+[`docs/reference/connect-library.md`](./docs/reference/connect-library.md).
+
 ## Run after platform login
 
 `wmh run` is the single interactive execution command. After `wmh login`, an opaque platform id

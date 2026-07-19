@@ -781,7 +781,7 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
 
     def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
         if name == "broken":
-            raise urllib.error.HTTPError("https://hub/x", 404, "nf", None, None)  # type: ignore[arg-type]
+            raise urllib.error.HTTPError("https://hub/x", 404, "nf", None, None)  # ty: ignore[invalid-argument-type]
         fetched.append(name)
         return tmp_path
 

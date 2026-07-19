@@ -110,7 +110,8 @@ class _PublicOnlyRedirects(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_PublicOnlyRedirects)
 
 
-def _http_get(url: str, headers: dict[str, str]) -> str:
+def http_get(url: str, headers: dict[str, str]) -> str:
+    """Fetch a public http(s) URL as text: the default, SSRF-guarded `FetchFn`."""
     _assert_public_http_url(url)
     request = urllib.request.Request(url, headers=headers)  # noqa: S310 — guarded above
     with _OPENER.open(request, timeout=_TIMEOUT_SECONDS) as response:  # noqa: S310
@@ -129,7 +130,7 @@ class _BraveResponse(BaseModel):
 class BraveGrounder:
     """Brave Search API backend (`X-Subscription-Token` keyed GET, JSON response)."""
 
-    def __init__(self, api_key: str, *, count: int = 5, fetch: FetchFn = _http_get) -> None:
+    def __init__(self, api_key: str, *, count: int = 5, fetch: FetchFn = http_get) -> None:
         self._api_key = api_key
         self._count = count
         self._fetch = fetch
@@ -164,7 +165,7 @@ class FetchGrounder:
     ungrounded prediction, never break the step.
     """
 
-    def __init__(self, *, max_chars: int = 8_000, fetch: FetchFn = _http_get) -> None:
+    def __init__(self, *, max_chars: int = 8_000, fetch: FetchFn = http_get) -> None:
         self._max_chars = max_chars
         self._fetch = fetch
         self._memo: dict[str, list[GroundingResult]] = {}
@@ -293,7 +294,7 @@ class SourceResolver:
     live: first-touch reads match the pin exactly; post-edit re-reads do not).
     """
 
-    def __init__(self, pins: dict[str, dict[str, str]], *, fetch: FetchFn = _http_get) -> None:
+    def __init__(self, pins: dict[str, dict[str, str]], *, fetch: FetchFn = http_get) -> None:
         self._pins = pins
         self._fetch = fetch
         self._memo: dict[str, list[str] | None] = {}
@@ -421,7 +422,7 @@ _REGISTRY_MEMO: dict[tuple[str, str], str | None] = {}
 
 
 def registry_grounded_knowledge(
-    knowledge: str | None, action: Action, *, fetch: FetchFn = _http_get
+    knowledge: str | None, action: Action, *, fetch: FetchFn = http_get
 ) -> str | None:
     """Append the real registry record for a package action (harmless keyless poll).
 
@@ -433,7 +434,7 @@ def registry_grounded_knowledge(
     if query is None:
         return knowledge
     registry, package = query
-    memoize = fetch is _http_get  # injected fetch fns (tests) must not share process state
+    memoize = fetch is http_get  # injected fetch fns (tests) must not share process state
     if memoize and query in _REGISTRY_MEMO:
         block = _REGISTRY_MEMO[query]
         if block is None:
