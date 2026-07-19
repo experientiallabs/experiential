@@ -54,6 +54,10 @@ from wmh.tracking.budget import (
     TimedResourceRole,
     orphaned_timed_resource_requires_reap,
 )
+from wmh.tracking.rate_limit import (
+    ExternalDispatchRateAuthority,
+    validate_e2b_sandbox_create_rate_policy,
+)
 
 PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
@@ -79,9 +83,13 @@ _EXACT_E2B_TEMPLATE = re.compile(r"[A-Za-z0-9_.-]{1,512}:[A-Za-z0-9_.-]{1,512}\Z
 _PROJECT_LEASE_FILE = re.compile(r"[0-9a-f]{32}\.json\Z")
 _MAX_PROJECT_LEASE_FILES = 4096
 _PROJECT_CREATE_RETRY_DELAYS_S = (1.0, 3.0, 9.0)
+_PROJECT_CREATE_ATTEMPTS = len(_PROJECT_CREATE_RETRY_DELAYS_S) + 1
+_PROJECT_RATE_GATE_TIMEOUT_S = float(E2B_CREATE_REQUEST_TIMEOUT_S)
+_PROJECT_RATE_GATE_HORIZON_S = math.ceil(_PROJECT_RATE_GATE_TIMEOUT_S * _PROJECT_CREATE_ATTEMPTS)
 _PROJECT_CREATE_HORIZON_S = int(
-    E2B_CREATE_REQUEST_TIMEOUT_S * (len(_PROJECT_CREATE_RETRY_DELAYS_S) + 1)
+    E2B_CREATE_REQUEST_TIMEOUT_S * _PROJECT_CREATE_ATTEMPTS
     + sum(_PROJECT_CREATE_RETRY_DELAYS_S)
+    + _PROJECT_RATE_GATE_HORIZON_S
 )
 _PROJECT_PROVIDER_CLOCK_SKEW_S = 30
 _E2B_RATE_REFUSAL_PREFIX = "429: Rate limit exceeded, please try again later."
@@ -140,9 +148,27 @@ class _ProjectResourceLease:
 
 def _is_definitive_e2b_rate_refusal(error: Exception) -> bool:
     """Return whether E2B proved this create was rejected before allocating a sandbox."""
-    return type(error).__name__ == "RateLimitException" and str(error).startswith(
-        _E2B_RATE_REFUSAL_PREFIX
+    error_type = type(error)
+    message = str(error)
+    return (
+        error_type.__module__ == "e2b.exceptions"
+        and error_type.__qualname__ == "RateLimitException"
+        and (
+            message == _E2B_RATE_REFUSAL_PREFIX
+            or message.startswith(_E2B_RATE_REFUSAL_PREFIX + " - ")
+        )
     )
+
+
+def _validate_project_create_rate_authority(
+    authority: ExternalDispatchRateAuthority | None,
+) -> ExternalDispatchRateAuthority:
+    if authority is None:
+        raise ValueError("E2B projects require a create-rate authority")
+    if not isinstance(authority, ExternalDispatchRateAuthority):
+        raise TypeError("E2B project create-rate authority has the wrong type")
+    validate_e2b_sandbox_create_rate_policy(authority.policy)
+    return authority
 
 
 class _BudgetedProjectSandboxFactory:
@@ -158,8 +184,10 @@ class _BudgetedProjectSandboxFactory:
         api_key: str | None,
         cpu_count: int,
         memory_mb: int,
+        create_rate_authority: ExternalDispatchRateAuthority,
         orphan_reaper: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
+        self._create_rate_authority = _validate_project_create_rate_authority(create_rate_authority)
         if not math.isfinite(timeout) or timeout <= 0 or not timeout.is_integer():
             raise ValueError("project sandbox timeout must be a positive whole number of seconds")
         if timeout > E2B_MAX_SANDBOX_TIMEOUT_S:
@@ -231,7 +259,8 @@ class _BudgetedProjectSandboxFactory:
                 lifecycle={"on_timeout": "kill", "auto_resume": False},
                 request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
             )
-            for attempt in range(len(_PROJECT_CREATE_RETRY_DELAYS_S) + 1):
+            for attempt in range(_PROJECT_CREATE_ATTEMPTS):
+                self._create_rate_authority.acquire(timeout_seconds=_PROJECT_RATE_GATE_TIMEOUT_S)
                 create_outcome = "unknown"
                 try:
                     sandbox = factory()
@@ -516,10 +545,12 @@ class AgentProject:
         memory_mb: int,
         resource_budget_account: TimedResourceBudgetAccount,
         lease_ledger_dir: Path,
+        create_rate_authority: ExternalDispatchRateAuthority,
         api_key: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> AgentProject:
         """Create one hard-budgeted owned E2B project from an immutable template build."""
+        validated_rate_authority = _validate_project_create_rate_authority(create_rate_authority)
         if metadata:
             raise ValueError("project sandbox provider metadata is controlled by WMH")
         factory = _BudgetedProjectSandboxFactory(
@@ -530,6 +561,7 @@ class AgentProject:
             api_key=api_key,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
+            create_rate_authority=validated_rate_authority,
         )
         sandbox = factory()
         return cls(

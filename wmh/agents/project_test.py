@@ -37,6 +37,12 @@ from wmh.tracking.budget import (
     TimedResourceRole,
     bootstrap_budget_ledger,
 )
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchPermit,
+    ExternalDispatchRateAuthority,
+    ExternalDispatchRatePolicy,
+)
 
 
 class _Files:
@@ -1444,6 +1450,37 @@ class _AttestedProjectSandbox(_Sandbox):
 class RateLimitException(RuntimeError):
     """Pinned E2B SDK 429 shape used without importing the optional SDK in tests."""
 
+    __module__ = "e2b.exceptions"
+
+
+_UNTRUSTED_RATE_LIMIT_EXCEPTION = type("RateLimitException", (RuntimeError,), {})
+
+
+class _ProjectRateClock:
+    def __init__(self) -> None:
+        self.now_ns = 10_000_000_000
+
+    def time_ns(self) -> int:
+        return self.now_ns
+
+    def sleep(self, seconds: float) -> None:
+        self.now_ns += int(seconds * 1_000_000_000)
+
+
+def _project_rate_authority(
+    tmp_path: Path,
+    *,
+    policy: ExternalDispatchRatePolicy = E2B_SANDBOX_CREATE_RATE_POLICY,
+    name: str = "project-create-rate.json",
+) -> ExternalDispatchRateAuthority:
+    clock = _ProjectRateClock()
+    return ExternalDispatchRateAuthority.bootstrap(
+        (tmp_path / name).resolve(),
+        policy,
+        clock_ns=clock.time_ns,
+        sleeper=clock.sleep,
+    )
+
 
 def _project_resource_account(
     tmp_path: Path,
@@ -1516,6 +1553,7 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
         memory_mb=2048,
         resource_budget_account=account,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_project_rate_authority(tmp_path),
         api_key="explicit-secret-key",
     )
 
@@ -1558,6 +1596,7 @@ def test_budgeted_project_accepts_sdk_lifecycle_mapping(
         memory_mb=2048,
         resource_budget_account=account,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_project_rate_authority(tmp_path),
         api_key="explicit-secret-key",
     )
 
@@ -1575,8 +1614,116 @@ def test_budgeted_project_rejects_timeout_above_provider_maximum(tmp_path: Path)
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=_project_rate_authority(tmp_path),
             api_key="explicit-secret-key",
         )
+
+
+def test_agent_project_requires_host_rate_authority_before_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    dispatches = 0
+    reaped: list[str] = []
+
+    def unexpected_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        def create() -> _Sandbox:
+            nonlocal dispatches
+            dispatches += 1
+            raise AssertionError("missing rate authority must precede provider dispatch")
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", unexpected_factory)
+    monkeypatch.setattr(
+        project_module,
+        "reap_e2b_runner_lease",
+        lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
+    )
+    create_without_rate = cast("Callable[..., AgentProject]", AgentProject.create)
+
+    with pytest.raises(TypeError, match="create_rate_authority"):
+        create_without_rate(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+        )
+
+    assert dispatches == 0
+    assert reaped == []
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+    assert not (tmp_path / "leases").exists()
+
+
+def test_budgeted_factory_rejects_missing_rate_authority_before_effects(tmp_path: Path) -> None:
+    account = _project_resource_account(tmp_path)
+
+    with pytest.raises(ValueError, match="create-rate authority"):
+        project_module._BudgetedProjectSandboxFactory(
+            account=account,
+            ledger_dir=(tmp_path / "leases").resolve(),
+            timeout=60,
+            template="template-immutable:build-immutable",
+            api_key=None,
+            cpu_count=2,
+            memory_mb=2048,
+            create_rate_authority=cast("ExternalDispatchRateAuthority", None),
+        )
+
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+    assert not (tmp_path / "leases").exists()
+
+
+def test_agent_project_rejects_wrong_rate_policy_before_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _project_resource_account(tmp_path)
+    wrong_policy = ExternalDispatchRatePolicy(
+        provider="e2b",
+        operation="sandbox_create",
+        maximum_dispatches=5,
+        period_milliseconds=1000,
+    )
+    authority = _project_rate_authority(tmp_path, policy=wrong_policy)
+    factories = 0
+
+    def unexpected_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
+        nonlocal factories
+        factories += 1
+        raise AssertionError("wrong rate policy must precede provider setup")
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", unexpected_factory)
+
+    with pytest.raises(ValueError, match="frozen four-per-second policy"):
+        AgentProject.create(
+            timeout=60,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=authority,
+        )
+    with pytest.raises(ValueError, match="frozen four-per-second policy"):
+        project_module._BudgetedProjectSandboxFactory(
+            account=account,
+            ledger_dir=(tmp_path / "leases").resolve(),
+            timeout=60,
+            template="template-immutable:build-immutable",
+            api_key=None,
+            cpu_count=2,
+            memory_mb=2048,
+            create_rate_authority=authority,
+        )
+
+    assert factories == 0
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+    assert not (tmp_path / "leases").exists()
 
 
 def test_budgeted_project_requires_budget_for_the_full_retry_horizon(tmp_path: Path) -> None:
@@ -1593,6 +1740,7 @@ def test_budgeted_project_requires_budget_for_the_full_retry_horizon(tmp_path: P
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=_project_rate_authority(tmp_path),
         )
 
     assert not (tmp_path / "leases").exists()
@@ -1626,6 +1774,7 @@ def test_project_budget_denial_never_dispatches_or_reaps(
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=_project_rate_authority(tmp_path),
             api_key="explicit-key",
         )
 
@@ -1664,6 +1813,7 @@ def test_project_ambiguous_create_uses_explicit_key_and_forfeits_full_ceiling(
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=_project_rate_authority(tmp_path),
             api_key="explicit-key",
         )
 
@@ -1682,12 +1832,22 @@ def test_budgeted_project_retries_definitive_e2b_rate_refusal_under_one_lease(
     create_metadata: list[dict[str, str]] = []
     sleeps: list[float] = []
     reaped: list[str] = []
+    dispatch_events: list[str] = []
+    gate_timeouts: list[float | None] = []
+    authority = _project_rate_authority(tmp_path)
+    original_acquire = authority.acquire
+
+    def acquire(*, timeout_seconds: float | None = None) -> ExternalDispatchPermit:
+        dispatch_events.append("acquire")
+        gate_timeouts.append(timeout_seconds)
+        return original_acquire(timeout_seconds=timeout_seconds)
 
     def rate_limited_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
         frozen = dict(kwargs)
 
         def create() -> _AttestedProjectSandbox:
             nonlocal create_calls
+            dispatch_events.append("dispatch")
             create_calls += 1
             create_metadata.append(dict(cast("dict[str, str]", frozen["metadata"])))
             if create_calls < 3:
@@ -1700,6 +1860,7 @@ def test_budgeted_project_retries_definitive_e2b_rate_refusal_under_one_lease(
 
     monkeypatch.setattr(project_module, "default_sandbox_factory", rate_limited_factory)
     monkeypatch.setattr(project_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(authority, "acquire", acquire)
     monkeypatch.setattr(
         project_module,
         "reap_e2b_runner_lease",
@@ -1713,10 +1874,20 @@ def test_budgeted_project_retries_definitive_e2b_rate_refusal_under_one_lease(
         memory_mb=2048,
         resource_budget_account=account,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=authority,
     )
     project.close()
 
     assert create_calls == 3
+    assert dispatch_events == [
+        "acquire",
+        "dispatch",
+        "acquire",
+        "dispatch",
+        "acquire",
+        "dispatch",
+    ]
+    assert gate_timeouts == [project_module._PROJECT_RATE_GATE_TIMEOUT_S] * 3
     assert sleeps == [1.0, 3.0]
     assert len({metadata["wmh_runner_lease"] for metadata in create_metadata}) == 1
     assert len({metadata["wmh_runner_owner"] for metadata in create_metadata}) == 1
@@ -1745,6 +1916,7 @@ def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
     create_calls = 0
     sleeps: list[float] = []
     reaped: list[str] = []
+    authority = _project_rate_authority(tmp_path)
 
     def rate_limited_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
         def create() -> _Sandbox:
@@ -1770,10 +1942,12 @@ def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=authority,
         )
 
     assert create_calls == 4
     assert sleeps == [1.0, 3.0, 9.0]
+    assert json.loads((tmp_path / "project-create-rate.json").read_text())["sequence"] == 4
     assert reaped == []
     [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
     assert reservation.status is ReservationStatus.FORFEITED
@@ -1788,10 +1962,18 @@ def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
         RuntimeError("503 capacity unavailable"),
         RuntimeError("429 too many requests"),
         RateLimitException("429: Unauthorized"),
+        _UNTRUSTED_RATE_LIMIT_EXCEPTION("429: Rate limit exceeded, please try again later."),
         RuntimeError("invalid template configuration"),
         TimeoutError("create request timed out"),
     ],
-    ids=["capacity-503", "untyped-429", "spoofed-rate-limit", "config", "timeout"],
+    ids=[
+        "capacity-503",
+        "untyped-429",
+        "wrong-status",
+        "wrong-module",
+        "config",
+        "timeout",
+    ],
 )
 def test_budgeted_project_never_retries_unproven_create_errors(
     tmp_path: Path,
@@ -1827,6 +2009,7 @@ def test_budgeted_project_never_retries_unproven_create_errors(
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=_project_rate_authority(tmp_path),
         )
 
     assert create_calls == 1
@@ -1881,6 +2064,7 @@ def test_project_activation_failure_kills_and_terminates_budget_and_lease(
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=_project_rate_authority(tmp_path),
         )
 
     assert len(created) == 1
@@ -1926,6 +2110,7 @@ def test_project_creation_fails_closed_on_network_or_volume_attestation_drift(
             memory_mb=2048,
             resource_budget_account=account,
             lease_ledger_dir=(tmp_path / "leases").resolve(),
+            create_rate_authority=_project_rate_authority(tmp_path),
         )
 
     assert len(created) == 1
