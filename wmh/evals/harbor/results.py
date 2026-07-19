@@ -727,10 +727,7 @@ def _parse_task_environment_attestation(
         else:
             requested_storage_mb = requested_value
         observed_storage_mb = parsed.get("observed_storage_mb")
-        if (
-            requested_storage_mb is None
-            and observed_storage_mb is not None
-        ) or (
+        if (requested_storage_mb is None and observed_storage_mb is not None) or (
             requested_storage_mb is not None
             and (
                 isinstance(observed_storage_mb, bool)

@@ -488,9 +488,7 @@ def test_requested_storage_changes_launch_but_reuses_the_exact_build(tmp_path: P
     build = _build()
     assert exact_environment._launch_config_digest(
         build
-    ) != larger_environment._launch_config_digest(
-        build
-    )
+    ) != larger_environment._launch_config_digest(build)
 
 
 def test_content_keyed_build_registry_reuses_only_completed_exact_ids(
@@ -1757,9 +1755,7 @@ def test_exact_create_retries_initially_empty_provider_storage_metrics(
 
     assert "disk_size_mb" not in SandboxInfo.__dataclass_fields__
     assert created[0].metric_calls == 3
-    assert created[0].metric_request_timeouts == [
-        mod._E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S
-    ] * 3
+    assert created[0].metric_request_timeouts == [mod._E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S] * 3
     assert environment.wmh_environment_attestation is not None
     asyncio.run(environment.stop(delete=True))
 

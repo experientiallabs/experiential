@@ -1079,10 +1079,7 @@ async def _attest_docker_environment(
             timeout_sec=_TASK_DISK_HEALTH_TIMEOUT_S,
         )
         available_storage_kib = _task_free_disk_kib(storage_result)
-        if (
-            available_storage_kib is None
-            or available_storage_kib < requested_storage_mb * 1024
-        ):
+        if available_storage_kib is None or available_storage_kib < requested_storage_mb * 1024:
             raise RuntimeError("Docker task filesystem does not satisfy requested storage capacity")
 
     return cast(
@@ -1146,10 +1143,7 @@ async def _attest_e2b_environment(
         raise RuntimeError("E2B returned invalid sandbox resource evidence")
     requested_storage_mb = evidence.get("requested_storage_mb")
     observed_storage_mb = evidence.get("observed_storage_mb")
-    if (
-        requested_storage_mb is None
-        and observed_storage_mb is not None
-    ) or (
+    if (requested_storage_mb is None and observed_storage_mb is not None) or (
         requested_storage_mb is not None
         and (
             isinstance(requested_storage_mb, bool)

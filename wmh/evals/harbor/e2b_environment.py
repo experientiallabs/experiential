@@ -563,11 +563,7 @@ class ExactE2BEnvironment(E2BEnvironment):
     ) -> None:
         effective_resource_config = task_env_config.model_copy(
             update={
-                **(
-                    {"storage_mb": override_storage_mb}
-                    if override_storage_mb is not None
-                    else {}
-                ),
+                **({"storage_mb": override_storage_mb} if override_storage_mb is not None else {}),
                 **({"gpus": override_gpus} if override_gpus is not None else {}),
                 **({"tpu": override_tpu} if override_tpu is not None else {}),
             },
@@ -1044,9 +1040,7 @@ async def _observe_e2b_storage_capacity_mb(
 
     metrics: list[object] = []
     for attempt in range(_E2B_STORAGE_METRIC_ATTEMPTS):
-        reported = await sandbox.get_metrics(
-            request_timeout=_E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S
-        )
+        reported = await sandbox.get_metrics(request_timeout=_E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S)
         if not isinstance(reported, list):
             raise RuntimeError("E2B task sandbox storage metrics were malformed")
         if reported:
