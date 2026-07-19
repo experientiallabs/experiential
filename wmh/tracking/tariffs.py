@@ -146,11 +146,13 @@ def _bedrock_tariff(
 
 
 _CATALOG = (
+    # The ``us.`` inference profiles use Bedrock's Geo Cross-Region rates, not the lower
+    # ``global.`` profile rates.
     _bedrock_tariff(
         model_type="claude-haiku-4-5",
         model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        input_usd="1",
-        output_usd="5",
+        input_usd="1.1",
+        output_usd="5.5",
     ),
     _bedrock_tariff(
         model_type="glm-5",
@@ -161,7 +163,7 @@ _CATALOG = (
     _bedrock_tariff(
         model_type="claude-opus-4-8",
         model="us.anthropic.claude-opus-4-8",
-        input_usd="5",
-        output_usd="25",
+        input_usd="5.5",
+        output_usd="27.5",
     ),
 )

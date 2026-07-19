@@ -216,6 +216,18 @@ def test_partial_usage_fails_closed() -> None:
         )
 
 
+def test_null_usage_counter_fails_closed() -> None:
+    with pytest.raises(ValueError, match="usage counters"):
+        bedrock_converse_response(
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": None, "outputTokens": 1},
+            },
+            _MODEL,
+        )
+
+
 def test_signed_reasoning_replay_is_bound_to_originating_model() -> None:
     content = [
         {"reasoningContent": {"reasoningText": {"text": "inspect", "signature": "sig"}}},

@@ -23,11 +23,11 @@ from wmh.tracking.tariffs import (
         (
             "claude-haiku-4-5",
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            1_000,
-            5_000,
+            1_100,
+            5_500,
         ),
         ("glm-5", "zai.glm-5", 1_000, 3_200),
-        ("claude-opus-4-8", "us.anthropic.claude-opus-4-8", 5_000, 25_000),
+        ("claude-opus-4-8", "us.anthropic.claude-opus-4-8", 5_500, 27_500),
     ],
 )
 def test_catalog_freezes_verified_bedrock_routes_and_exact_nominal_prices(

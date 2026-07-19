@@ -400,8 +400,6 @@ def _object(value: object, label: str) -> dict[str, object]:
 
 
 def _usage_count(value: object) -> int:
-    if value is None:
-        return 0
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError("Bedrock Converse usage counters must be non-negative integers")
     return value
