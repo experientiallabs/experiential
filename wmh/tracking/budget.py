@@ -1192,6 +1192,38 @@ class BudgetSnapshot(BaseModel):
     breached: bool
 
 
+class BudgetAuditState(BaseModel):
+    """One atomic, fully audited ledger head, reservation set, and exposure snapshot."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    audit_version: Literal["1"] = "1"
+    policy: BudgetPolicy
+    policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
+    ledger_head_sequence: int = Field(ge=1, le=_SQLITE_INTEGER_MAX)
+    ledger_head_digest: str = Field(pattern=_DIGEST_PATTERN)
+    snapshot: BudgetSnapshot
+    reservations: tuple[BudgetReservation, ...]
+
+    @model_validator(mode="after")
+    def _validate_audit_state(self) -> Self:
+        if self.policy_digest != self.policy.policy_digest:
+            raise ValueError("budget audit policy digest is inconsistent")
+        reservation_ids = tuple(item.reservation_id for item in self.reservations)
+        if reservation_ids != tuple(sorted(set(reservation_ids))):
+            raise ValueError("budget audit reservations must be unique and canonical")
+        expected = _snapshot_from_reservations(self.policy, list(self.reservations))
+        if self.snapshot != expected:
+            raise ValueError("budget audit snapshot differs from its reservations")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return the exact public identity of this audited ledger state."""
+        return _digest_json(self.model_dump(mode="json"))
+
+
 class _BudgetOpened(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -1543,6 +1575,23 @@ class SpendLedger:
                 self._verified_reservations[reservation_id].model_copy(deep=True)
                 for reservation_id in sorted(self._verified_reservations)
             ]
+
+    def audit_state(self) -> BudgetAuditState:
+        """Return one transactionally consistent, content-addressed ledger audit state."""
+        with self._verified_transaction():
+            reservations = tuple(
+                self._verified_reservations[reservation_id].model_copy(deep=True)
+                for reservation_id in sorted(self._verified_reservations)
+            )
+            return BudgetAuditState(
+                policy=self._policy.model_copy(deep=True),
+                policy_digest=self._policy.policy_digest,
+                ledger_identity=self.ledger_identity,
+                ledger_head_sequence=self._verified_sequence,
+                ledger_head_digest=self._verified_digest,
+                snapshot=_snapshot_from_reservations(self._policy, list(reservations)),
+                reservations=reservations,
+            )
 
     def settlement_provenance(
         self,
