@@ -23,7 +23,7 @@ from pathlib import Path
 
 MANIFEST_FILE = "manifest.json"
 _SCHEMA_VERSION = 1
-_CHUNK = 65536  # 64 KiB read chunks — keeps memory flat for large index files
+_CHUNK = 65536  # 64 KiB read chunks; keeps memory flat for large index files
 
 
 def _sha256(path: Path) -> str:
@@ -106,7 +106,7 @@ def write_manifest(artifact_dir: str | Path, files: list[Path]) -> None:
         try:
             rel = path.relative_to(root)
         except ValueError:
-            continue  # file outside the artifact root — skip
+            continue  # File is outside the artifact root; skip.
         checksums[str(rel)] = _sha256(path)
     payload = {
         "schema_version": _SCHEMA_VERSION,

@@ -38,7 +38,7 @@ def load_world_model(
                 bad = [f.name for f in result.files if not f.ok]
                 warnings.warn(
                     f"artifact integrity check failed for {bad}; "
-                    "the model may produce incorrect results — rebuild with `wmh build`",
+                    "the model may produce incorrect results. Rebuild with `wmh build`.",
                     stacklevel=2,
                 )
         except ManifestMismatch:
