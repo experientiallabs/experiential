@@ -21,6 +21,7 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import BudgetAccount
 
 _console = Console()
 _OUTPUT_LEASE_SUFFIX = ".wmh-eval-output.lock"
@@ -122,6 +123,16 @@ def eval_harness(
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project artifact directory."),
     out: str = typer.Option(..., "--out", help="Canonical benchmark result JSON output."),
+    budget_account_path: str | None = typer.Option(
+        None,
+        "--budget-account",
+        help="Frozen BudgetAccount JSON. Required unless development bypass is explicit.",
+    ),
+    allow_unbudgeted_development: bool = typer.Option(
+        False,
+        "--allow-unbudgeted-development",
+        help="Explicitly permit an unmetered development run. Never use for paid experiments.",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -145,6 +156,18 @@ def eval_harness(
         azure_api_version=azure_api_version,
         bedrock_region=bedrock_region,
     )
+    if budget_account_path is not None and allow_unbudgeted_development:
+        raise typer.BadParameter(
+            "--budget-account and --allow-unbudgeted-development are mutually exclusive"
+        )
+    if budget_account_path is None and not allow_unbudgeted_development:
+        raise typer.BadParameter(
+            "paid harness evaluation requires --budget-account; use "
+            "--allow-unbudgeted-development only for an explicitly unmetered local check"
+        )
+    budget_account = (
+        _load_budget_account(budget_account_path) if budget_account_path is not None else None
+    )
     backend = _parse_task_backend(task_backend)
     resolved_jobs_dir = (
         Path(jobs_dir).expanduser().resolve()
@@ -165,6 +188,7 @@ def eval_harness(
             provider_config,
             runner_image=runner_image,
             turn_timeout_s=turn_timeout_s,
+            budget_account=budget_account,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -237,6 +261,21 @@ def _load_harness(selector: str, root: str) -> HarnessDoc:
             param_hint="HARNESS",
         )
     return candidate
+
+
+def _load_budget_account(path: str) -> BudgetAccount:
+    account_path = Path(path).expanduser()
+    if account_path.is_symlink():
+        raise typer.BadParameter(
+            "budget account file cannot be a symlink",
+            param_hint="--budget-account",
+        )
+    try:
+        if not account_path.is_file():
+            raise ValueError("budget account path must be a regular file")
+        return BudgetAccount.model_validate_json(account_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--budget-account") from exc
 
 
 def _build_dataset_config(

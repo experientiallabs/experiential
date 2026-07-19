@@ -1,11 +1,29 @@
-"""Run tracking: time + cost + tokens across the harness lifecycle.
+"""Run tracking, cost accounting, and hard-budget admission.
 
 Instrument at the provider boundary (`MeteredProvider`) so the world model, GEPA, and the judge are
 all metered without changes to those modules. `RunTracker` aggregates `UsageEvent`s into
 `UsageTotals` (priced via `wmh.tracking.pricing`) plus a wall-clock duration from an injectable
 `Clock`; `RunRecord`s persist under `.wmh/runs/`.
+
+Paid experiments use `SpendLedger` and `BudgetedProvider` separately from descriptive run
+tracking. The ledger reserves a conservative call ceiling before dispatch, which makes its hard
+cap an admission rule instead of a report generated after spend has already occurred.
 """
 
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetBreachError,
+    BudgetedProvider,
+    BudgetExceededError,
+    BudgetIntegrityError,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    SpendLedger,
+    TokenPriceCeiling,
+    nano_usd_from_usd,
+    open_shared_spend_ledger,
+)
 from wmh.tracking.clock import Clock, SystemClock
 from wmh.tracking.metered import MeteredProvider, classify_build_call
 from wmh.tracking.pricing import ModelPrice, cost_usd, price_for
@@ -19,9 +37,17 @@ from wmh.tracking.tracker import (
 )
 
 __all__ = [
+    "BudgetAccount",
+    "BudgetBreachError",
+    "BudgetExceededError",
+    "BudgetIntegrityError",
+    "BudgetPolicy",
+    "BudgetScope",
+    "BudgetedProvider",
     "Clock",
     "SystemClock",
     "MeteredProvider",
+    "ProviderCostMeter",
     "classify_build_call",
     "ModelPrice",
     "cost_usd",
@@ -31,6 +57,10 @@ __all__ = [
     "Phase",
     "RunRecord",
     "RunTracker",
+    "SpendLedger",
     "UsageEvent",
     "UsageTotals",
+    "TokenPriceCeiling",
+    "nano_usd_from_usd",
+    "open_shared_spend_ledger",
 ]

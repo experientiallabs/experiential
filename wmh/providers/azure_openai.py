@@ -10,7 +10,7 @@ api_version come from ProviderConfig.deployment / ProviderConfig.api_version.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
 from wmh.providers import _openai_common
@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 class AzureOpenAIProvider:
     """GPT 5.5 via an Azure OpenAI deployment."""
+
+    paid_request_attempts: Literal[1] = 1
 
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config

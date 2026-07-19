@@ -55,7 +55,8 @@ uv run wmh harness init pi-baseline --runtime pi-node
 uv run wmh harness eval pi-baseline@champion \
   --dataset-path ./benchmark-tasks \
   --provider bedrock --model "$BEDROCK_MODEL_ID" --bedrock-region "$AWS_REGION" \
-  --attempts 1 --concurrency 1 --out result.json
+  --attempts 1 --concurrency 1 --out result.json \
+  --allow-unbudgeted-development
 ```
 
 Local Docker task environments are the default. Local tasks must name a prebuilt image; WMH keeps
@@ -78,8 +79,13 @@ uv run wmh harness eval pi-baseline@champion \
   --azure-endpoint "$AZURE_OPENAI_ENDPOINT" \
   --azure-deployment "$AZURE_OPENAI_DEPLOYMENT" \
   --azure-api-version "$AZURE_OPENAI_API_VERSION" \
-  --task-backend e2b --concurrency 50 --out result-e2b.json
+  --task-backend e2b --concurrency 50 --out result-e2b.json \
+  --budget-account ./frozen-budget-account.json
 ```
+
+Paid evaluation fails closed unless `--budget-account` supplies a frozen provider route, tariff,
+estimator, hard cap, phase cap, ledger, and attribution scope. The explicit development bypass is
+for unmetered local checks only.
 
 WMH does not inject provider credentials into the task or pi-runner environment. The local
 prebuilt-image policy also rejects run-level environment imports, host mounts, Compose overlays,

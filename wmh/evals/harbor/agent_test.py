@@ -41,6 +41,13 @@ from wmh.providers.process_worker import (
     ProviderWorkerDeadlineExceeded,
     ProviderWorkerUnavailable,
 )
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    TokenPriceCeiling,
+)
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
     "JsonObject",
@@ -206,6 +213,45 @@ def _provider_receipt_payload(
             "turn_call_index": call_index,
         },
     )
+
+
+def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path) -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    policy = BudgetPolicy(
+        study_id="study",
+        manifest_digest="sha256:" + "a" * 64,
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"search": 1_000_000},
+        meters={
+            "worker": ProviderCostMeter(
+                provider_config=config,
+                price=TokenPriceCeiling(
+                    input_nano_usd_per_token=1,
+                    output_nano_usd_per_token=5,
+                ),
+            )
+        },
+    )
+    account = BudgetAccount(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=policy,
+        scope=BudgetScope(
+            phase="search",
+            category="worker",
+            run_id="candidate-1",
+        ),
+        meter_id="worker",
+    )
+
+    agent = mod.WmhPiAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="bedrock/model",
+        harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
+        provider_config=cast("JsonObject", config.model_dump(mode="json")),
+        budget_account=cast("JsonObject", account.model_dump(mode="json")),
+    )
+
+    assert agent._budget_account == account
 
 
 @pytest.mark.parametrize("turn_timeout_s", [float("nan"), float("inf"), float("-inf")])

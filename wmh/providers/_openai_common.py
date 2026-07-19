@@ -91,12 +91,18 @@ def complete(
         raise ValueError(f"{model} returned no choices")
     text = response.choices[0].message.content or ""
     usage = response.usage
-    token_usage = (
-        TokenUsage(input_tokens=usage.prompt_tokens, output_tokens=usage.completion_tokens)
-        if usage is not None
-        else TokenUsage()
+    if usage is None:
+        # Preserve provenance: hard-budget callers distinguish missing metering from a genuine
+        # provider-reported zero. Supplying a default TokenUsage here would incorrectly settle a
+        # paid request at $0 instead of forfeiting its conservative reservation.
+        return Completion(text=text)
+    return Completion(
+        text=text,
+        usage=TokenUsage(
+            input_tokens=usage.prompt_tokens,
+            output_tokens=usage.completion_tokens,
+        ),
     )
-    return Completion(text=text, usage=token_usage)
 
 
 def complete_chat(

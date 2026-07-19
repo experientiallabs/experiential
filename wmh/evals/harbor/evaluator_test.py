@@ -600,6 +600,57 @@ def test_evaluator_builds_and_hashes_the_final_agent_concurrency(tmp_path: Path)
     assert harbor_agent_config_digest(job_config.agents[0]) == harbor_agent_config_digest(agent)
 
 
+def test_evaluator_binds_serialized_budget_account_into_agent_identity(tmp_path: Path) -> None:
+    from wmh.tracking.budget import (
+        BudgetAccount,
+        BudgetPolicy,
+        BudgetScope,
+        ProviderCostMeter,
+        TokenPriceCeiling,
+    )
+
+    provider_config = _provider()
+    account = BudgetAccount(
+        ledger_path=(tmp_path / "budget.sqlite3").resolve(),
+        policy=BudgetPolicy(
+            study_id="study",
+            manifest_digest="sha256:" + "b" * 64,
+            hard_limit_nano_usd=1_000_000,
+            phase_limits_nano_usd={"search": 1_000_000},
+            meters={
+                "worker": ProviderCostMeter(
+                    provider_config=provider_config,
+                    price=TokenPriceCeiling(
+                        input_nano_usd_per_token=1,
+                        output_nano_usd_per_token=5,
+                    ),
+                )
+            },
+        ),
+        scope=BudgetScope(
+            phase="search",
+            category="worker",
+            run_id="candidate-1",
+        ),
+        meter_id="worker",
+    )
+    evaluator = mod.HarborEvaluator(
+        _spec(tmp_path, tmp_path / "dataset"),
+        provider_config,
+        budget_account=account,
+    )
+
+    agent = evaluator._build_agent(pi_node_baseline("candidate"))
+
+    serialized_account = agent.kwargs["budget_account"]
+    assert serialized_account == account.model_dump(mode="json")
+    without_budget = mod.HarborEvaluator(
+        _spec(tmp_path, tmp_path / "dataset"),
+        _provider(),
+    )._build_agent(pi_node_baseline("candidate"))
+    assert harbor_agent_config_digest(agent) != harbor_agent_config_digest(without_budget)
+
+
 def test_evaluator_runs_with_agent_concurrency_below_trial_concurrency(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

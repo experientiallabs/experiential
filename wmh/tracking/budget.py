@@ -1,0 +1,1320 @@
+"""Crash-safe hard-budget admission and provider-boundary cost ceilings.
+
+The budget database is an append-only, hash-chained audit log plus a transactionally maintained
+reservation index. A paid call must reserve its conservative maximum cost before dispatch. Exact
+usage settles the reservation; missing usage or an exception forfeits the full ceiling. Open
+reservations continue to consume budget after a process crash, so an orphaned request can never
+silently release money for a second call.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+import stat
+import threading
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from decimal import ROUND_CEILING, Decimal
+from enum import StrEnum
+from pathlib import Path
+from typing import Annotated, Literal, Self, cast
+from uuid import uuid4
+
+from llm_waterfall import ChatRequest, ChatResponse
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+
+from wmh.providers.base import (
+    DEFAULT_MAX_TOKENS,
+    Completion,
+    Message,
+    Provider,
+    ProviderConfig,
+    SingleDispatchProvider,
+    ToolCallingProvider,
+    VerifyResult,
+    verify_via_ping,
+)
+
+_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_ZERO_DIGEST = "sha256:" + "0" * 64
+_SCHEMA_VERSION = 1
+_DEFAULT_BUSY_TIMEOUT_MS = 30_000
+_NANO_USD_PER_USD = 1_000_000_000
+_TOKENS_PER_MILLION = 1_000_000
+_SQLITE_INTEGER_MAX = (1 << 63) - 1
+
+
+class BudgetExceededError(RuntimeError):
+    """A call cannot start inside the frozen hard or phase budget."""
+
+
+class BudgetBreachError(RuntimeError):
+    """Observed usage exceeded a pre-dispatch ceiling or a prior breach exists."""
+
+
+class BudgetIntegrityError(RuntimeError):
+    """The persisted policy, event chain, or derived reservation state is invalid."""
+
+
+class ReservationStatus(StrEnum):
+    """Terminal or open state of one pre-dispatch cost reservation."""
+
+    RESERVED = "reserved"
+    SETTLED = "settled"
+    FORFEITED = "forfeited"
+    BREACHED = "breached"
+
+
+class BudgetBreachKind(StrEnum):
+    """Bounded reason a charged call violated its reservation contract."""
+
+    RESERVATION = "reservation"
+    INPUT_TOKEN_CEILING = "input_token_ceiling"
+    OUTPUT_TOKEN_CEILING = "output_token_ceiling"
+
+
+class BudgetScope(BaseModel):
+    """Typed attribution attached to every reservation without carrying prompt data."""
+
+    model_config = ConfigDict(frozen=True)
+
+    phase: str = Field(min_length=1)
+    category: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    lane: str | None = None
+    arm: str | None = None
+
+    @field_validator("phase", "category", "run_id", "lane", "arm")
+    @classmethod
+    def _strip_nonempty(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("budget scope strings cannot be blank")
+        return stripped
+
+
+class TokenPriceCeiling(BaseModel):
+    """Frozen upper-bound price per token, represented exactly in nano-USD."""
+
+    model_config = ConfigDict(frozen=True)
+
+    input_nano_usd_per_token: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    output_nano_usd_per_token: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+
+    @model_validator(mode="after")
+    def _require_priced_calls(self) -> Self:
+        if self.input_nano_usd_per_token == self.output_nano_usd_per_token == 0:
+            raise ValueError("at least one token price must be positive")
+        return self
+
+    def charge(self, *, input_tokens: int, output_tokens: int) -> int:
+        """Price nonnegative token counts without floating-point rounding."""
+        if input_tokens < 0 or output_tokens < 0:
+            raise ValueError("token counts cannot be negative")
+        if input_tokens > _SQLITE_INTEGER_MAX or output_tokens > _SQLITE_INTEGER_MAX:
+            raise OverflowError("token counts must fit a SQLite integer")
+        charged = (
+            input_tokens * self.input_nano_usd_per_token
+            + output_tokens * self.output_nano_usd_per_token
+        )
+        if charged > _SQLITE_INTEGER_MAX:
+            raise OverflowError("priced token ceiling does not fit a SQLite integer")
+        return charged
+
+    @classmethod
+    def from_usd_per_million(
+        cls,
+        *,
+        input_usd: Decimal | str | int,
+        output_usd: Decimal | str | int,
+    ) -> TokenPriceCeiling:
+        """Convert public USD-per-million prices into conservative integer ceilings."""
+        return cls(
+            input_nano_usd_per_token=_nano_usd_per_token(input_usd),
+            output_nano_usd_per_token=_nano_usd_per_token(output_usd),
+        )
+
+
+class ProviderCostMeter(BaseModel):
+    """One immutable provider route, tariff ceiling, and input estimator."""
+
+    model_config = ConfigDict(frozen=True)
+
+    provider_config: ProviderConfig
+    price: TokenPriceCeiling
+    input_estimator: Literal["canonical-json-utf8-v1"] = "canonical-json-utf8-v1"
+    input_overhead_tokens: int = Field(default=8192, ge=1, le=_SQLITE_INTEGER_MAX)
+
+
+class BudgetPolicy(BaseModel):
+    """Immutable experiment caps and route-specific conservative tariffs."""
+
+    model_config = ConfigDict(frozen=True)
+
+    study_id: str = Field(min_length=1)
+    manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    hard_limit_nano_usd: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+    phase_limits_nano_usd: dict[str, int] = Field(min_length=1)
+    meters: dict[str, ProviderCostMeter] = Field(min_length=1)
+
+    @field_validator("phase_limits_nano_usd")
+    @classmethod
+    def _validate_phases(cls, value: dict[str, int]) -> dict[str, int]:
+        if any(not phase.strip() for phase in value):
+            raise ValueError("budget phase names cannot be blank")
+        if any(limit < 0 or limit > _SQLITE_INTEGER_MAX for limit in value.values()):
+            raise ValueError("budget phase limits must fit a nonnegative SQLite integer")
+        return dict(sorted(value.items()))
+
+    @field_validator("meters")
+    @classmethod
+    def _validate_meters(
+        cls,
+        value: dict[str, ProviderCostMeter],
+    ) -> dict[str, ProviderCostMeter]:
+        if any(not meter_id.strip() for meter_id in value):
+            raise ValueError("budget meter ids cannot be blank")
+        return dict(sorted(value.items()))
+
+    @model_validator(mode="after")
+    def _validate_total(self) -> Self:
+        if sum(self.phase_limits_nano_usd.values()) > self.hard_limit_nano_usd:
+            raise ValueError("budget phase limits cannot sum above the hard limit")
+        return self
+
+    @property
+    def policy_digest(self) -> str:
+        """Return the canonical digest that binds every ledger open."""
+        return _digest_json(self.model_dump(mode="json"))
+
+
+class BudgetAccount(BaseModel):
+    """Serializable provider-call budget binding used by local and worker processes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ledger_path: Path
+    policy: BudgetPolicy
+    scope: BudgetScope
+    meter_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _bind_scope_to_policy(self) -> Self:
+        if not self.ledger_path.is_absolute():
+            raise ValueError("budget ledger_path must be absolute for cross-process workers")
+        if self.scope.phase not in self.policy.phase_limits_nano_usd:
+            raise ValueError(f"budget scope phase {self.scope.phase!r} is absent from policy")
+        if self.meter_id not in self.policy.meters:
+            raise ValueError(f"budget meter {self.meter_id!r} is absent from policy")
+        return self
+
+
+class BudgetReservation(BaseModel):
+    """Current state reconstructed from one reservation's append-only events."""
+
+    model_config = ConfigDict(frozen=True)
+
+    reservation_id: str = Field(min_length=1)
+    scope: BudgetScope
+    meter_id: str = Field(min_length=1)
+    max_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    charged_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    status: ReservationStatus
+    input_tokens: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
+    output_tokens: int | None = Field(default=None, ge=0, le=_SQLITE_INTEGER_MAX)
+    failure_type: str | None = None
+    breach_kind: BudgetBreachKind | None = None
+
+
+class BudgetSnapshot(BaseModel):
+    """Atomic exposure summary used by operator gates and call admission."""
+
+    model_config = ConfigDict(frozen=True)
+
+    hard_limit_nano_usd: int
+    charged_nano_usd: int
+    reserved_nano_usd: int
+    remaining_nano_usd: int
+    by_phase_nano_usd: dict[str, int]
+    breached: bool
+
+
+class _BudgetOpened(BaseModel):
+    kind: Literal["opened"] = "opened"
+    policy: BudgetPolicy
+
+
+class _BudgetReserved(BaseModel):
+    kind: Literal["reserved"] = "reserved"
+    reservation_id: str = Field(min_length=1)
+    scope: BudgetScope
+    meter_id: str = Field(min_length=1)
+    max_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+
+
+class _BudgetSettled(BaseModel):
+    kind: Literal["settled"] = "settled"
+    reservation_id: str = Field(min_length=1)
+    charged_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    input_tokens: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    output_tokens: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    status: Literal[ReservationStatus.SETTLED, ReservationStatus.BREACHED]
+    breach_kind: BudgetBreachKind | None = None
+
+    @model_validator(mode="after")
+    def _validate_breach(self) -> Self:
+        if self.status is ReservationStatus.BREACHED and self.breach_kind is None:
+            raise ValueError("breached settlement requires a breach kind")
+        if self.status is ReservationStatus.SETTLED and self.breach_kind is not None:
+            raise ValueError("ordinary settlement cannot carry a breach kind")
+        return self
+
+
+class _BudgetForfeited(BaseModel):
+    kind: Literal["forfeited"] = "forfeited"
+    reservation_id: str = Field(min_length=1)
+    charged_nano_usd: int = Field(ge=0, le=_SQLITE_INTEGER_MAX)
+    failure_type: str = Field(min_length=1)
+
+
+_BudgetAction = Annotated[
+    _BudgetOpened | _BudgetReserved | _BudgetSettled | _BudgetForfeited,
+    Field(discriminator="kind"),
+]
+
+
+class BudgetEvent(BaseModel):
+    """One immutable hash-linked ledger event."""
+
+    model_config = ConfigDict(frozen=True)
+
+    sequence: int = Field(ge=1)
+    recorded_at: datetime
+    previous_digest: str = Field(pattern=_DIGEST_PATTERN)
+    action: _BudgetAction
+    digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator("recorded_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("budget event timestamps must include a timezone")
+        return value
+
+
+class SpendLedger:
+    """SQLite-backed atomic reservation ledger with an append-only audit chain."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        policy: BudgetPolicy,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        requested = Path(path).expanduser()
+        if requested.is_symlink():
+            raise BudgetIntegrityError(f"budget ledger path cannot be a symlink: {requested}")
+        requested.parent.mkdir(parents=True, exist_ok=True)
+        self.path = requested.parent.resolve() / requested.name
+        if self.path.exists() and not stat.S_ISREG(self.path.stat(follow_symlinks=False).st_mode):
+            raise BudgetIntegrityError(f"budget ledger path must be a regular file: {self.path}")
+        self._policy = BudgetPolicy.model_validate(policy.model_dump())
+        self._now = now or (lambda: datetime.now(UTC))
+        self._state_lock = threading.RLock()
+        self._verified_sequence = 0
+        self._verified_digest = _ZERO_DIGEST
+        self._verified_reservations: dict[str, BudgetReservation] = {}
+        self._initialize()
+        ledger_stat = self.path.stat(follow_symlinks=False)
+        self._file_identity = (ledger_stat.st_dev, ledger_stat.st_ino)
+        self.audit()
+
+    @property
+    def policy(self) -> BudgetPolicy:
+        """Return a defensive policy copy; callers cannot mutate admission state in memory."""
+        return self._policy.model_copy(deep=True)
+
+    def reserve(
+        self,
+        scope: BudgetScope,
+        *,
+        meter_id: str,
+        max_nano_usd: int,
+        reservation_id: str,
+    ) -> BudgetReservation:
+        """Atomically reserve a call ceiling before any external side effect."""
+        if max_nano_usd < 0:
+            raise ValueError("reservation ceiling cannot be negative")
+        if not reservation_id.strip():
+            raise ValueError("reservation_id cannot be blank")
+        scope = BudgetScope.model_validate(scope.model_dump())
+        if scope.phase not in self._policy.phase_limits_nano_usd:
+            raise ValueError(f"unknown budget phase {scope.phase!r}")
+        if meter_id not in self._policy.meters:
+            raise ValueError(f"unknown budget meter {meter_id!r}")
+        with self._verified_transaction() as connection:
+            snapshot = _snapshot_from_reservations(
+                self._policy,
+                list(self._verified_reservations.values()),
+            )
+            if snapshot.breached:
+                raise BudgetBreachError("budget ledger is already breached; no call may start")
+            hard_remaining = snapshot.remaining_nano_usd
+            if max_nano_usd > hard_remaining:
+                raise BudgetExceededError(
+                    f"hard budget cannot reserve {max_nano_usd} nano-USD; "
+                    f"remaining={hard_remaining}"
+                )
+            phase_limit = self._policy.phase_limits_nano_usd[scope.phase]
+            phase_used = snapshot.by_phase_nano_usd[scope.phase]
+            phase_remaining = phase_limit - phase_used
+            if max_nano_usd > phase_remaining:
+                raise BudgetExceededError(
+                    f"phase {scope.phase!r} cannot reserve {max_nano_usd} nano-USD; "
+                    f"remaining={phase_remaining}"
+                )
+            action = _BudgetReserved(
+                reservation_id=reservation_id,
+                scope=scope,
+                meter_id=meter_id,
+                max_nano_usd=max_nano_usd,
+            )
+            self._append_event(connection, action)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO budget_reservations (
+                        reservation_id, scope_json, meter_id, max_nano_usd, charged_nano_usd,
+                        status, input_tokens, output_tokens, failure_type, breach_kind
+                    ) VALUES (?, ?, ?, ?, 0, ?, NULL, NULL, NULL, NULL)
+                    """,
+                    (
+                        reservation_id,
+                        _canonical_json(scope.model_dump(mode="json")),
+                        meter_id,
+                        max_nano_usd,
+                        ReservationStatus.RESERVED.value,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise BudgetIntegrityError(
+                    f"duplicate budget reservation_id {reservation_id!r}"
+                ) from exc
+        return self._reservation(reservation_id)
+
+    def settle(
+        self,
+        reservation_id: str,
+        *,
+        charged_nano_usd: int,
+        input_tokens: int,
+        output_tokens: int,
+        breach_kind: BudgetBreachKind | None = None,
+    ) -> BudgetReservation:
+        """Settle exact usage, recording and raising after any ceiling breach."""
+        if min(charged_nano_usd, input_tokens, output_tokens) < 0:
+            raise ValueError("settlement cost and token counts cannot be negative")
+        breached = False
+        resolved_breach = breach_kind
+        with self._verified_transaction() as connection:
+            reservation = self._verified_reservation(connection, reservation_id)
+            if reservation.status is not ReservationStatus.RESERVED:
+                raise BudgetIntegrityError(
+                    f"reservation {reservation_id!r} is already {reservation.status.value}"
+                )
+            if charged_nano_usd > reservation.max_nano_usd:
+                resolved_breach = BudgetBreachKind.RESERVATION
+            breached = resolved_breach is not None
+            status = ReservationStatus.BREACHED if breached else ReservationStatus.SETTLED
+            self._append_event(
+                connection,
+                _BudgetSettled(
+                    reservation_id=reservation_id,
+                    charged_nano_usd=charged_nano_usd,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    status=status,
+                    breach_kind=resolved_breach,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE budget_reservations
+                SET charged_nano_usd = ?, status = ?, input_tokens = ?, output_tokens = ?,
+                    breach_kind = ?
+                WHERE reservation_id = ?
+                """,
+                (
+                    charged_nano_usd,
+                    status.value,
+                    input_tokens,
+                    output_tokens,
+                    resolved_breach.value if resolved_breach is not None else None,
+                    reservation_id,
+                ),
+            )
+        settled = self._reservation(reservation_id)
+        if breached:
+            assert resolved_breach is not None
+            detail = {
+                BudgetBreachKind.RESERVATION: (
+                    f"exceeded its {settled.max_nano_usd} nano-USD reservation"
+                ),
+                BudgetBreachKind.INPUT_TOKEN_CEILING: "exceeded its input-token ceiling",
+                BudgetBreachKind.OUTPUT_TOKEN_CEILING: "exceeded its output-token ceiling",
+            }[resolved_breach]
+            raise BudgetBreachError(f"reservation {reservation_id!r} {detail}")
+        return settled
+
+    def forfeit(self, reservation_id: str, *, failure_type: str) -> BudgetReservation:
+        """Charge a full ceiling when exact provider usage cannot be proved."""
+        if not failure_type.strip():
+            raise ValueError("failure_type cannot be blank")
+        with self._verified_transaction() as connection:
+            reservation = self._verified_reservation(connection, reservation_id)
+            if reservation.status is not ReservationStatus.RESERVED:
+                raise BudgetIntegrityError(
+                    f"reservation {reservation_id!r} is already {reservation.status.value}"
+                )
+            self._append_event(
+                connection,
+                _BudgetForfeited(
+                    reservation_id=reservation_id,
+                    charged_nano_usd=reservation.max_nano_usd,
+                    failure_type=failure_type,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE budget_reservations
+                SET charged_nano_usd = max_nano_usd, status = ?, failure_type = ?
+                WHERE reservation_id = ?
+                """,
+                (ReservationStatus.FORFEITED.value, failure_type, reservation_id),
+            )
+        return self._reservation(reservation_id)
+
+    def snapshot(self) -> BudgetSnapshot:
+        """Return one transactionally consistent exposure snapshot."""
+        with self._verified_transaction():
+            return _snapshot_from_reservations(
+                self._policy,
+                list(self._verified_reservations.values()),
+            )
+
+    def reservations(self) -> list[BudgetReservation]:
+        """Return every current reservation state in stable identity order."""
+        with self._verified_transaction():
+            return [
+                self._verified_reservations[reservation_id].model_copy(deep=True)
+                for reservation_id in sorted(self._verified_reservations)
+            ]
+
+    def events(self) -> list[BudgetEvent]:
+        """Return the append-only audit events after verifying each serialized entry."""
+        with self._state_lock:
+            self._audit_unlocked()
+            verified_sequence = self._verified_sequence
+            with self._connection() as connection:
+                rows = connection.execute(
+                    "SELECT sequence, entry_json FROM budget_events "
+                    "WHERE sequence <= ? ORDER BY sequence",
+                    (verified_sequence,),
+                ).fetchall()
+            events = [
+                self._parse_event(row["entry_json"], sequence=row["sequence"]) for row in rows
+            ]
+            previous = _ZERO_DIGEST
+            for expected_sequence, event in enumerate(events, start=1):
+                if (
+                    event.sequence != expected_sequence
+                    or event.previous_digest != previous
+                    or _event_digest(event) != event.digest
+                ):
+                    raise BudgetIntegrityError(
+                        f"budget event {expected_sequence} changed after full audit"
+                    )
+                previous = event.digest
+            return events
+
+    def audit(self) -> None:
+        """Rebuild state from the full hash chain and compare the derived index exactly."""
+        with self._state_lock:
+            self._audit_unlocked()
+
+    def _audit_unlocked(self) -> None:
+        """Full audit implementation; caller owns the process-local state lock."""
+        # Read the log and its derived index from one SQLite snapshot. Paid workers may append
+        # concurrently while orchestration audits; two independent connections would otherwise
+        # report a false integrity failure merely because a reservation landed between reads.
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            event_rows = connection.execute(
+                "SELECT sequence, entry_json FROM budget_events ORDER BY sequence"
+            ).fetchall()
+            reservation_rows = connection.execute(
+                "SELECT * FROM budget_reservations ORDER BY reservation_id"
+            ).fetchall()
+        events = [
+            self._parse_event(row["entry_json"], sequence=row["sequence"]) for row in event_rows
+        ]
+        if not events:
+            raise BudgetIntegrityError("budget ledger has no genesis event")
+        previous = _ZERO_DIGEST
+        reconstructed: dict[str, BudgetReservation] = {}
+        for expected_sequence, event in enumerate(events, start=1):
+            if event.sequence != expected_sequence:
+                raise BudgetIntegrityError(
+                    f"budget event sequence gap at {expected_sequence}, found {event.sequence}"
+                )
+            if event.previous_digest != previous:
+                raise BudgetIntegrityError(
+                    f"budget event {event.sequence} previous digest does not match"
+                )
+            if _event_digest(event) != event.digest:
+                raise BudgetIntegrityError(f"budget event {event.sequence} digest does not match")
+            _apply_budget_event(self._policy, event, reconstructed)
+            previous = event.digest
+        indexed = {
+            item.reservation_id: item
+            for item in (self._reservation_from_row(row) for row in reservation_rows)
+        }
+        if reconstructed != indexed:
+            raise BudgetIntegrityError("budget reservation index differs from append-only events")
+        reconstructed_reservations = list(reconstructed.values())
+        _validate_final_snapshot(
+            _snapshot_from_reservations(self._policy, reconstructed_reservations),
+            reconstructed_reservations,
+            self._policy,
+        )
+        self._verified_sequence = events[-1].sequence
+        self._verified_digest = events[-1].digest
+        self._verified_reservations = {
+            reservation_id: reservation.model_copy(deep=True)
+            for reservation_id, reservation in reconstructed.items()
+        }
+
+    def _initialize(self) -> None:
+        with self._connection() as connection:
+            connection.executescript(_SCHEMA)
+        if self.path.exists():
+            os.chmod(self.path, 0o600)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT policy_digest, policy_json, schema_version "
+                "FROM budget_metadata WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO budget_metadata (id, schema_version, policy_digest, policy_json)
+                    VALUES (1, ?, ?, ?)
+                    """,
+                    (
+                        _SCHEMA_VERSION,
+                        self._policy.policy_digest,
+                        _canonical_json(self._policy.model_dump(mode="json")),
+                    ),
+                )
+                self._append_event(connection, _BudgetOpened(policy=self._policy))
+            else:
+                if row["schema_version"] != _SCHEMA_VERSION:
+                    raise BudgetIntegrityError(
+                        f"unsupported budget schema version {row['schema_version']}"
+                    )
+                try:
+                    persisted = BudgetPolicy.model_validate_json(row["policy_json"])
+                except ValueError as exc:
+                    raise BudgetIntegrityError("budget policy metadata is malformed") from exc
+                if row["policy_digest"] != self._policy.policy_digest or persisted != self._policy:
+                    raise BudgetIntegrityError("budget policy differs from the existing ledger")
+
+    def _append_event(
+        self,
+        connection: sqlite3.Connection,
+        action: _BudgetAction,
+    ) -> BudgetEvent:
+        row = connection.execute(
+            "SELECT sequence, digest FROM budget_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        sequence = 1 if row is None else cast("int", row["sequence"]) + 1
+        previous_digest = _ZERO_DIGEST if row is None else cast("str", row["digest"])
+        recorded_at = self._now()
+        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
+            raise ValueError("budget ledger clock must return a timezone-aware datetime")
+        unsigned = {
+            "sequence": sequence,
+            "recorded_at": recorded_at,
+            "previous_digest": previous_digest,
+            "action": action,
+        }
+        digest = _digest_json(_event_dump(unsigned))
+        event = BudgetEvent.model_validate({**unsigned, "digest": digest})
+        connection.execute(
+            "INSERT INTO budget_events (sequence, digest, entry_json) VALUES (?, ?, ?)",
+            (sequence, digest, _canonical_json(event.model_dump(mode="json"))),
+        )
+        return event
+
+    def _sync_verified_state(self, connection: sqlite3.Connection) -> None:
+        """Apply newly committed hash-linked events to authoritative process-local state."""
+        rows = connection.execute(
+            "SELECT sequence, entry_json FROM budget_events WHERE sequence > ? ORDER BY sequence",
+            (self._verified_sequence,),
+        ).fetchall()
+        if not rows:
+            return
+        reconstructed = dict(self._verified_reservations)
+        previous = self._verified_digest
+        expected_sequence = self._verified_sequence + 1
+        touched: set[str] = set()
+        for row in rows:
+            event = self._parse_event(row["entry_json"], sequence=row["sequence"])
+            if event.sequence != expected_sequence:
+                raise BudgetIntegrityError(
+                    f"budget event sequence gap at {expected_sequence}, found {event.sequence}"
+                )
+            if event.previous_digest != previous or _event_digest(event) != event.digest:
+                raise BudgetIntegrityError(
+                    f"budget event {event.sequence} is not linked to verified state"
+                )
+            _apply_budget_event(self._policy, event, reconstructed)
+            action = event.action
+            if not isinstance(action, _BudgetOpened):
+                touched.add(action.reservation_id)
+            expected_sequence += 1
+            previous = event.digest
+        for reservation_id in touched:
+            indexed = self._reservation_from_connection(connection, reservation_id)
+            if indexed != reconstructed[reservation_id]:
+                raise BudgetIntegrityError(
+                    f"budget reservation {reservation_id!r} index differs from verified events"
+                )
+        _validate_final_snapshot(
+            _snapshot_from_reservations(self._policy, list(reconstructed.values())),
+            list(reconstructed.values()),
+            self._policy,
+        )
+        self._verified_sequence = expected_sequence - 1
+        self._verified_digest = previous
+        self._verified_reservations = reconstructed
+
+    def _verified_reservation(
+        self,
+        connection: sqlite3.Connection,
+        reservation_id: str,
+    ) -> BudgetReservation:
+        reservation = self._verified_reservations.get(reservation_id)
+        if reservation is None:
+            raise BudgetIntegrityError(f"unknown budget reservation {reservation_id!r}")
+        indexed = self._reservation_from_connection(connection, reservation_id)
+        if indexed != reservation:
+            raise BudgetIntegrityError(
+                f"budget reservation {reservation_id!r} index differs from verified events"
+            )
+        return reservation
+
+    def _reservation(self, reservation_id: str) -> BudgetReservation:
+        with self._connection() as connection:
+            return self._reservation_from_connection(connection, reservation_id)
+
+    def _reservation_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        reservation_id: str,
+    ) -> BudgetReservation:
+        row = connection.execute(
+            "SELECT * FROM budget_reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise BudgetIntegrityError(f"unknown budget reservation {reservation_id!r}")
+        return self._reservation_from_row(row)
+
+    def _reservation_from_row(self, row: sqlite3.Row) -> BudgetReservation:
+        try:
+            scope = BudgetScope.model_validate_json(row["scope_json"])
+            return BudgetReservation(
+                reservation_id=row["reservation_id"],
+                scope=scope,
+                meter_id=row["meter_id"],
+                max_nano_usd=row["max_nano_usd"],
+                charged_nano_usd=row["charged_nano_usd"],
+                status=row["status"],
+                input_tokens=row["input_tokens"],
+                output_tokens=row["output_tokens"],
+                failure_type=row["failure_type"],
+                breach_kind=row["breach_kind"],
+            )
+        except ValueError as exc:
+            raise BudgetIntegrityError("budget reservation index contains malformed data") from exc
+
+    def _parse_event(self, raw: str, *, sequence: int) -> BudgetEvent:
+        try:
+            event = BudgetEvent.model_validate_json(raw)
+        except ValueError as exc:
+            raise BudgetIntegrityError(f"budget event {sequence} is malformed") from exc
+        if event.sequence != sequence:
+            raise BudgetIntegrityError(
+                f"budget event {sequence} serialized sequence is {event.sequence}"
+            )
+        return event
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        self._validate_file_identity()
+        connection = sqlite3.connect(
+            self.path,
+            timeout=_DEFAULT_BUSY_TIMEOUT_MS / 1000,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout = {_DEFAULT_BUSY_TIMEOUT_MS}")
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            self._validate_file_identity()
+            yield connection
+        finally:
+            connection.close()
+
+    def _validate_file_identity(self) -> None:
+        expected = getattr(self, "_file_identity", None)
+        if expected is None:
+            return
+        try:
+            current = self.path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise BudgetIntegrityError("budget ledger path disappeared after audit") from exc
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != expected:
+            raise BudgetIntegrityError("budget ledger file changed after audit")
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+
+    @contextmanager
+    def _verified_transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._state_lock:
+            with self._transaction() as connection:
+                self._sync_verified_state(connection)
+                yield connection
+
+
+_SHARED_LEDGER_LOCK = threading.Lock()
+_SHARED_LEDGERS: dict[Path, SpendLedger] = {}
+
+
+def open_shared_spend_ledger(path: str | Path, policy: BudgetPolicy) -> SpendLedger:
+    """Fully audit one ledger once per process, then reuse its connectionless handle.
+
+    Harbor creates an agent object per trial, but every object runs in the trusted evaluator
+    process and the ledger opens a fresh SQLite connection per operation. Process-local reuse
+    avoids quadratic full-log replay while every independently started process still performs a
+    complete audit before its first paid call.
+    """
+    requested = Path(path).expanduser()
+    with _SHARED_LEDGER_LOCK:
+        existing = _SHARED_LEDGERS.get(requested)
+        if existing is not None:
+            if existing.policy != policy:
+                raise BudgetIntegrityError("shared budget ledger policy differs from requested")
+            return existing
+        ledger = SpendLedger(requested, policy)
+        _SHARED_LEDGERS[requested] = ledger
+        return ledger
+
+
+class BudgetedProvider:
+    """Reserve a conservative ceiling around every provider completion call."""
+
+    def __init__(
+        self,
+        provider: Provider,
+        account: BudgetAccount,
+        *,
+        id_factory: Callable[[], str] | None = None,
+    ) -> None:
+        if (
+            not isinstance(provider, ToolCallingProvider)
+            or getattr(provider, "paid_request_attempts", None) != 1
+        ):
+            raise TypeError(
+                "BudgetedProvider requires a single-dispatch tool-calling provider with "
+                "SDK retries and fallback disabled"
+            )
+        validated_account = BudgetAccount.model_validate(account.model_dump())
+        meter = validated_account.policy.meters[validated_account.meter_id]
+        if provider.config != meter.provider_config:
+            raise ValueError("budget account provider config differs from the wrapped provider")
+        self._provider = cast("SingleDispatchProvider", provider)
+        self._tool_provider = cast("SingleDispatchProvider", provider)
+        self._account = validated_account
+        self._meter = meter
+        self._ledger = open_shared_spend_ledger(
+            self._account.ledger_path,
+            self._account.policy,
+        )
+        self._id_factory = id_factory or (lambda: str(uuid4()))
+
+    @property
+    def config(self) -> ProviderConfig:
+        return self._provider.config
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Completion:
+        if max_tokens < 1:
+            raise ValueError("provider output-token limit must be positive")
+        payload = {
+            "system": system,
+            "messages": [message.model_dump(mode="json") for message in messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        reservation_id, input_ceiling = self._reserve(
+            cast("JsonValue", payload),
+            max_output_tokens=max_tokens,
+        )
+        try:
+            completion = self._provider.complete(
+                system,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as error:
+            self._forfeit_after_error(reservation_id, error)
+            raise
+        if "usage" not in completion.model_fields_set or not {
+            "input_tokens",
+            "output_tokens",
+        }.issubset(completion.usage.model_fields_set):
+            self._ledger.forfeit(reservation_id, failure_type="UsageUnavailable")
+            return completion
+        self._settle_usage(
+            reservation_id,
+            input_tokens=completion.usage.input_tokens,
+            output_tokens=completion.usage.output_tokens,
+            input_ceiling=input_ceiling,
+            output_ceiling=max_tokens,
+        )
+        return completion
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Budget one structured call using its provider-routed output limit."""
+        if request.model_extra:
+            extras = ", ".join(sorted(request.model_extra))
+            raise ValueError("budgeted chat requests reject unquoted provider fields: " + extras)
+        _require_text_only_chat(request)
+        output_ceiling = _chat_output_limit(request)
+        reservation_id, input_ceiling = self._reserve(
+            request.model_dump(mode="json", exclude_none=True),
+            max_output_tokens=output_ceiling,
+        )
+        try:
+            response = self._tool_provider.complete_chat(request)
+        except Exception as error:
+            self._forfeit_after_error(reservation_id, error)
+            raise
+        if response.usage is None or not {
+            "prompt_tokens",
+            "completion_tokens",
+        }.issubset(response.usage.model_fields_set):
+            self._ledger.forfeit(reservation_id, failure_type="UsageUnavailable")
+            return response
+        self._settle_usage(
+            reservation_id,
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
+            input_ceiling=input_ceiling,
+            output_ceiling=output_ceiling,
+        )
+        return response
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Reject unpriced embeddings instead of allowing an unreserved paid call."""
+        del texts
+        raise RuntimeError("embeddings are disabled for this budgeted provider account")
+
+    def verify(self) -> VerifyResult:
+        """Run the ordinary reachability ping through this same budget boundary."""
+        return verify_via_ping(self)
+
+    def _reserve(
+        self,
+        payload: JsonValue,
+        *,
+        max_output_tokens: int,
+    ) -> tuple[str, int]:
+        canonical = _canonical_json(payload)
+        # Every model token consumes at least one encoded byte. The fixed overhead covers chat
+        # framing and provider-added special tokens, so bytes plus overhead is a conservative
+        # upper bound without relying on a provider-specific tokenizer.
+        input_ceiling = len(canonical.encode("utf-8")) + self._meter.input_overhead_tokens
+        max_nano_usd = self._meter.price.charge(
+            input_tokens=input_ceiling,
+            output_tokens=max_output_tokens,
+        )
+        reservation_id = self._id_factory()
+        self._ledger.reserve(
+            self._account.scope,
+            meter_id=self._account.meter_id,
+            max_nano_usd=max_nano_usd,
+            reservation_id=reservation_id,
+        )
+        return reservation_id, input_ceiling
+
+    def _settle_usage(
+        self,
+        reservation_id: str,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        input_ceiling: int,
+        output_ceiling: int,
+    ) -> None:
+        breach_kind = None
+        if input_tokens > input_ceiling:
+            breach_kind = BudgetBreachKind.INPUT_TOKEN_CEILING
+        elif output_tokens > output_ceiling:
+            breach_kind = BudgetBreachKind.OUTPUT_TOKEN_CEILING
+        charged = self._meter.price.charge(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        self._ledger.settle(
+            reservation_id,
+            charged_nano_usd=charged,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            breach_kind=breach_kind,
+        )
+
+    def _forfeit_after_error(self, reservation_id: str, error: Exception) -> None:
+        try:
+            self._ledger.forfeit(reservation_id, failure_type=type(error).__name__)
+        except Exception as ledger_error:
+            raise ledger_error from error
+
+
+def _chat_output_limit(request: ChatRequest) -> int:
+    # Provider translators do not all prioritize the two compatibility fields identically. The
+    # hard ceiling must dominate either dispatch path, including requests that set both fields.
+    limits = [
+        limit for limit in (request.max_tokens, request.max_completion_tokens) if limit is not None
+    ]
+    if not limits or min(limits) < 1:
+        raise ValueError("budgeted chat request requires a positive output-token limit")
+    return max(limits)
+
+
+def _require_text_only_chat(request: ChatRequest) -> None:
+    """Reject content whose provider charge is not bounded by its serialized text bytes."""
+    for index, message in enumerate(request.messages):
+        content = message.content
+        if content is None or isinstance(content, str):
+            continue
+        if isinstance(content, list) and all(_is_text_content_part(item) for item in content):
+            continue
+        raise ValueError(
+            f"budgeted chat requests reject unpriced non-text content in message {index}"
+        )
+
+
+def _is_text_content_part(value: JsonValue) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"type", "text"}
+        and value.get("type") == "text"
+        and isinstance(value.get("text"), str)
+    )
+
+
+def nano_usd_from_usd(value: Decimal | str | int) -> int:
+    """Convert a nonnegative USD amount to nano-USD, rounding upward."""
+    amount = _decimal_currency(value)
+    if amount < 0:
+        raise ValueError("USD amount cannot be negative")
+    result = int((amount * _NANO_USD_PER_USD).to_integral_value(rounding=ROUND_CEILING))
+    if result > _SQLITE_INTEGER_MAX:
+        raise OverflowError("USD amount does not fit a SQLite integer in nano-USD")
+    return result
+
+
+def _nano_usd_per_token(value: Decimal | str | int) -> int:
+    amount = _decimal_currency(value)
+    if amount < 0:
+        raise ValueError("token price cannot be negative")
+    nano_per_token = amount * _NANO_USD_PER_USD / _TOKENS_PER_MILLION
+    result = int(nano_per_token.to_integral_value(rounding=ROUND_CEILING))
+    if result > _SQLITE_INTEGER_MAX:
+        raise OverflowError("token price does not fit a SQLite integer in nano-USD")
+    return result
+
+
+def _decimal_currency(value: Decimal | str | int) -> Decimal:
+    if isinstance(value, float):
+        raise TypeError("currency inputs cannot use floating-point values")
+    try:
+        amount = Decimal(value)
+    except ArithmeticError as exc:
+        raise ValueError(f"invalid currency value {value!r}") from exc
+    if not amount.is_finite():
+        raise ValueError("currency values must be finite")
+    return amount
+
+
+def _snapshot_from_reservations(
+    policy: BudgetPolicy,
+    reservations: list[BudgetReservation],
+) -> BudgetSnapshot:
+    charged = 0
+    reserved = 0
+    by_phase = {phase: 0 for phase in policy.phase_limits_nano_usd}
+    breached = False
+    for reservation in reservations:
+        if reservation.scope.phase not in by_phase:
+            raise BudgetIntegrityError(
+                f"reservation uses unknown budget phase {reservation.scope.phase!r}"
+            )
+        if reservation.status is ReservationStatus.RESERVED:
+            amount = reservation.max_nano_usd
+            reserved += amount
+        else:
+            amount = reservation.charged_nano_usd
+            charged += amount
+        by_phase[reservation.scope.phase] += amount
+        breached = breached or reservation.status is ReservationStatus.BREACHED
+    exposure = charged + reserved
+    if exposure > policy.hard_limit_nano_usd:
+        breached = True
+    if any(by_phase[phase] > limit for phase, limit in policy.phase_limits_nano_usd.items()):
+        breached = True
+    return BudgetSnapshot(
+        hard_limit_nano_usd=policy.hard_limit_nano_usd,
+        charged_nano_usd=charged,
+        reserved_nano_usd=reserved,
+        remaining_nano_usd=max(policy.hard_limit_nano_usd - exposure, 0),
+        by_phase_nano_usd=by_phase,
+        breached=breached,
+    )
+
+
+def _validate_settlement_event(
+    action: _BudgetSettled,
+    reservation: BudgetReservation,
+) -> None:
+    exceeds_reservation = action.charged_nano_usd > reservation.max_nano_usd
+    if exceeds_reservation:
+        if (
+            action.status is not ReservationStatus.BREACHED
+            or action.breach_kind is not BudgetBreachKind.RESERVATION
+        ):
+            raise BudgetIntegrityError(
+                f"settlement {action.reservation_id!r} exceeded its reservation without "
+                "a reservation breach"
+            )
+    elif action.breach_kind is BudgetBreachKind.RESERVATION:
+        raise BudgetIntegrityError(
+            f"settlement {action.reservation_id!r} records a false reservation breach"
+        )
+
+
+def _validate_final_snapshot(
+    snapshot: BudgetSnapshot,
+    reservations: list[BudgetReservation],
+    policy: BudgetPolicy,
+) -> None:
+    explicit_breach = any(
+        reservation.status is ReservationStatus.BREACHED for reservation in reservations
+    )
+    hard_overrun = (
+        snapshot.charged_nano_usd + snapshot.reserved_nano_usd > snapshot.hard_limit_nano_usd
+    )
+    phase_overrun = any(
+        amount > policy.phase_limits_nano_usd[phase]
+        for phase, amount in snapshot.by_phase_nano_usd.items()
+    )
+    if (hard_overrun or phase_overrun) and not explicit_breach:
+        raise BudgetIntegrityError("budget caps were exceeded without an explicit breach event")
+    if snapshot.breached != (explicit_breach or hard_overrun or phase_overrun):
+        raise BudgetIntegrityError("budget breach snapshot is inconsistent with ledger events")
+
+
+def _apply_budget_event(
+    policy: BudgetPolicy,
+    event: BudgetEvent,
+    reconstructed: dict[str, BudgetReservation],
+) -> None:
+    action = event.action
+    if event.sequence == 1:
+        if not isinstance(action, _BudgetOpened):
+            raise BudgetIntegrityError("first budget event is not the policy genesis")
+        if action.policy != policy:
+            raise BudgetIntegrityError("budget genesis policy differs from requested policy")
+        return
+    if isinstance(action, _BudgetOpened):
+        raise BudgetIntegrityError("budget policy genesis appears more than once")
+    if isinstance(action, _BudgetReserved):
+        if action.reservation_id in reconstructed:
+            raise BudgetIntegrityError(f"duplicate reservation event {action.reservation_id!r}")
+        if action.scope.phase not in policy.phase_limits_nano_usd:
+            raise BudgetIntegrityError(
+                f"reservation {action.reservation_id!r} uses an unknown budget phase"
+            )
+        if action.meter_id not in policy.meters:
+            raise BudgetIntegrityError(
+                f"reservation {action.reservation_id!r} uses an unknown budget meter"
+            )
+        before = _snapshot_from_reservations(policy, list(reconstructed.values()))
+        if before.breached:
+            raise BudgetIntegrityError("reservation was admitted after the ledger breached")
+        if action.max_nano_usd > before.remaining_nano_usd:
+            raise BudgetIntegrityError(
+                f"reservation {action.reservation_id!r} exceeded the remaining hard budget"
+            )
+        phase_remaining = (
+            policy.phase_limits_nano_usd[action.scope.phase]
+            - before.by_phase_nano_usd[action.scope.phase]
+        )
+        if action.max_nano_usd > phase_remaining:
+            raise BudgetIntegrityError(
+                f"reservation {action.reservation_id!r} exceeded its phase budget"
+            )
+        reconstructed[action.reservation_id] = BudgetReservation(
+            reservation_id=action.reservation_id,
+            scope=action.scope,
+            meter_id=action.meter_id,
+            max_nano_usd=action.max_nano_usd,
+            charged_nano_usd=0,
+            status=ReservationStatus.RESERVED,
+        )
+        return
+    if isinstance(action, _BudgetSettled):
+        prior = _open_reconstructed(reconstructed, action.reservation_id)
+        _validate_settlement_event(action, prior)
+        reconstructed[action.reservation_id] = prior.model_copy(
+            update={
+                "charged_nano_usd": action.charged_nano_usd,
+                "status": action.status,
+                "input_tokens": action.input_tokens,
+                "output_tokens": action.output_tokens,
+                "breach_kind": action.breach_kind,
+            }
+        )
+        return
+    assert isinstance(action, _BudgetForfeited)
+    prior = _open_reconstructed(reconstructed, action.reservation_id)
+    if action.charged_nano_usd != prior.max_nano_usd:
+        raise BudgetIntegrityError(
+            f"forfeit {action.reservation_id!r} did not charge its full ceiling"
+        )
+    reconstructed[action.reservation_id] = prior.model_copy(
+        update={
+            "charged_nano_usd": action.charged_nano_usd,
+            "status": ReservationStatus.FORFEITED,
+            "failure_type": action.failure_type,
+        }
+    )
+
+
+def _open_reconstructed(
+    reservations: dict[str, BudgetReservation],
+    reservation_id: str,
+) -> BudgetReservation:
+    reservation = reservations.get(reservation_id)
+    if reservation is None:
+        raise BudgetIntegrityError(f"terminal event references unknown {reservation_id!r}")
+    if reservation.status is not ReservationStatus.RESERVED:
+        raise BudgetIntegrityError(f"reservation {reservation_id!r} has two terminal events")
+    return reservation
+
+
+def _event_digest(event: BudgetEvent) -> str:
+    unsigned = event.model_dump(mode="json", exclude={"digest"})
+    return _digest_json(unsigned)
+
+
+def _event_dump(value: Mapping[str, object]) -> dict[str, object]:
+    event = BudgetEvent.model_validate({**value, "digest": _ZERO_DIGEST})
+    return event.model_dump(mode="json", exclude={"digest"})
+
+
+def _digest_json(value: object) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json(value).encode()).hexdigest()
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS budget_metadata (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    schema_version INTEGER NOT NULL,
+    policy_digest TEXT NOT NULL,
+    policy_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS budget_events (
+    sequence INTEGER PRIMARY KEY,
+    digest TEXT NOT NULL UNIQUE,
+    entry_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS budget_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    scope_json TEXT NOT NULL,
+    meter_id TEXT NOT NULL,
+    max_nano_usd INTEGER NOT NULL CHECK (max_nano_usd >= 0),
+    charged_nano_usd INTEGER NOT NULL CHECK (charged_nano_usd >= 0),
+    status TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    failure_type TEXT,
+    breach_kind TEXT
+);
+
+CREATE TRIGGER IF NOT EXISTS budget_events_no_update
+BEFORE UPDATE ON budget_events
+BEGIN
+    SELECT RAISE(ABORT, 'budget events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS budget_events_no_delete
+BEFORE DELETE ON budget_events
+BEGIN
+    SELECT RAISE(ABORT, 'budget events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS budget_metadata_no_update
+BEFORE UPDATE ON budget_metadata
+BEGIN
+    SELECT RAISE(ABORT, 'budget metadata is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS budget_metadata_no_delete
+BEFORE DELETE ON budget_metadata
+BEGIN
+    SELECT RAISE(ABORT, 'budget metadata is immutable');
+END;
+"""

@@ -206,6 +206,17 @@ class ToolCallingProvider(Protocol):
         ...
 
 
+@runtime_checkable
+class SingleDispatchProvider(Provider, ToolCallingProvider, Protocol):
+    """A provider whose public completion methods issue at most one paid request.
+
+    Hard-budget settlement cannot observe SDK-internal retries or fallback requests. Providers
+    advertise this narrower capability only when their clients disable those hidden attempts.
+    """
+
+    paid_request_attempts: Literal[1]
+
+
 # One read-only instance reused across every verify() ping (complete() never mutates messages).
 _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 

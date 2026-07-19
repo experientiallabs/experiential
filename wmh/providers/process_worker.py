@@ -25,6 +25,7 @@ from wmh.providers.failure_attribution import (
     classify_provider_failure,
 )
 from wmh.providers.registry import get_provider
+from wmh.tracking.budget import BudgetAccount, BudgetedProvider
 
 _FRAME_HEADER = struct.Struct("!I")
 _MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -84,6 +85,7 @@ class _StrictFrame(BaseModel):
 class _InitializeFrame(_StrictFrame):
     kind: Literal["initialize"] = "initialize"
     provider_config: ProviderConfig
+    budget_account: BudgetAccount | None = None
 
 
 class _ReadyFrame(_StrictFrame):
@@ -136,8 +138,20 @@ class ProviderProcessWorker:
     cancellation boundary for synchronous SDK calls and any SDK-owned helper threads.
     """
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        budget_account: BudgetAccount | None = None,
+    ) -> None:
         self._config = config.model_copy(deep=True)
+        self._budget_account: BudgetAccount | None = None
+        if budget_account is not None:
+            account = BudgetAccount.model_validate(budget_account.model_dump())
+            meter = account.policy.meters[account.meter_id]
+            if meter.provider_config != self._config:
+                raise ValueError("budget account provider config differs from provider worker")
+            self._budget_account = account
         self._state_lock = threading.Lock()
         self._start_lock = threading.Lock()
         self._io_lock = threading.Lock()
@@ -217,7 +231,10 @@ class ProviderProcessWorker:
             try:
                 _send_frame(
                     parent_socket,
-                    _InitializeFrame(provider_config=self._config),
+                    _InitializeFrame(
+                        provider_config=self._config,
+                        budget_account=self._budget_account,
+                    ),
                     deadline=deadline,
                     cancelled=self._cancelled_event,
                 )
@@ -531,6 +548,8 @@ def _serve_worker(socket_fd: int) -> int:
             provider = get_provider(initialization.provider_config)
             if not isinstance(provider, ToolCallingProvider):
                 raise TypeError("configured provider has no structured chat capability")
+            if initialization.budget_account is not None:
+                provider = BudgetedProvider(provider, initialization.budget_account)
         except Exception:  # noqa: BLE001 - provider construction errors never cross the channel
             _send_frame(
                 connection,

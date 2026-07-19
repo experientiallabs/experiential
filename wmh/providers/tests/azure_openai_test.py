@@ -27,7 +27,7 @@ class _FakeUsage:
 
 
 class _FakeChatResponse:
-    def __init__(self, content: str, usage: _FakeUsage) -> None:
+    def __init__(self, content: str, usage: _FakeUsage | None) -> None:
         self.choices = [_FakeChoice(content)]
         self.usage = usage
         self.id = "completion-azure-1"
@@ -47,10 +47,14 @@ class _FakeChatResponse:
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {
-                "prompt_tokens": self.usage.prompt_tokens,
-                "completion_tokens": self.usage.completion_tokens,
-            },
+            "usage": (
+                {
+                    "prompt_tokens": self.usage.prompt_tokens,
+                    "completion_tokens": self.usage.completion_tokens,
+                }
+                if self.usage is not None
+                else None
+            ),
         }
 
 
@@ -147,6 +151,19 @@ def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> 
     # On Azure the `model` arg carries the deployment name, not the base model id.
     assert chat.last_kwargs["model"] == "gpt55-deploy"
     assert chat.last_kwargs["max_completion_tokens"] == 16
+
+
+def test_complete_preserves_missing_usage_for_budget_forfeit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _FakeChatCompletions(_FakeChatResponse("yo", None))
+    provider = AzureOpenAIProvider(_config())
+    monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
+
+    completion = provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
+
+    assert completion.text == "yo"
+    assert "usage" not in completion.model_fields_set
 
 
 @pytest.mark.parametrize(

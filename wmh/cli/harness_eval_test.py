@@ -32,6 +32,13 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner import pi_node_baseline
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetPolicy,
+    BudgetScope,
+    ProviderCostMeter,
+    TokenPriceCeiling,
+)
 
 harness_eval_module = importlib.import_module("wmh.cli.harness_eval")
 runner = CliRunner()
@@ -223,12 +230,14 @@ def _patch_evaluator(
             *,
             runner_image: str,
             turn_timeout_s: float,
+            budget_account: BudgetAccount | None = None,
         ) -> None:
             self._call: dict[str, object] = {
                 "spec": spec,
                 "provider_config": provider_config,
                 "runner_image": runner_image,
                 "turn_timeout_s": turn_timeout_s,
+                "budget_account": budget_account,
             }
 
         async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
@@ -260,7 +269,92 @@ def _base_args(
         str(root),
         "--out",
         str(out),
+        "--allow-unbudgeted-development",
     ]
+
+
+def _write_budget_account(path: Path, provider_config: ProviderConfig) -> BudgetAccount:
+    account = BudgetAccount(
+        ledger_path=(path.parent / "spend.sqlite3").resolve(),
+        policy=BudgetPolicy(
+            study_id="cli-study",
+            manifest_digest="sha256:" + "c" * 64,
+            hard_limit_nano_usd=1_000_000,
+            phase_limits_nano_usd={"qualification": 1_000_000},
+            meters={
+                "worker": ProviderCostMeter(
+                    provider_config=provider_config,
+                    price=TokenPriceCeiling(
+                        input_nano_usd_per_token=1,
+                        output_nano_usd_per_token=5,
+                    ),
+                )
+            },
+        ),
+        scope=BudgetScope(
+            phase="qualification",
+            category="worker",
+            run_id="cli-run",
+        ),
+        meter_id="worker",
+    )
+    path.write_text(account.model_dump_json(indent=2), encoding="utf-8")
+    return account
+
+
+def test_paid_eval_requires_budget_or_explicit_development_bypass(tmp_path: Path) -> None:
+    root = tmp_path / ".wmh"
+    _save_harness(root)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    out = tmp_path / "result.json"
+    args = _base_args(root, out)
+    args.remove("--allow-unbudgeted-development")
+
+    result = runner.invoke(
+        app,
+        [*args, "--dataset-path", str(dataset), "--yes"],
+    )
+
+    assert result.exit_code == 2
+    assert "paid harness evaluation requires --budget-account" in result.output
+
+
+def test_budget_account_is_loaded_and_wired_into_the_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / ".wmh"
+    _save_harness(root)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    out = tmp_path / "result.json"
+    provider_config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="model",
+        region="us-east-1",
+    )
+    account_path = tmp_path / "budget-account.json"
+    account = _write_budget_account(account_path, provider_config)
+    calls = _patch_evaluator(monkeypatch, _all_scored_result(tmp_path))
+    args = _base_args(root, out)
+    args.remove("--allow-unbudgeted-development")
+
+    result = runner.invoke(
+        app,
+        [
+            *args,
+            "--dataset-path",
+            str(dataset),
+            "--budget-account",
+            str(account_path),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [call] = calls
+    assert call["budget_account"] == account
 
 
 def test_local_bedrock_eval_wires_exact_inputs_and_writes_only_canonical_result(
@@ -388,6 +482,7 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
             str(root),
             "--out",
             str(out),
+            "--allow-unbudgeted-development",
             "--yes",
         ],
     )

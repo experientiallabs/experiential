@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 from llm_waterfall import ChatRequest, ChatResponse
 from llm_waterfall.bedrock_chat import bedrock_converse_request, bedrock_converse_response
@@ -80,6 +80,8 @@ def _is_nova(model_id: str) -> bool:
 
 class BedrockProvider:
     """Claude 4.8 via the Bedrock Runtime (InvokeModel with the Anthropic Messages body)."""
+
+    paid_request_attempts: Literal[1] = 1
 
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config

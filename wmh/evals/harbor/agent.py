@@ -59,6 +59,7 @@ from wmh.providers.process_worker import (
     ProviderWorkerUnavailable,
 )
 from wmh.providers.receipt import validate_chat_provider_receipt
+from wmh.tracking.budget import BudgetAccount
 
 _TOOL_OUTPUT_CHARS = 16_000
 _TOOL_STREAM_CHARS = _TOOL_OUTPUT_CHARS // 2
@@ -562,6 +563,7 @@ class WmhPiAgent(BaseAgent):
         extra_env: dict[str, str] | None = None,
         harness: JsonObject,
         provider_config: JsonObject,
+        budget_account: JsonObject | None = None,
         runner_image: str = PI_CONTAINER_IMAGE,
         turn_timeout_s: float = 300.0,
         require_provider_receipts: bool = False,
@@ -580,6 +582,13 @@ class WmhPiAgent(BaseAgent):
         )
         self._harness = HarnessDoc.model_validate(harness)
         config = ProviderConfig.model_validate(provider_config)
+        account = (
+            BudgetAccount.model_validate(budget_account) if budget_account is not None else None
+        )
+        if account is not None:
+            meter = account.policy.meters[account.meter_id]
+            if meter.provider_config != config:
+                raise ValueError("budget account provider config must match the Harbor agent")
         if self._harness.runtime_kind() != "pi-node":
             raise ValueError(
                 "WMH pi benchmark evaluation requires runtime kind 'pi-node', got "
@@ -591,6 +600,7 @@ class WmhPiAgent(BaseAgent):
         if not isinstance(require_provider_receipts, bool):
             raise ValueError("require_provider_receipts must be a boolean")
         self._provider_config = config.model_copy(deep=True)
+        self._budget_account = account.model_copy(deep=True) if account is not None else None
         self._runner_image = runner_image
         self._turn_timeout_s = turn_timeout_s
         self._require_provider_receipts = require_provider_receipts
@@ -652,7 +662,10 @@ class WmhPiAgent(BaseAgent):
         event_loop = asyncio.get_running_loop()
         executor = HarborToolExecutor(event_loop, environment)
         runner_factory = LocalContainerRunnerFactory(image=self._runner_image)
-        provider_worker = ProviderProcessWorker(self._provider_config)
+        provider_worker = ProviderProcessWorker(
+            self._provider_config,
+            budget_account=self._budget_account,
+        )
         candidate_error: PiCandidateError | None = None
         result: PiTurnResult | None = None
         turn_task = asyncio.create_task(

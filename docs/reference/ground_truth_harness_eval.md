@@ -853,6 +853,9 @@ The reusable evaluation slice provides:
 - a benchmark-neutral `wmh harness eval` command and canonical result JSON;
 - a synchronous `HarborHarnessScorer` that requires an exact literal task matrix, rejects compute
   drift, and projects only complete binary verifier evidence into generic harness scores;
+- a crash-safe, cross-process provider spend ledger with immutable hard and phase caps,
+  frozen route tariffs and estimators, conservative pre-call reservations, full-usage settlement,
+  and full-audit plus incrementally verified worker state;
 - typed completed, failed, unknown, and cancelled candidate evidence without arbitrary Harbor
   metadata passthrough;
 - pre-job local enforcement of one literal prebuilt image with task Compose, dotenv, host
@@ -870,7 +873,6 @@ The following remain required work before experiment launch:
 - add the proposer and Pareto search loop on top of existing harness deltas, including a sealed
   discovery-only workspace, immutable proposer identity, complete-history evidence, the matched-
   compute eligibility gate, deterministic winner selection, and cost evidence;
-- implement a persistent spend ledger and phase-budget admission check;
 - implement an atomic attempt ledger that retains every attempt's usage, failure type, and terminal
   result before enabling retry or search ranking;
 - implement an external-resource ledger that reconciles local Compose and E2B resource creation and
