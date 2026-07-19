@@ -240,10 +240,12 @@ def _register_e2b_task_build(tmp_path: Path, task_dir: Path) -> None:
     register_exact_e2b_build_record(
         jobs_dir=tmp_path / "jobs",
         environment_id=environment_content_hash(task_dir / "environment"),
+        docker_image=f"example.invalid/{task_dir.name}:frozen",
         template_id="task-template",
         build_id="task-build",
         cpu_count=2,
         memory_mb=1024,
+        acknowledge_preexisting_outside_study=True,
     )
 
 

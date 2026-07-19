@@ -76,6 +76,7 @@ def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: P
             "2",
             "--memory-mb",
             "1024",
+            "--acknowledge-preexisting-outside-study",
         ],
     )
 
@@ -83,11 +84,64 @@ def test_register_e2b_build_cli_publishes_only_an_exact_local_record(tmp_path: P
     record = require_exact_e2b_build_record(
         jobs_dir=jobs_dir,
         environment_id="environment-immutable",
+        docker_image=None,
         cpu_count=2,
         memory_mb=1024,
     )
     assert record.exact_template_ref == "template-immutable:build-immutable"
     assert "environment-immutable" not in result.output
+
+
+def test_register_e2b_build_cli_requires_outside_study_acknowledgment(
+    tmp_path: Path,
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "harness",
+            "register-e2b-build",
+            "--jobs-dir",
+            str(tmp_path / "jobs"),
+            "--environment-id",
+            "environment-immutable",
+            "--template-id",
+            "template-immutable",
+            "--build-id",
+            "build-immutable",
+            "--cpu-count",
+            "2",
+            "--memory-mb",
+            "1024",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "outside-study acknowledgment" in str(result.exception)
+
+
+def test_prepare_e2b_build_cli_requires_explicit_paid_call_approval(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "harness",
+            "prepare-e2b-build",
+            "--jobs-dir",
+            str(tmp_path / "jobs"),
+            "--environment-dir",
+            str(tmp_path / "environment"),
+            "--cpu-count",
+            "2",
+            "--memory-mb",
+            "1024",
+            "--resource-budget-account",
+            str(tmp_path / "account.json"),
+            "--e2b-spend-limit-attestation",
+            str(tmp_path / "spend-limit.json"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "requires explicit --yes approval" in str(result.exception)
 
 
 def _loaded_result(tmp_path: Path) -> LoadedHarborJobResult:

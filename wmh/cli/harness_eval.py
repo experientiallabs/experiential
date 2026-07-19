@@ -17,7 +17,12 @@ from rich.console import Console
 from wmh.config import ARTIFACT_DIR
 from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
-from wmh.evals.harbor.e2b_environment import register_exact_e2b_build_record
+from wmh.evals.harbor.e2b_environment import (
+    E2BSpendLimitAttestation,
+    freeze_exact_e2b_build_spec,
+    prepare_exact_e2b_build,
+    register_exact_e2b_build_record,
+)
 from wmh.evals.harbor.evaluator import HarborEvaluator, harbor_job_lease_path
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
@@ -38,30 +43,86 @@ def register(app: typer.Typer) -> None:
     """Register ground-truth harness evaluation on the harness command group."""
     app.command("eval")(eval_harness)
     app.command("register-e2b-build")(register_e2b_build)
+    app.command("prepare-e2b-build")(prepare_e2b_build)
 
 
 def register_e2b_build(
     jobs_dir: str = typer.Option(..., "--jobs-dir"),
     environment_id: str = typer.Option(..., "--environment-id"),
+    docker_image: str | None = typer.Option(None, "--docker-image"),
     template_id: str = typer.Option(..., "--template-id"),
     build_id: str = typer.Option(..., "--build-id"),
     cpu_count: int = typer.Option(..., "--cpu-count", min=1),
     memory_mb: int = typer.Option(..., "--memory-mb", min=1),
+    acknowledge_preexisting_outside_study: bool = typer.Option(
+        False,
+        "--acknowledge-preexisting-outside-study",
+        help="Acknowledge that this build was paid outside the current study ledger.",
+    ),
 ) -> None:
     """Register already-built exact E2B IDs; this command never calls E2B."""
     try:
         record = register_exact_e2b_build_record(
             jobs_dir=Path(jobs_dir),
             environment_id=environment_id,
+            docker_image=docker_image,
             template_id=template_id,
             build_id=build_id,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
+            acknowledge_preexisting_outside_study=acknowledge_preexisting_outside_study,
         )
     except (OSError, ValueError, RuntimeError) as exc:
         raise ClickException(str(exc)) from exc
     _console.print(
         "registered exact E2B build "
+        f"{record.exact_template_ref} for {record.build_config_digest}"
+    )
+
+
+def prepare_e2b_build(
+    jobs_dir: str = typer.Option(..., "--jobs-dir"),
+    environment_dir: str = typer.Option(..., "--environment-dir"),
+    docker_image: str | None = typer.Option(None, "--docker-image"),
+    cpu_count: int = typer.Option(..., "--cpu-count", min=1),
+    memory_mb: int = typer.Option(..., "--memory-mb", min=1),
+    resource_budget_account_path: str = typer.Option(..., "--resource-budget-account"),
+    spend_limit_attestation_path: str = typer.Option(..., "--e2b-spend-limit-attestation"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm the budgeted E2B template-build provider call.",
+    ),
+) -> None:
+    """Prepare one exact E2B build through a timed study-budget reservation."""
+    if not yes:
+        raise ClickException("budgeted E2B build preparation requires explicit --yes approval")
+    try:
+        source = Path(environment_dir)
+        spec = freeze_exact_e2b_build_spec(
+            environment_dir=source,
+            docker_image=docker_image,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+        )
+        account = _load_timed_resource_budget_account(
+            resource_budget_account_path,
+            param_hint="--resource-budget-account",
+        )
+        spend_limit = _load_e2b_spend_limit_attestation(spend_limit_attestation_path)
+        record = asyncio.run(
+            prepare_exact_e2b_build(
+                jobs_dir=Path(jobs_dir),
+                environment_dir=source,
+                spec=spec,
+                budget_account=account,
+                provider_spend_limit=spend_limit,
+            )
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ClickException(str(exc)) from exc
+    _console.print(
+        "prepared budgeted exact E2B build "
         f"{record.exact_template_ref} for {record.build_config_digest}"
     )
 
@@ -367,6 +428,27 @@ def _load_timed_resource_budget_account(
         )
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
+
+
+def _load_e2b_spend_limit_attestation(path: str) -> E2BSpendLimitAttestation:
+    attestation_path = Path(path).expanduser()
+    if attestation_path.is_symlink():
+        raise typer.BadParameter(
+            "E2B spending-limit attestation cannot be a symlink",
+            param_hint="--e2b-spend-limit-attestation",
+        )
+    try:
+        if not attestation_path.is_file():
+            raise ValueError("E2B spending-limit attestation must be a regular file")
+        payload = attestation_path.read_bytes()
+        if len(payload) > 64 * 1024:
+            raise ValueError("E2B spending-limit attestation exceeds 64 KiB")
+        return E2BSpendLimitAttestation.model_validate_json(payload)
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(
+            str(exc),
+            param_hint="--e2b-spend-limit-attestation",
+        ) from exc
 
 
 def _build_dataset_config(

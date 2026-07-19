@@ -210,6 +210,7 @@ class TimedResourceRole(StrEnum):
     """Stable backend roles whose independently billed leases share one hard cap."""
 
     TASK_ENVIRONMENT = "task_environment"
+    TASK_ENVIRONMENT_BUILD = "task_environment_build"
     AGENT_RUNNER = "agent_runner"
     PROPOSER_PROJECT = "proposer_project"
 

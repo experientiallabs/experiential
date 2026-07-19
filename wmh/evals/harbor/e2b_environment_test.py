@@ -25,6 +25,7 @@ import wmh.evals.harbor.e2b_environment as mod
 from wmh.harness.pi_runner_backend import RunnerLeaseRecord
 from wmh.tracking.budget import (
     BudgetExceededError,
+    BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
     ReservationStatus,
@@ -104,6 +105,78 @@ def _resource_account(
     )
 
 
+def _build_resource_account(
+    tmp_path: Path,
+    *,
+    hard_limit: int | None = None,
+) -> TimedResourceBudgetAccount:
+    resource_class = mod.exact_e2b_build_resource_class(
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    meter = TimedResourceCostMeter(
+        resource_type=resource_class.role.value,
+        resource_class_digest=resource_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=resource_class.max_host_observation_seconds,
+    )
+    limit = meter.maximum_charge_nano_usd() * 3 if hard_limit is None else hard_limit
+    policy = BudgetPolicy(
+        study_id="e2b-build-resource-test",
+        manifest_digest="sha256:" + hashlib.sha256((str(tmp_path) + ":build").encode()).hexdigest(),
+        hard_limit_nano_usd=limit,
+        phase_limits_nano_usd={"preparation": limit},
+        meters={"e2b-build": meter},
+    )
+    ledger_path = tmp_path / "build-budget.sqlite3"
+    return TimedResourceBudgetAccount(
+        ledger_path=ledger_path.resolve(),
+        ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
+        policy=policy,
+        scope=BudgetScope(
+            phase="preparation",
+            category="task-environment-build",
+            run_id="pre-open-roster",
+        ),
+        meter_id="e2b-build",
+    )
+
+
+def _spend_limit(account: TimedResourceBudgetAccount) -> mod.E2BSpendLimitAttestation:
+    return mod.E2BSpendLimitAttestation(
+        account_identity_digest="sha256:"
+        + hashlib.sha256(str(account.ledger_path).encode()).hexdigest(),
+        policy_digest=account.policy.policy_digest,
+        ledger_identity=account.ledger_identity,
+        account_spend_nano_usd=0,
+        account_limit_nano_usd=account.policy.hard_limit_nano_usd,
+        evidence_digest="sha256:" + hashlib.sha256(b"provider-limit-evidence").hexdigest(),
+    )
+
+
+def _build_attribution() -> mod.BudgetedE2BBuildAttribution:
+    spend_limit = mod.E2BSpendLimitAttestation(
+        account_identity_digest="sha256:" + "a" * 64,
+        policy_digest="sha256:" + "b" * 64,
+        ledger_identity="sha256:" + "c" * 64,
+        account_spend_nano_usd=0,
+        account_limit_nano_usd=1,
+        evidence_digest="sha256:" + "d" * 64,
+    )
+    return mod.BudgetedE2BBuildAttribution(
+        policy_digest=spend_limit.policy_digest,
+        ledger_identity=spend_limit.ledger_identity,
+        meter_id="e2b-build",
+        reservation_id="e2b-build-reservation",
+        scope=BudgetScope(
+            phase="preparation",
+            category="task-environment-build",
+            run_id="pre-open-roster",
+        ),
+        provider_spend_limit=spend_limit,
+    )
+
+
 def _build() -> mod.ExactE2BBuildRecord:
     return mod.ExactE2BBuildRecord(
         build_config_digest="sha256:" + "a" * 64,
@@ -112,6 +185,7 @@ def _build() -> mod.ExactE2BBuildRecord:
         build_id="build-immutable",
         cpu_count=2,
         memory_mb=1024,
+        cost_attribution=mod.PreexistingE2BBuildAttribution(),
     )
 
 
@@ -179,6 +253,7 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
         environment_id="environment-immutable",
         cpu_count=2,
         memory_mb=1024,
+        cost_attribution=_build_attribution(),
     )
 
     assert record.exact_template_ref == "template-immutable:build-immutable"
@@ -195,6 +270,7 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
             environment_id="environment-immutable",
             cpu_count=2,
             memory_mb=1024,
+            cost_attribution=_build_attribution(),
         )
 
     with pytest.raises(ValidationError):
@@ -205,6 +281,7 @@ def test_completed_build_record_requires_unambiguous_immutable_components() -> N
             build_id="build:ambiguous",
             cpu_count=2,
             memory_mb=1024,
+            cost_attribution=mod.PreexistingE2BBuildAttribution(),
         )
 
 
@@ -212,11 +289,27 @@ def test_content_keyed_build_registry_reuses_only_completed_exact_ids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = _environment(tmp_path, trial_name="trial-a")
-    second = _environment(tmp_path, trial_name="trial-b")
+    _environment(tmp_path, trial_name="trial-a")
+    environment_dir = tmp_path / "environment"
+    jobs_dir = tmp_path / "jobs"
+    account = _build_resource_account(tmp_path)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
     calls: list[tuple[int, int]] = []
 
-    async def build_once(*, cpu_count: int, memory_mb: int) -> BuildInfo:
+    async def build_once(
+        *,
+        template: object,
+        alias: str,
+        cpu_count: int,
+        memory_mb: int,
+    ) -> BuildInfo:
+        del template
+        assert alias.startswith("wmh-")
         calls.append((cpu_count, memory_mb))
         return BuildInfo(
             template_id="template-immutable",
@@ -225,35 +318,65 @@ def test_content_keyed_build_registry_reuses_only_completed_exact_ids(
             alias="mutable-alias",
         )
 
-    async def unexpected_build(*, cpu_count: int, memory_mb: int) -> BuildInfo:
-        del cpu_count, memory_mb
-        raise AssertionError("completed exact build should have been reused")
+    monkeypatch.setattr(mod, "_build_exact_template_once", build_once)
 
-    monkeypatch.setattr(first, "_build_template_once", build_once)
-    monkeypatch.setattr(second, "_build_template_once", unexpected_build)
-
-    first_record = asyncio.run(first._load_or_build_exact_template(allow_build=True))
-    second_record = asyncio.run(second._load_or_build_exact_template())
+    first_record = asyncio.run(
+        mod.prepare_exact_e2b_build(
+            jobs_dir=jobs_dir,
+            environment_dir=environment_dir,
+            spec=spec,
+            budget_account=account,
+            provider_spend_limit=_spend_limit(account),
+        )
+    )
+    second_record = asyncio.run(
+        mod.prepare_exact_e2b_build(
+            jobs_dir=jobs_dir,
+            environment_dir=environment_dir,
+            spec=spec,
+            budget_account=account,
+            provider_spend_limit=_spend_limit(account),
+        )
+    )
 
     assert calls == [(2, 1024)]
     assert second_record == first_record
     assert second_record.exact_template_ref == "template-immutable:build-immutable"
+    assert isinstance(second_record.cost_attribution, mod.BudgetedE2BBuildAttribution)
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.reservation_id == second_record.cost_attribution.reservation_id
 
 
 def test_concurrent_build_registry_serializes_before_publishing_exact_ids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = _environment(tmp_path, trial_name="trial-a")
-    second = _environment(tmp_path, trial_name="trial-b")
+    _environment(tmp_path, trial_name="trial-a")
+    environment_dir = tmp_path / "environment"
+    jobs_dir = tmp_path / "jobs"
+    account = _build_resource_account(tmp_path)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
 
     async def scenario() -> None:
         build_started = asyncio.Event()
         release_build = asyncio.Event()
         calls = 0
 
-        async def build_once(*, cpu_count: int, memory_mb: int) -> BuildInfo:
+        async def build_once(
+            *,
+            template: object,
+            alias: str,
+            cpu_count: int,
+            memory_mb: int,
+        ) -> BuildInfo:
             nonlocal calls
+            del template, alias
             assert (cpu_count, memory_mb) == (2, 1024)
             calls += 1
             build_started.set()
@@ -265,17 +388,26 @@ def test_concurrent_build_registry_serializes_before_publishing_exact_ids(
                 alias="opaque-alias",
             )
 
-        async def duplicate_build(*, cpu_count: int, memory_mb: int) -> BuildInfo:
-            del cpu_count, memory_mb
-            raise AssertionError("the serialized registry must reuse the first completed build")
-
-        monkeypatch.setattr(first, "_build_template_once", build_once)
-        monkeypatch.setattr(second, "_build_template_once", duplicate_build)
+        monkeypatch.setattr(mod, "_build_exact_template_once", build_once)
         first_task = asyncio.create_task(
-            first._load_or_build_exact_template(allow_build=True)
+            mod.prepare_exact_e2b_build(
+                jobs_dir=jobs_dir,
+                environment_dir=environment_dir,
+                spec=spec,
+                budget_account=account,
+                provider_spend_limit=_spend_limit(account),
+            )
         )
         await asyncio.wait_for(build_started.wait(), timeout=1)
-        second_task = asyncio.create_task(second._load_or_build_exact_template())
+        second_task = asyncio.create_task(
+            mod.prepare_exact_e2b_build(
+                jobs_dir=jobs_dir,
+                environment_dir=environment_dir,
+                spec=spec,
+                budget_account=account,
+                provider_spend_limit=_spend_limit(account),
+            )
+        )
         await asyncio.sleep(0.05)
         assert not second_task.done()
 
@@ -295,10 +427,12 @@ def test_concurrent_exact_build_registration_allows_one_conflicting_record(
         return mod.register_exact_e2b_build_record(
             jobs_dir=tmp_path / "jobs",
             environment_id="environment-immutable",
+            docker_image=None,
             template_id="template-immutable",
             build_id=build_id,
             cpu_count=2,
             memory_mb=1024,
+            acknowledge_preexisting_outside_study=True,
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -320,6 +454,7 @@ def test_concurrent_exact_build_registration_allows_one_conflicting_record(
     loaded = mod.require_exact_e2b_build_record(
         jobs_dir=tmp_path / "jobs",
         environment_id="environment-immutable",
+        docker_image=None,
         cpu_count=2,
         memory_mb=1024,
     )
@@ -332,14 +467,201 @@ def test_scored_runtime_rejects_an_unprepared_billable_template_build(
 ) -> None:
     environment = _environment(tmp_path)
 
-    async def forbidden_build(*, cpu_count: int, memory_mb: int) -> BuildInfo:
-        del cpu_count, memory_mb
+    async def forbidden_build(**_kwargs: object) -> BuildInfo:
         raise AssertionError("scored runtime must not dispatch a template build")
 
-    monkeypatch.setattr(environment, "_build_template_once", forbidden_build)
+    monkeypatch.setattr(mod, "_build_exact_template_once", forbidden_build)
 
     with pytest.raises(RuntimeError, match="prebuilt exact template"):
         asyncio.run(environment._load_or_build_exact_template())
+
+
+def test_ambiguous_build_forfeits_the_ceiling_and_blocks_automatic_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _environment(tmp_path)
+    environment_dir = tmp_path / "environment"
+    account = _build_resource_account(tmp_path)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    calls = 0
+
+    async def fail_build(**_kwargs: object) -> BuildInfo:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("provider completion is unknown")
+
+    monkeypatch.setattr(mod, "_build_exact_template_once", fail_build)
+
+    async def prepare() -> mod.ExactE2BBuildRecord:
+        return await mod.prepare_exact_e2b_build(
+            jobs_dir=tmp_path / "jobs",
+            environment_dir=environment_dir,
+            spec=spec,
+            budget_account=account,
+            provider_spend_limit=_spend_limit(account),
+        )
+
+    with pytest.raises(RuntimeError, match="completion is unknown"):
+        asyncio.run(prepare())
+
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+    assert calls == 1
+
+    with pytest.raises(RuntimeError, match="automatic retry is forbidden"):
+        asyncio.run(prepare())
+    assert calls == 1
+
+
+def test_build_source_symlink_is_rejected_before_reservation_or_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _environment(tmp_path)
+    environment_dir = tmp_path / "environment"
+    (environment_dir / "linked").symlink_to(environment_dir / "Dockerfile")
+    account = _build_resource_account(tmp_path)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+
+    async def unexpected_build(**_kwargs: object) -> BuildInfo:
+        raise AssertionError("unsafe source must be rejected before provider dispatch")
+
+    monkeypatch.setattr(mod, "_build_exact_template_once", unexpected_build)
+
+    with pytest.raises(RuntimeError, match="cannot contain symbolic links"):
+        asyncio.run(
+            mod.prepare_exact_e2b_build(
+                jobs_dir=tmp_path / "jobs",
+                environment_dir=environment_dir,
+                spec=spec,
+                budget_account=account,
+                provider_spend_limit=_spend_limit(account),
+            )
+        )
+
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+
+
+def test_provider_limit_above_frozen_remaining_cap_blocks_build_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _environment(tmp_path)
+    environment_dir = tmp_path / "environment"
+    account = _build_resource_account(tmp_path)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    spend_limit = _spend_limit(account).model_copy(
+        update={"account_limit_nano_usd": account.policy.hard_limit_nano_usd + 1}
+    )
+
+    async def unexpected_build(**_kwargs: object) -> BuildInfo:
+        raise AssertionError("provider limit gate must precede provider dispatch")
+
+    monkeypatch.setattr(mod, "_build_exact_template_once", unexpected_build)
+
+    with pytest.raises(BudgetIntegrityError, match="exceeds the frozen remaining"):
+        asyncio.run(
+            mod.prepare_exact_e2b_build(
+                jobs_dir=tmp_path / "jobs",
+                environment_dir=environment_dir,
+                spec=spec,
+                budget_account=account,
+                provider_spend_limit=spend_limit,
+            )
+        )
+
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+
+
+def test_build_budget_denial_releases_predispatch_claim_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _environment(tmp_path)
+    environment_dir = tmp_path / "environment"
+    account = _build_resource_account(tmp_path, hard_limit=1)
+    spec = mod.freeze_exact_e2b_build_spec(
+        environment_dir=environment_dir,
+        docker_image=None,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+
+    async def unexpected_build(**_kwargs: object) -> BuildInfo:
+        raise AssertionError("hard-cap denial must precede provider dispatch")
+
+    monkeypatch.setattr(mod, "_build_exact_template_once", unexpected_build)
+
+    with pytest.raises(BudgetExceededError, match="hard budget"):
+        asyncio.run(
+            mod.prepare_exact_e2b_build(
+                jobs_dir=tmp_path / "jobs",
+                environment_dir=environment_dir,
+                spec=spec,
+                budget_account=account,
+                provider_spend_limit=_spend_limit(account),
+            )
+        )
+
+    registry = tmp_path / "jobs" / mod._BUILD_REGISTRY_DIR
+    assert list(registry.glob("*.attempt.json")) == []
+    assert SpendLedger(account.ledger_path, account.policy).reservations() == []
+
+
+def test_exact_build_digest_binds_docker_image_even_with_nonempty_context(
+    tmp_path: Path,
+) -> None:
+    _environment(tmp_path)
+    source = tmp_path / "environment"
+
+    first = mod.freeze_exact_e2b_build_spec(
+        environment_dir=source,
+        docker_image="example.invalid/base@sha256:" + "a" * 64,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    second = mod.freeze_exact_e2b_build_spec(
+        environment_dir=source,
+        docker_image="example.invalid/base@sha256:" + "b" * 64,
+        cpu_count=2,
+        memory_mb=1024,
+    )
+
+    assert first.environment_id == second.environment_id
+    assert first.digest != second.digest
+
+
+def test_external_build_registration_requires_explicit_outside_study_acknowledgment(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="outside-study acknowledgment"):
+        mod.register_exact_e2b_build_record(
+            jobs_dir=tmp_path / "jobs",
+            environment_id="environment-immutable",
+            docker_image=None,
+            template_id="template-immutable",
+            build_id="build-immutable",
+            cpu_count=2,
+            memory_mb=1024,
+            acknowledge_preexisting_outside_study=False,
+        )
 
 
 def test_exact_create_binds_build_policy_and_terminal_cleanup_receipt(

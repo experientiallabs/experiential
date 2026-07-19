@@ -779,8 +779,10 @@ def _preflight_exact_e2b_builds(
             require_exact_e2b_build_record(
                 jobs_dir=config.jobs_dir,
                 environment_id=environment_id,
+                docker_image=docker_image,
                 cpu_count=resource_class.cpu_count,
                 memory_mb=resource_class.memory_mb,
+                expected_budget_authority=matched_account,
             )
     if admitted_account_ids != set(range(len(resource_accounts))):
         raise ValueError("E2B task resource accounts must exactly cover the frozen task classes")
