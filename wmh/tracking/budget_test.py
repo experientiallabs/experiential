@@ -947,7 +947,11 @@ def test_exposed_policy_is_a_defensive_deep_copy(tmp_path: Path) -> None:
     exposed.phase_limits_nano_usd["search"] = 1
     exposed_meter = exposed.meters["worker"]
     assert isinstance(exposed_meter, ProviderCostMeter)
-    exposed_meter.provider_config.model = "mutated"
+    exposed.meters["worker"] = exposed_meter.model_copy(
+        update={
+            "provider_config": exposed_meter.provider_config.model_copy(update={"model": "mutated"})
+        }
+    )
 
     assert ledger.policy.phase_limits_nano_usd["search"] == 80
     persisted_meter = ledger.policy.meters["worker"]
