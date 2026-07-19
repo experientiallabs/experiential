@@ -25,8 +25,10 @@ _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _JOURNAL_VERSION: Literal["1"] = "1"
 _RECORD_VERSION: Literal["1"] = "1"
 _GENESIS_FILE = "study-journal.json"
+_PENDING_FILE = "pending-phase.json"
 _MAX_RECORD_BYTES = 64 * 1024
 _RECORD_PATTERN = re.compile(r"^(?P<sequence>[0-9]{3})-(?P<phase>[a-z_]+)\.json$")
+_TEMPORARY_PATTERN = re.compile(r"^\.tmp-(?P<target>.+)-(?P<nonce>[0-9a-f]{32})$")
 
 
 class StudyPhase(StrEnum):
@@ -177,7 +179,7 @@ class StudyPhaseRecord(BaseModel):
 
 
 class ExternalCommitmentPublisher(Protocol):
-    """Idempotent adapter to an externally verifiable append-only channel."""
+    """Idempotent, fork-rejecting adapter to an external append-only channel."""
 
     @property
     def configuration_digest(self) -> str:
@@ -185,7 +187,7 @@ class ExternalCommitmentPublisher(Protocol):
         ...
 
     def publish(self, commitment: StudyPhaseCommitment) -> ExternalPublicationReceipt:
-        """Publish or recover the sole receipt for ``commitment.digest``."""
+        """Publish or recover this journal-sequence slot, rejecting another digest."""
         ...
 
     def verify(
@@ -194,6 +196,15 @@ class ExternalCommitmentPublisher(Protocol):
         receipt: ExternalPublicationReceipt,
     ) -> None:
         """Raise unless the external channel still proves this exact publication."""
+        ...
+
+    def verify_chain_head(
+        self,
+        genesis: StudyJournalGenesis,
+        records: tuple[StudyPhaseRecord, ...],
+        pending: StudyPhaseCommitment | None,
+    ) -> None:
+        """Raise unless the channel has this exact chain and optional next commitment."""
         ...
 
 
@@ -210,12 +221,13 @@ class StudyJournalStore:
         self._directory = Path(os.path.abspath(Path(directory).expanduser()))
         directory_descriptor = _open_private_directory(self._directory)
         with _managed_descriptor(directory_descriptor):
-            self._directory_identity = _private_directory_identity(
-                os.fstat(directory_descriptor)
-            )
-            self._genesis = StudyJournalGenesis.model_validate_json(
-                _read_regular_file_at(directory_descriptor, _GENESIS_FILE)
-            )
+            self._directory_identity = _private_directory_identity(os.fstat(directory_descriptor))
+            genesis_payload = _read_regular_file_at(directory_descriptor, _GENESIS_FILE)
+            self._genesis = StudyJournalGenesis.model_validate_json(genesis_payload)
+            if genesis_payload != _canonical_json_bytes(self._genesis.model_dump(mode="json")):
+                raise ValueError("study journal genesis is not canonical")
+            _require_directory_binding(self._directory, self._directory_identity)
+            _require_genesis_binding(self, directory_descriptor)
             _require_directory_binding(self._directory, self._directory_identity)
         if self._genesis.study_id != study_id:
             raise ValueError("study journal belongs to a different study")
@@ -239,10 +251,8 @@ class StudyJournalStore:
         _validate_leaf_name(path.name)
         parent_descriptor = _open_parent_directory(path)
         with _managed_descriptor(parent_descriptor):
-            created = False
             try:
                 os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
-                created = True
             except FileExistsError:
                 pass
             directory_descriptor = _open_private_directory_at(
@@ -250,12 +260,9 @@ class StudyJournalStore:
                 path.name,
             )
             with _managed_descriptor(directory_descriptor):
-                directory_identity = _private_directory_identity(
-                    os.fstat(directory_descriptor)
-                )
+                directory_identity = _private_directory_identity(os.fstat(directory_descriptor))
                 _require_directory_binding(path, directory_identity)
-                if created:
-                    os.fsync(parent_descriptor)
+                os.fsync(parent_descriptor)
                 _publish_regular_file_once_at(
                     directory_descriptor,
                     _GENESIS_FILE,
@@ -298,32 +305,38 @@ class StudyJournalStore:
                 contention_error=RuntimeError("study journal is already locked"),
             ):
                 _require_directory_binding(self._directory, self._directory_identity)
+                _require_genesis_binding(self, directory_descriptor)
                 try:
                     yield directory_descriptor
                 except BaseException as primary_error:
                     try:
-                        _require_directory_binding(self._directory, self._directory_identity)
+                        _require_store_binding(self, directory_descriptor)
                     except OSError as binding_error:
                         primary_error.add_note(
-                            f"study journal directory binding also failed: {binding_error}"
+                            f"study journal binding also failed: {binding_error}"
                         )
                     raise
                 else:
-                    _require_directory_binding(self._directory, self._directory_identity)
+                    _require_store_binding(self, directory_descriptor)
 
 
 def load_study_journal(
     store: StudyJournalStore,
     *,
-    publisher: ExternalCommitmentPublisher | None = None,
+    publisher: ExternalCommitmentPublisher,
 ) -> tuple[StudyPhaseRecord, ...]:
-    """Load and revalidate the complete local chain and optional external proofs."""
+    """Load the complete local chain after revalidating every external proof."""
     with store.locked() as directory_descriptor:
         records = _load_records_locked(store, directory_descriptor)
-        if publisher is not None:
-            _validate_publisher(store, publisher)
-            for record in records:
-                publisher.verify(record.commitment, record.publication)
+        pending = _load_pending_locked(store, directory_descriptor, records)
+        _validate_publisher(store, publisher)
+        _verify_external_chain_locked(
+            store,
+            directory_descriptor,
+            publisher,
+            records,
+            pending,
+        )
         return records
 
 
@@ -342,15 +355,38 @@ def append_study_phase(
     requested_index = STUDY_PHASES.index(requested_phase)
     with store.locked() as directory_descriptor:
         records = _load_records_locked(store, directory_descriptor)
+        pending, pending_is_complete = _load_pending_locked(
+            store,
+            directory_descriptor,
+            records,
+        )
+        if pending_is_complete:
+            _remove_file_durably_at(directory_descriptor, _PENDING_FILE)
+            pending = None
+            pending_is_complete = False
         if requested_index < len(records):
             existing = records[requested_index]
             if existing.commitment.payload_digest != payload_digest:
                 raise ValueError("study phase is already committed with a different payload")
-            publisher.verify(existing.commitment, existing.publication)
+            _verify_external_chain_locked(
+                store,
+                directory_descriptor,
+                publisher,
+                records,
+                (pending, pending_is_complete),
+            )
             return existing
         if requested_index != len(records):
             expected = STUDY_PHASES[len(records)] if len(records) < len(STUDY_PHASES) else None
             raise ValueError(f"next study phase must be {expected.value if expected else 'none'}")
+
+        _verify_external_chain_locked(
+            store,
+            directory_descriptor,
+            publisher,
+            records,
+            (pending, pending_is_complete),
+        )
 
         commitment = StudyPhaseCommitment(
             journal_genesis_digest=store.genesis.digest,
@@ -360,15 +396,29 @@ def append_study_phase(
             previous_record_digest=records[-1].digest if records else None,
             payload_digest=payload_digest,
         )
+        if pending is None:
+            _publish_regular_file_once_at(
+                directory_descriptor,
+                _PENDING_FILE,
+                _canonical_json_bytes(commitment.model_dump(mode="json")),
+            )
+        elif pending != commitment:
+            raise ValueError("pending commitment fixes a different payload or chain position")
         publication = ExternalPublicationReceipt.model_validate(
             publisher.publish(commitment).model_dump(mode="json")
         )
+        _validate_publisher(store, publisher)
         if publication.commitment_digest != commitment.digest:
             raise ValueError("publication receipt names a different commitment")
         publisher.verify(commitment, publication)
+        _validate_publisher(store, publisher)
         if records and publication.published_at < records[-1].publication.published_at:
             raise ValueError("study journal publication timestamps move backwards")
+        _require_store_binding(store, directory_descriptor)
         record = StudyPhaseRecord.create(commitment=commitment, publication=publication)
+        publisher.verify_chain_head(store.genesis, (*records, record), None)
+        _validate_publisher(store, publisher)
+        _require_store_binding(store, directory_descriptor)
         _publish_regular_file_once_at(
             directory_descriptor,
             _record_name(requested_index, requested_phase),
@@ -377,6 +427,14 @@ def append_study_phase(
         persisted = _load_records_locked(store, directory_descriptor)
         if len(persisted) != len(records) + 1 or persisted[-1] != record:
             raise RuntimeError("study journal append did not persist the exact phase record")
+        persisted_pending, pending_is_complete = _load_pending_locked(
+            store,
+            directory_descriptor,
+            persisted,
+        )
+        if persisted_pending != commitment or not pending_is_complete:
+            raise RuntimeError("study journal pending commitment changed during append")
+        _remove_file_durably_at(directory_descriptor, _PENDING_FILE)
         return record
 
 
@@ -386,9 +444,14 @@ def _load_records_locked(
 ) -> tuple[StudyPhaseRecord, ...]:
     record_names: list[tuple[int, StudyPhase, str]] = []
     for name in os.listdir(directory_descriptor):
+        if name in {_GENESIS_FILE, _PENDING_FILE}:
+            continue
         match = _RECORD_PATTERN.fullmatch(name)
         if match is None:
-            continue
+            if _is_valid_temporary_name(name):
+                _read_regular_file_at(directory_descriptor, name)
+                continue
+            raise ValueError(f"study journal contains unexpected entry {name!r}")
         try:
             phase = StudyPhase(match.group("phase"))
         except ValueError as exc:
@@ -398,13 +461,18 @@ def _load_records_locked(
 
     records: list[StudyPhaseRecord] = []
     for expected_sequence, (sequence, phase, name) in enumerate(record_names):
-        if sequence != expected_sequence or phase is not STUDY_PHASES[expected_sequence]:
+        if (
+            expected_sequence >= len(STUDY_PHASES)
+            or sequence != expected_sequence
+            or phase is not STUDY_PHASES[expected_sequence]
+        ):
             raise ValueError("study journal phase files are missing, duplicated, or out of order")
         if name != _record_name(sequence, phase):
             raise ValueError("study journal phase filename is not canonical")
-        record = StudyPhaseRecord.model_validate_json(
-            _read_regular_file_at(directory_descriptor, name)
-        )
+        record_payload = _read_regular_file_at(directory_descriptor, name)
+        record = StudyPhaseRecord.model_validate_json(record_payload)
+        if record_payload != _canonical_json_bytes(record.model_dump(mode="json")):
+            raise ValueError("study journal record is not canonical")
         expected_previous = records[-1].digest if records else None
         if (
             record.commitment.journal_genesis_digest != store.genesis.digest
@@ -418,6 +486,60 @@ def _load_records_locked(
             raise ValueError("study journal publication timestamps move backwards")
         records.append(record)
     return tuple(records)
+
+
+def _load_pending_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+    records: tuple[StudyPhaseRecord, ...],
+) -> tuple[StudyPhaseCommitment | None, bool]:
+    try:
+        payload = _read_regular_file_at(directory_descriptor, _PENDING_FILE)
+    except FileNotFoundError:
+        return None, False
+    try:
+        pending = StudyPhaseCommitment.model_validate_json(payload)
+    except ValueError as exc:
+        raise ValueError("study journal pending commitment is invalid") from exc
+    if payload != _canonical_json_bytes(pending.model_dump(mode="json")):
+        raise ValueError("study journal pending commitment is not canonical")
+    if (
+        pending.journal_genesis_digest != store.genesis.digest
+        or pending.study_id != store.genesis.study_id
+    ):
+        raise ValueError("study journal pending commitment belongs to another journal")
+    if records and pending == records[-1].commitment:
+        return pending, True
+    expected_sequence = len(records)
+    if expected_sequence >= len(STUDY_PHASES):
+        raise ValueError("completed study journal cannot contain a pending commitment")
+    expected_previous = records[-1].digest if records else None
+    if (
+        pending.sequence != expected_sequence
+        or pending.phase is not STUDY_PHASES[expected_sequence]
+        or pending.previous_record_digest != expected_previous
+    ):
+        raise ValueError("study journal pending commitment differs from its chain position")
+    return pending, False
+
+
+def _verify_external_chain_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+    publisher: ExternalCommitmentPublisher,
+    records: tuple[StudyPhaseRecord, ...],
+    pending: tuple[StudyPhaseCommitment | None, bool],
+) -> None:
+    _validate_publisher(store, publisher)
+    for record in records:
+        publisher.verify(record.commitment, record.publication)
+    active_pending = pending[0] if not pending[1] else None
+    publisher.verify_chain_head(store.genesis, records, active_pending)
+    _validate_publisher(store, publisher)
+    persisted = _load_records_locked(store, directory_descriptor)
+    persisted_pending = _load_pending_locked(store, directory_descriptor, persisted)
+    if persisted != records or persisted_pending != pending:
+        raise RuntimeError("study journal changed during external verification")
 
 
 def _record_name(sequence: int, phase: StudyPhase) -> str:
@@ -464,9 +586,7 @@ def _open_private_directory(
         raise OSError("study journal directory does not exist") from None
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-            raise OSError(
-                "study journal path must be a directory, not a symlink or file"
-            ) from exc
+            raise OSError("study journal path must be a directory, not a symlink or file") from exc
         raise
     try:
         identity = _private_directory_identity(os.fstat(descriptor))
@@ -512,9 +632,7 @@ def _open_private_directory_at(parent_descriptor: int, name: str) -> int:
         raise OSError("study journal directory does not exist") from None
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-            raise OSError(
-                "study journal path must be a directory, not a symlink or file"
-            ) from exc
+            raise OSError("study journal path must be a directory, not a symlink or file") from exc
         raise
     try:
         _private_directory_identity(os.fstat(descriptor))
@@ -531,6 +649,27 @@ def _require_directory_binding(path: Path, expected_identity: tuple[int, int]) -
         raise OSError("study journal directory was replaced or changed") from exc
     if actual_identity != expected_identity:
         raise OSError("study journal directory was replaced or changed")
+
+
+def _require_genesis_binding(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+) -> None:
+    expected = _canonical_json_bytes(store.genesis.model_dump(mode="json"))
+    try:
+        actual = _read_regular_file_at(directory_descriptor, _GENESIS_FILE)
+    except OSError as exc:
+        raise OSError("study journal genesis was replaced or changed") from exc
+    if actual != expected:
+        raise OSError("study journal genesis was replaced or changed")
+
+
+def _require_store_binding(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+) -> None:
+    _require_directory_binding(store.directory, store._directory_identity)
+    _require_genesis_binding(store, directory_descriptor)
 
 
 @contextmanager
@@ -666,6 +805,34 @@ def _remove_temporary_file_at(
     if primary_error is None:
         raise cleanup_error
     primary_error.add_note(f"study journal temporary-file cleanup also failed: {cleanup_error}")
+
+
+def _remove_file_durably_at(directory_descriptor: int, name: str) -> None:
+    _validate_leaf_name(name)
+    os.unlink(name, dir_fd=directory_descriptor)
+    os.fsync(directory_descriptor)
+
+
+def _is_valid_temporary_name(name: str) -> bool:
+    match = _TEMPORARY_PATTERN.fullmatch(name)
+    if match is None:
+        return False
+    target = match.group("target")
+    if target in {_GENESIS_FILE, _PENDING_FILE}:
+        return True
+    record_match = _RECORD_PATTERN.fullmatch(target)
+    if record_match is None:
+        return False
+    try:
+        phase = StudyPhase(record_match.group("phase"))
+    except ValueError:
+        return False
+    sequence = int(record_match.group("sequence"))
+    return (
+        sequence < len(STUDY_PHASES)
+        and phase is STUDY_PHASES[sequence]
+        and target == _record_name(sequence, phase)
+    )
 
 
 def _validate_leaf_name(name: str) -> None:
