@@ -308,6 +308,30 @@ def test_evaluator_requires_fixed_e2b_lease_to_cover_the_turn(tmp_path: Path) ->
         )
 
 
+def test_evaluator_admits_hour_turn_with_long_e2b_runner_lease(tmp_path: Path) -> None:
+    runner_spec = _e2b_runner(lease_timeout_s=7_200)
+    evaluator = mod.HarborEvaluator(
+        _spec(tmp_path, tmp_path / "dataset"),
+        _provider(),
+        runner_spec=runner_spec,
+        turn_timeout_s=3_600,
+        **_e2b_budget_kwargs(tmp_path, runner_spec=runner_spec),
+    )
+
+    assert isinstance(evaluator._runner_spec, E2BPiRunnerSpec)
+    assert evaluator._runner_spec.lease_timeout_s == 7_200
+
+
+def test_evaluator_rejects_hour_turn_without_cleanup_margin(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="lease_timeout_s"):
+        mod.HarborEvaluator(
+            _spec(tmp_path, tmp_path / "dataset"),
+            _provider(),
+            runner_spec=_e2b_runner(lease_timeout_s=3_659),
+            turn_timeout_s=3_600,
+        )
+
+
 def test_e2b_runner_readiness_checks_only_local_prerequisites(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

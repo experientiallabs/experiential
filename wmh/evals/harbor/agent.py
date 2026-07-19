@@ -30,6 +30,7 @@ from pydantic import TypeAdapter
 from wmh.core.types import JsonObject
 from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.e2b_sandbox import E2B_MAX_SANDBOX_TIMEOUT_S
 from wmh.harness.live_session import OutputEmitter, SessionEvent, ToolOutcome
 from wmh.harness.pi_runner import (
     AmbiguousTaskEnvironmentError,
@@ -49,6 +50,7 @@ from wmh.harness.pi_runner_backend import (
     PiRunnerBackendSpec,
     build_pi_runner_factory,
     runner_owner_id,
+    validate_pi_runner_turn_timeout,
 )
 from wmh.harness.runner_link import TokenUsage
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -83,7 +85,7 @@ _TRACE_FILE = "wmh-events.jsonl"
 _RUNNER_LEASE_FILE = "wmh-runner-lease.json"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.8.0"
+WMH_PI_AGENT_VERSION: Final = "0.8.1"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -570,8 +572,7 @@ class WmhPiAgent(BaseAgent):
         if isinstance(validated_runner, E2BPiRunnerSpec) and binding is not None:
             if runner_budget_account is None:
                 raise ValueError("budgeted E2B runners require a timed resource budget")
-        if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
-            raise ValueError("turn_timeout_s must be finite and positive")
+        validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
         if not isinstance(require_provider_receipts, bool):
             raise ValueError("require_provider_receipts must be a boolean")
         self._provider_config = config.model_copy(deep=True)
@@ -1170,7 +1171,7 @@ async def _attest_e2b_environment(
     if (
         isinstance(lease_timeout_s, bool)
         or not isinstance(lease_timeout_s, int)
-        or not 60 <= lease_timeout_s <= 3600
+        or not 60 <= lease_timeout_s <= E2B_MAX_SANDBOX_TIMEOUT_S
     ):
         raise RuntimeError("E2B task environment lease lifetime is invalid")
     network_mode = evidence.get("network_mode")

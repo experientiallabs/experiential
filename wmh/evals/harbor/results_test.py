@@ -94,7 +94,7 @@ _E2B_TASK_ENVIRONMENT_ATTESTATION = {
     "internet_access": False,
     "network_allow_out": [],
     "network_deny_out": ["0.0.0.0/0"],
-    "lease_timeout_s": 3600,
+    "lease_timeout_s": 86_400,
     "timeout_action": "kill",
     "auto_resume": False,
     "volume_mounts": False,

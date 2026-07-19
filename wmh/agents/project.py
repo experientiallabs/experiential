@@ -23,6 +23,7 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
     E2B_CLEANUP_HORIZON_S,
     E2B_CREATE_REQUEST_TIMEOUT_S,
+    E2B_MAX_SANDBOX_TIMEOUT_S,
     CommandOutput,
     SandboxCleanupError,
     SandboxFactory,
@@ -146,6 +147,8 @@ class _BudgetedProjectSandboxFactory:
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0 or not timeout.is_integer():
             raise ValueError("project sandbox timeout must be a positive whole number of seconds")
+        if timeout > E2B_MAX_SANDBOX_TIMEOUT_S:
+            raise ValueError("project sandbox timeout exceeds the E2B provider maximum")
         if _EXACT_E2B_TEMPLATE.fullmatch(template) is None:
             raise ValueError("project sandbox template must pin an exact template and build ID")
         if not ledger_dir.is_absolute():

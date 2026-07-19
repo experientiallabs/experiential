@@ -11,6 +11,7 @@ optional extra (`uv sync --extra e2b`).
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
@@ -43,6 +44,9 @@ E2B_TEMPLATE_ENV = "WMH_E2B_TEMPLATE"
 # Sandbox lifetime. The sandbox only hosts the harness process (tool calls are answered by the
 # environment host-side), so the bound is episode wall-time, not command time.
 DEFAULT_SANDBOX_TIMEOUT_S = 900.0
+# E2B accepts a sandbox lifetime of at most one day. Keep every producer and consumer of E2B
+# lifecycle attestations on this shared provider bound so long eval turns remain representable.
+E2B_MAX_SANDBOX_TIMEOUT_S = 86_400
 E2B_CREATE_REQUEST_TIMEOUT_S = 30
 # Bounds the direct kill retries plus metadata list/connect/kill reconciliation. The resource
 # meter includes this horizon in addition to provider TTL so host-clock settlement stays within
@@ -200,6 +204,12 @@ def default_sandbox_factory(
     (`Sandbox.list`) can find and reap an orphaned sandbox whose owning process died — the live
     session driver relies on this for cost-leak reconciliation.
     """
+    if (
+        isinstance(timeout, bool)
+        or not math.isfinite(timeout)
+        or not 1 <= timeout <= E2B_MAX_SANDBOX_TIMEOUT_S
+    ):
+        raise ValueError("E2B sandbox timeout must be between 1 and 86400 seconds")
 
     def make() -> SandboxHandle:
         try:

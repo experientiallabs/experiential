@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -22,6 +23,7 @@ from wmh.core.types import JsonObject
 from wmh.harness.e2b_sandbox import (
     E2B_CLEANUP_HORIZON_S,
     E2B_CREATE_REQUEST_TIMEOUT_S,
+    E2B_MAX_SANDBOX_TIMEOUT_S,
     CommandOutput,
     SandboxHandle,
     SandboxLifecyclePolicy,
@@ -59,6 +61,7 @@ _PLATFORM_PROBE_TIMEOUT_S = 10.0
 _PROVIDER_CLOCK_SKEW_S = 30.0
 _LEASE_LABEL = "wmh.runner.lease"
 _OWNER_LABEL = "wmh.runner.owner"
+E2B_RUNNER_TURN_CLEANUP_MARGIN_S = 60
 
 
 def _canonical_digest(value: JsonObject) -> str:
@@ -155,7 +158,7 @@ class E2BPiRunnerSpec(BaseModel):
     memory_mb: int = Field(ge=1)
     platform: str
     envd_version: str
-    lease_timeout_s: int = Field(ge=60, le=3600)
+    lease_timeout_s: int = Field(ge=60, le=E2B_MAX_SANDBOX_TIMEOUT_S)
 
     @field_validator("template_id", "build_id", "envd_version")
     @classmethod
@@ -218,6 +221,20 @@ PiRunnerBackendSpec = Annotated[
     LocalPiRunnerSpec | E2BPiRunnerSpec,
     Field(discriminator="backend"),
 ]
+
+
+def validate_pi_runner_turn_timeout(
+    spec: PiRunnerBackendSpec,
+    *,
+    turn_timeout_s: float,
+) -> None:
+    """Require a valid turn bound whose E2B lease includes teardown margin."""
+    if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
+        raise ValueError("turn_timeout_s must be finite and positive")
+    if isinstance(spec, E2BPiRunnerSpec) and (
+        spec.lease_timeout_s < math.ceil(turn_timeout_s) + E2B_RUNNER_TURN_CLEANUP_MARGIN_S
+    ):
+        raise ValueError("E2B runner lease_timeout_s must cover turn_timeout_s plus 60 seconds")
 
 
 @dataclass(frozen=True)

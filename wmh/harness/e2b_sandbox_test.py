@@ -284,6 +284,12 @@ def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
     ]
 
 
+@pytest.mark.parametrize("timeout", [0.0, float("nan"), 86_401.0])
+def test_default_factory_rejects_timeout_outside_provider_bounds(timeout: float) -> None:
+    with pytest.raises(ValueError, match="between 1 and 86400"):
+        default_sandbox_factory(timeout=timeout)
+
+
 def test_orphan_reaper_catches_a_sandbox_that_appears_after_an_empty_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

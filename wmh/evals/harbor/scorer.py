@@ -45,6 +45,7 @@ from wmh.harness.live_session import EventKind
 from wmh.harness.pi_runner_backend import (
     LocalPiRunnerSpec,
     PiRunnerBackendSpec,
+    validate_pi_runner_turn_timeout,
 )
 from wmh.harness.scoring import (
     MAX_TASK_EVIDENCE_CHARS,
@@ -156,8 +157,7 @@ class HarborHarnessScorer:
         validated_runner = TypeAdapter(PiRunnerBackendSpec).validate_python(
             runner_spec if runner_spec is not None else LocalPiRunnerSpec().model_dump(mode="json")
         )
-        if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
-            raise ValueError("turn_timeout_s must be finite and positive")
+        validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
         if not reward_key.strip():
             raise ValueError("reward_key must be non-empty")
         validate_durable_text(reward_key, field="Harbor reward key")
@@ -608,6 +608,7 @@ def validate_harbor_run_identity(
             else LocalPiRunnerSpec()
         )
     )
+    validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
     if result.job_name != spec.job_name:
         raise ValueError(
             f"Harbor result job name {result.job_name!r} does not match {spec.job_name!r}"

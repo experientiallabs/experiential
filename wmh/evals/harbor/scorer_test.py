@@ -408,6 +408,44 @@ def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Pat
     )
 
 
+def test_scorer_rejects_e2b_runner_lease_without_turn_cleanup_margin(
+    tmp_path: Path,
+) -> None:
+    runner_spec = E2BPiRunnerSpec(
+        template_id="runner-template",
+        build_id="runner-build",
+        cpu_count=2,
+        memory_mb=2048,
+        platform="linux/x86_64",
+        envd_version="0.2.1",
+        lease_timeout_s=3_659,
+    )
+
+    with pytest.raises(ValueError, match="lease_timeout_s"):
+        _scorer(
+            tmp_path,
+            runner_spec=runner_spec,
+            turn_timeout_s=3_600,
+        )
+
+
+def test_run_identity_validation_rejects_invalid_turn_before_matching(
+    tmp_path: Path,
+) -> None:
+    candidate = pi_node_baseline("candidate")
+    spec = _spec(tmp_path)
+    result = _loaded_result(tmp_path, candidate, spec).result
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        mod.validate_harbor_run_identity(
+            result,
+            candidate=candidate,
+            spec=spec,
+            provider_config=_provider(),
+            turn_timeout_s=float("nan"),
+        )
+
+
 def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

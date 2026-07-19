@@ -1246,6 +1246,14 @@ def test_pool_rejects_an_invalid_fixed_billing_horizon(invalid: object) -> None:
         )
 
 
+def test_pool_rejects_fixed_billing_horizon_above_provider_maximum() -> None:
+    with pytest.raises(ValueError, match="provider maximum"):
+        E2BSandboxPool(
+            sandbox_factory=lambda: pytest.fail("invalid horizon must fail before create"),
+            max_billing_seconds=86_401,
+        )
+
+
 def test_pool_issues_only_one_external_create_per_admission() -> None:
     """An ambiguous create cannot trigger extra resources outside the reserved horizon."""
     attempts = 0

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import math
 import os
 import shutil
 import stat
@@ -80,10 +79,10 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_API_KEY_ENV
 from wmh.harness.pi_local import verify_container_pi_runner_ready
 from wmh.harness.pi_runner_backend import (
-    E2BPiRunnerSpec,
     LocalPiRunnerSpec,
     PiRunnerBackendSpec,
     e2b_runner_resource_class,
+    validate_pi_runner_turn_timeout,
 )
 from wmh.providers.base import ProviderConfig
 from wmh.tracking.budget import (
@@ -187,8 +186,7 @@ def harbor_run_expectation(
 ) -> HarborRunExpectation:
     """Build the path-independent identity expected from one exact Harbor run."""
     validated_runner = _coerce_runner_spec(runner_spec=runner_spec, runner_image=runner_image)
-    if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
-        raise ValueError("turn_timeout_s must be finite and positive")
+    validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
     frozen_spec = HarborJobSpec.model_validate(spec.model_dump())
     frozen_provider = ProviderConfig.model_validate(provider_config.model_dump())
     agent = _build_harbor_agent_config(
@@ -370,14 +368,9 @@ class HarborEvaluator:
             runner_spec=runner_spec,
             runner_image=runner_image,
         )
-        if not math.isfinite(turn_timeout_s) or turn_timeout_s <= 0:
-            raise ValueError("turn_timeout_s must be finite and positive")
+        validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
         if not isinstance(require_provider_receipts, bool):
             raise ValueError("require_provider_receipts must be a boolean")
-        if isinstance(validated_runner, E2BPiRunnerSpec) and (
-            validated_runner.lease_timeout_s < math.ceil(turn_timeout_s) + 60
-        ):
-            raise ValueError("E2B runner lease_timeout_s must cover turn_timeout_s plus 60 seconds")
         validated_spec = HarborJobSpec.model_validate(spec.model_dump())
         _validate_job_name(validated_spec.job_name)
         self._spec = validated_spec.model_copy(

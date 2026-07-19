@@ -38,6 +38,7 @@ from wmh.core.types import JsonObject
 from wmh.harness.e2b_sandbox import (
     E2B_CLEANUP_HORIZON_S,
     E2B_CREATE_REQUEST_TIMEOUT_S,
+    E2B_MAX_SANDBOX_TIMEOUT_S,
     reap_e2b_runner_lease,
 )
 from wmh.harness.pi_runner_backend import (
@@ -79,7 +80,7 @@ _BUILD_REGISTRY_DIR = ".wmh-e2b-builds"
 # verification. Preserve Harbor's full-day E2B horizon so a valid long-running task cannot lose its
 # environment between those independently bounded phases. The timed-resource reservation prices
 # this entire provider TTL before create, while settlement uses observed lifetime after cleanup.
-_TASK_LEASE_TIMEOUT_S = 86_400
+_TASK_LEASE_TIMEOUT_S = E2B_MAX_SANDBOX_TIMEOUT_S
 _PLATFORM_PROBE_TIMEOUT_S = 10
 _PROVIDER_CLOCK_SKEW_S = 30
 _TEMPLATE_BUILD_WAIT_TIMEOUT_S = 3_600

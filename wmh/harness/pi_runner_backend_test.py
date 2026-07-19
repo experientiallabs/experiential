@@ -153,6 +153,24 @@ def _e2b_spec() -> E2BPiRunnerSpec:
     )
 
 
+def test_e2b_runner_lease_supports_provider_maximum_and_binds_resource_class() -> None:
+    spec = _e2b_spec().model_copy(update={"lease_timeout_s": 86_400})
+
+    validated = E2BPiRunnerSpec.model_validate(spec.model_dump())
+
+    assert validated.lease_timeout_s == 86_400
+    assert validated.attestation.evidence["lease_timeout_s"] == 86_400
+    assert backend_mod.e2b_runner_resource_class(validated).provider_ttl_seconds == 86_400
+
+
+def test_e2b_runner_lease_rejects_above_provider_maximum() -> None:
+    payload = _e2b_spec().model_dump()
+    payload["lease_timeout_s"] = 86_401
+
+    with pytest.raises(ValueError, match="lease_timeout_s"):
+        E2BPiRunnerSpec.model_validate(payload)
+
+
 def _resource_account(
     tmp_path: Path,
     spec: E2BPiRunnerSpec,

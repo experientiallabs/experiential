@@ -42,6 +42,7 @@ from typing import Literal, cast, overload
 from wmh.core.types import JsonObject
 from wmh.harness.e2b_sandbox import (
     DEFAULT_SANDBOX_TIMEOUT_S,
+    E2B_MAX_SANDBOX_TIMEOUT_S,
     E2B_TEMPLATE_ENV,
     CommandHandle,
     SandboxCleanupError,
@@ -1097,6 +1098,8 @@ class E2BSandboxPool:
             raise ValueError("max_billing_seconds must be a positive integer")
         if max_billing_seconds < 1:
             raise ValueError("max_billing_seconds must be a positive integer")
+        if max_billing_seconds > E2B_MAX_SANDBOX_TIMEOUT_S:
+            raise ValueError("max_billing_seconds exceeds the E2B provider maximum")
         self._template = template
         self._max_billing_seconds = max_billing_seconds
         lifecycle = SandboxLifecyclePolicy(on_timeout="kill", auto_resume=False)

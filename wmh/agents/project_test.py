@@ -1532,6 +1532,21 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     assert all(item.status is ReservationStatus.SETTLED for item in reservations)
 
 
+def test_budgeted_project_rejects_timeout_above_provider_maximum(tmp_path: Path) -> None:
+    account = _project_resource_account(tmp_path, timeout=86_401)
+
+    with pytest.raises(ValueError, match="provider maximum"):
+        AgentProject.create(
+            timeout=86_401,
+            template="template-immutable:build-immutable",
+            cpu_count=2,
+            memory_mb=2048,
+            resource_budget_account=account,
+            lease_ledger_dir=(tmp_path / "leases").resolve(),
+            api_key="explicit-secret-key",
+        )
+
+
 def test_project_budget_denial_never_dispatches_or_reaps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

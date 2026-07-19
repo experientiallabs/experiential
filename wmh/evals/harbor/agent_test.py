@@ -108,7 +108,7 @@ _E2B_TASK_ENVIRONMENT_ATTESTATION = cast(
         "internet_access": False,
         "network_allow_out": [],
         "network_deny_out": ["0.0.0.0/0"],
-        "lease_timeout_s": 3600,
+        "lease_timeout_s": 86_400,
         "timeout_action": "kill",
         "auto_resume": False,
         "volume_mounts": False,
@@ -322,6 +322,53 @@ def test_agent_rejects_non_finite_turn_timeout(
             provider_config=cast("JsonObject", config.model_dump(mode="json")),
             turn_timeout_s=turn_timeout_s,
         )
+
+
+def test_agent_rejects_e2b_runner_lease_without_turn_cleanup_margin(tmp_path: Path) -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    runner_spec = E2BPiRunnerSpec(
+        template_id="template-immutable",
+        build_id="build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        platform="linux/x86_64",
+        envd_version="0.2.1",
+        lease_timeout_s=3_659,
+    )
+
+    with pytest.raises(ValueError, match="lease_timeout_s"):
+        mod.WmhPiAgent(
+            logs_dir=tmp_path / "agent",
+            model_name="bedrock/model",
+            harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
+            provider_config=cast("JsonObject", config.model_dump(mode="json")),
+            runner_spec=cast("JsonObject", runner_spec.model_dump(mode="json")),
+            turn_timeout_s=3_600,
+        )
+
+
+def test_agent_admits_e2b_runner_lease_with_turn_cleanup_margin(tmp_path: Path) -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    runner_spec = E2BPiRunnerSpec(
+        template_id="template-immutable",
+        build_id="build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        platform="linux/x86_64",
+        envd_version="0.2.1",
+        lease_timeout_s=3_660,
+    )
+
+    agent = mod.WmhPiAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="bedrock/model",
+        harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
+        provider_config=cast("JsonObject", config.model_dump(mode="json")),
+        runner_spec=cast("JsonObject", runner_spec.model_dump(mode="json")),
+        turn_timeout_s=3_600,
+    )
+
+    assert agent._runner_spec == runner_spec
 
 
 def test_agent_rejects_mutable_runner_spec(
@@ -571,6 +618,28 @@ def test_setup_attests_e2b_template_build_resources_and_platform(
     attestation = agent._task_environment_attestation
     assert attestation is not None
     assert attestation.evidence == _E2B_TASK_ENVIRONMENT_ATTESTATION
+
+
+def test_setup_rejects_e2b_adapter_lease_above_provider_maximum(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+
+    class E2BEnvironment(_Environment):
+        @property
+        def wmh_environment_attestation(self) -> JsonObject:
+            return cast(
+                "JsonObject",
+                {**_E2B_TASK_ENVIRONMENT_ATTESTATION, "lease_timeout_s": 86_401},
+            )
+
+        @staticmethod
+        def type() -> EnvironmentType:
+            return EnvironmentType.E2B
+
+    with pytest.raises(mod.WmhPiEnvironmentError, match="attestation failed"):
+        asyncio.run(agent.setup(cast("BaseEnvironment", E2BEnvironment())))
 
 
 def test_setup_rejects_e2b_adapter_evidence_without_fail_closed_lifecycle(
