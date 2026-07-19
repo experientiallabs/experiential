@@ -988,6 +988,7 @@ def harbor_job_lease_path(jobs_dir: Path, job_name: str) -> Path:
 def _validate_job_name(job_name: str) -> None:
     if (
         job_name in {".", ".."}
+        or "\0" in job_name
         or Path(job_name).is_absolute()
         or "/" in job_name
         or "\\" in job_name

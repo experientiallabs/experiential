@@ -43,7 +43,10 @@ The paper's Terminal-Bench 2 discovery experiment searched and evaluated on the 
 released final evaluation uses five trials per task, but that method does not test held-out
 generalization. The primary WMH lane instead freezes family-stratified discovery and confirmation
 partitions before search. It scores candidates only on discovery tasks, selects one winner, and
-evaluates that winner once on the untouched confirmation partition.
+evaluates that winner once on the confirmation partition sealed from experiment-time search
+artifacts and rewards. The empirical matched delta on that realized confirmation matrix is the
+assumption-free primary observation. Interpreting it as generalization to a task population requires
+the exchangeability, sampling, and contamination assumptions defined in the power gate below.
 
 After selection, the primary winner may also be compared descriptively with pi on all 89 tasks at
 five trials per task. That full-suite score is useful for locating the candidate relative to 76.4%,
@@ -70,7 +73,8 @@ If any gate is unavailable, the lane may proceed only as a method-inspired all-8
 and must not be described as reproducing the paper's method. Its scores, proposer workspace,
 candidate identity, and budget ledger must remain distinct from the confirmation-valid primary
 lane. Confidence intervals from that lane describe repeated-trial variability after selection on
-the same tasks; they do not establish generalization to unseen tasks. The Bedrock serving path
+the same tasks; they do not establish generalization beyond the evaluated benchmark. The Bedrock
+serving path
 would remain a provider-shifted replication even after these gates pass. Freeze the primary lane's
 task IDs, family strata, random seed, and powered minimum detectable effect before the first
 candidate-scoring call.
@@ -127,7 +131,7 @@ Before seeing final results, use these interpretation bands:
 | Matched improvement over stock pi | Interpretation |
 |---|---|
 | less than 1 point | no actionable improvement |
-| at least 1 and less than 3 points | promising, but require a confidence interval excluding zero |
+| at least 1 and less than 3 points | promising; conditional CI must exclude zero for a population claim |
 | at least 3 and at most 5 points | practically meaningful harness improvement |
 | more than 5 points | strong result, requiring leakage and infrastructure audits |
 
@@ -402,8 +406,16 @@ Family metadata used by the split generator must have frozen provenance and must
 WMH, candidate, and task-level leaderboard rewards. Only the sealed control plane assigns tasks to
 strata and partitions. Aggregate discovery stratum counts may be published to the proposer when
 needed, but confirmation membership may not. Public availability and possible model pretraining on
-Terminal-Bench remain limitations; this boundary prevents experiment-time access and must not be
-misrepresented as decontaminating model weights.
+Terminal-Bench remain limitations. This seal establishes only that search receives no confirmation
+artifacts or rewards through experiment-time storage, tools, or network access. It cannot show that
+confirmation content was absent from model training, prevent a proposer with a memorized public task
+roster from inferring the complement of the discovery set, or rule out consequential pretraining
+contamination. A task-population generalization interpretation therefore requires the registered
+assumption that retained training information neither lets search target confirmation content nor
+makes confirmation performance unrepresentative of the declared population. If that assumption is
+not defensible, the confirmation result remains a descriptive matched delta on the realized sealed
+matrix only. The seal cannot verify this assumption; every population claim must label it explicitly
+and accompany it with the descriptive result.
 
 The final evaluator may of course expose one confirmation task instruction and environment to the
 frozen worker candidate while that task is running. It must not expose confirmation content to the
@@ -417,21 +429,37 @@ manifest. It must predeclare the baseline pass rate, within-task intraclass corr
 arm correlation used by the data-generating model, the target effect, test direction, alpha, power,
 attempt count, family strata, stratum population sizes, task inclusion probabilities, estimator,
 confidence-interval algorithm, bootstrap resample count and seed, and minimum discovery-set
-constraints. The target estimand is the task-uniform mean paired delta over the 89 frozen tasks,
-with each task weighted equally regardless of family size or attempt count. Use a 3 percentage-point
-paired effect as the target, a two-sided alpha of 0.05, power of at least 0.80, and five attempts per
-task for the locked primary confirmation. Derive nuisance assumptions from published or otherwise
-external evidence, and run sensitivity cases over a predeclared plausible range rather than fitting
-them to WMH candidate outcomes.
+constraints. It must also state the inferential target and the assumptions that make it
+identifiable. Within each frozen family stratum, benchmark tasks must be exchangeable draws from the
+declared Terminal-Bench-regime task superpopulation, and a future task must be another such draw. The
+score-independent split must be independent of task potential outcomes, and information retained in
+proposer or worker model weights must neither let search target confirmation membership or content
+nor make confirmation outcomes unrepresentative of the declared population.
+
+Conditional on those assumptions and on the realized discovery search, the primary inferential
+estimand is the expected paired reward delta of the frozen winner versus pi on a fresh task from
+that task population, standardized to the frozen family shares of the 89-task benchmark. The primary
+empirical statistic is the corresponding family-standardized paired delta on the realized
+confirmation matrix. Also report the unweighted, task-uniform paired delta across the realized
+confirmation tasks and planned attempts. Both empirical statistics are assumption-free descriptions
+of that realized matrix. Because the candidate is selected as a function of the discovery
+complement, neither confirmation statistic identifies the selected candidate's finite-population
+mean over all 89 tasks. Use a 3 percentage-point paired effect as the target, a two-sided alpha of
+0.05, power of at least 0.80, and five attempts per task for the locked primary confirmation. Derive
+nuisance assumptions from published or otherwise external evidence, and run sensitivity cases over
+a predeclared plausible range rather than fitting them to WMH candidate outcomes.
 
 Use task-clustered simulation that generates complete tasks with attempts nested inside each task,
 applies the exact planned missing-cell rule, and runs the same paired analysis that will produce the
-final interval. Sample tasks within each frozen family stratum. Estimate the task-uniform benchmark
-mean with inverse-inclusion weights, which is equivalent to weighting each stratum mean by its share
-of the 89 tasks under fixed within-stratum sample counts. Resample complete tasks only within their
-strata for the bootstrap. The simulation must verify both at least 0.80 power at the target effect
-and empirical two-sided type-I error no greater than 0.05 and interval coverage of at least 0.95,
-within a predeclared Monte Carlo tolerance, throughout the nuisance range.
+final interval. Sample tasks within each frozen family stratum. Estimate the family-standardized
+task-population mean with inverse-inclusion weights, which is equivalent to weighting each
+confirmation stratum mean by its frozen share of the 89 tasks under fixed within-stratum sample
+counts. Resample complete tasks only within their strata for the bootstrap. Throughout the nuisance
+range and within a predeclared Monte Carlo tolerance, the simulation must verify at least 0.80 power
+at the target effect, empirical two-sided type-I error no greater than 0.05, and interval coverage
+of at least 0.95. Those operating characteristics are conditional on the registered task-population
+and data-generating assumptions; they are not design-based inference for the selected candidate's
+finite 89-task mean.
 
 Enumerate integer, family-stratified discovery and confirmation allocations across the 89 frozen
 tasks. Select task counts before scoring: choose a confirmation count that passes every power,
@@ -451,8 +479,8 @@ confirmation gate fails before spending. Choose and record exactly one route bef
 and add independent compatible tasks under a separately defined broader estimand; retain a held-out
 confirmation lane with the larger minimum detectable effect supported by the same simulation and
 treat 3 points as descriptive only; or use a locked all-89 paired estimate as a
-benchmark-descriptive endpoint and abandon the unseen-task generalization claim. Do not lower the
-power target, choose the route after seeing scores, or present an underpowered interval as
+benchmark-descriptive endpoint and abandon the task-population generalization claim. Do not lower
+the power target, choose the route after seeing scores, or present an underpowered interval as
 confirmation of a 3 point effect.
 
 ### Phase 1: zero-cost and low-cost qualification
@@ -608,17 +636,24 @@ Harbor's valid post-timeout verifier reward for the primary zero; it may not rep
 result after scores are observed.
 
 First average the planned analysis outcomes within each task and arm: five for primary confirmation
-and the separately frozen count for Azure transfer. The primary metric is the paired difference of
-inverse-inclusion-weighted task means over the exact confirmation matrix, targeting the task-uniform
-mean over the 89 frozen tasks. Use frozen family population shares and resample complete paired
-tasks within family strata using the predeclared bootstrap algorithm, resample count, and seed. The
-metric is valid only if every planned cell has a primary analysis outcome and the frozen inclusion
-weight.
+and the separately frozen count for Azure transfer. The primary empirical metric is the paired
+difference of inverse-inclusion-weighted task means over the exact confirmation matrix, standardized
+to the frozen family shares of the 89-task benchmark. Under the registered exchangeability,
+sampling, and contamination assumptions, it estimates the conditional task-population
+generalization delta of the frozen winner versus pi. Use frozen family shares and resample complete
+paired tasks within family strata using the predeclared bootstrap algorithm, resample count, and
+seed. The bootstrap interval has that population interpretation only under those assumptions. Also
+report the unweighted task-uniform matched delta on the realized confirmation matrix as an
+additional empirical quantity. Both point estimates are assumption-free descriptions of the
+realized matrix; neither confirmation metric nor its interval identifies the selected candidate's
+finite all-89 mean. The metric is valid only if every planned cell has a primary analysis outcome
+and the frozen inclusion weight.
 
 For each provider lane, report:
 
 - pi baseline score, candidate score, and paired percentage-point delta;
-- the frozen family-stratified task bootstrap confidence interval over the paired delta;
+- the frozen family-stratified task bootstrap confidence interval over the paired delta, labeled as
+  conditional on the registered task-population assumptions;
 - per-task win, tie, and loss counts;
 - timeout and infrastructure rates;
 - total input tokens, output tokens, provider cost, environment cost, and wall time;
@@ -629,13 +664,18 @@ including usage and exception type. Once that prerequisite exists, retry only ex
 allowlisted infrastructure failures, reuse the same task identity with a distinct attempt identity,
 and report every attempt. Never retry a task failure, candidate failure, or low score.
 
-The main success criteria are conditional on passing the power and partition gate:
+The main success criteria are conditional on passing the power and partition gate. Criteria 1 and 2
+support task-population generalization only while the registered exchangeability, sampling, and
+contamination assumptions remain defensible. If an audit breaks one of those assumptions, report the
+matched confirmation delta as descriptive and do not call it confirmed generalization:
 
-1. a positive paired delta over pi whose confidence interval excludes zero on the untouched
-   confirmation partition in the primary provider lane;
-2. at least a 3 point practical improvement when the frozen design has at least 0.80 power for that
-   effect, or the larger predeclared minimum detectable effect selected by the fail route; a smaller
-   improvement that holds across both providers remains useful but is not a powered 3 point result;
+1. a positive family-standardized paired delta over pi whose conditional task-population confidence
+   interval excludes zero on the confirmation partition sealed from experiment-time search evidence
+   in the primary provider lane;
+2. at least a 3 point conditional task-population improvement when the frozen design has at least
+   0.80 power for that effect, or the larger predeclared minimum detectable effect selected by the
+   fail route; a smaller improvement that holds across both providers remains useful but is not a
+   powered 3 point result;
 3. cost, timeout rate, and candidate-failure rate remain inside their predeclared noninferiority
    margins, with the score-cost decision rule and all margins frozen before search.
 

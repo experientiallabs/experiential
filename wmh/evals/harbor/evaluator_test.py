@@ -1291,3 +1291,11 @@ def test_job_name_must_be_one_safe_component(tmp_path: Path, job_name: str) -> N
 
     with pytest.raises(ValueError, match="single safe path component"):
         mod.HarborEvaluator(_spec(tmp_path, dataset, job_name=job_name), _provider())
+
+
+def test_job_name_must_not_contain_nul_byte(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+
+    with pytest.raises(ValueError, match="single safe path component"):
+        mod.HarborEvaluator(_spec(tmp_path, dataset, job_name="job\0name"), _provider())
