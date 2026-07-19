@@ -13,7 +13,7 @@ from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from wmh.agents.project import AgentProjectRun
+from wmh.agents.project import AgentProjectRun, AgentProjectState
 from wmh.core.types import JsonObject
 from wmh.harness.cost import (
     SearchComponentCostBinding,
@@ -491,7 +491,8 @@ class ProjectDeltaProposer:
             raise ValueError("project proposer current state does not match witness pre-call state")
         if after.iteration != before.iteration + 1:
             raise ValueError("project proposer witness must advance exactly one iteration")
-        self._apply_search_state(after)
+        self._advance_project_state(before, after)
+        self._apply_search_metadata(after)
 
     def _apply_search_state(self, state: _ProjectProposerState) -> None:
         """Replace live state with one already validated durable snapshot."""
@@ -501,6 +502,43 @@ class ProjectDeltaProposer:
                 "checkpointed project proposal search requires AgentProject.restore_search_state"
             )
         restore_project(state.project_state)
+        self._apply_search_metadata(state)
+
+    def _advance_project_state(
+        self,
+        before: _ProjectProposerState,
+        after: _ProjectProposerState,
+    ) -> None:
+        """Replay one additive project turn over an already-restored checkpoint."""
+        before_project = AgentProjectState.model_validate(before.project_state)
+        after_project = AgentProjectState.model_validate(after.project_state)
+        export_project = getattr(self._project, "export_search_state", None)
+        if not callable(export_project):
+            raise RuntimeError(
+                "checkpointed project proposal search requires AgentProject.export_search_state"
+            )
+        current_project = AgentProjectState.model_validate(export_project())
+        if current_project != before_project:
+            raise ValueError("project state does not match witness pre-call state")
+
+        removed_visible = set(before_project.visible_files) - set(after_project.visible_files)
+        removed_private = set(before_project.private_files) - set(after_project.private_files)
+        if removed_visible or removed_private:
+            raise ValueError("project proposer witness cannot remove durable project files")
+
+        for path, content in sorted(after_project.visible_files.items()):
+            if before_project.visible_files.get(path) != content:
+                self._project.write_text(path, content)
+        for path, content in sorted(after_project.private_files.items()):
+            if before_project.private_files.get(path) != content:
+                self._project.write_private_text(path, content)
+
+        restored_project = AgentProjectState.model_validate(export_project())
+        if restored_project != after_project:
+            raise ValueError("project state does not match witnessed post-call state after replay")
+
+    def _apply_search_metadata(self, state: _ProjectProposerState) -> None:
+        """Replace proposer metadata after its project state is restored or replayed."""
         self._iteration = state.iteration
         self._evaluation_dirs = dict(state.evaluation_dirs)
         self._proposal_files = dict(state.proposal_files)
