@@ -1,3 +1,5 @@
+"""Tests for shared POSIX file and directory leases."""
+
 from __future__ import annotations
 
 import os

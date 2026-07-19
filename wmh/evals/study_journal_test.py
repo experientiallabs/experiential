@@ -1,3 +1,5 @@
+"""Tests for the externally witnessed optimization study journal."""
+
 from __future__ import annotations
 
 import hashlib
@@ -31,8 +33,14 @@ class _Publisher:
         self.published: list[str] = []
         self.verified: list[str] = []
         self.receipts: dict[str, ExternalPublicationReceipt] = {}
+        self.slots: dict[tuple[str, int], str] = {}
 
     def publish(self, commitment: StudyPhaseCommitment) -> ExternalPublicationReceipt:
+        slot = (commitment.journal_genesis_digest, commitment.sequence)
+        existing_digest = self.slots.get(slot)
+        if existing_digest is not None and existing_digest != commitment.digest:
+            raise ValueError("external chain slot already contains another commitment")
+        self.slots[slot] = commitment.digest
         self.published.append(commitment.digest)
         receipt = self.receipts.get(commitment.digest)
         if receipt is None:
@@ -55,6 +63,28 @@ class _Publisher:
         self.verified.append(commitment.digest)
         if self.receipts.get(commitment.digest) != receipt:
             raise ValueError("publication receipt is not present in the external log")
+
+    def verify_chain_head(
+        self,
+        genesis: mod.StudyJournalGenesis,
+        records: tuple[mod.StudyPhaseRecord, ...],
+        pending: StudyPhaseCommitment | None,
+    ) -> None:
+        expected = {record.commitment.sequence: record.commitment.digest for record in records}
+        actual = {
+            sequence: digest
+            for (genesis_digest, sequence), digest in self.slots.items()
+            if genesis_digest == genesis.digest
+        }
+        for sequence, digest in expected.items():
+            if actual.get(sequence) != digest:
+                raise ValueError("external chain differs from the local journal")
+        for sequence, digest in actual.items():
+            if expected.get(sequence) == digest:
+                continue
+            if pending is not None and sequence == pending.sequence and digest == pending.digest:
+                continue
+            raise ValueError("external chain differs from the local journal")
 
 
 def _store(tmp_path: Path) -> StudyJournalStore:
@@ -87,7 +117,11 @@ def test_journal_requires_exact_phase_order_and_chains_external_commitments(
     for previous, current in zip(records, records[1:], strict=False):
         assert current.commitment.previous_record_digest == previous.digest
     assert publisher.published == [record.commitment.digest for record in records]
-    assert publisher.verified == [record.commitment.digest for record in records]
+    assert publisher.verified == [
+        records[verified_index].commitment.digest
+        for appended_index in range(len(records))
+        for verified_index in range(appended_index + 1)
+    ]
 
     restarted = StudyJournalStore(
         store.directory,
@@ -119,6 +153,91 @@ def test_append_is_idempotent_without_republishing(tmp_path: Path) -> None:
     assert repeated == first
     assert publisher.published == [first.commitment.digest]
     assert publisher.verified == [first.commitment.digest, first.commitment.digest]
+
+
+def test_public_load_requires_an_external_publisher(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    with pytest.raises(TypeError, match="publisher"):
+        load_study_journal(store)  # ty: ignore[missing-argument]
+
+
+def test_failed_local_append_pins_the_published_commitment_across_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    real_publish_file = mod._publish_regular_file_once_at
+
+    def fail_final_record(
+        directory_descriptor: int,
+        name: str,
+        payload: bytes,
+    ) -> None:
+        if name == "000-preparation_planned.json":
+            raise OSError("forced final record failure")
+        real_publish_file(directory_descriptor, name, payload)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(mod, "_publish_regular_file_once_at", fail_final_record)
+        with pytest.raises(OSError, match="forced final record failure"):
+            append_study_phase(
+                store,
+                phase=StudyPhase.PREPARATION_PLANNED,
+                payload_digest=_digest("plan"),
+                publisher=publisher,
+            )
+
+    assert (store.directory / mod._PENDING_FILE).is_file()
+    restarted = StudyJournalStore(
+        store.directory,
+        study_id="study-1",
+        publisher_configuration_digest=_Publisher.configuration_digest,
+    )
+    with pytest.raises(ValueError, match="pending commitment"):
+        append_study_phase(
+            restarted,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            payload_digest=_digest("different-plan"),
+            publisher=publisher,
+        )
+
+    recovered = append_study_phase(
+        restarted,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+
+    assert publisher.published == [recovered.commitment.digest] * 2
+    assert not (store.directory / mod._PENDING_FILE).exists()
+    assert load_study_journal(restarted, publisher=publisher) == (recovered,)
+
+
+def test_load_rejects_a_corrupted_pending_commitment(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+
+    class _UnavailablePublisher(_Publisher):
+        def publish(
+            self,
+            commitment: StudyPhaseCommitment,
+        ) -> ExternalPublicationReceipt:
+            raise RuntimeError("publisher unavailable")
+
+    with pytest.raises(RuntimeError, match="publisher unavailable"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            payload_digest=_digest("plan"),
+            publisher=_UnavailablePublisher(),
+        )
+    (store.directory / mod._PENDING_FILE).write_bytes(b"{}")
+
+    with pytest.raises(ValueError, match="pending commitment"):
+        load_study_journal(store, publisher=_Publisher())
 
 
 def test_append_rejects_skip_reorder_and_payload_drift(tmp_path: Path) -> None:
@@ -168,7 +287,34 @@ def test_bad_publication_receipt_never_creates_a_local_record(tmp_path: Path) ->
             payload_digest=_digest("plan"),
             publisher=_BadPublisher(),
         )
-    assert load_study_journal(store) == ()
+    assert load_study_journal(store, publisher=_Publisher()) == ()
+
+
+def test_append_rejects_a_publisher_configuration_change_mid_call(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+
+    class _ChangingPublisher(_Publisher):
+        def publish(
+            self,
+            commitment: StudyPhaseCommitment,
+        ) -> ExternalPublicationReceipt:
+            receipt = super().publish(commitment)
+            self.configuration_digest = _digest("changed-publisher-config")
+            return receipt
+
+    publisher = _ChangingPublisher()
+    with pytest.raises(ValueError, match="runtime publisher differs"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            payload_digest=_digest("plan"),
+            publisher=publisher,
+        )
+
+    assert not (store.directory / "000-preparation_planned.json").exists()
+    assert (store.directory / mod._PENDING_FILE).is_file()
 
 
 def test_load_rejects_local_record_tampering(tmp_path: Path) -> None:
@@ -186,8 +332,206 @@ def test_load_rejects_local_record_tampering(tmp_path: Path) -> None:
     record_path.write_text(json.dumps(raw), encoding="utf-8")
 
     with pytest.raises(ValueError, match="record digest"):
-        load_study_journal(store)
+        load_study_journal(store, publisher=publisher)
     assert record.commitment.payload_digest != raw["commitment"]["payload_digest"]
+
+
+def test_append_verifies_the_existing_external_chain_before_publication(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    first = append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+    forged_receipt = first.publication.model_copy(update={"publication_id": "forged-entry"})
+    forged = mod.StudyPhaseRecord.create(
+        commitment=first.commitment,
+        publication=forged_receipt,
+    )
+    (store.directory / "000-preparation_planned.json").write_bytes(
+        mod._canonical_json_bytes(forged.model_dump(mode="json"))
+    )
+
+    with pytest.raises(ValueError, match="external log"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.ROSTER_QUALIFIED,
+            payload_digest=_digest("roster"),
+            publisher=publisher,
+        )
+
+    assert publisher.published == [first.commitment.digest]
+    assert not (store.directory / mod._PENDING_FILE).exists()
+
+
+def test_load_rejects_noncanonical_record_bytes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+    record_path = store.directory / "000-preparation_planned.json"
+    raw = json.loads(record_path.read_text(encoding="utf-8"))
+    record_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not canonical"):
+        load_study_journal(store, publisher=publisher)
+
+
+def test_load_rejects_a_phase_record_hidden_under_an_unknown_name(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+    record_path = store.directory / "000-preparation_planned.json"
+    record_path.rename(store.directory / "hidden-record.json")
+
+    with pytest.raises(ValueError, match="unexpected entry"):
+        load_study_journal(store, publisher=publisher)
+
+
+def test_load_rejects_a_temporary_name_with_the_wrong_phase_sequence(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    temporary = store.directory / (
+        ".tmp-000-roster_qualified.json-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    temporary.write_bytes(b"partial")
+    temporary.chmod(0o600)
+
+    with pytest.raises(ValueError, match="unexpected entry"):
+        load_study_journal(store, publisher=_Publisher())
+
+
+def test_load_rejects_a_locally_truncated_external_chain(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+    (store.directory / "000-preparation_planned.json").unlink()
+
+    with pytest.raises(ValueError, match="external chain"):
+        load_study_journal(store, publisher=publisher)
+
+
+def test_load_revalidates_records_after_external_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+    original_verify = publisher.verify
+    moved = store.directory / "moved-record.json"
+
+    def verify_then_move(
+        commitment: StudyPhaseCommitment,
+        receipt: ExternalPublicationReceipt,
+    ) -> None:
+        original_verify(commitment, receipt)
+        (store.directory / "000-preparation_planned.json").rename(moved)
+
+    monkeypatch.setattr(publisher, "verify", verify_then_move)
+
+    with pytest.raises(ValueError, match="unexpected entry"):
+        load_study_journal(store, publisher=publisher)
+
+
+def test_idempotent_append_revalidates_records_after_external_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("plan"),
+        publisher=publisher,
+    )
+    original_verify = publisher.verify
+
+    def verify_then_hide(
+        commitment: StudyPhaseCommitment,
+        receipt: ExternalPublicationReceipt,
+    ) -> None:
+        original_verify(commitment, receipt)
+        (store.directory / "000-preparation_planned.json").rename(
+            store.directory / "hidden-record.json"
+        )
+
+    monkeypatch.setattr(publisher, "verify", verify_then_hide)
+
+    with pytest.raises(ValueError, match="unexpected entry"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            payload_digest=_digest("plan"),
+            publisher=publisher,
+        )
+
+
+def test_append_revalidates_genesis_after_the_store_is_opened(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    (store.directory / "study-journal.json").write_bytes(b"{}")
+
+    with pytest.raises(OSError, match="genesis was replaced or changed"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            payload_digest=_digest("plan"),
+            publisher=publisher,
+        )
+
+    assert publisher.published == []
+
+
+def test_store_construction_rechecks_genesis_after_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    real_read = mod._read_regular_file_at
+    changed = False
+
+    def read_then_change(directory_descriptor: int, name: str) -> bytes:
+        nonlocal changed
+        payload = real_read(directory_descriptor, name)
+        if name == "study-journal.json" and not changed:
+            changed = True
+            (store.directory / name).write_bytes(b"{}")
+        return payload
+
+    monkeypatch.setattr(mod, "_read_regular_file_at", read_then_change)
+
+    with pytest.raises(OSError, match="genesis was replaced or changed"):
+        StudyJournalStore(
+            store.directory,
+            study_id="study-1",
+            publisher_configuration_digest=_Publisher.configuration_digest,
+        )
 
 
 def test_store_rejects_wrong_study_and_symlinked_record(tmp_path: Path) -> None:
@@ -210,7 +554,7 @@ def test_store_rejects_wrong_study_and_symlinked_record(tmp_path: Path) -> None:
     target.write_text("{}", encoding="utf-8")
     (store.directory / "000-preparation_planned.json").symlink_to(target)
     with pytest.raises(OSError, match="regular file"):
-        load_study_journal(store)
+        load_study_journal(store, publisher=_Publisher())
 
 
 def test_load_rejects_backward_publication_time_and_public_record_mode(
@@ -248,7 +592,7 @@ def test_load_rejects_backward_publication_time_and_public_record_mode(
     first_path = store.directory / "000-preparation_planned.json"
     os.chmod(first_path, 0o644)
     with pytest.raises(OSError, match="group or other users"):
-        load_study_journal(store)
+        load_study_journal(store, publisher=publisher)
 
 
 def test_append_never_follows_a_replaced_journal_directory(
@@ -279,7 +623,8 @@ def test_append_never_follows_a_replaced_journal_directory(
         )
 
     assert not (store.directory / "000-preparation_planned.json").exists()
-    assert (original_directory / "000-preparation_planned.json").is_file()
+    assert not (original_directory / "000-preparation_planned.json").exists()
+    assert (original_directory / mod._PENDING_FILE).is_file()
 
 
 def test_create_fsyncs_the_parent_after_creating_the_journal_directory(
@@ -298,6 +643,31 @@ def test_create_fsyncs_the_parent_after_creating_the_journal_directory(
     monkeypatch.setattr(os, "fsync", record_fsync)
 
     _store(tmp_path)
+
+    assert parent_identity in fsynced_identities
+
+
+def test_create_fsyncs_the_parent_when_reopening_an_existing_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    fsynced_identities: set[tuple[int, int]] = set()
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        fsynced_identities.add((metadata.st_dev, metadata.st_ino))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+
+    StudyJournalStore.create(
+        store.directory,
+        study_id="study-1",
+        publisher_configuration_digest=_Publisher.configuration_digest,
+    )
 
     assert parent_identity in fsynced_identities
 
