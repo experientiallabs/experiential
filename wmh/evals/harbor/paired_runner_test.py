@@ -278,6 +278,32 @@ def test_execution_plan_is_task_and_host_path_independent() -> None:
     assert "jobs_dir" not in plan.model_dump(mode="json")
 
 
+def test_execution_plan_admits_long_official_task_timeout_with_e2b_runner_lease() -> None:
+    """The sealed plan remains generic enough for long official benchmark tasks."""
+    runner_spec = E2BPiRunnerSpec(
+        template_id="runner-template",
+        build_id="runner-build",
+        cpu_count=2,
+        memory_mb=1024,
+        platform="linux/x86_64",
+        envd_version="v1",
+        lease_timeout_s=18_000,
+    )
+
+    plan = mod.HarborExecutionPlan.freeze(
+        reference_harness=pi_node_baseline("baseline"),
+        reward_key="reward",
+        environment_backend=HarborEnvironmentBackend.E2B,
+        runner_spec=runner_spec,
+        turn_timeout_s=12_000,
+    )
+
+    assert plan.turn_timeout_s == 12_000
+    assert plan.compute_envelope.turn_timeout_s == 12_000
+    assert isinstance(plan.runner_spec, E2BPiRunnerSpec)
+    assert plan.runner_spec.lease_timeout_s == 18_000
+
+
 def test_confirmation_selection_is_a_deterministic_projection_of_full_roster() -> None:
     """Opening can select qualified entries but cannot supply a free-form task spec."""
     candidate = _candidate()
@@ -1293,7 +1319,7 @@ def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
     design = _design()
     assert len(calls) == 2 * len(design.blocks)
     assert len(report.evidence) == len(design.blocks)
-    assert report.run_version == "8"
+    assert report.run_version == "9"
     assert report.protocol.protocol_version == "8"
     assert report.protocol.design_digest == design.digest
     assert report.protocol.baseline_execution_digest == baseline.execution_digest
@@ -1345,7 +1371,8 @@ def test_job_names_are_deterministic_and_bind_each_arm(
 
     assert first_names == second_names
     assert len(set(first_names)) == len(first_names)
-    assert [call[0].job_name for call in first_calls] == [call[0].job_name for call in second_calls]
+    assert {call[0].job_name for call in first_calls} == set(first_names)
+    assert second_calls == []
 
 
 def test_rejects_candidate_opening_and_compute_envelope_mismatches(tmp_path: Path) -> None:
@@ -1973,6 +2000,7 @@ def test_completed_pair_generation_cannot_be_downgraded_to_failed(tmp_path: Path
         status="complete",
         baseline_admission_digest="sha256:" + "a" * 64,
         candidate_admission_digest="sha256:" + "b" * 64,
+        evidence_digest="sha256:" + "c" * 64,
     )
     path = runner._pair_state_path(block)
     mod._create_pair_generation_state(path, completed)
@@ -2035,41 +2063,17 @@ def test_two_arm_directories_without_pair_state_are_rejected_before_provider_acc
     assert calls == []
 
 
-def test_failed_pair_with_both_arm_directories_requires_new_generation(
+def test_restart_reuses_completed_pairs_and_reruns_only_authorized_failed_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     baseline = pi_node_baseline("baseline")
     candidate = _candidate()
-    failed_calls: list[str] = []
-
-    class IncompleteSecondArmEvaluator:
-        def __init__(
-            self,
-            spec: HarborJobSpec,
-            provider_config: ProviderConfig,
-            **_kwargs: object,
-        ) -> None:
-            self._spec = spec
-            self._provider = provider_config
-            self._budget_policy_digest = cast(
-                "BudgetAccount", _kwargs["budget_account"]
-            ).policy.policy_digest
-
-        async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
-            failed_calls.append(self._spec.job_name)
-            if len(failed_calls) == 2:
-                (self._spec.jobs_dir / self._spec.job_name).mkdir(parents=True)
-                raise RuntimeError("synthetic incomplete second arm")
-            return _loaded_result(
-                self._spec,
-                self._provider,
-                harness,
-                reward=0.0,
-                budget_policy_digest=self._budget_policy_digest,
-            )
-
-    monkeypatch.setattr(mod, "HarborEvaluator", IncompleteSecondArmEvaluator)
+    failed_calls, _ = _install_fake_evaluator(
+        monkeypatch,
+        candidate=candidate,
+        fail_job=2 * len(_design().blocks),
+    )
     first_generation = _runner(
         tmp_path,
         candidate,
@@ -2078,24 +2082,23 @@ def test_failed_pair_with_both_arm_directories_requires_new_generation(
     )
     with pytest.raises(mod.PairedHarborMatrixError):
         asyncio.run(first_generation.run(baseline=baseline, candidate=candidate))
-    assert len(failed_calls) == 2
-    first_block = first_generation._protocol.design.blocks[0]
-    failed_state = mod._read_pair_generation_state(first_generation._pair_state_path(first_block))
+    assert len(failed_calls) == 2 * len(_design().blocks)
+    failed_block = first_generation._protocol.design.blocks[-1]
+    failed_state = mod._read_pair_generation_state(first_generation._pair_state_path(failed_block))
     assert failed_state.status == "failed"
-    assert all(
-        (first_generation._runtime.jobs_dir / name).exists()
-        for name in (
-            failed_state.baseline_job_name,
-            failed_state.candidate_job_name,
-        )
+    completed_blocks = first_generation._protocol.design.blocks[:-1]
+    completed_states = tuple(
+        mod._read_pair_generation_state(first_generation._pair_state_path(block))
+        for block in completed_blocks
     )
+    assert all(state.status == "complete" for state in completed_states)
 
     replay_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
     with pytest.raises(mod.PartialPairedHarborReuseError, match="is 'failed'"):
         asyncio.run(first_generation.run(baseline=baseline, candidate=candidate))
     assert replay_calls == []
 
-    next_generation = _runner(
+    unauthorized_generation = _runner(
         tmp_path,
         candidate,
         baseline=baseline,
@@ -2103,9 +2106,70 @@ def test_failed_pair_with_both_arm_directories_requires_new_generation(
         generation_id=2,
         max_concurrent_blocks=1,
     )
-    report = asyncio.run(next_generation.run(baseline=baseline, candidate=candidate))
-    assert len(replay_calls) == 2 * len(_design().blocks)
+    with pytest.raises(mod.PartialPairedHarborReuseError, match="retry authorization"):
+        asyncio.run(unauthorized_generation.run(baseline=baseline, candidate=candidate))
+    assert replay_calls == []
+
+    authorization = mod.authorize_paired_harbor_pair_retry(
+        jobs_dir=first_generation._runtime.jobs_dir,
+        protocol=first_generation._protocol,
+        operation_id="offline-test-operation",
+        failed_state=failed_state,
+    )
+    assert authorization.from_generation_id == 1
+    assert authorization.to_generation_id == 2
+    assert authorization.failed_state_digest == failed_state.state_digest
+
+    authorized_generation = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        operation_id="offline-test-operation",
+        generation_id=2,
+        max_concurrent_blocks=1,
+    )
+    report = asyncio.run(authorized_generation.run(baseline=baseline, candidate=candidate))
+
+    assert len(replay_calls) == 2
     assert report.generation_id == 2
+    assert report.retry_authorizations == (authorization,)
+    assert tuple(item.generation_id for item in report.evidence) == (1, 1, 1, 2)
+    assert tuple(item.pair_generation_id for item in report.evidence[:-1]) == tuple(
+        state.pair_generation_id for state in completed_states
+    )
+
+    drifted_authorization = cast("dict[str, Any]", authorization.model_dump(mode="json"))
+    drifted_authorization["failed_state_digest"] = "sha256:" + "f" * 64
+    drifted_authorization["authorization_digest"] = mod._canonical_digest(
+        cast(
+            "Any",
+            {
+                key: value
+                for key, value in drifted_authorization.items()
+                if key != "authorization_digest"
+            },
+        )
+    )
+    with pytest.raises(ValueError, match="differs from its failed state"):
+        mod.PairedHarborPairRetryAuthorization.model_validate(drifted_authorization)
+
+
+def test_operation_lease_excludes_concurrent_cross_generation_restart(tmp_path: Path) -> None:
+    coordinator = mod._LocalPairedHarborLeaseCoordinator(tmp_path / "jobs")
+
+    async def contend() -> None:
+        async with coordinator.operation_lease(
+            protocol_digest="sha256:" + "a" * 64,
+            operation_id="operation-a",
+        ):
+            with pytest.raises(mod.ConcurrentPairedHarborRunError):
+                async with coordinator.operation_lease(
+                    protocol_digest="sha256:" + "a" * 64,
+                    operation_id="operation-a",
+                ):
+                    pytest.fail("cross-generation operation lease unexpectedly succeeded")
+
+    asyncio.run(contend())
 
 
 def test_complete_state_with_incomplete_arm_is_rejected_before_provider_access(

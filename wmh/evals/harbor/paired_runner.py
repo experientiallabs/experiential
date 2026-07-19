@@ -108,7 +108,7 @@ from wmh.tracking.budget import (
 )
 
 PAIRED_HARBOR_PROTOCOL_VERSION: Literal["8"] = "8"
-PAIRED_HARBOR_RUN_VERSION: Literal["8"] = "8"
+PAIRED_HARBOR_RUN_VERSION: Literal["9"] = "9"
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -1490,6 +1490,7 @@ class PairedHarborBlockEvidence(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     block: PairedBlock
+    generation_id: StrictInt = Field(ge=1)
     pair_generation_id: str = Field(pattern=_DIGEST_PATTERN)
     first: PairedHarborArmEvidence
     second: PairedHarborArmEvidence
@@ -1519,17 +1520,30 @@ class PairedHarborBlockEvidence(BaseModel):
             raise ValueError("paired Harbor arms executed different task inputs")
         return self
 
+    @field_validator("generation_id", mode="before")
+    @classmethod
+    def _reject_boolean_generation(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("pair generation_id cannot be boolean")
+        return value
+
+    @property
+    def digest(self) -> str:
+        """Return the immutable admitted evidence identity for this pair generation."""
+        return _canonical_digest(self.model_dump(mode="json"))
+
 
 class PairedHarborRunReport(BaseModel):
     """Reload-safe paired execution evidence plus its predeclared statistical analysis."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    run_version: Literal["8"]
+    run_version: Literal["9"]
     protocol: PairedHarborProtocol
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
     generation_id: StrictInt = Field(ge=1)
+    retry_authorizations: tuple[PairedHarborPairRetryAuthorization, ...] = ()
     evidence: tuple[PairedHarborBlockEvidence, ...]
     analysis: PairedAnalysisReport
 
@@ -1553,6 +1567,40 @@ class PairedHarborRunReport(BaseModel):
         if tuple(item.block for item in self.evidence) != expected_blocks:
             raise ValueError("paired Harbor evidence does not contain the exact frozen blocks")
 
+        evidence_by_block = {item.block: item for item in self.evidence}
+        authorization_keys = tuple(
+            (item.block, item.from_generation_id) for item in self.retry_authorizations
+        )
+        expected_authorization_keys = tuple(
+            sorted(
+                authorization_keys,
+                key=lambda item: (expected_blocks.index(item[0]), item[1]),
+            )
+        )
+        if authorization_keys != expected_authorization_keys or len(authorization_keys) != len(
+            set(authorization_keys)
+        ):
+            raise ValueError("paired Harbor retry authorizations are not unique and canonical")
+        authorizations_by_block: dict[
+            PairedBlock,
+            list[PairedHarborPairRetryAuthorization],
+        ] = {}
+        for authorization in self.retry_authorizations:
+            if (
+                authorization.protocol_digest != self.protocol_digest
+                or authorization.operation_id != self.operation_id
+                or authorization.retry_policy_digest != self.protocol.retry_policy_digest
+                or authorization.block not in evidence_by_block
+            ):
+                raise ValueError("paired Harbor retry authorization differs from the report")
+            authorizations_by_block.setdefault(authorization.block, []).append(authorization)
+        for block, authorizations in authorizations_by_block.items():
+            for previous, current in zip(authorizations, authorizations[1:], strict=False):
+                if previous.to_generation_id != current.from_generation_id:
+                    raise ValueError("paired Harbor report retry authority is not contiguous")
+            if authorizations[-1].to_generation_id != evidence_by_block[block].generation_id:
+                raise ValueError("paired Harbor retry authority does not reach admitted evidence")
+
         qualification_by_id = {task.task_id: task for task in self.protocol.opened_selection.tasks}
         route_by_member = {route.panel_member: route for route in self.protocol.panel_routes}
         job_names: list[str] = []
@@ -1560,10 +1608,12 @@ class PairedHarborRunReport(BaseModel):
         external_resource_ids: list[str] = []
         for item in self.evidence:
             qualification = qualification_by_id[item.block.task_id]
+            if item.generation_id > self.generation_id:
+                raise ValueError("paired Harbor evidence comes from a future run generation")
             if item.pair_generation_id != paired_harbor_pair_generation_id(
                 protocol_digest=self.protocol_digest,
                 operation_id=self.operation_id,
-                generation_id=self.generation_id,
+                generation_id=item.generation_id,
                 block=item.block,
             ):
                 raise ValueError("paired Harbor evidence has the wrong pair generation identity")
@@ -1572,7 +1622,7 @@ class PairedHarborRunReport(BaseModel):
                 expected_name = paired_harbor_job_name(
                     protocol_digest=self.protocol_digest,
                     operation_id=self.operation_id,
-                    generation_id=self.generation_id,
+                    generation_id=item.generation_id,
                     block=item.block,
                     arm=arm_evidence.arm,
                 )
@@ -1671,7 +1721,7 @@ class PairedHarborMatrixError(RuntimeError):
 
 
 class PartialPairedHarborReuseError(RuntimeError):
-    """A pair generation is incomplete or failed and cannot be safely resumed."""
+    """A pair generation cannot be safely resumed without explicit retry authority."""
 
 
 class ConcurrentPairedHarborRunError(RuntimeError):
@@ -1695,7 +1745,7 @@ class PairedHarborPairGenerationState(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    state_version: Literal["1"] = "1"
+    state_version: Literal["2"] = "2"
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
     generation_id: StrictInt = Field(ge=1)
@@ -1706,6 +1756,7 @@ class PairedHarborPairGenerationState(BaseModel):
     status: Literal["running", "complete", "failed"]
     baseline_admission_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     candidate_admission_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    evidence_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     state_digest: str = Field(pattern=_DIGEST_PATTERN)
 
     @model_validator(mode="after")
@@ -1738,14 +1789,68 @@ class PairedHarborPairGenerationState(BaseModel):
             self.candidate_admission_digest,
         )
         if self.status == "complete":
-            if any(digest is None for digest in admission_digests):
-                raise ValueError("complete paired Harbor state lacks both arm admissions")
-        elif any(digest is not None for digest in admission_digests):
-            raise ValueError("non-complete paired Harbor state cannot carry arm admissions")
+            if any(digest is None for digest in admission_digests) or self.evidence_digest is None:
+                raise ValueError("complete paired Harbor state lacks pair evidence")
+        elif (
+            any(digest is not None for digest in admission_digests)
+            or self.evidence_digest is not None
+        ):
+            raise ValueError("non-complete paired Harbor state cannot carry pair evidence")
         expected_digest = _canonical_digest(self.model_dump(mode="json", exclude={"state_digest"}))
         if self.state_digest != expected_digest:
             raise ValueError("paired Harbor state digest is inconsistent")
         return self
+
+
+class PairedHarborPairRetryAuthorization(BaseModel):
+    """Immutable control-plane authority for exactly one whole-pair retry."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    authorization_version: Literal["1"] = "1"
+    protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    operation_id: str = Field(min_length=1, max_length=256)
+    retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    block: PairedBlock
+    from_generation_id: StrictInt = Field(ge=1)
+    to_generation_id: StrictInt = Field(ge=2)
+    failed_state: PairedHarborPairGenerationState
+    failed_state_digest: str = Field(pattern=_DIGEST_PATTERN)
+    reason: Literal["infrastructure_failure"] = "infrastructure_failure"
+    authorization_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator("operation_id")
+    @classmethod
+    def _require_operation_id(cls, value: str) -> str:
+        return _validate_operation_id(value)
+
+    @field_validator("from_generation_id", "to_generation_id", mode="before")
+    @classmethod
+    def _reject_boolean_generations(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("retry authorization generation cannot be boolean")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_authorization(self) -> Self:
+        if self.to_generation_id != self.from_generation_id + 1:
+            raise ValueError("pair retry authorization must advance exactly one generation")
+        if (
+            self.failed_state.status == "complete"
+            or self.failed_state.protocol_digest != self.protocol_digest
+            or self.failed_state.operation_id != self.operation_id
+            or self.failed_state.block != self.block
+            or self.failed_state.generation_id != self.from_generation_id
+            or self.failed_state.state_digest != self.failed_state_digest
+        ):
+            raise ValueError("pair retry authorization differs from its failed state")
+        expected = _canonical_digest(self.model_dump(mode="json", exclude={"authorization_digest"}))
+        if self.authorization_digest != expected:
+            raise ValueError("pair retry authorization digest is inconsistent")
+        return self
+
+
+PairedHarborRunReport.model_rebuild()
 
 
 class PairedHarborLeaseCoordinator(Protocol):
@@ -1756,7 +1861,6 @@ class PairedHarborLeaseCoordinator(Protocol):
         *,
         protocol_digest: str,
         operation_id: str,
-        generation_id: int,
     ) -> AbstractAsyncContextManager[None]: ...
 
     def block_lease(
@@ -1782,16 +1886,14 @@ class _LocalPairedHarborLeaseCoordinator:
         *,
         protocol_digest: str,
         operation_id: str,
-        generation_id: int,
     ) -> AsyncIterator[None]:
-        token = _lease_token(
-            "operation",
-            protocol_digest,
-            operation_id,
-            str(generation_id),
+        lease_path = _operation_lease_path(
+            self._lease_dir,
+            protocol_digest=protocol_digest,
+            operation_id=operation_id,
         )
         with exclusive_posix_file_lease(
-            self._lease_dir / "operations" / f"{token}.lock",
+            lease_path,
             unsupported_error=RuntimeError(
                 "paired Harbor local operation leases require POSIX; use a durable coordinator"
             ),
@@ -1920,10 +2022,9 @@ class _FairBlockScheduler:
 class PairedHarborRunner:
     """Execute a frozen protocol without score retries or unbounded task creation.
 
-    Reusing a complete arm pair requires both Harbor evidence and crash-durable pair state. Any
-    running, failed, missing, or incomplete state rejects same-generation reuse. Authorizing the
-    next generation after an infrastructure failure still requires an external durable ledger that
-    records budget and retry authority; this runner only guarantees that both new arm jobs execute.
+    Complete arm pairs are reused from immutable admitted evidence. An incomplete pair can advance
+    exactly one generation only when a separate durable authorization binds its failed state and
+    frozen retry policy. Both arms of an authorized pair always receive fresh job identities.
     """
 
     def __init__(
@@ -2002,12 +2103,12 @@ class PairedHarborRunner:
         async with self._lease_coordinator.operation_lease(
             protocol_digest=self._protocol.digest,
             operation_id=self._operation_id,
-            generation_id=self._generation_id,
         ):
-            self._reject_partial_pair_reuse()
+            generation_by_block, retry_authorizations = self._plan_pair_generations()
             evidence = await self._run_fair_matrix(
                 baseline=baseline,
                 candidate=candidate,
+                generation_by_block=generation_by_block,
             )
             try:
                 analysis = analyze_paired_outcomes(
@@ -2020,6 +2121,7 @@ class PairedHarborRunner:
                     protocol_digest=self._protocol.digest,
                     operation_id=self._operation_id,
                     generation_id=self._generation_id,
+                    retry_authorizations=retry_authorizations,
                     evidence=evidence,
                     analysis=analysis,
                 )
@@ -2035,6 +2137,7 @@ class PairedHarborRunner:
         *,
         baseline: HarnessDoc,
         candidate: HarnessDoc,
+        generation_by_block: dict[PairedBlock, int],
     ) -> tuple[PairedHarborBlockEvidence, ...]:
         scheduler = _FairBlockScheduler(self._protocol)
         results: list[PairedHarborBlockEvidence | None] = [
@@ -2057,6 +2160,7 @@ class PairedHarborRunner:
                         baseline=baseline,
                         candidate=candidate,
                         evaluator_session=evaluator_session,
+                        generation_id=generation_by_block[block],
                     )
                 except asyncio.CancelledError:
                     raise
@@ -2092,6 +2196,7 @@ class PairedHarborRunner:
         baseline: HarnessDoc,
         candidate: HarnessDoc,
         evaluator_session: HarborEvaluatorSession,
+        generation_id: int,
     ) -> PairedHarborBlockEvidence:
         route = self._routes[block.panel_member]
         async with self._lease_coordinator.block_lease(
@@ -2100,7 +2205,9 @@ class PairedHarborRunner:
             max_concurrent_blocks=self._protocol.max_concurrent_blocks,
             max_concurrent_route_blocks=route.max_concurrent_blocks,
         ):
-            pair_state = self._begin_pair_generation(block)
+            pair_state = self._begin_pair_generation(block, generation_id=generation_id)
+            if pair_state.status == "complete":
+                return self._load_complete_pair_generation(pair_state)
             harnesses = {
                 PairedArm.BASELINE: baseline,
                 PairedArm.CANDIDATE: candidate,
@@ -2111,6 +2218,7 @@ class PairedHarborRunner:
                     arm=block.first_arm,
                     harness=harnesses[block.first_arm],
                     evaluator_session=evaluator_session,
+                    generation_id=generation_id,
                 )
                 second_arm = _other_arm(block.first_arm)
                 second = await self._evaluate_arm(
@@ -2118,6 +2226,7 @@ class PairedHarborRunner:
                     arm=second_arm,
                     harness=harnesses[second_arm],
                     evaluator_session=evaluator_session,
+                    generation_id=generation_id,
                 )
                 scores = {
                     first.arm: first.analysis_score,
@@ -2125,10 +2234,11 @@ class PairedHarborRunner:
                 }
                 evidence = PairedHarborBlockEvidence(
                     block=block,
+                    generation_id=generation_id,
                     pair_generation_id=paired_harbor_pair_generation_id(
                         protocol_digest=self._protocol.digest,
                         operation_id=self._operation_id,
-                        generation_id=self._generation_id,
+                        generation_id=generation_id,
                         block=block,
                     ),
                     first=first,
@@ -2152,13 +2262,14 @@ class PairedHarborRunner:
         arm: PairedArm,
         harness: HarnessDoc,
         evaluator_session: HarborEvaluatorSession,
+        generation_id: int,
     ) -> PairedHarborArmEvidence:
         route = self._routes[block.panel_member]
         qualification = self._qualifications[block.task_id]
         job_name = paired_harbor_job_name(
             protocol_digest=self._protocol.digest,
             operation_id=self._operation_id,
-            generation_id=self._generation_id,
+            generation_id=generation_id,
             block=block,
             arm=arm,
         )
@@ -2307,8 +2418,17 @@ class PairedHarborRunner:
         ):
             raise ValueError("scored E2B task build differs from full-roster qualification")
 
-    def _begin_pair_generation(self, block: PairedBlock) -> PairedHarborPairGenerationState:
-        state = self._inspect_pair_generation(block, create=True)
+    def _begin_pair_generation(
+        self,
+        block: PairedBlock,
+        *,
+        generation_id: int,
+    ) -> PairedHarborPairGenerationState:
+        state = self._inspect_pair_generation(
+            block,
+            generation_id=generation_id,
+            create=True,
+        )
         if state is None:
             raise RuntimeError("paired Harbor pair state was not created")
         return state
@@ -2317,13 +2437,20 @@ class PairedHarborRunner:
         self,
         block: PairedBlock,
         *,
+        generation_id: int,
         create: bool,
+        allow_incomplete: bool = False,
     ) -> PairedHarborPairGenerationState | None:
-        path = self._pair_state_path(block)
-        names = self._arm_job_names(block)
+        path = self._pair_state_path(block, generation_id=generation_id)
+        evidence_path = self._pair_evidence_path(block, generation_id=generation_id)
+        names = self._arm_job_names(block, generation_id=generation_id)
         job_paths = tuple(self._runtime.jobs_dir / name for name in names.values())
         job_exists = tuple(os.path.lexists(path) for path in job_paths)
         if not os.path.lexists(path):
+            if os.path.lexists(evidence_path):
+                raise PairedHarborPairStateError(
+                    "paired Harbor generation has admitted evidence without durable pair state"
+                )
             if any(job_exists):
                 raise PartialPairedHarborReuseError(
                     "paired Harbor generation has arm artifacts without durable pair state for "
@@ -2332,12 +2459,20 @@ class PairedHarborRunner:
                 )
             if not create:
                 return None
-            state = self._pair_state(block, status="running")
+            state = self._pair_state(
+                block,
+                generation_id=generation_id,
+                status="running",
+            )
             _create_pair_generation_state(path, state)
             return state
 
         state = _read_pair_generation_state(path)
-        expected_identity = self._pair_state(block, status="running")
+        expected_identity = self._pair_state(
+            block,
+            generation_id=generation_id,
+            status="running",
+        )
         identity_fields = (
             "protocol_digest",
             "operation_id",
@@ -2353,7 +2488,11 @@ class PairedHarborRunner:
             raise PairedHarborPairStateError(
                 "paired Harbor generation state does not match the requested block"
             )
+        if state.status != "complete" and os.path.lexists(evidence_path):
+            state = self._recover_pair_generation(state)
         if state.status != "complete":
+            if allow_incomplete:
+                return state
             raise PartialPairedHarborReuseError(
                 f"paired Harbor generation is {state.status!r} for "
                 f"{block.task_id}/{block.panel_member}/{block.attempt}; allocate a new "
@@ -2367,24 +2506,95 @@ class PairedHarborRunner:
             )
         for job_path in job_paths:
             _require_completed_arm_job(job_path)
+        self._load_complete_pair_generation(state)
         return state
+
+    def _recover_pair_generation(
+        self,
+        current: PairedHarborPairGenerationState,
+    ) -> PairedHarborPairGenerationState:
+        """Finish the durable state transition when immutable pair evidence already exists."""
+        evidence = _read_pair_generation_evidence(
+            self._pair_evidence_path(
+                current.block,
+                generation_id=current.generation_id,
+            )
+        )
+        completed = self._completed_pair_state(current, evidence)
+        _replace_pair_generation_state(
+            self._pair_state_path(
+                current.block,
+                generation_id=current.generation_id,
+            ),
+            completed,
+        )
+        return completed
+
+    def _load_complete_pair_generation(
+        self,
+        state: PairedHarborPairGenerationState,
+    ) -> PairedHarborBlockEvidence:
+        if state.status != "complete":
+            raise PairedHarborPairStateError("only complete paired Harbor state can be reused")
+        evidence = _read_pair_generation_evidence(
+            self._pair_evidence_path(
+                state.block,
+                generation_id=state.generation_id,
+            )
+        )
+        expected = self._completed_pair_state(state, evidence)
+        if state != expected:
+            raise PairedHarborPairStateError(
+                "reloaded paired Harbor evidence differs from durable complete state"
+            )
+        return evidence
+
+    def _completed_pair_state(
+        self,
+        current: PairedHarborPairGenerationState,
+        evidence: PairedHarborBlockEvidence,
+    ) -> PairedHarborPairGenerationState:
+        if (
+            evidence.block != current.block
+            or evidence.generation_id != current.generation_id
+            or evidence.pair_generation_id != current.pair_generation_id
+            or evidence.first.job_name
+            != self._arm_job_names(
+                current.block,
+                generation_id=current.generation_id,
+            )[evidence.first.arm]
+            or evidence.second.job_name
+            != self._arm_job_names(
+                current.block,
+                generation_id=current.generation_id,
+            )[evidence.second.arm]
+        ):
+            raise PairedHarborPairStateError(
+                "paired Harbor evidence differs from its pair generation identity"
+            )
+        admissions = {item.arm: item.admission_digest for item in (evidence.first, evidence.second)}
+        return self._pair_state(
+            evidence.block,
+            generation_id=current.generation_id,
+            status="complete",
+            baseline_admission_digest=admissions[PairedArm.BASELINE],
+            candidate_admission_digest=admissions[PairedArm.CANDIDATE],
+            evidence_digest=evidence.digest,
+        )
 
     def _complete_pair_generation(
         self,
         current: PairedHarborPairGenerationState,
         evidence: PairedHarborBlockEvidence,
     ) -> None:
-        admissions = {item.arm: item.admission_digest for item in (evidence.first, evidence.second)}
-        for job_name in self._arm_job_names(evidence.block).values():
-            _require_completed_arm_job(self._runtime.jobs_dir / job_name)
-        completed = self._pair_state(
+        for job_name in self._arm_job_names(
             evidence.block,
-            status="complete",
-            baseline_admission_digest=admissions[PairedArm.BASELINE],
-            candidate_admission_digest=admissions[PairedArm.CANDIDATE],
-        )
+            generation_id=evidence.generation_id,
+        ).values():
+            _require_completed_arm_job(self._runtime.jobs_dir / job_name)
+        completed = self._completed_pair_state(current, evidence)
         if current.status == "complete":
-            if current != completed:
+            if current != completed or self._load_complete_pair_generation(current) != evidence:
                 raise PairedHarborPairStateError(
                     "reloaded paired Harbor admissions differ from durable complete state"
                 )
@@ -2393,36 +2603,69 @@ class PairedHarborRunner:
             raise PairedHarborPairStateError(
                 "only a running paired Harbor generation can become complete"
             )
-        _replace_pair_generation_state(self._pair_state_path(evidence.block), completed)
+        _create_or_compare_pair_generation_evidence(
+            self._pair_evidence_path(
+                evidence.block,
+                generation_id=evidence.generation_id,
+            ),
+            evidence,
+        )
+        _replace_pair_generation_state(
+            self._pair_state_path(
+                evidence.block,
+                generation_id=evidence.generation_id,
+            ),
+            completed,
+        )
 
     def _fail_pair_generation(self, current: PairedHarborPairGenerationState) -> None:
         if current.status == "complete":
+            return
+        evidence_path = self._pair_evidence_path(
+            current.block,
+            generation_id=current.generation_id,
+        )
+        if os.path.lexists(evidence_path):
+            self._recover_pair_generation(current)
             return
         if current.status != "running":
             raise PairedHarborPairStateError(
                 "only a running paired Harbor generation can become failed"
             )
-        failed = self._pair_state(current.block, status="failed")
-        _replace_pair_generation_state(self._pair_state_path(current.block), failed)
+        failed = self._pair_state(
+            current.block,
+            generation_id=current.generation_id,
+            status="failed",
+        )
+        _replace_pair_generation_state(
+            self._pair_state_path(
+                current.block,
+                generation_id=current.generation_id,
+            ),
+            failed,
+        )
 
     def _pair_state(
         self,
         block: PairedBlock,
         *,
+        generation_id: int | None = None,
         status: Literal["running", "complete", "failed"],
         baseline_admission_digest: str | None = None,
         candidate_admission_digest: str | None = None,
+        evidence_digest: str | None = None,
     ) -> PairedHarborPairGenerationState:
-        names = self._arm_job_names(block)
+        generation_id = self._generation_id if generation_id is None else generation_id
+        names = self._arm_job_names(block, generation_id=generation_id)
         payload = {
-            "state_version": "1",
+            "state_version": "2",
             "protocol_digest": self._protocol.digest,
             "operation_id": self._operation_id,
-            "generation_id": self._generation_id,
+            "generation_id": generation_id,
             "pair_generation_id": paired_harbor_pair_generation_id(
                 protocol_digest=self._protocol.digest,
                 operation_id=self._operation_id,
-                generation_id=self._generation_id,
+                generation_id=generation_id,
                 block=block,
             ),
             "block": block.model_dump(mode="json"),
@@ -2431,35 +2674,273 @@ class PairedHarborRunner:
             "status": status,
             "baseline_admission_digest": baseline_admission_digest,
             "candidate_admission_digest": candidate_admission_digest,
+            "evidence_digest": evidence_digest,
         }
         return PairedHarborPairGenerationState.model_validate(
             {**payload, "state_digest": _canonical_digest(payload)}
         )
 
-    def _arm_job_names(self, block: PairedBlock) -> dict[PairedArm, str]:
+    def _arm_job_names(
+        self,
+        block: PairedBlock,
+        *,
+        generation_id: int,
+    ) -> dict[PairedArm, str]:
         return {
             arm: paired_harbor_job_name(
                 protocol_digest=self._protocol.digest,
                 operation_id=self._operation_id,
-                generation_id=self._generation_id,
+                generation_id=generation_id,
                 block=block,
                 arm=arm,
             )
             for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE)
         }
 
-    def _pair_state_path(self, block: PairedBlock) -> Path:
-        pair_id = paired_harbor_pair_generation_id(
+    def _pair_state_path(
+        self,
+        block: PairedBlock,
+        *,
+        generation_id: int | None = None,
+    ) -> Path:
+        generation_id = self._generation_id if generation_id is None else generation_id
+        return _pair_generation_state_path(
+            self._runtime.jobs_dir,
             protocol_digest=self._protocol.digest,
             operation_id=self._operation_id,
-            generation_id=self._generation_id,
+            generation_id=generation_id,
             block=block,
-        ).removeprefix("sha256:")
-        return self._runtime.jobs_dir / ".wmh-paired-state" / f"{pair_id}.json"
+        )
 
-    def _reject_partial_pair_reuse(self) -> None:
+    def _pair_evidence_path(
+        self,
+        block: PairedBlock,
+        *,
+        generation_id: int,
+    ) -> Path:
+        return self._pair_state_path(
+            block,
+            generation_id=generation_id,
+        ).with_suffix(".evidence.json")
+
+    def _plan_pair_generations(
+        self,
+    ) -> tuple[
+        dict[PairedBlock, int],
+        tuple[PairedHarborPairRetryAuthorization, ...],
+    ]:
+        planned: dict[PairedBlock, int] = {}
+        authorizations: list[PairedHarborPairRetryAuthorization] = []
+        any_prior_state = False
         for block in self._protocol.design.blocks:
-            self._inspect_pair_generation(block, create=False)
+            states: list[PairedHarborPairGenerationState] = []
+            for generation_id in range(1, self._generation_id + 1):
+                state = self._inspect_pair_generation(
+                    block,
+                    generation_id=generation_id,
+                    create=False,
+                    allow_incomplete=True,
+                )
+                if state is not None:
+                    states.append(state)
+                    any_prior_state = True
+            for previous, current in zip(states, states[1:], strict=False):
+                if previous.status == "complete":
+                    raise PairedHarborPairStateError(
+                        "paired Harbor complete pair has an unexpected later generation"
+                    )
+                if current.generation_id != previous.generation_id + 1:
+                    raise PairedHarborPairStateError(
+                        "paired Harbor pair generations are not contiguous"
+                    )
+                authorizations.append(
+                    self._require_pair_retry_authorization(
+                        previous,
+                        to_generation_id=current.generation_id,
+                    )
+                )
+
+            if not states:
+                planned[block] = self._generation_id
+                continue
+            latest = states[-1]
+            if latest.status == "complete":
+                planned[block] = latest.generation_id
+                continue
+            if latest.generation_id == self._generation_id:
+                raise PartialPairedHarborReuseError(
+                    f"paired Harbor generation is {latest.status!r} for "
+                    f"{block.task_id}/{block.panel_member}/{block.attempt}; allocate a new "
+                    "ledger-authorized generation and rerun both arms"
+                )
+            if self._generation_id != latest.generation_id + 1:
+                raise PartialPairedHarborReuseError("paired Harbor retry skipped a pair generation")
+            authorizations.append(
+                self._require_pair_retry_authorization(
+                    latest,
+                    to_generation_id=self._generation_id,
+                )
+            )
+            planned[block] = self._generation_id
+
+        if self._generation_id != 1 and not any_prior_state:
+            raise PartialPairedHarborReuseError(
+                "paired Harbor operation must begin at generation 1"
+            )
+        return planned, tuple(authorizations)
+
+    def _require_pair_retry_authorization(
+        self,
+        failed_state: PairedHarborPairGenerationState,
+        *,
+        to_generation_id: int,
+    ) -> PairedHarborPairRetryAuthorization:
+        expected = _pair_retry_authorization(
+            protocol=self._protocol,
+            operation_id=self._operation_id,
+            failed_state=failed_state,
+            to_generation_id=to_generation_id,
+        )
+        path = _pair_retry_authorization_path(
+            self._runtime.jobs_dir,
+            expected=expected,
+        )
+        if path.is_symlink() or not path.is_file():
+            raise PartialPairedHarborReuseError("paired Harbor pair retry authorization is missing")
+        try:
+            actual = PairedHarborPairRetryAuthorization.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, ValidationError) as exc:
+            raise PairedHarborPairStateError(
+                "paired Harbor pair retry authorization is unreadable or invalid"
+            ) from exc
+        if actual != expected:
+            raise PairedHarborPairStateError(
+                "paired Harbor pair retry authorization differs from the failed generation"
+            )
+        return actual
+
+
+def authorize_paired_harbor_pair_retry(
+    *,
+    jobs_dir: Path,
+    protocol: PairedHarborProtocol,
+    operation_id: str,
+    failed_state: PairedHarborPairGenerationState,
+) -> PairedHarborPairRetryAuthorization:
+    """Durably authorize one fresh whole-pair generation after control-plane classification."""
+    root = jobs_dir.expanduser()
+    if not root.is_absolute():
+        raise ValueError("paired Harbor retry jobs_dir must be absolute")
+    frozen_protocol = PairedHarborProtocol.model_validate(protocol.model_dump())
+    frozen_state = PairedHarborPairGenerationState.model_validate(failed_state.model_dump())
+    operation_id = _validate_operation_id(operation_id)
+    if (
+        frozen_state.protocol_digest != frozen_protocol.digest
+        or frozen_state.operation_id != operation_id
+        or frozen_state.block not in frozen_protocol.design.blocks
+    ):
+        raise ValueError("paired Harbor retry state differs from its frozen operation")
+    if frozen_state.status == "complete":
+        raise ValueError("a complete paired Harbor generation cannot be retried")
+
+    authorization = _pair_retry_authorization(
+        protocol=frozen_protocol,
+        operation_id=operation_id,
+        failed_state=frozen_state,
+        to_generation_id=frozen_state.generation_id + 1,
+    )
+    lease_dir = root / ".wmh-paired-leases"
+    with exclusive_posix_file_lease(
+        _operation_lease_path(
+            lease_dir,
+            protocol_digest=frozen_protocol.digest,
+            operation_id=operation_id,
+        ),
+        unsupported_error=RuntimeError(
+            "paired Harbor retry authorization requires POSIX operation exclusion"
+        ),
+        irregular_file_error=OSError("paired Harbor retry operation lease is not a regular file"),
+        contention_error=ConcurrentPairedHarborRunError(
+            "paired Harbor retry cannot be authorized while the operation is running"
+        ),
+    ):
+        state_path = _pair_generation_state_path(
+            root,
+            protocol_digest=frozen_protocol.digest,
+            operation_id=operation_id,
+            generation_id=frozen_state.generation_id,
+            block=frozen_state.block,
+        )
+        if _read_pair_generation_state(state_path) != frozen_state:
+            raise PairedHarborPairStateError(
+                "paired Harbor retry state changed before authorization"
+            )
+        authorization_path = _pair_retry_authorization_path(
+            root,
+            expected=authorization,
+        )
+        if os.path.lexists(authorization_path):
+            actual = _read_pair_retry_authorization(authorization_path)
+            if actual != authorization:
+                raise PairedHarborPairStateError(
+                    "paired Harbor retry authorization path contains different authority"
+                )
+            return actual
+
+        next_state_path = _pair_generation_state_path(
+            root,
+            protocol_digest=frozen_protocol.digest,
+            operation_id=operation_id,
+            generation_id=authorization.to_generation_id,
+            block=frozen_state.block,
+        )
+        next_job_paths = tuple(
+            root
+            / paired_harbor_job_name(
+                protocol_digest=frozen_protocol.digest,
+                operation_id=operation_id,
+                generation_id=authorization.to_generation_id,
+                block=frozen_state.block,
+                arm=arm,
+            )
+            for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE)
+        )
+        if os.path.lexists(next_state_path) or any(
+            os.path.lexists(path) for path in next_job_paths
+        ):
+            raise PairedHarborPairStateError(
+                "paired Harbor retry generation exists without prior durable authorization"
+            )
+        _create_retry_authorization(authorization_path, authorization)
+        return authorization
+
+
+def _pair_retry_authorization(
+    *,
+    protocol: PairedHarborProtocol,
+    operation_id: str,
+    failed_state: PairedHarborPairGenerationState,
+    to_generation_id: int,
+) -> PairedHarborPairRetryAuthorization:
+    if failed_state.status == "complete":
+        raise ValueError("a complete paired Harbor generation cannot be retried")
+    payload = {
+        "authorization_version": "1",
+        "protocol_digest": protocol.digest,
+        "operation_id": operation_id,
+        "retry_policy_digest": protocol.retry_policy_digest,
+        "block": failed_state.block.model_dump(mode="json"),
+        "from_generation_id": failed_state.generation_id,
+        "to_generation_id": to_generation_id,
+        "failed_state": failed_state.model_dump(mode="json"),
+        "failed_state_digest": failed_state.state_digest,
+        "reason": "infrastructure_failure",
+    }
+    return PairedHarborPairRetryAuthorization.model_validate(
+        {**payload, "authorization_digest": _canonical_digest(payload)}
+    )
 
 
 def paired_harbor_job_name(
@@ -2547,6 +3028,77 @@ def _create_pair_generation_state(
         raise
 
 
+def _create_or_compare_pair_generation_evidence(
+    path: Path,
+    evidence: PairedHarborBlockEvidence,
+) -> None:
+    if os.path.lexists(path):
+        if _read_pair_generation_evidence(path) != evidence:
+            raise PairedHarborPairStateError(
+                "paired Harbor pair evidence was already published with different contents"
+            )
+        return
+    _create_immutable_json_record(path, evidence.model_dump_json(indent=2) + "\n")
+
+
+def _read_pair_generation_evidence(path: Path) -> PairedHarborBlockEvidence:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborPairStateError(
+            f"paired Harbor pair evidence must be a regular file: {path}"
+        )
+    try:
+        return PairedHarborBlockEvidence.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor pair evidence is unreadable or invalid: {path}"
+        ) from exc
+
+
+def _create_retry_authorization(
+    path: Path,
+    authorization: PairedHarborPairRetryAuthorization,
+) -> None:
+    _create_immutable_json_record(path, authorization.model_dump_json(indent=2) + "\n")
+
+
+def _read_pair_retry_authorization(path: Path) -> PairedHarborPairRetryAuthorization:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborPairStateError(
+            f"paired Harbor retry authorization must be a regular file: {path}"
+        )
+    try:
+        return PairedHarborPairRetryAuthorization.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor retry authorization is unreadable or invalid: {path}"
+        ) from exc
+
+
+def _create_immutable_json_record(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor immutable record was concurrently created: {path}"
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def _replace_pair_generation_state(
     path: Path,
     state: PairedHarborPairGenerationState,
@@ -2614,6 +3166,42 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _pair_generation_state_path(
+    jobs_dir: Path,
+    *,
+    protocol_digest: str,
+    operation_id: str,
+    generation_id: int,
+    block: PairedBlock,
+) -> Path:
+    pair_id = paired_harbor_pair_generation_id(
+        protocol_digest=protocol_digest,
+        operation_id=operation_id,
+        generation_id=generation_id,
+        block=block,
+    ).removeprefix("sha256:")
+    return jobs_dir / ".wmh-paired-state" / f"{pair_id}.json"
+
+
+def _pair_retry_authorization_path(
+    jobs_dir: Path,
+    *,
+    expected: PairedHarborPairRetryAuthorization,
+) -> Path:
+    token = expected.authorization_digest.removeprefix("sha256:")
+    return jobs_dir / ".wmh-paired-retry-authority" / f"{token}.json"
+
+
+def _operation_lease_path(
+    lease_dir: Path,
+    *,
+    protocol_digest: str,
+    operation_id: str,
+) -> Path:
+    token = _lease_token("operation", protocol_digest, operation_id)
+    return lease_dir / "operations" / f"{token}.lock"
 
 
 def _lease_token(kind: str, *parts: str) -> str:
