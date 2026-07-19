@@ -30,7 +30,7 @@ from wmh.evals.benchmark import (
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.receipt_trace import validate_provider_receipt_trace
 from wmh.evals.harbor.results import HarborTrialLocator, LoadedHarborJobResult
-from wmh.evals.paired import PairedArm, PairedEvaluationDesign, PairedPanelPlan
+from wmh.evals.paired import BoundedMeanBet, PairedArm, PairedEvaluationDesign, PairedPanelPlan
 from wmh.evals.partition import ConfirmationPartition, PartitionTask
 from wmh.harness.doc import HarnessDoc, Surface
 from wmh.harness.pi_local import PI_CONTAINER_IMAGE
@@ -78,10 +78,10 @@ def _design() -> PairedEvaluationDesign:
     return PairedEvaluationDesign.create(
         task_ids=_TASK_IDS,
         panel=(PairedPanelPlan(panel_member="worker", attempts=2),),
+        bounded_mean_bets=(BoundedMeanBet(fraction=1.0, weight=1.0),),
         schedule_seed="paired-schedule-v1",
         analysis_seed="paired-analysis-v1",
         randomization_samples=1_000,
-        bootstrap_samples=1_000,
         minimum_panel_delta=0.05,
         minimum_member_delta=0.03,
         noninferiority_margin=0.02,
@@ -1272,10 +1272,10 @@ def test_scheduler_is_bounded_route_fair_and_serializes_each_task(
             PairedPanelPlan(panel_member="route-a", attempts=2),
             PairedPanelPlan(panel_member="route-b", attempts=2),
         ),
+        bounded_mean_bets=(BoundedMeanBet(fraction=1.0, weight=1.0),),
         schedule_seed="fair-schedule",
         analysis_seed="fair-analysis",
         randomization_samples=1_000,
-        bootstrap_samples=1_000,
         minimum_panel_delta=0.05,
         minimum_member_delta=0.03,
         noninferiority_margin=0.02,
