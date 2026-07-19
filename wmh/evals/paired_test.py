@@ -61,33 +61,94 @@ def _outcomes(
     ]
 
 
-def test_schedule_is_deterministic_complete_and_balanced_across_tasks() -> None:
+def test_schedule_is_deterministic_complete_and_balanced_within_tasks() -> None:
     task_ids = tuple(f"task-{index}" for index in range(5))
     design = _design(task_ids=task_ids, attempts=3)
     repeated = _design(task_ids=task_ids, attempts=3)
+    reordered = _design(
+        task_ids=tuple(reversed(task_ids)),
+        panel_members=("large", "medium", "small"),
+        attempts=3,
+    )
 
     assert design == repeated
+    assert design == reordered
     assert design.digest == repeated.digest
     assert len(design.blocks) == 5 * 3 * 3
     for member in design.panel_members:
-        first_arm_by_task: dict[str, set[PairedArm]] = {}
+        first_arm_by_task: dict[str, Counter[PairedArm]] = {}
         for block in design.blocks:
             if block.panel_member == member:
-                first_arm_by_task.setdefault(block.task_id, set()).add(block.first_arm)
-        assert all(len(arms) == 1 for arms in first_arm_by_task.values())
-        counts = Counter(next(iter(arms)) for arms in first_arm_by_task.values())
-        assert abs(counts[PairedArm.BASELINE] - counts[PairedArm.CANDIDATE]) == 1
+                first_arm_by_task.setdefault(block.task_id, Counter())[block.first_arm] += 1
+        assert all(
+            abs(counts[PairedArm.BASELINE] - counts[PairedArm.CANDIDATE]) == 1
+            for counts in first_arm_by_task.values()
+        )
+        total = sum(first_arm_by_task.values(), Counter())
+        assert abs(total[PairedArm.BASELINE] - total[PairedArm.CANDIDATE]) == 1
+
+
+def test_schedule_exactly_balances_even_attempt_counts_within_each_task() -> None:
+    design = _design(
+        task_ids=tuple(f"task-{index}" for index in range(7)),
+        panel_members=("economy", "standard"),
+        attempts_by_member={"economy": 20, "standard": 10},
+    )
+
+    counts: dict[tuple[str, str], Counter[PairedArm]] = {}
+    for block in design.blocks:
+        counts.setdefault((block.task_id, block.panel_member), Counter())[block.first_arm] += 1
+
+    assert all(value[PairedArm.BASELINE] == value[PairedArm.CANDIDATE] for value in counts.values())
+
+
+def test_schedule_balances_odd_attempt_extra_direction_across_tasks() -> None:
+    design = _design(
+        task_ids=tuple(f"task-{index}" for index in range(8)),
+        panel_members=("premium",),
+        attempts_by_member={"premium": 5},
+    )
+
+    per_task: dict[str, Counter[PairedArm]] = {}
+    for block in design.blocks:
+        per_task.setdefault(block.task_id, Counter())[block.first_arm] += 1
+
+    assert Counter(
+        PairedArm.CANDIDATE
+        if counts[PairedArm.CANDIDATE] > counts[PairedArm.BASELINE]
+        else PairedArm.BASELINE
+        for counts in per_task.values()
+    ) == {PairedArm.BASELINE: 4, PairedArm.CANDIDATE: 4}
 
 
 def test_schedule_supports_predeclared_member_specific_attempt_counts() -> None:
     design = _design(
+        task_ids=tuple(f"task-{index}" for index in range(9)),
         panel_members=("economy", "standard", "premium"),
         attempts_by_member={"economy": 20, "standard": 10, "premium": 5},
     )
 
     counts = Counter(block.panel_member for block in design.blocks)
-    assert counts == {"economy": 80, "standard": 40, "premium": 20}
+    assert counts == {"economy": 180, "standard": 90, "premium": 45}
     assert design.attempts_by_member == {"economy": 20, "premium": 5, "standard": 10}
+
+    per_task_member: dict[tuple[str, str], Counter[PairedArm]] = {}
+    for block in design.blocks:
+        per_task_member.setdefault(
+            (block.task_id, block.panel_member), Counter()
+        )[block.first_arm] += 1
+    for plan in design.panel:
+        member_counts = {
+            task: per_task_member[(task, plan.panel_member)] for task in design.task_ids
+        }
+        assert all(sum(value.values()) == plan.attempts for value in member_counts.values())
+        assert all(
+            abs(value[PairedArm.BASELINE] - value[PairedArm.CANDIDATE])
+            == plan.attempts % 2
+            for value in member_counts.values()
+        )
+        total = sum(member_counts.values(), Counter())
+        assert abs(total[PairedArm.BASELINE] - total[PairedArm.CANDIDATE]) <= 1
 
 
 def test_design_rejects_a_schedule_that_differs_from_its_frozen_seed() -> None:

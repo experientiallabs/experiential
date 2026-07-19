@@ -372,24 +372,50 @@ def _scheduled_blocks(
     blocks: list[PairedBlock] = []
     for plan in panel:
         member = plan.panel_member
-        ranked_tasks = sorted(
-            task_ids,
-            key=lambda task_id: _digest_bytes(seed, "task-order", member, task_id),
-        )
-        candidate_first_count = len(task_ids) // 2
-        if len(task_ids) % 2:
-            candidate_first_count += _digest_bytes(seed, "odd-arm", member)[0] & 1
-        candidate_first_tasks = frozenset(ranked_tasks[:candidate_first_count])
+        candidate_extra_tasks: frozenset[str] = frozenset()
+        if plan.attempts % 2:
+            ranked_tasks = sorted(
+                task_ids,
+                key=lambda task_id: _digest_bytes(
+                    seed,
+                    "odd-attempt-task-order",
+                    member,
+                    task_id,
+                ),
+            )
+            candidate_extra_count = len(task_ids) // 2
+            if len(task_ids) % 2:
+                candidate_extra_count += (
+                    _digest_bytes(seed, "odd-attempt-extra-arm", member)[0] & 1
+                )
+            candidate_extra_tasks = frozenset(ranked_tasks[:candidate_extra_count])
         for task_id in task_ids:
-            first_arm = (
-                PairedArm.CANDIDATE if task_id in candidate_first_tasks else PairedArm.BASELINE
+            ranked_attempts = sorted(
+                range(1, plan.attempts + 1),
+                key=lambda attempt: _digest_bytes(
+                    seed,
+                    "attempt-order",
+                    member,
+                    task_id,
+                    str(attempt),
+                ),
+            )
+            candidate_first_count = plan.attempts // 2 + (
+                task_id in candidate_extra_tasks
+            )
+            candidate_first_attempts = frozenset(
+                ranked_attempts[:candidate_first_count]
             )
             blocks.extend(
                 PairedBlock(
                     task_id=task_id,
                     panel_member=member,
                     attempt=attempt,
-                    first_arm=first_arm,
+                    first_arm=(
+                        PairedArm.CANDIDATE
+                        if attempt in candidate_first_attempts
+                        else PairedArm.BASELINE
+                    ),
                 )
                 for attempt in range(1, plan.attempts + 1)
             )
