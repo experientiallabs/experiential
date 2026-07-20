@@ -1392,6 +1392,51 @@ def _validate_consumed_proposal_batch_witness(
             raise ValueError("committed proposal output does not match unusable slot")
 
 
+def search_result_from_completed_checkpoint(checkpoint: SearchCheckpoint) -> SearchResult:
+    """Reconstruct a complete search result from its exact terminal checkpoint.
+
+    This performs no scoring, proposal, progress, or checkpoint callback work. It is intended for
+    host recovery after the terminal checkpoint was persisted but the original result was lost.
+
+    Args:
+        checkpoint: Checksummed checkpoint at the configured terminal iteration.
+
+    Returns:
+        The detached result represented by the terminal checkpoint.
+
+    Raises:
+        ValueError: If the checkpoint is not terminal or its checksum is invalid.
+    """
+    resumed = _validated_checkpoint_copy(checkpoint)
+    configuration = resumed.configuration
+    if resumed.completed_iteration != configuration.iterations:
+        raise ValueError("search result requires a terminal checkpoint")
+    champion_hash = resumed.champion_doc_hash
+    best = resumed.docs[champion_hash].model_copy(
+        update={"name": configuration.name, "version": 0},
+        deep=True,
+    )
+    return SearchResult(
+        best=best,
+        best_score=resumed.reports[champion_hash].score,
+        archive=resumed.archive.model_copy(deep=True),
+        reports={
+            doc_hash: report.model_copy(deep=True) for doc_hash, report in resumed.reports.items()
+        },
+        holdout_reports={
+            doc_hash: report.model_copy(deep=True)
+            for doc_hash, report in resumed.holdout_reports.items()
+        },
+        suite=list(resumed.suite),
+        skipped=resumed.skipped,
+        proposal_records=[record.model_copy(deep=True) for record in resumed.proposal_records],
+        screened=resumed.screened,
+        confirmations=resumed.confirmations,
+        iterations=configuration.iterations,
+        proposal_batch_size=configuration.proposal_batch_size,
+    )
+
+
 def search_harness(
     name: str,
     seed_doc: HarnessDoc,

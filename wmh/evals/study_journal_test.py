@@ -22,6 +22,7 @@ from wmh.evals.study_journal import (
     append_study_phase,
     call_in_study_slice,
     load_study_journal,
+    reconcile_study_slice,
 )
 
 
@@ -324,6 +325,205 @@ def test_study_slice_reconciles_a_persisted_checkpoint_after_operation_crash(
     assert load_study_journal(store, publisher=publisher)[-1].commitment.phase is (
         StudyPhase.PREPARATION_PLANNED
     )
+
+
+def test_study_slice_reenters_exact_claim_before_checkpoint_zero(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    calls: list[str] = []
+
+    with pytest.raises(RuntimeError, match="provider failed before checkpoint"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (
+                calls.append("failed")
+                or (_ for _ in ()).throw(RuntimeError("provider failed before checkpoint"))
+            ),
+        )
+
+    with pytest.raises(ValueError, match="different run identity or configuration"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("drifted-configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (
+                calls.append("forked") or "forked",
+                StudyRunCheckpointIdentity(
+                    sequence=0,
+                    checkpoint_digest=_digest("forked-checkpoint"),
+                ),
+            ),
+        )
+
+    recovered = call_in_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=_digest("configuration"),
+        resume_from=None,
+        publisher=publisher,
+        operation=lambda: (
+            calls.append("recovered") or "result",
+            StudyRunCheckpointIdentity(
+                sequence=0,
+                checkpoint_digest=_digest("checkpoint-0"),
+            ),
+        ),
+    )
+
+    assert recovered == "result"
+    assert calls == ["failed", "recovered"]
+
+
+def test_uncheckpointed_study_slice_cannot_reenter_after_terminal_stop(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    calls: list[str] = []
+
+    with pytest.raises(RuntimeError, match="terminal budget error"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (
+                calls.append("paid") or (_ for _ in ()).throw(RuntimeError("terminal budget error"))
+            ),
+        )
+    append_study_phase(
+        store,
+        phase=StudyPhase.STOPPED,
+        payload_digest=_digest("budget-exhausted"),
+        publisher=publisher,
+    )
+
+    with pytest.raises(ValueError, match="current study phase is stopped"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (
+                calls.append("duplicated") or "result",
+                StudyRunCheckpointIdentity(
+                    sequence=0,
+                    checkpoint_digest=_digest("checkpoint-0"),
+                ),
+            ),
+        )
+
+    assert calls == ["paid"]
+
+
+def test_reconcile_study_slice_returns_completed_resume_without_new_checkpoint(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    configuration_digest = _digest("configuration")
+    first_checkpoint = StudyRunCheckpointIdentity(
+        sequence=0,
+        checkpoint_digest=_digest("checkpoint-0"),
+    )
+    completed_checkpoint = StudyRunCheckpointIdentity(
+        sequence=1,
+        checkpoint_digest=_digest("checkpoint-1"),
+    )
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    call_in_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=configuration_digest,
+        resume_from=None,
+        publisher=publisher,
+        operation=lambda: ("first", first_checkpoint),
+    )
+    reconstructions: list[str] = []
+
+    recovered = reconcile_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=configuration_digest,
+        resume_from=completed_checkpoint,
+        publisher=publisher,
+        operation=lambda: reconstructions.append("recovered") or "complete",
+    )
+    repeated = reconcile_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=configuration_digest,
+        resume_from=completed_checkpoint,
+        publisher=publisher,
+        operation=lambda: reconstructions.append("repeated") or "complete",
+    )
+
+    assert recovered == "complete"
+    assert repeated == "complete"
+    assert reconstructions == ["recovered", "repeated"]
+    assert len(tuple(store.directory.glob("run-checkpoint-*.json"))) == 2
+
+    with pytest.raises(ValueError, match="latest durable checkpoint"):
+        reconcile_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=configuration_digest,
+            resume_from=first_checkpoint,
+            publisher=publisher,
+            operation=lambda: "stale",
+        )
+
+
+def test_study_checkpoint_sequence_fits_its_canonical_filename() -> None:
+    with pytest.raises(ValueError, match="less than or equal to 99999999"):
+        StudyRunCheckpointIdentity(
+            sequence=100_000_000,
+            checkpoint_digest=_digest("too-large"),
+        )
 
 
 def test_public_load_requires_an_external_publisher(tmp_path: Path) -> None:

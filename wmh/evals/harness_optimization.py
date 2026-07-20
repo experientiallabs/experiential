@@ -57,6 +57,7 @@ from wmh.harness.create import (
     SearchProposalBatchWitness,
     SearchResult,
     search_harness,
+    search_result_from_completed_checkpoint,
 )
 from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc, SurfaceKind
@@ -594,11 +595,12 @@ def run_harness_optimization_search_slice(
     on_proposal_batch_witness: Callable[[SearchProposalBatchWitness], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> StudySliceResult[SearchCheckpoint, SearchResult]:
-    """Execute one serialized discovery slice and return its newly durable checkpoint.
+    """Execute one serialized discovery slice or recover its completed result.
 
     The initial slice qualifies the seed and returns checkpoint zero. Each resumed slice executes
     exactly one planned proposal iteration. Paid slices require both proposal transaction
-    callbacks so a crash around the proposer call can fail closed or replay its exact witness.
+    callbacks so a crash around the proposer call can fail closed or replay its exact witness. An
+    exact terminal resume only reconciles its checkpoint and reconstructs the completed result.
 
     Args:
         discovery: Held-out-safe frozen study inputs.
@@ -606,7 +608,7 @@ def run_harness_optimization_search_slice(
         proposer: Exact delta proposer named by the frozen search plan.
         lifecycle: Journal-backed phase and sequential execution authority.
         authorization: Current discovery phase payload and stable run identity.
-        resume_from: Latest durable search checkpoint, or none for the initial slice.
+        resume_from: Latest caller-persisted search checkpoint, or none for the initial slice.
         resume_proposal_batch_witness: Exact prepared or completed transaction recovered after a
             crash around the next proposer call.
         on_checkpoint: Required durable checkpoint persistence callback.
@@ -617,7 +619,8 @@ def run_harness_optimization_search_slice(
         should_cancel: Cooperative host cancellation check.
 
     Returns:
-        One new checkpoint and a final result only when all planned iterations are complete.
+        One new checkpoint, or the exact reconciled terminal checkpoint, with a final result only
+        when all planned iterations are complete.
 
     Raises:
         ValueError: If authorization, runtime components, resume state, or sequence drifts.
@@ -637,6 +640,13 @@ def run_harness_optimization_search_slice(
         if resume_from is not None
         else None
     )
+
+    def _checkpoint_identity(checkpoint: SearchCheckpoint) -> StudyRunCheckpointIdentity:
+        return StudyRunCheckpointIdentity(
+            sequence=checkpoint.completed_iteration,
+            checkpoint_digest="sha256:" + checkpoint.payload_sha256,
+        )
+
     if resumed is not None:
         _validate_search_slice_checkpoint(
             study,
@@ -646,7 +656,17 @@ def run_harness_optimization_search_slice(
             search_run_id=authorization.search_run_id,
         )
         if resumed.completed_iteration == plan.iterations:
-            raise ValueError("discovery search is already complete and has no new slice")
+            return lifecycle.reconcile_slice(
+                StudyPhase.DISCOVERY_RUNNING,
+                authorization.search_run_id,
+                lambda: StudySliceResult[SearchCheckpoint, SearchResult](
+                    checkpoint=resumed,
+                    result=search_result_from_completed_checkpoint(resumed),
+                ),
+                payload_digest=authorization.digest,
+                configuration_digest=authorization.search_configuration_digest,
+                resume_from=_checkpoint_identity(resumed),
+            )
     if should_cancel is not None and should_cancel():
         raise HarnessSearchCancelled("harness search cancelled before slice admission")
 
@@ -703,7 +723,11 @@ def run_harness_optimization_search_slice(
                 should_cancel=_should_cancel,
             )
         except HarnessSearchCancelled:
-            if committed is None or not stop_after_checkpoint:
+            if committed is None:
+                raise
+            if committed.completed_iteration == plan.iterations:
+                final = search_result_from_completed_checkpoint(committed)
+            elif not stop_after_checkpoint:
                 raise
         if committed is None:
             raise RuntimeError("study slice returned without a new durable search checkpoint")
@@ -720,18 +744,8 @@ def run_harness_optimization_search_slice(
         _run,
         payload_digest=authorization.digest,
         configuration_digest=authorization.search_configuration_digest,
-        resume_from=(
-            StudyRunCheckpointIdentity(
-                sequence=resumed.completed_iteration,
-                checkpoint_digest="sha256:" + resumed.payload_sha256,
-            )
-            if resumed is not None
-            else None
-        ),
-        checkpoint_identity=lambda checkpoint: StudyRunCheckpointIdentity(
-            sequence=checkpoint.completed_iteration,
-            checkpoint_digest="sha256:" + checkpoint.payload_sha256,
-        ),
+        resume_from=(_checkpoint_identity(resumed) if resumed is not None else None),
+        checkpoint_identity=_checkpoint_identity,
     )
 
 
