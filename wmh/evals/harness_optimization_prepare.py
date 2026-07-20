@@ -1355,7 +1355,7 @@ def _publish_and_reopen(
                     "sealed canary artifact already exists with different bytes"
                 ) from None
         else:
-            staging_path.unlink()
+            staging_path.unlink(missing_ok=True)
             _fsync_directory(path.parent)
     finally:
         if staging_descriptor >= 0:

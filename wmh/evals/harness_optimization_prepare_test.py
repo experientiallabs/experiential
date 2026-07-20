@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -458,6 +459,30 @@ def test_atomic_publication_preserves_the_original_descriptor_failure(
         _publish_and_reopen(destination, runner, E2BPiRunnerArtifact)
 
     assert not destination.exists()
+    assert not tuple(tmp_path.glob(".sealed.json.staging-*"))
+
+
+def test_atomic_publication_tolerates_concurrent_staging_link_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    destination = tmp_path / "sealed.json"
+    real_link = os.link
+
+    def link_then_recover(source: Path, target: Path, *, follow_symlinks: bool) -> None:
+        real_link(source, target, follow_symlinks=follow_symlinks)
+        source.unlink()
+
+    monkeypatch.setattr(
+        "wmh.evals.harness_optimization_prepare.os.link",
+        link_then_recover,
+    )
+
+    reopened = _publish_and_reopen(destination, runner, E2BPiRunnerArtifact)
+
+    assert reopened == runner
+    assert destination.is_file()
     assert not tuple(tmp_path.glob(".sealed.json.staging-*"))
 
 
