@@ -47,6 +47,13 @@ _KILL_DELAYS = (0.1, 0.5)
 _KILL_REQUEST_TIMEOUT_S = 5.0
 
 
+def resolve_e2b_template(template: str | None) -> str | None:
+    """Resolve the template once; an explicit empty string disables environment fallback."""
+    if template is None:
+        return os.environ.get(E2B_TEMPLATE_ENV) or None
+    return template or None
+
+
 class SandboxCleanupError(RuntimeError):
     """An E2B sandbox may still be live after bounded teardown retries."""
 
@@ -175,6 +182,8 @@ def default_sandbox_factory(
     session driver relies on this for cost-leak reconciliation.
     """
 
+    chosen_template = resolve_e2b_template(template)
+
     def make() -> SandboxHandle:
         try:
             from e2b import Sandbox
@@ -186,13 +195,19 @@ def default_sandbox_factory(
         key = api_key or os.environ.get(E2B_API_KEY_ENV)
         if not key:
             raise RuntimeError(f"set ${E2B_API_KEY_ENV} to run the harness in E2B sandboxes")
-        chosen = template or os.environ.get(E2B_TEMPLATE_ENV) or None
         if metadata:
             sandbox = Sandbox.create(
-                template=chosen, timeout=int(timeout), api_key=key, metadata=metadata
+                template=chosen_template,
+                timeout=int(timeout),
+                api_key=key,
+                metadata=metadata,
             )
         else:
-            sandbox = Sandbox.create(template=chosen, timeout=int(timeout), api_key=key)
+            sandbox = Sandbox.create(
+                template=chosen_template,
+                timeout=int(timeout),
+                api_key=key,
+            )
         # The SDK object satisfies the protocol slice structurally; cast rather than pin the
         # SDK's full (much wider) signatures into the protocol.
         return cast("SandboxHandle", sandbox)

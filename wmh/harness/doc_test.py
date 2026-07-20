@@ -312,3 +312,15 @@ def test_runtime_e2b_backend_rejects_in_process_runtime_kinds() -> None:
         HarnessDoc.baseline("b").runtime(provider, backend="e2b")
     with pytest.raises(ValueError, match="use backend='local'"):
         code_baseline("c").runtime(provider, backend="e2b")
+
+
+def test_pi_transport_rejects_execution_modes_where_it_has_no_effect() -> None:
+    provider = _stub_provider()
+    with pytest.raises(ValueError, match="only to local pi-node"):
+        _pi_doc().runtime(
+            provider,
+            backend="e2b",
+            pi_transport="ssh",
+        )
+    with pytest.raises(ValueError, match="only to local pi-node"):
+        HarnessDoc.baseline("b").runtime(provider, pi_transport="ssh")

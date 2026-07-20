@@ -28,7 +28,7 @@ import os
 import re
 from collections.abc import Callable
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -272,6 +272,8 @@ class HarnessDoc(BaseModel):
         backend: str = "local",
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
+        pi_transport: Literal["ssh", "link"] | None = None,
+        transport_retries: int = 1,
         should_cancel: Callable[[], bool] | None = None,
     ) -> Runtime:
         """The configured agent runtime this document describes.
@@ -291,7 +293,18 @@ class HarnessDoc(BaseModel):
         """
         if backend not in ("local", "e2b"):
             raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
-        if self.runtime_kind() == "pi-node":
+        if (
+            isinstance(transport_retries, bool)
+            or not isinstance(transport_retries, int)
+            or transport_retries < 0
+        ):
+            raise ValueError("transport_retries must be a nonnegative integer")
+        if pi_transport not in (None, "ssh", "link"):
+            raise ValueError("pi_transport must be ssh or link")
+        runtime_kind = self.runtime_kind()
+        if pi_transport is not None and (backend != "local" or runtime_kind != "pi-node"):
+            raise ValueError("pi_transport applies only to local pi-node execution")
+        if runtime_kind == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
             tool_names = self.tools()
@@ -302,8 +315,11 @@ class HarnessDoc(BaseModel):
                 tool_names.append(READ_SKILL.name)
             tools = resolve_tools(tool_names)
             structured_provider = provider if isinstance(provider, ToolCallingProvider) else None
+            effective_pi_transport = pi_transport or (
+                "link" if os.environ.get("PI_TRANSPORT") == "link" else "ssh"
+            )
             if (
-                backend == "e2b" or os.environ.get("PI_TRANSPORT") == "link"
+                backend == "e2b" or effective_pi_transport == "link"
             ) and structured_provider is None:
                 raise TypeError(
                     "pi-node link/e2b execution needs a ToolCallingProvider; "
@@ -325,12 +341,13 @@ class HarnessDoc(BaseModel):
                     pool=e2b_pool,
                     max_turns=self.max_turns(),
                     max_output_tokens=self.max_output_tokens(),
+                    transport_retries=transport_retries,
                     should_cancel=should_cancel,
                 )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
             # host set via runner_link.set_active_channel) instead of the per-episode SSH shim; the
             # default (unset / "ssh") keeps PiRuntime. The worker LLM reads the same PI_AGENT_* env.
-            if os.environ.get("PI_TRANSPORT") == "link":
+            if effective_pi_transport == "link":
                 from wmh.harness.runner_link import (
                     RunnerLink,
                     active_channel,

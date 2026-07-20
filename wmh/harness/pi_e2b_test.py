@@ -507,6 +507,7 @@ def _runtime(
     temperature: float = 0.7,
     skills: SkillLibrary | None = None,
     episode_timeout_s: float = 300.0,
+    transport_retries: int = 1,
     should_cancel: Callable[[], bool] | None = None,
 ) -> E2BPiRuntime:
     return E2BPiRuntime(
@@ -522,6 +523,7 @@ def _runtime(
         temperature=temperature,
         skills=skills,
         episode_timeout_s=episode_timeout_s,
+        transport_retries=transport_retries,
         should_cancel=should_cancel,
     )
 
@@ -536,6 +538,12 @@ def _sent_frames(fake: FakeSandbox) -> list[JsonObject]:
         else value
         for value in decoded
     ]
+
+
+@pytest.mark.parametrize("value", [True, -1, 0.5])
+def test_transport_retry_budget_must_be_a_nonnegative_integer(value: object) -> None:
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        _runtime(transport_retries=cast("int", value))
 
 
 def _of_kind(fake: FakeSandbox, kind: str) -> list[JsonObject]:
@@ -1328,6 +1336,34 @@ def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(
     assert result.answer == "recovered"
     assert len(made) == 2
     assert made[0].kills == 1  # the dead attempt's sandbox was discarded, not reused
+    pool.close()
+
+
+def test_zero_transport_retry_budget_never_replays_an_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for(
+        [
+            [{"type": "hello"}],
+            [
+                {"type": "hello"},
+                {"type": "done", "answer": "must not run"},
+            ],
+        ]
+    )
+
+    def dying_factory() -> FakeSandbox:
+        fake = factory()
+        fake.commands._handle._hold_open = False  # noqa: SLF001
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=dying_factory)
+    with pytest.raises(RuntimeError, match="exited mid-episode"):
+        _runtime(pool=pool, transport_retries=0).run("t1", "do it", _RecordingEnv())
+
+    assert len(made) == 1
+    assert made[0].kills == 1
     pool.close()
 
 

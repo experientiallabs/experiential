@@ -51,6 +51,7 @@ from wmh.harness.e2b_sandbox import (
     create_sandbox,
     default_sandbox_factory,
     kill_sandbox,
+    resolve_e2b_template,
 )
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.runner_link import RunnerLink, WorkerFn
@@ -1136,10 +1137,10 @@ class E2BSandboxPool:
         sandbox_factory: SandboxFactory | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
     ) -> None:
-        self._template = template
+        self._template = resolve_e2b_template(template)
         self._factory = sandbox_factory or default_sandbox_factory(
             api_key=api_key,
-            template=template,
+            template=self._template if self._template is not None else "",
             metadata=metadata,
         )
         self._hello_timeout = hello_timeout
@@ -1313,7 +1314,7 @@ class E2BSandboxPool:
         """Upload the runner files; on template-less sandboxes also install node 22 + pi's deps."""
         for name in _RUNNER_FILES:
             sandbox.files.write(f"{RUNNER_WORKDIR}/{name}", _read_entry(name))
-        if self._template or os.environ.get(E2B_TEMPLATE_ENV):
+        if self._template:
             return  # the template prebakes node 22 + node_modules; only the runner files refresh
         sandbox.files.write(f"{RUNNER_WORKDIR}/package.json", _PACKAGE_JSON)
         sandbox.commands.run(NODE_INSTALL_CMD, timeout=INSTALL_TIMEOUT_S)
@@ -1386,6 +1387,7 @@ class E2BPiRuntime:
         temperature: float = 0.7,
         skills: SkillLibrary | None = None,
         episode_timeout_s: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+        transport_retries: int = 1,
         should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         if max_turns < 1:
@@ -1396,6 +1398,12 @@ class E2BPiRuntime:
             raise ValueError("temperature must be in [0, 2]")
         if episode_timeout_s <= 0:
             raise ValueError("episode_timeout_s must be positive")
+        if (
+            isinstance(transport_retries, bool)
+            or not isinstance(transport_retries, int)
+            or transport_retries < 0
+        ):
+            raise ValueError("transport_retries must be a nonnegative integer")
         self._provider = provider
         self._files = dict(files)
         self._tools = list(tools)
@@ -1406,6 +1414,7 @@ class E2BPiRuntime:
         self._temperature = temperature
         self._skills = skills if skills is not None else SkillLibrary()
         self._episode_timeout_s = episode_timeout_s
+        self._transport_retries = transport_retries
         self._should_cancel = should_cancel
         self._aborted = threading.Event()
         self._owns_pool = pool is None
@@ -1416,24 +1425,24 @@ class E2BPiRuntime:
     def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
         if self._cancel_requested():
             raise RuntimeCancelled("runtime episode cancelled")
-        try:
-            return self._run_episode(task_id, instruction, environment)
-        except RuntimeCancelled:
-            # RunnerLink owns the episode's authoritative partial worker meter.
-            # Preserve it instead of replacing the cancellation at this wrapper.
-            raise
-        except Exception as exc:
-            if self._cancel_requested():
-                raise RuntimeCancelled("runtime episode cancelled") from exc
-            if not _is_retryable_transport_error(exc):
+        transport_failures = 0
+        while True:
+            try:
+                return self._run_episode(task_id, instruction, environment)
+            except RuntimeCancelled:
+                # RunnerLink owns the episode's authoritative partial worker meter.
+                # Preserve it instead of replacing the cancellation at this wrapper.
                 raise
-            # Transport death (stream drop, sandbox lifetime, dead runner) — the failed
-            # attempt's sandbox was already discarded on release. Retry ONCE on a fresh
-            # sandbox: the environment session may replay the dead attempt's opening steps,
-            # which for the world-model sim beats failing a whole search wave over one
-            # dropped connection. pi-level failures come back as RunResults (episode_error),
-            # never as exceptions, so this retries infrastructure only.
-            return self._run_episode(task_id, instruction, environment)
+            except Exception as exc:
+                if self._cancel_requested():
+                    raise RuntimeCancelled("runtime episode cancelled") from exc
+                if not _is_retryable_transport_error(exc):
+                    raise
+                if transport_failures >= self._transport_retries:
+                    raise
+                # Whole-episode replay is an explicit runtime policy. Same-sequence durable
+                # transport recovery inside a channel is unaffected by this budget.
+                transport_failures += 1
 
     def _run_episode(
         self, task_id: str, instruction: str, environment: AgentEnvironment

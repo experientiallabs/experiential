@@ -19,6 +19,7 @@ from wmh.harness.e2b_sandbox import (
     create_sandbox,
     default_sandbox_factory,
     kill_sandbox,
+    resolve_e2b_template,
 )
 
 
@@ -280,6 +281,30 @@ def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
             "metadata": metadata,
         }
     ]
+
+
+def test_default_factory_snapshots_template_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSandbox()
+    calls: list[dict[str, object]] = []
+
+    class _SandboxSdk:
+        @staticmethod
+        def create(**kwargs: object) -> FakeSandbox:
+            calls.append(kwargs)
+            return fake
+
+    e2b = ModuleType("e2b")
+    e2b.__dict__["Sandbox"] = _SandboxSdk
+    monkeypatch.setitem(sys.modules, "e2b", e2b)
+    monkeypatch.setenv("WMH_E2B_TEMPLATE", "template-at-construction")
+    factory = default_sandbox_factory(api_key="key")
+    monkeypatch.setenv("WMH_E2B_TEMPLATE", "template-after-construction")
+
+    assert factory() is fake
+    assert calls[0]["template"] == "template-at-construction"
+    assert resolve_e2b_template("") is None
 
 
 def test_fake_sandbox_satisfies_the_sandbox_handle_protocol() -> None:
