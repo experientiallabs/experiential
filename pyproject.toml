@@ -3,7 +3,7 @@ name = "world-model-harness"
 version = "0.1.0"
 description = "Docker as an LLM: a frontier model acts as your agent's environment, reconstructed from OTel traces."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "typer>=0.12",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
@@ -32,6 +32,9 @@ dependencies = [
     # llm-waterfall to PyPI before any wmh release, like environment-capture.
     "llm-waterfall",
     "python-multipart>=0.0.9",  # FastAPI UploadFile for the build-your-own traces upload
+    # Harbor owns real task environments and verifier lifecycles for ground-truth evaluation.
+    # Pin the supported API exactly; its public models are part of WMH's evaluator adapter.
+    "harbor==0.20.0",
 ]
 
 [project.optional-dependencies]
@@ -39,11 +42,9 @@ otel = ["opentelemetry-proto>=1.24"]
 # Plotting/figures for research runs (wmh research plot-concurrency); kept out of the core install.
 # pandas backs the concurrency-scaling plot's tidy DataFrame.
 viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
-# The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
-# pooled E2B microVMs while the environment stays the world model. Only those runs need it —
-# local runs stay sandbox-free — so it is an optional extra imported lazily
-# (wmh.harness.e2b_sandbox / wmh.harness.pi_e2b).
-e2b = ["e2b>=2.0"]
+# E2B execution is opt-in and independently selectable for the pi-node harness process and Harbor
+# task environments. Local execution remains the default and imports neither E2B integration.
+e2b = ["e2b>=2.25.0", "harbor[e2b]==0.20.0"]
 # Context connectors (`wmh.connect`): the MCP client SDK backs the Notion connector's
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
 # lazily (wmh.connect.notion), same contract as the e2b extra above.
