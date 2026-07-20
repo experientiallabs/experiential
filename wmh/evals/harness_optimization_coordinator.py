@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, Protocol, Self, TypeVar
+from typing import Annotated, Literal, Protocol, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -26,6 +26,11 @@ from pydantic import (
     model_validator,
 )
 
+from wmh.agents.project import (
+    PROJECT_WORKSPACE,
+    AgentProject,
+    AgentProjectExecutionCommitment,
+)
 from wmh.core.file_lease import exclusive_posix_file_lease
 from wmh.core.text import validate_durable_text
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
@@ -80,18 +85,57 @@ from wmh.evals.study_lifecycle import (
 from wmh.harness.cost import SearchComponentRole, SearchCostRuntime
 from wmh.harness.create import SearchCheckpoint, SearchProposalBatchWitness
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.proposer import DeltaProposer, ProviderDeltaProposer
+from wmh.harness.proposer import DeltaProposer, ProjectDeltaProposer, ProviderDeltaProposer
 from wmh.harness.scoring import HarnessScorer
 from wmh.providers import Provider, get_provider
-from wmh.providers.base import ProviderConfig
+from wmh.providers.base import ProviderConfig, ToolCallingProvider
 from wmh.tracking.budget import BudgetLedgerAuthority
-from wmh.tracking.rate_limit import ExternalDispatchRateAuthority
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+    bind_external_dispatch_rate_authority,
+)
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _STATE_FILE = "study-state.json"
 _STATE_LOCK_FILE = "study-state.lock"
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
+
+
+class DirectDiscoveryProposerRuntime(BaseModel):
+    """Use one provider completion directly for each proposal batch."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["direct"] = "direct"
+
+
+class ProjectDiscoveryProposerRuntime(BaseModel):
+    """Run a tool-using proposer agent inside one durable project sandbox."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["project"] = "project"
+    agent: HarnessDoc
+    workspace: str = PROJECT_WORKSPACE
+    execution: AgentProjectExecutionCommitment
+    lease_ledger_dir: Path
+    preserve_runtime_kind: bool = False
+
+    @model_validator(mode="after")
+    def _validate_host_coordinates(self) -> Self:
+        if self.workspace != PROJECT_WORKSPACE:
+            raise ValueError("project proposer workspace differs from the supported project root")
+        if not self.lease_ledger_dir.is_absolute():
+            raise ValueError("project proposer lease ledger directory must be absolute")
+        return self
+
+
+DiscoveryProposerRuntime = Annotated[
+    DirectDiscoveryProposerRuntime | ProjectDiscoveryProposerRuntime,
+    Field(discriminator="kind"),
+]
 
 
 class HarnessOptimizationStudySpec(BaseModel):
@@ -104,6 +148,9 @@ class HarnessOptimizationStudySpec(BaseModel):
     partition_control_dir: Path
     discovery_job_spec: HarborJobSpec
     confirmation_runtime: HarborExecutionRuntime
+    discovery_proposer: DiscoveryProposerRuntime = Field(
+        default_factory=DirectDiscoveryProposerRuntime
+    )
     discovery_create_rate_ledger_path: Path | None = None
     qualification_report_digest: str = Field(pattern=_DIGEST_PATTERN)
     confirmation_operation_id: str = Field(min_length=1, max_length=256)
@@ -157,18 +204,50 @@ class HarnessOptimizationStudySpec(BaseModel):
             task.dataset_id for task in self.prepared.qualification_roster.tasks
         }:
             raise ValueError("confirmation runtime datasets differ from the qualified roster")
-        if plan.create_rate_policy is None:
+        project_proposer = isinstance(self.discovery_proposer, ProjectDiscoveryProposerRuntime)
+        discovery_uses_e2b = plan.create_rate_policy is not None or project_proposer
+        if not discovery_uses_e2b:
             if self.discovery_create_rate_ledger_path is not None:
-                raise ValueError("local execution cannot carry a create-rate ledger")
-            if self.confirmation_runtime.create_rate_ledger_path is not None:
-                raise ValueError("local confirmation cannot carry a create-rate ledger")
+                raise ValueError("discovery without E2B cannot carry a create-rate ledger")
+            if self.prepared.search_cost_binding.external_dispatch_rate_binding is not None:
+                raise ValueError("discovery without E2B cannot bind a create-rate authority")
         else:
             if self.discovery_create_rate_ledger_path is None:
                 raise ValueError("E2B discovery requires a create-rate ledger")
             if not self.discovery_create_rate_ledger_path.is_absolute():
                 raise ValueError("discovery create-rate ledger must be absolute")
+            expected_rate = self.prepared.search_cost_binding.external_dispatch_rate_binding
+            if expected_rate is None:
+                raise ValueError("E2B discovery requires a frozen create-rate binding")
+            if expected_rate.policy_digest != E2B_SANDBOX_CREATE_RATE_POLICY.digest:
+                raise ValueError("discovery create-rate binding differs from the E2B policy")
+            if project_proposer and self.discovery_proposer.execution.create_rate_binding != (
+                expected_rate
+            ):
+                raise ValueError(
+                    "project proposer create-rate binding differs from the search cost binding"
+                )
+        if plan.create_rate_policy is None:
+            if self.confirmation_runtime.create_rate_ledger_path is not None:
+                raise ValueError("local confirmation cannot carry a create-rate ledger")
+        else:
             if self.confirmation_runtime.create_rate_ledger_path is None:
                 raise ValueError("E2B confirmation requires a create-rate ledger")
+        proposer_resources = self.prepared.search_cost_binding.proposer.timed_resources
+        if project_proposer:
+            if len(proposer_resources) != 1:
+                raise ValueError("project proposer requires one timed project resource")
+            resource = proposer_resources[0]
+            execution_resource = self.discovery_proposer.execution.resource_class
+            if (
+                resource.resource_type != execution_resource.role.value
+                or resource.resource_class_digest != execution_resource.digest
+            ):
+                raise ValueError(
+                    "project proposer execution differs from its timed resource binding"
+                )
+        elif proposer_resources:
+            raise ValueError("direct proposer cannot bind a timed project resource")
         return self
 
     @property
@@ -438,9 +517,15 @@ class LocalStudyEvidenceStore:
             evidence={"sequence": commitment.sequence, "phase": commitment.phase.value},
         )
         entry = _LocalCommitmentEntry(commitment=commitment, receipt=receipt)
-        _atomic_publish_private_json(path, entry.model_dump(mode="json"))
+        won_publication = _atomic_publish_private_json(path, entry.model_dump(mode="json"))
         persisted = self._read_commitment(path)
+        if persisted is None:
+            raise RuntimeError("local study publication did not persist evidence")
+        if not won_publication and persisted.commitment == commitment:
+            return persisted.receipt
         if persisted != entry:
+            if persisted.commitment != commitment:
+                raise ValueError("local study publication sequence is already occupied")
             raise RuntimeError("local study publication did not persist exact evidence")
         return receipt
 
@@ -496,9 +581,15 @@ class LocalStudyEvidenceStore:
             evidence={"kind": kind},
         )
         entry = _LocalArtifactEntry(kind=kind, content=content, publication=publication)
-        _atomic_publish_private_json(path, entry.model_dump(mode="json"))
+        won_publication = _atomic_publish_private_json(path, entry.model_dump(mode="json"))
         persisted = self._read_artifact(path)
+        if persisted is None:
+            raise RuntimeError("local study artifact did not persist evidence")
+        if not won_publication and persisted.kind == kind and persisted.content == content:
+            return persisted.publication
         if persisted != entry:
+            if persisted.kind != kind or persisted.content != content:
+                raise ValueError("artifact digest is already published with different content")
             raise RuntimeError("local study artifact did not persist exact evidence")
         return publication
 
@@ -543,10 +634,12 @@ class LocalStudyEvidenceStore:
 
     @staticmethod
     def _read_commitment(path: Path) -> _LocalCommitmentEntry | None:
+        _recover_atomic_publication_aliases(path)
         return _read_optional_canonical_model(path, _LocalCommitmentEntry)
 
     @staticmethod
     def _read_artifact(path: Path) -> _LocalArtifactEntry | None:
+        _recover_atomic_publication_aliases(path)
         return _read_optional_canonical_model(path, _LocalArtifactEntry)
 
 
@@ -593,8 +686,29 @@ class HarnessOptimizationRuntimeFactory(Protocol):
     ) -> PairedHarborSliceRunner: ...
 
 
+def _close_discovery_resources(
+    project: AgentProject | None,
+    scorer: HarborHarnessScorer,
+) -> None:
+    """Close every owned discovery resource even when an earlier cleanup fails."""
+    failures: list[BaseException] = []
+    if project is not None:
+        try:
+            project.close()
+        except BaseException as error:  # noqa: BLE001 - all cleanup must still be attempted
+            failures.append(error)
+    try:
+        scorer.close()
+    except BaseException as error:  # noqa: BLE001 - preserve every cleanup failure
+        failures.append(error)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("discovery resource cleanup failed", failures)
+
+
 class ProductionHarnessOptimizationRuntimeFactory:
-    """Construct direct-provider discovery and frozen Harbor confirmation runtimes."""
+    """Construct frozen direct or project-backed discovery and Harbor confirmation runtimes."""
 
     def __init__(
         self,
@@ -615,23 +729,28 @@ class ProductionHarnessOptimizationRuntimeFactory:
             raise ValueError("production direct discovery requires one provider per component")
         authority = _budget_authority(prepared)
         cost_runtime = SearchCostRuntime(authority=authority, binding=binding)
+        create_rate_authority: ExternalDispatchRateAuthority | None = None
+        if spec.discovery_create_rate_ledger_path is not None:
+            create_rate_authority = ExternalDispatchRateAuthority.bootstrap(
+                spec.discovery_create_rate_ledger_path,
+                E2B_SANDBOX_CREATE_RATE_POLICY,
+            )
+            expected_binding = binding.external_dispatch_rate_binding
+            if (
+                expected_binding is None
+                or bind_external_dispatch_rate_authority(create_rate_authority) != expected_binding
+            ):
+                raise ValueError("discovery create-rate authority differs from its cost binding")
         scorer_provider = scorer_binding.providers[0]
         qualifications = {task.task_id: task for task in prepared.qualification_roster.tasks}
         discovery_tasks = tuple(
             qualifications[task.task_id] for task in prepared.protocol.discovery.tasks
         )
-        create_rate_authority: ExternalDispatchRateAuthority | None = None
-        if prepared.protocol.execution_plan.create_rate_policy is not None:
-            rate_path = spec.discovery_create_rate_ledger_path
-            if rate_path is None:
-                raise ValueError("E2B discovery requires a create-rate ledger")
-            create_rate_authority = ExternalDispatchRateAuthority.bootstrap(
-                rate_path,
-                prepared.protocol.execution_plan.create_rate_policy,
-            )
-            expected_binding = binding.external_dispatch_rate_binding
-            if expected_binding is None or create_rate_authority.binding != expected_binding:
-                raise ValueError("discovery create-rate authority differs from its cost binding")
+        scorer_create_rate_authority = (
+            create_rate_authority
+            if prepared.protocol.execution_plan.create_rate_policy is not None
+            else None
+        )
         scorer = HarborHarnessScorer(
             job_spec=spec.discovery_job_spec,
             provider_config=scorer_provider.provider_config,
@@ -642,18 +761,79 @@ class ProductionHarnessOptimizationRuntimeFactory:
             runner_spec=prepared.protocol.execution_plan.runner_spec,
             turn_timeout_s=prepared.protocol.execution_plan.turn_timeout_s,
             cost_runtime=cost_runtime.for_component(SearchComponentRole.SCORER),
-            create_rate_authority=create_rate_authority,
+            create_rate_authority=scorer_create_rate_authority,
         )
         proposer_provider = proposer_binding.providers[0]
-        proposer = ProviderDeltaProposer(
-            self._provider_factory(proposer_provider.provider_config),
-            cost_runtime=cost_runtime.for_component(SearchComponentRole.PROPOSER),
-            response_identity=proposer_provider.response_identity,
-        )
+        project: AgentProject | None = None
+        try:
+            raw_proposer = self._provider_factory(proposer_provider.provider_config)
+            if isinstance(spec.discovery_proposer, DirectDiscoveryProposerRuntime):
+                proposer: DeltaProposer = ProviderDeltaProposer(
+                    raw_proposer,
+                    cost_runtime=cost_runtime.for_component(SearchComponentRole.PROPOSER),
+                    response_identity=proposer_provider.response_identity,
+                )
+            else:
+                if create_rate_authority is None:
+                    raise ValueError("project proposer requires a create-rate authority")
+                if not isinstance(raw_proposer, ToolCallingProvider):
+                    raise TypeError("project proposer requires a tool-calling provider")
+                project_spec = spec.discovery_proposer
+                execution = AgentProject.execution_commitment_for(
+                    timeout=project_spec.execution.resource_class.provider_ttl_seconds,
+                    template=project_spec.execution.template,
+                    cpu_count=project_spec.execution.resource_class.cpu_count,
+                    memory_mb=project_spec.execution.resource_class.memory_mb,
+                    create_rate_authority=create_rate_authority,
+                )
+                if execution != project_spec.execution:
+                    raise ValueError("project proposer runtime differs from its frozen execution")
+                configuration_id = ProjectDeltaProposer.configuration_id_for(
+                    project_type=AgentProject,
+                    project_workspace=project_spec.workspace,
+                    project_execution_configuration_id=execution.digest,
+                    agent=project_spec.agent,
+                    provider=raw_proposer,
+                    preserve_runtime_kind=project_spec.preserve_runtime_kind,
+                    project_create_rate_binding=execution.create_rate_binding,
+                    response_identity=proposer_provider.response_identity,
+                )
+                if configuration_id != proposer_binding.configuration_id:
+                    raise ValueError(
+                        "project proposer configuration differs from its search cost binding"
+                    )
+                component_runtime = cost_runtime.for_component(SearchComponentRole.PROPOSER)
+                project = AgentProject.create(
+                    timeout=execution.resource_class.provider_ttl_seconds,
+                    template=execution.template,
+                    cpu_count=execution.resource_class.cpu_count,
+                    memory_mb=execution.resource_class.memory_mb,
+                    cost_runtime=component_runtime,
+                    component_configuration_id=configuration_id,
+                    lease_ledger_dir=project_spec.lease_ledger_dir,
+                    create_rate_authority=create_rate_authority,
+                )
+                proposer = ProjectDeltaProposer(
+                    project,
+                    project_spec.agent,
+                    raw_proposer,
+                    preserve_runtime_kind=project_spec.preserve_runtime_kind,
+                    cost_runtime=component_runtime,
+                    response_identity=proposer_provider.response_identity,
+                )
+        except BaseException as construction_error:
+            try:
+                _close_discovery_resources(project, scorer)
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve both failures
+                raise BaseExceptionGroup(
+                    "discovery construction and cleanup failed",
+                    [construction_error, cleanup_error],
+                ) from None
+            raise
         return HarnessOptimizationDiscoveryRuntime(
             scorer=scorer,
             proposer=proposer,
-            close=scorer.close,
+            close=lambda: _close_discovery_resources(project, scorer),
         )
 
     def build_confirmation(
@@ -1677,12 +1857,15 @@ def _atomic_write_private_json(path: Path, value: JsonValue) -> None:
                 pass
 
 
-def _atomic_publish_private_json(path: Path, value: JsonValue) -> None:
+def _atomic_publish_private_json(path: Path, value: JsonValue) -> bool:
+    """Publish one complete file without replacement and report whether this call won."""
+    _recover_atomic_publication_aliases(path)
     if path.exists():
-        return
+        return False
     payload = _canonical_json_bytes(value)
+    temporary: Path | None = path.parent / f".publish-{path.name}-{uuid.uuid4().hex}"
     descriptor = os.open(
-        path,
+        temporary,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
         _PRIVATE_FILE_MODE,
     )
@@ -1693,15 +1876,58 @@ def _atomic_publish_private_json(path: Path, value: JsonValue) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        won_publication = True
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            won_publication = False
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        temporary = None
         directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)
         _require_private_regular_file(path)
+        return won_publication
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _recover_atomic_publication_aliases(path: Path) -> None:
+    """Remove a staging hard link left by a crash after immutable publication."""
+    try:
+        published = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(published.st_mode) or stat.S_ISLNK(published.st_mode):
+        raise ValueError(f"study evidence file must be a regular file: {path}")
+    prefix = f".publish-{path.name}-"
+    changed = False
+    for candidate in path.parent.glob(prefix + "*"):
+        try:
+            staged = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        if (staged.st_dev, staged.st_ino) != (published.st_dev, published.st_ino):
+            continue
+        candidate.unlink()
+        changed = True
+    if changed:
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)

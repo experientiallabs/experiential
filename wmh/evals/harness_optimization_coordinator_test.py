@@ -2,32 +2,43 @@
 
 from __future__ import annotations
 
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from harbor.models.job.config import DatasetConfig
+from llm_waterfall import ChatRequest, ChatResponse
 from typer.testing import CliRunner
 
-from wmh.agents import default_agent
+from wmh.agents import AgentProject, default_agent, meta_agent
+from wmh.agents import project as project_module
 from wmh.cli.app import app
+from wmh.evals import harness_optimization_coordinator as coordinator_module
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.paired_runner import (
     HarborExecutionPlan,
     HarborExecutionRuntime,
+    PairedHarborBudgetRuntime,
     PairedHarborCompletedBlock,
     PairedHarborProtocol,
     PairedHarborSliceIntent,
+    PairedHarborSlicePolicy,
     PairedHarborSliceProgress,
     PairedHarborSliceResult,
     _select_paired_harbor_slice_blocks,
     paired_harbor_pair_generation_id,
 )
 from wmh.evals.harness_optimization import (
+    DiscoverySearchPlan,
+    HarnessOptimizationProtocol,
     OpenedHarnessOptimizationConfirmation,
     freeze_harness_optimization_candidate,
     freeze_harness_optimization_harbor_protocol,
     open_harness_optimization_confirmation,
+    prepare_harness_optimization_study,
     run_harness_optimization_search,
     run_harness_optimization_search_slice,
 )
@@ -40,6 +51,8 @@ from wmh.evals.harness_optimization_coordinator import (
     LocalHarnessOptimizationStateStore,
     LocalStudyEvidenceStore,
     PairedHarborSliceRunner,
+    ProductionHarnessOptimizationRuntimeFactory,
+    ProjectDiscoveryProposerRuntime,
     confirmation_initial_run_state_digest,
     reconcile_harness_optimization_confirmation_slice,
     run_harness_optimization_confirmation_slice,
@@ -60,13 +73,94 @@ from wmh.evals.study_lifecycle import (
     ConfirmationFrozenPayload,
     ConfirmationOpenedPayload,
     ConfirmationRunningPayload,
+    StudyArtifactPublication,
     StudyBudgetReport,
     StudyLifecycleController,
 )
+from wmh.harness.cost import (
+    ProviderCostBinding,
+    SearchComponentCostBinding,
+    SearchComponentCostRuntime,
+    SearchComponentRole,
+    SearchCostBinding,
+    TimedResourceCostBinding,
+)
 from wmh.harness.create import SearchCheckpoint, SearchProposalBatchWitness
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.proposer import ProjectDeltaProposer
+from wmh.providers.base import (
+    Completion,
+    Message,
+    ProviderConfig,
+    ToolCallingProvider,
+    VerifyResult,
+)
+from wmh.tracking.budget import (
+    BudgetPolicy,
+    TimedResourceCostMeter,
+    bind_budget_account,
+    bind_timed_resource_account,
+    bootstrap_budget_ledger,
+)
+from wmh.tracking.rate_limit import (
+    E2B_SANDBOX_CREATE_RATE_POLICY,
+    ExternalDispatchRateAuthority,
+    bind_external_dispatch_rate_authority,
+)
 
 runner = CliRunner()
+
+
+class _NoDispatchToolProvider:
+    """Tool provider identity used to prove project construction stays pre-dispatch."""
+
+    paid_request_attempts = 1
+
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+        self.calls = 0
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        del system, messages, temperature, max_tokens
+        self.calls += 1
+        raise AssertionError("project runtime construction cannot call the provider")
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        del request
+        self.calls += 1
+        raise AssertionError("project runtime construction cannot call the provider")
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        del texts
+        self.calls += 1
+        raise AssertionError("project runtime construction cannot call the provider")
+
+    def verify(self) -> VerifyResult:
+        self.calls += 1
+        raise AssertionError("project runtime construction cannot verify the provider")
+
+
+class _NoDispatchHarborScorer:
+    """Cost-bound scorer double that never opens Harbor or provider resources."""
+
+    def __init__(self, **kwargs: object) -> None:
+        runtime = kwargs.get("cost_runtime")
+        if not isinstance(runtime, SearchComponentCostRuntime):
+            raise AssertionError("production factory omitted the scorer cost runtime")
+        self.configuration_id = runtime.binding.configuration_id
+        self.search_cost_binding = runtime.binding
+        self.create_rate_binding = None
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _UnusedRuntimeFactory:
@@ -116,6 +210,180 @@ def _spec(tmp_path: Path) -> HarnessOptimizationStudySpec:
         qualification_report_digest=_digest("qualified-roster-report"),
         confirmation_operation_id="confirmation-run",
     )
+
+
+def _project_spec(
+    tmp_path: Path,
+) -> tuple[HarnessOptimizationStudySpec, _NoDispatchToolProvider]:
+    """Re-freeze the synthetic study around one real deferred AgentProject contract."""
+    base = _spec(tmp_path)
+    prepared = base.prepared
+    rate_path = (tmp_path / "project-create-rate.json").resolve()
+    rate_authority = ExternalDispatchRateAuthority.bootstrap(
+        rate_path,
+        E2B_SANDBOX_CREATE_RATE_POLICY,
+    )
+    execution = AgentProject.execution_commitment_for(
+        timeout=60,
+        template="wmh-project-template:immutable-build",
+        cpu_count=2,
+        memory_mb=2048,
+        create_rate_authority=rate_authority,
+    )
+    proposer_agent = meta_agent("optimizer")
+    old_binding = prepared.search_cost_binding
+    proposer_provider = _NoDispatchToolProvider(old_binding.proposer.providers[0].provider_config)
+    proposer_configuration_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=AgentProject,
+        project_workspace="/home/user/project",
+        project_execution_configuration_id=execution.digest,
+        agent=proposer_agent,
+        provider=proposer_provider,
+        project_create_rate_binding=execution.create_rate_binding,
+        response_identity=old_binding.proposer.providers[0].response_identity,
+    )
+    project_meter_id = "proposer-project"
+    project_meter = TimedResourceCostMeter(
+        resource_type=execution.resource_class.role.value,
+        resource_class_digest=execution.resource_class.digest,
+        nano_usd_per_second=1,
+        max_billing_seconds=execution.resource_class.max_host_observation_seconds,
+    )
+    policy = BudgetPolicy.model_validate(
+        {
+            **old_binding.policy.model_dump(mode="python"),
+            "meters": {**old_binding.policy.meters, project_meter_id: project_meter},
+        }
+    )
+    authority = bootstrap_budget_ledger((tmp_path / "project-budget.sqlite3").resolve(), policy)
+
+    def provider_binding(
+        original: ProviderCostBinding,
+        *,
+        configuration_id: str,
+    ) -> ProviderCostBinding:
+        account = authority.provider_account(
+            scope=original.account.scope,
+            meter_id=original.account.meter_id,
+        )
+        return ProviderCostBinding(
+            component_configuration_id=configuration_id,
+            provider_config=original.provider_config,
+            response_identity=original.response_identity,
+            account=bind_budget_account(account),
+        )
+
+    proposer_scope = old_binding.proposer.providers[0].account.scope
+    project_account = authority.timed_resource_account(
+        scope=proposer_scope,
+        meter_id=project_meter_id,
+    )
+    search_cost_binding = SearchCostBinding(
+        declared_hard_limit_nano_usd=policy.hard_limit_nano_usd,
+        policy=policy,
+        ledger_identity=authority.ledger_identity,
+        phase=old_binding.phase,
+        run_id=old_binding.run_id,
+        external_dispatch_rate_binding=bind_external_dispatch_rate_authority(rate_authority),
+        proposer=SearchComponentCostBinding(
+            role=SearchComponentRole.PROPOSER,
+            configuration_id=proposer_configuration_id,
+            scope_category=old_binding.proposer.scope_category,
+            providers=(
+                provider_binding(
+                    old_binding.proposer.providers[0],
+                    configuration_id=proposer_configuration_id,
+                ),
+            ),
+            timed_resources=(
+                TimedResourceCostBinding(
+                    component_configuration_id=proposer_configuration_id,
+                    resource_type=execution.resource_class.role.value,
+                    resource_class_digest=execution.resource_class.digest,
+                    account=bind_timed_resource_account(project_account),
+                ),
+            ),
+        ),
+        scorer=SearchComponentCostBinding(
+            role=SearchComponentRole.SCORER,
+            configuration_id=old_binding.scorer.configuration_id,
+            scope_category=old_binding.scorer.scope_category,
+            providers=(
+                provider_binding(
+                    old_binding.scorer.providers[0],
+                    configuration_id=old_binding.scorer.configuration_id,
+                ),
+            ),
+        ),
+    )
+    old_budget = prepared.confirmation_budget
+    confirmation_budget = PairedHarborBudgetRuntime(
+        ledger_path=authority.ledger_path,
+        ledger_identity=authority.ledger_identity,
+        policy=policy,
+        phase=old_budget.phase,
+        provider_meter_by_panel_member=old_budget.provider_meter_by_panel_member,
+        task_resource_meter_by_class_digest=old_budget.task_resource_meter_by_class_digest,
+        runner_resource_meter_id=old_budget.runner_resource_meter_id,
+    )
+    old_protocol = prepared.protocol
+    slice_policy = PairedHarborSlicePolicy(
+        max_new_blocks=3,
+        max_waves_per_invocation=1,
+        max_block_runtime_s=900,
+        max_invocation_runtime_s=7_200,
+    )
+    assert slice_policy.digest == old_protocol.confirmation_slice_policy_digest
+    protocol = HarnessOptimizationProtocol.create(
+        experiment_id=old_protocol.experiment_id,
+        protocol_id=old_protocol.protocol_id,
+        provenance=old_protocol.provenance,
+        partition=prepared.partition,
+        baseline=prepared.baseline,
+        search=DiscoverySearchPlan.model_validate(
+            {
+                **old_protocol.search.model_dump(mode="python"),
+                "proposer_configuration_id": proposer_configuration_id,
+            }
+        ),
+        candidate_policy=old_protocol.candidate_policy,
+        confirmation=old_protocol.confirmation,
+        panel_routes=old_protocol.panel_routes,
+        execution_plan=old_protocol.execution_plan,
+        qualification_roster=prepared.qualification_roster,
+        max_concurrent_blocks=old_protocol.max_concurrent_blocks,
+        retry_policy_digest=old_protocol.retry_policy_digest,
+        search_cost_binding=search_cost_binding,
+        confirmation_budget=confirmation_budget,
+        confirmation_slice_policy=slice_policy,
+    )
+    project_prepared = prepare_harness_optimization_study(
+        protocol=protocol,
+        partition=prepared.partition,
+        baseline=prepared.baseline,
+        qualification_roster=prepared.qualification_roster,
+        confirmation_budget=confirmation_budget,
+        search_cost_binding=search_cost_binding,
+        confirmation_slice_policy=slice_policy,
+    )
+    spec = HarnessOptimizationStudySpec(
+        prepared=project_prepared,
+        partition_control_dir=base.partition_control_dir,
+        discovery_job_spec=base.discovery_job_spec,
+        confirmation_runtime=base.confirmation_runtime.model_copy(
+            update={"budget": confirmation_budget},
+            deep=True,
+        ),
+        discovery_proposer=ProjectDiscoveryProposerRuntime(
+            agent=proposer_agent,
+            execution=execution,
+            lease_ledger_dir=(tmp_path / "project-leases").resolve(),
+        ),
+        discovery_create_rate_ledger_path=rate_path,
+        qualification_report_digest=base.qualification_report_digest,
+        confirmation_operation_id=base.confirmation_operation_id,
+    )
+    return spec, proposer_provider
 
 
 def test_advance_publishes_one_phase_at_a_time_without_constructing_runtimes(
@@ -192,6 +460,77 @@ def test_backend_identity_is_frozen_in_the_execution_plan() -> None:
     assert e2b.create_rate_policy is not None
     assert e2b.create_rate_policy_digest == e2b.create_rate_policy.digest
     assert local.create_rate_policy_digest != e2b.create_rate_policy_digest
+
+
+def test_local_harbor_can_build_a_deferred_project_backed_proposer_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, provider = _project_spec(tmp_path)
+    assert spec.prepared.protocol.execution_plan.environment_backend is (
+        HarborEnvironmentBackend.LOCAL
+    )
+    assert isinstance(provider, ToolCallingProvider)
+    monkeypatch.setattr(coordinator_module, "HarborHarnessScorer", _NoDispatchHarborScorer)
+
+    def unexpected_sandbox_factory(**_kwargs: object) -> object:
+        raise AssertionError("project construction cannot create an E2B sandbox")
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", unexpected_sandbox_factory)
+    factory = ProductionHarnessOptimizationRuntimeFactory(
+        provider_factory=lambda config: (
+            provider
+            if config == provider.config
+            else (_ for _ in ()).throw(AssertionError("unexpected provider config"))
+        )
+    )
+
+    runtime = factory.build_discovery(spec)
+
+    assert isinstance(runtime.proposer, ProjectDeltaProposer)
+    assert provider.calls == 0
+    project_runtime = spec.discovery_proposer
+    assert isinstance(project_runtime, ProjectDiscoveryProposerRuntime)
+    assert not project_runtime.lease_ledger_dir.exists()
+    runtime.close()
+    assert provider.calls == 0
+
+
+def test_project_proposer_rate_authority_is_independent_of_local_harbor(
+    tmp_path: Path,
+) -> None:
+    spec, _provider = _project_spec(tmp_path)
+    payload = spec.model_dump(mode="python")
+    payload["discovery_create_rate_ledger_path"] = None
+
+    with pytest.raises(ValueError, match="E2B discovery requires a create-rate ledger"):
+        HarnessOptimizationStudySpec.model_validate(payload)
+
+
+def test_discovery_factory_closes_scorer_when_provider_construction_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, _provider = _project_spec(tmp_path)
+    scorers: list[_NoDispatchHarborScorer] = []
+
+    class RecordingScorer(_NoDispatchHarborScorer):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            scorers.append(self)
+
+    monkeypatch.setattr(coordinator_module, "HarborHarnessScorer", RecordingScorer)
+
+    def fail_provider(_config: ProviderConfig) -> _NoDispatchToolProvider:
+        raise RuntimeError("synthetic provider construction failure")
+
+    factory = ProductionHarnessOptimizationRuntimeFactory(provider_factory=fail_provider)
+
+    with pytest.raises(RuntimeError, match="provider construction failure"):
+        factory.build_discovery(spec)
+
+    assert len(scorers) == 1
+    assert scorers[0].closed is True
 
 
 def test_rehearsal_is_pure_and_never_claims_a_complete_publication(tmp_path: Path) -> None:
@@ -625,6 +964,126 @@ def test_coordinator_recovers_runner_progress_after_crash_before_state_checkpoin
     assert recovered_state.confirmation_journaled_sequence == 0
     assert factory.confirmation.recovery_calls == 1
     assert factory.confirmation.run_calls == 0
+
+
+def test_append_only_evidence_crash_before_link_leaves_no_poisoned_final_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="atomic-publication-study",
+        clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=UTC),
+    )
+    content = {"kind": "protocol", "value": 1}
+    digest = _canonical_digest(content)
+    real_link = os.link
+
+    def crash_before_link(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("synthetic crash before immutable link")
+
+    monkeypatch.setattr(os, "link", crash_before_link)
+    with pytest.raises(OSError, match="before immutable link"):
+        store.publish_artifact(kind="protocol", artifact_digest=digest, content=content)
+
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    assert not final.exists()
+
+    monkeypatch.setattr(os, "link", real_link)
+    publication = store.publish_artifact(
+        kind="protocol",
+        artifact_digest=digest,
+        content=content,
+    )
+
+    assert publication.artifact_digest == digest
+    store.verify_artifact(publication)
+
+
+def test_append_only_evidence_recovers_post_link_crash_alias(tmp_path: Path) -> None:
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="post-link-crash-study",
+        clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=UTC),
+    )
+    content = {"kind": "protocol", "value": 2}
+    digest = _canonical_digest(content)
+    publication = store.publish_artifact(
+        kind="protocol",
+        artifact_digest=digest,
+        content=content,
+    )
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    alias = final.parent / f".publish-{final.name}-interrupted"
+    os.link(final, alias)
+
+    assert os.lstat(final).st_nlink == 2
+    store.verify_artifact(publication)
+
+    assert not alias.exists()
+    assert os.lstat(final).st_nlink == 1
+
+
+def test_concurrent_identical_artifact_publication_returns_one_persisted_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock_lock = threading.Lock()
+    clock_tick = 0
+
+    def clock() -> datetime:
+        nonlocal clock_tick
+        with clock_lock:
+            clock_tick += 1
+            return datetime(2026, 7, 19, 12, 0, 0, clock_tick, tzinfo=UTC)
+
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="concurrent-publication-study",
+        clock=clock,
+    )
+    content = {"kind": "protocol", "value": 3}
+    digest = _canonical_digest(content)
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    barrier = threading.Barrier(2)
+    real_link = os.link
+
+    def racing_link(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if Path(os.fsdecode(destination)) == final:
+            barrier.wait(timeout=5)
+        real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(os, "link", racing_link)
+
+    def publish() -> StudyArtifactPublication:
+        return store.publish_artifact(
+            kind="protocol",
+            artifact_digest=digest,
+            content=content,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(publish)
+        second_future = executor.submit(publish)
+        first = first_future.result(timeout=10)
+        second = second_future.result(timeout=10)
+
+    assert first == second
+    store.verify_artifact(first)
 
 
 def test_coordinator_reconciles_terminal_discovery_checkpoint_before_freeze(
