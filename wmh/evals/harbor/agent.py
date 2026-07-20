@@ -23,8 +23,12 @@ from wmh.harness.runtime import RunResult
 from wmh.providers.base import ProviderConfig
 from wmh.providers.registry import get_provider
 
-WMH_HARBOR_AGENT_VERSION = "1"
+WMH_HARBOR_AGENT_VERSION = "2"
 WMH_HARBOR_AGENT_IMPORT_PATH = "wmh.evals.harbor.agent:WmhHarborAgent"
+# Keep every task command finite and leave cleanup headroom beneath the local Pi process cap. The
+# local shim also joins active request handlers, so a late-starting command cannot outlive runtime
+# return; E2B Pi already blocks synchronously on the same bridge.
+MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC = 240
 _TRACE_FILENAME = "wmh-run.json"
 _TaskResultT = TypeVar("_TaskResultT")
 _WRITE_COMMAND = (
@@ -40,9 +44,12 @@ class HarborAgentEnvironment:
         self,
         event_loop: asyncio.AbstractEventLoop,
         environment: BaseEnvironment,
+        *,
+        command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
     ) -> None:
         self._event_loop = event_loop
         self._environment = environment
+        self._command_timeout_sec = _validate_command_timeout_sec(command_timeout_sec)
 
     def execute(self, action: Action) -> Observation:
         """Execute one supported WMH tool in Harbor's owned task environment."""
@@ -87,7 +94,11 @@ class HarborAgentEnvironment:
 
     def _exec(self, command: str, *, env: dict[str, str] | None = None) -> ExecResult:
         future = asyncio.run_coroutine_threadsafe(
-            self._environment.exec(command, env=env),
+            self._environment.exec(
+                command,
+                env=env,
+                timeout_sec=self._command_timeout_sec,
+            ),
             self._event_loop,
         )
         return future.result()
@@ -104,6 +115,7 @@ class WmhHarborAgent(BaseAgent):
         mcp_servers: list[MCPServerConfig] | None = None,
         skills_dir: str | None = None,
         *,
+        command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         extra_env: dict[str, str] | None = None,
         harness: dict[str, object],
         provider_config: dict[str, object],
@@ -132,6 +144,7 @@ class WmhHarborAgent(BaseAgent):
                 f"Harbor model identity must be {expected_model_name!r}, got {model_name!r}"
             )
         self._provider = get_provider(self._provider_config)
+        self._command_timeout_sec = _validate_command_timeout_sec(command_timeout_sec)
         self._harness_backend = harness_backend
         self._e2b_template = e2b_template
         self._pi_transport: Literal["ssh"] | None = "ssh" if harness_backend == "local" else None
@@ -166,7 +179,11 @@ class WmhHarborAgent(BaseAgent):
             transport_retries=0 if self._harness_backend == "e2b" else None,
             should_cancel=cancel_requested.is_set,
         )
-        bridge = HarborAgentEnvironment(asyncio.get_running_loop(), environment)
+        bridge = HarborAgentEnvironment(
+            asyncio.get_running_loop(),
+            environment,
+            command_timeout_sec=self._command_timeout_sec,
+        )
         task_id = str(self.context_id or self.session_id or "harbor-task")
         run_task = asyncio.create_task(asyncio.to_thread(runtime.run, task_id, instruction, bridge))
         try:
@@ -270,3 +287,17 @@ def _command_observation(result: ExecResult) -> Observation:
 
 def _shell_quote(value: str) -> str:
     return shlex.quote(value)
+
+
+def _validate_command_timeout_sec(value: int) -> int:
+    """Validate the evaluator-owned finite task-command policy."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
+    ):
+        raise ValueError(
+            f"command_timeout_sec must be an integer in [1, {MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC}]"
+        )
+    return value

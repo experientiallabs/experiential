@@ -28,6 +28,7 @@ from harbor.models.trial.result import TrialResult
 from pydantic import BaseModel
 
 from wmh.evals.harbor.agent import (
+    MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
     WMH_HARBOR_AGENT_IMPORT_PATH,
     WMH_HARBOR_AGENT_VERSION,
     WmhHarborAgent,
@@ -54,7 +55,7 @@ from wmh.providers.base import ProviderConfig
 _INDEX_PATH = "raw/index.json"
 _REQUIRED_JOB_FILES = frozenset({"config.json", "lock.json", "result.json", "job.log"})
 _REQUIRED_TRIAL_FILES = frozenset({"config.json", "lock.json", "result.json", "trial.log"})
-_HARBOR_SCORER_VERSION = "1"
+_HARBOR_SCORER_VERSION = "2"
 _CHECKSUM_PATTERN = r"^[0-9a-f]{64}$"
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -100,6 +101,7 @@ class HarborScorer:
         task_set: ResolvedHarborTaskSet,
         provider_config: ProviderConfig,
         reward_key: str,
+        environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         harness_backend: Literal["local", "e2b"] = "local",
         e2b_template: str | None = None,
         runner: HarborRunner | None = None,
@@ -141,6 +143,16 @@ class HarborScorer:
             )
         if not reward_key:
             raise ValueError("reward_key must be nonempty")
+        if (
+            isinstance(environment_command_timeout_sec, bool)
+            or not isinstance(environment_command_timeout_sec, int)
+            or environment_command_timeout_sec < 1
+            or environment_command_timeout_sec > MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
+        ):
+            raise ValueError(
+                "environment_command_timeout_sec must be an integer in "
+                f"[1, {MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC}]"
+            )
         if harness_backend not in ("local", "e2b"):
             raise ValueError("harness_backend must be local or e2b")
         if harness_backend == "local" and e2b_template is not None:
@@ -166,6 +178,7 @@ class HarborScorer:
             provider_config.model_dump(mode="python")
         )
         self._reward_key = reward_key
+        self._environment_command_timeout_sec = environment_command_timeout_sec
         self._harness_backend = harness_backend
         if harness_backend == "local":
             self._local_runner_identity = {
@@ -190,6 +203,7 @@ class HarborScorer:
         task_ids: tuple[str, ...],
         provider_config: ProviderConfig,
         reward_key: str,
+        environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         harness_backend: Literal["local", "e2b"] = "local",
         e2b_template: str | None = None,
         runner: HarborRunner | None = None,
@@ -203,6 +217,7 @@ class HarborScorer:
             task_set=task_set,
             provider_config=provider_config,
             reward_key=reward_key,
+            environment_command_timeout_sec=environment_command_timeout_sec,
             harness_backend=harness_backend,
             e2b_template=e2b_template,
             runner=runner,
@@ -270,6 +285,7 @@ class HarborScorer:
             "harness_backend": self._harness_backend,
             "e2b_template": self._e2b_template,
             "local_runner": self._local_runner_identity,
+            "environment_command_timeout_sec": self._environment_command_timeout_sec,
         }
         return ScoreContext(
             task_set_digest=_digest_json(task_payload),
@@ -355,6 +371,7 @@ class HarborScorer:
                     "provider_config": self._provider_config.model_dump(mode="json"),
                     "harness_backend": self._harness_backend,
                     "e2b_template": self._e2b_template,
+                    "command_timeout_sec": self._environment_command_timeout_sec,
                 },
             },
             deep=True,

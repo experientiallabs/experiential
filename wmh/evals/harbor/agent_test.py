@@ -23,16 +23,17 @@ from wmh.providers.base import ProviderConfig, ProviderKind
 
 class _Environment:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str] | None]] = []
+        self.calls: list[tuple[str, dict[str, str] | None, int | None]] = []
 
     async def exec(
         self,
         command: str,
         *,
         env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
         **_kwargs: object,
     ) -> ExecResult:
-        self.calls.append((command, env))
+        self.calls.append((command, env, timeout_sec))
         if command == "false":
             return ExecResult(stdout="", stderr="failed\n", return_code=7)
         if command.startswith("cat --"):
@@ -80,6 +81,7 @@ def test_harbor_environment_routes_supported_tools_and_preserves_command_failure
         assert environment.calls[1][0] == "cat -- notes.txt"
         assert environment.calls[2][1] is not None
         assert environment.calls[2][1]["WMH_FILE_CONTENT_B64"] == "aGVsbG8="
+        assert {call[2] for call in environment.calls} == {240}
 
     asyncio.run(run())
 
@@ -231,6 +233,86 @@ def test_cancellation_during_close_is_re_raised_after_close_finishes(
     asyncio.run(run())
 
 
+def test_cancellation_during_environment_exec_cannot_release_harbor_to_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exec_started = threading.Event()
+    events: list[str] = []
+
+    class _Runtime:
+        def run(
+            self,
+            task_id: str,
+            _instruction: str,
+            task_environment: HarborAgentEnvironment,
+        ) -> RunResult:
+            observation = task_environment.execute(
+                Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "work"})
+            )
+            assert observation.content == "finished\n"
+            events.append("runtime-finished")
+            return RunResult(
+                task_id=task_id,
+                stop_reason=StopReason.SUBMITTED,
+                answer="done",
+                turns=1,
+            )
+
+        def abort(self) -> None:
+            events.append("aborted")
+
+        def close(self) -> None:
+            assert "exec-finished" in events
+            events.append("closed")
+
+    monkeypatch.setattr("wmh.evals.harbor.agent.get_provider", lambda _config: object())
+    monkeypatch.setattr(HarnessDoc, "runtime", lambda *_args, **_kwargs: _Runtime())
+    agent = WmhHarborAgent(
+        logs_dir=tmp_path,
+        model_name="bedrock/worker-model",
+        harness=HarnessDoc.baseline().model_dump(mode="json"),
+        provider_config=_provider_config().model_dump(mode="json"),
+        command_timeout_sec=17,
+    )
+
+    async def run() -> None:
+        release_exec = asyncio.Event()
+
+        class _BlockingEnvironment(_Environment):
+            async def exec(
+                self,
+                command: str,
+                *,
+                env: dict[str, str] | None = None,
+                timeout_sec: int | None = None,
+                **_kwargs: object,
+            ) -> ExecResult:
+                self.calls.append((command, env, timeout_sec))
+                exec_started.set()
+                await release_exec.wait()
+                events.append("exec-finished")
+                return ExecResult(stdout="finished\n", stderr="", return_code=0)
+
+        environment = _BlockingEnvironment()
+        task = asyncio.create_task(
+            agent.run("solve it", cast("BaseEnvironment", environment), AgentContext())
+        )
+        assert await asyncio.to_thread(exec_started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert task.done() is False
+        assert events == ["aborted"]
+
+        release_exec.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert environment.calls == [("work", None, 17)]
+        assert events == ["aborted", "exec-finished", "runtime-finished", "closed"]
+
+    asyncio.run(run())
+
+
 def test_harbor_environment_rejects_malformed_or_unknown_tool_calls() -> None:
     async def run() -> None:
         environment = _Environment()
@@ -249,6 +331,21 @@ def test_harbor_environment_rejects_malformed_or_unknown_tool_calls() -> None:
         assert malformed.is_error is True
         assert unknown.is_error is True
         assert environment.calls == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid", [True, 0, 241])
+def test_harbor_environment_rejects_command_timeouts_that_cannot_quiesce(
+    invalid: object,
+) -> None:
+    async def run() -> None:
+        with pytest.raises(ValueError, match="command_timeout_sec"):
+            HarborAgentEnvironment(
+                asyncio.get_running_loop(),
+                cast("BaseEnvironment", _Environment()),
+                command_timeout_sec=cast("int", invalid),
+            )
 
     asyncio.run(run())
 

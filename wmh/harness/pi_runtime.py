@@ -140,6 +140,10 @@ _params_schema = params_schema
 class _ShimServer(ThreadingHTTPServer):
     """A threading HTTP server that carries the current episode for its handlers."""
 
+    # Environment calls mutate evaluator-owned state. ``server_close()`` must join an active tool
+    # handler before PiRuntime returns and Harbor can begin verification. The Harbor adapter gives
+    # each task-mutating tool command a finite timeout, bounding that handler's join.
+    daemon_threads = False
     episode: _Episode
 
 

@@ -36,6 +36,7 @@ from harbor.models.verifier.result import VerifierResult
 from harbor.tasks.client import TaskDownloadResult
 
 from wmh.evals.harbor.agent import (
+    MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
     WMH_HARBOR_AGENT_IMPORT_PATH,
     WMH_HARBOR_AGENT_VERSION,
     WmhHarborAgent,
@@ -151,6 +152,7 @@ def _executed_agent(
     *,
     harness_backend: str,
     e2b_template: str | None = None,
+    environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
 ) -> AgentConfig:
     return job_config.agents[0].model_copy(
         update={
@@ -165,6 +167,7 @@ def _executed_agent(
                 "provider_config": provider.model_dump(mode="json"),
                 "harness_backend": harness_backend,
                 "e2b_template": e2b_template,
+                "command_timeout_sec": environment_command_timeout_sec,
             },
         },
         deep=True,
@@ -184,6 +187,7 @@ def _trial(
     job_config: JobConfig | None = None,
     harness_backend: Literal["local", "e2b"] = "local",
     e2b_template: str | None = None,
+    environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
 ) -> TrialResult:
     candidate = candidate or HarnessDoc.baseline()
     provider = provider or _provider()
@@ -210,6 +214,7 @@ def _trial(
             job_config,
             harness_backend=harness_backend,
             e2b_template=e2b_template,
+            environment_command_timeout_sec=environment_command_timeout_sec,
         ),
         environment=job_config.environment,
         verifier=job_config.verifier,
@@ -340,6 +345,7 @@ def _scorer(
     reward_key: str = "reward",
     harness_backend: Literal["local", "e2b"] = "local",
     e2b_template: str | None = None,
+    environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
 ) -> tuple[HarborScorer, _Runner]:
     job_config = job_config or _job_config(tmp_path)
     dataset_path = job_config.datasets[0].path
@@ -352,6 +358,7 @@ def _scorer(
         task_set=task_set,
         provider_config=provider or _provider(),
         reward_key=reward_key,
+        environment_command_timeout_sec=environment_command_timeout_sec,
         harness_backend=harness_backend,
         e2b_template=e2b_template,
         runner=runner,
@@ -404,6 +411,7 @@ def test_scorer_projects_shuffled_opaque_replicates_and_injects_candidate(
     assert config.agents[0].import_path == WMH_HARBOR_AGENT_IMPORT_PATH
     assert config.agents[0].kwargs["harness"] == candidate.model_dump(mode="json")
     assert config.agents[0].kwargs["harness_backend"] == "local"
+    assert config.agents[0].kwargs["command_timeout_sec"] == MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
     assert "secret" not in json.dumps(config.agents[0].kwargs).lower()
 
 
@@ -768,6 +776,11 @@ def test_context_commits_to_tasks_evaluator_backend_model_and_harbor_version(
         e2b_template="runner-template",
     )
     changed_model, _ = _scorer(tmp_path / "model", run, provider=_provider("other-model"))
+    changed_command_timeout, _ = _scorer(
+        tmp_path / "command-timeout",
+        run,
+        environment_command_timeout_sec=17,
+    )
     changed_task_backend, _ = _scorer(
         tmp_path / "task-backend",
         run,
@@ -781,9 +794,80 @@ def test_context_commits_to_tasks_evaluator_backend_model_and_harbor_version(
     assert changed_backend.context().execution_config_digest != original.execution_config_digest
     assert changed_model.context().execution_config_digest != original.execution_config_digest
     assert (
+        changed_command_timeout.context().execution_config_digest
+        != original.execution_config_digest
+    )
+    assert (
         changed_task_backend.context().execution_config_digest != original.execution_config_digest
     )
     assert changed_version.evaluator_digest != original.evaluator_digest
+
+
+def test_environment_command_timeout_is_injected_and_execution_drift_is_rejected(
+    tmp_path: Path,
+) -> None:
+    timeout_sec = 17
+    job_dir = tmp_path / "completed-job"
+    trials = [
+        _trial(
+            job_dir,
+            task_id,
+            1,
+            score=1,
+            environment_command_timeout_sec=timeout_sec,
+        )
+        for task_id in ("task-a", "task-b")
+    ]
+    scorer, runner = _scorer(
+        tmp_path,
+        _run(tmp_path, trials),
+        environment_command_timeout_sec=timeout_sec,
+    )
+
+    score_harness(
+        scorer,
+        HarnessDoc.baseline(),
+        request=scorer.request(attempts=1),
+    )
+
+    assert runner.configs[0].agents[0].kwargs["command_timeout_sec"] == timeout_sec
+
+    drift_path = tmp_path / "drift"
+    drift_job_dir = drift_path / "completed-job"
+    drift_trials = [
+        _trial(
+            drift_job_dir,
+            task_id,
+            1,
+            score=1,
+            environment_command_timeout_sec=timeout_sec - 1,
+        )
+        for task_id in ("task-a", "task-b")
+    ]
+    drift_scorer, _ = _scorer(
+        drift_path,
+        _run(drift_path, drift_trials),
+        environment_command_timeout_sec=timeout_sec,
+    )
+    with pytest.raises(ValueError, match="different agent config|execution config"):
+        score_harness(
+            drift_scorer,
+            HarnessDoc.baseline(),
+            request=drift_scorer.request(attempts=1),
+        )
+
+
+@pytest.mark.parametrize("invalid", [True, 0, 241])
+def test_scorer_rejects_unbounded_environment_command_timeout(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    with pytest.raises(ValueError, match="environment_command_timeout_sec"):
+        _scorer(
+            tmp_path,
+            _run(tmp_path, []),
+            environment_command_timeout_sec=cast("int", invalid),
+        )
 
 
 @pytest.mark.parametrize(
