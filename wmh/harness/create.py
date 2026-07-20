@@ -1292,9 +1292,9 @@ class _ClosedLoopHarnessScorer:
         validate_candidate: Callable[[HarnessDoc], str | None],
         provenance: ScoreProvenance,
     ) -> None:
-        self._tasks = list(tasks)
-        self._by_id = {task.task_id: task for task in tasks}
-        if len(self._by_id) != len(tasks):
+        self._tasks = [task.model_copy(deep=True) for task in tasks]
+        self._by_id = {task.task_id: task for task in self._tasks}
+        if len(self._by_id) != len(self._tasks):
             raise ValueError("closed-loop search task ids must be unique")
         self.default_attempts = default_attempts
         self._evaluate = evaluate
@@ -1472,9 +1472,11 @@ def _closed_loop_score_provenance(
     if harness_backend == "local":
         resolved_concurrency = eval_concurrency if eval_concurrency is not None else 1
         resolved_e2b_template = None
+        resolved_e2b_metadata: dict[str, str] = {}
     else:
         resolved_concurrency = eval_concurrency if eval_concurrency is not None else 0
         resolved_e2b_template = e2b_template or os.environ.get(E2B_TEMPLATE_ENV)
+        resolved_e2b_metadata = dict(sorted((e2b_metadata or {}).items()))
     return ScoreProvenance(
         task_set={"tasks": [task.model_dump(mode="json") for task in tasks]},
         evaluator={
@@ -1493,7 +1495,7 @@ def _closed_loop_score_provenance(
             "kind": harness_backend,
             "concurrency": resolved_concurrency,
             "e2b_template": resolved_e2b_template,
-            "e2b_metadata": dict(sorted((e2b_metadata or {}).items())),
+            "e2b_metadata": resolved_e2b_metadata,
         },
     )
 
@@ -1532,6 +1534,12 @@ def create_harness(
             f"runtime kind is {seed_doc.runtime_kind()!r}, which already runs in-process; "
             "use harness_backend='local'"
         )
+    if harness_backend == "e2b":
+        resolved_e2b_template = e2b_template or os.environ.get(E2B_TEMPLATE_ENV)
+        resolved_e2b_metadata = dict(sorted((e2b_metadata or {}).items()))
+    else:
+        resolved_e2b_template = None
+        resolved_e2b_metadata = {}
 
     discovery_provenance = _closed_loop_score_provenance(
         tasks,
@@ -1540,8 +1548,8 @@ def create_harness(
         judge=judge,
         harness_backend=harness_backend,
         eval_concurrency=eval_concurrency,
-        e2b_template=e2b_template,
-        e2b_metadata=e2b_metadata,
+        e2b_template=resolved_e2b_template,
+        e2b_metadata=resolved_e2b_metadata,
     )
     holdout_provenance = (
         _closed_loop_score_provenance(
@@ -1551,8 +1559,8 @@ def create_harness(
             judge=judge,
             harness_backend=harness_backend,
             eval_concurrency=eval_concurrency,
-            e2b_template=e2b_template,
-            e2b_metadata=e2b_metadata,
+            e2b_template=resolved_e2b_template,
+            e2b_metadata=resolved_e2b_metadata,
         )
         if holdout
         else None
@@ -1562,7 +1570,10 @@ def create_harness(
     if harness_backend == "e2b":
         from wmh.harness.pi_e2b import E2BSandboxPool as _Pool
 
-        sandbox_pool = _Pool(template=e2b_template, metadata=e2b_metadata)
+        sandbox_pool = _Pool(
+            template=resolved_e2b_template,
+            metadata=resolved_e2b_metadata,
+        )
 
     worker_usages: list[TokenUsage | None] = []
     cancelled: HarnessSearchCancelled | None = None

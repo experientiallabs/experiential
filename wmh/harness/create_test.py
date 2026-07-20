@@ -624,7 +624,9 @@ def test_search_harness_rejects_report_identity_mismatch(mismatch: str) -> None:
         )
 
 
-def test_closed_loop_provenance_binds_task_evaluator_and_backend_configuration() -> None:
+def test_closed_loop_provenance_binds_task_evaluator_and_backend_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = RoleProvider()
     world_model = _wm(provider)
     judge = GoldJudge(provider)
@@ -691,6 +693,17 @@ def test_closed_loop_provenance_binds_task_evaluator_and_backend_configuration()
         e2b_template="template-v2",
         e2b_metadata={"run": "comparison"},
     )
+    monkeypatch.setenv(create_module.E2B_TEMPLATE_ENV, "template-from-env")
+    environment_backend = create_module._closed_loop_score_provenance(
+        _tasks(),
+        world_model=world_model,
+        agent_provider=provider,
+        judge=judge,
+        harness_backend="e2b",
+        eval_concurrency=None,
+        e2b_template=None,
+        e2b_metadata=None,
+    )
 
     assert base.task_set == {"tasks": [task.model_dump(mode="json") for task in _tasks()]}
     assert base.backend == {
@@ -708,10 +721,31 @@ def test_closed_loop_provenance_binds_task_evaluator_and_backend_configuration()
                 changed_agent.model_dump_json(),
                 changed_judge.model_dump_json(),
                 changed_backend.model_dump_json(),
+                environment_backend.model_dump_json(),
             }
         )
-        == 6
+        == 7
     )
+    assert environment_backend.backend["e2b_template"] == "template-from-env"
+
+
+def test_closed_loop_scorer_snapshots_caller_owned_task_specs() -> None:
+    tasks = _tasks()
+    scorer = create_module._ClosedLoopHarnessScorer(
+        tasks,
+        default_attempts=1,
+        evaluate=lambda candidate, split, attempts: _canned_report(1.0, k=attempts),
+        validate_candidate=lambda candidate: None,
+        provenance=_NEUTRAL_PROVENANCE,
+    )
+    tasks[0].instruction = "mutated after scorer construction"
+
+    report = scorer.score(
+        HarnessDoc.baseline("seed"),
+        request=ScoreRequest(purpose="seed"),
+    )
+
+    assert report.per_task["t1"].description == "answer it"
 
 
 @pytest.mark.parametrize(
@@ -2158,6 +2192,39 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
         response = channel.sent[1]
         # The WORLD MODEL answered the tool: "ok" is the RoleProvider env-role marker reply.
         assert response.get("content") == "ok" and response.get("is_error") is False
+
+
+def test_e2b_backend_freezes_environment_template_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_pool_cls: type[_FakePool],
+) -> None:
+    provider = RoleProvider()
+    metadata = {"purpose": "evaluation", "run": "frozen"}
+    monkeypatch.setenv(create_module.E2B_TEMPLATE_ENV, "template-from-env")
+    monkeypatch.setattr(
+        create_module,
+        "evaluate_closed_loop",
+        lambda *args, **kwargs: _canned_report(1.0, k=kwargs.get("k", 1)),
+    )
+
+    create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=0,
+        k=1,
+        harness_backend="e2b",
+        e2b_metadata=metadata,
+    )
+
+    [pool] = fake_pool_cls.instances
+    assert pool.template == "template-from-env"
+    assert pool.metadata == {"purpose": "evaluation", "run": "frozen"}
+    assert pool.metadata is not metadata
 
 
 def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
