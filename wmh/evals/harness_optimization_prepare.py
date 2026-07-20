@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Literal, Protocol, Self, TypeVar
 
@@ -1314,35 +1315,47 @@ def _publish_and_reopen(
     model_type: type[_ModelT],
 ) -> _ModelT:
     payload = _canonical_bytes(model.model_dump(mode="json"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging_descriptor, staging_name = tempfile.mkstemp(
+        prefix=f".{path.name}.staging-",
+        dir=path.parent,
+    )
+    staging_path = Path(staging_name)
     try:
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-        )
-    except FileExistsError:
-        existing = _read_regular_nofollow(
-            path,
-            maximum_bytes=max(len(payload), 1),
-            label="sealed canary artifact",
-        )
-        if existing != payload:
-            raise ValueError("sealed canary artifact already exists with different bytes") from None
-    else:
         try:
-            with os.fdopen(descriptor, "wb", closefd=True) as handle:
-                descriptor = -1
+            os.fchmod(staging_descriptor, 0o600)
+            with os.fdopen(staging_descriptor, "wb", closefd=True) as handle:
+                staging_descriptor = -1
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            if staging_descriptor >= 0:
+                os.close(staging_descriptor)
         try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+            os.link(staging_path, path, follow_symlinks=False)
+        except (FileExistsError, FileNotFoundError):
+            if not path.exists():
+                raise
+            existing = _read_regular_nofollow(
+                path,
+                maximum_bytes=max(len(payload), 1),
+                label="sealed canary artifact",
+            )
+            if existing != payload:
+                raise ValueError(
+                    "sealed canary artifact already exists with different bytes"
+                ) from None
+        else:
+            staging_path.unlink()
+            _fsync_directory(path.parent)
+    finally:
+        if staging_descriptor >= 0:
+            os.close(staging_descriptor)
+        try:
+            staging_path.unlink()
+        except FileNotFoundError:
+            pass
     reopened = _read_regular_nofollow(
         path,
         maximum_bytes=max(len(payload), 1),
@@ -1353,7 +1366,33 @@ def _publish_and_reopen(
     parsed = model_type.model_validate_json(reopened)
     if parsed != model:
         raise RuntimeError("sealed canary artifact changed during validation")
+    if _cleanup_publish_staging(path):
+        _fsync_directory(path.parent)
     return parsed
+
+
+def _cleanup_publish_staging(destination: Path) -> bool:
+    """Remove redundant same-directory stages after a complete final is installed."""
+    prefix = f".{destination.name}.staging-"
+    removed = False
+    with os.scandir(destination.parent) as entries:
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                continue
+            removed = True
+    return removed
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _verify_clean_git_checkout(

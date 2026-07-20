@@ -42,6 +42,7 @@ from wmh.evals.harness_optimization_prepare import (
     GitCheckoutProof,
     HarnessOptimizationCanaryManifest,
     PreparedHarnessOptimizationCanary,
+    _publish_and_reopen,
     prepare_e2b_harness_optimization_canary,
 )
 from wmh.evals.study_provenance import HarnessOptimizationCodeProvenance
@@ -397,6 +398,21 @@ def test_exact_live_runner_preflight_receipt_binds_all_spec_fields_and_raw_bytes
         mismatched.validate_runner_spec(runner.spec)
     with pytest.raises(ValueError):
         E2BPiRunnerArtifact.from_json_bytes(b'{"backend":"local"}')
+
+
+def test_atomic_publication_recovers_after_sigkill_before_no_replace_link(
+    tmp_path: Path,
+) -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    destination = tmp_path / "sealed.json"
+    orphaned_staging = tmp_path / ".sealed.json.staging-killed-process"
+    orphaned_staging.write_bytes(b'{"partial":')
+
+    reopened = _publish_and_reopen(destination, runner, E2BPiRunnerArtifact)
+
+    assert reopened == runner
+    assert destination.is_file()
+    assert not orphaned_staging.exists()
 
 
 def test_authoritative_split_commitment_rejects_non_discovery_task_before_qualification(
