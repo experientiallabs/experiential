@@ -179,13 +179,36 @@ class ProviderDeltaProposer:
             provider_config,
             response_identity,
         )
+        return cls.configuration_id_for_contract(
+            provider_config=provider_config,
+            provider_implementation=_provider_implementation(cast("ToolCallingProvider", provider)),
+            response_identity=frozen_response_identity,
+        )
+
+    @classmethod
+    def configuration_id_for_contract(
+        cls,
+        *,
+        provider_config: ProviderConfig,
+        provider_implementation: str,
+        response_identity: ProviderResponseIdentity | None = None,
+    ) -> str:
+        """Compute direct proposer identity from a nonsecret, client-free contract."""
+        if (
+            provider_implementation != provider_implementation.strip()
+            or not provider_implementation
+        ):
+            raise ValueError("provider implementation identity must be canonical")
+        frozen_config = ProviderConfig.model_validate(provider_config.model_dump())
+        frozen_response_identity = freeze_provider_response_identity(
+            frozen_config,
+            response_identity,
+        )
         payload = {
             "schema_version": 2,
             "implementation": f"{cls.__module__}.{cls.__qualname__}",
-            "provider_implementation": _provider_implementation(
-                cast("ToolCallingProvider", provider)
-            ),
-            "provider_config": provider_config.model_dump(mode="json"),
+            "provider_implementation": provider_implementation,
+            "provider_config": frozen_config.model_dump(mode="json"),
             "response_identity": frozen_response_identity.model_dump(mode="json"),
         }
         return _content_digest(_canonical_json(payload))

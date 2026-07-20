@@ -17,7 +17,12 @@ from wmh.providers.base import (
     VerifyResult,
 )
 from wmh.providers.models import ProviderModel, model_types_for_provider, resolve_provider_model
-from wmh.providers.registry import get_provider, verify_all, verify_embedder
+from wmh.providers.registry import (
+    get_provider,
+    provider_implementation_for,
+    verify_all,
+    verify_embedder,
+)
 from wmh.providers.waterfall import WaterfallProvider, provider_or_chain
 
 __all__ = [
@@ -31,6 +36,7 @@ __all__ = [
     "Message",
     "VerifyResult",
     "get_provider",
+    "provider_implementation_for",
     "provider_or_chain",
     "WaterfallProvider",
     "verify_all",

@@ -31,6 +31,15 @@ def get_provider(config: ProviderConfig) -> Provider:
     return backend(config)
 
 
+def provider_implementation_for(config: ProviderConfig) -> str:
+    """Return the exact provider class identity without constructing a client."""
+    try:
+        backend = _BACKENDS[config.kind]
+    except KeyError:  # pragma: no cover - exhaustive over the enum
+        raise ValueError(f"unknown provider kind: {config.kind}") from None
+    return f"{backend.__module__}.{backend.__qualname__}"
+
+
 def verify_all(configs: list[ProviderConfig]) -> list[VerifyResult]:
     """Ping every configured provider; never raises (failures come back as ok=False)."""
     results: list[VerifyResult] = []

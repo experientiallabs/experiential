@@ -46,6 +46,7 @@ from wmh.harness.scoring import (
     TaskScore,
     canonical_score_json,
 )
+from wmh.providers import get_provider, provider_implementation_for
 from wmh.providers.base import (
     Completion,
     Message,
@@ -90,6 +91,22 @@ from wmh.tracking.rate_limit import (
 
 def _trigger() -> FailureSignature:
     return FailureSignature(mechanism="verification", task_ids=["t1"])
+
+
+def test_direct_proposer_contract_identity_matches_constructed_provider() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        region="us-east-1",
+    )
+
+    expected = ProviderDeltaProposer.configuration_id_for(get_provider(config))
+    observed = ProviderDeltaProposer.configuration_id_for_contract(
+        provider_config=config,
+        provider_implementation=provider_implementation_for(config),
+    )
+
+    assert observed == expected
 
 
 def _payload(parent: HarnessDoc, content: str) -> str:
