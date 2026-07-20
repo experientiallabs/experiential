@@ -54,6 +54,7 @@ from wmh.harness.pi_runner_backend import (
     runner_owner_id,
 )
 from wmh.providers.base import ProviderConfig
+from wmh.providers.failure_attribution import ProviderFailureReason, ProviderFailureStage
 
 _TASK_TIMEOUT_EXCEPTIONS = frozenset({"AgentTimeoutError"})
 _CANCELLED_EXCEPTIONS = frozenset({"CancelledError", "RuntimeCancelled"})
@@ -143,6 +144,8 @@ _CANDIDATE_OUTCOME_METADATA_KEYS = frozenset(
 _TASK_ENVIRONMENT_DIGEST_KEY = "task_environment_digest"
 _TASK_ENVIRONMENT_ATTESTATION_KEY = "task_environment_attestation"
 _MODEL_CALLS_KEY = "model_calls"
+_PROVIDER_FAILURE_STAGE_KEY = "provider_failure_stage"
+_PROVIDER_FAILURE_REASON_KEY = "provider_failure_reason"
 _MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES = 64 * 1024
 _RUNNER_CONFIG_DIGEST_KEY = "runner_config_digest"
 _RUNNER_ENVIRONMENT_DIGEST_KEY = "runner_environment_digest"
@@ -167,6 +170,8 @@ class _TrustedRunEvidence:
     runner_environment_attestation: JsonObject | None
     runner_lease_receipts: tuple[JsonObject, ...]
     model_calls: int | None
+    provider_failure_stage: ProviderFailureStage | None
+    provider_failure_reason: ProviderFailureReason | None
 
 
 @dataclass(frozen=True)
@@ -572,6 +577,7 @@ def _validate_run_identity(
     environment_evidence: list[_ParsedTaskEnvironmentEvidence] = []
     runner_evidence: list[_ParsedRunnerEvidence] = []
     model_calls: list[int | None] = []
+    provider_failures: list[tuple[ProviderFailureStage | None, ProviderFailureReason | None]] = []
     for context in contexts:
         metadata = context.metadata or {}
         candidate_hash = metadata.get("harness_hash")
@@ -593,6 +599,7 @@ def _validate_run_identity(
             )
         )
         model_calls.append(_parse_model_calls(metadata))
+        provider_failures.append(_parse_provider_failure(metadata))
         outcome = _parse_candidate_outcome(metadata)
         run_health = _parse_run_health(metadata)
         runner_evidence.append(
@@ -623,6 +630,8 @@ def _validate_run_identity(
             runner_environment_attestation=None,
             runner_lease_receipts=(),
             model_calls=None,
+            provider_failure_stage=None,
+            provider_failure_reason=None,
         )
     first = outcomes[0]
     if any(outcome != first for outcome in outcomes[1:]):
@@ -635,6 +644,9 @@ def _validate_run_identity(
     first_model_calls = model_calls[0]
     if any(calls != first_model_calls for calls in model_calls[1:]):
         raise ValueError("Harbor step contexts contain inconsistent model call metadata")
+    first_provider_failure = provider_failures[0]
+    if any(attribution != first_provider_failure for attribution in provider_failures[1:]):
+        raise ValueError("Harbor step contexts contain inconsistent provider failure metadata")
     first_runner_digest = runner_evidence[0].digest
     first_runner_attestation = runner_evidence[0].attestation
     if any(
@@ -660,6 +672,8 @@ def _validate_run_identity(
         runner_environment_attestation=first_runner_attestation,
         runner_lease_receipts=tuple(receipts_by_lease.values()),
         model_calls=first_model_calls,
+        provider_failure_stage=first_provider_failure[0],
+        provider_failure_reason=first_provider_failure[1],
     )
 
 
@@ -671,6 +685,24 @@ def _parse_model_calls(metadata: dict[str, object]) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("Harbor agent metadata model_calls must be a non-negative integer")
     return value
+
+
+def _parse_provider_failure(
+    metadata: dict[str, object],
+) -> tuple[ProviderFailureStage | None, ProviderFailureReason | None]:
+    """Parse only bounded provider attribution authored by the trusted adapter."""
+    stage_present = _PROVIDER_FAILURE_STAGE_KEY in metadata
+    reason_present = _PROVIDER_FAILURE_REASON_KEY in metadata
+    if not stage_present and not reason_present:
+        return None, None
+    if stage_present != reason_present:
+        raise ValueError("Harbor agent metadata provider failure attribution is incomplete")
+    try:
+        stage = ProviderFailureStage(metadata[_PROVIDER_FAILURE_STAGE_KEY])
+        reason = ProviderFailureReason(metadata[_PROVIDER_FAILURE_REASON_KEY])
+    except (TypeError, ValueError):
+        raise ValueError("Harbor agent metadata has unknown provider failure attribution") from None
+    return stage, reason
 
 
 def _parse_task_environment_attestation(
@@ -1072,6 +1104,8 @@ def _convert_trial(
         error=error,
         candidate_outcome=candidate_outcome,
         run_health=run_health,
+        provider_failure_stage=run_evidence.provider_failure_stage,
+        provider_failure_reason=run_evidence.provider_failure_reason,
         usage=BenchmarkUsage(
             calls=run_evidence.model_calls,
             calls_status=(

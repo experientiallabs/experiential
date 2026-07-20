@@ -43,6 +43,7 @@ from wmh.harness.pi_runner_backend import (
 )
 from wmh.harness.runner_link import TokenUsage
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.failure_attribution import ProviderFailureReason, ProviderFailureStage
 from wmh.providers.process_worker import (
     ProviderWorkerCleanupError,
     ProviderWorkerDeadlineExceeded,
@@ -1462,6 +1463,8 @@ def test_confirmation_rejects_missing_receipt_as_infrastructure(
     assert context.metadata is not None
     assert context.metadata["infrastructure_failure"] is True
     assert context.metadata["infrastructure_failure_kind"] == "provider_receipt"
+    assert context.metadata["provider_failure_stage"] == "receipt"
+    assert context.metadata["provider_failure_reason"] == "configuration"
     assert context.metadata["run_health"] == "infrastructure_failure"
 
 
@@ -1908,6 +1911,8 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
             SessionEvent(kind="error", payload={"message": "worker provider unavailable"}),
         ),
         worker_usage=TokenUsage(input_tokens=17, output_tokens=5, calls=1),
+        provider_failure_stage=ProviderFailureStage.RESPONSE_TRANSLATION,
+        provider_failure_reason=ProviderFailureReason.UNKNOWN,
     )
     monkeypatch.setattr(
         mod,
@@ -1924,6 +1929,8 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
     assert context.metadata is not None
     assert context.metadata["infrastructure_failure"] is True
     assert context.metadata["infrastructure_failure_kind"] == "provider"
+    assert context.metadata["provider_failure_stage"] == "response_translation"
+    assert context.metadata["provider_failure_reason"] == "unknown"
     assert context.metadata["run_health"] == "infrastructure_failure"
     trace = (tmp_path / "wmh-events.jsonl").read_text(encoding="utf-8")
     assert "first answer" in trace

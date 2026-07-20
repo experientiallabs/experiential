@@ -41,6 +41,7 @@ from wmh.evals.harbor.results import (
 )
 from wmh.harness.pi_runner import pi_node_baseline
 from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, runner_owner_id
+from wmh.providers.failure_attribution import ProviderFailureReason, ProviderFailureStage
 
 _NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 _TASK_CHECKSUM = "sha256:" + "b" * 64
@@ -532,6 +533,59 @@ def test_interrupted_usage_is_a_known_lower_bound_not_an_exact_total(
     assert result.usage.input_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
     assert result.usage.output_tokens == 4
     assert result.usage.output_tokens_status is BenchmarkUsageStatus.LOWER_BOUND
+
+
+def test_provider_failure_attribution_is_retained_without_raw_error_text(tmp_path: Path) -> None:
+    secret = "provider-secret-sentinel"
+    trial = _trial(
+        tmp_path,
+        "task",
+        exception_type="WmhPiProviderError",
+        candidate_metadata={
+            "run_health": "infrastructure_failure",
+            "provider_failure_stage": "dispatch",
+            "provider_failure_reason": "auth",
+        },
+    )
+    assert trial.exception_info is not None
+    trial.exception_info.exception_message = secret
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    result = load_harbor_job_result(
+        job_dir,
+        _manifest("job", ("task", 1, trial.trial_name)),
+    ).result.trials[0]
+
+    assert result.provider_failure_stage is ProviderFailureStage.DISPATCH
+    assert result.provider_failure_reason is ProviderFailureReason.AUTH
+    assert secret not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "candidate_metadata",
+    [
+        {"provider_failure_stage": "dispatch"},
+        {"provider_failure_reason": "auth"},
+        {"provider_failure_stage": "private-stage", "provider_failure_reason": "auth"},
+        {"provider_failure_stage": "dispatch", "provider_failure_reason": "private-reason"},
+    ],
+)
+def test_unbounded_provider_failure_metadata_is_rejected(
+    tmp_path: Path,
+    candidate_metadata: dict[str, object],
+) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        exception_type="WmhPiProviderError",
+        candidate_metadata=candidate_metadata,
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    with pytest.raises(ValueError, match="provider failure attribution"):
+        load_harbor_job_result(job_dir, _manifest("job", ("task", 1, trial.trial_name)))
 
 
 @pytest.mark.parametrize(

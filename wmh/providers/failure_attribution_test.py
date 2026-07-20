@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 
 from wmh.providers.failure_attribution import (
+    ProviderBoundaryError,
     ProviderFailureOwner,
     ProviderFailureReason,
+    ProviderFailureStage,
     classify_provider_failure,
 )
 
@@ -49,6 +51,21 @@ class ParamValidationError(RuntimeError):
 _SdkError.__module__ = "openai._exceptions"
 _BedrockError.__module__ = "botocore.exceptions"
 ParamValidationError.__module__ = "botocore.exceptions"
+
+
+def test_staged_failure_preserves_sdk_attribution_without_raw_text() -> None:
+    secret = "provider-secret-sentinel"
+    error = ProviderBoundaryError(
+        ProviderFailureStage.DISPATCH,
+        _BedrockError("AccessDeniedException", secret, status_code=403),
+    )
+
+    attribution = classify_provider_failure(error)
+
+    assert attribution.owner is ProviderFailureOwner.INFRASTRUCTURE
+    assert attribution.reason is ProviderFailureReason.AUTH
+    assert attribution.stage is ProviderFailureStage.DISPATCH
+    assert secret not in str(error)
 
 
 @pytest.mark.parametrize(

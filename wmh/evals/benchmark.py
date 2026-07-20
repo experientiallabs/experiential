@@ -20,6 +20,7 @@ from llm_waterfall import ReasoningEffort
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wmh.core.types import JsonObject
+from wmh.providers.failure_attribution import ProviderFailureReason, ProviderFailureStage
 
 RewardValue = float | int
 Rewards = dict[str, RewardValue]
@@ -341,6 +342,8 @@ class BenchmarkTrialResult(BaseModel):
     usage: BenchmarkUsage = Field(default_factory=BenchmarkUsage)
     candidate_outcome: BenchmarkCandidateOutcome = Field(default_factory=BenchmarkCandidateOutcome)
     run_health: BenchmarkRunHealth = BenchmarkRunHealth.UNKNOWN
+    provider_failure_stage: ProviderFailureStage | None = None
+    provider_failure_reason: ProviderFailureReason | None = None
 
     @field_validator("rewards", mode="before")
     @classmethod
@@ -356,6 +359,12 @@ class BenchmarkTrialResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_evidence(self) -> Self:
+        if (self.provider_failure_stage is None) != (self.provider_failure_reason is None):
+            raise ValueError("provider failure stage and reason must be supplied together")
+        if self.provider_failure_stage is not None and (
+            self.error is None or self.error.kind is not BenchmarkFailureKind.PROVIDER
+        ):
+            raise ValueError("provider failure attribution requires a provider error")
         if self.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED and (
             self.candidate_outcome.status is not BenchmarkCandidateStatus.FAILED
         ):

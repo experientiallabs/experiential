@@ -10,8 +10,10 @@ import boto3
 import pytest
 from botocore.stub import Stubber
 
+import wmh.providers.bedrock as mod
 from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
 from wmh.providers.bedrock import BedrockProvider, _is_nova
+from wmh.providers.failure_attribution import ProviderBoundaryError, ProviderFailureStage
 
 if TYPE_CHECKING:
     from botocore.client import BaseClient
@@ -45,6 +47,92 @@ class _StubConverseClient:
             "usage": {"inputTokens": 2, "outputTokens": 1},
             "ResponseMetadata": {"RequestId": f"request-{len(self.requests)}"},
         }
+
+
+def _haiku_provider() -> BedrockProvider:
+    return BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model_type="claude-haiku-4-5",
+            model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            region="us-east-1",
+        )
+    )
+
+
+def _chat_request() -> ChatRequest:
+    return ChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "submit"}],
+            "max_completion_tokens": 64,
+        }
+    )
+
+
+def test_structured_chat_stages_client_initialization_without_raw_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _haiku_provider()
+    secret = "client-init-secret-sentinel"
+
+    def fail_client() -> object:
+        raise ValueError(secret)
+
+    monkeypatch.setattr(provider, "_get_client", fail_client)
+
+    with pytest.raises(ProviderBoundaryError) as caught:
+        provider.complete_chat(_chat_request())
+
+    assert caught.value.stage is ProviderFailureStage.CLIENT_INIT
+    assert secret not in str(caught.value)
+
+
+def test_structured_chat_stages_dispatch_without_raw_text() -> None:
+    class FailingClient:
+        def converse(self, **_kwargs: object) -> dict[str, object]:
+            raise ValueError("dispatch-secret-sentinel")
+
+    provider = _haiku_provider()
+    provider._client = cast("BaseClient", FailingClient())
+
+    with pytest.raises(ProviderBoundaryError) as caught:
+        provider.complete_chat(_chat_request())
+
+    assert caught.value.stage is ProviderFailureStage.DISPATCH
+    assert "dispatch-secret-sentinel" not in str(caught.value)
+
+
+def test_structured_chat_stages_response_translation_without_raw_text() -> None:
+    class InvalidResponseClient:
+        def converse(self, **_kwargs: object) -> dict[str, object]:
+            return {"ResponseMetadata": {"RequestId": "request-1"}}
+
+    provider = _haiku_provider()
+    provider._client = cast("BaseClient", InvalidResponseClient())
+
+    with pytest.raises(ProviderBoundaryError) as caught:
+        provider.complete_chat(_chat_request())
+
+    assert caught.value.stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert "Bedrock Converse" not in str(caught.value)
+
+
+def test_structured_chat_stages_receipt_construction_without_raw_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _haiku_provider()
+    provider._client = cast("BaseClient", _StubConverseClient())
+
+    def fail_receipt(**_kwargs: object) -> object:
+        raise ValueError("receipt-secret-sentinel")
+
+    monkeypatch.setattr(mod, "build_chat_provider_receipt", fail_receipt)
+
+    with pytest.raises(ProviderBoundaryError) as caught:
+        provider.complete_chat(_chat_request())
+
+    assert caught.value.stage is ProviderFailureStage.RECEIPT
+    assert "receipt-secret-sentinel" not in str(caught.value)
 
 
 def test_is_nova_matches_nova_model_ids_only() -> None:
@@ -239,7 +327,7 @@ def test_structured_chat_rejects_forced_tool_choice_before_sdk_request() -> None
     stub = _StubConverseClient()
     provider._client = cast("BaseClient", stub)
 
-    with pytest.raises(ValueError, match="only auto or none"):
+    with pytest.raises(ProviderBoundaryError) as caught:
         provider.complete_chat(
             ChatRequest.model_validate(
                 {
@@ -257,6 +345,8 @@ def test_structured_chat_rejects_forced_tool_choice_before_sdk_request() -> None
             )
         )
 
+    assert caught.value.stage is ProviderFailureStage.REQUEST_TRANSLATION
+    assert "only auto or none" not in str(caught.value)
     assert stub.requests == []
 
 

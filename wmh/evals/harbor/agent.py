@@ -815,6 +815,12 @@ class WmhPiAgent(BaseAgent):
                         "run_health": run_health.value,
                     },
                 )
+                if (
+                    exc.provider_failure_stage is not None
+                    and exc.provider_failure_reason is not None
+                ):
+                    metadata["provider_failure_stage"] = exc.provider_failure_stage.value
+                    metadata["provider_failure_reason"] = exc.provider_failure_reason.value
                 _populate_context(context, exc.worker_usage, metadata)
                 try:
                     self._write_trace(exc.events)

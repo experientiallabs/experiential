@@ -31,8 +31,15 @@ from wmh.harness.pi_runner import (
     run_pi_turn,
 )
 from wmh.harness.runner_link import TokenUsage
+from wmh.providers.failure_attribution import (
+    ProviderFailureAttribution,
+    ProviderFailureOwner,
+    ProviderFailureReason,
+    ProviderFailureStage,
+)
 from wmh.providers.process_worker import (
     ProviderWorkerDeadlineExceeded,
+    ProviderWorkerFailure,
     RequestDeadlineSource,
 )
 from wmh.providers.receipt import ProviderResponseIdentityError
@@ -335,9 +342,49 @@ def test_run_pi_turn_keeps_worker_failures_infrastructure_typed() -> None:
     assert not isinstance(caught.value, PiCandidateError)
     assert isinstance(caught.value, PiInfrastructureError)
     assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER
+    assert caught.value.provider_failure_stage is ProviderFailureStage.UNKNOWN
+    assert caught.value.provider_failure_reason is ProviderFailureReason.UNKNOWN
     assert secret not in str(caught.value)
     assert secret not in str(channel.sent)
     assert "worker provider unavailable" in str(channel.sent)
+
+
+def test_run_pi_turn_preserves_bounded_worker_attribution_in_evidenced_copy() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+
+    def failing_worker(
+        _request: ChatRequest,
+        _deadline: TurnDeadline,
+    ) -> ChatResponse:
+        raise ProviderWorkerFailure(
+            ProviderFailureAttribution(
+                owner=ProviderFailureOwner.INFRASTRUCTURE,
+                reason=ProviderFailureReason.AUTH,
+                stage=ProviderFailureStage.CLIENT_INIT,
+            )
+        )
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiInfrastructureError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=failing_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER
+    assert caught.value.provider_failure_stage is ProviderFailureStage.CLIENT_INIT
+    assert caught.value.provider_failure_reason is ProviderFailureReason.AUTH
 
 
 @pytest.mark.parametrize(
@@ -417,6 +464,8 @@ def test_run_pi_turn_types_response_evidence_rejection_as_infrastructure() -> No
         )
 
     assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER_RECEIPT
+    assert caught.value.provider_failure_stage is ProviderFailureStage.RECEIPT
+    assert caught.value.provider_failure_reason is ProviderFailureReason.CONFIGURATION
     assert secret not in str(caught.value)
     assert secret not in str(channel.sent)
     assert "worker provider receipt is invalid" in str(channel.sent)

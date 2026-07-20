@@ -20,6 +20,7 @@ from wmh.providers.base import (
     normalize_chat_temperature,
     verify_via_ping,
 )
+from wmh.providers.failure_attribution import ProviderBoundaryError, ProviderFailureStage
 from wmh.providers.receipt import build_chat_provider_receipt
 
 if TYPE_CHECKING:
@@ -176,51 +177,69 @@ class BedrockProvider:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured agent request through Bedrock Converse."""
-        normalized = normalize_chat_temperature(
-            request,
-            forward_temperature=self._forward_temperature,
-        )
-        wire_request = bedrock_converse_request(
-            normalized,
-            self.config.model,
-            reasoning_effort=self.config.reasoning_effort,
-        )
+        try:
+            normalized = normalize_chat_temperature(
+                request,
+                forward_temperature=self._forward_temperature,
+            )
+            wire_request = bedrock_converse_request(
+                normalized,
+                self.config.model,
+                reasoning_effort=self.config.reasoning_effort,
+            )
+            inference_config = wire_request.get("inferenceConfig")
+            if not isinstance(inference_config, dict):
+                raise ValueError("Bedrock Converse request is missing inferenceConfig")
+            max_tokens = inference_config.get("maxTokens")
+            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+                raise ValueError("Bedrock Converse request is missing inferenceConfig.maxTokens")
+            temperature = inference_config.get("temperature")
+            if temperature is not None and (
+                isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            ):
+                raise ValueError(
+                    "Bedrock Converse request has an invalid inferenceConfig.temperature"
+                )
+        except Exception as exc:
+            raise ProviderBoundaryError(ProviderFailureStage.REQUEST_TRANSLATION, exc) from exc
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            raise ProviderBoundaryError(ProviderFailureStage.CLIENT_INIT, exc) from exc
         started_at = time.time()
-        raw = self._get_client().converse(**wire_request)
+        try:
+            raw = client.converse(**wire_request)
+        except Exception as exc:
+            raise ProviderBoundaryError(ProviderFailureStage.DISPATCH, exc) from exc
         finished_at = time.time()
-        raw_mapping = cast("dict[str, object]", raw)
-        response_metadata = raw_mapping.get("ResponseMetadata")
-        provider_request_id = (
-            response_metadata.get("RequestId") if isinstance(response_metadata, dict) else None
-        )
-        inference_config = wire_request.get("inferenceConfig")
-        if not isinstance(inference_config, dict):
-            raise ValueError("Bedrock Converse request is missing inferenceConfig")
-        max_tokens = inference_config.get("maxTokens")
-        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
-            raise ValueError("Bedrock Converse request is missing inferenceConfig.maxTokens")
-        temperature = inference_config.get("temperature")
-        if temperature is not None and (
-            isinstance(temperature, bool) or not isinstance(temperature, (int, float))
-        ):
-            raise ValueError("Bedrock Converse request has an invalid inferenceConfig.temperature")
-        response = bedrock_converse_response(raw, self.config.model)
+        try:
+            raw_mapping = cast("dict[str, object]", raw)
+            response_metadata = raw_mapping.get("ResponseMetadata")
+            provider_request_id = (
+                response_metadata.get("RequestId") if isinstance(response_metadata, dict) else None
+            )
+            response = bedrock_converse_response(raw, self.config.model)
+        except Exception as exc:
+            raise ProviderBoundaryError(ProviderFailureStage.RESPONSE_TRANSLATION, exc) from exc
         if not isinstance(provider_request_id, str) or not provider_request_id:
             return response
-        receipt = build_chat_provider_receipt(
-            provider=self.config.kind.value,
-            provider_request_id=provider_request_id,
-            response_id=None,
-            requested_model=self.config.model,
-            response_model=None,
-            system_fingerprint=None,
-            request_payload=cast("JsonObject", wire_request),
-            temperature=float(temperature) if temperature is not None else None,
-            max_tokens=max_tokens,
-            max_tokens_field="inferenceConfig.maxTokens",
-            started_at_unix_s=started_at,
-            finished_at_unix_s=finished_at,
-        )
+        try:
+            receipt = build_chat_provider_receipt(
+                provider=self.config.kind.value,
+                provider_request_id=provider_request_id,
+                response_id=None,
+                requested_model=self.config.model,
+                response_model=None,
+                system_fingerprint=None,
+                request_payload=cast("JsonObject", wire_request),
+                temperature=float(temperature) if temperature is not None else None,
+                max_tokens=max_tokens,
+                max_tokens_field="inferenceConfig.maxTokens",
+                started_at_unix_s=started_at,
+                finished_at_unix_s=finished_at,
+            )
+        except Exception as exc:
+            raise ProviderBoundaryError(ProviderFailureStage.RECEIPT, exc) from exc
         return response.model_copy(update={"provider_receipt": receipt})
 
     def _complete_reasoning(

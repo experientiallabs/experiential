@@ -38,6 +38,8 @@ from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS, search_safety_termina
 from wmh.harness.tools import READ_SKILL, ToolSpec, resolve_tools
 from wmh.providers.failure_attribution import (
     ProviderFailureOwner,
+    ProviderFailureReason,
+    ProviderFailureStage,
     classify_provider_failure,
 )
 from wmh.providers.process_worker import (
@@ -199,6 +201,8 @@ class PiInfrastructureError(RuntimeError):
         events: tuple[SessionEvent, ...] = (),
         worker_usage: TokenUsage | None = None,
         run_health: PiRunHealth | None = None,
+        provider_failure_stage: ProviderFailureStage | None = None,
+        provider_failure_reason: ProviderFailureReason | None = None,
     ) -> None:
         message = {
             PiInfrastructureFailureKind.PROVIDER: "pi turn worker provider failed",
@@ -229,6 +233,31 @@ class PiInfrastructureError(RuntimeError):
                 ),
             }[kind]
         )
+        provider_defaults = {
+            PiInfrastructureFailureKind.PROVIDER: (
+                ProviderFailureStage.UNKNOWN,
+                ProviderFailureReason.UNKNOWN,
+            ),
+            PiInfrastructureFailureKind.PROVIDER_DEADLINE: (
+                ProviderFailureStage.DISPATCH,
+                ProviderFailureReason.TIMEOUT,
+            ),
+            PiInfrastructureFailureKind.PROVIDER_RECEIPT: (
+                ProviderFailureStage.RECEIPT,
+                ProviderFailureReason.CONFIGURATION,
+            ),
+        }
+        if kind in provider_defaults:
+            if (provider_failure_stage is None) != (provider_failure_reason is None):
+                raise ValueError("provider failure stage and reason must be supplied together")
+            default_stage, default_reason = provider_defaults[kind]
+            self.provider_failure_stage = provider_failure_stage or default_stage
+            self.provider_failure_reason = provider_failure_reason or default_reason
+        else:
+            if provider_failure_stage is not None or provider_failure_reason is not None:
+                raise ValueError("task-environment failures cannot carry provider attribution")
+            self.provider_failure_stage = None
+            self.provider_failure_reason = None
 
 
 class PiCandidateError(RuntimeError):
@@ -418,7 +447,11 @@ def run_pi_turn(
             if attribution.owner is ProviderFailureOwner.CANDIDATE:
                 candidate_worker_failure = True
                 raise RuntimeError("candidate worker request rejected") from None
-            infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
+            infrastructure_failure = PiInfrastructureError(
+                PiInfrastructureFailureKind.PROVIDER,
+                provider_failure_stage=attribution.stage,
+                provider_failure_reason=attribution.reason,
+            )
             raise RuntimeError("worker provider unavailable") from None
         except ProviderWorkerUnavailable:
             infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
@@ -432,7 +465,11 @@ def run_pi_turn(
             if attribution.owner is ProviderFailureOwner.CANDIDATE:
                 candidate_worker_failure = True
                 raise RuntimeError("candidate worker request rejected") from None
-            infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
+            infrastructure_failure = PiInfrastructureError(
+                PiInfrastructureFailureKind.PROVIDER,
+                provider_failure_stage=attribution.stage,
+                provider_failure_reason=attribution.reason,
+            )
             raise RuntimeError("worker provider unavailable") from None
         if response_validator is not None:
             try:
@@ -483,6 +520,8 @@ def run_pi_turn(
             events=tuple(events),
             worker_usage=session.worker_usage.model_copy(),
             run_health=error.run_health,
+            provider_failure_stage=error.provider_failure_stage,
+            provider_failure_reason=error.provider_failure_reason,
         )
 
     def evidenced_candidate(

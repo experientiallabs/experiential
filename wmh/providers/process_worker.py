@@ -22,6 +22,7 @@ from wmh.providers.failure_attribution import (
     ProviderFailureAttribution,
     ProviderFailureOwner,
     ProviderFailureReason,
+    ProviderFailureStage,
     classify_provider_failure,
 )
 from wmh.providers.receipt import (
@@ -130,10 +131,11 @@ class _FailureFrame(_StrictFrame):
     kind: Literal["failure"] = "failure"
     owner: ProviderFailureOwner
     reason: ProviderFailureReason
+    stage: ProviderFailureStage
 
     @property
     def attribution(self) -> ProviderFailureAttribution:
-        return ProviderFailureAttribution(self.owner, self.reason)
+        return ProviderFailureAttribution(self.owner, self.reason, self.stage)
 
 
 class _TerminalFailureReason(StrEnum):
@@ -354,6 +356,7 @@ class ProviderProcessWorker:
                     ProviderFailureAttribution(
                         ProviderFailureOwner.CANDIDATE,
                         ProviderFailureReason.INVALID_REQUEST,
+                        ProviderFailureStage.REQUEST_TRANSLATION,
                     )
                 ) from None
             except _FrameDeadlineExceeded:
@@ -657,6 +660,7 @@ def _serve_worker(socket_fd: int) -> int:
                 or _FailureFrame(
                     owner=ProviderFailureOwner.INFRASTRUCTURE,
                     reason=ProviderFailureReason.CONFIGURATION,
+                    stage=ProviderFailureStage.CLIENT_INIT,
                 ),
             )
             return 1
@@ -672,6 +676,7 @@ def _serve_worker(socket_fd: int) -> int:
                     _FailureFrame(
                         owner=ProviderFailureOwner.INFRASTRUCTURE,
                         reason=ProviderFailureReason.UNKNOWN,
+                        stage=ProviderFailureStage.UNKNOWN,
                     ),
                 )
                 return 1
@@ -688,6 +693,7 @@ def _serve_worker(socket_fd: int) -> int:
                     _FailureFrame(
                         owner=attribution.owner,
                         reason=attribution.reason,
+                        stage=attribution.stage,
                     ),
                 )
                 continue

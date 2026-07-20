@@ -21,6 +21,18 @@ class ProviderFailureOwner(StrEnum):
     INFRASTRUCTURE = "infrastructure"
 
 
+class ProviderFailureStage(StrEnum):
+    """Bounded provider-neutral boundary at which one request failed."""
+
+    CLIENT_INIT = "client_init"
+    REQUEST_TRANSLATION = "request_translation"
+    DISPATCH = "dispatch"
+    RESPONSE_TRANSLATION = "response_translation"
+    RECEIPT = "receipt"
+    BUDGET = "budget"
+    UNKNOWN = "unknown"
+
+
 class ProviderFailureReason(StrEnum):
     """Sanitized provider failure class retained for control flow and audit evidence."""
 
@@ -41,6 +53,18 @@ class ProviderFailureAttribution:
 
     owner: ProviderFailureOwner
     reason: ProviderFailureReason
+    stage: ProviderFailureStage = ProviderFailureStage.UNKNOWN
+
+
+class ProviderBoundaryError(RuntimeError):
+    """Attach a bounded stage while retaining raw provider detail only in-process."""
+
+    def __init__(self, stage: ProviderFailureStage, cause: Exception) -> None:
+        if not isinstance(stage, ProviderFailureStage):
+            raise TypeError("provider failure stage must be a ProviderFailureStage")
+        super().__init__(f"provider request failed during {stage.value}")
+        self.stage = stage
+        self.cause = cause
 
 
 _INFRASTRUCTURE_UNKNOWN = ProviderFailureAttribution(
@@ -252,12 +276,22 @@ def classify_provider_failure(error: Exception) -> ProviderFailureAttribution:
     Unknown exceptions fail closed as infrastructure. The exception text is used only inside this
     classifier and is never copied into the returned value or candidate-visible evidence.
     """
+    stage = ProviderFailureStage.UNKNOWN
+    if isinstance(error, ProviderBoundaryError):
+        stage = error.stage
+        error = error.cause
     module = type(error).__module__.lower()
     if _module_has_root(module, _BEDROCK_MODULE_ROOTS):
-        return _classify_bedrock(error)
-    if _module_has_root(module, _OPENAI_MODULE_ROOTS):
-        return _classify_openai(error)
-    return _INFRASTRUCTURE_UNKNOWN
+        attribution = _classify_bedrock(error)
+    elif _module_has_root(module, _OPENAI_MODULE_ROOTS):
+        attribution = _classify_openai(error)
+    else:
+        attribution = _INFRASTRUCTURE_UNKNOWN
+    return ProviderFailureAttribution(
+        owner=attribution.owner,
+        reason=attribution.reason,
+        stage=stage,
+    )
 
 
 def _classify_openai(error: Exception) -> ProviderFailureAttribution:

@@ -19,8 +19,10 @@ import wmh.providers.process_worker as mod
 from wmh.harness.pi_runner import TurnDeadline
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.failure_attribution import (
+    ProviderBoundaryError,
     ProviderFailureOwner,
     ProviderFailureReason,
+    ProviderFailureStage,
 )
 from wmh.providers.receipt import ProviderResponseIdentity, ProviderResponseIdentityError
 from wmh.tracking._testing import (
@@ -313,6 +315,44 @@ def test_worker_child_forfeits_response_identity_mismatch(
     assert reservation.charged_nano_usd == reservation.max_nano_usd
 
 
+def test_worker_child_preserves_only_bounded_failure_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "provider-secret-sentinel"
+
+    class FakeProvider:
+        config = _CONFIG
+
+        def complete_chat(self, _request: ChatRequest) -> ChatResponse:
+            raise ProviderBoundaryError(
+                ProviderFailureStage.DISPATCH,
+                ValueError(secret),
+            )
+
+    monkeypatch.setattr(mod, "get_provider", lambda _config: FakeProvider())
+    server, client = socket.socketpair()
+    server_fd = server.detach()
+    exit_codes: list[int] = []
+    worker_thread = threading.Thread(target=lambda: exit_codes.append(mod._serve_worker(server_fd)))
+    worker_thread.start()
+    try:
+        mod._send_frame(client, mod._InitializeFrame(provider_config=_CONFIG))
+        assert mod._receive_frame(client) == {"kind": "ready"}
+        mod._send_frame(client, mod._CompletionRequestFrame(request=_REQUEST))
+        payload = mod._receive_frame(client)
+        failure = mod._FailureFrame.model_validate(payload)
+        assert failure.owner is ProviderFailureOwner.INFRASTRUCTURE
+        assert failure.reason is ProviderFailureReason.UNKNOWN
+        assert failure.stage is ProviderFailureStage.DISPATCH
+        assert secret not in json.dumps(payload)
+    finally:
+        client.close()
+        worker_thread.join(timeout=5)
+
+    assert worker_thread.is_alive() is False
+    assert exit_codes == [0]
+
+
 @pytest.mark.parametrize(
     ("reason", "error_type"),
     [
@@ -473,6 +513,7 @@ def test_worker_preserves_only_typed_candidate_failure(
             "kind": "failure",
             "owner": "candidate",
             "reason": "invalid_request",
+            "stage": "request_translation",
         },
     )
     worker = mod.ProviderProcessWorker(_CONFIG)
@@ -484,6 +525,7 @@ def test_worker_preserves_only_typed_candidate_failure(
 
     assert caught.value.attribution.owner is ProviderFailureOwner.CANDIDATE
     assert caught.value.attribution.reason is ProviderFailureReason.INVALID_REQUEST
+    assert caught.value.attribution.stage is ProviderFailureStage.REQUEST_TRANSLATION
     worker.close()
     _assert_reaped(process)
 
