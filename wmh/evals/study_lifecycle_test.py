@@ -15,6 +15,7 @@ from wmh.evals.study_journal import (
     StudyPhase,
     StudyPhaseCommitment,
     StudyPhaseRecord,
+    StudyRunCheckpointIdentity,
 )
 from wmh.evals.study_lifecycle import (
     CandidateFrozenPayload,
@@ -26,6 +27,7 @@ from wmh.evals.study_lifecycle import (
     StudyArtifactPublication,
     StudyBudgetReport,
     StudyLifecycleController,
+    StudySliceResult,
     StudyStopReason,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -345,6 +347,57 @@ def test_guard_holds_operation_lease_against_a_concurrent_terminal_transition(
         detail="Operator requested a stop.",
     )
     assert controller.current_phase is StudyPhase.STOPPED
+
+
+def test_study_slice_holds_the_lifecycle_lease_across_bounded_work(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    preparation = _preparation()
+    controller.publish(preparation)
+    nested_errors: list[RuntimeError] = []
+
+    def _checkpoint(sequence: int) -> StudyRunCheckpointIdentity:
+        return StudyRunCheckpointIdentity(
+            sequence=sequence,
+            checkpoint_digest=_digest(f"checkpoint-{sequence}"),
+        )
+
+    def _outer_operation() -> StudySliceResult[
+        StudyRunCheckpointIdentity,
+        StudyRunCheckpointIdentity,
+    ]:
+        try:
+            controller.run_slice(
+                StudyPhase.PREPARATION_PLANNED,
+                "run-1",
+                lambda: StudySliceResult[
+                    StudyRunCheckpointIdentity,
+                    StudyRunCheckpointIdentity,
+                ](checkpoint=_checkpoint(0)),
+                payload_digest=preparation.digest,
+                configuration_digest=_digest("configuration"),
+                resume_from=None,
+                checkpoint_identity=lambda checkpoint: checkpoint,
+            )
+        except RuntimeError as error:
+            nested_errors.append(error)
+        return StudySliceResult[
+            StudyRunCheckpointIdentity,
+            StudyRunCheckpointIdentity,
+        ](checkpoint=_checkpoint(0))
+
+    result = controller.run_slice(
+        StudyPhase.PREPARATION_PLANNED,
+        "run-1",
+        _outer_operation,
+        payload_digest=preparation.digest,
+        configuration_digest=_digest("configuration"),
+        resume_from=None,
+        checkpoint_identity=lambda checkpoint: checkpoint,
+    )
+
+    assert result.checkpoint == _checkpoint(0)
+    assert len(nested_errors) == 1
+    assert "locked" in str(nested_errors[0])
 
 
 def test_candidate_freeze_payload_binds_completed_search_and_cost_evidence() -> None:

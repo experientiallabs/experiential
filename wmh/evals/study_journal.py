@@ -29,6 +29,9 @@ _PENDING_FILE = "pending-phase.json"
 _MAX_RECORD_BYTES = 64 * 1024
 _RECORD_PATTERN = re.compile(r"^(?P<sequence>[0-9]{3})-(?P<phase>[a-z_]+)\.json$")
 _RUN_CLAIM_PATTERN = re.compile(r"^run-claim-(?P<phase>[a-z_]+)\.json$")
+_RUN_CHECKPOINT_PATTERN = re.compile(
+    r"^run-checkpoint-(?P<phase>[a-z_]+)-(?P<sequence>[0-9]{8})\.json$"
+)
 _TEMPORARY_PATTERN = re.compile(r"^\.tmp-(?P<target>.+)-(?P<nonce>[0-9a-f]{32})$")
 _ResultT = TypeVar("_ResultT")
 
@@ -211,6 +214,55 @@ class StudyRunClaim(BaseModel):
                 raise ValueError(f"study run {field} cannot have surrounding whitespace")
             validate_durable_text(value, field=f"study run {field}")
         return self
+
+
+class StudyRunCheckpointIdentity(BaseModel):
+    """Path-free identity of one caller-persisted resumable checkpoint."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sequence: StrictInt = Field(ge=0)
+    checkpoint_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @model_validator(mode="after")
+    def _reject_boolean_sequence(self) -> Self:
+        if isinstance(self.sequence, bool):
+            raise ValueError("study run checkpoint sequence cannot be boolean")
+        return self
+
+
+class StudyRunCheckpointRecord(BaseModel):
+    """Append-only binding from one admitted run to its latest durable checkpoint."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    record_version: Literal["1"] = "1"
+    journal_genesis_digest: str = Field(pattern=_DIGEST_PATTERN)
+    study_id: str = Field(min_length=1, max_length=512)
+    phase: StudyPhase
+    authorization_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
+    run_id: str = Field(min_length=1, max_length=512)
+    configuration_digest: str = Field(pattern=_DIGEST_PATTERN)
+    checkpoint: StudyRunCheckpointIdentity
+    previous_record_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    record_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @model_validator(mode="after")
+    def _validate_record(self) -> Self:
+        for field in ("study_id", "run_id"):
+            value = getattr(self, field)
+            if value != value.strip():
+                raise ValueError(f"study run checkpoint {field} cannot have surrounding whitespace")
+            validate_durable_text(value, field=f"study run checkpoint {field}")
+        payload = self.model_dump(mode="json", exclude={"record_digest"})
+        if self.record_digest != _canonical_digest(payload):
+            raise ValueError("study run checkpoint record digest is inconsistent")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return the append-only record identity used by its successor."""
+        return self.record_digest
 
 
 class ExternalCommitmentPublisher(Protocol):
@@ -521,26 +573,117 @@ def claim_study_run(
             requested_phase,
             payload_digest=authorization_payload_digest,
         )
-        claim_name = _run_claim_name(requested_phase)
-        try:
-            existing_payload = _read_regular_file_at(directory_descriptor, claim_name)
-        except FileNotFoundError:
-            existing_payload = None
-        if existing_payload is None:
-            if resume:
-                raise ValueError("study run cannot resume before its durable claim exists")
-            _publish_regular_file_once_at(
-                directory_descriptor,
-                claim_name,
-                _canonical_json_bytes(proposed.model_dump(mode="json")),
+        return _claim_study_run_locked(
+            store,
+            directory_descriptor,
+            proposed=proposed,
+            resume=resume,
+        )
+
+
+def call_in_study_slice(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    authorization_payload_digest: str,
+    run_id: str,
+    configuration_digest: str,
+    resume_from: StudyRunCheckpointIdentity | None,
+    publisher: ExternalCommitmentPublisher,
+    operation: Callable[[], tuple[_ResultT, StudyRunCheckpointIdentity]],
+) -> _ResultT:
+    """Execute one serialized run slice and append exactly one checkpoint identity.
+
+    The operation must durably persist its checkpoint before returning its identity. The journal
+    lease stays held across verification, execution, and checkpoint append, so another local
+    invocation cannot race the host-local budget authority. A checkpoint that survived a process
+    failure before its journal append is reconciled from ``resume_from`` before new work starts.
+
+    Args:
+        store: Host-private journal that owns the phase and run claim.
+        phase: Active phase authorized to execute the slice.
+        authorization_payload_digest: Exact current phase payload identity.
+        run_id: Caller-issued identity shared by every resume.
+        configuration_digest: Frozen path-free slice configuration identity.
+        resume_from: Latest caller-persisted checkpoint, or none for a fresh run.
+        publisher: External phase-chain verifier.
+        operation: One bounded invocation returning its result and new checkpoint identity.
+
+    Returns:
+        The operation result after its checkpoint identity is durably appended.
+
+    Raises:
+        ValueError: If phase, run, configuration, sequence, or checkpoint identity drifts.
+    """
+    requested_phase = StudyPhase(phase)
+    proposed = StudyRunClaim(
+        journal_genesis_digest=store.genesis.digest,
+        study_id=store.genesis.study_id,
+        phase=requested_phase,
+        authorization_payload_digest=authorization_payload_digest,
+        run_id=run_id,
+    )
+    if not _is_digest(configuration_digest):
+        raise ValueError("study slice configuration_digest must be a canonical SHA-256 digest")
+    resumed = (
+        StudyRunCheckpointIdentity.model_validate(resume_from.model_dump(mode="json"))
+        if resume_from is not None
+        else None
+    )
+    with store.locked() as directory_descriptor:
+        records = _load_records_locked(store, directory_descriptor)
+        pending = _load_pending_locked(store, directory_descriptor, records)
+        _verify_external_chain_locked(
+            store,
+            directory_descriptor,
+            publisher,
+            records,
+            pending,
+        )
+        _require_current_phase_locked(
+            records,
+            requested_phase,
+            payload_digest=authorization_payload_digest,
+        )
+        claim = _claim_study_run_locked(
+            store,
+            directory_descriptor,
+            proposed=proposed,
+            resume=resumed is not None,
+        )
+        checkpoints_by_phase = _load_run_checkpoints_locked(store, directory_descriptor)
+        checkpoints = checkpoints_by_phase.get(requested_phase, ())
+        checkpoints = _reconcile_resume_checkpoint_locked(
+            store,
+            directory_descriptor,
+            claim=claim,
+            configuration_digest=configuration_digest,
+            checkpoints=checkpoints,
+            resume_from=resumed,
+        )
+        result, checkpoint = operation()
+        frozen_checkpoint = StudyRunCheckpointIdentity.model_validate(
+            checkpoint.model_dump(mode="json")
+        )
+        expected_sequence = len(checkpoints)
+        if frozen_checkpoint.sequence != expected_sequence:
+            raise ValueError(
+                "study slice did not return exactly the next durable checkpoint sequence"
             )
-            return proposed
-        existing = _validate_run_claim_payload(store, claim_name, existing_payload)
-        if existing != proposed:
-            raise ValueError("study phase is already claimed by a different run authorization")
-        if not resume:
-            raise ValueError("study run already started; supply its exact durable checkpoint")
-        return existing
+        if (
+            checkpoints
+            and frozen_checkpoint.checkpoint_digest == checkpoints[-1].checkpoint.checkpoint_digest
+        ):
+            raise ValueError("study slice did not advance the durable checkpoint identity")
+        _append_run_checkpoint_locked(
+            store,
+            directory_descriptor,
+            claim=claim,
+            configuration_digest=configuration_digest,
+            checkpoint=frozen_checkpoint,
+            previous=checkpoints[-1] if checkpoints else None,
+        )
+        return result
 
 
 def call_in_study_phase(
@@ -582,6 +725,8 @@ def _load_records_locked(
                 _read_regular_file_at(directory_descriptor, name),
             )
             continue
+        if _RUN_CHECKPOINT_PATTERN.fullmatch(name) is not None:
+            continue
         match = _RECORD_PATTERN.fullmatch(name)
         if match is None:
             if _is_valid_temporary_name(name):
@@ -619,6 +764,7 @@ def _load_records_locked(
         if records and record.publication.published_at < records[-1].publication.published_at:
             raise ValueError("study journal publication timestamps move backwards")
         records.append(record)
+    _load_run_checkpoints_locked(store, directory_descriptor)
     return tuple(records)
 
 
@@ -685,6 +831,168 @@ def _run_claim_name(phase: StudyPhase) -> str:
     return f"run-claim-{phase.value}.json"
 
 
+def _run_checkpoint_name(phase: StudyPhase, sequence: int) -> str:
+    return f"run-checkpoint-{phase.value}-{sequence:08d}.json"
+
+
+def _claim_study_run_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+    *,
+    proposed: StudyRunClaim,
+    resume: bool,
+) -> StudyRunClaim:
+    """Create or verify the sole phase run claim while its journal lease is held."""
+    claim_name = _run_claim_name(proposed.phase)
+    try:
+        existing_payload = _read_regular_file_at(directory_descriptor, claim_name)
+    except FileNotFoundError:
+        existing_payload = None
+    if existing_payload is None:
+        if resume:
+            raise ValueError("study run cannot resume before its durable claim exists")
+        _publish_regular_file_once_at(
+            directory_descriptor,
+            claim_name,
+            _canonical_json_bytes(proposed.model_dump(mode="json")),
+        )
+        return proposed
+    existing = _validate_run_claim_payload(store, claim_name, existing_payload)
+    if existing != proposed:
+        raise ValueError("study phase is already claimed by a different run authorization")
+    if not resume:
+        raise ValueError("study run already started; supply its exact durable checkpoint")
+    return existing
+
+
+def _load_run_checkpoints_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+) -> dict[StudyPhase, tuple[StudyRunCheckpointRecord, ...]]:
+    """Load and validate every append-only run checkpoint chain in the journal."""
+    names_by_phase: dict[StudyPhase, list[tuple[int, str]]] = {}
+    for name in os.listdir(directory_descriptor):
+        match = _RUN_CHECKPOINT_PATTERN.fullmatch(name)
+        if match is None:
+            continue
+        try:
+            phase = StudyPhase(match.group("phase"))
+        except ValueError as exc:
+            raise ValueError(f"study journal contains unknown run checkpoint {name!r}") from exc
+        names_by_phase.setdefault(phase, []).append((int(match.group("sequence")), name))
+
+    loaded: dict[StudyPhase, tuple[StudyRunCheckpointRecord, ...]] = {}
+    for phase, names in names_by_phase.items():
+        claim_name = _run_claim_name(phase)
+        try:
+            claim_payload = _read_regular_file_at(directory_descriptor, claim_name)
+        except FileNotFoundError:
+            raise ValueError("study run checkpoints exist without a durable run claim") from None
+        claim = _validate_run_claim_payload(store, claim_name, claim_payload)
+        records: list[StudyRunCheckpointRecord] = []
+        configuration_digest: str | None = None
+        for expected_sequence, (sequence, name) in enumerate(sorted(names)):
+            if sequence != expected_sequence:
+                raise ValueError("study run checkpoints are missing, duplicated, or out of order")
+            record = _validate_run_checkpoint_payload(
+                store,
+                name,
+                _read_regular_file_at(directory_descriptor, name),
+            )
+            previous_digest = records[-1].digest if records else None
+            if (
+                record.phase is not phase
+                or record.checkpoint.sequence != sequence
+                or record.previous_record_digest != previous_digest
+                or record.authorization_payload_digest != claim.authorization_payload_digest
+                or record.run_id != claim.run_id
+            ):
+                raise ValueError("study run checkpoint differs from its chain position")
+            if configuration_digest is None:
+                configuration_digest = record.configuration_digest
+            elif record.configuration_digest != configuration_digest:
+                raise ValueError("study run checkpoint configuration changed across resume")
+            records.append(record)
+        loaded[phase] = tuple(records)
+    return loaded
+
+
+def _reconcile_resume_checkpoint_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+    *,
+    claim: StudyRunClaim,
+    configuration_digest: str,
+    checkpoints: tuple[StudyRunCheckpointRecord, ...],
+    resume_from: StudyRunCheckpointIdentity | None,
+) -> tuple[StudyRunCheckpointRecord, ...]:
+    """Match the latest record or append one checkpoint recovered after a crash."""
+    if resume_from is None:
+        if checkpoints:
+            raise ValueError("study run already has a durable checkpoint and must resume from it")
+        return checkpoints
+    if checkpoints and checkpoints[0].configuration_digest != configuration_digest:
+        raise ValueError("study slice configuration differs from its durable checkpoint chain")
+    if resume_from.sequence < len(checkpoints) - 1:
+        raise ValueError("resume checkpoint is not the latest durable checkpoint")
+    if resume_from.sequence == len(checkpoints) - 1:
+        latest = checkpoints[-1]
+        if resume_from != latest.checkpoint:
+            raise ValueError("resume checkpoint identity differs from the durable checkpoint")
+        return checkpoints
+    if resume_from.sequence != len(checkpoints):
+        raise ValueError("resume checkpoint skips a durable checkpoint sequence")
+    recovered = _append_run_checkpoint_locked(
+        store,
+        directory_descriptor,
+        claim=claim,
+        configuration_digest=configuration_digest,
+        checkpoint=resume_from,
+        previous=checkpoints[-1] if checkpoints else None,
+    )
+    return (*checkpoints, recovered)
+
+
+def _append_run_checkpoint_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+    *,
+    claim: StudyRunClaim,
+    configuration_digest: str,
+    checkpoint: StudyRunCheckpointIdentity,
+    previous: StudyRunCheckpointRecord | None,
+) -> StudyRunCheckpointRecord:
+    """Append one immutable checkpoint record at the exact next sequence."""
+    payload = {
+        "record_version": "1",
+        "journal_genesis_digest": store.genesis.digest,
+        "study_id": store.genesis.study_id,
+        "phase": claim.phase.value,
+        "authorization_payload_digest": claim.authorization_payload_digest,
+        "run_id": claim.run_id,
+        "configuration_digest": configuration_digest,
+        "checkpoint": checkpoint.model_dump(mode="json"),
+        "previous_record_digest": previous.digest if previous is not None else None,
+    }
+    record = StudyRunCheckpointRecord.model_validate(
+        {**payload, "record_digest": _canonical_digest(payload)}
+    )
+    name = _run_checkpoint_name(claim.phase, checkpoint.sequence)
+    _publish_regular_file_once_at(
+        directory_descriptor,
+        name,
+        _canonical_json_bytes(record.model_dump(mode="json")),
+    )
+    persisted = _validate_run_checkpoint_payload(
+        store,
+        name,
+        _read_regular_file_at(directory_descriptor, name),
+    )
+    if persisted != record:
+        raise RuntimeError("study run checkpoint append did not persist exact evidence")
+    return record
+
+
 def _validate_run_claim_payload(
     store: StudyJournalStore,
     name: str,
@@ -708,6 +1016,34 @@ def _validate_run_claim_payload(
     ):
         raise ValueError("study run claim belongs to another journal or phase")
     return claim
+
+
+def _validate_run_checkpoint_payload(
+    store: StudyJournalStore,
+    name: str,
+    payload: bytes,
+) -> StudyRunCheckpointRecord:
+    """Parse one checkpoint record and bind it to its canonical journal filename."""
+    match = _RUN_CHECKPOINT_PATTERN.fullmatch(name)
+    if match is None:
+        raise ValueError("study run checkpoint filename is not canonical")
+    try:
+        filename_phase = StudyPhase(match.group("phase"))
+        filename_sequence = int(match.group("sequence"))
+        record = StudyRunCheckpointRecord.model_validate_json(payload)
+    except ValueError as exc:
+        raise ValueError("study run checkpoint is invalid") from exc
+    if payload != _canonical_json_bytes(record.model_dump(mode="json")):
+        raise ValueError("study run checkpoint is not canonical")
+    if (
+        record.phase is not filename_phase
+        or record.checkpoint.sequence != filename_sequence
+        or name != _run_checkpoint_name(record.phase, record.checkpoint.sequence)
+        or record.journal_genesis_digest != store.genesis.digest
+        or record.study_id != store.genesis.study_id
+    ):
+        raise ValueError("study run checkpoint belongs to another journal or sequence")
+    return record
 
 
 def _require_current_phase_locked(
@@ -1015,6 +1351,14 @@ def _is_valid_temporary_name(name: str) -> bool:
         return True
     if _RUN_CLAIM_PATTERN.fullmatch(target) is not None:
         return True
+    checkpoint_match = _RUN_CHECKPOINT_PATTERN.fullmatch(target)
+    if checkpoint_match is not None:
+        try:
+            phase = StudyPhase(checkpoint_match.group("phase"))
+        except ValueError:
+            return False
+        sequence = int(checkpoint_match.group("sequence"))
+        return target == _run_checkpoint_name(phase, sequence)
     record_match = _RECORD_PATTERN.fullmatch(target)
     if record_match is None:
         return False

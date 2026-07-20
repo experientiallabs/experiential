@@ -42,23 +42,26 @@ from wmh.evals.partition import (
     freeze_confirmation_candidate,
     open_confirmation_once,
 )
-from wmh.evals.study_journal import StudyPhase
+from wmh.evals.study_journal import StudyPhase, StudyRunCheckpointIdentity
 from wmh.evals.study_lifecycle import (
     CandidatePublishedPayload,
     ConfirmationOpenedPayload,
     DiscoveryRunningPayload,
     StudyLifecycleController,
+    StudySliceResult,
 )
 from wmh.harness.create import (
     CreateProgress,
     ProposalRecord,
     SearchCheckpoint,
+    SearchProposalBatchWitness,
     SearchResult,
     search_harness,
 )
 from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc, SurfaceKind
 from wmh.harness.proposer import DeltaProposer
+from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.harness.scoring import HarnessScorer
 
 HARNESS_OPTIMIZATION_PROTOCOL_VERSION: Literal["1"] = "1"
@@ -523,11 +526,14 @@ def run_harness_optimization_search(
     lifecycle: StudyLifecycleController,
     authorization: DiscoveryRunningPayload,
     resume_from: SearchCheckpoint | None = None,
+    resume_proposal_batch_witness: SearchProposalBatchWitness | None = None,
     on_progress: CreateProgress | None = None,
     on_note: Callable[[str], None] | None = None,
     on_proposal: Callable[[ProposalRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
     on_checkpoint: Callable[[SearchCheckpoint], None],
+    on_proposal_batch_prepare: Callable[[SearchProposalBatchWitness], None] | None = None,
+    on_proposal_batch_witness: Callable[[SearchProposalBatchWitness], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> SearchResult:
     """Run the predeclared discovery search without any held-out scorer or adaptive matrix."""
@@ -560,14 +566,172 @@ def run_harness_optimization_search(
             holdout_scorer=None,
             confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
             resume_from=resume_from,
+            resume_proposal_batch_witness=resume_proposal_batch_witness,
             on_progress=on_progress,
             on_note=on_note,
             on_proposal=on_proposal,
             on_accept=on_accept,
             on_checkpoint=on_checkpoint,
+            on_proposal_batch_prepare=on_proposal_batch_prepare,
+            on_proposal_batch_witness=on_proposal_batch_witness,
             should_cancel=should_cancel,
         ),
         payload_digest=authorization.digest,
+    )
+
+
+def run_harness_optimization_search_slice(
+    discovery: HarnessOptimizationDiscoveryContract,
+    *,
+    scorer: HarnessScorer,
+    proposer: DeltaProposer,
+    lifecycle: StudyLifecycleController,
+    authorization: DiscoveryRunningPayload,
+    resume_from: SearchCheckpoint | None = None,
+    resume_proposal_batch_witness: SearchProposalBatchWitness | None = None,
+    on_checkpoint: Callable[[SearchCheckpoint], None],
+    on_proposal_batch_prepare: Callable[[SearchProposalBatchWitness], None] | None = None,
+    on_proposal_batch_witness: Callable[[SearchProposalBatchWitness], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> StudySliceResult[SearchCheckpoint, SearchResult]:
+    """Execute one serialized discovery slice and return its newly durable checkpoint.
+
+    The initial slice qualifies the seed and returns checkpoint zero. Each resumed slice executes
+    exactly one planned proposal iteration. Paid slices require both proposal transaction
+    callbacks so a crash around the proposer call can fail closed or replay its exact witness.
+
+    Args:
+        discovery: Held-out-safe frozen study inputs.
+        scorer: Exact discovery scorer named by the frozen search plan.
+        proposer: Exact delta proposer named by the frozen search plan.
+        lifecycle: Journal-backed phase and sequential execution authority.
+        authorization: Current discovery phase payload and stable run identity.
+        resume_from: Latest durable search checkpoint, or none for the initial slice.
+        resume_proposal_batch_witness: Exact prepared or completed transaction recovered after a
+            crash around the next proposer call.
+        on_checkpoint: Required durable checkpoint persistence callback.
+        on_proposal_batch_prepare: Durable pre-proposer transaction callback, required for paid
+            slices.
+        on_proposal_batch_witness: Durable post-proposer transaction callback, required for paid
+            slices.
+        should_cancel: Cooperative host cancellation check.
+
+    Returns:
+        One new checkpoint and a final result only when all planned iterations are complete.
+
+    Raises:
+        ValueError: If authorization, runtime components, resume state, or sequence drifts.
+        HarnessSearchCancelled: If cancellation arrives before a new checkpoint is durable.
+    """
+    study = HarnessOptimizationDiscoveryContract.model_validate(discovery.model_dump(mode="json"))
+    if (
+        authorization.protocol_digest != study.protocol.digest
+        or authorization.search_configuration_digest
+        != _canonical_digest(study.protocol.search.model_dump(mode="json"))
+    ):
+        raise ValueError("discovery authorization differs from the optimization protocol")
+    _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
+    plan = study.protocol.search
+    resumed = (
+        SearchCheckpoint.model_validate(resume_from.model_dump(mode="json"))
+        if resume_from is not None
+        else None
+    )
+    if resumed is not None:
+        _validate_search_slice_checkpoint(
+            study,
+            resumed,
+            scorer=scorer,
+            proposer=proposer,
+            search_run_id=authorization.search_run_id,
+        )
+        if resumed.completed_iteration == plan.iterations:
+            raise ValueError("discovery search is already complete and has no new slice")
+    if should_cancel is not None and should_cancel():
+        raise HarnessSearchCancelled("harness search cancelled before slice admission")
+
+    expected_iteration = 0 if resumed is None else resumed.completed_iteration + 1
+    if expected_iteration > 0 and (
+        on_proposal_batch_prepare is None or on_proposal_batch_witness is None
+    ):
+        raise ValueError(
+            "paid discovery slices require durable proposal prepare and witness callbacks"
+        )
+    committed: SearchCheckpoint | None = None
+    stop_after_checkpoint = False
+
+    def _persist_checkpoint(checkpoint: SearchCheckpoint) -> None:
+        nonlocal committed, stop_after_checkpoint
+        frozen = SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
+        if committed is not None:
+            raise RuntimeError("study slice emitted more than one new search checkpoint")
+        if frozen.completed_iteration != expected_iteration:
+            raise RuntimeError("study slice emitted an unexpected search checkpoint sequence")
+        _validate_search_slice_checkpoint(
+            study,
+            frozen,
+            scorer=scorer,
+            proposer=proposer,
+            search_run_id=authorization.search_run_id,
+        )
+        on_checkpoint(frozen.model_copy(deep=True))
+        committed = frozen
+        stop_after_checkpoint = frozen.completed_iteration < plan.iterations
+
+    def _should_cancel() -> bool:
+        return stop_after_checkpoint or (should_cancel is not None and should_cancel())
+
+    def _run() -> StudySliceResult[SearchCheckpoint, SearchResult]:
+        final: SearchResult | None = None
+        try:
+            final = search_harness(
+                plan.candidate_name,
+                study.baseline.model_copy(deep=True),
+                scorer,
+                proposer,
+                search_run_id=authorization.search_run_id,
+                iterations=plan.iterations,
+                proposal_batch_size=plan.proposal_batch_size,
+                screen_proposals=plan.screen_proposals,
+                holdout_scorer=None,
+                confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
+                resume_from=resumed,
+                resume_proposal_batch_witness=resume_proposal_batch_witness,
+                on_checkpoint=_persist_checkpoint,
+                on_proposal_batch_prepare=on_proposal_batch_prepare,
+                on_proposal_batch_witness=on_proposal_batch_witness,
+                should_cancel=_should_cancel,
+            )
+        except HarnessSearchCancelled:
+            if committed is None or not stop_after_checkpoint:
+                raise
+        if committed is None:
+            raise RuntimeError("study slice returned without a new durable search checkpoint")
+        if (final is not None) != (committed.completed_iteration == plan.iterations):
+            raise RuntimeError("study slice completion differs from its durable checkpoint")
+        return StudySliceResult[SearchCheckpoint, SearchResult](
+            checkpoint=committed,
+            result=final,
+        )
+
+    return lifecycle.run_slice(
+        StudyPhase.DISCOVERY_RUNNING,
+        authorization.search_run_id,
+        _run,
+        payload_digest=authorization.digest,
+        configuration_digest=authorization.search_configuration_digest,
+        resume_from=(
+            StudyRunCheckpointIdentity(
+                sequence=resumed.completed_iteration,
+                checkpoint_digest="sha256:" + resumed.payload_sha256,
+            )
+            if resumed is not None
+            else None
+        ),
+        checkpoint_identity=lambda checkpoint: StudyRunCheckpointIdentity(
+            sequence=checkpoint.completed_iteration,
+            checkpoint_digest="sha256:" + checkpoint.payload_sha256,
+        ),
     )
 
 
@@ -801,6 +965,49 @@ def _validate_search_component_bindings(
         raise ValueError("runtime proposer configuration differs from the discovery search plan")
 
 
+def _validate_search_slice_checkpoint(
+    prepared: HarnessOptimizationDiscoveryContract,
+    checkpoint: SearchCheckpoint,
+    *,
+    scorer: HarnessScorer,
+    proposer: DeltaProposer,
+    search_run_id: str,
+) -> None:
+    """Bind a resumable checkpoint to the exact frozen plan and runtime components."""
+    plan = prepared.protocol.search
+    config = checkpoint.configuration
+    if (
+        config.search_run_id != search_run_id
+        or config.name != plan.candidate_name
+        or config.seed_doc_hash != prepared.baseline.doc_hash
+        or config.seed_execution_hash != prepared.baseline.execution_hash
+        or config.iterations != plan.iterations
+        or config.proposal_batch_size != plan.proposal_batch_size
+        or config.screen_proposals != plan.screen_proposals
+        or config.confirm_narrow_vetoes != plan.confirm_narrow_vetoes
+        or config.holdout_scorer is not None
+    ):
+        raise ValueError("search slice checkpoint configuration differs from the frozen plan")
+    discovery_ids = tuple(task.task_id for task in prepared.protocol.discovery.tasks)
+    scorer_config = config.discovery_scorer
+    if (
+        scorer_config.implementation != _implementation_id(scorer)
+        or scorer_config.configuration_id != plan.scorer_configuration_id
+        or scorer_config.task_ids != discovery_ids
+        or scorer_config.default_attempts != plan.attempts_per_task
+        or scorer_config.capabilities != scorer.capabilities
+    ):
+        raise ValueError("search slice checkpoint scorer identity differs from the runtime")
+    proposer_config = config.proposer
+    if (
+        proposer_config.implementation != _implementation_id(proposer)
+        or proposer_config.configuration_id != plan.proposer_configuration_id
+        or proposer_config.durable_state_required
+        != bool(getattr(proposer, "durable_state_required", False))
+    ):
+        raise ValueError("search slice checkpoint proposer identity differs from the runtime")
+
+
 def _validate_completed_search_checkpoint(
     prepared: PreparedHarnessOptimizationStudy,
     checkpoint: SearchCheckpoint,
@@ -895,6 +1102,11 @@ def _configuration_id(component: object, *, role: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"runtime {role} must expose a stable non-empty configuration_id")
     return value
+
+
+def _implementation_id(component: object) -> str:
+    component_type = type(component)
+    return f"{component_type.__module__}.{component_type.__qualname__}"
 
 
 def _canonical_digest(value: object) -> str:

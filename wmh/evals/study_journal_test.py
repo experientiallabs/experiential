@@ -18,7 +18,9 @@ from wmh.evals.study_journal import (
     StudyJournalStore,
     StudyPhase,
     StudyPhaseCommitment,
+    StudyRunCheckpointIdentity,
     append_study_phase,
+    call_in_study_slice,
     load_study_journal,
 )
 
@@ -190,6 +192,138 @@ def test_append_is_idempotent_without_republishing(tmp_path: Path) -> None:
     assert repeated == first
     assert publisher.published == [first.commitment.digest]
     assert publisher.verified == [first.commitment.digest, first.commitment.digest]
+
+
+def test_study_slice_chains_checkpoints_and_rejects_stale_replay(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    calls: list[int] = []
+
+    first = call_in_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=_digest("configuration"),
+        resume_from=None,
+        publisher=publisher,
+        operation=lambda: (
+            calls.append(0) or "first",
+            StudyRunCheckpointIdentity(
+                sequence=0,
+                checkpoint_digest=_digest("checkpoint-0"),
+            ),
+        ),
+    )
+    second = call_in_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=_digest("configuration"),
+        resume_from=StudyRunCheckpointIdentity(
+            sequence=0,
+            checkpoint_digest=_digest("checkpoint-0"),
+        ),
+        publisher=publisher,
+        operation=lambda: (
+            calls.append(1) or "second",
+            StudyRunCheckpointIdentity(
+                sequence=1,
+                checkpoint_digest=_digest("checkpoint-1"),
+            ),
+        ),
+    )
+
+    assert first == "first"
+    assert second == "second"
+    assert calls == [0, 1]
+    assert sorted(path.name for path in store.directory.glob("run-checkpoint-*.json")) == [
+        "run-checkpoint-preparation_planned-00000000.json",
+        "run-checkpoint-preparation_planned-00000001.json",
+    ]
+
+    with pytest.raises(ValueError, match="latest durable checkpoint"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("configuration"),
+            resume_from=StudyRunCheckpointIdentity(
+                sequence=0,
+                checkpoint_digest=_digest("checkpoint-0"),
+            ),
+            publisher=publisher,
+            operation=lambda: (
+                calls.append(2) or "stale",
+                StudyRunCheckpointIdentity(
+                    sequence=1,
+                    checkpoint_digest=_digest("replacement"),
+                ),
+            ),
+        )
+
+    assert calls == [0, 1]
+
+
+def test_study_slice_reconciles_a_persisted_checkpoint_after_operation_crash(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (_ for _ in ()).throw(RuntimeError("simulated crash")),
+        )
+
+    result = call_in_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=_digest("configuration"),
+        resume_from=StudyRunCheckpointIdentity(
+            sequence=0,
+            checkpoint_digest=_digest("checkpoint-0"),
+        ),
+        publisher=publisher,
+        operation=lambda: (
+            "resumed",
+            StudyRunCheckpointIdentity(
+                sequence=1,
+                checkpoint_digest=_digest("checkpoint-1"),
+            ),
+        ),
+    )
+
+    assert result == "resumed"
+    assert len(tuple(store.directory.glob("run-checkpoint-*.json"))) == 2
+    assert load_study_journal(store, publisher=publisher)[-1].commitment.phase is (
+        StudyPhase.PREPARATION_PLANNED
+    )
 
 
 def test_public_load_requires_an_external_publisher(tmp_path: Path) -> None:
