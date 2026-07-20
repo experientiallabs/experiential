@@ -14,7 +14,7 @@ from typing import Protocol, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wmh.core.text import validate_durable_text
-from wmh.harness.doc import HarnessDoc
+from wmh.harness.doc import DOC_HASH_PATTERN, HarnessDoc
 
 _SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _SAFE_ARTIFACT_PART = r"^[A-Za-z0-9._-]+$"
@@ -177,12 +177,12 @@ class HarnessScoreReport(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     source_run_id: str = Field(strict=True, min_length=1, max_length=1024)
-    candidate_execution_hash: str = Field(strict=True, pattern=r"^[0-9a-f]{32}$")
+    candidate_doc_hash: str = Field(strict=True, pattern=DOC_HASH_PATTERN)
     request: ScoreRequest
     cells: tuple[ScoreCell, ...]
     artifacts: tuple[EvaluationArtifact, ...]
 
-    @field_validator("source_run_id", "candidate_execution_hash")
+    @field_validator("source_run_id", "candidate_doc_hash")
     @classmethod
     def _validate_identity_text(cls, value: str, info: object) -> str:
         field_name = getattr(info, "field_name", "score identity")
@@ -227,6 +227,10 @@ class HarnessScoreReport(BaseModel):
         )
         if missing_paths:
             raise ValueError(f"score cells reference missing artifact(s): {missing_paths}")
+        referenced_paths = {path for cell in self.cells for path in cell.artifact_paths}
+        orphan_paths = sorted(known_paths - referenced_paths)
+        if orphan_paths:
+            raise ValueError(f"score report contains unreferenced artifact(s): {orphan_paths}")
         return self
 
     @property
@@ -280,9 +284,9 @@ def score_harness(
 ) -> HarnessScore:
     """Score once, reject identity drift, and detach immutable trusted metadata."""
     scored = scorer.score(candidate, request=request)
-    if scored.report.candidate_execution_hash != candidate.doc_hash:
+    if scored.report.candidate_doc_hash != candidate.doc_hash:
         raise ValueError(
-            "scorer returned a candidate execution hash that does not match the scored harness"
+            "scorer returned a candidate document hash that does not match the harness"
         )
     if scored.report.request != request:
         raise ValueError("scorer returned a different score request than the caller supplied")

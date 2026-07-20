@@ -82,7 +82,7 @@ def _score(candidate: HarnessDoc, *, content: str = "raw trace\n") -> HarnessSco
     artifact = EvaluationArtifact.from_text(path=_RAW_PATH, content=content)
     report = HarnessScoreReport(
         source_run_id="run-1",
-        candidate_execution_hash=candidate.doc_hash,
+        candidate_doc_hash=candidate.doc_hash,
         request=_request(),
         cells=_cells(),
         artifacts=(artifact,),
@@ -130,9 +130,9 @@ def test_score_report_rejects_unknown_fields_and_invalid_candidate_hash() -> Non
 
     with pytest.raises(ValidationError, match="extra_forbidden"):
         HarnessScoreReport.model_validate({**report.model_dump(), "unexpected": "value"})
-    with pytest.raises(ValidationError, match="candidate_execution_hash"):
+    with pytest.raises(ValidationError, match="candidate_doc_hash"):
         HarnessScoreReport.model_validate(
-            {**report.model_dump(), "candidate_execution_hash": "not-a-hash"}
+            {**report.model_dump(), "candidate_doc_hash": "not-a-hash"}
         )
 
 
@@ -182,7 +182,7 @@ def test_score_report_requires_the_exact_task_attempt_matrix(
     with pytest.raises(ValidationError, match=match):
         HarnessScoreReport(
             source_run_id="run-1",
-            candidate_execution_hash=candidate.doc_hash,
+            candidate_doc_hash=candidate.doc_hash,
             request=_request(),
             cells=cells,
             artifacts=(artifact,),
@@ -198,6 +198,7 @@ def test_artifact_manifest_rejects_unsafe_or_noncanonical_paths(path: str) -> No
 def test_score_report_requires_raw_evidence_and_unique_artifact_paths() -> None:
     candidate = HarnessDoc.baseline("candidate")
     artifact = EvaluationArtifact.from_text(path=_RAW_PATH, content="raw trace\n")
+    orphan = EvaluationArtifact.from_text(path="raw/orphan.txt", content="orphan\n")
     unreferenced = _cells()[0].model_copy(update={"artifact_paths": ("missing.txt",)})
     no_evidence = _cells()[0].model_copy(update={"artifact_paths": ()})
 
@@ -207,7 +208,7 @@ def test_score_report_requires_raw_evidence_and_unique_artifact_paths() -> None:
     with pytest.raises(ValidationError, match="missing artifact"):
         HarnessScoreReport(
             source_run_id="run-1",
-            candidate_execution_hash=candidate.doc_hash,
+            candidate_doc_hash=candidate.doc_hash,
             request=_request(),
             cells=(unreferenced, *_cells()[1:]),
             artifacts=(artifact,),
@@ -216,10 +217,19 @@ def test_score_report_requires_raw_evidence_and_unique_artifact_paths() -> None:
     with pytest.raises(ValidationError, match="duplicate artifact"):
         HarnessScoreReport(
             source_run_id="run-1",
-            candidate_execution_hash=candidate.doc_hash,
+            candidate_doc_hash=candidate.doc_hash,
             request=_request(),
             cells=_cells(),
             artifacts=(artifact, artifact),
+        )
+
+    with pytest.raises(ValidationError, match="unreferenced artifact"):
+        HarnessScoreReport(
+            source_run_id="run-1",
+            candidate_doc_hash=candidate.doc_hash,
+            request=_request(),
+            cells=_cells(),
+            artifacts=(artifact, orphan),
         )
 
 
@@ -266,7 +276,7 @@ def test_artifact_manifest_and_reader_preserve_arbitrary_bytes() -> None:
     cells = tuple(cell.model_copy(update={"artifact_paths": (path,)}) for cell in _cells())
     report = HarnessScoreReport(
         source_run_id="run-1",
-        candidate_execution_hash=candidate.doc_hash,
+        candidate_doc_hash=candidate.doc_hash,
         request=_request(),
         cells=cells,
         artifacts=(artifact,),
@@ -288,7 +298,7 @@ def test_report_identity_is_canonical_and_commits_to_all_evidence() -> None:
     report = scored.report
     reordered = HarnessScoreReport(
         source_run_id=report.source_run_id,
-        candidate_execution_hash=report.candidate_execution_hash,
+        candidate_doc_hash=report.candidate_doc_hash,
         request=report.request,
         cells=tuple(reversed(report.cells)),
         artifacts=tuple(reversed(report.artifacts)),
@@ -337,7 +347,7 @@ def test_score_harness_rejects_candidate_request_or_artifact_identity_drift() ->
             del candidate, request
             return _score(other)
 
-    with pytest.raises(ValueError, match="candidate execution hash"):
+    with pytest.raises(ValueError, match="candidate document hash"):
         score_harness(WrongCandidateScorer(), candidate, request=_request())
 
     class WrongRequestScorer:
@@ -371,7 +381,7 @@ def test_score_harness_returns_a_detached_deeply_immutable_snapshot() -> None:
 
     class Scorer:
         def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScore:
-            assert candidate.doc_hash == original.report.candidate_execution_hash
+            assert candidate.doc_hash == original.report.candidate_doc_hash
             assert request == _request()
             return original
 
@@ -401,7 +411,7 @@ def test_score_harness_detects_artifact_mutation_after_snapshot() -> None:
     source = _ArtifactReader({_RAW_PATH: content.encode("utf-8")})
     report = HarnessScoreReport(
         source_run_id="run-1",
-        candidate_execution_hash=candidate.doc_hash,
+        candidate_doc_hash=candidate.doc_hash,
         request=_request(),
         cells=_cells(),
         artifacts=(artifact,),

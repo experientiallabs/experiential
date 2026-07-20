@@ -56,6 +56,10 @@ if TYPE_CHECKING:
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
+# The canonical document identity is a lowercase hexadecimal 16-byte BLAKE2b digest.
+DOC_HASH_DIGEST_BYTES = 16
+DOC_HASH_PATTERN = rf"^[0-9a-f]{{{DOC_HASH_DIGEST_BYTES * 2}}}$"
+
 # Well-known surface ids. The tool policy and scalar parameters are singletons; prompt and skill
 # surfaces may be added freely (an update can split `prompt:core` into finer sections).
 TOOL_POLICY_ID = "tool_policy:main"
@@ -433,4 +437,4 @@ def code_baseline(name: str = "baseline") -> HarnessDoc:
 
 
 def _digest(text: str) -> str:
-    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=DOC_HASH_DIGEST_BYTES).hexdigest()
