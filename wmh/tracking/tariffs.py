@@ -196,7 +196,7 @@ class _BedrockCatalogRecord(BaseModel):
     source_snapshots: tuple[ProviderTariffSourceSnapshot, ...]
     source_bindings: tuple[ProviderTariffSourceBinding, ...]
     effective_on: date | None
-    billing_meters: tuple[ProviderTariffBillingMeter, ...]
+    billing_meters: tuple[ProviderTariffBillingMeter, ProviderTariffBillingMeter]
     input_usd: str
     output_usd: str
 
@@ -573,7 +573,7 @@ class ProviderTokenTariff(BaseModel):
         price_unit: Literal["per_1m_tokens"],
         billing_region: str,
         billing_mode: str,
-        billing_meters: tuple[ProviderTariffBillingMeter, ...],
+        billing_meters: tuple[ProviderTariffBillingMeter, ProviderTariffBillingMeter],
     ) -> ProviderTokenTariff:
         """Freeze a live-verified route price using exact nano-USD ceilings.
 

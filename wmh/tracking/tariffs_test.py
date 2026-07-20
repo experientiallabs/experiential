@@ -144,7 +144,7 @@ def _test_billing_meters(
     *,
     billing_region: str = "eastus2",
     billing_mode: str = "global-standard",
-) -> tuple[ProviderTariffBillingMeter, ...]:
+) -> tuple[ProviderTariffBillingMeter, ProviderTariffBillingMeter]:
     return (
         _test_billing_meter(
             "input_tokens",
@@ -1233,7 +1233,10 @@ def test_tariff_route_requires_exact_input_and_output_billing_meters(
             ),
             billing_region="us-east-1",
             billing_mode="in-region-on-demand-standard",
-            billing_meters=billing_meters,
+            billing_meters=cast(
+                "tuple[ProviderTariffBillingMeter, ProviderTariffBillingMeter]",
+                billing_meters,
+            ),
         )
 
 
