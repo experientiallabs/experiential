@@ -36,6 +36,7 @@ from wmh.core.text import validate_durable_text
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.paired_runner import (
     HarborExecutionRuntime,
+    PairedHarborNoActiveSliceIntentError,
     PairedHarborProtocol,
     PairedHarborRunner,
     PairedHarborRunReport,
@@ -663,6 +664,13 @@ class PairedHarborSliceRunner(Protocol):
         max_new_blocks: int | None = None,
     ) -> PairedHarborSliceResult: ...
 
+    async def resume_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult: ...
+
     async def recover_persisted_slice(
         self,
         *,
@@ -913,7 +921,7 @@ def run_harness_optimization_confirmation_slice(
             result=result.report,
         )
 
-    sliced = lifecycle.run_slice(
+    sliced = lifecycle.run_resumable_slice(
         StudyPhase.CONFIRMATION_RUNNING,
         authorization.confirmation_run_id,
         _run,
@@ -1678,10 +1686,19 @@ def _run_async_confirmation_slice(
     baseline: HarnessDoc,
     candidate: HarnessDoc,
 ) -> PairedHarborSliceResult:
+    async def _resume_or_run() -> PairedHarborSliceResult:
+        try:
+            return await runner.resume_persisted_slice(
+                baseline=baseline,
+                candidate=candidate,
+            )
+        except PairedHarborNoActiveSliceIntentError:
+            return await runner.run_slice(baseline=baseline, candidate=candidate)
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(runner.run_slice(baseline=baseline, candidate=candidate))
+        return asyncio.run(_resume_or_run())
     raise RuntimeError(
         "synchronous study coordination cannot run inside an active event loop; invoke it from "
         "a worker thread or process"
