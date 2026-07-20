@@ -21,6 +21,7 @@ from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
+    TokenUsage,
     VerifyResult,
     normalize_chat_temperature,
     verify_via_ping,
@@ -138,6 +139,34 @@ class AzureOpenAIProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
+        if self.config.reasoning_effort is not None:
+            request_messages: list[dict[str, str]] = []
+            if system:
+                request_messages.append({"role": "system", "content": system})
+            request_messages.extend(
+                {"role": message.role, "content": message.content} for message in messages
+            )
+            response = self.complete_chat(
+                ChatRequest.model_validate(
+                    {
+                        "messages": request_messages,
+                        "max_completion_tokens": max_tokens,
+                    }
+                )
+            )
+            if not response.choices:
+                raise ValueError(f"{self._deployment()} returned no choices")
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                raise ValueError(f"{self._deployment()} returned no text completion")
+            usage = response.token_usage()
+            return Completion(
+                text=content,
+                usage=TokenUsage(
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                ),
+            )
         return _openai_common.complete(
             self._get_client().chat.completions,
             self._deployment(),

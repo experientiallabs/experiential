@@ -11,7 +11,7 @@ import pytest
 from openai import AzureOpenAI, OpenAI
 
 from wmh.providers.azure_openai import AzureOpenAIProvider
-from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
+from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind, TokenUsage
 from wmh.providers.receipt import validate_chat_provider_receipt
 
 
@@ -106,29 +106,43 @@ class _FakeChat:
 
 
 class _FakeResponsesResponse:
-    def __init__(self, tool_name: str = "bash") -> None:
+    def __init__(self, tool_name: str = "bash", text: str | None = None) -> None:
         self.tool_name = tool_name
+        self.text = text
 
     def model_dump(self, *, mode: str) -> dict[str, object]:
         assert mode == "json"
-        return {
-            "id": "response-azure-1",
-            "model": "gpt-5.5-2026-06-01",
-            "status": "completed",
-            "output": [
-                {
-                    "type": "reasoning",
-                    "id": "reasoning-1",
-                    "summary": [],
-                    "encrypted_content": "ciphertext-1",
-                },
+        output: list[dict[str, object]] = [
+            {
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "summary": [],
+                "encrypted_content": "ciphertext-1",
+            }
+        ]
+        if self.text is None:
+            output.append(
                 {
                     "type": "function_call",
                     "call_id": "call-1",
                     "name": self.tool_name,
                     "arguments": '{"command":"pwd"}',
-                },
-            ],
+                }
+            )
+        else:
+            output.append(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": self.text}],
+                }
+            )
+        return {
+            "id": "response-azure-1",
+            "model": "gpt-5.5-2026-06-01",
+            "status": "completed",
+            "output": output,
             "usage": {"input_tokens": 11, "output_tokens": 7},
         }
 
@@ -138,10 +152,12 @@ class _FakeResponses:
         self,
         *,
         tool_name: str = "bash",
+        text: str | None = None,
         headers: dict[str, str] | None = None,
         error: Exception | None = None,
     ) -> None:
         self.tool_name = tool_name
+        self.text = text
         self.headers = (
             {"apim-request-id": "provider-request-azure-responses-1"}
             if headers is None
@@ -157,7 +173,7 @@ class _FakeResponses:
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
-        return _FakeResponsesResponse(self.tool_name)
+        return _FakeResponsesResponse(self.tool_name, self.text)
 
 
 class _FakeResponsesRawResponse:
@@ -263,14 +279,30 @@ def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_complete_binds_configured_reasoning_effort(monkeypatch: pytest.MonkeyPatch) -> None:
-    chat = _FakeChatCompletions(_FakeChatResponse("yo", _FakeUsage(3, 2)))
+    responses = _FakeResponses(text="yo")
     provider = AzureOpenAIProvider(_reasoning_config())
-    monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
+    monkeypatch.setattr(
+        provider,
+        "_get_responses_client",
+        lambda: _FakeResponsesClient(responses),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("reasoning text must use Responses")),
+    )
 
-    provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
+    completion = provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
 
-    assert chat.last_kwargs["reasoning_effort"] == "high"
-    assert "temperature" not in chat.last_kwargs
+    assert completion.text == "yo"
+    assert completion.usage == TokenUsage(input_tokens=11, output_tokens=7)
+    assert responses.last_kwargs["reasoning"] == {"effort": "high"}
+    assert responses.last_kwargs["input"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert responses.last_kwargs["max_output_tokens"] == 16
+    assert "temperature" not in responses.last_kwargs
 
 
 def test_complete_preserves_missing_usage_for_budget_forfeit(
