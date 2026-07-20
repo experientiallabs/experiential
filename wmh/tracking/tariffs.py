@@ -469,11 +469,11 @@ _BEDROCK_CATALOG_RECORDS = (
 
 _BEDROCK_CATALOG_RECORD_DIGESTS = {
     "us.anthropic.claude-haiku-4-5-20251001-v1:0": (
-        "sha256:827e06ceb43f1f5618a9e8aba2dbc8f93a61ff289b67d7b73bb7f56baa942de6"
+        "sha256:d9460ca39c3d183914ddec29d1e035c340072f9c11289aee3deca9bb849e8517"
     ),
-    "zai.glm-5": "sha256:2140ffa2bd76676ce9e64cb8ee7b053a8f18c56fad7b417e44aeacdf596e3678",
+    "zai.glm-5": "sha256:95f751b7efce9e3ba68ff1a926e4d42a502b6caab279affca2df08f00d2e77ca",
     "us.anthropic.claude-opus-4-8": (
-        "sha256:24bfec158bbdb7910c31184c110a575b88cbc38c83b153473072d138bf10d5bc"
+        "sha256:1435fdfb3bca497904994658076ff33c734472c806acff722e3dec51f4104bdd"
     ),
 }
 
