@@ -1584,6 +1584,60 @@ def test_bounded_slices_complete_across_restarts_without_replaying_pairs(
     assert late_calls == []
 
 
+def test_one_block_slices_complete_two_task_confirmation_across_restarts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    design = PairedEvaluationDesign.create(
+        tasks=tuple(PairedTaskPlan(task_id=task_id, group_id=task_id) for task_id in _TASK_IDS),
+        panel=(PairedPanelPlan(panel_member="worker", attempts=1),),
+        primary_e_value_bets=(BoundedMeanBet(fraction=1.0, weight=1.0),),
+        schedule_seed="two-task-slice-schedule",
+        analysis_seed="two-task-slice-analysis",
+        randomization_samples=1_000,
+        minimum_equal_task_member_delta=0.03,
+        noninferiority_margin=0.02,
+    )
+    policy = _slice_policy(max_new_blocks=1, max_waves_per_invocation=1)
+    first_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    first_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        design=design,
+        slice_policy=policy,
+    )
+
+    first = asyncio.run(first_runner.run_slice(baseline=baseline, candidate=candidate))
+
+    assert first.report is None
+    assert first.progress.selected_blocks == (design.blocks[0],)
+    assert first.progress.completed_block_count == 1
+    assert first.progress.remaining_block_count == 1
+    assert len(first_calls) == 2
+
+    second_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    second_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        design=design,
+        slice_policy=policy,
+    )
+    second = asyncio.run(second_runner.run_slice(baseline=baseline, candidate=candidate))
+
+    assert second.report is not None
+    assert second.progress.selected_blocks == (design.blocks[1],)
+    assert second.progress.completed_block_count == 2
+    assert second.progress.remaining_block_count == 0
+    assert second.progress.previous_progress_digest == first.progress.progress_digest
+    assert second_runner._load_progress_chain() == (first.progress, second.progress)
+    assert len(second_calls) == 2
+    assert tuple(item.block for item in second.report.evidence) == design.blocks
+
+
 def test_recover_persisted_slice_closes_genesis_evidence_ahead_without_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3603,8 +3657,7 @@ def test_candidate_task_and_score_failures_remain_analysis_zero_without_retry() 
         assert malformed_descriptor.owner is mod.PairedHarborPairFailureOwner.SCORING
         assert malformed_descriptor.source is mod.PairedHarborPairFailureSource.ADMISSION
         assert (
-            malformed_descriptor.retry_eligibility
-            is mod.PairedHarborPairRetryEligibility.FORBIDDEN
+            malformed_descriptor.retry_eligibility is mod.PairedHarborPairRetryEligibility.FORBIDDEN
         )
 
     for trial in (low_score, candidate_failure, task_timeout):

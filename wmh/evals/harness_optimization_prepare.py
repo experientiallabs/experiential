@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 import subprocess
@@ -12,12 +13,13 @@ from pathlib import Path
 from typing import Literal, Protocol, Self, TypeVar
 
 from harbor.models.job.config import DatasetConfig
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from wmh.agents import default_agent
 from wmh.core.text import validate_durable_text
 from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
 from wmh.evals.harbor.paired_runner import (
+    MAX_RESUMABLE_INVOCATION_RUNTIME_S,
     HarborExecutionPlan,
     HarborExecutionRuntime,
     PairedHarborBudgetRuntime,
@@ -345,7 +347,7 @@ class HarnessOptimizationCanaryManifest(BaseModel):
     dataset_git_commit: str = Field(pattern=_GIT_COMMIT_PATTERN)
     dataset_git_tree: str = Field(pattern=_GIT_COMMIT_PATTERN)
     discovery_source_artifact_digest: str = Field(pattern=_DIGEST_PATTERN)
-    selected_task_names: tuple[str, str]
+    selected_task_names: tuple[str, ...] = Field(min_length=3)
     max_study_budget_nano_usd: int = Field(gt=0, le=(1 << 63) - 1)
     benchmark_adapter: str = Field(default="harbor", min_length=1, max_length=256)
     benchmark_adapter_version: str = Field(min_length=1, max_length=256)
@@ -360,8 +362,19 @@ class HarnessOptimizationCanaryManifest(BaseModel):
     runner_resource_meter_id: str = Field(min_length=1)
     reward_key: str = Field(default="reward", min_length=1)
     turn_timeout_s: float = Field(default=600.0, gt=0.0, le=840.0)
-    iterations: Literal[1] = 1
-    proposal_batch_size: Literal[1] = 1
+    confirmation_max_block_runtime_s: StrictInt = Field(
+        default=3_600,
+        ge=1,
+        description="Full paired block allowance including both Harbor arms and verifiers",
+    )
+    confirmation_per_arm_verifier_timeout_s: StrictInt = Field(default=900, gt=0)
+    confirmation_max_invocation_runtime_s: StrictInt = Field(
+        default=3_900,
+        ge=1,
+        le=MAX_RESUMABLE_INVOCATION_RUNTIME_S,
+    )
+    iterations: StrictInt = Field(default=1, ge=1, le=8)
+    proposal_batch_size: StrictInt = Field(default=1, ge=1, le=8)
     discovery_attempts_per_task: Literal[1] = 1
     confirmation_attempts_per_task: Literal[1] = 1
     schedule_seed: str = Field(min_length=1)
@@ -393,8 +406,13 @@ class HarnessOptimizationCanaryManifest(BaseModel):
         return value
 
     @field_validator(
+        "confirmation_max_block_runtime_s",
+        "confirmation_max_invocation_runtime_s",
+        "confirmation_per_arm_verifier_timeout_s",
         "confirmation_randomization_samples",
+        "iterations",
         "max_study_budget_nano_usd",
+        "proposal_batch_size",
         mode="before",
     )
     @classmethod
@@ -407,13 +425,25 @@ class HarnessOptimizationCanaryManifest(BaseModel):
     def _validate_canary_scope(self) -> Self:
         selected = self.selected_task_names
         if selected != tuple(sorted(set(selected))):
-            raise ValueError("canary requires exactly two sorted unique selected tasks")
+            raise ValueError("canary selected tasks must be sorted and unique")
         for task_name in selected:
             if task_name != task_name.strip() or any(
                 marker in task_name for marker in ("*", "?", "[", "]")
             ):
                 raise ValueError("canary task names must be canonical literals")
             validate_durable_text(task_name, field="canary task name")
+        minimum_confirmation_block_runtime_s = (
+            math.ceil(2 * self.turn_timeout_s) + 2 * self.confirmation_per_arm_verifier_timeout_s
+        )
+        if self.confirmation_max_block_runtime_s < minimum_confirmation_block_runtime_s:
+            raise ValueError(
+                "canary confirmation block runtime must cover both arm timeouts and verifier "
+                "allowances"
+            )
+        if self.confirmation_max_block_runtime_s >= self.confirmation_max_invocation_runtime_s:
+            raise ValueError(
+                "canary confirmation invocation runtime must leave headroom after its block"
+            )
         freeze_provider_response_identity(
             self.proposer_provider_config,
             self.proposer_response_identity,
@@ -629,14 +659,20 @@ class PreparedHarnessOptimizationCanary(BaseModel):
             )
         discovery = self.study_spec.prepared.discovery_contract()
         discovery_ids = {task.task_id for task in discovery.protocol.discovery.tasks}
-        confirmation_ids = set(self.study_spec.prepared.partition.confirmation_task_ids)
+        partition = self.study_spec.prepared.partition
+        confirmation_ids = set(partition.confirmation_task_ids)
+        confirmation_group_ids = {
+            task.group_id for task in partition.tasks if task.task_id in confirmation_ids
+        }
         if (
             discovery_ids & confirmation_ids
             or len(discovery_ids) != 1
-            or len(confirmation_ids) != 1
+            or len(confirmation_ids) < 2
+            or len(confirmation_group_ids) < 2
         ):
             raise ValueError(
-                "plumbing canary requires one isolated discovery and confirmation task"
+                "canary requires one isolated discovery task and at least two confirmation task "
+                "groups"
             )
         serialized_discovery = discovery.model_dump_json()
         if any(task_id in serialized_discovery for task_id in confirmation_ids):
@@ -948,8 +984,8 @@ def _compose_canary(
     slice_policy = PairedHarborSlicePolicy(
         max_new_blocks=1,
         max_waves_per_invocation=1,
-        max_block_runtime_s=max(1, int(manifest.turn_timeout_s) + 120),
-        max_invocation_runtime_s=max(2, int(manifest.turn_timeout_s) + 300),
+        max_block_runtime_s=manifest.confirmation_max_block_runtime_s,
+        max_invocation_runtime_s=manifest.confirmation_max_invocation_runtime_s,
     )
     route = PairedHarborPanelRoute(
         panel_member="worker",

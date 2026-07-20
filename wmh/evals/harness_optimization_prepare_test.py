@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,8 +25,14 @@ from wmh.evals.harbor.e2b_environment import (
     exact_e2b_build_resource_class,
 )
 from wmh.evals.harbor.paired_runner import (
+    HarborConfirmationExecutionCommitment,
     HarborExecutionPlan,
+    OpenedHarborExecutionSelection,
+    PairedHarborProtocol,
     PrequalifiedHarborRoster,
+    _select_paired_harbor_slice_blocks,
+    freeze_harbor_confirmation_candidate,
+    open_harbor_confirmation_once,
 )
 from wmh.evals.harbor.qualification import (
     E2BSpendLimitProvider,
@@ -47,6 +54,7 @@ from wmh.evals.harness_optimization_prepare import (
     _verify_clean_git_checkout,
     prepare_e2b_harness_optimization_canary,
 )
+from wmh.evals.partition import PartitionControlStore
 from wmh.evals.study_provenance import HarnessOptimizationCodeProvenance
 from wmh.harness.pi_runner_backend import e2b_runner_resource_class
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -165,6 +173,7 @@ def _manifest(runner: E2BPiRunnerArtifact) -> HarnessOptimizationCanaryManifest:
         selected_task_names=(
             "discovery-task-a",
             "discovery-task-b",
+            "discovery-task-c",
         ),
         max_study_budget_nano_usd=15_000_000_000_000,
         benchmark_adapter_version="0.18.0",
@@ -179,7 +188,8 @@ def _manifest(runner: E2BPiRunnerArtifact) -> HarnessOptimizationCanaryManifest:
         runner_resource_meter_id="runner",
         reward_key="reward",
         turn_timeout_s=300,
-        iterations=1,
+        iterations=2,
+        proposal_batch_size=2,
         discovery_attempts_per_task=1,
         confirmation_attempts_per_task=1,
         schedule_seed="plumbing-schedule-seed",
@@ -312,7 +322,7 @@ def _qualified_roster(
     task_class: TimedResourceClass,
 ) -> PrequalifiedHarborRoster:
     tasks: list[QualifiedHarborTask] = []
-    for index, task_id in enumerate(("discovery-task-a", "discovery-task-b")):
+    for index, task_id in enumerate(("discovery-task-a", "discovery-task-b", "discovery-task-c")):
         build_spec = ExactE2BBuildSpec(
             environment_id=f"canary-environment-{index}",
             build_context_digest=_digest(f"build-context:{task_id}"),
@@ -400,6 +410,113 @@ def test_exact_live_runner_preflight_receipt_binds_all_spec_fields_and_raw_bytes
         mismatched.validate_runner_spec(runner.spec)
     with pytest.raises(ValueError):
         E2BPiRunnerArtifact.from_json_bytes(b'{"backend":"local"}')
+
+
+@pytest.mark.parametrize(
+    "selected_task_names",
+    [
+        (),
+        ("discovery-task-a",),
+        ("discovery-task-a", "discovery-task-b"),
+    ],
+)
+def test_canary_manifest_rejects_fewer_than_three_selected_tasks(
+    selected_task_names: tuple[str, ...],
+) -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    payload = _manifest(runner).model_dump(mode="python")
+    payload["selected_task_names"] = selected_task_names
+
+    with pytest.raises(ValueError):
+        HarnessOptimizationCanaryManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "selected_task_names",
+    [
+        ("discovery-task-a", "discovery-task-b", "discovery-task-c"),
+        (
+            "discovery-task-a",
+            "discovery-task-b",
+            "discovery-task-c",
+            "discovery-task-d",
+        ),
+    ],
+)
+def test_canary_manifest_accepts_three_or_more_selected_tasks(
+    selected_task_names: tuple[str, ...],
+) -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    payload = _manifest(runner).model_dump(mode="python")
+    payload.update(
+        selected_task_names=selected_task_names,
+        iterations=2,
+        proposal_batch_size=2,
+    )
+
+    manifest = HarnessOptimizationCanaryManifest.model_validate(payload)
+
+    assert manifest.selected_task_names == selected_task_names
+    assert manifest.iterations == 2
+    assert manifest.proposal_batch_size == 2
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {
+                "turn_timeout_s": 840.0,
+                "confirmation_max_block_runtime_s": 3_479,
+            },
+            "cover both arm timeouts and verifier allowances",
+        ),
+        (
+            {
+                "confirmation_max_block_runtime_s": 3_900,
+                "confirmation_max_invocation_runtime_s": 3_900,
+            },
+            "leave headroom after its block",
+        ),
+        (
+            {"confirmation_max_invocation_runtime_s": 82_801},
+            "less than or equal to 82800",
+        ),
+        (
+            {"confirmation_per_arm_verifier_timeout_s": True},
+            "cannot be boolean",
+        ),
+        (
+            {"confirmation_per_arm_verifier_timeout_s": "900"},
+            "valid integer",
+        ),
+    ],
+)
+def test_canary_manifest_rejects_unsafe_confirmation_runtime_bounds(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    payload = _manifest(runner).model_dump(mode="python")
+    payload.update(updates)
+
+    with pytest.raises(ValueError, match=message):
+        HarnessOptimizationCanaryManifest.model_validate(payload)
+
+
+def test_canary_manifest_accepts_exact_arm_and_verifier_runtime_boundary() -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    payload = _manifest(runner).model_dump(mode="python")
+    payload.update(
+        turn_timeout_s=840.0,
+        confirmation_per_arm_verifier_timeout_s=900,
+        confirmation_max_block_runtime_s=3_480,
+        confirmation_max_invocation_runtime_s=3_481,
+    )
+
+    manifest = HarnessOptimizationCanaryManifest.model_validate(payload)
+
+    assert manifest.confirmation_max_block_runtime_s == 3_480
 
 
 def test_atomic_publication_recovers_after_sigkill_before_no_replace_link(
@@ -505,7 +622,11 @@ def test_authoritative_split_commitment_rejects_non_discovery_task_before_qualif
     runner_path, runner_preflight_path, discovery_path, repository = _input_artifacts(tmp_path)
     runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
     payload = _manifest(runner).model_dump(mode="python")
-    payload["selected_task_names"] = ("discovery-task-b", "heldout-task")
+    payload["selected_task_names"] = (
+        "discovery-task-a",
+        "discovery-task-b",
+        "heldout-task",
+    )
     manifest = HarnessOptimizationCanaryManifest.model_validate(payload)
     runtime, _task_class = _runtime(tmp_path, runner, manifest)
 
@@ -542,7 +663,7 @@ def test_prequalification_budget_policy_ledger_and_15k_cap_bind_final_study_spec
 ) -> None:
     runner_path, runner_preflight_path, discovery_path, repository = _input_artifacts(tmp_path)
     runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
-    manifest = _manifest(runner)
+    manifest = _manifest(runner).model_copy(update={"turn_timeout_s": 840.0})
     runtime, task_class = _runtime(tmp_path, runner, manifest)
     qualifier_calls: list[dict[str, object]] = []
 
@@ -601,15 +722,112 @@ def test_prequalification_budget_policy_ledger_and_15k_cap_bind_final_study_spec
     assert launch.optimizer_feedback_allowed is False
     assert launch.final_evidence_allowed is False
     assert len(launch.study_spec.prepared.protocol.discovery.tasks) == 1
-    assert len(launch.study_spec.prepared.partition.confirmation_task_ids) == 1
-    confirmation_task = launch.study_spec.prepared.partition.confirmation_task_ids[0]
+    assert len(launch.study_spec.prepared.partition.confirmation_task_ids) == 2
+    confirmation_tasks = launch.study_spec.prepared.partition.confirmation_task_ids
     discovery_json = launch.study_spec.prepared.discovery_contract().model_dump_json()
-    assert confirmation_task not in discovery_json
-    assert launch.study_spec.qualification_report.qualified_task_count == 2
+    assert all(task_id not in discovery_json for task_id in confirmation_tasks)
+    assert launch.study_spec.qualification_report.qualified_task_count == 3
     assert (
         launch.study_spec.qualification_report.environment_backend is HarborEnvironmentBackend.E2B
     )
     assert qualifier_calls[0]["e2b_spend_limit_provider"] is _unused_spend_limit_provider
+
+    prepared = launch.study_spec.prepared
+    assert prepared.protocol.search.iterations == manifest.iterations == 2
+    assert prepared.protocol.search.proposal_batch_size == manifest.proposal_batch_size == 2
+    baseline = prepared.baseline
+    candidate_surfaces = [surface.model_copy(deep=True) for surface in baseline.surfaces]
+    prompt_index = next(
+        index for index, surface in enumerate(candidate_surfaces) if surface.id == "prompt:core"
+    )
+    prompt = candidate_surfaces[prompt_index]
+    candidate_surfaces[prompt_index] = prompt.model_copy(
+        update={"content": f"{prompt.content}\nCheck the final result before submitting."}
+    )
+    candidate = baseline.model_copy(
+        update={"name": "optimized", "surfaces": candidate_surfaces},
+        deep=True,
+    )
+    slice_policy = prepared.confirmation_slice_policy
+    verifier_timeout_s = manifest.confirmation_per_arm_verifier_timeout_s
+    assert slice_policy.max_block_runtime_s == manifest.confirmation_max_block_runtime_s == 3_600
+    assert (
+        slice_policy.max_block_runtime_s
+        >= math.ceil(2 * manifest.turn_timeout_s) + 2 * verifier_timeout_s
+    )
+    assert (
+        slice_policy.max_invocation_runtime_s
+        == manifest.confirmation_max_invocation_runtime_s
+        == 3_900
+    )
+    assert slice_policy.max_invocation_runtime_s - slice_policy.max_block_runtime_s == 300
+    commitment = HarborConfirmationExecutionCommitment.freeze(
+        discovery=prepared.protocol.discovery,
+        design_template=prepared.protocol.confirmation.template(),
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=prepared.protocol.execution_plan,
+        panel_routes=prepared.protocol.panel_routes,
+        qualification_roster=prepared.qualification_roster,
+        max_concurrent_blocks=prepared.protocol.max_concurrent_blocks,
+        slice_policy=slice_policy,
+        retry_policy_digest=prepared.protocol.retry_policy_digest,
+        budget_runtime=prepared.confirmation_budget,
+    )
+    control_store = PartitionControlStore(launch.study_spec.partition_control_dir)
+    freeze_harbor_confirmation_candidate(
+        control_store,
+        manifest=prepared.partition,
+        commitment=commitment,
+    )
+    confirmation = open_harbor_confirmation_once(
+        control_store,
+        manifest=prepared.partition,
+        commitment=commitment,
+    )
+    design = commitment.derive_design(confirmation)
+    selection = OpenedHarborExecutionSelection.project(
+        execution_plan=prepared.protocol.execution_plan,
+        roster=prepared.qualification_roster,
+        confirmation=confirmation,
+        design=design,
+    )
+    paired = PairedHarborProtocol.freeze(
+        preopen_commitment=commitment,
+        design=design,
+        confirmation=confirmation,
+        baseline=baseline,
+        candidate=candidate,
+        execution_plan=prepared.protocol.execution_plan,
+        panel_routes=prepared.protocol.panel_routes,
+        qualification_roster=prepared.qualification_roster,
+        opened_selection=selection,
+        max_concurrent_blocks=prepared.protocol.max_concurrent_blocks,
+        retry_policy_digest=prepared.protocol.retry_policy_digest,
+    )
+    first_slice = _select_paired_harbor_slice_blocks(
+        paired,
+        completed_blocks=frozenset(),
+        max_new_blocks=paired.slice_policy.max_new_blocks,
+    )
+    second_slice = _select_paired_harbor_slice_blocks(
+        paired,
+        completed_blocks=frozenset(first_slice),
+        max_new_blocks=paired.slice_policy.max_new_blocks,
+    )
+    completed = frozenset((*first_slice, *second_slice))
+
+    assert len(design.group_ids) == 2
+    assert len(design.blocks) == 2
+    assert len(first_slice) == len(second_slice) == 1
+    assert first_slice != second_slice
+    assert completed == frozenset(design.blocks)
+    assert not _select_paired_harbor_slice_blocks(
+        paired,
+        completed_blocks=completed,
+        max_new_blocks=paired.slice_policy.max_new_blocks,
+    )
+
     sealed = tmp_path / "work" / "sealed-canary"
     prepared_path = sealed / "prepared-canary-launch.json"
     assert prepared_path.is_file()
@@ -640,6 +858,22 @@ def test_prequalification_budget_policy_ledger_and_15k_cap_bind_final_study_spec
         for name in PreparedHarnessOptimizationCanary.model_fields
         if name != "study_spec"
     }
+    confirmation_ids = set(prepared.partition.confirmation_task_ids)
+    one_group_partition = prepared.partition.model_copy(
+        update={
+            "tasks": tuple(
+                task.model_copy(update={"group_id": "shared-confirmation-group"})
+                if task.task_id in confirmation_ids
+                else task
+                for task in prepared.partition.tasks
+            )
+        }
+    )
+    one_group_prepared = prepared.model_copy(update={"partition": one_group_partition})
+    one_group_study = launch.study_spec.model_copy(update={"prepared": one_group_prepared})
+    with pytest.raises(ValueError, match="at least two confirmation task groups"):
+        PreparedHarnessOptimizationCanary(**launch_fields, study_spec=one_group_study)
+
     with pytest.raises(ValueError, match="budget or runtime differs"):
         PreparedHarnessOptimizationCanary(**launch_fields, study_spec=foreign_study)
 
