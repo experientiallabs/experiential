@@ -47,6 +47,10 @@ class Message(BaseModel):
 
 
 class TokenUsage(BaseModel):
+    # Providers may report separately billed usage dimensions. Preserve them so the hard-budget
+    # boundary can price a registered inclusive subset or fail closed on an unknown dimension.
+    model_config = ConfigDict(extra="allow")
+
     input_tokens: int = 0
     output_tokens: int = 0
 
@@ -58,6 +62,9 @@ class Completion(BaseModel):
     # the call. None (the norm) means "the configured model" — metering falls back to config.
     # min_length=1 keeps "" impossible, so `completion.model or config.model` is exact.
     model: str | None = Field(default=None, min_length=1)
+    # OpenAI-compatible providers can report a backend fingerprint independently of the served
+    # model. Preserve explicit absence so a frozen scored route can distinguish it from a value.
+    system_fingerprint: str | None = Field(default=None, min_length=1, max_length=512)
 
 
 DEFAULT_MAX_TOKENS = 8192

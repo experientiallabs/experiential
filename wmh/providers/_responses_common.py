@@ -209,10 +209,18 @@ def responses_response(
 
     usage = _object_dict(raw.get("usage"))
     if usage is not None:
-        response["usage"] = {
+        translated_usage: dict[str, object] = {
             "prompt_tokens": _usage_count(usage.get("input_tokens")),
             "completion_tokens": _usage_count(usage.get("output_tokens")),
         }
+        translated_usage.update(
+            {
+                name: value
+                for name, value in usage.items()
+                if name not in {"input_tokens", "output_tokens"}
+            }
+        )
+        response["usage"] = translated_usage
 
     service_tier = raw.get("service_tier")
     if isinstance(service_tier, str):

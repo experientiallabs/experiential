@@ -106,9 +106,18 @@ class _FakeChat:
 
 
 class _FakeResponsesResponse:
-    def __init__(self, tool_name: str = "bash", text: str | None = None) -> None:
+    def __init__(
+        self,
+        tool_name: str = "bash",
+        text: str | None = None,
+        *,
+        usage: dict[str, object] | None = None,
+        system_fingerprint: str | None = None,
+    ) -> None:
         self.tool_name = tool_name
         self.text = text
+        self.usage = usage or {"input_tokens": 11, "output_tokens": 7}
+        self.system_fingerprint = system_fingerprint
 
     def model_dump(self, *, mode: str) -> dict[str, object]:
         assert mode == "json"
@@ -138,13 +147,16 @@ class _FakeResponsesResponse:
                     "content": [{"type": "output_text", "text": self.text}],
                 }
             )
-        return {
+        response: dict[str, object] = {
             "id": "response-azure-1",
             "model": "gpt-5.5-2026-06-01",
             "status": "completed",
             "output": output,
-            "usage": {"input_tokens": 11, "output_tokens": 7},
+            "usage": self.usage,
         }
+        if self.system_fingerprint is not None:
+            response["system_fingerprint"] = self.system_fingerprint
+        return response
 
 
 class _FakeResponses:
@@ -153,11 +165,15 @@ class _FakeResponses:
         *,
         tool_name: str = "bash",
         text: str | None = None,
+        usage: dict[str, object] | None = None,
+        system_fingerprint: str | None = None,
         headers: dict[str, str] | None = None,
         error: Exception | None = None,
     ) -> None:
         self.tool_name = tool_name
         self.text = text
+        self.usage = usage
+        self.system_fingerprint = system_fingerprint
         self.headers = (
             {"apim-request-id": "provider-request-azure-responses-1"}
             if headers is None
@@ -173,7 +189,12 @@ class _FakeResponses:
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
-        return _FakeResponsesResponse(self.tool_name, self.text)
+        return _FakeResponsesResponse(
+            self.tool_name,
+            self.text,
+            usage=self.usage,
+            system_fingerprint=self.system_fingerprint,
+        )
 
 
 class _FakeResponsesRawResponse:
@@ -242,6 +263,7 @@ def _config() -> ProviderConfig:
 def _reasoning_config() -> ProviderConfig:
     return ProviderConfig(
         kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
         model="gpt-5.5",
         endpoint="https://example.openai.azure.com",
         deployment="gpt55-deploy",
@@ -249,6 +271,16 @@ def _reasoning_config() -> ProviderConfig:
         reasoning_effort="high",
         responses_api_version="v1",
     )
+
+
+def _reasoning_response_usage() -> dict[str, object]:
+    return {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+        "input_tokens_details": {"cached_tokens": 3},
+        "output_tokens_details": {"reasoning_tokens": 5},
+    }
 
 
 def test_reasoning_config_requires_explicit_responses_api_version() -> None:
@@ -279,7 +311,11 @@ def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_complete_binds_configured_reasoning_effort(monkeypatch: pytest.MonkeyPatch) -> None:
-    responses = _FakeResponses(text="yo")
+    responses = _FakeResponses(
+        text="yo",
+        usage=_reasoning_response_usage(),
+        system_fingerprint="fp-azure-responses-1",
+    )
     provider = AzureOpenAIProvider(_reasoning_config())
     monkeypatch.setattr(
         provider,
@@ -295,7 +331,17 @@ def test_complete_binds_configured_reasoning_effort(monkeypatch: pytest.MonkeyPa
     completion = provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
 
     assert completion.text == "yo"
-    assert completion.usage == TokenUsage(input_tokens=11, output_tokens=7)
+    assert completion.model == "gpt-5.5-2026-06-01"
+    assert completion.system_fingerprint == "fp-azure-responses-1"
+    assert completion.usage == TokenUsage.model_validate(
+        {
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "total_tokens": 18,
+            "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens_details": {"reasoning_tokens": 5},
+        }
+    )
     assert responses.last_kwargs["reasoning"] == {"effort": "high"}
     assert responses.last_kwargs["input"] == [
         {"role": "system", "content": "sys"},

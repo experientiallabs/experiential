@@ -159,14 +159,26 @@ class AzureOpenAIProvider:
             content = response.choices[0].message.content
             if not isinstance(content, str):
                 raise ValueError(f"{self._deployment()} returned no text completion")
-            usage = response.token_usage()
-            return Completion(
-                text=content,
-                usage=TokenUsage(
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                ),
+            completion_fields: dict[str, object] = {
+                "text": content,
+                "model": response.model,
+                "system_fingerprint": response.system_fingerprint,
+            }
+            if response.usage is None:
+                # A paid response without provider usage must remain distinguishable from a
+                # genuine zero-token response so the hard-budget boundary can forfeit it.
+                return Completion.model_validate(completion_fields)
+            usage_payload = response.usage.model_dump(mode="json")
+            usage_payload.pop("prompt_tokens", None)
+            usage_payload.pop("completion_tokens", None)
+            completion_fields["usage"] = TokenUsage.model_validate(
+                {
+                    "input_tokens": response.usage.prompt_tokens,
+                    "output_tokens": response.usage.completion_tokens,
+                    **usage_payload,
+                }
             )
+            return Completion.model_validate(completion_fields)
         return _openai_common.complete(
             self._get_client().chat.completions,
             self._deployment(),
