@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Protocol, TypedDict, TypeVar
+from typing import Annotated, Generic, Literal, Protocol, TypedDict, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -27,10 +27,12 @@ from wmh.evals.study_journal import (
     StudyJournalStore,
     StudyPhase,
     StudyPhaseRecord,
+    StudyRunCheckpointIdentity,
     StudyRunClaim,
     append_study_phase,
     append_study_phase_derived,
     call_in_study_phase,
+    call_in_study_slice,
     claim_study_run,
     load_study_journal,
 )
@@ -44,6 +46,8 @@ from wmh.tracking.budget import (
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _ResultT = TypeVar("_ResultT")
+_CheckpointT = TypeVar("_CheckpointT", bound=BaseModel)
+_CompletedResultT = TypeVar("_CompletedResultT", bound=BaseModel)
 
 
 class _TerminalBudgetFields(TypedDict):
@@ -79,6 +83,15 @@ class _StudyPayload(BaseModel):
 
 
 _StudyPayloadT = TypeVar("_StudyPayloadT", bound=_StudyPayload)
+
+
+class StudySliceResult(BaseModel, Generic[_CheckpointT, _CompletedResultT]):
+    """One newly durable checkpoint plus a result only when the run is complete."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    checkpoint: _CheckpointT
+    result: _CompletedResultT | None = None
 
 
 class StudyArtifactPublication(BaseModel):
@@ -717,6 +730,53 @@ class StudyLifecycleController:
             run_id=run_id,
             publisher=self._publisher,
             resume=resume,
+        )
+
+    def run_slice(
+        self,
+        expected: StudyPhase,
+        run_id: str,
+        operation: Callable[[], StudySliceResult[_CheckpointT, _CompletedResultT]],
+        *,
+        payload_digest: str,
+        configuration_digest: str,
+        resume_from: StudyRunCheckpointIdentity | None,
+        checkpoint_identity: Callable[[_CheckpointT], StudyRunCheckpointIdentity],
+    ) -> StudySliceResult[_CheckpointT, _CompletedResultT]:
+        """Run one serialized invocation and bind its newly persisted checkpoint.
+
+        Args:
+            expected: Active phase authorized to execute the slice.
+            run_id: Stable identity shared by the fresh invocation and every resume.
+            operation: Bounded work that returns one new durable checkpoint.
+            payload_digest: Exact typed phase authorization digest.
+            configuration_digest: Frozen path-free slice configuration identity.
+            resume_from: Latest checkpoint identity, or none for a fresh run.
+            checkpoint_identity: Extract the path-free identity from the returned checkpoint.
+
+        Returns:
+            The detached checkpoint and optional complete result returned by the operation.
+        """
+
+        def _run() -> tuple[
+            StudySliceResult[_CheckpointT, _CompletedResultT],
+            StudyRunCheckpointIdentity,
+        ]:
+            frozen = operation().model_copy(deep=True)
+            identity = StudyRunCheckpointIdentity.model_validate(
+                checkpoint_identity(frozen.checkpoint).model_dump(mode="json")
+            )
+            return frozen, identity
+
+        return call_in_study_slice(
+            self._store,
+            phase=expected,
+            authorization_payload_digest=payload_digest,
+            run_id=run_id,
+            configuration_digest=configuration_digest,
+            resume_from=resume_from,
+            publisher=self._publisher,
+            operation=_run,
         )
 
     def call_in_phase(

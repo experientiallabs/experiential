@@ -32,6 +32,7 @@ from wmh.evals.harness_optimization import (
     open_harness_optimization_confirmation,
     prepare_harness_optimization_study,
     run_harness_optimization_search,
+    run_harness_optimization_search_slice,
 )
 from wmh.evals.paired import BoundedMeanBet, PairedPanelPlan
 from wmh.evals.partition import (
@@ -67,6 +68,7 @@ from wmh.harness.delta import (
 )
 from wmh.harness.doc import HarnessDoc, SurfaceKind
 from wmh.harness.proposer import ProposalFailure
+from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.harness.scoring import (
     HarnessScoreReport,
     ScoreCapabilities,
@@ -619,6 +621,270 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
     assert opened.design.panel_members == ("glm", "haiku", "opus")
     assert opened.design.attempts_by_member == {"glm": 15, "haiku": 15, "opus": 15}
     assert opened.confirmation.confirmation_protocol_digest == frozen.confirmation_commitment.digest
+
+
+def test_search_slice_returns_after_one_durable_checkpoint_and_resumes(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    persisted: list[SearchCheckpoint] = []
+
+    first = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=persisted.append,
+    )
+
+    assert first.checkpoint == persisted[-1]
+    assert first.checkpoint.completed_iteration == 0
+    assert first.result is None
+    assert scorer.score_calls == 1
+
+    second = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=authorization,
+        resume_from=first.checkpoint,
+        on_checkpoint=persisted.append,
+        on_proposal_batch_prepare=lambda _witness: None,
+        on_proposal_batch_witness=lambda _witness: None,
+    )
+
+    assert [checkpoint.completed_iteration for checkpoint in persisted] == [0, 1]
+    assert second.checkpoint == persisted[-1]
+    assert second.result is not None
+    assert second.result.best.execution_digest != baseline.execution_digest
+    assert scorer.score_calls == 2
+
+
+def test_search_slice_rejects_identity_drift_before_paid_resume_work(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    first_scorer = _Scorer(manifest.discovery_task_ids)
+    first = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=first_scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=lambda _checkpoint: None,
+    )
+    drifted_scorer = _Scorer(tuple(reversed(manifest.discovery_task_ids)))
+
+    with pytest.raises(ValueError, match="task matrix"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=drifted_scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=authorization,
+            resume_from=first.checkpoint,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert drifted_scorer.score_calls == 0
+
+
+def test_search_slice_checkpoint_callback_crash_resumes_from_captured_state(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    persisted: list[SearchCheckpoint] = []
+
+    def _persist_then_crash(checkpoint: SearchCheckpoint) -> None:
+        persisted.append(checkpoint)
+        raise RuntimeError("simulated host crash after checkpoint persistence")
+
+    with pytest.raises(RuntimeError, match="simulated host crash"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=authorization,
+            on_checkpoint=_persist_then_crash,
+        )
+
+    assert persisted[-1].completed_iteration == 0
+    resumed = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        resume_from=persisted[-1],
+        on_checkpoint=persisted.append,
+        on_proposal_batch_prepare=lambda _witness: None,
+        on_proposal_batch_witness=lambda _witness: None,
+    )
+
+    assert resumed.result is not None
+    assert resumed.checkpoint.completed_iteration == 1
+    assert scorer.score_calls == 2
+
+
+def test_search_slice_rejects_fresh_replay_without_new_paid_work(tmp_path: Path) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    first = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=lambda _checkpoint: None,
+    )
+    assert first.checkpoint.completed_iteration == 0
+    paid_calls = scorer.score_calls
+
+    with pytest.raises(ValueError, match="already started"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=authorization,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert scorer.score_calls == paid_calls
+
+
+def test_search_slice_requires_durable_proposal_witnesses_before_paid_work(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    first = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=lambda _checkpoint: None,
+    )
+    paid_calls = scorer.score_calls
+
+    with pytest.raises(ValueError, match="durable proposal prepare and witness"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=authorization,
+            resume_from=first.checkpoint,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert scorer.score_calls == paid_calls
+
+
+def test_search_slice_rejects_stale_checkpoint_replay_without_paid_work(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    first = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=lambda _checkpoint: None,
+    )
+    second = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        resume_from=first.checkpoint,
+        on_checkpoint=lambda _checkpoint: None,
+        on_proposal_batch_prepare=lambda _witness: None,
+        on_proposal_batch_witness=lambda _witness: None,
+    )
+    assert second.result is not None
+    paid_calls = scorer.score_calls
+
+    with pytest.raises(ValueError, match="latest durable checkpoint"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=authorization,
+            resume_from=first.checkpoint,
+            on_checkpoint=lambda _checkpoint: None,
+            on_proposal_batch_prepare=lambda _witness: None,
+            on_proposal_batch_witness=lambda _witness: None,
+        )
+
+    assert scorer.score_calls == paid_calls
+
+    with pytest.raises(ValueError, match="already complete"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=authorization,
+            resume_from=second.checkpoint,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert scorer.score_calls == paid_calls
+
+
+def test_search_slice_never_returns_without_a_new_durable_checkpoint(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    persisted: list[SearchCheckpoint] = []
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=_CodeProposer(),
+            lifecycle=lifecycle,
+            authorization=authorization,
+            on_checkpoint=persisted.append,
+            should_cancel=lambda: True,
+        )
+
+    assert persisted == []
+    assert scorer.score_calls == 0
 
 
 def test_heldout_open_rejects_a_candidate_publication_for_different_source(
