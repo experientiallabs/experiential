@@ -11,7 +11,6 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -34,6 +33,7 @@ from wmh.providers.base import (
     TokenUsage,
     VerifyResult,
 )
+from wmh.tracking._testing import synthetic_tariff_provenance
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
@@ -48,8 +48,6 @@ from wmh.tracking.budget import (
     BudgetTerminalProvenance,
     ExternalSpendAuthority,
     ProviderCostMeter,
-    ProviderTariffProvenance,
-    ProviderTariffRoute,
     ReservationStatus,
     SpendLedger,
     TimedResourceBudget,
@@ -72,22 +70,6 @@ from wmh.tracking.budget import (
 )
 
 
-def _test_tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
-    return ProviderTariffProvenance(
-        source_locator="https://example.test/provider-pricing",
-        source_snapshot_digest="sha256:" + "f" * 64,
-        verified_on=date(2026, 7, 19),
-        effective_on=date(2026, 7, 1),
-        currency="USD",
-        price_unit="per_1m_tokens",
-        route=ProviderTariffRoute(
-            provider_config=provider_config,
-            billing_region=provider_config.region or "test-region",
-            billing_sku="test-sku",
-        ),
-    )
-
-
 def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPolicy:
     provider_config = ProviderConfig(
         kind=ProviderKind.BEDROCK,
@@ -106,7 +88,7 @@ def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPoli
                     input_nano_usd_per_token=2,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_test_tariff_provenance(provider_config),
+                tariff_provenance=synthetic_tariff_provenance(provider_config),
                 input_overhead_tokens=8,
             )
         },

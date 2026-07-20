@@ -11,7 +11,6 @@ import os
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Iterator
 from contextlib import ExitStack, asynccontextmanager, contextmanager
-from datetime import date
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -63,12 +62,11 @@ from wmh.harness.pi_runner_backend import (
     e2b_runner_resource_class,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking._testing import synthetic_tariff_provenance
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     ProviderCostMeter,
-    ProviderTariffProvenance,
-    ProviderTariffRoute,
     SpendLedger,
     TimedResourceClass,
     TimedResourceCostMeter,
@@ -96,22 +94,6 @@ _ENVIRONMENT_DIGESTS = {
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RETRY_POLICY_DIGEST = "sha256:" + "5" * 64
 _BUDGET_POLICY_DIGEST = "sha256:" + "6" * 64
-
-
-def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
-    return ProviderTariffProvenance(
-        source_locator="https://example.test/provider-pricing",
-        source_snapshot_digest="sha256:" + "f" * 64,
-        verified_on=date(2026, 7, 19),
-        effective_on=date(2026, 7, 1),
-        currency="USD",
-        price_unit="per_1m_tokens",
-        route=ProviderTariffRoute(
-            provider_config=provider_config,
-            billing_region=provider_config.region or "test-region",
-            billing_sku="test-sku",
-        ),
-    )
 
 
 class _ProcessEvent(Protocol):
@@ -791,7 +773,7 @@ def _budget_runtime(
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_tariff_provenance(route.provider_config),
+                tariff_provenance=synthetic_tariff_provenance(route.provider_config),
             )
             for route in routes
         },
@@ -921,7 +903,7 @@ def _e2b_budget_runtime(
                         input_nano_usd_per_token=1,
                         output_nano_usd_per_token=5,
                     ),
-                    tariff_provenance=_tariff_provenance(route.provider_config),
+                    tariff_provenance=synthetic_tariff_provenance(route.provider_config),
                 )
                 for route in routes
             },

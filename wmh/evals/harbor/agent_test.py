@@ -9,7 +9,6 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -47,13 +46,12 @@ from wmh.providers.process_worker import (
     ProviderWorkerDeadlineExceeded,
     ProviderWorkerUnavailable,
 )
+from wmh.tracking._testing import synthetic_tariff_provenance
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
-    ProviderTariffProvenance,
-    ProviderTariffRoute,
     TokenPriceCeiling,
     bind_budget_account,
     bootstrap_budget_ledger,
@@ -64,23 +62,6 @@ from wmh.tracking.rate_limit import (
     ExternalDispatchRatePolicy,
     bind_external_dispatch_rate_authority,
 )
-
-
-def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
-    return ProviderTariffProvenance(
-        source_locator="https://example.test/provider-pricing",
-        source_snapshot_digest="sha256:" + "f" * 64,
-        verified_on=date(2026, 7, 19),
-        effective_on=date(2026, 7, 1),
-        currency="USD",
-        price_unit="per_1m_tokens",
-        route=ProviderTariffRoute(
-            provider_config=provider_config,
-            billing_region=provider_config.region or "test-region",
-            billing_sku="test-sku",
-        ),
-    )
-
 
 _TASK_ENVIRONMENT_ATTESTATION = cast(
     "JsonObject",
@@ -310,7 +291,7 @@ def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 ),
-                tariff_provenance=_tariff_provenance(config),
+                tariff_provenance=synthetic_tariff_provenance(config),
             )
         },
     )
