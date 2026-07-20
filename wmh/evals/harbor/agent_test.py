@@ -19,7 +19,7 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatRequest, ChatResponse, ResponseTranslationFailure
 
 import wmh.evals.harbor.agent as mod
 from wmh.core.types import JsonObject
@@ -1913,6 +1913,7 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
         worker_usage=TokenUsage(input_tokens=17, output_tokens=5, calls=1),
         provider_failure_stage=ProviderFailureStage.RESPONSE_TRANSLATION,
         provider_failure_reason=ProviderFailureReason.UNKNOWN,
+        provider_response_translation_failure=(ResponseTranslationFailure.TOOL_USE_SHAPE),
     )
     monkeypatch.setattr(
         mod,
@@ -1931,6 +1932,7 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
     assert context.metadata["infrastructure_failure_kind"] == "provider"
     assert context.metadata["provider_failure_stage"] == "response_translation"
     assert context.metadata["provider_failure_reason"] == "unknown"
+    assert context.metadata["provider_response_translation_failure"] == "tool_use_shape"
     assert context.metadata["run_health"] == "infrastructure_failure"
     trace = (tmp_path / "wmh-events.jsonl").read_text(encoding="utf-8")
     assert "first answer" in trace

@@ -14,7 +14,7 @@ import time
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol
 
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatRequest, ChatResponse, ResponseTranslationFailure
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from wmh.providers.base import ProviderConfig, ToolCallingProvider
@@ -132,10 +132,27 @@ class _FailureFrame(_StrictFrame):
     owner: ProviderFailureOwner
     reason: ProviderFailureReason
     stage: ProviderFailureStage
+    response_translation_failure: ResponseTranslationFailure | None = None
+
+    @model_validator(mode="after")
+    def _bind_response_translation_failure(self) -> _FailureFrame:
+        if self.stage is ProviderFailureStage.RESPONSE_TRANSLATION:
+            if self.response_translation_failure is None:
+                raise ValueError(
+                    "response translation failure is required at the response_translation stage"
+                )
+        elif self.response_translation_failure is not None:
+            raise ValueError("response translation failure requires the response_translation stage")
+        return self
 
     @property
     def attribution(self) -> ProviderFailureAttribution:
-        return ProviderFailureAttribution(self.owner, self.reason, self.stage)
+        return ProviderFailureAttribution(
+            self.owner,
+            self.reason,
+            self.stage,
+            self.response_translation_failure,
+        )
 
 
 class _TerminalFailureReason(StrEnum):
@@ -711,6 +728,7 @@ def _serve_worker(socket_fd: int) -> int:
                         owner=attribution.owner,
                         reason=attribution.reason,
                         stage=attribution.stage,
+                        response_translation_failure=(attribution.response_translation_failure),
                     ),
                 )
                 continue

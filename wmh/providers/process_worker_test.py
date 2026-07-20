@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatRequest, ChatResponse, ResponseTranslationFailure
 
 import wmh.providers.process_worker as mod
 from wmh.harness.pi_runner import TurnDeadline
@@ -352,6 +352,69 @@ def test_worker_child_preserves_only_bounded_failure_stage(
 
     assert worker_thread.is_alive() is False
     assert exit_codes == [0]
+
+
+def test_worker_child_preserves_only_bounded_response_translation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "provider-secret-sentinel"
+
+    class FakeProvider:
+        config = _CONFIG
+
+        def complete_chat(self, _request: ChatRequest) -> ChatResponse:
+            raise ProviderBoundaryError(
+                ProviderFailureStage.RESPONSE_TRANSLATION,
+                ValueError(secret),
+                response_translation_failure=(ResponseTranslationFailure.TOOL_USE_SHAPE),
+            )
+
+    monkeypatch.setattr(mod, "get_provider", lambda _config: FakeProvider())
+    server, client = socket.socketpair()
+    server_fd = server.detach()
+    exit_codes: list[int] = []
+    worker_thread = threading.Thread(target=lambda: exit_codes.append(mod._serve_worker(server_fd)))
+    worker_thread.start()
+    try:
+        mod._send_frame(client, mod._InitializeFrame(provider_config=_CONFIG))
+        assert mod._receive_frame(client) == {"kind": "ready"}
+        mod._send_frame(client, mod._CompletionRequestFrame(request=_REQUEST))
+        payload = mod._receive_frame(client)
+        failure = mod._FailureFrame.model_validate(payload)
+        assert failure.owner is ProviderFailureOwner.INFRASTRUCTURE
+        assert failure.reason is ProviderFailureReason.UNKNOWN
+        assert failure.stage is ProviderFailureStage.RESPONSE_TRANSLATION
+        assert failure.response_translation_failure is ResponseTranslationFailure.TOOL_USE_SHAPE
+        assert secret not in json.dumps(payload)
+    finally:
+        client.close()
+        worker_thread.join(timeout=5)
+
+    assert worker_thread.is_alive() is False
+    assert exit_codes == [0]
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {
+            "owner": ProviderFailureOwner.INFRASTRUCTURE,
+            "reason": ProviderFailureReason.UNKNOWN,
+            "stage": ProviderFailureStage.RESPONSE_TRANSLATION,
+        },
+        {
+            "owner": ProviderFailureOwner.INFRASTRUCTURE,
+            "reason": ProviderFailureReason.UNKNOWN,
+            "stage": ProviderFailureStage.DISPATCH,
+            "response_translation_failure": ResponseTranslationFailure.TOOL_USE_SHAPE,
+        },
+    ],
+)
+def test_failure_frame_binds_discriminator_to_response_translation_stage(
+    frame: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="response translation failure"):
+        mod._FailureFrame.model_validate(frame)
 
 
 def test_terminal_failure_frame_rejects_stage_reason_drift() -> None:

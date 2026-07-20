@@ -11,7 +11,11 @@ import threading
 from typing import TYPE_CHECKING, TypedDict, cast
 
 from llm_waterfall.adapters.base import missing_sdk_error
-from llm_waterfall.bedrock_chat import bedrock_converse_request, bedrock_converse_response
+from llm_waterfall.bedrock_chat import (
+    bedrock_converse_client_tool_names,
+    bedrock_converse_request,
+    bedrock_converse_response,
+)
 from llm_waterfall.types import (
     Backend,
     ChatRequest,
@@ -121,7 +125,11 @@ class BedrockAdapter:
                 reasoning_effort=self.backend.reasoning_effort,
             )
             raw = self._get_client().converse(**payload)
-            response = bedrock_converse_response(raw, self.backend.model)
+            response = bedrock_converse_response(
+                raw,
+                self.backend.model,
+                advertised_client_tools=bedrock_converse_client_tool_names(payload),
+            )
             choice = response.choices[0]
             return str(choice.message.content or ""), response.token_usage()
         body: dict[str, object] = {
@@ -150,7 +158,11 @@ class BedrockAdapter:
             reasoning_effort=self.backend.reasoning_effort,
         )
         response = self._get_client().converse(**payload)
-        return bedrock_converse_response(response, self.backend.model)
+        return bedrock_converse_response(
+            response,
+            self.backend.model,
+            advertised_client_tools=bedrock_converse_client_tool_names(payload),
+        )
 
     def embed_model_id(self) -> str | None:
         """The model embed() resolves to — the single source of truth for embed attribution."""

@@ -16,7 +16,7 @@ from enum import StrEnum
 from statistics import fmean
 from typing import Self, TypeGuard
 
-from llm_waterfall import ReasoningEffort
+from llm_waterfall import ReasoningEffort, ResponseTranslationFailure
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wmh.core.types import JsonObject
@@ -344,6 +344,7 @@ class BenchmarkTrialResult(BaseModel):
     run_health: BenchmarkRunHealth = BenchmarkRunHealth.UNKNOWN
     provider_failure_stage: ProviderFailureStage | None = None
     provider_failure_reason: ProviderFailureReason | None = None
+    provider_response_translation_failure: ResponseTranslationFailure | None = None
 
     @field_validator("rewards", mode="before")
     @classmethod
@@ -361,6 +362,13 @@ class BenchmarkTrialResult(BaseModel):
     def _validate_evidence(self) -> Self:
         if (self.provider_failure_stage is None) != (self.provider_failure_reason is None):
             raise ValueError("provider failure stage and reason must be supplied together")
+        if self.provider_failure_stage is ProviderFailureStage.RESPONSE_TRANSLATION:
+            if self.provider_response_translation_failure is None:
+                raise ValueError(
+                    "response translation failure is required at the response_translation stage"
+                )
+        elif self.provider_response_translation_failure is not None:
+            raise ValueError("response translation failure requires the response_translation stage")
         if self.provider_failure_stage is not None and (
             self.error is None or self.error.kind is not BenchmarkFailureKind.PROVIDER
         ):

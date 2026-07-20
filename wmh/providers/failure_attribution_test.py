@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from llm_waterfall import ResponseTranslationFailure
 
 from wmh.providers.failure_attribution import (
     ProviderBoundaryError,
@@ -66,6 +67,32 @@ def test_staged_failure_preserves_sdk_attribution_without_raw_text() -> None:
     assert attribution.reason is ProviderFailureReason.AUTH
     assert attribution.stage is ProviderFailureStage.DISPATCH
     assert secret not in str(error)
+
+
+def test_response_translation_failure_preserves_only_fixed_discriminator() -> None:
+    secret = "provider-secret-sentinel"
+    error = ProviderBoundaryError(
+        ProviderFailureStage.RESPONSE_TRANSLATION,
+        ValueError(secret),
+        response_translation_failure=ResponseTranslationFailure.TOOL_USE_SHAPE,
+    )
+
+    attribution = classify_provider_failure(error)
+
+    assert attribution.owner is ProviderFailureOwner.INFRASTRUCTURE
+    assert attribution.reason is ProviderFailureReason.UNKNOWN
+    assert attribution.stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert attribution.response_translation_failure is ResponseTranslationFailure.TOOL_USE_SHAPE
+    assert secret not in str(error)
+
+
+def test_response_translation_failure_cannot_drift_to_another_stage() -> None:
+    with pytest.raises(ValueError, match="requires the response_translation stage"):
+        ProviderBoundaryError(
+            ProviderFailureStage.DISPATCH,
+            ValueError("private"),
+            response_translation_failure=ResponseTranslationFailure.TOOL_USE_SHAPE,
+        )
 
 
 @pytest.mark.parametrize(

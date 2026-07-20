@@ -14,6 +14,7 @@ from harbor.models.job.lock import TrialLock
 from harbor.models.job.result import JobResult
 from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import ExceptionInfo, TrialResult
+from llm_waterfall import ResponseTranslationFailure
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -146,6 +147,7 @@ _TASK_ENVIRONMENT_ATTESTATION_KEY = "task_environment_attestation"
 _MODEL_CALLS_KEY = "model_calls"
 _PROVIDER_FAILURE_STAGE_KEY = "provider_failure_stage"
 _PROVIDER_FAILURE_REASON_KEY = "provider_failure_reason"
+_PROVIDER_RESPONSE_TRANSLATION_FAILURE_KEY = "provider_response_translation_failure"
 _MAX_TASK_ENVIRONMENT_ATTESTATION_BYTES = 64 * 1024
 _RUNNER_CONFIG_DIGEST_KEY = "runner_config_digest"
 _RUNNER_ENVIRONMENT_DIGEST_KEY = "runner_environment_digest"
@@ -172,6 +174,7 @@ class _TrustedRunEvidence:
     model_calls: int | None
     provider_failure_stage: ProviderFailureStage | None
     provider_failure_reason: ProviderFailureReason | None
+    provider_response_translation_failure: ResponseTranslationFailure | None
 
 
 @dataclass(frozen=True)
@@ -577,7 +580,13 @@ def _validate_run_identity(
     environment_evidence: list[_ParsedTaskEnvironmentEvidence] = []
     runner_evidence: list[_ParsedRunnerEvidence] = []
     model_calls: list[int | None] = []
-    provider_failures: list[tuple[ProviderFailureStage | None, ProviderFailureReason | None]] = []
+    provider_failures: list[
+        tuple[
+            ProviderFailureStage | None,
+            ProviderFailureReason | None,
+            ResponseTranslationFailure | None,
+        ]
+    ] = []
     for context in contexts:
         metadata = context.metadata or {}
         candidate_hash = metadata.get("harness_hash")
@@ -632,6 +641,7 @@ def _validate_run_identity(
             model_calls=None,
             provider_failure_stage=None,
             provider_failure_reason=None,
+            provider_response_translation_failure=None,
         )
     first = outcomes[0]
     if any(outcome != first for outcome in outcomes[1:]):
@@ -674,6 +684,7 @@ def _validate_run_identity(
         model_calls=first_model_calls,
         provider_failure_stage=first_provider_failure[0],
         provider_failure_reason=first_provider_failure[1],
+        provider_response_translation_failure=first_provider_failure[2],
     )
 
 
@@ -689,12 +700,21 @@ def _parse_model_calls(metadata: dict[str, object]) -> int | None:
 
 def _parse_provider_failure(
     metadata: dict[str, object],
-) -> tuple[ProviderFailureStage | None, ProviderFailureReason | None]:
+) -> tuple[
+    ProviderFailureStage | None,
+    ProviderFailureReason | None,
+    ResponseTranslationFailure | None,
+]:
     """Parse only bounded provider attribution authored by the trusted adapter."""
     stage_present = _PROVIDER_FAILURE_STAGE_KEY in metadata
     reason_present = _PROVIDER_FAILURE_REASON_KEY in metadata
+    translation_present = _PROVIDER_RESPONSE_TRANSLATION_FAILURE_KEY in metadata
     if not stage_present and not reason_present:
-        return None, None
+        if translation_present:
+            raise ValueError(
+                "Harbor agent metadata provider failure attribution lacks stage and reason"
+            )
+        return None, None, None
     if stage_present != reason_present:
         raise ValueError("Harbor agent metadata provider failure attribution is incomplete")
     try:
@@ -702,7 +722,29 @@ def _parse_provider_failure(
         reason = ProviderFailureReason(metadata[_PROVIDER_FAILURE_REASON_KEY])
     except (TypeError, ValueError):
         raise ValueError("Harbor agent metadata has unknown provider failure attribution") from None
-    return stage, reason
+    if stage is ProviderFailureStage.RESPONSE_TRANSLATION:
+        if not translation_present:
+            raise ValueError(
+                "Harbor agent metadata provider failure attribution lacks a response "
+                "translation discriminator"
+            )
+        try:
+            translation_failure = ResponseTranslationFailure(
+                metadata[_PROVIDER_RESPONSE_TRANSLATION_FAILURE_KEY]
+            )
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Harbor agent metadata provider failure attribution has an unknown response "
+                "translation discriminator"
+            ) from None
+    else:
+        if translation_present:
+            raise ValueError(
+                "Harbor agent metadata provider failure attribution has a response translation "
+                "discriminator at the wrong stage"
+            )
+        translation_failure = None
+    return stage, reason, translation_failure
 
 
 def _parse_task_environment_attestation(
@@ -1106,6 +1148,7 @@ def _convert_trial(
         run_health=run_health,
         provider_failure_stage=run_evidence.provider_failure_stage,
         provider_failure_reason=run_evidence.provider_failure_reason,
+        provider_response_translation_failure=(run_evidence.provider_response_translation_failure),
         usage=BenchmarkUsage(
             calls=run_evidence.model_calls,
             calls_status=(

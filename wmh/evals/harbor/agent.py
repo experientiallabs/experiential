@@ -821,6 +821,10 @@ class WmhPiAgent(BaseAgent):
                 ):
                     metadata["provider_failure_stage"] = exc.provider_failure_stage.value
                     metadata["provider_failure_reason"] = exc.provider_failure_reason.value
+                    if exc.provider_response_translation_failure is not None:
+                        metadata["provider_response_translation_failure"] = (
+                            exc.provider_response_translation_failure.value
+                        )
                 _populate_context(context, exc.worker_usage, metadata)
                 try:
                     self._write_trace(exc.events)

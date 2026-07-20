@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 import boto3
 import pytest
 from botocore.stub import Stubber
+from llm_waterfall import ResponseTranslationFailure
 
 import wmh.providers.bedrock as mod
 from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
@@ -69,6 +70,29 @@ def _chat_request() -> ChatRequest:
     )
 
 
+def _tool_chat_request() -> ChatRequest:
+    return ChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "submit"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "submit",
+                        "description": "finish the task",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"],
+                        },
+                    },
+                }
+            ],
+            "max_completion_tokens": 64,
+        }
+    )
+
+
 def test_structured_chat_stages_client_initialization_without_raw_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -114,7 +138,80 @@ def test_structured_chat_stages_response_translation_without_raw_text() -> None:
         provider.complete_chat(_chat_request())
 
     assert caught.value.stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert caught.value.response_translation_failure is ResponseTranslationFailure.OUTPUT_OBJECT
     assert "Bedrock Converse" not in str(caught.value)
+
+
+def test_structured_chat_accepts_request_bound_client_tool_type() -> None:
+    class TypedToolClient:
+        def converse(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "submit",
+                                    "input": {"answer": "OK"},
+                                    "type": "tool_use",
+                                }
+                            }
+                        ],
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 2, "outputTokens": 1},
+                "ResponseMetadata": {"RequestId": "request-1"},
+            }
+
+    provider = _haiku_provider()
+    provider._client = cast("BaseClient", TypedToolClient())
+
+    response = provider.complete_chat(_tool_chat_request())
+
+    [tool_call] = response.choices[0].message.tool_calls or []
+    assert tool_call.function.name == "submit"
+    assert json.loads(tool_call.function.arguments) == {"answer": "OK"}
+    assert response.provider_receipt is not None
+
+
+def test_structured_chat_rejects_typed_tool_not_advertised_by_request() -> None:
+    class UnadvertisedTypedToolClient:
+        def converse(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "not_advertised",
+                                    "input": {},
+                                    "type": "tool_use",
+                                }
+                            }
+                        ],
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 2, "outputTokens": 1},
+                "ResponseMetadata": {"RequestId": "request-1"},
+            }
+
+    provider = _haiku_provider()
+    provider._client = cast("BaseClient", UnadvertisedTypedToolClient())
+
+    with pytest.raises(ProviderBoundaryError) as caught:
+        provider.complete_chat(_tool_chat_request())
+
+    assert caught.value.stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert (
+        caught.value.response_translation_failure
+        is ResponseTranslationFailure.TOOL_USE_ADVERTISEMENT
+    )
 
 
 def test_structured_chat_stages_receipt_construction_without_raw_text(

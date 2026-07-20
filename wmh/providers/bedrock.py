@@ -7,7 +7,12 @@ import time
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 from llm_waterfall import ChatRequest, ChatResponse
-from llm_waterfall.bedrock_chat import bedrock_converse_request, bedrock_converse_response
+from llm_waterfall.bedrock_chat import (
+    BedrockResponseTranslationError,
+    bedrock_converse_client_tool_names,
+    bedrock_converse_request,
+    bedrock_converse_response,
+)
 
 from wmh.core.types import JsonObject, JsonValue
 from wmh.providers.base import (
@@ -187,6 +192,7 @@ class BedrockProvider:
                 self.config.model,
                 reasoning_effort=self.config.reasoning_effort,
             )
+            advertised_client_tools = bedrock_converse_client_tool_names(wire_request)
             inference_config = wire_request.get("inferenceConfig")
             if not isinstance(inference_config, dict):
                 raise ValueError("Bedrock Converse request is missing inferenceConfig")
@@ -218,7 +224,17 @@ class BedrockProvider:
             provider_request_id = (
                 response_metadata.get("RequestId") if isinstance(response_metadata, dict) else None
             )
-            response = bedrock_converse_response(raw, self.config.model)
+            response = bedrock_converse_response(
+                raw,
+                self.config.model,
+                advertised_client_tools=advertised_client_tools,
+            )
+        except BedrockResponseTranslationError as exc:
+            raise ProviderBoundaryError(
+                ProviderFailureStage.RESPONSE_TRANSLATION,
+                exc,
+                response_translation_failure=exc.failure,
+            ) from exc
         except Exception as exc:
             raise ProviderBoundaryError(ProviderFailureStage.RESPONSE_TRANSLATION, exc) from exc
         if not isinstance(provider_request_id, str) or not provider_request_id:

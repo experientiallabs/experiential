@@ -7,8 +7,12 @@ from typing import cast
 
 import pytest
 
-from llm_waterfall.bedrock_chat import bedrock_converse_request, bedrock_converse_response
-from llm_waterfall.types import ChatRequest
+from llm_waterfall.bedrock_chat import (
+    BedrockResponseTranslationError,
+    bedrock_converse_request,
+    bedrock_converse_response,
+)
+from llm_waterfall.types import ChatRequest, ResponseTranslationFailure
 
 _MODEL = "us.anthropic.claude-opus-4-6-v1"
 
@@ -99,6 +103,7 @@ def test_signed_reasoning_and_redacted_content_replay_byte_for_byte() -> None:
                 "toolUseId": "call-1",
                 "name": "read_file",
                 "input": {"path": "README.md"},
+                "type": "tool_use",
             }
         },
     ]
@@ -109,6 +114,7 @@ def test_signed_reasoning_and_redacted_content_replay_byte_for_byte() -> None:
             "usage": {"inputTokens": 5, "outputTokens": 7},
         },
         _MODEL,
+        advertised_client_tools=frozenset({"read_file"}),
     )
     assistant = response.choices[0].message.model_dump(mode="json", exclude_none=True)
     replay = ChatRequest.model_validate(
@@ -180,6 +186,224 @@ def test_missing_usage_remains_distinguishable_from_reported_zero() -> None:
     )
 
     assert response.usage is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "failure"),
+    [
+        (None, ResponseTranslationFailure.RESPONSE_OBJECT),
+        ({}, ResponseTranslationFailure.OUTPUT_OBJECT),
+        ({"output": {}}, ResponseTranslationFailure.MESSAGE_OBJECT),
+        (
+            {"output": {"message": {"role": "user", "content": []}}},
+            ResponseTranslationFailure.MESSAGE_ROLE,
+        ),
+        (
+            {"output": {"message": {"role": "assistant", "content": None}}},
+            ResponseTranslationFailure.CONTENT_ARRAY,
+        ),
+        (
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "ok", "toolUse": {}}],
+                    }
+                }
+            },
+            ResponseTranslationFailure.CONTENT_BLOCK,
+        ),
+        (
+            {"output": {"message": {"role": "assistant", "content": [{"text": 1}]}}},
+            ResponseTranslationFailure.TEXT_BLOCK,
+        ),
+        (
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "submit",
+                                    "input": {},
+                                    "unexpected": True,
+                                }
+                            }
+                        ],
+                    }
+                }
+            },
+            ResponseTranslationFailure.TOOL_USE_SHAPE,
+        ),
+        (
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "submit",
+                                    "input": [],
+                                }
+                            }
+                        ],
+                    }
+                }
+            },
+            ResponseTranslationFailure.TOOL_USE_INPUT,
+        ),
+        (
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"reasoningContent": {}}],
+                    }
+                }
+            },
+            ResponseTranslationFailure.REASONING_CONTENT,
+        ),
+        (
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "stopReason": 1,
+            },
+            ResponseTranslationFailure.STOP_REASON,
+        ),
+        (
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "usage": [],
+            },
+            ResponseTranslationFailure.USAGE_OBJECT,
+        ),
+        (
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "usage": {"inputTokens": 1},
+            },
+            ResponseTranslationFailure.USAGE_FIELDS,
+        ),
+        (
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "usage": {"inputTokens": None, "outputTokens": 1},
+            },
+            ResponseTranslationFailure.USAGE_COUNTER,
+        ),
+    ],
+)
+def test_response_translation_failure_is_one_fixed_content_free_branch(
+    raw: object,
+    failure: ResponseTranslationFailure,
+) -> None:
+    with pytest.raises(BedrockResponseTranslationError) as caught:
+        bedrock_converse_response(raw, _MODEL)
+
+    assert caught.value.failure is failure
+    assert caught.value.failure.value in {item.value for item in ResponseTranslationFailure}
+
+
+def test_client_tool_type_is_preserved_in_bedrock_envelope_but_not_pi_projection() -> None:
+    response = bedrock_converse_response(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "toolUse": {
+                                "toolUseId": "call-1",
+                                "name": "submit",
+                                "input": {"answer": "OK"},
+                                "type": "tool_use",
+                            }
+                        }
+                    ],
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 1, "outputTokens": 1},
+        },
+        _MODEL,
+        advertised_client_tools=frozenset({"submit"}),
+    )
+
+    [tool_call] = response.choices[0].message.tool_calls or []
+    assert tool_call.type == "function"
+    assert tool_call.function.name == "submit"
+    assert json.loads(tool_call.function.arguments) == {"answer": "OK"}
+    assert '"type":"tool_use"' not in json.dumps(
+        response.wire_payload(),
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    ["server_tool_use", "client_tool_use", "function", "unknown", 1, None],
+)
+def test_non_client_tool_type_fails_closed_with_fixed_discriminator(
+    tool_type: object,
+) -> None:
+    with pytest.raises(BedrockResponseTranslationError) as caught:
+        bedrock_converse_response(
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "submit",
+                                    "input": {"answer": "OK"},
+                                    "type": tool_type,
+                                }
+                            }
+                        ],
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 1, "outputTokens": 1},
+            },
+            _MODEL,
+        )
+
+    assert caught.value.failure is ResponseTranslationFailure.TOOL_USE_TYPE
+
+
+def test_typed_client_tool_requires_exact_request_advertisement() -> None:
+    with pytest.raises(BedrockResponseTranslationError) as caught:
+        bedrock_converse_response(
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "submit",
+                                    "input": {"answer": "OK"},
+                                    "type": "tool_use",
+                                }
+                            }
+                        ],
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 1, "outputTokens": 1},
+            },
+            _MODEL,
+            advertised_client_tools=frozenset({"read_file"}),
+        )
+
+    assert caught.value.failure is ResponseTranslationFailure.TOOL_USE_ADVERTISEMENT
 
 
 def test_usage_preserves_provider_dimensions_for_downstream_pricing() -> None:

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
 
+from llm_waterfall import ResponseTranslationFailure
+
 
 class ProviderFailureOwner(StrEnum):
     """Which side of the evaluation boundary owns a failed provider call."""
@@ -54,17 +56,43 @@ class ProviderFailureAttribution:
     owner: ProviderFailureOwner
     reason: ProviderFailureReason
     stage: ProviderFailureStage = ProviderFailureStage.UNKNOWN
+    response_translation_failure: ResponseTranslationFailure | None = None
+
+    def __post_init__(self) -> None:
+        if self.stage is ProviderFailureStage.RESPONSE_TRANSLATION:
+            if self.response_translation_failure is None:
+                object.__setattr__(
+                    self,
+                    "response_translation_failure",
+                    ResponseTranslationFailure.UNKNOWN,
+                )
+            return
+        if self.response_translation_failure is not None:
+            raise ValueError("response translation failure requires the response_translation stage")
 
 
 class ProviderBoundaryError(RuntimeError):
     """Attach a bounded stage while retaining raw provider detail only in-process."""
 
-    def __init__(self, stage: ProviderFailureStage, cause: Exception) -> None:
+    def __init__(
+        self,
+        stage: ProviderFailureStage,
+        cause: Exception,
+        *,
+        response_translation_failure: ResponseTranslationFailure | None = None,
+    ) -> None:
         if not isinstance(stage, ProviderFailureStage):
             raise TypeError("provider failure stage must be a ProviderFailureStage")
+        if stage is ProviderFailureStage.RESPONSE_TRANSLATION:
+            response_translation_failure = (
+                response_translation_failure or ResponseTranslationFailure.UNKNOWN
+            )
+        elif response_translation_failure is not None:
+            raise ValueError("response translation failure requires the response_translation stage")
         super().__init__(f"provider request failed during {stage.value}")
         self.stage = stage
         self.cause = cause
+        self.response_translation_failure = response_translation_failure
 
 
 _INFRASTRUCTURE_UNKNOWN = ProviderFailureAttribution(
@@ -277,8 +305,10 @@ def classify_provider_failure(error: Exception) -> ProviderFailureAttribution:
     classifier and is never copied into the returned value or candidate-visible evidence.
     """
     stage = ProviderFailureStage.UNKNOWN
+    response_translation_failure: ResponseTranslationFailure | None = None
     if isinstance(error, ProviderBoundaryError):
         stage = error.stage
+        response_translation_failure = error.response_translation_failure
         error = error.cause
     module = type(error).__module__.lower()
     if _module_has_root(module, _BEDROCK_MODULE_ROOTS):
@@ -291,6 +321,7 @@ def classify_provider_failure(error: Exception) -> ProviderFailureAttribution:
         owner=attribution.owner,
         reason=attribution.reason,
         stage=stage,
+        response_translation_failure=response_translation_failure,
     )
 
 

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatRequest, ChatResponse, ResponseTranslationFailure
 
 from wmh.core.types import JsonObject
 from wmh.harness.doc import (
@@ -203,6 +203,7 @@ class PiInfrastructureError(RuntimeError):
         run_health: PiRunHealth | None = None,
         provider_failure_stage: ProviderFailureStage | None = None,
         provider_failure_reason: ProviderFailureReason | None = None,
+        provider_response_translation_failure: ResponseTranslationFailure | None = None,
     ) -> None:
         message = {
             PiInfrastructureFailureKind.PROVIDER: "pi turn worker provider failed",
@@ -252,20 +253,31 @@ class PiInfrastructureError(RuntimeError):
                 raise ValueError("provider failure stage and reason must be supplied together")
             default_stage, default_reason = provider_defaults[kind]
             self.provider_failure_stage = (
-                provider_failure_stage
-                if provider_failure_stage is not None
-                else default_stage
+                provider_failure_stage if provider_failure_stage is not None else default_stage
             )
             self.provider_failure_reason = (
-                provider_failure_reason
-                if provider_failure_reason is not None
-                else default_reason
+                provider_failure_reason if provider_failure_reason is not None else default_reason
             )
+            if self.provider_failure_stage is ProviderFailureStage.RESPONSE_TRANSLATION:
+                self.provider_response_translation_failure = (
+                    provider_response_translation_failure or ResponseTranslationFailure.UNKNOWN
+                )
+            else:
+                if provider_response_translation_failure is not None:
+                    raise ValueError(
+                        "response translation failure requires the response_translation stage"
+                    )
+                self.provider_response_translation_failure = None
         else:
-            if provider_failure_stage is not None or provider_failure_reason is not None:
+            if (
+                provider_failure_stage is not None
+                or provider_failure_reason is not None
+                or provider_response_translation_failure is not None
+            ):
                 raise ValueError("task-environment failures cannot carry provider attribution")
             self.provider_failure_stage = None
             self.provider_failure_reason = None
+            self.provider_response_translation_failure = None
 
 
 class PiCandidateError(RuntimeError):
@@ -459,6 +471,7 @@ def run_pi_turn(
                 PiInfrastructureFailureKind.PROVIDER,
                 provider_failure_stage=attribution.stage,
                 provider_failure_reason=attribution.reason,
+                provider_response_translation_failure=(attribution.response_translation_failure),
             )
             raise RuntimeError("worker provider unavailable") from None
         except ProviderWorkerUnavailable:
@@ -477,6 +490,7 @@ def run_pi_turn(
                 PiInfrastructureFailureKind.PROVIDER,
                 provider_failure_stage=attribution.stage,
                 provider_failure_reason=attribution.reason,
+                provider_response_translation_failure=(attribution.response_translation_failure),
             )
             raise RuntimeError("worker provider unavailable") from None
         if response_validator is not None:
@@ -530,6 +544,7 @@ def run_pi_turn(
             run_health=error.run_health,
             provider_failure_stage=error.provider_failure_stage,
             provider_failure_reason=error.provider_failure_reason,
+            provider_response_translation_failure=(error.provider_response_translation_failure),
         )
 
     def evidenced_candidate(

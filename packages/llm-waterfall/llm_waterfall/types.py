@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -18,6 +19,36 @@ Role = Literal["user", "assistant"]
 ChatMaxTokensField = Literal["max_completion_tokens", "max_tokens"]
 
 PROVIDERS = ("openai", "anthropic", "azure_openai", "bedrock", "aws_mantle")
+
+
+class ResponseTranslationFailure(StrEnum):
+    """Bounded structural branch that rejected a provider chat response.
+
+    Values are deliberately limited to translator-owned schema locations. They carry no provider
+    text, response values, request IDs, model output, or other candidate-visible content.
+    """
+
+    RESPONSE_OBJECT = "response_object"
+    OUTPUT_OBJECT = "output_object"
+    MESSAGE_OBJECT = "message_object"
+    MESSAGE_ROLE = "message_role"
+    CONTENT_ARRAY = "content_array"
+    CONTENT_BLOCK = "content_block"
+    TEXT_BLOCK = "text_block"
+    TOOL_USE_SHAPE = "tool_use_shape"
+    TOOL_USE_TYPE = "tool_use_type"
+    TOOL_USE_ADVERTISEMENT = "tool_use_advertisement"
+    TOOL_USE_ID = "tool_use_id"
+    TOOL_USE_NAME = "tool_use_name"
+    TOOL_USE_INPUT = "tool_use_input"
+    REASONING_CONTENT = "reasoning_content"
+    STOP_REASON = "stop_reason"
+    USAGE_OBJECT = "usage_object"
+    USAGE_FIELDS = "usage_fields"
+    USAGE_COUNTER = "usage_counter"
+    USAGE_ALIAS_COLLISION = "usage_alias_collision"
+    CHAT_RESPONSE = "chat_response"
+    UNKNOWN = "unknown"
 
 
 class Message(BaseModel):

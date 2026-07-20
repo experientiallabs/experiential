@@ -16,6 +16,7 @@ from harbor.models.job.result import JobResult, JobStats
 from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
 from harbor.models.trial.result import AgentInfo, ExceptionInfo, ModelInfo, StepResult, TrialResult
 from harbor.models.verifier.result import VerifierResult
+from llm_waterfall import ResponseTranslationFailure
 from pydantic import ValidationError
 
 from wmh.evals.benchmark import (
@@ -562,6 +563,31 @@ def test_provider_failure_attribution_is_retained_without_raw_error_text(tmp_pat
     assert secret not in result.model_dump_json()
 
 
+def test_response_translation_failure_is_retained_as_fixed_evidence(tmp_path: Path) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        exception_type="WmhPiProviderError",
+        candidate_metadata={
+            "run_health": "infrastructure_failure",
+            "provider_failure_stage": "response_translation",
+            "provider_failure_reason": "unknown",
+            "provider_response_translation_failure": "tool_use_shape",
+        },
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    result = load_harbor_job_result(
+        job_dir,
+        _manifest("job", ("task", 1, trial.trial_name)),
+    ).result.trials[0]
+
+    assert result.provider_failure_stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert result.provider_failure_reason is ProviderFailureReason.UNKNOWN
+    assert result.provider_response_translation_failure is ResponseTranslationFailure.TOOL_USE_SHAPE
+
+
 @pytest.mark.parametrize(
     "candidate_metadata",
     [
@@ -569,6 +595,21 @@ def test_provider_failure_attribution_is_retained_without_raw_error_text(tmp_pat
         {"provider_failure_reason": "auth"},
         {"provider_failure_stage": "private-stage", "provider_failure_reason": "auth"},
         {"provider_failure_stage": "dispatch", "provider_failure_reason": "private-reason"},
+        {
+            "provider_failure_stage": "response_translation",
+            "provider_failure_reason": "unknown",
+        },
+        {
+            "provider_failure_stage": "dispatch",
+            "provider_failure_reason": "auth",
+            "provider_response_translation_failure": "tool_use_shape",
+        },
+        {
+            "provider_failure_stage": "response_translation",
+            "provider_failure_reason": "unknown",
+            "provider_response_translation_failure": "private-shape",
+        },
+        {"provider_response_translation_failure": "tool_use_shape"},
     ],
 )
 def test_unbounded_provider_failure_metadata_is_rejected(

@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall import ChatRequest, ChatResponse, ResponseTranslationFailure
 
 import wmh.harness.pi_runner as mod
 from wmh.core.types import JsonObject
@@ -385,6 +385,49 @@ def test_run_pi_turn_preserves_bounded_worker_attribution_in_evidenced_copy() ->
     assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER
     assert caught.value.provider_failure_stage is ProviderFailureStage.CLIENT_INIT
     assert caught.value.provider_failure_reason is ProviderFailureReason.AUTH
+
+
+def test_run_pi_turn_preserves_bounded_response_translation_failure() -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+    ]
+
+    def failing_worker(
+        _request: ChatRequest,
+        _deadline: TurnDeadline,
+    ) -> ChatResponse:
+        raise ProviderWorkerFailure(
+            ProviderFailureAttribution(
+                owner=ProviderFailureOwner.INFRASTRUCTURE,
+                reason=ProviderFailureReason.UNKNOWN,
+                stage=ProviderFailureStage.RESPONSE_TRANSLATION,
+                response_translation_failure=(ResponseTranslationFailure.TOOL_USE_SHAPE),
+            )
+        )
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(PiInfrastructureError) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=failing_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value.kind is PiInfrastructureFailureKind.PROVIDER
+    assert caught.value.provider_failure_stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert caught.value.provider_failure_reason is ProviderFailureReason.UNKNOWN
+    assert (
+        caught.value.provider_response_translation_failure
+        is ResponseTranslationFailure.TOOL_USE_SHAPE
+    )
 
 
 @pytest.mark.parametrize(
