@@ -122,7 +122,7 @@ select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
 "packages/environment-capture/**" = ["T20"]
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.12"
 
 [tool.ty.src]
 # `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
