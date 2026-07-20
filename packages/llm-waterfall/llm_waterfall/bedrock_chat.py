@@ -288,6 +288,18 @@ def bedrock_converse_response(
                     f"{translated_name!r}",
                 )
             translated_usage[translated_name] = value
+        # Converse can materialize optional cache telemetry even when no caching occurred.
+        # Normalize only exact no-op provider values. Positive, malformed, and unknown values
+        # remain visible so downstream pricing continues to fail closed.
+        for provider_name in ("cacheReadInputTokens", "cacheWriteInputTokens"):
+            if provider_name not in usage_data:
+                continue
+            value = usage_data[provider_name]
+            if type(value) is int and value == 0:
+                translated_usage.pop(usage_names[provider_name])
+        cache_details = usage_data.get("cacheDetails")
+        if type(cache_details) is list and not cache_details:
+            translated_usage.pop("cacheDetails")
         result["usage"] = translated_usage
     try:
         return ChatResponse.model_validate(result)

@@ -6,6 +6,7 @@ import json
 from typing import cast
 
 import pytest
+from pydantic import JsonValue
 
 from llm_waterfall.bedrock_chat import (
     BedrockResponseTranslationError,
@@ -16,6 +17,10 @@ from llm_waterfall.bedrock_chat import (
 from llm_waterfall.types import ChatRequest, ResponseTranslationFailure
 
 _MODEL = "us.anthropic.claude-opus-4-6-v1"
+
+
+class _EmptyCacheDetails(list[JsonValue]):
+    """List subtype that must not be mistaken for the SDK's exact empty list."""
 
 
 def _tool_request() -> ChatRequest:
@@ -442,6 +447,62 @@ def test_usage_preserves_provider_dimensions_for_downstream_pricing() -> None:
     }
 
 
+def test_usage_omits_only_zero_or_empty_bedrock_cache_placeholders() -> None:
+    response = bedrock_converse_response(
+        {
+            "output": {"message": {"role": "assistant", "content": [{"text": "done"}]}},
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 2,
+                "totalTokens": 12,
+                "cacheReadInputTokens": 0,
+                "cacheWriteInputTokens": 0,
+                "cacheDetails": [],
+            },
+        },
+        _MODEL,
+    )
+
+    assert response.usage is not None
+    assert response.usage.model_extra == {"total_tokens": 12}
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "value", "translated_name"),
+    [
+        ("cacheReadInputTokens", 1, "cache_read_input_tokens"),
+        ("cacheWriteInputTokens", 1, "cache_write_input_tokens"),
+        ("cacheReadInputTokens", False, "cache_read_input_tokens"),
+        ("cacheWriteInputTokens", 0.0, "cache_write_input_tokens"),
+        ("cacheDetails", [{"inputTokens": 1, "ttl": "5m"}], "cacheDetails"),
+        ("cacheDetails", {}, "cacheDetails"),
+        ("cacheDetails", None, "cacheDetails"),
+        ("cacheDetails", _EmptyCacheDetails(), "cacheDetails"),
+    ],
+)
+def test_usage_preserves_nonempty_or_malformed_bedrock_cache_dimensions(
+    provider_name: str,
+    value: JsonValue,
+    translated_name: str,
+) -> None:
+    response = bedrock_converse_response(
+        {
+            "output": {"message": {"role": "assistant", "content": [{"text": "done"}]}},
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 2,
+                provider_name: value,
+            },
+        },
+        _MODEL,
+    )
+
+    assert response.usage is not None
+    assert response.usage.model_extra == {translated_name: value}
+
+
 def test_partial_usage_fails_closed() -> None:
     with pytest.raises(ValueError, match="must include inputTokens and outputTokens"):
         bedrock_converse_response(
@@ -495,6 +556,23 @@ def test_usage_alias_collision_fails_closed(
                 "output": {"message": {"role": "assistant", "content": []}},
                 "stopReason": "end_turn",
                 "usage": usage,
+            },
+            _MODEL,
+        )
+
+
+def test_zero_cache_alias_collision_fails_before_normalization() -> None:
+    with pytest.raises(ValueError, match="duplicate ChatUsage field"):
+        bedrock_converse_response(
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 10,
+                    "outputTokens": 4,
+                    "cacheReadInputTokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
             },
             _MODEL,
         )

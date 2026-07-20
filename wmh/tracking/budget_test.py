@@ -12,10 +12,11 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 import pytest
 from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall.bedrock_chat import bedrock_converse_response
 from llm_waterfall.types import (
     ChatChoice,
     ChatMessage,
@@ -23,16 +24,18 @@ from llm_waterfall.types import (
 )
 from openai.types.completion_usage import CompletionUsage
 from openai.types.responses.response_usage import ResponseUsage
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
     ProviderKind,
+    SingleDispatchProvider,
     TokenUsage,
     VerifyResult,
 )
+from wmh.providers.bedrock import BedrockProvider
 from wmh.providers.receipt import (
     ProviderResponseIdentity,
     build_chat_provider_receipt,
@@ -1581,7 +1584,7 @@ def test_exposed_policy_is_a_defensive_deep_copy(tmp_path: Path) -> None:
 
 
 class _FakeToolProvider:
-    paid_request_attempts = 1
+    paid_request_attempts: Literal[1] = 1
 
     def __init__(
         self,
@@ -1637,7 +1640,7 @@ class _FakeToolProvider:
 
 def _budgeted_provider(
     tmp_path: Path,
-    provider: _FakeToolProvider,
+    provider: SingleDispatchProvider,
     *,
     ids: Iterator[str],
     response_identity: ProviderResponseIdentity | None = None,
@@ -1755,6 +1758,148 @@ def test_budgeted_provider_reserves_before_call_and_settles_exact_usage(tmp_path
     assert reservation.status is ReservationStatus.SETTLED
     assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
     assert reservation.max_nano_usd > reservation.charged_nano_usd
+
+
+def test_live_shaped_bedrock_submit_with_zero_cache_usage_settles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LiveShapedBedrockClient:
+        def converse(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "submit",
+                                    "input": {"answer": "ok"},
+                                    "type": "tool_use",
+                                }
+                            }
+                        ],
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {
+                    "inputTokens": 2,
+                    "outputTokens": 1,
+                    "totalTokens": 3,
+                    "cacheReadInputTokens": 0,
+                    "cacheWriteInputTokens": 0,
+                },
+                "ResponseMetadata": {"RequestId": "bedrock-request-1"},
+            }
+
+    raw_provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model="model-1",
+            region="test-region",
+        )
+    )
+    client = LiveShapedBedrockClient()
+    monkeypatch.setattr(raw_provider, "_get_client", lambda: client)
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        raw_provider,
+        ids=iter(["bedrock-zero-cache"]),
+    )
+
+    returned = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "solve"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "submit",
+                            "description": "return the answer",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "max_completion_tokens": 20,
+            }
+        )
+    )
+
+    assert returned.choices[0].message.tool_calls is not None
+    assert returned.choices[0].message.tool_calls[0].function.name == "submit"
+    assert returned.usage is not None
+    assert returned.usage.model_extra == {"total_tokens": 3}
+    assert returned.provider_receipt is not None
+    assert returned.provider_receipt.provider_request_id == "bedrock-request-1"
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 2 * 2 + 1 * 5
+
+
+@pytest.mark.parametrize(
+    ("usage_dimension", "dimension_name"),
+    [
+        ({"cacheReadInputTokens": 1}, "cache_read_input_tokens"),
+        ({"cacheWriteInputTokens": 1}, "cache_write_input_tokens"),
+        ({"cacheReadInputTokens": False}, "cache_read_input_tokens"),
+        ({"cacheWriteInputTokens": 0.0}, "cache_write_input_tokens"),
+        ({"cacheDetails": [{"inputTokens": 1, "ttl": "5m"}]}, "cacheDetails"),
+        ({"cacheDetails": {}}, "cacheDetails"),
+        ({"cacheDetails": None}, "cacheDetails"),
+    ],
+)
+def test_bedrock_submit_rejects_nonzero_nonempty_or_malformed_cache_usage(
+    tmp_path: Path,
+    usage_dimension: dict[str, JsonValue],
+    dimension_name: str,
+) -> None:
+    response = bedrock_converse_response(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "toolUse": {
+                                "toolUseId": "call-1",
+                                "name": "submit",
+                                "input": {"answer": "ok"},
+                                "type": "tool_use",
+                            }
+                        }
+                    ],
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {
+                "inputTokens": 2,
+                "outputTokens": 1,
+                "totalTokens": 3,
+                **usage_dimension,
+            },
+        },
+        "model-1",
+        advertised_client_tools=frozenset({"submit"}),
+    )
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(chat_response=response),
+        ids=iter(["bedrock-unsupported-cache"]),
+    )
+
+    with pytest.raises(UnpricedProviderUsageError, match=dimension_name):
+        provider.complete_chat(
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="solve")],
+                max_completion_tokens=20,
+            )
+        )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UnpricedUsage"
 
 
 def test_budgeted_chat_forfeits_before_settlement_on_unpriced_usage_dimensions(
