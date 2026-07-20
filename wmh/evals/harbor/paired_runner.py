@@ -5419,7 +5419,12 @@ def _classify_nonadmissible_benchmark_result(
 ) -> _PairFailureDescriptor | None:
     """Classify one typed non-scoreable trial without reading a reward value."""
     if len(trials) != 1:
-        return None
+        return _PairFailureDescriptor(
+            owner=PairedHarborPairFailureOwner.SCORING,
+            source=PairedHarborPairFailureSource.ADMISSION,
+            retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+            arm=arm,
+        )
     trial = trials[0]
     if trial.status in {
         BenchmarkTrialStatus.SCORED,

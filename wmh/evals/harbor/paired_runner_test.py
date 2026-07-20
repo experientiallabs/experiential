@@ -3594,6 +3594,19 @@ def test_candidate_task_and_score_failures_remain_analysis_zero_without_retry() 
         }
     )
 
+    for malformed_trials in ([], [low_score, low_score]):
+        malformed_descriptor = mod._classify_nonadmissible_benchmark_result(
+            malformed_trials,
+            arm=PairedArm.CANDIDATE,
+        )
+        assert malformed_descriptor is not None
+        assert malformed_descriptor.owner is mod.PairedHarborPairFailureOwner.SCORING
+        assert malformed_descriptor.source is mod.PairedHarborPairFailureSource.ADMISSION
+        assert (
+            malformed_descriptor.retry_eligibility
+            is mod.PairedHarborPairRetryEligibility.FORBIDDEN
+        )
+
     for trial in (low_score, candidate_failure, task_timeout):
         assert (
             mod._classify_nonadmissible_benchmark_result(
