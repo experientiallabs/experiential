@@ -2129,7 +2129,7 @@ def _is_publication_nonce(value: str) -> bool:
 
 
 def _canonical_process_id(value: str) -> int | None:
-    if not value.isdecimal() or value.startswith("0"):
+    if not value.isascii() or not value.isdecimal() or value.startswith("0"):
         return None
     pid = int(value)
     return pid if 0 < pid <= 2_147_483_647 else None
