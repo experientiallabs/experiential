@@ -679,6 +679,62 @@ def call_in_study_slice(
     Raises:
         ValueError: If phase, run, configuration, sequence, or checkpoint identity drifts.
     """
+    return _call_in_study_slice(
+        store,
+        phase=phase,
+        authorization_payload_digest=authorization_payload_digest,
+        run_id=run_id,
+        configuration_digest=configuration_digest,
+        resume_from=resume_from,
+        publisher=publisher,
+        operation=operation,
+        reuse_uncheckpointed_intent=False,
+    )
+
+
+def call_in_resumable_study_slice(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    authorization_payload_digest: str,
+    run_id: str,
+    configuration_digest: str,
+    resume_from: StudyRunCheckpointIdentity | None,
+    publisher: ExternalCommitmentPublisher,
+    operation: Callable[[], tuple[_ResultT, StudyRunCheckpointIdentity]],
+) -> _ResultT:
+    """Run idempotent work under a fresh or exact unconsumed durable slice intent.
+
+    Unlike :func:`call_in_study_slice`, this explicit recovery surface may reenter the sole
+    uncheckpointed intent for the same claim, configuration, and prior checkpoint. Callers must
+    make ``operation`` resume only precommitted outstanding work and durably reuse completed work.
+    """
+    return _call_in_study_slice(
+        store,
+        phase=phase,
+        authorization_payload_digest=authorization_payload_digest,
+        run_id=run_id,
+        configuration_digest=configuration_digest,
+        resume_from=resume_from,
+        publisher=publisher,
+        operation=operation,
+        reuse_uncheckpointed_intent=True,
+    )
+
+
+def _call_in_study_slice(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    authorization_payload_digest: str,
+    run_id: str,
+    configuration_digest: str,
+    resume_from: StudyRunCheckpointIdentity | None,
+    publisher: ExternalCommitmentPublisher,
+    operation: Callable[[], tuple[_ResultT, StudyRunCheckpointIdentity]],
+    reuse_uncheckpointed_intent: bool,
+) -> _ResultT:
+    """Share checkpoint append mechanics across strict and explicitly resumable calls."""
     with _locked_study_slice(
         store,
         phase=phase,
@@ -688,6 +744,7 @@ def call_in_study_slice(
         resume_from=resume_from,
         publisher=publisher,
         prepare_next=True,
+        reuse_uncheckpointed_intent=reuse_uncheckpointed_intent,
     ) as (directory_descriptor, claim, checkpoints):
         result, checkpoint = operation()
         frozen_checkpoint = StudyRunCheckpointIdentity.model_validate(
@@ -767,6 +824,7 @@ def _locked_study_slice(
     resume_from: StudyRunCheckpointIdentity | None,
     publisher: ExternalCommitmentPublisher,
     prepare_next: bool,
+    reuse_uncheckpointed_intent: bool = False,
 ) -> Iterator[tuple[int, StudyRunClaim, tuple[StudyRunCheckpointRecord, ...]]]:
     """Admit one exact fresh, resumed, or completed-reconciliation slice."""
     requested_phase = StudyPhase(phase)
@@ -827,12 +885,13 @@ def _locked_study_slice(
             intents=intents,
             resume_from=resumed,
         )
-        if len(intents) > len(reconciled):
+        has_uncheckpointed_intent = len(intents) > len(reconciled)
+        if has_uncheckpointed_intent and not reuse_uncheckpointed_intent:
             raise ValueError(
                 "study run has an ambiguous durable slice intent without its exact persisted "
                 "checkpoint"
             )
-        if prepare_next:
+        if prepare_next and not has_uncheckpointed_intent:
             _append_run_slice_intent_locked(
                 store,
                 directory_descriptor,

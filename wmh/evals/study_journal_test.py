@@ -20,6 +20,7 @@ from wmh.evals.study_journal import (
     StudyPhaseCommitment,
     StudyRunCheckpointIdentity,
     append_study_phase,
+    call_in_resumable_study_slice,
     call_in_study_slice,
     load_study_journal,
     reconcile_study_slice,
@@ -393,6 +394,76 @@ def test_study_slice_fails_closed_after_ambiguous_precheckpoint_work(tmp_path: P
         )
 
     assert calls == ["failed"]
+
+
+def test_explicit_resumable_slice_reuses_only_the_exact_uncheckpointed_intent(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    configuration_digest = _digest("resumable-configuration")
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    calls: list[str] = []
+
+    def crash_after_intent() -> tuple[str, StudyRunCheckpointIdentity]:
+        calls.append("crashed")
+        raise RuntimeError("synthetic resumable crash")
+
+    with pytest.raises(RuntimeError, match="resumable crash"):
+        call_in_resumable_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="resumable-run",
+            configuration_digest=configuration_digest,
+            resume_from=None,
+            publisher=publisher,
+            operation=crash_after_intent,
+        )
+
+    with pytest.raises(ValueError, match="different run identity or configuration"):
+        call_in_resumable_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="resumable-run",
+            configuration_digest=_digest("different-configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (
+                "must-not-run",
+                StudyRunCheckpointIdentity(
+                    sequence=0,
+                    checkpoint_digest=_digest("must-not-run"),
+                ),
+            ),
+        )
+
+    checkpoint = StudyRunCheckpointIdentity(
+        sequence=0,
+        checkpoint_digest=_digest("recovered-checkpoint"),
+    )
+    result = call_in_resumable_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="resumable-run",
+        configuration_digest=configuration_digest,
+        resume_from=None,
+        publisher=publisher,
+        operation=lambda: (calls.append("resumed") or "recovered", checkpoint),
+    )
+
+    assert result == "recovered"
+    assert calls == ["crashed", "resumed"]
+    assert len(tuple(store.directory.glob("run-slice-intent-*.json"))) == 1
+    assert len(tuple(store.directory.glob("run-checkpoint-*.json"))) == 1
 
 
 def test_uncheckpointed_study_slice_cannot_reenter_after_terminal_stop(tmp_path: Path) -> None:
