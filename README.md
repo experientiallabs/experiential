@@ -1,34 +1,116 @@
 # World Model Harness
 
-`wmh` makes it easy to go from agent traces to faithful replication of your production environment where your agents run.
+`wmh` is an open-source system for running worker agents, learning simulations of their
+deployed environments from traces, and using optimizer agents to improve the harness around them.
 
-Basically, an LLM pretends to be a virtual machine executing instructions — but it's 5x faster than a real sandbox.
+```mermaid
+flowchart TB
+    world["World model<br/>Simulates the environment"]
 
-Just:
+    subgraph agents[" "]
+        direction LR
+        worker["Worker agent<br/>Runs tasks"]
+        optimizer["Optimizer agent<br/>Improves the harness"]
+    end
+
+    world <-->|"actions / observations"| worker
+    worker <-->|"traces / harness updates"| optimizer
+    optimizer <-->|"evaluation / feedback"| world
+
+    classDef world fill:#ffffff,stroke:#0070f3,color:#0a0a0a,stroke-width:2px
+    classDef worker fill:#ffffff,stroke:#7928ca,color:#0a0a0a,stroke-width:2px
+    classDef optimizer fill:#ffffff,stroke:#f5a623,color:#0a0a0a,stroke-width:2px
+
+    class world world
+    class worker worker
+    class optimizer optimizer
+    style agents fill:transparent,stroke:transparent
+    linkStyle 0 stroke:#0070f3,stroke-width:2px
+    linkStyle 1 stroke:#7928ca,stroke-width:2px
+    linkStyle 2 stroke:#f5a623,stroke-width:2px
+```
+
+The **world model** reproduces the environment, the **worker agent** acts inside it, and the
+**optimizer agent** uses the resulting evidence to search for a better worker harness.
+
+## Choose your starting point
+
+Set up the repository once:
 
 ```bash
 git clone https://github.com/experientiallabs/world-model-harness
 cd world-model-harness
 uv sync
-uv run wmh build
 ```
 
-The `build` command opens a wizard that walks you through creating your own world model from your traces.
+### Run an open-source agent
+
+Start the built-in [pi](https://github.com/earendil-works/pi) worker agent on a task. Logging in
+lets the local harness use platform-managed model credentials; you can also stay logged out and
+use local provider credentials.
+
+```bash
+uv run wmh login
+uv run wmh run --task "Inspect this repository and explain it"
+```
+
+Use `--dir PATH` to choose its working directory. Use `wmh run <agent-id>` instead when you want
+to run a hosted agent and its champion harness.
+
+### Build a world model from traces
+
+Turn recorded agent behavior into a model of the environment the agent acts against:
+
+```bash
+uv run wmh build
+uv run wmh play
+```
+
+`wmh build` opens a guided flow for OpenTelemetry, chat/tool-call logs, Braintrust, Arize Phoenix,
+Langfuse, LangSmith, PostHog, and Mastra traces. The resulting model can run in process, behind the
+local HTTP server, or as the environment for closed-loop agent evaluation. See
+[trace ingestion](./docs/reference/ingest.md) for source-specific setup.
+
+### Optimize an agent harness
+
+Given a world model and a task set, let an optimizer agent propose harness changes and evaluate
+each candidate against the simulated environment:
+
+```bash
+uv run wmh harness create my-agent \
+  --tasks tasks.jsonl \
+  --model my-environment \
+  --iterations 5
+
+uv run wmh eval tasks.jsonl \
+  --mode closed-loop \
+  --name my-environment \
+  --harness my-agent@champion
+```
+
+The search stores immutable harness versions and moves the `champion` alias only when a candidate
+passes its evaluation gates. Use `--harness-backend e2b` to evaluate the real pi harness in pooled
+E2B sandboxes while the world model remains the environment. See the
+[closed-loop evaluation guide](./docs/reference/closed_loop.md) and
+[harness update contract](./docs/reference/harness_delta.md) for the underlying workflow.
+
+## How the loop works
+
+1. The **worker agent** runs tasks in a real or simulated environment and produces traces,
+   trajectories, and outcomes.
+2. The **world model** learns a fast simulation of the deployed environment from those traces.
+3. The **optimizer agent** proposes changes to the worker's prompts, tools, policies, skills, or
+   runtime code, then measures the candidates in closed-loop runs against the world model.
+4. The best gated candidate becomes the new worker harness, which can be validated in the real
+   environment and produce the next round of evidence.
+
+## See the world model in action
 
 Below is a comparison running 8 SWE-bench tasks: real sandboxes on the left, a world model acting as the sandbox on the right.
 
 ![world-model-harness demo](./assets/demo.gif)
 
-## How it works
-
-A frontier LLM acts as the *environment* your agent steps against, reconstructed from your own OpenTelemetry traces. Inspired by **Qwen-AgentWorld** (LLM-as-environment), **GEPA** (reflective prompt evolution), and **DreamGym** (retrieval over a trace replay buffer) — but with **zero training**: we get there with prompt optimization on a frontier model.
-
-1. **Build** from your OTel traces: ingest → normalize → split train/held-out → index a replay buffer → evolve the env prompt with GEPA against the held-out split.
-2. **Serve**: agents call `WorldModel.step(action)` (in-process or via the local HTTP backend). Each step retrieves the most similar past `(state, action) → observation` examples and predicts the next observation.
-
-Already have traces in **Braintrust, Arize Phoenix, Langfuse, LangSmith, PostHog, or Mastra**, or just chat/tool-call logs? Pick the source right in `wmh build` (`--source <name>` with `--file` or `--pull`, or choose it in the wizard); it's normalized into the harness's trace format via one pluggable interface, no separate step. See [`docs/reference/ingest.md`](./docs/reference/ingest.md).
-
-## Try it
+## Explore the world-model tools
 
 ```bash
 uv run wmh examples list          # swe-bench, tau-bench, terminal-tasks
@@ -41,7 +123,7 @@ uv run wmh serve                  # local HTTP backend on :8000
 
 Example-local prebuilt models live under `examples/<task>/models/`; pass `--root examples/<task>` to `wmh list`, `wmh demo`, `wmh play`, or `wmh serve` to use one without rebuilding.
 
-## Use it as an API
+## Use a world model as an API
 
 ```python
 from wmh import Action, ActionKind
@@ -141,11 +223,11 @@ shell commands run with your normal user permissions: file tools are restricted 
 bash is not OS-sandboxed. The CLI states this boundary before the local pi process starts. A
 logged-out bare `wmh run` remains available with local provider environment credentials.
 
-## Real agents in E2B sandboxes
+## Worker and optimizer agents in E2B sandboxes
 
-Harness evals normally drive a plain in-process agent loop. With `--harness-backend e2b`, a
-`pi-node` harness runs the **real vendored [pi](https://github.com/earendil-works/pi) agent** —
-actual context management, actual harness code — as a process inside an
+Harness evals normally drive a plain in-process worker loop. With `--harness-backend e2b`, a
+`pi-node` harness runs the **real vendored [pi](https://github.com/earendil-works/pi) worker**
+with actual context management and actual harness code as a process inside an
 [E2B](https://e2b.dev) sandbox, one sandbox per (scenario × pass), **all rollouts in parallel**.
 The environment stays the world-model simulation on every backend: the sandbox only hosts the
 agent process, its tool calls come back over a stdin/stdout frame channel and are answered
@@ -166,10 +248,11 @@ at `/home/user/pi-run` to skip per-sandbox installs (~13 s cold episodes); `--ev
 caps the fan-out (default: every cell at once). Worker-LLM tokens and sandbox-seconds are metered
 on the results (`worker_usage`, `sandbox_usage`).
 
-`wmh.agents` exposes the default agent and a separately customizable meta agent over the same
-vendored pi source and `LiveSession` runtime. `AgentProject` gives an agent a persistent E2B
-filesystem while starting a fresh session for each turn. `ProjectDeltaProposer` uses that ordinary
-agent/project pair to retain every earlier proposal. Each optimization iteration generates a
+`wmh.agents` exposes the worker agent and a separately customizable optimizer agent, called the
+meta agent in the Python API, over the same vendored pi source and `LiveSession` runtime.
+`AgentProject` gives an agent a persistent E2B filesystem while starting a fresh session for each
+turn. `ProjectDeltaProposer` uses that ordinary agent/project pair to retain every earlier proposal.
+Each optimization iteration generates a
 sibling batch from the frozen current champion, evaluates every sibling against that same
 snapshot, and selects at most one gate-eligible winner. Proposal batch size controls search
 breadth; `k` independently controls the number of evaluation passes per scenario.
