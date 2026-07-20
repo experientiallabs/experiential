@@ -11,7 +11,14 @@ import pytest
 from openai import AzureOpenAI, OpenAI
 
 from wmh.providers.azure_openai import AzureOpenAIProvider
-from wmh.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind, TokenUsage
+from wmh.providers.base import (
+    ChatRequest,
+    ChatResponse,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    TokenUsage,
+)
 from wmh.providers.receipt import validate_chat_provider_receipt
 
 
@@ -349,6 +356,36 @@ def test_complete_binds_configured_reasoning_effort(monkeypatch: pytest.MonkeyPa
     ]
     assert responses.last_kwargs["max_output_tokens"] == 16
     assert "temperature" not in responses.last_kwargs
+
+
+@pytest.mark.parametrize("reserved_name", ["input_tokens", "output_tokens"])
+def test_reasoning_complete_rejects_reserved_usage_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    reserved_name: str,
+) -> None:
+    """Structured response extras cannot overwrite canonical billing counters."""
+    response = ChatResponse.model_validate(
+        {
+            "model": "gpt-5.5-2026-06-01",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "yo"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                reserved_name: 0,
+            },
+        }
+    )
+    provider = AzureOpenAIProvider(_reasoning_config())
+    monkeypatch.setattr(provider, "complete_chat", lambda request: response)
+
+    with pytest.raises(ValueError, match="reserved TokenUsage field"):
+        provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
 
 
 def test_complete_preserves_missing_usage_for_budget_forfeit(
