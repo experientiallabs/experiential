@@ -31,6 +31,7 @@ from wmh.evals.study_journal import (
     StudyRunClaim,
     append_study_phase,
     append_study_phase_derived,
+    call_in_resumable_study_slice,
     call_in_study_phase,
     call_in_study_slice,
     claim_study_run,
@@ -826,6 +827,44 @@ class StudyLifecycleController:
             resume_from=resume_from,
             publisher=self._publisher,
             operation=_reconstruct,
+        )
+
+    def run_resumable_slice(
+        self,
+        expected: StudyPhase,
+        run_id: str,
+        operation: Callable[[], StudySliceResult[_CheckpointT, _CompletedResultT]],
+        *,
+        payload_digest: str,
+        configuration_digest: str,
+        resume_from: StudyRunCheckpointIdentity | None,
+        checkpoint_identity: Callable[[_CheckpointT], StudyRunCheckpointIdentity],
+    ) -> StudySliceResult[_CheckpointT, _CompletedResultT]:
+        """Run idempotent work under a fresh or exact uncheckpointed slice intent.
+
+        The operation must durably reuse completed work and execute only the outstanding work
+        already bound by its own nested intent. Ordinary callbacks must use :meth:`run_slice`.
+        """
+
+        def _run() -> tuple[
+            StudySliceResult[_CheckpointT, _CompletedResultT],
+            StudyRunCheckpointIdentity,
+        ]:
+            frozen = operation().model_copy(deep=True)
+            identity = StudyRunCheckpointIdentity.model_validate(
+                checkpoint_identity(frozen.checkpoint).model_dump(mode="json")
+            )
+            return frozen, identity
+
+        return call_in_resumable_study_slice(
+            self._store,
+            phase=expected,
+            authorization_payload_digest=payload_digest,
+            run_id=run_id,
+            configuration_digest=configuration_digest,
+            resume_from=resume_from,
+            publisher=self._publisher,
+            operation=_run,
         )
 
     def call_in_phase(
