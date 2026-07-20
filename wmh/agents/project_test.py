@@ -1398,8 +1398,7 @@ def test_project_accepts_bash_as_a_contained_agent_tool() -> None:
 
     assert project.run(shell_agent, _Provider(), "inspect", timeout=1).answer == "done"
     assert any(
-        command
-        == "mkdir -p /home/user/project/.scratch && chmod 1777 /home/user/project/.scratch"
+        command == "mkdir -p /home/user/project/.scratch && chmod 1777 /home/user/project/.scratch"
         for command in sandbox.commands.runs
     )
 
