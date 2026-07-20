@@ -176,13 +176,16 @@ def bedrock_converse_response(raw: object, model: str) -> ChatResponse:
             "cacheReadInputTokens": "cache_read_input_tokens",
             "cacheWriteInputTokens": "cache_write_input_tokens",
         }
-        translated_usage.update(
-            {
-                usage_names.get(name, name): value
-                for name, value in usage_data.items()
-                if name not in {"inputTokens", "outputTokens"}
-            }
-        )
+        for name, value in usage_data.items():
+            if name in {"inputTokens", "outputTokens"}:
+                continue
+            translated_name = usage_names.get(name, name)
+            if translated_name in translated_usage:
+                raise ValueError(
+                    "Bedrock Converse usage fields map to duplicate ChatUsage field "
+                    f"{translated_name!r}"
+                )
+            translated_usage[translated_name] = value
         result["usage"] = translated_usage
     return ChatResponse.model_validate(result)
 

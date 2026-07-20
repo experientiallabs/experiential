@@ -88,6 +88,44 @@ def test_complete_preserves_provider_usage_dimensions_for_budget_pricing() -> No
     }
 
 
+@pytest.mark.parametrize("reserved_name", ["input_tokens", "output_tokens"])
+def test_complete_rejects_reserved_usage_aliases(reserved_name: str) -> None:
+    """SDK extras cannot overwrite canonical TokenUsage counters."""
+
+    class _Choice:
+        def __init__(self) -> None:
+            self.message = type("M", (), {"content": "hi"})()
+
+    class _Usage:
+        prompt_tokens = 8
+        completion_tokens = 3
+
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {
+                "prompt_tokens": 8,
+                "completion_tokens": 3,
+                reserved_name: 0,
+            }
+
+    class _Resp:
+        choices = [_Choice()]
+        usage = _Usage()
+
+    class _Chat:
+        def create(self, **kwargs: object) -> _Resp:
+            return _Resp()
+
+    with pytest.raises(ValueError, match="reserved TokenUsage field"):
+        _openai_common.complete(
+            cast("_openai_common._ChatCompletions", _Chat()),
+            "m",
+            "",
+            [Message(role="user", content="x")],
+            8,
+        )
+
+
 def test_complete_raises_clearly_on_empty_choices() -> None:
     class _Resp:
         choices: list[object] = []

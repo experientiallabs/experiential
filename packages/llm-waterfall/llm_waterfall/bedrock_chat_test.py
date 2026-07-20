@@ -228,6 +228,40 @@ def test_null_usage_counter_fails_closed() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("canonical_name", "provider_name"),
+    [
+        ("prompt_tokens", None),
+        ("completion_tokens", None),
+        ("total_tokens", "totalTokens"),
+        ("cache_read_input_tokens", "cacheReadInputTokens"),
+        ("cache_write_input_tokens", "cacheWriteInputTokens"),
+    ],
+)
+def test_usage_alias_collision_fails_closed(
+    canonical_name: str,
+    provider_name: str | None,
+) -> None:
+    """Provider aliases cannot overwrite translated usage dimensions."""
+    usage: dict[str, object] = {
+        "inputTokens": 10,
+        "outputTokens": 4,
+        canonical_name: 0,
+    }
+    if provider_name is not None:
+        usage[provider_name] = 1
+
+    with pytest.raises(ValueError, match="duplicate ChatUsage field"):
+        bedrock_converse_response(
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "stopReason": "end_turn",
+                "usage": usage,
+            },
+            _MODEL,
+        )
+
+
 def test_signed_reasoning_replay_is_bound_to_originating_model() -> None:
     content = [
         {"reasoningContent": {"reasoningText": {"text": "inspect", "signature": "sig"}}},

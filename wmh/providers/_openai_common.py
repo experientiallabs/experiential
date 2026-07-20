@@ -96,6 +96,10 @@ def complete(
     usage_payload = cast("dict[str, object]", usage.model_dump(mode="json"))
     usage_payload.pop("prompt_tokens", None)
     usage_payload.pop("completion_tokens", None)
+    reserved_usage_names = {"input_tokens", "output_tokens"}.intersection(usage_payload)
+    if reserved_usage_names:
+        reserved_name = min(reserved_usage_names)
+        raise ValueError(f"OpenAI usage contains reserved TokenUsage field {reserved_name!r}")
     return Completion(
         text=text,
         usage=TokenUsage.model_validate(

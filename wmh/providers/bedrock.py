@@ -360,15 +360,17 @@ def _token_usage(
         or output_tokens < 0
     ):
         raise ValueError("Bedrock usage counters must be non-negative integers")
-    extras = {
-        _USAGE_FIELD_NAMES.get(name, name): item
-        for name, item in usage.items()
-        if name not in {input_field, output_field}
+    translated_usage: dict[str, object] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
     }
-    return TokenUsage.model_validate(
-        {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            **extras,
-        }
-    )
+    for name, item in usage.items():
+        if name in {input_field, output_field}:
+            continue
+        translated_name = _USAGE_FIELD_NAMES.get(name, name)
+        if translated_name in translated_usage:
+            raise ValueError(
+                f"Bedrock usage fields map to duplicate TokenUsage field {translated_name!r}"
+            )
+        translated_usage[translated_name] = item
+    return TokenUsage.model_validate(translated_usage)

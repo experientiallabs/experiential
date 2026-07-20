@@ -10,7 +10,7 @@ import pytest
 from botocore.config import Config
 
 from wmh.providers.base import DEFAULT_MAX_TOKENS, Message, ProviderConfig, ProviderKind
-from wmh.providers.bedrock import BedrockProvider
+from wmh.providers.bedrock import BedrockProvider, _token_usage
 
 
 class _FakeBody:
@@ -116,6 +116,32 @@ def test_complete_preserves_provider_usage_dimensions_for_budget_pricing(
     completion = provider.complete("sys", [Message(role="user", content="hi")], max_tokens=32)
 
     assert completion.usage.model_extra == {"cache_read_input_tokens": 2}
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"inputTokens": 10, "outputTokens": 4, "input_tokens": 0},
+        {"inputTokens": 10, "outputTokens": 4, "output_tokens": 0},
+        {"inputTokens": 10, "outputTokens": 4, "totalTokens": 14, "total_tokens": 0},
+        {
+            "inputTokens": 10,
+            "outputTokens": 4,
+            "cacheReadInputTokens": 2,
+            "cache_read_input_tokens": 0,
+        },
+        {
+            "inputTokens": 10,
+            "outputTokens": 4,
+            "cacheWriteInputTokens": 2,
+            "cache_write_input_tokens": 0,
+        },
+    ],
+)
+def test_token_usage_alias_collision_fails_closed(usage: dict[str, object]) -> None:
+    """Raw provider aliases cannot overwrite translated billing dimensions."""
+    with pytest.raises(ValueError, match="duplicate TokenUsage field"):
+        _token_usage(usage, input_field="inputTokens", output_field="outputTokens")
 
 
 def test_complete_default_max_tokens_is_8k(monkeypatch: pytest.MonkeyPatch) -> None:
