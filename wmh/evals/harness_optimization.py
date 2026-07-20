@@ -268,7 +268,6 @@ class HarnessOptimizationProtocol(BaseModel):
         retry_policy_digest: str,
         search_cost_binding: SearchCostBinding,
         confirmation_budget: PairedHarborBudgetRuntime,
-        create_rate_policy_digest: str,
         confirmation_slice_policy: PairedHarborSlicePolicy,
     ) -> HarnessOptimizationProtocol:
         """Freeze the public contract from a still-private benchmark partition."""
@@ -316,7 +315,7 @@ class HarnessOptimizationProtocol(BaseModel):
             confirmation_budget_policy_digest=frozen_budget.policy.policy_digest,
             confirmation_budget_ledger_identity=frozen_budget.ledger_identity,
             confirmation_budget_binding_digest=frozen_budget.binding_digest,
-            create_rate_policy_digest=create_rate_policy_digest,
+            create_rate_policy_digest=frozen_plan.create_rate_policy_digest,
             confirmation_slice_policy_digest=frozen_slice_policy.digest,
         )
         _validate_search_cost_binding(protocol, frozen_search_cost_binding)
@@ -342,6 +341,10 @@ class HarnessOptimizationProtocol(BaseModel):
             raise ValueError("baseline legacy and canonical execution identities are ambiguous")
         if not self.panel_routes:
             raise ValueError("optimization protocol needs at least one worker route")
+        if self.create_rate_policy_digest != self.execution_plan.create_rate_policy_digest:
+            raise ValueError(
+                "optimization protocol create-rate policy differs from its execution plan"
+            )
         route_members = tuple(item.panel_member for item in self.panel_routes)
         expected_members = tuple(item.panel_member for item in self.confirmation.panel)
         if route_members != expected_members:

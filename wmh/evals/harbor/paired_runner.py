@@ -631,6 +631,13 @@ class HarborExecutionPlan(BaseModel):
         """Return the path- and task-independent scored execution identity."""
         return _canonical_digest(self.model_dump(mode="json"))
 
+    @property
+    def create_rate_policy_digest(self) -> str:
+        """Return the frozen create-rate authority identity, including the local absence case."""
+        if self.create_rate_policy is None:
+            return _canonical_digest(None)
+        return self.create_rate_policy.digest
+
     @classmethod
     def freeze(
         cls,
