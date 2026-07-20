@@ -415,6 +415,28 @@ def test_atomic_publication_recovers_after_sigkill_before_no_replace_link(
     assert not orphaned_staging.exists()
 
 
+def test_atomic_publication_recovers_after_sigkill_in_hard_link_window(
+    tmp_path: Path,
+) -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    destination = tmp_path / "sealed.json"
+    staging = tmp_path / ".sealed.json.staging-killed-after-link"
+    payload = json.dumps(
+        runner.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    staging.write_bytes(payload)
+    destination.hardlink_to(staging)
+    assert destination.stat().st_nlink == 2
+
+    reopened = _publish_and_reopen(destination, runner, E2BPiRunnerArtifact)
+
+    assert reopened == runner
+    assert not staging.exists()
+    assert destination.stat().st_nlink == 1
+
+
 def test_authoritative_split_commitment_rejects_non_discovery_task_before_qualification(
     tmp_path: Path,
 ) -> None:

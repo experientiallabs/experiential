@@ -1337,6 +1337,7 @@ def _publish_and_reopen(
         except (FileExistsError, FileNotFoundError):
             if not path.exists():
                 raise
+            _recover_installed_staging_links(path)
             existing = _read_regular_nofollow(
                 path,
                 maximum_bytes=max(len(payload), 1),
@@ -1385,6 +1386,43 @@ def _cleanup_publish_staging(destination: Path) -> bool:
                 continue
             removed = True
     return removed
+
+
+def _recover_installed_staging_links(destination: Path) -> None:
+    """Remove only stale staging names hard-linked to a complete installed final."""
+    try:
+        descriptor = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ValueError("sealed canary artifact must be a readable non-link file") from exc
+    try:
+        final_metadata = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(final_metadata.st_mode) or final_metadata.st_nlink <= 1:
+        return
+    prefix = f".{destination.name}.staging-"
+    removed = False
+    with os.scandir(destination.parent) as entries:
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_dev != final_metadata.st_dev
+                or metadata.st_ino != final_metadata.st_ino
+            ):
+                continue
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                continue
+            removed = True
+    if removed:
+        _fsync_directory(destination.parent)
 
 
 def _fsync_directory(path: Path) -> None:
