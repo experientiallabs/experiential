@@ -1725,7 +1725,7 @@ def azure_provider_cost_meter_from_evidence(
         raise ProviderTariffEvidenceIntegrityError(
             "Azure tariff factory requires explicitly supplied retained artifacts"
         )
-    source_bytes, _ = _verified_tariff_source_bytes(
+    source_bytes, verified_sources = _verified_tariff_source_bytes(
         frozen_sources,
         evidence_artifacts=evidence_artifacts,
     )
@@ -1896,25 +1896,37 @@ def azure_provider_cost_meter_from_evidence(
         price=resolved_price,
         provenance=provenance,
     )
-    return provider_cost_meter(
-        tariff,
-        input_overhead_tokens=input_overhead_tokens,
-        evidence_artifacts=evidence_artifacts,
-    )
-
-
-def verify_provider_tariff_evidence(
-    tariff: ProviderTokenTariff,
-    *,
-    evidence_artifacts: Mapping[str, bytes] | None = None,
-) -> ProviderTariffEvidenceReceipt:
-    """Offline-verify injected retained bytes and return a deterministic policy receipt."""
     snapshot = ProviderTokenTariff.model_validate(tariff.model_dump())
-    snapshots = {source.source_id: source for source in snapshot.provenance.source_snapshots}
-    source_bytes, verified_sources = _verified_tariff_source_bytes(
-        snapshot.provenance.source_snapshots,
-        evidence_artifacts=evidence_artifacts,
+    evidence_receipt = _verify_provider_tariff_evidence_snapshot(
+        snapshot,
+        source_bytes=source_bytes,
+        verified_sources=verified_sources,
     )
+    return ProviderCostMeter(
+        provider_config=snapshot.provider_config,
+        price=snapshot.price,
+        tariff_provenance=snapshot.provenance,
+        tariff_evidence_receipt=evidence_receipt,
+        input_overhead_tokens=input_overhead_tokens,
+    )
+
+
+def _verify_provider_tariff_evidence_snapshot(
+    snapshot: ProviderTokenTariff,
+    *,
+    source_bytes: dict[str, bytes],
+    verified_sources: tuple[ProviderTariffVerifiedSource, ...],
+) -> ProviderTariffEvidenceReceipt:
+    snapshots = {source.source_id: source for source in snapshot.provenance.source_snapshots}
+    expected_source_ids = tuple(source.source_id for source in snapshot.provenance.source_snapshots)
+    if set(source_bytes) != set(snapshots):
+        raise ProviderTariffEvidenceIntegrityError(
+            "verified tariff source bytes differ from provenance"
+        )
+    if tuple(source.source_id for source in verified_sources) != expected_source_ids:
+        raise ProviderTariffEvidenceIntegrityError(
+            "verified tariff source receipt order differs from provenance"
+        )
     if snapshot.provider_config.kind is ProviderKind.BEDROCK:
         route_matches = [
             catalog_tariff
@@ -1949,6 +1961,24 @@ def verify_provider_tariff_evidence(
         tariff_claim_digest=snapshot.digest,
         verified_sources=verified_sources,
         validated_records=provider_tariff_validated_records(snapshot.provenance),
+    )
+
+
+def verify_provider_tariff_evidence(
+    tariff: ProviderTokenTariff,
+    *,
+    evidence_artifacts: Mapping[str, bytes] | None = None,
+) -> ProviderTariffEvidenceReceipt:
+    """Offline-verify injected retained bytes and return a deterministic policy receipt."""
+    snapshot = ProviderTokenTariff.model_validate(tariff.model_dump())
+    source_bytes, verified_sources = _verified_tariff_source_bytes(
+        snapshot.provenance.source_snapshots,
+        evidence_artifacts=evidence_artifacts,
+    )
+    return _verify_provider_tariff_evidence_snapshot(
+        snapshot,
+        source_bytes=source_bytes,
+        verified_sources=verified_sources,
     )
 
 

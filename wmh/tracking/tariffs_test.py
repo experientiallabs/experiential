@@ -1330,7 +1330,9 @@ def test_caller_supplied_tariff_freezes_an_exact_azure_responses_route() -> None
     assert meter.model_dump(mode="json")["provider_config"] == config.model_dump(mode="json")
 
 
-def test_azure_evidence_factory_derives_the_complete_paid_meter() -> None:
+def test_azure_evidence_factory_derives_the_complete_paid_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = ProviderConfig(
         kind=ProviderKind.AZURE_OPENAI,
         model_type="gpt-5.5",
@@ -1342,6 +1344,27 @@ def test_azure_evidence_factory_derives_the_complete_paid_meter() -> None:
         responses_api_version="v1",
     )
     declared, artifacts = _azure_tariff_fixture(config)
+    decoded_artifacts: list[str] = []
+    original_decode = tariffs_module._decode_verified_artifact
+
+    def record_decode(
+        *,
+        locator: str,
+        artifact_bytes: bytes,
+        artifact_digest: str,
+        artifact_encoding: str,
+        source_digest: str,
+    ) -> bytes:
+        decoded_artifacts.append(locator)
+        return original_decode(
+            locator=locator,
+            artifact_bytes=artifact_bytes,
+            artifact_digest=artifact_digest,
+            artifact_encoding=artifact_encoding,
+            source_digest=source_digest,
+        )
+
+    monkeypatch.setattr(tariffs_module, "_decode_verified_artifact", record_decode)
 
     meter = azure_provider_cost_meter_from_evidence(
         provider_config=config,
@@ -1355,6 +1378,7 @@ def test_azure_evidence_factory_derives_the_complete_paid_meter() -> None:
     assert meter.price == declared.price
     assert meter.tariff_provenance == declared.provenance
     assert meter.input_overhead_tokens == 16_384
+    assert len(decoded_artifacts) == 3
     assert meter.tariff_evidence_receipt == verify_provider_tariff_evidence(
         declared,
         evidence_artifacts=artifacts,
@@ -1463,6 +1487,31 @@ def test_azure_evidence_factory_requires_complete_utc_effective_timestamps(
             evidence_artifacts={**artifacts, "azure-retail-price": retained},
             verified_on=date(2026, 7, 19),
         )
+
+
+def test_azure_evidence_factory_accepts_seven_digit_zero_fraction_timestamp() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example-resource.openai.azure.com",
+        deployment="audited-gpt-55-deployment",
+        api_version="2026-06-01",
+    )
+    declared, artifacts = _azure_tariff_fixture(config)
+    retail = json.loads(artifacts["azure-retail-price"])
+    for record in retail["Items"]:
+        record["effectiveStartDate"] = "2026-07-01T00:00:00.0000000Z"
+    mutated, retained = _replace_azure_retail_document(declared, retail)
+
+    meter = azure_provider_cost_meter_from_evidence(
+        provider_config=config,
+        source_snapshots=mutated.provenance.source_snapshots,
+        evidence_artifacts={**artifacts, "azure-retail-price": retained},
+        verified_on=date(2026, 7, 19),
+    )
+
+    assert meter.tariff_provenance.effective_on == date(2026, 7, 1)
 
 
 @pytest.mark.parametrize(
