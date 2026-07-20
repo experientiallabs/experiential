@@ -292,7 +292,7 @@ def test_agent_runs_the_exact_candidate_and_persists_its_trace(
         *,
         backend: str = "local",
         e2b_template: str | None = None,
-        transport_retries: int = 1,
+        transport_retries: int | None = None,
         **_kwargs: object,
     ) -> _Runtime:
         observed["candidate_hash"] = self.doc_hash
@@ -372,9 +372,11 @@ def test_local_agent_forces_ssh_transport_despite_ambient_link_setting(
         _provider: object,
         *,
         pi_transport: str | None = None,
+        transport_retries: int | None = None,
         **_kwargs: object,
     ) -> _Runtime:
         observed["pi_transport"] = pi_transport
+        observed["transport_retries"] = transport_retries
         return _Runtime()
 
     monkeypatch.setenv("PI_TRANSPORT", "link")
@@ -395,7 +397,7 @@ def test_local_agent_forces_ssh_transport_despite_ambient_link_setting(
         )
     )
 
-    assert observed == {"pi_transport": "ssh"}
+    assert observed == {"pi_transport": "ssh", "transport_retries": None}
 
 
 def test_agent_rejects_secret_environment_injection(tmp_path: Path) -> None:

@@ -166,7 +166,9 @@ class WmhHarborAgent(BaseAgent):
             backend=self._harness_backend,
             e2b_template=self._e2b_template,
             pi_transport=self._pi_transport,
-            transport_retries=0,
+            # A real task environment is mutable, so an E2B transport failure must not replay
+            # the whole episode against already-mutated state. Local Pi has no replay wrapper.
+            transport_retries=0 if self._harness_backend == "e2b" else None,
             should_cancel=cancel_requested.is_set,
         )
         bridge = HarborAgentEnvironment(asyncio.get_running_loop(), environment)
