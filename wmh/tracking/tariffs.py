@@ -1207,36 +1207,39 @@ def _azure_source_by_shape(
             label="Azure tariff source",
         )
         parsed_locator = urlsplit(snapshot.source_locator)
-        host = parsed_locator.hostname
+        authority = parsed_locator.netloc
         locator_path = parsed_locator.path.casefold()
         if "%" in locator_path or "\\" in locator_path:
             raise ProviderTariffEvidenceIntegrityError(
                 "Azure tariff evidence resource path must not use encoded or alternate separators"
             )
         if snapshot.role == "rate_catalog" and "Items" in document:
-            if host != "prices.azure.com" or locator_path != "/api/retail/prices":
+            if authority != "prices.azure.com" or locator_path != "/api/retail/prices":
                 raise ProviderTariffEvidenceIntegrityError(
-                    "Azure retail evidence must use the exact public retail-prices resource"
+                    "Azure retail evidence must use the exact canonical authority and "
+                    "public retail-prices resource"
                 )
             retail_sources.append((snapshot, document))
         elif snapshot.role == "route_definition" and "/deployments/" in locator_path:
-            if host != "management.azure.com" or not re.fullmatch(
+            if authority != "management.azure.com" or not re.fullmatch(
                 r"/subscriptions/[^/]+/resourcegroups/[^/]+/providers/"
                 r"microsoft\.cognitiveservices/accounts/[^/]+/deployments/[^/]+",
                 locator_path,
             ):
                 raise ProviderTariffEvidenceIntegrityError(
-                    "Azure deployment evidence must use an exact ARM deployment resource"
+                    "Azure deployment evidence must use the exact canonical authority and "
+                    "an exact ARM deployment resource"
                 )
             deployment_sources.append((snapshot, document))
         elif snapshot.role == "route_definition":
-            if host != "management.azure.com" or not re.fullmatch(
+            if authority != "management.azure.com" or not re.fullmatch(
                 r"/subscriptions/[^/]+/resourcegroups/[^/]+/providers/"
                 r"microsoft\.cognitiveservices/accounts/[^/]+",
                 locator_path,
             ):
                 raise ProviderTariffEvidenceIntegrityError(
-                    "Azure account evidence must use an exact ARM account resource"
+                    "Azure account evidence must use the exact canonical authority and "
+                    "an exact ARM account resource"
                 )
             account_sources.append((snapshot, document))
         else:

@@ -1092,6 +1092,28 @@ def test_public_source_query_is_canonical_and_rejects_credential_channels() -> N
         ProviderTariffSourceSnapshot.model_validate(
             {**source.model_dump(mode="json"), "public_request_query": list(reversed(public_query))}
         )
+    for duplicate_name in ("$filter", "api-version"):
+        duplicated = tuple(
+            sorted(
+                (
+                    *public_query,
+                    ProviderTariffPublicQueryParameter(
+                        name=duplicate_name,
+                        value="additional-public-coordinate",
+                    ),
+                ),
+                key=lambda parameter: (parameter.name, parameter.value),
+            )
+        )
+        with pytest.raises(ValidationError, match="unique parameter names"):
+            ProviderTariffSourceSnapshot.model_validate(
+                {
+                    **source.model_dump(mode="json"),
+                    "public_request_query": [
+                        parameter.model_dump(mode="json") for parameter in duplicated
+                    ],
+                }
+            )
     with pytest.raises(ValidationError, match="credential-bearing"):
         ProviderTariffPublicQueryParameter(name="sig", value="opaque")
     with pytest.raises(ValidationError, match="credential-bearing"):
@@ -1100,6 +1122,62 @@ def test_public_source_query_is_canonical_and_rejects_credential_channels() -> N
         ProviderTariffPublicQueryParameter(name="subscription-key", value="opaque")
     with pytest.raises(ValidationError, match="credential-bearing"):
         ProviderTariffPublicQueryParameter(name="$filter", value="sig eq 'opaque'")
+
+
+@pytest.mark.parametrize("control", ["\n", "\r", "\t", "\x7f", "\x85", "\u200b"])
+def test_public_source_query_rejects_nonprintable_values(control: str) -> None:
+    with pytest.raises(ValidationError, match="printable"):
+        ProviderTariffPublicQueryParameter(name="$filter", value=f"safe{control}value")
+
+
+@pytest.mark.parametrize("control", ["\n", "\r", "\t", "\x7f", "\x85", "\u200b"])
+def test_public_source_locator_rejects_nonprintable_text(control: str) -> None:
+    payload = _test_source_snapshot().model_dump(mode="json")
+    payload["source_locator"] = f"https://prices.azure.com{control}/api/retail/prices"
+
+    with pytest.raises(ValidationError, match="printable"):
+        ProviderTariffSourceSnapshot.model_validate(payload)
+
+
+@pytest.mark.parametrize("control", ["\n", "\r", "\t", "\x7f", "\x85", "\u200b"])
+def test_retained_artifact_locator_rejects_nonprintable_text(control: str) -> None:
+    payload = _test_source_snapshot().retained_artifact.model_dump(mode="json")
+    payload["locator"] = f"https://example.test{control}/evidence/rates.json"
+
+    with pytest.raises(ValidationError, match="printable"):
+        ProviderTariffRetainedArtifact.model_validate(payload)
+
+
+@pytest.mark.parametrize("segment", [".", ".."])
+def test_retained_https_artifact_locator_rejects_dot_path_segments(segment: str) -> None:
+    payload = _test_source_snapshot().retained_artifact.model_dump(mode="json")
+    payload["locator"] = f"https://example.test/evidence/{segment}/rates.json"
+
+    with pytest.raises(ValidationError, match="dot path segments"):
+        ProviderTariffRetainedArtifact.model_validate(payload)
+
+
+@pytest.mark.parametrize("segment", [".", ".."])
+@pytest.mark.parametrize("resource", ["account", "deployment"])
+def test_public_source_locator_rejects_dot_resource_segments(
+    segment: str,
+    resource: str,
+) -> None:
+    suffix = (
+        "providers/Microsoft.CognitiveServices/accounts/example-resource"
+        if resource == "account"
+        else (
+            "providers/Microsoft.CognitiveServices/accounts/example-resource/"
+            "deployments/example-deployment"
+        )
+    )
+    payload = _test_source_snapshot().model_dump(mode="json")
+    payload["source_locator"] = (
+        f"https://management.azure.com/subscriptions/{segment}/resourceGroups/example/{suffix}"
+    )
+
+    with pytest.raises(ValidationError, match="dot path segments"):
+        ProviderTariffSourceSnapshot.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -1519,6 +1597,40 @@ def test_azure_deployment_resource_must_belong_to_the_bound_account() -> None:
     with pytest.raises(
         tariffs_module.ProviderTariffEvidenceIntegrityError,
         match="different ARM account resource",
+    ):
+        verify_provider_tariff_evidence(mutated, evidence_artifacts=artifacts)
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    ["azure-account-route", "azure-deployment-route", "azure-retail-price"],
+)
+def test_azure_sources_require_the_exact_canonical_authority(source_id: str) -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example-resource.openai.azure.com",
+        deployment="audited-gpt-55-deployment",
+        api_version="2026-06-01",
+    )
+    tariff, artifacts = _azure_tariff_fixture(config)
+    payload = tariff.model_dump(mode="json")
+    provenance = payload["provenance"]
+    assert isinstance(provenance, dict)
+    sources = provenance["source_snapshots"]
+    assert isinstance(sources, list)
+    source = next(source for source in sources if source["source_id"] == source_id)
+    locator = source["source_locator"]
+    assert isinstance(locator, str)
+    scheme, authority_and_path = locator.split("://", 1)
+    authority, path = authority_and_path.split("/", 1)
+    source["source_locator"] = f"{scheme}://{authority}:444/{path}"
+    mutated = ProviderTokenTariff.model_validate(payload)
+
+    with pytest.raises(
+        tariffs_module.ProviderTariffEvidenceIntegrityError,
+        match="canonical authority",
     ):
         verify_provider_tariff_evidence(mutated, evidence_artifacts=artifacts)
 

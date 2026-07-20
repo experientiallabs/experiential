@@ -95,6 +95,11 @@ _PROVIDER_TARIFF_EVIDENCE_CONTRACTS = {
 }
 
 
+def _contains_nonprintable_text(value: str) -> bool:
+    """Return whether exact provenance text contains a control or format character."""
+    return any(not character.isprintable() for character in value)
+
+
 def provider_tariff_evidence_verifier_digest(profile: str) -> str:
     """Return the local registry digest for one supported tariff evidence contract."""
     try:
@@ -221,7 +226,7 @@ class ProviderTariffPublicQueryParameter(BaseModel):
     @field_validator("value")
     @classmethod
     def _reject_credential_syntax(cls, value: str) -> str:
-        if value != value.strip() or any(ord(character) < 32 for character in value):
+        if value != value.strip() or _contains_nonprintable_text(value):
             raise ValueError("public tariff query values must be exact printable text")
         if _SENSITIVE_QUERY_VALUE.search(value):
             raise ValueError("public tariff query cannot contain credential-bearing syntax")
@@ -243,6 +248,8 @@ class ProviderTariffRetainedArtifact(BaseModel):
     def _require_safe_locator(self) -> Self:
         if self.locator != self.locator.strip():
             raise ValueError("retained artifact locator cannot have surrounding whitespace")
+        if _contains_nonprintable_text(self.locator):
+            raise ValueError("retained artifact locator must be exact printable text")
         if self.storage_kind == "package_resource":
             if re.fullmatch(_PACKAGE_RESOURCE_PATTERN, self.locator) is None:
                 raise ValueError("retained package artifact requires a canonical resource locator")
@@ -262,6 +269,8 @@ class ProviderTariffRetainedArtifact(BaseModel):
                 raise ValueError(
                     "retained HTTPS artifact must not contain credentials, query, or fragment"
                 )
+            if any(segment in {".", ".."} for segment in parsed.path.split("/")):
+                raise ValueError("retained HTTPS artifact locator cannot contain dot path segments")
         if self.artifact_digest == _ZERO_DIGEST:
             raise ValueError("retained artifact digest cannot be the zero digest")
         return self
@@ -296,6 +305,8 @@ class ProviderTariffSourceSnapshot(BaseModel):
     def _require_canonical_source_locator(cls, value: str) -> str:
         if value != value.strip():
             raise ValueError("tariff source locator cannot have surrounding whitespace")
+        if _contains_nonprintable_text(value):
+            raise ValueError("tariff source locator must be exact printable text")
         parsed = urlsplit(value)
         if (
             parsed.scheme != "https"
@@ -308,6 +319,8 @@ class ProviderTariffSourceSnapshot(BaseModel):
             raise ValueError(
                 "tariff source locator must be HTTPS without credentials, query, or fragment"
             )
+        if any(segment in {".", ".."} for segment in parsed.path.split("/")):
+            raise ValueError("tariff source locator cannot contain dot path segments")
         return value
 
     @field_validator("source_snapshot_digest")
@@ -320,9 +333,7 @@ class ProviderTariffSourceSnapshot(BaseModel):
     @field_validator("publication_id")
     @classmethod
     def _require_exact_publication_id(cls, value: str | None) -> str | None:
-        if value is not None and (
-            value != value.strip() or any(ord(character) < 32 for character in value)
-        ):
+        if value is not None and (value != value.strip() or _contains_nonprintable_text(value)):
             raise ValueError("tariff publication identifier must be an exact printable value")
         return value
 
@@ -335,6 +346,9 @@ class ProviderTariffSourceSnapshot(BaseModel):
         coordinates = tuple((parameter.name, parameter.value) for parameter in value)
         if coordinates != tuple(sorted(coordinates)) or len(coordinates) != len(set(coordinates)):
             raise ValueError("public tariff query parameters require canonical ascending order")
+        names = tuple(parameter.name for parameter in value)
+        if len(names) != len(set(names)):
+            raise ValueError("public tariff query parameters require unique parameter names")
         return value
 
 
@@ -372,7 +386,7 @@ class ProviderTariffValidatedRecord(BaseModel):
         if (
             not value.startswith("/")
             or value != value.strip()
-            or any(ord(character) < 32 for character in value)
+            or _contains_nonprintable_text(value)
         ):
             raise ValueError("validated tariff record requires an exact absolute path")
         return value
@@ -446,7 +460,7 @@ class ProviderTariffSourceBinding(BaseModel):
         if (
             not value.startswith("/")
             or value != value.strip()
-            or any(ord(character) < 32 for character in value)
+            or _contains_nonprintable_text(value)
         ):
             raise ValueError("tariff source binding requires an absolute record path")
         return value
@@ -454,7 +468,7 @@ class ProviderTariffSourceBinding(BaseModel):
     @field_validator("source_value", "canonical_value")
     @classmethod
     def _require_exact_printable_value(cls, value: str) -> str:
-        if value != value.strip() or any(ord(character) < 32 for character in value):
+        if value != value.strip() or _contains_nonprintable_text(value):
             raise ValueError("tariff source binding values must be exact printable text")
         return value
 
@@ -490,7 +504,7 @@ class ProviderTariffBillingMeter(BaseModel):
         if (
             not value.startswith("/")
             or value != value.strip()
-            or any(ord(character) < 32 for character in value)
+            or _contains_nonprintable_text(value)
         ):
             raise ValueError("tariff source record path must be an exact absolute printable path")
         return value
@@ -498,7 +512,7 @@ class ProviderTariffBillingMeter(BaseModel):
     @field_validator("sku_id", "rate_id", "billing_region", "billing_mode")
     @classmethod
     def _require_exact_nonblank_billing_id(cls, value: str) -> str:
-        if value != value.strip() or any(ord(character) < 32 for character in value):
+        if value != value.strip() or _contains_nonprintable_text(value):
             raise ValueError("tariff billing identifier must be an exact printable value")
         return value
 
