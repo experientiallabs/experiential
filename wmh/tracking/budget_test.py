@@ -1684,6 +1684,35 @@ def test_budgeted_provider_exposes_exact_binding_and_rejects_nested_wrapper(
         )
 
 
+@pytest.mark.parametrize("attempt_contract", ["missing", "multiple"])
+def test_budgeted_provider_rejects_non_single_dispatch_before_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attempt_contract: str,
+) -> None:
+    """Unsafe provider retry contracts never enter the paid budget boundary."""
+    policy = _policy(hard=10_000_000, search=10_000_000, final=0)
+    path = tmp_path / "provider-contract-budget.sqlite3"
+    ledger = SpendLedger(path, policy)
+    account = BudgetAccount(
+        ledger_path=path,
+        ledger_identity=ledger.ledger_identity,
+        policy=policy,
+        scope=_scope(category="provider-call"),
+        meter_id="worker",
+    )
+    provider = _FakeToolProvider(chat_usage=ChatUsage(prompt_tokens=1, completion_tokens=1))
+    if attempt_contract == "missing":
+        monkeypatch.delattr(_FakeToolProvider, "paid_request_attempts")
+    else:
+        monkeypatch.setattr(provider, "paid_request_attempts", 2)
+
+    with pytest.raises(TypeError, match="single-dispatch"):
+        BudgetedProvider(provider, account, id_factory=lambda: "must-not-reserve")
+
+    assert ledger.reservations() == []
+
+
 def test_budgeted_provider_rejects_wrapped_config_drift_before_reservation(
     tmp_path: Path,
 ) -> None:
