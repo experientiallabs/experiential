@@ -324,3 +324,27 @@ def test_pi_transport_rejects_execution_modes_where_it_has_no_effect() -> None:
         )
     with pytest.raises(ValueError, match="only to local pi-node"):
         HarnessDoc.baseline("b").runtime(provider, pi_transport="ssh")
+
+
+def test_transport_retries_rejects_execution_modes_where_it_has_no_effect() -> None:
+    provider = _stub_provider()
+    with pytest.raises(ValueError, match="only to e2b pi-node"):
+        _pi_doc().runtime(provider, transport_retries=0)
+    with pytest.raises(ValueError, match="only to e2b pi-node"):
+        HarnessDoc.baseline("b").runtime(provider, transport_retries=0)
+
+
+def test_transport_retries_reaches_e2b_pi_runtime() -> None:
+    from wmh.harness.pi_e2b import E2BPiRuntime, E2BSandboxPool
+
+    pool = E2BSandboxPool()
+    runtime = _pi_doc().runtime(
+        _stub_provider(),
+        backend="e2b",
+        e2b_pool=pool,
+        transport_retries=0,
+    )
+
+    assert isinstance(runtime, E2BPiRuntime)
+    assert runtime._transport_retries == 0  # noqa: SLF001 - pins public policy passthrough
+    pool.close()
