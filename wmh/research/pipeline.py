@@ -48,6 +48,7 @@ def optimize_prompt(
     select_on_hard: bool = False,
     recheck: list[Trace] | None = None,
     minibatch_size: int = 3,
+    reflection_provider: Provider | None = None,
 ) -> OptimizeResult:
     """Evolve `base_prompt` with GEPA at `seed` (RAG-aware when `embedder` is set).
 
@@ -55,10 +56,13 @@ def optimize_prompt(
     the GEPA `OptimizeResult` (winning prompt + held-out accuracy + rollouts used).
     `hard_step_filter`/`select_on_hard` forward to `GEPAOptimizer.optimize` so experiments can
     concentrate reflection (and optionally candidate selection) on the steps with headroom - see
-    that method for the semantics and caveats.
+    that method for the semantics and caveats. `reflection_provider` runs GEPA's reflection on a
+    different (typically stronger) model than the rollout/serve provider; None self-reflects.
     """
     retriever = EmbeddingRetriever(embedder) if embedder is not None else None
-    optimizer = GEPAOptimizer(provider, judge, retriever=retriever, seed=seed)
+    optimizer = GEPAOptimizer(
+        provider, judge, retriever=retriever, seed=seed, reflection_provider=reflection_provider
+    )
     return optimizer.optimize(
         train,
         test,

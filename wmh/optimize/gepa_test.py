@@ -457,6 +457,28 @@ def test_optimize_minibatch_size_is_configurable(monkeypatch) -> None:  # noqa: 
     assert seen["minibatch"] == 2
 
 
+def test_reflection_provider_routes_reflection_off_the_executor(monkeypatch) -> None:  # noqa: ANN001
+    """`reflection_provider` runs reflection on a separate (typically stronger) model while
+    rollouts stay on the executor - the strong-reflector/cheap-executor lever."""
+    import wmh.optimize.gepa as g
+
+    seen: dict[str, object] = {}
+
+    def fake_optimize(**kwargs):  # noqa: ANN003, ANN202
+        seen["reflection_lm"] = kwargs["reflection_lm"]
+        return _FakeGepaResult(["BASE"], best_idx=0)
+
+    monkeypatch.setattr(g.gepa, "optimize", fake_optimize)
+    executor = FakeProvider()
+    reflector = FakeProvider(mutation="FROM-REFLECTOR")
+    GEPAOptimizer(executor, FakeJudge(), reflection_provider=reflector).optimize(
+        [_trace("t0", n=4)], [_trace("te1")], "BASE", budget=1
+    )
+    assert seen["reflection_lm"]("propose a better prompt") == "FROM-REFLECTOR"
+    assert reflector.reflection_calls == 1
+    assert executor.reflection_calls == 0
+
+
 def test_optimize_skips_recheck_when_base_wins_the_search(monkeypatch) -> None:  # noqa: ANN001
     _patched_gepa_optimize(monkeypatch, ["BASE", "EVOLVED"], best_idx=0)
     provider = _PromptSensitiveProvider()

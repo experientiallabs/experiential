@@ -1,0 +1,14 @@
+{
+  "suite": "terminal-tasks",
+  "executor": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+  "probed_steps": 28,
+  "failures": 19,
+  "failure_classes": {
+    "derivable": 1,
+    "session": 1,
+    "unknowable": 17
+  },
+  "headroom": 0.07142857142857142,
+  "probe_fidelity": 0.505,
+  "cost_usd": 0.5843799999999999
+}

@@ -77,6 +77,7 @@ class GepaScalingAblation:
         sample_turns: str = "all",
         test_cap: int | None = None,
         concurrency: int = 1,
+        reflection_provider: Provider | None = None,
     ) -> None:
         self._base_prompt = base_prompt
         self._make_backends = make_backends
@@ -85,6 +86,8 @@ class GepaScalingAblation:
         self._hard_probe_steps = hard_probe_steps
         self._sample_turns = sample_turns
         self._concurrency = concurrency
+        # Optional separate reflection LM (strong reflector, cheap executor); None self-reflects.
+        self._reflection_provider = reflection_provider
         self._split: CorpusSplit = partition_corpus(
             corpus, test_frac=test_frac, valid_frac=valid_frac
         )
@@ -174,6 +177,7 @@ class GepaScalingAblation:
                 select_on_hard=hard_filter is not None,
                 recheck=self._gepa_recheck,
                 minibatch_size=self._minibatch_size,
+                reflection_provider=self._reflection_provider,
             )
             prompt = result.prompt
 

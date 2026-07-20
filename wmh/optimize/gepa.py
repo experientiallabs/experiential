@@ -585,9 +585,14 @@ class GEPAOptimizer:
         on_budget: Callable[[int], None] | None = None,
         on_activity: Callable[[str], None] | None = None,
         seed: int = 0,
+        reflection_provider: Provider | None = None,
     ) -> None:
         self._provider = provider
         self._judge = judge
+        # Optional separate reflection LM. Reflection is ~budget calls per run (vs hundreds of
+        # rollout/valset calls), so a strong reflector adds almost no cost while the executor
+        # stays cheap; None preserves the historical self-reflection behavior.
+        self._reflection_provider = reflection_provider
         # `on_budget` receives the REAL translated max_metric_calls right before the run starts —
         # callers reporting progress must size their bar with it, not with `budget` (iterations),
         # or the bar finishes while GEPA is still burning valset calls.
@@ -705,7 +710,9 @@ class GEPAOptimizer:
             trainset=trainset,
             valset=valset,
             adapter=adapter,
-            reflection_lm=_reflection_lm(self._provider, self._on_activity),
+            reflection_lm=_reflection_lm(
+                self._reflection_provider or self._provider, self._on_activity
+            ),
             reflection_prompt_template=_REFLECTION_PROMPT_TEMPLATE,
             candidate_selection_strategy="pareto",
             # Merge is a headline GEPA feature: combine complementary lessons from two Pareto-front

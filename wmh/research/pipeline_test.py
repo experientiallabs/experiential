@@ -141,8 +141,17 @@ def test_optimize_prompt_forwards_hard_step_knobs(monkeypatch) -> None:  # noqa:
     seen: dict[str, object] = {}
 
     class _FakeOptimizer:
-        def __init__(self, provider, judge, retriever=None, *, seed=0):  # noqa: ANN001, ANN204
+        def __init__(  # noqa: ANN204
+            self,
+            provider,  # noqa: ANN001
+            judge,  # noqa: ANN001
+            retriever=None,  # noqa: ANN001
+            *,
+            seed=0,  # noqa: ANN001
+            reflection_provider=None,  # noqa: ANN001
+        ):
             seen["seed"] = seed
+            seen["reflection_provider"] = reflection_provider
 
         def optimize(  # noqa: ANN202
             self,
@@ -166,6 +175,7 @@ def test_optimize_prompt_forwards_hard_step_knobs(monkeypatch) -> None:  # noqa:
     monkeypatch.setattr(pl, "GEPAOptimizer", _FakeOptimizer)
     marker = lambda step: True  # noqa: E731
     recheck_traces = [_trace("rc1")]
+    reflector = FakeProvider()
     result = pl.optimize_prompt(
         [_trace("tr1")],
         [_trace("te1")],
@@ -179,10 +189,12 @@ def test_optimize_prompt_forwards_hard_step_knobs(monkeypatch) -> None:  # noqa:
         select_on_hard=True,
         recheck=recheck_traces,
         minibatch_size=8,
+        reflection_provider=reflector,
     )
     assert result == "RESULT"
     assert seen == {
         "seed": 7,
+        "reflection_provider": reflector,
         "budget": 4,
         "hard_step_filter": marker,
         "select_on_hard": True,

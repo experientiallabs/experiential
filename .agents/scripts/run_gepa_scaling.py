@@ -33,7 +33,7 @@ from pathlib import Path
 
 from wmh.engine.eval_suites import resolve_eval_suite
 from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import get_adapter
+from wmh.ingest import drop_degenerate_traces, get_adapter
 from wmh.optimize.judge import JUDGE_VERSION, Judge, RubricJudge
 from llm_waterfall import RetryPolicy
 
@@ -155,11 +155,22 @@ def _load_corpus(args: argparse.Namespace) -> tuple[list, str]:  # noqa: ANN201 
 
 def _run(args: argparse.Namespace, tracker: RunTracker) -> AblationReport:
     traces, label = _load_corpus(args)
+    if args.drop_degenerate:
+        traces, dropped = drop_degenerate_traces(traces)
+        if dropped:
+            print(f"dropped {dropped} degenerate traces (all-empty observations)")
     if not traces:
         raise SystemExit("no traces ingested")
 
     seeds = _parse_ints(args.seeds)
     grid = [(n, b) for n in _parse_ints(args.counts) for b in _parse_ints(args.budgets)]
+    reflection_provider = None
+    if args.reflect_model:
+        reflection_provider = MeteredProvider(
+            _chain(args.reflect_model, args.region, not args.no_fallback),
+            tracker,
+            classify=classify_build_call,
+        )
     ablation = GepaScalingAblation(
         traces,
         BASE_ENV_PROMPT,
@@ -185,6 +196,7 @@ def _run(args: argparse.Namespace, tracker: RunTracker) -> AblationReport:
         sample_turns=args.sample_turns,
         test_cap=args.test_cap,
         concurrency=args.concurrency,
+        reflection_provider=reflection_provider,
     )
     split = ablation.split
     scored = len(ablation.scored_test)
@@ -200,7 +212,8 @@ def _run(args: argparse.Namespace, tracker: RunTracker) -> AblationReport:
         f"grid={ablation.grid}, seeds={seeds}, "
         f"gepa valset {len(ablation.gepa_valid)} traces / {gepa_val_steps} steps, "
         f"hard-threshold={args.hard_threshold}\n"
-        f"opt-model={args.opt_model}, judge={JUDGE_VERSION} ({args.judge_model})\n"
+        f"opt-model={args.opt_model}, reflect-model={args.reflect_model or 'self'}, "
+        f"judge={JUDGE_VERSION} ({args.judge_model})\n"
     )
 
     def _progress(condition: Condition, seed: int, score: float) -> None:
@@ -288,6 +301,13 @@ def main() -> None:
         "unless --no-fallback.",
     )
     parser.add_argument(
+        "--reflect-model",
+        default=None,
+        help="Separate reflection LM (strong reflector, cheap executor): a Bedrock model id "
+        "(`model[@aws_profile]`) or `openai/model`; failover ladder appended unless "
+        "--no-fallback. Default: reflect with --opt-model (self-reflection).",
+    )
+    parser.add_argument(
         "--no-fallback",
         action="store_true",
         help="Run the primaries bare (no failover ladder) — a capacity error then propagates.",
@@ -295,6 +315,12 @@ def main() -> None:
     parser.add_argument("--region", default="us-east-1", help="AWS region (Bedrock).")
     parser.add_argument("--embed-dim", type=int, default=512, help="phi dim (offline embedder).")
     parser.add_argument("--no-rag", action="store_true", help="Disable retrieval (zero-shot).")
+    parser.add_argument(
+        "--drop-degenerate",
+        action="store_true",
+        help="Filter all-empty-observation traces before the split (swe-bench is ~66%% such "
+        "capture junk; same filter as `wmh build --drop-degenerate`).",
+    )
     parser.add_argument("--out", default=None, help="Path to write the AblationReport JSON.")
     args = parser.parse_args()
 
