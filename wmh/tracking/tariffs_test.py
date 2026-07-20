@@ -113,10 +113,16 @@ def test_catalog_does_not_infer_an_azure_deployment_price() -> None:
         catalog_provider_token_tariff(azure_config)
 
 
-def test_descriptive_prices_match_every_hard_budget_tariff_route() -> None:
+def test_descriptive_prices_are_exact_or_fail_closed_without_full_route_context() -> None:
     for tariff in catalog_provider_token_tariffs():
-        descriptive_price = price_for(tariff.provider_config.model)
+        descriptive_price = price_for(
+            tariff.provider_config.model,
+            provider=tariff.provider_config.kind.value,
+        )
 
+        if tariff.provider_config.model == "zai.glm-5":
+            assert descriptive_price is None
+            continue
         assert descriptive_price is not None
         assert descriptive_price.input_per_mtok * 1_000 == pytest.approx(
             tariff.price.input_nano_usd_per_token
