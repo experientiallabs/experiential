@@ -1769,6 +1769,102 @@ def test_complete_matching_job_is_reused_without_rerunning_completed_trials(
     assert readiness_configs == [(_LOCAL_RUNNER.image, _LOCAL_RUNNER.platform)]
 
 
+def test_load_existing_reingests_terminal_job_without_dispatch_or_runner_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    candidate = pi_node_baseline("candidate")
+    spec = _spec(tmp_path, dataset)
+    evaluator = mod.HarborEvaluator(spec, _provider())
+
+    async def first_run(job: Job) -> None:
+        _materialize_completed_job(job, candidate.execution_hash)
+
+    monkeypatch.setattr(Job, "run", first_run)
+    first = asyncio.run(evaluator.evaluate(candidate))
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("load_existing must not create a Harbor job")
+
+    async def unexpected_run(_job: Job) -> None:
+        raise AssertionError("load_existing must not run a Harbor job")
+
+    def unexpected_probe(*, image: str, platform: str) -> None:
+        raise AssertionError(f"load_existing must not probe {image}/{platform}")
+
+    monkeypatch.setattr(
+        mod._AtomicHarborJob,
+        "create",
+        classmethod(unexpected_create),
+    )
+    monkeypatch.setattr(Job, "run", unexpected_run)
+    monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
+
+    reconstructed = mod.HarborEvaluator(spec, _provider())
+    loaded = asyncio.run(reconstructed.load_existing(candidate))
+
+    assert loaded.result == first.result
+    assert loaded.locators == first.locators
+
+
+def test_load_existing_rejects_interrupted_root_with_cancelled_child_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    candidate = pi_node_baseline("candidate")
+    spec = _spec(tmp_path, dataset)
+    evaluator = mod.HarborEvaluator(spec, _provider())
+
+    async def first_run(job: Job) -> None:
+        complete_name, incomplete_name = sorted(config.trial_name for config in job._trial_configs)
+        _materialize_job(
+            job,
+            candidate.execution_hash,
+            complete_names={complete_name},
+            incomplete_names={incomplete_name},
+        )
+        result_path = job.job_dir / complete_name / "result.json"
+        trial = TrialResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+        trial.verifier_result = None
+        trial.exception_info = ExceptionInfo(
+            exception_type="CancelledError",
+            exception_message="control-plane cancellation",
+            exception_traceback="",
+            occurred_at=datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
+        )
+        result_path.write_text(trial.model_dump_json(indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(Job, "run", first_run)
+    first = asyncio.run(evaluator.evaluate(candidate))
+    assert first.result.n_incomplete == 1
+    assert first.result.n_cancelled == 1
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        raise AssertionError("load_existing must not create a Harbor job")
+
+    async def unexpected_run(_job: Job) -> None:
+        raise AssertionError("load_existing must not run a Harbor job")
+
+    def unexpected_probe(*, image: str, platform: str) -> None:
+        raise AssertionError(f"load_existing must not probe {image}/{platform}")
+
+    monkeypatch.setattr(
+        mod._AtomicHarborJob,
+        "create",
+        classmethod(unexpected_create),
+    )
+    monkeypatch.setattr(Job, "run", unexpected_run)
+    monkeypatch.setattr(mod, "verify_container_pi_runner_ready", unexpected_probe)
+
+    reconstructed = mod.HarborEvaluator(spec, _provider())
+    with pytest.raises(mod.StaleHarborJobError, match="finished root result"):
+        asyncio.run(reconstructed.load_existing(candidate))
+
+
 def test_evaluator_session_shares_one_concurrent_runner_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -9,7 +9,7 @@ import json
 import multiprocessing
 import os
 from collections import Counter, defaultdict
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -24,6 +24,8 @@ from wmh.evals.benchmark import (
     BenchmarkCandidateStage,
     BenchmarkCandidateStatus,
     BenchmarkCell,
+    BenchmarkError,
+    BenchmarkFailureKind,
     BenchmarkRunHealth,
     BenchmarkRunResult,
     BenchmarkTrialResult,
@@ -1250,6 +1252,7 @@ def _loaded_result(
     reward: float,
     budget_policy_digest: str,
     response_identity: mod.ProviderResponseIdentity | None = None,
+    failure_kind: BenchmarkFailureKind | None = None,
 ) -> LoadedHarborJobResult:
     task_names = spec.datasets[0].task_names
     assert task_names is not None
@@ -1268,17 +1271,53 @@ def _loaded_result(
         task_instruction=f"Solve {task_id}.",
         task_environment_digest=_ENVIRONMENT_DIGESTS[task_id],
         runner_environment_digest=LocalPiRunnerSpec().attestation.digest,
-        status=BenchmarkTrialStatus.SCORED,
-        rewards={"reward": reward},
-        candidate_outcome=BenchmarkCandidateOutcome(
-            status=BenchmarkCandidateStatus.COMPLETED,
+        status=(
+            BenchmarkTrialStatus.SCORED
+            if failure_kind is None
+            else BenchmarkTrialStatus.INFRASTRUCTURE_ERROR
         ),
-        run_health=BenchmarkRunHealth.VALID,
+        rewards={"reward": reward} if failure_kind is None else None,
+        error=(
+            None
+            if failure_kind is None
+            else BenchmarkError(
+                kind=failure_kind,
+                type="SyntheticInfrastructureError",
+                message="synthetic infrastructure failure",
+            )
+        ),
+        candidate_outcome=BenchmarkCandidateOutcome(
+            status=(
+                BenchmarkCandidateStatus.COMPLETED
+                if failure_kind is None
+                else BenchmarkCandidateStatus.UNKNOWN
+            ),
+        ),
+        run_health=(
+            BenchmarkRunHealth.VALID if failure_kind is None else BenchmarkRunHealth.RETRY_REQUIRED
+        ),
         usage=BenchmarkUsage(calls=1),
     )
     job_dir = spec.jobs_dir / spec.job_name
     trial_dir = Path("trial")
     (job_dir / trial_dir).mkdir(parents=True, exist_ok=True)
+    (job_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "started_at": "2026-07-19T00:00:00Z",
+                "finished_at": "2026-07-19T00:00:01Z",
+                "n_total_trials": 1,
+                "stats": {
+                    "n_completed_trials": 1,
+                    "n_running_trials": 0,
+                    "n_pending_trials": 0,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (job_dir / trial_dir / "result.json").write_text("{}\n", encoding="utf-8")
     receipt = mod.ChatProviderReceipt(
         provider=provider.kind.value,
@@ -1342,6 +1381,7 @@ def _install_fake_evaluator(
     *,
     candidate: HarnessDoc,
     fail_job: int | None = None,
+    result_transform: Callable[[LoadedHarborJobResult], LoadedHarborJobResult] | None = None,
 ) -> tuple[
     list[tuple[HarborJobSpec, ProviderConfig, HarnessDoc]],
     dict[str, int],
@@ -1349,6 +1389,7 @@ def _install_fake_evaluator(
     calls: list[tuple[HarborJobSpec, ProviderConfig, HarnessDoc]] = []
     active: defaultdict[str, int] = defaultdict(int)
     maximum: defaultdict[str, int] = defaultdict(int)
+    terminal_results: dict[str, LoadedHarborJobResult] = {}
 
     class FakeEvaluator:
         def __init__(
@@ -1381,6 +1422,24 @@ def _install_fake_evaluator(
             self._response_identity = response_identity
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
+            existing = terminal_results.get(self._spec.job_name)
+            if existing is not None:
+                maximum["resume-existing"] += 1
+                root_result_path = existing.job_dir / "result.json"
+                root_result = json.loads(root_result_path.read_text(encoding="utf-8"))
+                root_result["finished_at"] = "2026-07-19T00:00:01Z"
+                root_result["stats"].update(
+                    {
+                        "n_completed_trials": 1,
+                        "n_running_trials": 0,
+                        "n_pending_trials": 0,
+                    }
+                )
+                root_result_path.write_text(
+                    json.dumps(root_result) + "\n",
+                    encoding="utf-8",
+                )
+                return existing
             task_names = self._spec.datasets[0].task_names
             assert task_names is not None
             task_id = task_names[0]
@@ -1390,9 +1449,20 @@ def _install_fake_evaluator(
                 await asyncio.sleep(0)
                 calls.append((self._spec, self._provider, harness))
                 if fail_job is not None and len(calls) == fail_job:
-                    raise RuntimeError("synthetic infrastructure failure")
+                    loaded = _loaded_result(
+                        self._spec,
+                        self._provider,
+                        harness,
+                        reward=0.0,
+                        budget_policy_digest=self._budget_policy_digest,
+                        response_identity=self._response_identity,
+                        failure_kind=BenchmarkFailureKind.PROVIDER,
+                    )
+                    loaded = loaded if result_transform is None else result_transform(loaded)
+                    terminal_results[self._spec.job_name] = loaded
+                    return loaded
                 reward = float(harness.execution_digest == candidate.execution_digest)
-                return _loaded_result(
+                loaded = _loaded_result(
                     self._spec,
                     self._provider,
                     harness,
@@ -1400,8 +1470,18 @@ def _install_fake_evaluator(
                     budget_policy_digest=self._budget_policy_digest,
                     response_identity=self._response_identity,
                 )
+                loaded = loaded if result_transform is None else result_transform(loaded)
+                terminal_results[self._spec.job_name] = loaded
+                return loaded
+            except asyncio.CancelledError:
+                maximum["cancelled"] += 1
+                raise
             finally:
                 active[task_id] -= 1
+
+        async def load_existing(self, _harness: HarnessDoc) -> LoadedHarborJobResult:
+            maximum["load-existing"] += 1
+            return terminal_results[self._spec.job_name]
 
     monkeypatch.setattr(mod, "HarborEvaluator", FakeEvaluator)
     return calls, maximum
@@ -1427,7 +1507,7 @@ def test_runs_every_frozen_block_in_order_and_analyzes_exact_evidence(
     design = _design()
     assert len(calls) == 2 * len(design.blocks)
     assert len(report.evidence) == len(design.blocks)
-    assert report.run_version == "10"
+    assert report.run_version == "11"
     assert report.protocol.protocol_version == "9"
     assert report.protocol.design_digest == design.digest
     assert report.protocol.baseline_execution_digest == baseline.execution_digest
@@ -1502,6 +1582,442 @@ def test_bounded_slices_complete_across_restarts_without_replaying_pairs(
     assert late.progress == second.progress
     assert late.report == second.report
     assert late_calls == []
+
+
+def test_recover_persisted_slice_closes_genesis_evidence_ahead_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    execution_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+
+    class SyntheticCheckpointCrash(BaseException):
+        pass
+
+    def crash_before_progress(_progress: mod.PairedHarborSliceProgress) -> None:
+        raise SyntheticCheckpointCrash
+
+    monkeypatch.setattr(runner, "_persist_progress", crash_before_progress)
+    with pytest.raises(SyntheticCheckpointCrash):
+        asyncio.run(runner.run_slice(baseline=baseline, candidate=candidate))
+    assert runner._load_progress_chain() == ()
+    assert len(execution_calls) == 4
+
+    recovery_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    recovered = asyncio.run(
+        reconstructed.recover_persisted_slice(
+            baseline=baseline,
+            candidate=candidate,
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.progress.selected_blocks == mod._select_paired_harbor_slice_blocks(
+        reconstructed._protocol,
+        completed_blocks=frozenset(),
+        max_new_blocks=2,
+    )
+    assert recovered.progress.completed_block_count == 2
+    assert reconstructed._load_progress_chain() == (recovered.progress,)
+    assert recovery_calls == []
+
+
+def test_recover_persisted_slice_reuses_matching_checkpoint_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    first = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+
+    recovery_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    recovered = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).recover_persisted_slice(baseline=baseline, candidate=candidate)
+    )
+
+    assert recovered == first
+    assert recovery_calls == []
+    with pytest.raises(mod.PairedHarborNoActiveSliceIntentError):
+        asyncio.run(
+            _runner(
+                tmp_path,
+                candidate,
+                baseline=baseline,
+                slice_policy=policy,
+            ).resume_persisted_slice(baseline=baseline, candidate=candidate)
+        )
+
+
+def test_recover_persisted_slice_closes_later_evidence_ahead_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    first_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    first = asyncio.run(first_runner.run_slice(baseline=baseline, candidate=candidate))
+
+    second_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    second_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+
+    class SyntheticCheckpointCrash(BaseException):
+        pass
+
+    def crash_before_progress(_progress: mod.PairedHarborSliceProgress) -> None:
+        raise SyntheticCheckpointCrash
+
+    monkeypatch.setattr(second_runner, "_persist_progress", crash_before_progress)
+    with pytest.raises(SyntheticCheckpointCrash):
+        asyncio.run(second_runner.run_slice(baseline=baseline, candidate=candidate))
+    assert len(second_calls) == 4
+    assert second_runner._load_progress_chain() == (first.progress,)
+
+    recovery_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    recovered = asyncio.run(
+        reconstructed.recover_persisted_slice(
+            baseline=baseline,
+            candidate=candidate,
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.report is not None
+    assert recovered.progress.previous_progress_digest == first.progress.progress_digest
+    assert recovered.progress.completed_before == first.progress.completed_blocks
+    assert reconstructed._load_progress_chain() == (first.progress, recovered.progress)
+    assert recovery_calls == []
+
+
+def test_recover_persisted_slice_uses_changed_current_bound_from_durable_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    first = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(
+            baseline=baseline,
+            candidate=candidate,
+            max_new_blocks=2,
+        )
+    )
+
+    second_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    second_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+
+    class SyntheticCheckpointCrash(BaseException):
+        pass
+
+    def crash_before_progress(_progress: mod.PairedHarborSliceProgress) -> None:
+        raise SyntheticCheckpointCrash
+
+    monkeypatch.setattr(second_runner, "_persist_progress", crash_before_progress)
+    with pytest.raises(SyntheticCheckpointCrash):
+        asyncio.run(
+            second_runner.run_slice(
+                baseline=baseline,
+                candidate=candidate,
+                max_new_blocks=1,
+            )
+        )
+    assert len(second_calls) == 2
+
+    recovery_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    recovered = asyncio.run(
+        reconstructed.recover_persisted_slice(
+            baseline=baseline,
+            candidate=candidate,
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.progress.previous_progress_digest == first.progress.progress_digest
+    assert recovered.progress.requested_max_new_blocks == 1
+    assert recovered.progress.selected_blocks == mod._select_paired_harbor_slice_blocks(
+        reconstructed._protocol,
+        completed_blocks=frozenset(item.block for item in first.progress.completed_blocks),
+        max_new_blocks=1,
+    )
+    assert recovery_calls == []
+
+
+def test_recover_persisted_slice_does_not_false_checkpoint_changed_bound_partial_wave(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=2)
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    first_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+        slice_policy=policy,
+    )
+    first = asyncio.run(
+        first_runner.run_slice(
+            baseline=baseline,
+            candidate=candidate,
+            max_new_blocks=1,
+        )
+    )
+
+    second_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    second_runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+        slice_policy=policy,
+    )
+
+    class SyntheticBetweenWaveCrash(BaseException):
+        pass
+
+    async def complete_one_then_crash(
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+        generation_by_block: dict[PairedBlock, int],
+        blocks: tuple[PairedBlock, ...],
+    ) -> tuple[mod.PairedHarborBlockEvidence, ...]:
+        assert len(blocks) == 2
+        await second_runner._run_block(
+            blocks[0],
+            baseline=baseline,
+            candidate=candidate,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=second_runner._protocol.execution_plan.runner_spec
+            ),
+            generation_id=generation_by_block[blocks[0]],
+        )
+        raise SyntheticBetweenWaveCrash
+
+    monkeypatch.setattr(second_runner, "_run_fair_matrix", complete_one_then_crash)
+    with pytest.raises(SyntheticBetweenWaveCrash):
+        asyncio.run(
+            second_runner.run_slice(
+                baseline=baseline,
+                candidate=candidate,
+                max_new_blocks=2,
+            )
+        )
+    assert len(second_calls) == 2
+    assert second_runner._load_progress_chain() == (first.progress,)
+    assert len(second_runner._load_slice_intent_chain()) == 2
+    active_selection = second_runner._load_slice_intent_chain()[-1].selected_blocks
+
+    recovery_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+        slice_policy=policy,
+    )
+    recovered = asyncio.run(
+        reconstructed.recover_persisted_slice(
+            baseline=baseline,
+            candidate=candidate,
+        )
+    )
+    assert recovered == first
+    assert reconstructed._load_progress_chain() == (first.progress,)
+    assert recovery_calls == []
+
+    mismatch_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    with pytest.raises(mod.PairedHarborProgressStateError, match="exact precommitted"):
+        asyncio.run(
+            reconstructed.run_slice(
+                baseline=baseline,
+                candidate=candidate,
+                max_new_blocks=1,
+            )
+        )
+    assert mismatch_calls == []
+
+    resume_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    resumed = asyncio.run(
+        reconstructed.resume_persisted_slice(
+            baseline=baseline,
+            candidate=candidate,
+        )
+    )
+    assert resumed.progress.requested_max_new_blocks == 2
+    assert resumed.progress.selected_blocks == active_selection
+    assert resumed.progress.completed_block_count == 3
+    assert len(resume_calls) == 2
+
+
+def test_recover_persisted_slice_returns_none_for_intent_only_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    real_persist_intent = runner._persist_slice_intent
+
+    class SyntheticIntentCrash(BaseException):
+        pass
+
+    def persist_then_crash(intent: mod.PairedHarborSliceIntent) -> None:
+        real_persist_intent(intent)
+        raise SyntheticIntentCrash
+
+    monkeypatch.setattr(runner, "_persist_slice_intent", persist_then_crash)
+    with pytest.raises(SyntheticIntentCrash):
+        asyncio.run(runner.run_slice(baseline=baseline, candidate=candidate))
+    assert runner._load_progress_chain() == ()
+    assert len(runner._load_slice_intent_chain()) == 1
+    active_selection = runner._load_slice_intent_chain()[-1].selected_blocks
+
+    recovery_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    assert (
+        asyncio.run(
+            reconstructed.recover_persisted_slice(
+                baseline=baseline,
+                candidate=candidate,
+            )
+        )
+        is None
+    )
+    assert recovery_calls == []
+
+    resume_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    resumed = asyncio.run(
+        reconstructed.resume_persisted_slice(baseline=baseline, candidate=candidate)
+    )
+    assert resumed.progress.selected_blocks == active_selection
+    assert len(resume_calls) == 4
+
+
+def test_recover_persisted_slice_rejects_partial_deterministic_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    policy = _slice_policy(max_new_blocks=2, max_waves_per_invocation=1)
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    selected = mod._select_paired_harbor_slice_blocks(
+        runner._protocol,
+        completed_blocks=frozenset(),
+        max_new_blocks=2,
+    )
+    asyncio.run(
+        runner._run_block(
+            selected[0],
+            baseline=baseline,
+            candidate=candidate,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=runner._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+    assert runner._load_progress_chain() == ()
+
+    recovery_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        slice_policy=policy,
+    )
+    with pytest.raises(mod.PairedHarborProgressStateError, match="durable slice intent"):
+        asyncio.run(
+            reconstructed.recover_persisted_slice(
+                baseline=baseline,
+                candidate=candidate,
+            )
+        )
+    assert reconstructed._load_progress_chain() == ()
+    assert recovery_calls == []
 
 
 def test_slice_enforces_frozen_invocation_and_wave_deadlines(
@@ -1680,11 +2196,24 @@ def test_crash_before_progress_publish_recovers_pairs_without_provider_replay(
         ).run_slice(baseline=baseline, candidate=candidate)
     )
 
-    assert resumed.report is not None
+    assert resumed.report is None
     assert resumed.progress.slice_index == 1
-    assert tuple(item.block for item in resumed.progress.completed_before) == (_design().blocks[:2])
-    assert resumed.progress.selected_blocks == _design().blocks[2:]
-    assert len(resumed_calls) == 4
+    assert resumed.progress.completed_before == ()
+    assert resumed.progress.selected_blocks == _design().blocks[:2]
+    assert resumed_calls == []
+
+    final_calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    final = asyncio.run(
+        _runner(
+            tmp_path,
+            candidate,
+            baseline=baseline,
+            slice_policy=policy,
+        ).run_slice(baseline=baseline, candidate=candidate)
+    )
+    assert final.report is not None
+    assert final.progress.selected_blocks == _design().blocks[2:]
+    assert len(final_calls) == 4
 
 
 def test_partial_final_slice_is_smaller_and_analysis_waits_for_complete_matrix(
@@ -1784,9 +2313,9 @@ def test_slice_crash_requires_pair_retry_and_never_replays_completed_work(
     )
 
     assert resumed.report is None
-    assert resumed.progress.completed_block_count == 3
-    assert resumed.progress.selected_blocks == _design().blocks[1:3]
-    assert len(retry_calls) == 4
+    assert resumed.progress.completed_block_count == 2
+    assert resumed.progress.selected_blocks == _design().blocks[:2]
+    assert len(retry_calls) == 2
     completion_generations = {
         item.block: item.generation_id for item in resumed.progress.completed_blocks
     }
@@ -1805,7 +2334,7 @@ def test_slice_crash_requires_pair_retry_and_never_replays_completed_work(
         ).run_slice(baseline=baseline, candidate=candidate)
     )
     assert final.report is not None
-    assert len(final_calls) == 2
+    assert len(final_calls) == 4
 
 
 def test_slice_rejects_policy_progress_and_generation_drift_before_provider_access(
@@ -2004,7 +2533,7 @@ def test_first_block_failure_stops_scheduling_and_returns_no_partial_analysis(
     assert "synthetic infrastructure failure" not in str(captured.value)
 
 
-def test_fatal_block_failure_cancels_other_reserved_blocks(
+def test_fatal_block_failure_allows_other_reserved_block_to_finish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2012,7 +2541,6 @@ def test_fatal_block_failure_cancels_other_reserved_blocks(
     candidate = _candidate()
     both_started = asyncio.Event()
     calls: list[str] = []
-    cancelled: list[str] = []
 
     class CancellingEvaluator:
         def __init__(
@@ -2035,11 +2563,7 @@ def test_fatal_block_failure_cancels_other_reserved_blocks(
             await both_started.wait()
             if is_failure:
                 raise RuntimeError("synthetic fatal block")
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancelled.append(self._spec.job_name)
-                raise
+            await asyncio.sleep(0)
             return _loaded_result(
                 self._spec,
                 self._provider,
@@ -2059,8 +2583,7 @@ def test_fatal_block_failure_cancels_other_reserved_blocks(
             ).run(baseline=baseline, candidate=candidate)
         )
 
-    assert len(calls) == 2
-    assert len(cancelled) == 1
+    assert len(calls) == 3
 
 
 def test_schedule_has_both_first_arm_directions() -> None:
@@ -2751,6 +3274,14 @@ def test_restart_reuses_completed_pairs_and_reruns_only_authorized_failed_pair(
     assert authorization.from_generation_id == 1
     assert authorization.to_generation_id == 2
     assert authorization.failed_state_digest == failed_state.state_digest
+    assert authorization.failure_evidence.failed_state == failed_state
+    assert authorization.failure_evidence.owner is mod.PairedHarborPairFailureOwner.INFRASTRUCTURE
+    assert authorization.failure_evidence.failure_kind is BenchmarkFailureKind.PROVIDER
+    assert (
+        authorization.failure_evidence.retry_eligibility
+        is mod.PairedHarborPairRetryEligibility.WHOLE_PAIR
+    )
+    assert authorization.failure_evidence_digest == authorization.failure_evidence.evidence_digest
 
     authorized_generation = _runner(
         tmp_path,
@@ -2784,6 +3315,1378 @@ def test_restart_reuses_completed_pairs_and_reruns_only_authorized_failed_pair(
     )
     with pytest.raises(ValueError, match="differs from its failed state"):
         mod.PairedHarborPairRetryAuthorization.model_validate(drifted_authorization)
+
+
+def test_concurrent_sibling_finishes_before_retryable_failure_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    first_calls, first_counters = _install_fake_evaluator(
+        monkeypatch,
+        candidate=candidate,
+        fail_job=1,
+    )
+    first = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=2,
+    )
+
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(first.run(baseline=baseline, candidate=candidate))
+
+    materialized = tuple(
+        state
+        for block in first._protocol.design.blocks
+        if (
+            state := first._inspect_pair_generation(
+                block,
+                generation_id=1,
+                create=False,
+                allow_incomplete=True,
+            )
+        )
+        is not None
+    )
+    failed_states = tuple(state for state in materialized if state.status == "failed")
+    complete_states = tuple(state for state in materialized if state.status == "complete")
+    assert len(first_calls) == 3
+    assert first_counters["cancelled"] == 0
+    assert len(failed_states) == 1
+    assert len(complete_states) == 1
+    failed_state = failed_states[0]
+    authorization = mod.authorize_paired_harbor_pair_retry(
+        jobs_dir=first._runtime.jobs_dir,
+        protocol=first._protocol,
+        operation_id="offline-test-operation",
+        failed_state=failed_state,
+    )
+
+    retry_calls, retry_counters = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    retry = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        generation_id=2,
+        max_concurrent_blocks=2,
+    )
+    report = asyncio.run(retry.run(baseline=baseline, candidate=candidate))
+
+    assert len(retry_calls) == 6
+    assert retry_counters["cancelled"] == 0
+    assert report.retry_authorizations == (authorization,)
+    assert sum(item.generation_id == 1 for item in report.evidence) == 1
+    assert sum(item.generation_id == 2 for item in report.evidence) == 3
+
+
+def test_unclassified_evaluator_exception_is_durable_and_cannot_authorize_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+
+    async def fail_without_typed_evidence(
+        _self: mod.PairedHarborRunner,
+        _block: PairedBlock,
+        **_kwargs: object,
+    ) -> mod.PairedHarborArmEvidence:
+        raise RuntimeError("synthetic unclassified evaluator failure")
+
+    monkeypatch.setattr(
+        mod.PairedHarborRunner,
+        "_evaluate_arm",
+        fail_without_typed_evidence,
+    )
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(runner.run(baseline=baseline, candidate=candidate))
+
+    block = runner._protocol.design.blocks[0]
+    failed_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    failure_evidence = mod.load_paired_harbor_pair_failure_evidence(
+        jobs_dir=runner._runtime.jobs_dir,
+        failed_state=failed_state,
+    )
+    assert failure_evidence.failed_state_digest == failed_state.state_digest
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.UNCLASSIFIED
+    assert failure_evidence.source is mod.PairedHarborPairFailureSource.EVALUATOR_EXCEPTION
+    assert failure_evidence.retry_eligibility is mod.PairedHarborPairRetryEligibility.FORBIDDEN
+    with pytest.raises(ValueError, match="not eligible for whole-pair retry"):
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            failed_state=failed_state,
+        )
+
+
+@pytest.mark.parametrize(
+    "identity_field",
+    ["task_checksum", "task_environment_digest", "runner_environment_digest"],
+)
+def test_foreign_infrastructure_result_cannot_become_retry_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_field: str,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+
+    def replace_task_identity(loaded: LoadedHarborJobResult) -> LoadedHarborJobResult:
+        trial = loaded.result.trials[0].model_copy(update={identity_field: "sha256:" + "0" * 64})
+        return LoadedHarborJobResult(
+            result=loaded.result.model_copy(update={"trials": [trial]}),
+            job_dir=loaded.job_dir,
+            locators=loaded.locators,
+        )
+
+    _install_fake_evaluator(
+        monkeypatch,
+        candidate=candidate,
+        fail_job=1,
+        result_transform=replace_task_identity,
+    )
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(runner.run(baseline=baseline, candidate=candidate))
+
+    block = runner._protocol.design.blocks[0]
+    failed_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    failure_evidence = mod.load_paired_harbor_pair_failure_evidence(
+        jobs_dir=runner._runtime.jobs_dir,
+        failed_state=failed_state,
+    )
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.SCORING
+    assert failure_evidence.retry_eligibility is mod.PairedHarborPairRetryEligibility.FORBIDDEN
+    with pytest.raises(ValueError, match="not eligible for whole-pair retry"):
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            failed_state=failed_state,
+        )
+
+
+def test_malformed_result_without_optional_environment_digests_can_authorize_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+
+    def malformed_early_result(loaded: LoadedHarborJobResult) -> LoadedHarborJobResult:
+        trial = loaded.result.trials[0].model_copy(
+            update={
+                "task_environment_digest": None,
+                "runner_environment_digest": None,
+                "error": BenchmarkError(
+                    kind=BenchmarkFailureKind.MALFORMED_RESULT,
+                    type="SyntheticMalformedResult",
+                    message="result could not be decoded",
+                ),
+            }
+        )
+        return LoadedHarborJobResult(
+            result=loaded.result.model_copy(update={"trials": [trial]}),
+            job_dir=loaded.job_dir,
+            locators=loaded.locators,
+        )
+
+    _install_fake_evaluator(
+        monkeypatch,
+        candidate=candidate,
+        fail_job=1,
+        result_transform=malformed_early_result,
+    )
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(runner.run(baseline=baseline, candidate=candidate))
+
+    block = runner._protocol.design.blocks[0]
+    failed_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    failure_evidence = mod.load_paired_harbor_pair_failure_evidence(
+        jobs_dir=runner._runtime.jobs_dir,
+        failed_state=failed_state,
+    )
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.INFRASTRUCTURE
+    assert failure_evidence.failure_kind is BenchmarkFailureKind.MALFORMED_RESULT
+    assert failure_evidence.retry_eligibility is mod.PairedHarborPairRetryEligibility.WHOLE_PAIR
+    assert (
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            failed_state=failed_state,
+        ).failure_evidence
+        == failure_evidence
+    )
+
+
+def test_candidate_task_and_score_failures_remain_analysis_zero_without_retry() -> None:
+    cell = BenchmarkCell(
+        task_key=_TASK_KEYS["task-a"],
+        task_name="task-a",
+        attempt=1,
+        config_digest=_CONFIG_DIGEST,
+    )
+    common = {
+        "cell": cell.model_dump(mode="json"),
+        "task_identity": "task-a",
+        "task_checksum": _CONTENT_DIGESTS["task-a"],
+        "source": "test-dataset",
+        "task_instruction": "Solve task-a.",
+        "task_environment_digest": _ENVIRONMENT_DIGESTS["task-a"],
+        "runner_environment_digest": LocalPiRunnerSpec().attestation.digest,
+        "usage": BenchmarkUsage(calls=1).model_dump(mode="json"),
+    }
+    low_score = BenchmarkTrialResult.model_validate(
+        {
+            **common,
+            "status": BenchmarkTrialStatus.SCORED.value,
+            "rewards": {"reward": 0.0},
+            "candidate_outcome": {"status": BenchmarkCandidateStatus.COMPLETED.value},
+            "run_health": BenchmarkRunHealth.VALID.value,
+        }
+    )
+    candidate_failure = BenchmarkTrialResult.model_validate(
+        {
+            **common,
+            "status": BenchmarkTrialStatus.CANDIDATE_FAILURE.value,
+            "candidate_outcome": {
+                "status": BenchmarkCandidateStatus.FAILED.value,
+                "stage": BenchmarkCandidateStage.EXECUTION.value,
+                "failure_reason": BenchmarkCandidateFailureReason.RUNTIME_ERROR.value,
+            },
+            "run_health": BenchmarkRunHealth.CANDIDATE_DAMAGED.value,
+        }
+    )
+    task_timeout = BenchmarkTrialResult.model_validate(
+        {
+            **common,
+            "status": BenchmarkTrialStatus.SCORED.value,
+            "rewards": {"reward": 1.0},
+            "error": {
+                "kind": BenchmarkFailureKind.TASK_TIMEOUT.value,
+                "type": "AgentTimeoutError",
+                "message": "agent execution exceeded the task time limit",
+            },
+            "candidate_outcome": {"status": BenchmarkCandidateStatus.UNKNOWN.value},
+            "run_health": BenchmarkRunHealth.VALID.value,
+        }
+    )
+
+    for trial in (low_score, candidate_failure, task_timeout):
+        assert (
+            mod._classify_nonadmissible_benchmark_result(
+                [trial],
+                arm=PairedArm.CANDIDATE,
+            )
+            is None
+        )
+        assert mod.harbor_trial_analysis_values(trial, reward_key="reward")[1] == 0.0
+
+    candidate_owned_provider_error = BenchmarkTrialResult.model_validate(
+        {
+            **common,
+            "status": BenchmarkTrialStatus.INFRASTRUCTURE_ERROR.value,
+            "error": {
+                "kind": BenchmarkFailureKind.PROVIDER.value,
+                "type": "SyntheticProviderError",
+                "message": "synthetic provider failure",
+            },
+            "candidate_outcome": {
+                "status": BenchmarkCandidateStatus.FAILED.value,
+                "stage": BenchmarkCandidateStage.EXECUTION.value,
+                "failure_reason": BenchmarkCandidateFailureReason.INVALID_REQUEST.value,
+            },
+            "run_health": BenchmarkRunHealth.CANDIDATE_DAMAGED.value,
+        }
+    )
+    candidate_descriptor = mod._classify_nonadmissible_benchmark_result(
+        [candidate_owned_provider_error],
+        arm=PairedArm.CANDIDATE,
+    )
+    assert candidate_descriptor is not None
+    assert candidate_descriptor.owner is mod.PairedHarborPairFailureOwner.CANDIDATE
+    assert candidate_descriptor.retry_eligibility is mod.PairedHarborPairRetryEligibility.FORBIDDEN
+
+
+def test_explicit_process_crash_classification_authorizes_fresh_whole_pair(
+    tmp_path: Path,
+) -> None:
+    runner = _runner(tmp_path, _candidate(), max_concurrent_blocks=1)
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+
+    with pytest.raises(ValueError, match="must be failed"):
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            failed_state=running_state,
+        )
+
+    failure_evidence = mod.classify_paired_harbor_process_crash(
+        jobs_dir=runner._runtime.jobs_dir,
+        protocol=runner._protocol,
+        operation_id="offline-test-operation",
+        interrupted_state=running_state,
+    )
+    assert failure_evidence.failed_state.status == "failed"
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.PROCESS
+    assert failure_evidence.source is mod.PairedHarborPairFailureSource.PROCESS_CRASH
+    assert failure_evidence.retry_eligibility is mod.PairedHarborPairRetryEligibility.WHOLE_PAIR
+
+    authorization = mod.authorize_paired_harbor_pair_retry(
+        jobs_dir=runner._runtime.jobs_dir,
+        protocol=runner._protocol,
+        operation_id="offline-test-operation",
+        failed_state=failure_evidence.failed_state,
+    )
+    assert authorization.failure_evidence == failure_evidence
+    assert authorization.to_generation_id == 2
+
+
+@pytest.mark.parametrize("crash_after_arm", [1, 2])
+def test_restart_reconciles_terminal_arms_without_new_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_after_arm: int,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    calls, _ = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    real_publish = mod._create_or_compare_pair_arm_evidence
+    published = 0
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    def crash_after_publication(
+        path: Path,
+        evidence: mod.PairedHarborArmEvidence,
+    ) -> None:
+        nonlocal published
+        real_publish(path, evidence)
+        published += 1
+        if published == crash_after_arm:
+            raise SyntheticProcessCrash
+
+    monkeypatch.setattr(
+        mod,
+        "_create_or_compare_pair_arm_evidence",
+        crash_after_publication,
+    )
+    with pytest.raises(SyntheticProcessCrash):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    running_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    assert running_state.status == "running"
+    with pytest.raises(mod.PairedHarborPairStateError, match="resume the same generation"):
+        mod.classify_paired_harbor_process_crash(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            interrupted_state=running_state,
+        )
+
+    monkeypatch.setattr(mod, "_create_or_compare_pair_arm_evidence", real_publish)
+    recovered = asyncio.run(
+        runner._run_block(
+            block,
+            baseline=baseline,
+            candidate=candidate,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=runner._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+
+    assert recovered.generation_id == 1
+    assert len(calls) == 2
+    assert mod._read_pair_generation_state(runner._pair_state_path(block)).status == "complete"
+
+
+def test_restart_reingests_terminal_result_before_arm_evidence_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    calls, counters = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    def crash_before_arm_evidence(**_kwargs: object) -> None:
+        raise SyntheticProcessCrash
+
+    monkeypatch.setattr(runner, "_validate_arm_result_identity", crash_before_arm_evidence)
+    with pytest.raises(SyntheticProcessCrash):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+
+    running_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    first_arm = block.first_arm
+    assert not os.path.lexists(
+        mod._pair_arm_evidence_path(
+            runner._runtime.jobs_dir,
+            state=running_state,
+            arm=first_arm,
+        )
+    )
+    with pytest.raises(mod.PairedHarborPairStateError, match="unreconciled terminal arm"):
+        mod.classify_paired_harbor_process_crash(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            interrupted_state=running_state,
+        )
+
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    recovered = asyncio.run(
+        reconstructed._run_block(
+            block,
+            baseline=baseline,
+            candidate=candidate,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=reconstructed._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+
+    assert recovered.generation_id == 1
+    assert len(calls) == 2
+    assert counters["load-existing"] == 1
+    assert mod._read_pair_generation_state(reconstructed._pair_state_path(block)).status == (
+        "complete"
+    )
+
+
+def test_unfinished_root_with_published_outcome_forces_same_generation_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    calls, counters = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    def crash_before_arm_evidence(**_kwargs: object) -> None:
+        raise SyntheticProcessCrash
+
+    monkeypatch.setattr(runner, "_validate_arm_result_identity", crash_before_arm_evidence)
+    with pytest.raises(SyntheticProcessCrash):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    running_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    first_job_name = {
+        PairedArm.BASELINE: running_state.baseline_job_name,
+        PairedArm.CANDIDATE: running_state.candidate_job_name,
+    }[block.first_arm]
+    root_result_path = runner._runtime.jobs_dir / first_job_name / "result.json"
+    root_result = json.loads(root_result_path.read_text(encoding="utf-8"))
+    root_result["finished_at"] = None
+    root_result["stats"].update(
+        {
+            "n_completed_trials": 0,
+            "n_running_trials": 1,
+            "n_pending_trials": 0,
+        }
+    )
+    root_result_path.write_text(json.dumps(root_result) + "\n", encoding="utf-8")
+
+    assert (
+        mod._arm_job_recovery_state(root_result_path.parent)
+        is mod._HarborArmJobRecoveryState.OUTCOME_PUBLISHED
+    )
+    assert mod._pair_generation_can_resume_same_generation(
+        runner._runtime.jobs_dir,
+        running_state,
+    )
+    with pytest.raises(mod.PairedHarborPairStateError, match="published arm outcome"):
+        mod.classify_paired_harbor_process_crash(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            interrupted_state=running_state,
+        )
+
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    recovered = asyncio.run(
+        reconstructed._run_block(
+            block,
+            baseline=baseline,
+            candidate=candidate,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=reconstructed._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+    assert recovered.generation_id == 1
+    assert len(calls) == 2
+    assert counters["resume-existing"] == 1
+
+
+def test_unfinished_root_with_explicit_cancelled_child_can_authorize_process_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    def crash_before_arm_evidence(**_kwargs: object) -> None:
+        raise SyntheticProcessCrash
+
+    monkeypatch.setattr(runner, "_validate_arm_result_identity", crash_before_arm_evidence)
+    with pytest.raises(SyntheticProcessCrash):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    running_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    first_job_name = {
+        PairedArm.BASELINE: running_state.baseline_job_name,
+        PairedArm.CANDIDATE: running_state.candidate_job_name,
+    }[block.first_arm]
+    job_path = runner._runtime.jobs_dir / first_job_name
+    root_result_path = job_path / "result.json"
+    root_result = json.loads(root_result_path.read_text(encoding="utf-8"))
+    root_result["finished_at"] = None
+    root_result["stats"].update(
+        {
+            "n_completed_trials": 0,
+            "n_running_trials": 0,
+            "n_pending_trials": 1,
+        }
+    )
+    root_result_path.write_text(json.dumps(root_result) + "\n", encoding="utf-8")
+    (job_path / "trial" / "result.json").write_text(
+        json.dumps(
+            {
+                "exception_info": {"exception_type": "CancelledError"},
+                "verifier_result": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert mod._arm_job_recovery_state(job_path) is mod._HarborArmJobRecoveryState.CANCELLED
+    failure_evidence = mod.classify_paired_harbor_process_crash(
+        jobs_dir=runner._runtime.jobs_dir,
+        protocol=runner._protocol,
+        operation_id="offline-test-operation",
+        interrupted_state=running_state,
+    )
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.PROCESS
+    assert (
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            failed_state=failure_evidence.failed_state,
+        ).failure_evidence
+        == failure_evidence
+    )
+
+
+def test_cancelled_child_with_verifier_result_is_a_published_outcome(
+    tmp_path: Path,
+) -> None:
+    job_path = tmp_path / "jobs" / "cancelled-with-score"
+    trial_path = job_path / "trial"
+    trial_path.mkdir(parents=True)
+    (job_path / "result.json").write_text(
+        json.dumps(
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "started_at": "2026-07-19T00:00:00Z",
+                "finished_at": None,
+                "n_total_trials": 1,
+                "stats": {
+                    "n_completed_trials": 0,
+                    "n_running_trials": 0,
+                    "n_pending_trials": 1,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (trial_path / "result.json").write_text(
+        json.dumps(
+            {
+                "exception_info": {"exception_type": "CancelledError"},
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert mod._arm_job_recovery_state(job_path) is mod._HarborArmJobRecoveryState.OUTCOME_PUBLISHED
+
+
+def test_restart_classifies_terminal_infrastructure_result_before_arm_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    calls, counters = _install_fake_evaluator(
+        monkeypatch,
+        candidate=candidate,
+        fail_job=1,
+    )
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    def crash_before_failure_classification(**_kwargs: object) -> None:
+        raise SyntheticProcessCrash
+
+    monkeypatch.setattr(
+        runner,
+        "_validate_arm_result_identity",
+        crash_before_failure_classification,
+    )
+    with pytest.raises(SyntheticProcessCrash):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    running_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    with pytest.raises(mod.PairedHarborPairStateError, match="unreconciled terminal arm"):
+        mod.classify_paired_harbor_process_crash(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            interrupted_state=running_state,
+        )
+
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    with pytest.raises(mod._ClassifiedPairFailure):
+        asyncio.run(
+            reconstructed._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=reconstructed._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    failed_state = mod._read_pair_generation_state(reconstructed._pair_state_path(block))
+    failure_evidence = mod.load_paired_harbor_pair_failure_evidence(
+        jobs_dir=reconstructed._runtime.jobs_dir,
+        failed_state=failed_state,
+    )
+
+    assert len(calls) == 1
+    assert counters["load-existing"] == 1
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.INFRASTRUCTURE
+    assert failure_evidence.failure_kind is BenchmarkFailureKind.PROVIDER
+    assert failure_evidence.retry_eligibility is mod.PairedHarborPairRetryEligibility.WHOLE_PAIR
+    assert (
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=reconstructed._runtime.jobs_dir,
+            protocol=reconstructed._protocol,
+            operation_id="offline-test-operation",
+            failed_state=failed_state,
+        ).failure_evidence
+        == failure_evidence
+    )
+
+
+def test_restart_completes_evidence_first_infrastructure_failure_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate, fail_job=1)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    real_replace = mod._replace_pair_generation_state
+
+    def crash_before_failed_state(
+        path: Path,
+        state: mod.PairedHarborPairGenerationState,
+    ) -> None:
+        if state.status == "failed":
+            raise OSError("synthetic process crash before failed-state publication")
+        real_replace(path, state)
+
+    monkeypatch.setattr(mod, "_replace_pair_generation_state", crash_before_failed_state)
+    with pytest.raises(OSError, match="synthetic process crash"):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    interrupted = mod._read_pair_generation_state(runner._pair_state_path(block))
+    assert interrupted.status == "running"
+    expected_failed = mod._failed_pair_generation_state(interrupted)
+    assert mod._pair_failure_evidence_path(
+        runner._runtime.jobs_dir,
+        failed_state=expected_failed,
+    ).is_file()
+
+    monkeypatch.setattr(mod, "_replace_pair_generation_state", real_replace)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    recovered = reconstructed._inspect_pair_generation(
+        block,
+        generation_id=1,
+        create=False,
+        allow_incomplete=True,
+    )
+    assert recovered == expected_failed
+    failure_evidence = mod.load_paired_harbor_pair_failure_evidence(
+        jobs_dir=reconstructed._runtime.jobs_dir,
+        failed_state=expected_failed,
+    )
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.INFRASTRUCTURE
+    assert (
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=reconstructed._runtime.jobs_dir,
+            protocol=reconstructed._protocol,
+            operation_id="offline-test-operation",
+            failed_state=expected_failed,
+        ).failure_evidence
+        == failure_evidence
+    )
+
+
+def test_restart_completes_evidence_first_process_crash_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path, _candidate(), max_concurrent_blocks=1)
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+    real_replace = mod._replace_pair_generation_state
+
+    def crash_before_failed_state(
+        path: Path,
+        state: mod.PairedHarborPairGenerationState,
+    ) -> None:
+        if state.status == "failed":
+            raise OSError("synthetic process crash before failed-state publication")
+        real_replace(path, state)
+
+    monkeypatch.setattr(mod, "_replace_pair_generation_state", crash_before_failed_state)
+    with pytest.raises(OSError, match="synthetic process crash"):
+        mod.classify_paired_harbor_process_crash(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            interrupted_state=running_state,
+        )
+    assert mod._read_pair_generation_state(runner._pair_state_path(block)) == running_state
+
+    monkeypatch.setattr(mod, "_replace_pair_generation_state", real_replace)
+    failure_evidence = mod.classify_paired_harbor_process_crash(
+        jobs_dir=runner._runtime.jobs_dir,
+        protocol=runner._protocol,
+        operation_id="offline-test-operation",
+        interrupted_state=running_state,
+    )
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.PROCESS
+    assert mod._read_pair_generation_state(runner._pair_state_path(block)) == (
+        failure_evidence.failed_state
+    )
+    assert (
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            failed_state=failure_evidence.failed_state,
+        ).failure_evidence
+        == failure_evidence
+    )
+
+
+def test_interrupted_failure_evidence_publication_leaves_no_truncated_final_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate, fail_job=1)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+    failed_state = mod._failed_pair_generation_state(running_state)
+    failure_path = mod._pair_failure_evidence_path(
+        runner._runtime.jobs_dir,
+        failed_state=failed_state,
+    )
+    real_link = os.link
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    def crash_before_final_link(
+        source: Path,
+        destination: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if Path(destination) == failure_path:
+            raise SyntheticProcessCrash
+        real_link(source, destination, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "link", crash_before_final_link)
+    with pytest.raises(SyntheticProcessCrash):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    assert not os.path.lexists(failure_path)
+    assert mod._read_pair_generation_state(runner._pair_state_path(block)) == running_state
+
+    monkeypatch.setattr(os, "link", real_link)
+    with pytest.raises(mod._ClassifiedPairFailure):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    assert failure_path.is_file()
+    assert mod._read_pair_generation_state(runner._pair_state_path(block)).status == "failed"
+
+
+def test_interrupted_completion_witness_publication_recovers_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    calls, counters = _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+    witness_path = mod._pair_arm_completion_witness_path(
+        runner._runtime.jobs_dir,
+        state=running_state,
+        arm=block.first_arm,
+    )
+    real_link = os.link
+
+    class SyntheticProcessCrash(BaseException):
+        pass
+
+    def crash_before_final_link(
+        source: Path,
+        destination: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if Path(destination) == witness_path:
+            raise SyntheticProcessCrash
+        real_link(source, destination, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "link", crash_before_final_link)
+    with pytest.raises(SyntheticProcessCrash):
+        asyncio.run(
+            runner._run_block(
+                block,
+                baseline=baseline,
+                candidate=candidate,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    assert not os.path.lexists(witness_path)
+    assert mod._read_pair_generation_state(runner._pair_state_path(block)) == running_state
+
+    monkeypatch.setattr(os, "link", real_link)
+    reconstructed = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    recovered = asyncio.run(
+        reconstructed._run_block(
+            block,
+            baseline=baseline,
+            candidate=candidate,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=reconstructed._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+    assert recovered.generation_id == 1
+    assert len(calls) == 2
+    assert counters["load-existing"] == 1
+    assert witness_path.is_file()
+
+
+def test_process_crash_reconciliation_uses_only_score_blind_completion_witness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+    harnesses = {
+        PairedArm.BASELINE: baseline,
+        PairedArm.CANDIDATE: candidate,
+    }
+    asyncio.run(
+        runner._evaluate_arm(
+            block,
+            arm=block.first_arm,
+            harness=harnesses[block.first_arm],
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=runner._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+    second_arm = (
+        PairedArm.CANDIDATE if block.first_arm is PairedArm.BASELINE else PairedArm.BASELINE
+    )
+    second_job_name = {
+        PairedArm.BASELINE: running_state.baseline_job_name,
+        PairedArm.CANDIDATE: running_state.candidate_job_name,
+    }[second_arm]
+    (runner._runtime.jobs_dir / second_job_name).mkdir()
+
+    def reject_score_access(*_args: object, **_kwargs: object) -> tuple[float | None, float]:
+        raise AssertionError("process-crash classification must not read arm scores")
+
+    monkeypatch.setattr(mod, "harbor_trial_analysis_values", reject_score_access)
+    failure_evidence = mod.classify_paired_harbor_process_crash(
+        jobs_dir=runner._runtime.jobs_dir,
+        protocol=runner._protocol,
+        operation_id="offline-test-operation",
+        interrupted_state=running_state,
+    )
+    authorization = mod.authorize_paired_harbor_pair_retry(
+        jobs_dir=runner._runtime.jobs_dir,
+        protocol=runner._protocol,
+        operation_id="offline-test-operation",
+        failed_state=failure_evidence.failed_state,
+    )
+
+    assert failure_evidence.owner is mod.PairedHarborPairFailureOwner.PROCESS
+    assert authorization.failure_evidence == failure_evidence
+
+
+def test_swapped_arm_cache_record_is_rejected_by_expected_path_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+    harnesses = {
+        PairedArm.BASELINE: baseline,
+        PairedArm.CANDIDATE: candidate,
+    }
+    for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE):
+        asyncio.run(
+            runner._evaluate_arm(
+                block,
+                arm=arm,
+                harness=harnesses[arm],
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    baseline_path = mod._pair_arm_evidence_path(
+        runner._runtime.jobs_dir,
+        state=running_state,
+        arm=PairedArm.BASELINE,
+    )
+    candidate_path = mod._pair_arm_evidence_path(
+        runner._runtime.jobs_dir,
+        state=running_state,
+        arm=PairedArm.CANDIDATE,
+    )
+    baseline_path.write_bytes(candidate_path.read_bytes())
+
+    with pytest.raises(mod.PairedHarborPairStateError, match="pair generation"):
+        asyncio.run(
+            runner._evaluate_arm(
+                block,
+                arm=PairedArm.BASELINE,
+                harness=baseline,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+
+
+def test_swapped_arm_completion_witness_is_rejected_by_expected_path_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+    harnesses = {
+        PairedArm.BASELINE: baseline,
+        PairedArm.CANDIDATE: candidate,
+    }
+    for arm in (PairedArm.BASELINE, PairedArm.CANDIDATE):
+        asyncio.run(
+            runner._evaluate_arm(
+                block,
+                arm=arm,
+                harness=harnesses[arm],
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+    baseline_path = mod._pair_arm_completion_witness_path(
+        runner._runtime.jobs_dir,
+        state=running_state,
+        arm=PairedArm.BASELINE,
+    )
+    candidate_path = mod._pair_arm_completion_witness_path(
+        runner._runtime.jobs_dir,
+        state=running_state,
+        arm=PairedArm.CANDIDATE,
+    )
+    baseline_path.write_bytes(candidate_path.read_bytes())
+
+    with pytest.raises(mod.PairedHarborPairStateError, match="pair generation"):
+        mod.classify_paired_harbor_process_crash(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            interrupted_state=running_state,
+        )
+
+
+def test_arm_cache_is_reingested_before_reuse_and_rejects_score_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    running_state = runner._begin_pair_generation(block, generation_id=1)
+    arm = block.first_arm
+    harness = baseline if arm is PairedArm.BASELINE else candidate
+    asyncio.run(
+        runner._evaluate_arm(
+            block,
+            arm=arm,
+            harness=harness,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=runner._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+    evidence_path = mod._pair_arm_evidence_path(
+        runner._runtime.jobs_dir,
+        state=running_state,
+        arm=arm,
+    )
+    tampered = json.loads(evidence_path.read_text(encoding="utf-8"))
+    score = 1.0 - tampered["analysis_score"]
+    tampered["trial"]["rewards"]["reward"] = score
+    tampered["verifier_reward"] = score
+    tampered["analysis_score"] = score
+    _refresh_arm_admission_digest(tampered)
+    evidence_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    with pytest.raises(mod.PairedHarborPairStateError, match="different contents"):
+        asyncio.run(
+            runner._evaluate_arm(
+                block,
+                arm=arm,
+                harness=harness,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+
+
+def test_arm_completion_witness_rejects_raw_terminal_artifact_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    block = runner._protocol.design.blocks[0]
+    arm = block.first_arm
+    harness = baseline if arm is PairedArm.BASELINE else candidate
+    admitted = asyncio.run(
+        runner._evaluate_arm(
+            block,
+            arm=arm,
+            harness=harness,
+            evaluator_session=mod.HarborEvaluatorSession(
+                runner_spec=runner._protocol.execution_plan.runner_spec
+            ),
+            generation_id=1,
+        )
+    )
+    raw_result = runner._runtime.jobs_dir / admitted.job_name / "trial" / "result.json"
+    raw_result.write_text('{"tampered":true}\n', encoding="utf-8")
+
+    with pytest.raises(mod.PairedHarborPairStateError, match="different contents"):
+        asyncio.run(
+            runner._evaluate_arm(
+                block,
+                arm=arm,
+                harness=harness,
+                evaluator_session=mod.HarborEvaluatorSession(
+                    runner_spec=runner._protocol.execution_plan.runner_spec
+                ),
+                generation_id=1,
+            )
+        )
+
+
+def test_failure_classification_tamper_blocks_restart_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = pi_node_baseline("baseline")
+    candidate = _candidate()
+    _install_fake_evaluator(monkeypatch, candidate=candidate, fail_job=1)
+    runner = _runner(
+        tmp_path,
+        candidate,
+        baseline=baseline,
+        max_concurrent_blocks=1,
+    )
+    with pytest.raises(mod.PairedHarborMatrixError):
+        asyncio.run(runner.run(baseline=baseline, candidate=candidate))
+
+    block = runner._protocol.design.blocks[0]
+    failed_state = mod._read_pair_generation_state(runner._pair_state_path(block))
+    evidence_path = mod._pair_failure_evidence_path(
+        runner._runtime.jobs_dir,
+        failed_state=failed_state,
+    )
+    tampered = json.loads(evidence_path.read_text(encoding="utf-8"))
+    tampered["owner"] = mod.PairedHarborPairFailureOwner.TASK.value
+    evidence_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    with pytest.raises(mod.PairedHarborPairStateError, match="unreadable or invalid"):
+        mod.authorize_paired_harbor_pair_retry(
+            jobs_dir=runner._runtime.jobs_dir,
+            protocol=runner._protocol,
+            operation_id="offline-test-operation",
+            failed_state=failed_state,
+        )
 
 
 def test_operation_lease_excludes_concurrent_cross_generation_restart(tmp_path: Path) -> None:

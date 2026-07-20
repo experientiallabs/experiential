@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import tempfile
 from collections import Counter
 from collections.abc import AsyncIterator
@@ -16,6 +17,8 @@ from contextlib import (
     ExitStack,
     asynccontextmanager,
 )
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol, Self, TypedDict
 
@@ -37,9 +40,11 @@ from pydantic import (
 from wmh.core.text import validate_durable_text
 from wmh.evals.benchmark import (
     BenchmarkCandidateStatus,
+    BenchmarkFailureKind,
     BenchmarkRunHealth,
     BenchmarkRunIdentity,
     BenchmarkTrialResult,
+    BenchmarkTrialStatus,
     BenchmarkUsageStatus,
 )
 from wmh.evals.harbor._file_lease import exclusive_posix_file_lease
@@ -54,12 +59,15 @@ from wmh.evals.harbor.evaluator import (
     HARBOR_EVALUATOR_VERSION,
     HarborEvaluator,
     HarborEvaluatorSession,
+    StaleHarborJobError,
+    harbor_job_has_terminal_result,
     harbor_run_expectation,
 )
 from wmh.evals.harbor.qualification_types import (
     QualifiedE2BBuildIdentity as QualifiedE2BBuildIdentity,
 )
 from wmh.evals.harbor.qualification_types import QualifiedHarborTask
+from wmh.evals.harbor.results import LoadedHarborJobResult
 from wmh.evals.harbor.scorer import (
     HarborAgentComputeEnvelope,
     admit_harbor_matrix,
@@ -121,7 +129,7 @@ class _CreateRateKwargs(TypedDict, total=False):
 
 
 PAIRED_HARBOR_PROTOCOL_VERSION: Literal["9"] = "9"
-PAIRED_HARBOR_RUN_VERSION: Literal["10"] = "10"
+PAIRED_HARBOR_RUN_VERSION: Literal["11"] = "11"
 MAX_RESUMABLE_INVOCATION_RUNTIME_S = 82_800
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _LEGACY_PAIR_STATE_VERSION_ERROR = (
@@ -1502,6 +1510,39 @@ class PairedHarborArmEvidence(BaseModel):
         return self
 
 
+class PairedHarborArmCompletionWitness(BaseModel):
+    """Score-blind durable witness that one exact arm was fully admitted."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    witness_version: Literal["1"] = "1"
+    pair_generation_id: str = Field(pattern=_DIGEST_PATTERN)
+    protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    arm: PairedArm
+    job_name: str = Field(min_length=1)
+    harness_execution_hash: str = Field(min_length=1)
+    harness_execution_digest: str = Field(pattern=_DIGEST_PATTERN)
+    run_identity_digest: str = Field(pattern=_DIGEST_PATTERN)
+    task_identity: str = Field(min_length=1)
+    task_key: str = Field(min_length=1)
+    attempt: StrictInt = Field(ge=1)
+    task_checksum: str = Field(pattern=_DIGEST_PATTERN)
+    task_environment_digest: str = Field(pattern=_DIGEST_PATTERN)
+    runner_environment_digest: str = Field(pattern=_DIGEST_PATTERN)
+    admission_status: Literal["admitted"] = "admitted"
+    arm_evidence_digest: str = Field(pattern=_DIGEST_PATTERN)
+    arm_evidence_record_digest: str = Field(pattern=_DIGEST_PATTERN)
+    terminal_artifacts_digest: str = Field(pattern=_DIGEST_PATTERN)
+    witness_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @model_validator(mode="after")
+    def _validate_witness_digest(self) -> Self:
+        expected = _canonical_digest(self.model_dump(mode="json", exclude={"witness_digest"}))
+        if self.witness_digest != expected:
+            raise ValueError("paired Harbor arm completion witness digest is inconsistent")
+        return self
+
+
 class PairedHarborBlockEvidence(BaseModel):
     """Both ordered Harbor executions and their admitted binary outcome."""
 
@@ -1569,18 +1610,110 @@ class PairedHarborCompletedBlock(BaseModel):
         return value
 
 
+class PairedHarborSliceIntent(BaseModel):
+    """Immutable pre-dispatch commitment for one bounded slice lifecycle."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    intent_version: Literal["1"] = "1"
+    protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    slice_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
+    operation_id: str = Field(min_length=1, max_length=256)
+    intent_index: StrictInt = Field(ge=1)
+    intent_generation_id: StrictInt = Field(ge=1)
+    requested_max_new_blocks: StrictInt = Field(ge=1)
+    previous_intent_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    previous_progress_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
+    completed_before: tuple[PairedHarborCompletedBlock, ...]
+    selected_blocks: tuple[PairedBlock, ...]
+    expected_block_count: StrictInt = Field(ge=1)
+    intent_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator(
+        "intent_index",
+        "intent_generation_id",
+        "requested_max_new_blocks",
+        "expected_block_count",
+        mode="before",
+    )
+    @classmethod
+    def _reject_boolean_counts(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("paired slice intent counts cannot be boolean")
+        return value
+
+    @field_validator("operation_id")
+    @classmethod
+    def _require_operation_id(cls, value: str) -> str:
+        return _validate_operation_id(value)
+
+    @model_validator(mode="after")
+    def _validate_intent(self) -> Self:
+        before_blocks = tuple(item.block for item in self.completed_before)
+        if len(before_blocks) != len(set(before_blocks)):
+            raise ValueError("paired slice intent prior evidence contains duplicate blocks")
+        if not self.selected_blocks:
+            raise ValueError("paired slice intent must select at least one block")
+        if len(self.selected_blocks) != len(set(self.selected_blocks)):
+            raise ValueError("paired slice intent selection contains duplicate blocks")
+        if set(before_blocks) & set(self.selected_blocks):
+            raise ValueError("paired slice intent repeats a previously completed block")
+        if len(self.selected_blocks) > self.requested_max_new_blocks:
+            raise ValueError("paired slice intent selected more blocks than requested")
+        expected_digest = _canonical_digest(self.model_dump(mode="json", exclude={"intent_digest"}))
+        if self.intent_digest != expected_digest:
+            raise ValueError("paired slice intent digest is inconsistent")
+        return self
+
+    def require_protocol(self, protocol: PairedHarborProtocol) -> None:
+        """Validate this intent against the exact frozen protocol and selection order."""
+        if (
+            self.protocol_digest != protocol.digest
+            or self.slice_policy_digest != protocol.slice_policy_digest
+            or self.expected_block_count != len(protocol.design.blocks)
+            or self.requested_max_new_blocks > protocol.slice_policy.max_new_blocks
+        ):
+            raise ValueError("paired slice intent differs from its frozen protocol")
+        design_index = {block: index for index, block in enumerate(protocol.design.blocks)}
+        before_blocks = tuple(item.block for item in self.completed_before)
+        if any(block not in design_index for block in before_blocks):
+            raise ValueError("paired slice intent prior evidence contains a foreign block")
+        if before_blocks != tuple(sorted(before_blocks, key=design_index.__getitem__)):
+            raise ValueError("paired slice intent prior evidence is not in frozen order")
+        for item in self.completed_before:
+            expected_pair_id = paired_harbor_pair_generation_id(
+                protocol_digest=self.protocol_digest,
+                operation_id=self.operation_id,
+                generation_id=item.generation_id,
+                block=item.block,
+            )
+            if (
+                item.generation_id > self.intent_generation_id
+                or item.pair_generation_id != expected_pair_id
+            ):
+                raise ValueError("paired slice intent prior evidence has generation drift")
+        expected_selection = _select_paired_harbor_slice_blocks(
+            protocol,
+            completed_blocks=frozenset(before_blocks),
+            max_new_blocks=self.requested_max_new_blocks,
+        )
+        if self.selected_blocks != expected_selection:
+            raise ValueError("paired slice intent selection differs from frozen order")
+
+
 class PairedHarborSliceProgress(BaseModel):
     """Append-only, path-free progress evidence for one completed invocation slice."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    progress_version: Literal["1"] = "1"
+    progress_version: Literal["2"] = "2"
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     slice_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
     invocation_generation_id: StrictInt = Field(ge=1)
     slice_index: StrictInt = Field(ge=1)
     requested_max_new_blocks: StrictInt = Field(ge=1)
+    slice_intent_digest: str = Field(pattern=_DIGEST_PATTERN)
     previous_progress_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
     completed_before: tuple[PairedHarborCompletedBlock, ...]
     selected_blocks: tuple[PairedBlock, ...]
@@ -1689,7 +1822,7 @@ class PairedHarborRunReport(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    run_version: Literal["10"]
+    run_version: Literal["11"]
     protocol: PairedHarborProtocol
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
@@ -1816,7 +1949,6 @@ class PairedHarborRunReport(BaseModel):
                 trial = arm_evidence.trial
                 if (
                     trial.task_identity != item.block.task_id
-                    or trial.cell.task_name != item.block.task_id
                     or trial.cell.task_key != qualification.task_key
                     or trial.cell.attempt != 1
                     or trial.task_checksum != qualification.content_digest
@@ -1936,6 +2068,10 @@ class PairedHarborProgressStateError(RuntimeError):
     """Durable paired slice progress is unreadable, inconsistent, or non-monotone."""
 
 
+class PairedHarborNoActiveSliceIntentError(PairedHarborProgressStateError):
+    """An exact paired slice reentry was requested without an active durable intent."""
+
+
 class ConcurrentPairedHarborRunError(RuntimeError):
     """The same local operation generation is already executing."""
 
@@ -1948,8 +2084,8 @@ class PairedHarborPairStateError(RuntimeError):
     """Durable pair-generation state is missing, inconsistent, or unsafe to resume."""
 
 
-class _StopPairedHarborWorkers(RuntimeError):
-    """Internal TaskGroup signal that cancels work after the first fatal block."""
+class PairedHarborArmInterruptionError(RuntimeError):
+    """An arm job exists without terminal evidence and needs explicit crash handling."""
 
 
 class PairedHarborPairGenerationState(BaseModel):
@@ -2021,12 +2157,182 @@ class PairedHarborPairGenerationState(BaseModel):
         return self
 
 
+class PairedHarborPairFailureOwner(StrEnum):
+    """Stable owner of a failed pair generation, independent of backend exception text."""
+
+    INFRASTRUCTURE = "infrastructure"
+    PROCESS = "process"
+    CANDIDATE = "candidate"
+    TASK = "task"
+    SCORING = "scoring"
+    UNCLASSIFIED = "unclassified"
+
+
+class PairedHarborPairFailureSource(StrEnum):
+    """Trusted boundary that produced one pair-failure classification."""
+
+    BENCHMARK_TRIAL = "benchmark_trial"
+    EVALUATOR_EXCEPTION = "evaluator_exception"
+    ADMISSION = "admission"
+    PROCESS_CRASH = "process_crash"
+
+
+class PairedHarborPairRetryEligibility(StrEnum):
+    """Whether a classified failure can create one fresh whole-pair generation."""
+
+    WHOLE_PAIR = "whole_pair"
+    FORBIDDEN = "forbidden"
+
+
+class _HarborArmJobRecoveryState(StrEnum):
+    """Score-blind recovery state for one exact single-trial Harbor arm job."""
+
+    ABSENT = "absent"
+    INCOMPLETE = "incomplete"
+    CANCELLED = "cancelled"
+    OUTCOME_PUBLISHED = "outcome_published"
+    TERMINAL = "terminal"
+
+
+class _HarborTrialExceptionProjection(BaseModel):
+    """Non-score subset used to identify an explicit Harbor cancellation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    exception_type: str = Field(min_length=1)
+
+
+class _HarborTrialCancellationProjection(BaseModel):
+    """Projection that validates only score-free cancellation evidence."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    exception_info: _HarborTrialExceptionProjection | None = None
+    verifier_result: None = None
+
+
+_RETRYABLE_BENCHMARK_FAILURE_KINDS = frozenset(
+    {
+        BenchmarkFailureKind.ENVIRONMENT,
+        BenchmarkFailureKind.ENVIRONMENT_CONFIRMATION_REQUIRED,
+        BenchmarkFailureKind.PROVIDER,
+        BenchmarkFailureKind.VERIFIER,
+        BenchmarkFailureKind.MALFORMED_RESULT,
+    }
+)
+
+
+@dataclass(frozen=True)
+class _PairFailureDescriptor:
+    """In-memory score-blind inputs for one durable failure record."""
+
+    owner: PairedHarborPairFailureOwner
+    source: PairedHarborPairFailureSource
+    retry_eligibility: PairedHarborPairRetryEligibility
+    arm: PairedArm | None = None
+    failure_kind: BenchmarkFailureKind | None = None
+
+
+class _ClassifiedPairFailure(RuntimeError):
+    """Internal exception carrying only stable, nonsecret failure attribution."""
+
+    def __init__(self, descriptor: _PairFailureDescriptor) -> None:
+        self.descriptor = descriptor
+        detail = (
+            "invalid provider-call evidence or another admission-integrity failure"
+            if descriptor.source is PairedHarborPairFailureSource.ADMISSION
+            else "typed score-blind failure"
+        )
+        super().__init__(
+            f"paired Harbor arm has {detail}: {descriptor.owner.value}/{descriptor.source.value}"
+        )
+
+
+class PairedHarborPairFailureEvidence(BaseModel):
+    """Immutable score-blind classification bound to one exact failed pair state."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evidence_version: Literal["1"] = "1"
+    protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    operation_id: str = Field(min_length=1, max_length=256)
+    block: PairedBlock
+    generation_id: StrictInt = Field(ge=1)
+    pair_generation_id: str = Field(pattern=_DIGEST_PATTERN)
+    failed_state: PairedHarborPairGenerationState
+    failed_state_digest: str = Field(pattern=_DIGEST_PATTERN)
+    owner: PairedHarborPairFailureOwner
+    source: PairedHarborPairFailureSource
+    retry_eligibility: PairedHarborPairRetryEligibility
+    arm: PairedArm | None = None
+    failure_kind: BenchmarkFailureKind | None = None
+    evidence_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @field_validator("operation_id")
+    @classmethod
+    def _require_operation_id(cls, value: str) -> str:
+        return _validate_operation_id(value)
+
+    @field_validator("generation_id", mode="before")
+    @classmethod
+    def _reject_boolean_generation(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("pair failure generation cannot be boolean")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_evidence(self) -> Self:
+        state = self.failed_state
+        if (
+            state.status != "failed"
+            or state.protocol_digest != self.protocol_digest
+            or state.operation_id != self.operation_id
+            or state.block != self.block
+            or state.generation_id != self.generation_id
+            or state.pair_generation_id != self.pair_generation_id
+            or state.state_digest != self.failed_state_digest
+        ):
+            raise ValueError("pair failure evidence differs from its failed state")
+        if self.owner is PairedHarborPairFailureOwner.INFRASTRUCTURE:
+            if (
+                self.source is not PairedHarborPairFailureSource.BENCHMARK_TRIAL
+                or self.failure_kind not in _RETRYABLE_BENCHMARK_FAILURE_KINDS
+                or self.retry_eligibility is not PairedHarborPairRetryEligibility.WHOLE_PAIR
+                or self.arm is None
+            ):
+                raise ValueError("infrastructure failure evidence is not allowlisted")
+        elif self.owner is PairedHarborPairFailureOwner.PROCESS:
+            if (
+                self.source is not PairedHarborPairFailureSource.PROCESS_CRASH
+                or self.failure_kind is not None
+                or self.retry_eligibility is not PairedHarborPairRetryEligibility.WHOLE_PAIR
+                or self.arm is not None
+            ):
+                raise ValueError("process failure evidence is not an explicit ambiguous crash")
+        elif self.retry_eligibility is not PairedHarborPairRetryEligibility.FORBIDDEN:
+            raise ValueError("only infrastructure or process-crash evidence can permit retry")
+        if self.owner is PairedHarborPairFailureOwner.TASK and (
+            self.source is not PairedHarborPairFailureSource.BENCHMARK_TRIAL
+            or self.failure_kind is not BenchmarkFailureKind.TASK_TIMEOUT
+            or self.arm is None
+        ):
+            raise ValueError("task failure evidence must be a typed task timeout")
+        if self.owner is PairedHarborPairFailureOwner.SCORING and (
+            self.source is not PairedHarborPairFailureSource.ADMISSION or self.arm is None
+        ):
+            raise ValueError("scoring failure evidence must come from arm admission")
+        expected = _canonical_digest(self.model_dump(mode="json", exclude={"evidence_digest"}))
+        if self.evidence_digest != expected:
+            raise ValueError("pair failure evidence digest is inconsistent")
+        return self
+
+
 class PairedHarborPairRetryAuthorization(BaseModel):
     """Immutable control-plane authority for exactly one whole-pair retry."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    authorization_version: Literal["1"] = "1"
+    authorization_version: Literal["2"] = "2"
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
     operation_id: str = Field(min_length=1, max_length=256)
     retry_policy_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -2035,7 +2341,9 @@ class PairedHarborPairRetryAuthorization(BaseModel):
     to_generation_id: StrictInt = Field(ge=2)
     failed_state: PairedHarborPairGenerationState
     failed_state_digest: str = Field(pattern=_DIGEST_PATTERN)
-    reason: Literal["infrastructure_failure"] = "infrastructure_failure"
+    failure_evidence: PairedHarborPairFailureEvidence
+    failure_evidence_digest: str = Field(pattern=_DIGEST_PATTERN)
+    reason: Literal["classified_whole_pair_retry"] = "classified_whole_pair_retry"
     authorization_digest: str = Field(pattern=_DIGEST_PATTERN)
 
     @field_validator("operation_id")
@@ -2055,7 +2363,7 @@ class PairedHarborPairRetryAuthorization(BaseModel):
         if self.to_generation_id != self.from_generation_id + 1:
             raise ValueError("pair retry authorization must advance exactly one generation")
         if (
-            self.failed_state.status == "complete"
+            self.failed_state.status != "failed"
             or self.failed_state.protocol_digest != self.protocol_digest
             or self.failed_state.operation_id != self.operation_id
             or self.failed_state.block != self.block
@@ -2063,6 +2371,14 @@ class PairedHarborPairRetryAuthorization(BaseModel):
             or self.failed_state.state_digest != self.failed_state_digest
         ):
             raise ValueError("pair retry authorization differs from its failed state")
+        if (
+            self.failure_evidence.failed_state != self.failed_state
+            or self.failure_evidence.failed_state_digest != self.failed_state_digest
+            or self.failure_evidence.evidence_digest != self.failure_evidence_digest
+            or self.failure_evidence.retry_eligibility
+            is not PairedHarborPairRetryEligibility.WHOLE_PAIR
+        ):
+            raise ValueError("pair retry authorization lacks eligible failure evidence")
         expected = _canonical_digest(self.model_dump(mode="json", exclude={"authorization_digest"}))
         if self.authorization_digest != expected:
             raise ValueError("pair retry authorization digest is inconsistent")
@@ -2352,16 +2668,104 @@ class PairedHarborRunner:
                     baseline=baseline,
                     candidate=candidate,
                     requested=requested,
+                    require_active_intent=False,
                 )
         except TimeoutError as exc:
             raise PairedHarborSliceTimeoutError(scope="invocation", timeout_s=timeout_s) from exc
+
+    async def resume_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult:
+        """Resume only an existing exact slice intent without appending a new intent."""
+        self._require_runtime_protocol(baseline=baseline, candidate=candidate)
+        timeout_s = self._protocol.slice_policy.max_invocation_runtime_s
+        try:
+            async with asyncio.timeout(timeout_s):
+                return await self._run_slice_with_lease(
+                    baseline=baseline,
+                    candidate=candidate,
+                    requested=None,
+                    require_active_intent=True,
+                )
+        except TimeoutError as exc:
+            raise PairedHarborSliceTimeoutError(scope="invocation", timeout_s=timeout_s) from exc
+
+    async def recover_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult | None:
+        """Recover or close one precommitted persisted slice without evaluator dispatch."""
+        self._require_runtime_protocol(baseline=baseline, candidate=candidate)
+        async with self._lease_coordinator.operation_lease(
+            protocol_digest=self._protocol.digest,
+            operation_id=self._operation_id,
+        ):
+            progress_chain = self._load_progress_chain()
+            intent_chain = self._load_slice_intent_chain()
+            self._validate_slice_lifecycle(
+                intent_chain=intent_chain,
+                progress_chain=progress_chain,
+            )
+            generation_by_block, retry_authorizations = self._plan_pair_generations()
+            self._require_current_generation_authority(retry_authorizations)
+            completed = self._load_completed_blocks(generation_by_block)
+            self._validate_progress_against_evidence(progress_chain, completed=completed)
+            latest = progress_chain[-1] if progress_chain else None
+            active_intent = (
+                intent_chain[-1] if len(intent_chain) == len(progress_chain) + 1 else None
+            )
+            if active_intent is None:
+                if latest is not None and self._progress_matches_evidence(latest, completed):
+                    return self._slice_result(
+                        progress=latest,
+                        completed=completed,
+                        retry_authorizations=retry_authorizations,
+                    )
+                if latest is None and not completed:
+                    return None
+                raise PairedHarborProgressStateError(
+                    "paired Harbor evidence ahead of progress lacks a durable slice intent"
+                )
+
+            evidence_delta = self._validate_active_intent_against_evidence(
+                active_intent,
+                completed=completed,
+            )
+            if evidence_delta != active_intent.selected_blocks:
+                if latest is None:
+                    return None
+                checkpoint_evidence = {
+                    item.block: completed[item.block] for item in latest.completed_blocks
+                }
+                return self._slice_result(
+                    progress=latest,
+                    completed=checkpoint_evidence,
+                    retry_authorizations=retry_authorizations,
+                )
+            recovered = self._create_progress(
+                intent=active_intent,
+                completed_after=completed,
+                previous=latest,
+            )
+            self._persist_progress(recovered)
+            return self._slice_result(
+                progress=recovered,
+                completed=completed,
+                retry_authorizations=retry_authorizations,
+            )
 
     async def _run_slice_with_lease(
         self,
         *,
         baseline: HarnessDoc,
         candidate: HarnessDoc,
-        requested: int,
+        requested: int | None,
+        require_active_intent: bool,
     ) -> PairedHarborSliceResult:
         """Execute one validated slice while its operation-wide deadline is active."""
 
@@ -2370,71 +2774,149 @@ class PairedHarborRunner:
             operation_id=self._operation_id,
         ):
             progress_chain = self._load_progress_chain()
+            intent_chain = self._load_slice_intent_chain()
+            self._validate_slice_lifecycle(
+                intent_chain=intent_chain,
+                progress_chain=progress_chain,
+            )
             generation_by_block, retry_authorizations = self._plan_pair_generations()
-            if self._generation_id > 1 and not any(
-                item.to_generation_id == self._generation_id for item in retry_authorizations
-            ):
-                raise PartialPairedHarborReuseError(
-                    "paired Harbor operation generation can advance only through exact pair "
-                    "retry authority"
-                )
+            self._require_current_generation_authority(retry_authorizations)
             completed_before = self._load_completed_blocks(generation_by_block)
             self._validate_progress_against_evidence(
                 progress_chain,
                 completed=completed_before,
             )
-            selected = _select_paired_harbor_slice_blocks(
-                self._protocol,
-                completed_blocks=frozenset(completed_before),
-                max_new_blocks=requested,
+            latest = progress_chain[-1] if progress_chain else None
+            active_intent = (
+                intent_chain[-1] if len(intent_chain) == len(progress_chain) + 1 else None
             )
+            if active_intent is None:
+                if require_active_intent:
+                    raise PairedHarborNoActiveSliceIntentError(
+                        "paired Harbor resume requires one active precommitted slice intent"
+                    )
+                if requested is None:
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor new slice requires an explicit bounded selection"
+                    )
+                if latest is None:
+                    checkpoint_matches = not completed_before
+                else:
+                    checkpoint_matches = self._progress_matches_evidence(
+                        latest,
+                        completed_before,
+                    )
+                if not checkpoint_matches:
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor evidence ahead of progress lacks a durable slice intent"
+                    )
+                selected = _select_paired_harbor_slice_blocks(
+                    self._protocol,
+                    completed_blocks=frozenset(completed_before),
+                    max_new_blocks=requested,
+                )
+                if not selected:
+                    if latest is None:
+                        raise PairedHarborProgressStateError(
+                            "paired Harbor matrix has no selectable genesis block"
+                        )
+                    return self._slice_result(
+                        progress=latest,
+                        completed=completed_before,
+                        retry_authorizations=retry_authorizations,
+                    )
+                active_intent = self._create_slice_intent(
+                    requested_max_new_blocks=requested,
+                    selected_blocks=selected,
+                    completed_before=completed_before,
+                    previous_intent=(intent_chain[-1] if intent_chain else None),
+                    previous_progress=latest,
+                )
+                self._persist_slice_intent(active_intent)
+            else:
+                if requested is not None and requested != active_intent.requested_max_new_blocks:
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor active slice must resume with its exact precommitted "
+                        "max_new_blocks"
+                    )
+                self._validate_active_intent_against_evidence(
+                    active_intent,
+                    completed=completed_before,
+                )
+                selected = active_intent.selected_blocks
+
+            outstanding = tuple(block for block in selected if block not in completed_before)
             newly_completed: tuple[PairedHarborBlockEvidence, ...] = ()
-            if selected:
+            if outstanding:
                 newly_completed = await self._run_fair_matrix(
                     baseline=baseline,
                     candidate=candidate,
                     generation_by_block=generation_by_block,
-                    blocks=selected,
+                    blocks=outstanding,
                 )
             completed_after = {**completed_before}
             completed_after.update({item.block: item for item in newly_completed})
+            evidence_delta = self._validate_active_intent_against_evidence(
+                active_intent,
+                completed=completed_after,
+            )
+            if evidence_delta != active_intent.selected_blocks:
+                raise PairedHarborProgressStateError(
+                    "paired Harbor slice returned without its full precommitted selection"
+                )
+            progress = self._create_progress(
+                intent=active_intent,
+                completed_after=completed_after,
+                previous=latest,
+            )
+            self._persist_progress(progress)
 
-            latest = progress_chain[-1] if progress_chain else None
-            if (
-                not selected
-                and latest is not None
-                and self._progress_matches_evidence(latest, completed_after)
-            ):
-                progress = latest
-            else:
-                progress = self._create_progress(
-                    requested_max_new_blocks=requested,
-                    selected_blocks=selected,
-                    completed_before=completed_before,
-                    completed_after=completed_after,
-                    previous=latest,
-                )
-                self._persist_progress(progress)
+            return self._slice_result(
+                progress=progress,
+                completed=completed_after,
+                retry_authorizations=retry_authorizations,
+            )
 
-            report: PairedHarborRunReport | None = None
-            if progress.complete:
-                evidence = tuple(completed_after[block] for block in self._protocol.design.blocks)
-                analysis = analyze_paired_outcomes(
-                    self._protocol.design,
-                    [item.outcome for item in evidence],
-                )
-                report = PairedHarborRunReport(
-                    run_version=PAIRED_HARBOR_RUN_VERSION,
-                    protocol=self._protocol,
-                    protocol_digest=self._protocol.digest,
-                    operation_id=self._operation_id,
-                    generation_id=self._generation_id,
-                    retry_authorizations=retry_authorizations,
-                    evidence=evidence,
-                    completion_progress=progress,
-                    analysis=analysis,
-                )
-            return PairedHarborSliceResult(progress=progress, report=report)
+    def _require_current_generation_authority(
+        self,
+        retry_authorizations: tuple[PairedHarborPairRetryAuthorization, ...],
+    ) -> None:
+        """Require some exact pair authority before a later invocation generation."""
+        if self._generation_id > 1 and not any(
+            item.to_generation_id == self._generation_id for item in retry_authorizations
+        ):
+            raise PartialPairedHarborReuseError(
+                "paired Harbor operation generation can advance only through exact pair "
+                "retry authority"
+            )
+
+    def _slice_result(
+        self,
+        *,
+        progress: PairedHarborSliceProgress,
+        completed: dict[PairedBlock, PairedHarborBlockEvidence],
+        retry_authorizations: tuple[PairedHarborPairRetryAuthorization, ...],
+    ) -> PairedHarborSliceResult:
+        """Reconstruct a bounded result and terminal report from exact local evidence."""
+        report: PairedHarborRunReport | None = None
+        if progress.complete:
+            evidence = tuple(completed[block] for block in self._protocol.design.blocks)
+            analysis = analyze_paired_outcomes(
+                self._protocol.design,
+                [item.outcome for item in evidence],
+            )
+            report = PairedHarborRunReport(
+                run_version=PAIRED_HARBOR_RUN_VERSION,
+                protocol=self._protocol,
+                protocol_digest=self._protocol.digest,
+                operation_id=self._operation_id,
+                generation_id=self._generation_id,
+                retry_authorizations=retry_authorizations,
+                evidence=evidence,
+                completion_progress=progress,
+                analysis=analysis,
+            )
+        return PairedHarborSliceResult(progress=progress, report=report)
 
     def _require_runtime_protocol(
         self,
@@ -2476,29 +2958,73 @@ class PairedHarborRunner:
                 completed[block] = self._load_complete_pair_generation(state)
         return completed
 
-    def _create_progress(
+    def _create_slice_intent(
         self,
         *,
         requested_max_new_blocks: int,
         selected_blocks: tuple[PairedBlock, ...],
         completed_before: dict[PairedBlock, PairedHarborBlockEvidence],
+        previous_intent: PairedHarborSliceIntent | None,
+        previous_progress: PairedHarborSliceProgress | None,
+    ) -> PairedHarborSliceIntent:
+        """Create the immutable exact selection commitment before evaluator dispatch."""
+        before = self._completed_progress_entries(completed_before)
+        payload = {
+            "intent_version": "1",
+            "protocol_digest": self._protocol.digest,
+            "slice_policy_digest": self._protocol.slice_policy_digest,
+            "operation_id": self._operation_id,
+            "intent_index": 1 if previous_intent is None else previous_intent.intent_index + 1,
+            "intent_generation_id": self._generation_id,
+            "requested_max_new_blocks": requested_max_new_blocks,
+            "previous_intent_digest": (
+                None if previous_intent is None else previous_intent.intent_digest
+            ),
+            "previous_progress_digest": (
+                None if previous_progress is None else previous_progress.progress_digest
+            ),
+            "completed_before": tuple(item.model_dump(mode="json") for item in before),
+            "selected_blocks": tuple(block.model_dump(mode="json") for block in selected_blocks),
+            "expected_block_count": len(self._protocol.design.blocks),
+        }
+        intent = PairedHarborSliceIntent.model_validate(
+            {**payload, "intent_digest": _canonical_digest(payload)}
+        )
+        intent.require_protocol(self._protocol)
+        return intent
+
+    def _create_progress(
+        self,
+        *,
+        intent: PairedHarborSliceIntent,
         completed_after: dict[PairedBlock, PairedHarborBlockEvidence],
         previous: PairedHarborSliceProgress | None,
     ) -> PairedHarborSliceProgress:
-        """Create one canonical progress snapshot from admitted pair evidence."""
-        before = self._completed_progress_entries(completed_before)
+        """Create one canonical progress snapshot bound to its pre-dispatch intent."""
+        expected_previous_digest = None if previous is None else previous.progress_digest
+        if intent.previous_progress_digest != expected_previous_digest or intent.intent_index != (
+            1 if previous is None else previous.slice_index + 1
+        ):
+            raise PairedHarborProgressStateError(
+                "paired Harbor slice intent differs from the progress chain tip"
+            )
         completed = self._completed_progress_entries(completed_after)
         payload = {
-            "progress_version": "1",
+            "progress_version": "2",
             "protocol_digest": self._protocol.digest,
             "slice_policy_digest": self._protocol.slice_policy_digest,
             "operation_id": self._operation_id,
             "invocation_generation_id": self._generation_id,
-            "slice_index": 1 if previous is None else previous.slice_index + 1,
-            "requested_max_new_blocks": requested_max_new_blocks,
-            "previous_progress_digest": (None if previous is None else previous.progress_digest),
-            "completed_before": tuple(item.model_dump(mode="json") for item in before),
-            "selected_blocks": tuple(block.model_dump(mode="json") for block in selected_blocks),
+            "slice_index": intent.intent_index,
+            "requested_max_new_blocks": intent.requested_max_new_blocks,
+            "slice_intent_digest": intent.intent_digest,
+            "previous_progress_digest": intent.previous_progress_digest,
+            "completed_before": tuple(
+                item.model_dump(mode="json") for item in intent.completed_before
+            ),
+            "selected_blocks": tuple(
+                block.model_dump(mode="json") for block in intent.selected_blocks
+            ),
             "completed_blocks": tuple(item.model_dump(mode="json") for item in completed),
             "expected_block_count": len(self._protocol.design.blocks),
             "completed_block_count": len(completed),
@@ -2525,6 +3051,120 @@ class PairedHarborRunner:
             for block in self._protocol.design.blocks
             if block in evidence_by_block
         )
+
+    def _validate_active_intent_against_evidence(
+        self,
+        intent: PairedHarborSliceIntent,
+        *,
+        completed: dict[PairedBlock, PairedHarborBlockEvidence],
+    ) -> tuple[PairedBlock, ...]:
+        """Return the exact completed intent delta or reject foreign evidence."""
+        actual = {item.block: item for item in self._completed_progress_entries(completed)}
+        before = {item.block: item for item in intent.completed_before}
+        if any(actual.get(block) != item for block, item in before.items()):
+            raise PairedHarborProgressStateError(
+                "paired Harbor slice intent prior evidence differs from immutable pairs"
+            )
+        delta = tuple(
+            block
+            for block in self._protocol.design.blocks
+            if block in actual and block not in before
+        )
+        if not set(delta) <= set(intent.selected_blocks):
+            raise PairedHarborProgressStateError(
+                "paired Harbor evidence escaped the active precommitted slice selection"
+            )
+        return delta
+
+    def _validate_slice_lifecycle(
+        self,
+        *,
+        intent_chain: tuple[PairedHarborSliceIntent, ...],
+        progress_chain: tuple[PairedHarborSliceProgress, ...],
+    ) -> None:
+        """Require a one-to-one intent and progress lifecycle with at most one active intent."""
+        if len(intent_chain) not in (len(progress_chain), len(progress_chain) + 1):
+            raise PairedHarborProgressStateError(
+                "paired Harbor slice intent and progress chains are not contiguous"
+            )
+        for index, progress in enumerate(progress_chain):
+            intent = intent_chain[index]
+            if (
+                progress.slice_index != intent.intent_index
+                or progress.slice_intent_digest != intent.intent_digest
+                or progress.previous_progress_digest != intent.previous_progress_digest
+                or progress.requested_max_new_blocks != intent.requested_max_new_blocks
+                or progress.completed_before != intent.completed_before
+                or progress.selected_blocks != intent.selected_blocks
+                or progress.expected_block_count != intent.expected_block_count
+                or progress.invocation_generation_id < intent.intent_generation_id
+            ):
+                raise PairedHarborProgressStateError(
+                    "paired Harbor progress differs from its pre-dispatch slice intent"
+                )
+        if len(intent_chain) == len(progress_chain) + 1:
+            active = intent_chain[-1]
+            latest = progress_chain[-1] if progress_chain else None
+            expected_previous = None if latest is None else latest.progress_digest
+            expected_before = () if latest is None else latest.completed_blocks
+            if (
+                active.intent_index != len(progress_chain) + 1
+                or active.previous_progress_digest != expected_previous
+                or active.completed_before != expected_before
+            ):
+                raise PairedHarborProgressStateError(
+                    "paired Harbor active slice intent differs from the progress chain tip"
+                )
+
+    def _load_slice_intent_chain(self) -> tuple[PairedHarborSliceIntent, ...]:
+        """Load and validate the immutable pre-dispatch slice intent chain."""
+        directory = self._slice_intent_directory()
+        if not os.path.lexists(directory):
+            return ()
+        if directory.is_symlink() or not directory.is_dir():
+            raise PairedHarborProgressStateError(
+                "paired Harbor slice intent directory must be a regular directory"
+            )
+        records: list[PairedHarborSliceIntent] = []
+        for path in sorted(directory.iterdir()):
+            if path.is_symlink() or not path.is_file():
+                raise PairedHarborProgressStateError(
+                    "paired Harbor slice intent directory contains an unsafe entry"
+                )
+            intent = _read_paired_harbor_slice_intent(path)
+            try:
+                intent.require_protocol(self._protocol)
+            except ValueError as exc:
+                raise PairedHarborProgressStateError(
+                    "paired Harbor slice intent differs from its frozen protocol"
+                ) from exc
+            if (
+                intent.operation_id != self._operation_id
+                or intent.intent_generation_id > self._generation_id
+                or path != self._slice_intent_record_path(intent)
+            ):
+                raise PairedHarborProgressStateError(
+                    "paired Harbor slice intent has operation, generation, or path drift"
+                )
+            records.append(intent)
+
+        previous: PairedHarborSliceIntent | None = None
+        for intent in records:
+            if previous is None:
+                if intent.intent_index != 1 or intent.previous_intent_digest is not None:
+                    raise PairedHarborProgressStateError(
+                        "paired Harbor slice intent chain lacks a canonical genesis"
+                    )
+            elif (
+                intent.intent_index != previous.intent_index + 1
+                or intent.previous_intent_digest != previous.intent_digest
+                or intent.intent_generation_id < previous.intent_generation_id
+            ):
+                raise PairedHarborProgressStateError(
+                    "paired Harbor slice intent chain is non-contiguous"
+                )
+            previous = intent
+        return tuple(records)
 
     def _load_progress_chain(self) -> tuple[PairedHarborSliceProgress, ...]:
         """Load and validate the append-only operation progress chain."""
@@ -2614,6 +3254,32 @@ class PairedHarborRunner:
     ) -> bool:
         return progress.completed_blocks == self._completed_progress_entries(completed)
 
+    def _slice_intent_directory(self) -> Path:
+        token = _lease_token("slice-intent", self._protocol.digest, self._operation_id)
+        return self._runtime.jobs_dir / ".wmh-paired-slice-intents" / token
+
+    def _slice_intent_record_path(self, intent: PairedHarborSliceIntent) -> Path:
+        """Return the deterministic host path for one immutable slice intent."""
+        return self._slice_intent_directory() / (
+            f"{intent.intent_index:08d}-{intent.intent_digest.removeprefix('sha256:')}.json"
+        )
+
+    def _persist_slice_intent(self, intent: PairedHarborSliceIntent) -> None:
+        path = self._slice_intent_record_path(intent)
+        if os.path.lexists(path):
+            if _read_paired_harbor_slice_intent(path) != intent:
+                raise PairedHarborProgressStateError(
+                    "paired Harbor slice intent path contains different evidence"
+                )
+            return
+        try:
+            _create_immutable_json_record(
+                path,
+                intent.model_dump_json(indent=2) + "\n",
+            )
+        except PairedHarborPairStateError as exc:
+            raise PairedHarborProgressStateError(str(exc)) from exc
+
     def _progress_directory(self) -> Path:
         token = _lease_token("progress", self._protocol.digest, self._operation_id)
         return self._runtime.jobs_dir / ".wmh-paired-progress" / token
@@ -2699,7 +3365,6 @@ class PairedHarborRunner:
                 except Exception as error:  # noqa: BLE001 - retain the exact failed block
                     failures.append((block, error))
                     await scheduler.abort()
-                    raise _StopPairedHarborWorkers from None
                 finally:
                     await asyncio.shield(scheduler.release(block))
 
@@ -2707,12 +3372,9 @@ class PairedHarborRunner:
             self._protocol.max_concurrent_blocks,
             len(blocks),
         )
-        try:
-            async with asyncio.TaskGroup() as workers:
-                for _ in range(worker_count):
-                    workers.create_task(worker())
-        except* _StopPairedHarborWorkers:
-            pass
+        async with asyncio.TaskGroup() as workers:
+            for _ in range(worker_count):
+                workers.create_task(worker())
         if failures:
             failures.sort(key=lambda item: blocks.index(item[0]))
             raise PairedHarborMatrixError(failures)
@@ -2783,8 +3445,19 @@ class PairedHarborRunner:
                 )
                 self._complete_pair_generation(pair_state, evidence)
                 return evidence
-            except BaseException:
-                self._fail_pair_generation(pair_state)
+            except BaseException as error:
+                descriptor: _PairFailureDescriptor | None = None
+                if isinstance(error, _ClassifiedPairFailure):
+                    descriptor = error.descriptor
+                elif isinstance(error, PairedHarborArmInterruptionError):
+                    descriptor = None
+                elif isinstance(error, Exception):
+                    descriptor = _PairFailureDescriptor(
+                        owner=PairedHarborPairFailureOwner.UNCLASSIFIED,
+                        source=PairedHarborPairFailureSource.EVALUATOR_EXCEPTION,
+                        retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+                    )
+                self._fail_pair_generation(pair_state, descriptor=descriptor)
                 raise
 
     async def _evaluate_arm(
@@ -2811,6 +3484,50 @@ class PairedHarborRunner:
             qualification=qualification,
             job_name=job_name,
         )
+        generation_state = self._pair_state(
+            block,
+            generation_id=generation_id,
+            status="running",
+        )
+        arm_evidence_path = _pair_arm_evidence_path(
+            self._runtime.jobs_dir,
+            state=generation_state,
+            arm=arm,
+        )
+        completion_witness_path = _pair_arm_completion_witness_path(
+            self._runtime.jobs_dir,
+            state=generation_state,
+            arm=arm,
+        )
+        job_path = self._runtime.jobs_dir / job_name
+        recovery_state = _arm_job_recovery_state(job_path)
+        arm_evidence_exists = os.path.lexists(arm_evidence_path)
+        completion_witness_exists = os.path.lexists(completion_witness_path)
+        if completion_witness_exists and not arm_evidence_exists:
+            raise PairedHarborPairStateError(
+                "paired Harbor arm completion witness lacks its admission evidence"
+            )
+        if arm_evidence_exists:
+            _validate_arm_evidence_for_state(
+                self._protocol,
+                generation_state,
+                _read_pair_arm_evidence(arm_evidence_path),
+                expected_arm=arm,
+            )
+            if recovery_state is not _HarborArmJobRecoveryState.TERMINAL:
+                raise PairedHarborPairStateError(
+                    "paired Harbor arm evidence lacks its terminal Harbor result"
+                )
+        reuse_terminal_result = recovery_state is _HarborArmJobRecoveryState.TERMINAL
+        if recovery_state not in {
+            _HarborArmJobRecoveryState.ABSENT,
+            _HarborArmJobRecoveryState.TERMINAL,
+            _HarborArmJobRecoveryState.OUTCOME_PUBLISHED,
+        }:
+            raise PairedHarborArmInterruptionError(
+                "paired Harbor arm job is incomplete; explicitly classify the interrupted "
+                "whole pair before allocating a new generation"
+            )
         provider_account = self._budget_runtime.provider_account_for(
             panel_member=block.panel_member,
             arm=arm,
@@ -2849,7 +3566,89 @@ class PairedHarborRunner:
             qualified_tasks=(qualification,),
             **create_rate_kwargs,
         )
-        loaded = await evaluator.evaluate(harness)
+        try:
+            loaded = (
+                await evaluator.load_existing(harness)
+                if reuse_terminal_result
+                else await evaluator.evaluate(harness)
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown evaluator failures are never retryable
+            raise _ClassifiedPairFailure(
+                _PairFailureDescriptor(
+                    owner=PairedHarborPairFailureOwner.UNCLASSIFIED,
+                    source=PairedHarborPairFailureSource.EVALUATOR_EXCEPTION,
+                    retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+                    arm=arm,
+                )
+            ) from exc
+        try:
+            self._validate_arm_result_identity(
+                block=block,
+                harness=harness,
+                spec=spec,
+                route=route,
+                qualification=qualification,
+                loaded=loaded,
+            )
+        except Exception as exc:  # noqa: BLE001 - foreign results cannot become retry authority
+            raise _ClassifiedPairFailure(
+                _PairFailureDescriptor(
+                    owner=PairedHarborPairFailureOwner.SCORING,
+                    source=PairedHarborPairFailureSource.ADMISSION,
+                    retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+                    arm=arm,
+                )
+            ) from exc
+        trial_failure = _classify_nonadmissible_benchmark_result(loaded.result.trials, arm=arm)
+        if trial_failure is not None:
+            raise _ClassifiedPairFailure(trial_failure)
+        try:
+            evidence = self._admit_arm_evidence(
+                block=block,
+                arm=arm,
+                harness=harness,
+                job_name=job_name,
+                route=route,
+                qualification=qualification,
+                loaded=loaded,
+            )
+        except _ClassifiedPairFailure:
+            raise
+        except Exception as exc:  # noqa: BLE001 - admission defects cannot authorize paid retry
+            raise _ClassifiedPairFailure(
+                _PairFailureDescriptor(
+                    owner=PairedHarborPairFailureOwner.SCORING,
+                    source=PairedHarborPairFailureSource.ADMISSION,
+                    retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+                    arm=arm,
+                )
+            ) from exc
+        _create_or_compare_pair_arm_evidence(arm_evidence_path, evidence)
+        completion_witness = _arm_completion_witness(
+            protocol=self._protocol,
+            state=generation_state,
+            evidence=evidence,
+            arm_evidence_path=arm_evidence_path,
+            job_path=job_path,
+        )
+        _create_or_compare_pair_arm_completion_witness(
+            completion_witness_path,
+            completion_witness,
+        )
+        return evidence
+
+    def _validate_arm_result_identity(
+        self,
+        *,
+        block: PairedBlock,
+        harness: HarnessDoc,
+        spec: HarborJobSpec,
+        route: PairedHarborPanelRoute,
+        qualification: QualifiedHarborTask,
+        loaded: LoadedHarborJobResult,
+    ) -> None:
+        """Bind a score-blind failure classification to the exact requested cell."""
+        plan = self._protocol.execution_plan
         validate_harbor_run_identity(
             loaded.result,
             candidate=harness,
@@ -2861,6 +3660,45 @@ class PairedHarborRunner:
             budget_policy_digest=self._protocol.budget_policy_digest,
             response_identity=route.response_identity,
         )
+        expected_job_dir = (spec.jobs_dir / spec.job_name).resolve()
+        if (
+            loaded.job_dir.resolve() != expected_job_dir
+            or loaded.job_dir.is_symlink()
+            or not loaded.job_dir.is_dir()
+            or loaded.result.job_name != spec.job_name
+            or len(loaded.result.expected_cells) != 1
+            or len(loaded.result.trials) != 1
+            or len(loaded.locators) != 1
+        ):
+            raise ValueError("paired Harbor arm result is not the exact requested single cell")
+        expected_cell = loaded.result.expected_cells[0]
+        trial = loaded.result.trials[0]
+        locator = loaded.locators[0]
+        if trial.cell != expected_cell or locator.cell != expected_cell:
+            raise ValueError("paired Harbor arm result cell differs from its manifest")
+        if (
+            trial.task_identity != block.task_id
+            or trial.cell.task_key != qualification.task_key
+            or trial.cell.attempt != 1
+            or trial.task_checksum != qualification.content_digest
+            or trial.task_environment_digest not in {None, qualification.task_environment_digest}
+            or trial.runner_environment_digest not in {None, plan.runner_environment_digest}
+        ):
+            raise ValueError("paired Harbor arm result differs from the qualified task")
+
+    def _admit_arm_evidence(
+        self,
+        *,
+        block: PairedBlock,
+        arm: PairedArm,
+        harness: HarnessDoc,
+        job_name: str,
+        route: PairedHarborPanelRoute,
+        qualification: QualifiedHarborTask,
+        loaded: LoadedHarborJobResult,
+    ) -> PairedHarborArmEvidence:
+        """Validate and reduce one scoreable Harbor result to canonical arm evidence."""
+        plan = self._protocol.execution_plan
         admitted = admit_harbor_matrix(
             loaded,
             task_ids=(block.task_id,),
@@ -2983,13 +3821,21 @@ class PairedHarborRunner:
     ) -> PairedHarborPairGenerationState | None:
         path = self._pair_state_path(block, generation_id=generation_id)
         evidence_path = self._pair_evidence_path(block, generation_id=generation_id)
+        failure_evidence_path = _pair_failure_evidence_path(
+            self._runtime.jobs_dir,
+            failed_state=self._pair_state(
+                block,
+                generation_id=generation_id,
+                status="failed",
+            ),
+        )
         names = self._arm_job_names(block, generation_id=generation_id)
         job_paths = tuple(self._runtime.jobs_dir / name for name in names.values())
         job_exists = tuple(os.path.lexists(path) for path in job_paths)
         if not os.path.lexists(path):
-            if os.path.lexists(evidence_path):
+            if os.path.lexists(evidence_path) or os.path.lexists(failure_evidence_path):
                 raise PairedHarborPairStateError(
-                    "paired Harbor generation has admitted evidence without durable pair state"
+                    "paired Harbor generation has durable evidence without pair state"
                 )
             if any(job_exists):
                 raise PartialPairedHarborReuseError(
@@ -3028,9 +3874,20 @@ class PairedHarborRunner:
             raise PairedHarborPairStateError(
                 "paired Harbor generation state does not match the requested block"
             )
+        if os.path.lexists(evidence_path) and os.path.lexists(failure_evidence_path):
+            raise PairedHarborPairStateError(
+                "paired Harbor generation has conflicting completion and failure evidence"
+            )
         if state.status != "complete" and os.path.lexists(evidence_path):
             state = self._recover_pair_generation(state)
+        elif os.path.lexists(failure_evidence_path):
+            state = self._recover_failed_pair_generation(state, failure_evidence_path)
         if state.status != "complete":
+            if state.status == "running" and _pair_generation_can_resume_same_generation(
+                self._runtime.jobs_dir,
+                state,
+            ):
+                return state
             if allow_incomplete:
                 return state
             raise PartialPairedHarborReuseError(
@@ -3048,6 +3905,32 @@ class PairedHarborRunner:
             _require_completed_arm_job(job_path)
         self._load_complete_pair_generation(state)
         return state
+
+    def _recover_failed_pair_generation(
+        self,
+        current: PairedHarborPairGenerationState,
+        evidence_path: Path,
+    ) -> PairedHarborPairGenerationState:
+        """Finish an evidence-first failed transition after an interrupted publication."""
+        if current.status == "complete":
+            raise PairedHarborPairStateError(
+                "complete paired Harbor state cannot carry failure evidence"
+            )
+        failed = _failed_pair_generation_state(current)
+        evidence = _read_pair_failure_evidence(evidence_path)
+        if evidence.failed_state != failed:
+            raise PairedHarborPairStateError(
+                "paired Harbor failure evidence differs from its generation state"
+            )
+        if current.status == "running":
+            _replace_pair_generation_state(
+                self._pair_state_path(
+                    current.block,
+                    generation_id=current.generation_id,
+                ),
+                failed,
+            )
+        return failed
 
     def _recover_pair_generation(
         self,
@@ -3158,7 +4041,12 @@ class PairedHarborRunner:
             completed,
         )
 
-    def _fail_pair_generation(self, current: PairedHarborPairGenerationState) -> None:
+    def _fail_pair_generation(
+        self,
+        current: PairedHarborPairGenerationState,
+        *,
+        descriptor: _PairFailureDescriptor | None = None,
+    ) -> None:
         if current.status == "complete":
             return
         evidence_path = self._pair_evidence_path(
@@ -3172,10 +4060,22 @@ class PairedHarborRunner:
             raise PairedHarborPairStateError(
                 "only a running paired Harbor generation can become failed"
             )
+        if descriptor is None:
+            # A BaseException can be the process interruption itself. Keep the running marker so
+            # a separate control-plane action must explicitly classify that ambiguous crash.
+            return
         failed = self._pair_state(
             current.block,
             generation_id=current.generation_id,
             status="failed",
+        )
+        failure_evidence = _pair_failure_evidence(failed, descriptor=descriptor)
+        _create_or_compare_pair_failure_evidence(
+            _pair_failure_evidence_path(
+                self._runtime.jobs_dir,
+                failed_state=failed,
+            ),
+            failure_evidence,
         )
         _replace_pair_generation_state(
             self._pair_state_path(
@@ -3307,6 +4207,16 @@ class PairedHarborRunner:
             if latest.status == "complete":
                 planned[block] = latest.generation_id
                 continue
+            if (
+                latest.status == "running"
+                and latest.generation_id == self._generation_id
+                and _pair_generation_can_resume_same_generation(
+                    self._runtime.jobs_dir,
+                    latest,
+                )
+            ):
+                planned[block] = latest.generation_id
+                continue
             if latest.generation_id == self._generation_id:
                 raise PartialPairedHarborReuseError(
                     f"paired Harbor generation is {latest.status!r} for "
@@ -3335,10 +4245,21 @@ class PairedHarborRunner:
         *,
         to_generation_id: int,
     ) -> PairedHarborPairRetryAuthorization:
+        failure_evidence = load_paired_harbor_pair_failure_evidence(
+            jobs_dir=self._runtime.jobs_dir,
+            failed_state=failed_state,
+        )
+        if failure_evidence.owner is PairedHarborPairFailureOwner.PROCESS:
+            _require_process_crash_reconciliation(
+                self._runtime.jobs_dir,
+                self._protocol,
+                failed_state,
+            )
         expected = _pair_retry_authorization(
             protocol=self._protocol,
             operation_id=self._operation_id,
             failed_state=failed_state,
+            failure_evidence=failure_evidence,
             to_generation_id=to_generation_id,
         )
         path = _pair_retry_authorization_path(
@@ -3362,6 +4283,125 @@ class PairedHarborRunner:
         return actual
 
 
+def load_paired_harbor_pair_failure_evidence(
+    *,
+    jobs_dir: Path,
+    failed_state: PairedHarborPairGenerationState,
+) -> PairedHarborPairFailureEvidence:
+    """Load the immutable classification for one exact failed pair generation."""
+    root = jobs_dir.expanduser()
+    if not root.is_absolute():
+        raise ValueError("paired Harbor failure-evidence jobs_dir must be absolute")
+    frozen_state = PairedHarborPairGenerationState.model_validate(failed_state.model_dump())
+    if frozen_state.status != "failed":
+        raise ValueError("paired Harbor failure evidence requires a failed generation")
+    evidence = _read_pair_failure_evidence(
+        _pair_failure_evidence_path(root, failed_state=frozen_state)
+    )
+    if evidence.failed_state != frozen_state:
+        raise PairedHarborPairStateError(
+            "paired Harbor failure evidence differs from the failed generation"
+        )
+    return evidence
+
+
+def classify_paired_harbor_process_crash(
+    *,
+    jobs_dir: Path,
+    protocol: PairedHarborProtocol,
+    operation_id: str,
+    interrupted_state: PairedHarborPairGenerationState,
+) -> PairedHarborPairFailureEvidence:
+    """Explicitly classify a crash that left no trusted benchmark failure result."""
+    root = jobs_dir.expanduser()
+    if not root.is_absolute():
+        raise ValueError("paired Harbor process-crash jobs_dir must be absolute")
+    frozen_protocol = PairedHarborProtocol.model_validate(protocol.model_dump())
+    frozen_state = PairedHarborPairGenerationState.model_validate(interrupted_state.model_dump())
+    operation_id = _validate_operation_id(operation_id)
+    if (
+        frozen_state.protocol_digest != frozen_protocol.digest
+        or frozen_state.operation_id != operation_id
+        or frozen_state.block not in frozen_protocol.design.blocks
+    ):
+        raise ValueError("paired Harbor interrupted state differs from its frozen operation")
+    if frozen_state.status != "running":
+        raise ValueError(
+            "paired Harbor process-crash classification requires the interrupted running state"
+        )
+
+    with exclusive_posix_file_lease(
+        _operation_lease_path(
+            root / ".wmh-paired-leases",
+            protocol_digest=frozen_protocol.digest,
+            operation_id=operation_id,
+        ),
+        unsupported_error=RuntimeError(
+            "paired Harbor process-crash classification requires POSIX operation exclusion"
+        ),
+        irregular_file_error=OSError(
+            "paired Harbor process-crash operation lease is not a regular file"
+        ),
+        contention_error=ConcurrentPairedHarborRunError(
+            "paired Harbor process crash cannot be classified while the operation is running"
+        ),
+    ):
+        state_path = _pair_generation_state_path(
+            root,
+            protocol_digest=frozen_protocol.digest,
+            operation_id=operation_id,
+            generation_id=frozen_state.generation_id,
+            block=frozen_state.block,
+        )
+        actual = _read_pair_generation_state(state_path)
+        expected_failed = _failed_pair_generation_state(frozen_state)
+        if actual == frozen_state:
+            failed_state = expected_failed
+        elif actual == expected_failed:
+            failed_state = actual
+        else:
+            raise PairedHarborPairStateError(
+                "paired Harbor interrupted state changed before process-crash classification"
+            )
+        if os.path.lexists(state_path.with_suffix(".evidence.json")):
+            raise PairedHarborPairStateError(
+                "paired Harbor admitted pair evidence cannot be classified as a process crash"
+            )
+        _require_process_crash_reconciliation(root, frozen_protocol, failed_state)
+        evidence_path = _pair_failure_evidence_path(root, failed_state=failed_state)
+        if os.path.lexists(evidence_path):
+            existing = _read_pair_failure_evidence(evidence_path)
+            if existing.failed_state != failed_state:
+                raise PairedHarborPairStateError(
+                    "paired Harbor generation has mismatched failure classification"
+                )
+            if actual.status == "running":
+                _replace_pair_generation_state(state_path, failed_state)
+            if (
+                existing.owner is PairedHarborPairFailureOwner.PROCESS
+                and existing.source is PairedHarborPairFailureSource.PROCESS_CRASH
+            ):
+                return existing
+            raise PairedHarborPairStateError(
+                "paired Harbor generation already has a non-process failure classification"
+            )
+        if actual.status != "running":
+            raise PairedHarborPairStateError(
+                "paired Harbor failed state lacks evidence of a process-crash transition"
+            )
+        evidence = _pair_failure_evidence(
+            failed_state,
+            descriptor=_PairFailureDescriptor(
+                owner=PairedHarborPairFailureOwner.PROCESS,
+                source=PairedHarborPairFailureSource.PROCESS_CRASH,
+                retry_eligibility=PairedHarborPairRetryEligibility.WHOLE_PAIR,
+            ),
+        )
+        _create_or_compare_pair_failure_evidence(evidence_path, evidence)
+        _replace_pair_generation_state(state_path, failed_state)
+        return evidence
+
+
 def authorize_paired_harbor_pair_retry(
     *,
     jobs_dir: Path,
@@ -3382,15 +4422,11 @@ def authorize_paired_harbor_pair_retry(
         or frozen_state.block not in frozen_protocol.design.blocks
     ):
         raise ValueError("paired Harbor retry state differs from its frozen operation")
-    if frozen_state.status == "complete":
-        raise ValueError("a complete paired Harbor generation cannot be retried")
-
-    authorization = _pair_retry_authorization(
-        protocol=frozen_protocol,
-        operation_id=operation_id,
-        failed_state=frozen_state,
-        to_generation_id=frozen_state.generation_id + 1,
-    )
+    if frozen_state.status != "failed":
+        raise ValueError(
+            "paired Harbor retry state must be failed; explicitly classify an ambiguous "
+            "process crash before retrying a running generation"
+        )
     lease_dir = root / ".wmh-paired-leases"
     with exclusive_posix_file_lease(
         _operation_lease_path(
@@ -3417,6 +4453,23 @@ def authorize_paired_harbor_pair_retry(
             raise PairedHarborPairStateError(
                 "paired Harbor retry state changed before authorization"
             )
+        failure_evidence = load_paired_harbor_pair_failure_evidence(
+            jobs_dir=root,
+            failed_state=frozen_state,
+        )
+        if failure_evidence.retry_eligibility is not PairedHarborPairRetryEligibility.WHOLE_PAIR:
+            raise ValueError(
+                "paired Harbor failure classification is not eligible for whole-pair retry"
+            )
+        if failure_evidence.owner is PairedHarborPairFailureOwner.PROCESS:
+            _require_process_crash_reconciliation(root, frozen_protocol, frozen_state)
+        authorization = _pair_retry_authorization(
+            protocol=frozen_protocol,
+            operation_id=operation_id,
+            failed_state=frozen_state,
+            failure_evidence=failure_evidence,
+            to_generation_id=frozen_state.generation_id + 1,
+        )
         authorization_path = _pair_retry_authorization_path(
             root,
             expected=authorization,
@@ -3457,17 +4510,75 @@ def authorize_paired_harbor_pair_retry(
         return authorization
 
 
+def _failed_pair_generation_state(
+    state: PairedHarborPairGenerationState,
+) -> PairedHarborPairGenerationState:
+    """Return the canonical failed transition for one incomplete generation."""
+    if state.status == "complete":
+        raise ValueError("a complete paired Harbor generation cannot become failed")
+    if state.status == "failed":
+        return state
+    payload = state.model_dump(mode="json", exclude={"state_digest"})
+    payload.update(
+        {
+            "status": "failed",
+            "baseline_admission_digest": None,
+            "candidate_admission_digest": None,
+            "evidence_digest": None,
+        }
+    )
+    return PairedHarborPairGenerationState.model_validate(
+        {**payload, "state_digest": _canonical_digest(payload)}
+    )
+
+
+def _pair_failure_evidence(
+    failed_state: PairedHarborPairGenerationState,
+    *,
+    descriptor: _PairFailureDescriptor,
+) -> PairedHarborPairFailureEvidence:
+    """Bind one stable classification to the exact post-failure state digest."""
+    if failed_state.status != "failed":
+        raise ValueError("pair failure evidence requires a failed generation")
+    payload = {
+        "evidence_version": "1",
+        "protocol_digest": failed_state.protocol_digest,
+        "operation_id": failed_state.operation_id,
+        "block": failed_state.block.model_dump(mode="json"),
+        "generation_id": failed_state.generation_id,
+        "pair_generation_id": failed_state.pair_generation_id,
+        "failed_state": failed_state.model_dump(mode="json"),
+        "failed_state_digest": failed_state.state_digest,
+        "owner": descriptor.owner.value,
+        "source": descriptor.source.value,
+        "retry_eligibility": descriptor.retry_eligibility.value,
+        "arm": None if descriptor.arm is None else descriptor.arm.value,
+        "failure_kind": (
+            None if descriptor.failure_kind is None else descriptor.failure_kind.value
+        ),
+    }
+    return PairedHarborPairFailureEvidence.model_validate(
+        {**payload, "evidence_digest": _canonical_digest(payload)}
+    )
+
+
 def _pair_retry_authorization(
     *,
     protocol: PairedHarborProtocol,
     operation_id: str,
     failed_state: PairedHarborPairGenerationState,
+    failure_evidence: PairedHarborPairFailureEvidence,
     to_generation_id: int,
 ) -> PairedHarborPairRetryAuthorization:
-    if failed_state.status == "complete":
-        raise ValueError("a complete paired Harbor generation cannot be retried")
+    if failed_state.status != "failed":
+        raise ValueError("pair retry authorization requires a failed generation")
+    if (
+        failure_evidence.failed_state != failed_state
+        or failure_evidence.retry_eligibility is not PairedHarborPairRetryEligibility.WHOLE_PAIR
+    ):
+        raise ValueError("pair retry authorization requires eligible failure evidence")
     payload = {
-        "authorization_version": "1",
+        "authorization_version": "2",
         "protocol_digest": protocol.digest,
         "operation_id": operation_id,
         "retry_policy_digest": protocol.retry_policy_digest,
@@ -3476,7 +4587,9 @@ def _pair_retry_authorization(
         "to_generation_id": to_generation_id,
         "failed_state": failed_state.model_dump(mode="json"),
         "failed_state_digest": failed_state.state_digest,
-        "reason": "infrastructure_failure",
+        "failure_evidence": failure_evidence.model_dump(mode="json"),
+        "failure_evidence_digest": failure_evidence.evidence_digest,
+        "reason": "classified_whole_pair_retry",
     }
     return PairedHarborPairRetryAuthorization.model_validate(
         {**payload, "authorization_digest": _canonical_digest(payload)}
@@ -3631,27 +4744,7 @@ def _create_pair_generation_state(
     path: Path,
     state: PairedHarborPairGenerationState,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = state.model_dump_json(indent=2) + "\n"
-    try:
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-        )
-    except FileExistsError as exc:
-        raise PairedHarborPairStateError(
-            "paired Harbor pair state was concurrently created"
-        ) from exc
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(path.parent)
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
+    _create_immutable_json_record(path, state.model_dump_json(indent=2) + "\n")
 
 
 def _create_or_compare_pair_generation_evidence(
@@ -3680,6 +4773,86 @@ def _read_pair_generation_evidence(path: Path) -> PairedHarborBlockEvidence:
         ) from exc
 
 
+def _create_or_compare_pair_failure_evidence(
+    path: Path,
+    evidence: PairedHarborPairFailureEvidence,
+) -> None:
+    if os.path.lexists(path):
+        if _read_pair_failure_evidence(path) != evidence:
+            raise PairedHarborPairStateError(
+                "paired Harbor failure evidence was already published with different contents"
+            )
+        return
+    _create_immutable_json_record(path, evidence.model_dump_json(indent=2) + "\n")
+
+
+def _create_or_compare_pair_arm_evidence(
+    path: Path,
+    evidence: PairedHarborArmEvidence,
+) -> None:
+    if os.path.lexists(path):
+        if _read_pair_arm_evidence(path) != evidence:
+            raise PairedHarborPairStateError(
+                "paired Harbor arm evidence was already published with different contents"
+            )
+        return
+    _create_immutable_json_record(path, evidence.model_dump_json(indent=2) + "\n")
+
+
+def _create_or_compare_pair_arm_completion_witness(
+    path: Path,
+    witness: PairedHarborArmCompletionWitness,
+) -> None:
+    if os.path.lexists(path):
+        if _read_pair_arm_completion_witness(path) != witness:
+            raise PairedHarborPairStateError(
+                "paired Harbor arm completion witness was already published with different contents"
+            )
+        return
+    _create_immutable_json_record(path, witness.model_dump_json(indent=2) + "\n")
+
+
+def _read_pair_arm_evidence(path: Path) -> PairedHarborArmEvidence:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborPairStateError(
+            f"paired Harbor arm evidence must be a regular file: {path}"
+        )
+    try:
+        return PairedHarborArmEvidence.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor arm evidence is unreadable or invalid: {path}"
+        ) from exc
+
+
+def _read_pair_arm_completion_witness(path: Path) -> PairedHarborArmCompletionWitness:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborPairStateError(
+            f"paired Harbor arm completion witness must be a regular file: {path}"
+        )
+    try:
+        return PairedHarborArmCompletionWitness.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor arm completion witness is unreadable or invalid: {path}"
+        ) from exc
+
+
+def _read_pair_failure_evidence(path: Path) -> PairedHarborPairFailureEvidence:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborPairStateError(
+            f"paired Harbor failure evidence must be a regular file: {path}"
+        )
+    try:
+        return PairedHarborPairFailureEvidence.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor failure evidence is unreadable or invalid: {path}"
+        ) from exc
+
+
 def _create_retry_authorization(
     path: Path,
     authorization: PairedHarborPairRetryAuthorization,
@@ -3702,6 +4875,19 @@ def _read_pair_retry_authorization(path: Path) -> PairedHarborPairRetryAuthoriza
         ) from exc
 
 
+def _read_paired_harbor_slice_intent(path: Path) -> PairedHarborSliceIntent:
+    if path.is_symlink() or not path.is_file():
+        raise PairedHarborProgressStateError(
+            f"paired Harbor slice intent must be a regular file: {path}"
+        )
+    try:
+        return PairedHarborSliceIntent.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise PairedHarborProgressStateError(
+            f"paired Harbor slice intent is unreadable or invalid: {path}"
+        ) from exc
+
+
 def _read_paired_harbor_slice_progress(path: Path) -> PairedHarborSliceProgress:
     if path.is_symlink() or not path.is_file():
         raise PairedHarborProgressStateError(
@@ -3717,25 +4903,33 @@ def _read_paired_harbor_slice_progress(path: Path) -> PairedHarborSliceProgress:
 
 def _create_immutable_json_record(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-        )
-    except FileExistsError as exc:
+    staging_dir = path.parent.parent / ".wmh-paired-publish-tmp"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    if staging_dir.is_symlink() or not staging_dir.is_dir():
         raise PairedHarborPairStateError(
-            f"paired Harbor immutable record was concurrently created: {path}"
-        ) from exc
+            f"paired Harbor publication staging path is unsafe: {staging_dir}"
+        )
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=staging_dir)
+    temporary_path = Path(temporary)
     try:
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        try:
+            os.link(temporary_path, path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise PairedHarborPairStateError(
+                f"paired Harbor immutable record was concurrently created: {path}"
+            ) from exc
         _fsync_directory(path.parent)
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+        _fsync_directory(staging_dir)
 
 
 def _replace_pair_generation_state(
@@ -3781,6 +4975,10 @@ def _read_pair_generation_state(path: Path) -> PairedHarborPairGenerationState:
 
 
 def _require_completed_arm_job(job_path: Path) -> None:
+    if _arm_job_recovery_state(job_path) is not _HarborArmJobRecoveryState.TERMINAL:
+        raise PartialPairedHarborReuseError(
+            f"paired Harbor complete state lacks a finished root result: {job_path}"
+        )
     if job_path.is_symlink() or not job_path.is_dir():
         raise PartialPairedHarborReuseError(
             f"paired Harbor complete state has an unsafe arm job directory: {job_path}"
@@ -3802,6 +5000,202 @@ def _require_completed_arm_job(job_path: Path) -> None:
             "paired Harbor complete state contains an incomplete arm trial; allocate a new "
             "ledger-authorized generation and rerun both arms"
         )
+
+
+def _require_process_crash_reconciliation(
+    jobs_dir: Path,
+    protocol: PairedHarborProtocol,
+    state: PairedHarborPairGenerationState,
+) -> None:
+    """Require every terminal arm to be reconciled before ambiguous crash authority."""
+    job_names = {
+        PairedArm.BASELINE: state.baseline_job_name,
+        PairedArm.CANDIDATE: state.candidate_job_name,
+    }
+    recovery: dict[PairedArm, _HarborArmJobRecoveryState] = {}
+    partial: dict[PairedArm, bool] = {}
+    for arm, name in job_names.items():
+        job_path = jobs_dir / name
+        recovery[arm] = _arm_job_recovery_state(job_path)
+        partial[arm] = recovery[arm] in {
+            _HarborArmJobRecoveryState.INCOMPLETE,
+            _HarborArmJobRecoveryState.CANCELLED,
+        }
+        evidence_path = _pair_arm_evidence_path(jobs_dir, state=state, arm=arm)
+        witness_path = _pair_arm_completion_witness_path(jobs_dir, state=state, arm=arm)
+        if recovery[arm] is _HarborArmJobRecoveryState.OUTCOME_PUBLISHED:
+            raise PairedHarborPairStateError(
+                "paired Harbor process-crash classification found a published arm outcome; "
+                "resume the same generation first"
+            )
+        if recovery[arm] is _HarborArmJobRecoveryState.TERMINAL:
+            if not os.path.lexists(evidence_path) or not os.path.lexists(witness_path):
+                raise PairedHarborPairStateError(
+                    "paired Harbor process-crash classification found an unreconciled "
+                    "terminal arm result; resume the same generation first"
+                )
+            witness = _read_pair_arm_completion_witness(witness_path)
+            _validate_arm_completion_witness_for_state(
+                protocol,
+                state,
+                witness,
+                expected_arm=arm,
+            )
+            if witness.arm_evidence_record_digest != _sha256_regular_file(
+                evidence_path
+            ) or witness.terminal_artifacts_digest != _opaque_terminal_artifacts_digest(job_path):
+                raise PairedHarborPairStateError(
+                    "paired Harbor process-crash completion witness differs from its opaque "
+                    "terminal artifacts"
+                )
+        elif os.path.lexists(evidence_path) or os.path.lexists(witness_path):
+            raise PairedHarborPairStateError(
+                "paired Harbor arm completion evidence exists without a terminal Harbor result"
+            )
+
+    first = state.block.first_arm
+    second = _other_arm(first)
+    terminal = {arm: recovery[arm] is _HarborArmJobRecoveryState.TERMINAL for arm in recovery}
+    if terminal[second] and not terminal[first]:
+        raise PairedHarborPairStateError(
+            "paired Harbor later arm is terminal while the first arm is not"
+        )
+    if terminal[first] and not partial[second]:
+        raise PairedHarborPairStateError(
+            "paired Harbor terminal arm evidence can resume the same generation without retry"
+        )
+    if partial[second] and not terminal[first]:
+        raise PairedHarborPairStateError(
+            "paired Harbor later arm is partial without terminal first-arm evidence"
+        )
+
+
+def _pair_generation_can_resume_same_generation(
+    jobs_dir: Path,
+    state: PairedHarborPairGenerationState,
+) -> bool:
+    """Return whether immutable terminal arms and absent jobs permit exact continuation."""
+    names = {
+        PairedArm.BASELINE: state.baseline_job_name,
+        PairedArm.CANDIDATE: state.candidate_job_name,
+    }
+    recovery = {arm: _arm_job_recovery_state(jobs_dir / name) for arm, name in names.items()}
+    resumable = {
+        _HarborArmJobRecoveryState.ABSENT,
+        _HarborArmJobRecoveryState.OUTCOME_PUBLISHED,
+        _HarborArmJobRecoveryState.TERMINAL,
+    }
+    first = state.block.first_arm
+    second = _other_arm(first)
+    if recovery[first] not in resumable or recovery[second] not in resumable:
+        return False
+    published = {
+        arm: recovery[arm]
+        in {
+            _HarborArmJobRecoveryState.OUTCOME_PUBLISHED,
+            _HarborArmJobRecoveryState.TERMINAL,
+        }
+        for arm in recovery
+    }
+    if published[second] and not published[first]:
+        return False
+    return True
+
+
+def _arm_job_has_terminal_result(job_path: Path) -> bool:
+    """Return whether the score-blind root Harbor marker proves exact job completion."""
+    try:
+        return harbor_job_has_terminal_result(job_path, expected_trials=1)
+    except StaleHarborJobError as exc:
+        raise PairedHarborPairStateError(str(exc)) from exc
+
+
+def _arm_job_recovery_state(job_path: Path) -> _HarborArmJobRecoveryState:
+    """Inspect root completion and child publication without reading verifier scores."""
+    if _arm_job_has_terminal_result(job_path):
+        return _HarborArmJobRecoveryState.TERMINAL
+    try:
+        job_descriptor = os.open(
+            job_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except FileNotFoundError:
+        return _HarborArmJobRecoveryState.ABSENT
+    except OSError as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor arm job path is unsafe during recovery: {job_path}"
+        ) from exc
+    saw_cancelled = False
+    try:
+        for child_name in sorted(os.listdir(job_descriptor)):
+            try:
+                child_status = os.stat(
+                    child_name,
+                    dir_fd=job_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as exc:
+                raise PairedHarborPairStateError(
+                    f"paired Harbor arm job changed during recovery: {job_path}"
+                ) from exc
+            if stat.S_ISLNK(child_status.st_mode):
+                raise PairedHarborPairStateError(
+                    f"paired Harbor arm job contains an unsafe entry: {job_path / child_name}"
+                )
+            if not stat.S_ISDIR(child_status.st_mode):
+                continue
+            try:
+                child_descriptor = os.open(
+                    child_name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                    dir_fd=job_descriptor,
+                )
+            except OSError as exc:
+                raise PairedHarborPairStateError(
+                    f"paired Harbor arm trial path is unsafe: {job_path / child_name}"
+                ) from exc
+            result_descriptor = -1
+            try:
+                try:
+                    result_descriptor = os.open(
+                        "result.json",
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=child_descriptor,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise PairedHarborPairStateError(
+                        "paired Harbor arm result is unsafe or unreadable: "
+                        f"{job_path / child_name / 'result.json'}"
+                    ) from exc
+                if not stat.S_ISREG(os.fstat(result_descriptor).st_mode):
+                    raise PairedHarborPairStateError(
+                        "paired Harbor arm result is not a regular file: "
+                        f"{job_path / child_name / 'result.json'}"
+                    )
+                with os.fdopen(result_descriptor, "rb") as handle:
+                    result_descriptor = -1
+                    payload = handle.read()
+                try:
+                    projection = _HarborTrialCancellationProjection.model_validate_json(payload)
+                except ValidationError:
+                    return _HarborArmJobRecoveryState.OUTCOME_PUBLISHED
+                exception = projection.exception_info
+                if exception is None or exception.exception_type != "CancelledError":
+                    return _HarborArmJobRecoveryState.OUTCOME_PUBLISHED
+                saw_cancelled = True
+            finally:
+                if result_descriptor >= 0:
+                    os.close(result_descriptor)
+                os.close(child_descriptor)
+    finally:
+        os.close(job_descriptor)
+    return (
+        _HarborArmJobRecoveryState.CANCELLED
+        if saw_cancelled
+        else _HarborArmJobRecoveryState.INCOMPLETE
+    )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -3836,6 +5230,35 @@ def _pair_retry_authorization_path(
 ) -> Path:
     token = expected.authorization_digest.removeprefix("sha256:")
     return jobs_dir / ".wmh-paired-retry-authority" / f"{token}.json"
+
+
+def _pair_failure_evidence_path(
+    jobs_dir: Path,
+    *,
+    failed_state: PairedHarborPairGenerationState,
+) -> Path:
+    token = failed_state.pair_generation_id.removeprefix("sha256:")
+    return jobs_dir / ".wmh-paired-failure-evidence" / f"{token}.json"
+
+
+def _pair_arm_evidence_path(
+    jobs_dir: Path,
+    *,
+    state: PairedHarborPairGenerationState,
+    arm: PairedArm,
+) -> Path:
+    pair_token = state.pair_generation_id.removeprefix("sha256:")
+    return jobs_dir / ".wmh-paired-arm-evidence" / f"{pair_token}-{arm.value}.json"
+
+
+def _pair_arm_completion_witness_path(
+    jobs_dir: Path,
+    *,
+    state: PairedHarborPairGenerationState,
+    arm: PairedArm,
+) -> Path:
+    pair_token = state.pair_generation_id.removeprefix("sha256:")
+    return jobs_dir / ".wmh-paired-arm-completion" / f"{pair_token}-{arm.value}.json"
 
 
 def _operation_lease_path(
@@ -3980,6 +5403,361 @@ def _external_resource_ids(
 
 def _other_arm(arm: PairedArm) -> PairedArm:
     return PairedArm.CANDIDATE if arm is PairedArm.BASELINE else PairedArm.BASELINE
+
+
+def _classify_nonadmissible_benchmark_result(
+    trials: list[BenchmarkTrialResult],
+    *,
+    arm: PairedArm,
+) -> _PairFailureDescriptor | None:
+    """Classify one typed non-scoreable trial without reading a reward value."""
+    if len(trials) != 1:
+        return None
+    trial = trials[0]
+    if trial.status in {
+        BenchmarkTrialStatus.SCORED,
+        BenchmarkTrialStatus.CANDIDATE_FAILURE,
+    }:
+        return None
+    failure_kind = trial.error.kind if trial.error is not None else None
+    if (
+        trial.status is BenchmarkTrialStatus.INFRASTRUCTURE_ERROR
+        and failure_kind in _RETRYABLE_BENCHMARK_FAILURE_KINDS
+        and trial.run_health is BenchmarkRunHealth.RETRY_REQUIRED
+        and trial.candidate_outcome.status is not BenchmarkCandidateStatus.FAILED
+    ):
+        return _PairFailureDescriptor(
+            owner=PairedHarborPairFailureOwner.INFRASTRUCTURE,
+            source=PairedHarborPairFailureSource.BENCHMARK_TRIAL,
+            retry_eligibility=PairedHarborPairRetryEligibility.WHOLE_PAIR,
+            arm=arm,
+            failure_kind=failure_kind,
+        )
+    if (
+        trial.candidate_outcome.status is BenchmarkCandidateStatus.FAILED
+        or trial.run_health is BenchmarkRunHealth.CANDIDATE_DAMAGED
+    ):
+        return _PairFailureDescriptor(
+            owner=PairedHarborPairFailureOwner.CANDIDATE,
+            source=PairedHarborPairFailureSource.BENCHMARK_TRIAL,
+            retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+            arm=arm,
+            failure_kind=failure_kind,
+        )
+    if trial.status is BenchmarkTrialStatus.TASK_TIMEOUT:
+        return _PairFailureDescriptor(
+            owner=PairedHarborPairFailureOwner.TASK,
+            source=PairedHarborPairFailureSource.BENCHMARK_TRIAL,
+            retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+            arm=arm,
+            failure_kind=BenchmarkFailureKind.TASK_TIMEOUT,
+        )
+    return _PairFailureDescriptor(
+        owner=PairedHarborPairFailureOwner.UNCLASSIFIED,
+        source=PairedHarborPairFailureSource.BENCHMARK_TRIAL,
+        retry_eligibility=PairedHarborPairRetryEligibility.FORBIDDEN,
+        arm=arm,
+        failure_kind=failure_kind,
+    )
+
+
+def _validate_arm_evidence_for_state(
+    protocol: PairedHarborProtocol,
+    state: PairedHarborPairGenerationState,
+    evidence: PairedHarborArmEvidence,
+    *,
+    expected_arm: PairedArm,
+) -> None:
+    """Validate one durable arm admission against its exact protocol generation."""
+    if (
+        state.protocol_digest != protocol.digest
+        or state.block not in protocol.design.blocks
+        or evidence.arm is not expected_arm
+        or evidence.job_name
+        != {
+            PairedArm.BASELINE: state.baseline_job_name,
+            PairedArm.CANDIDATE: state.candidate_job_name,
+        }[expected_arm]
+    ):
+        raise PairedHarborPairStateError(
+            "paired Harbor arm evidence differs from its pair generation"
+        )
+    expected_hash, expected_digest = protocol.harness_identity(expected_arm)
+    if (
+        evidence.harness_execution_hash != expected_hash
+        or evidence.harness_execution_digest != expected_digest
+        or evidence.run_identity
+        != protocol.route_expectation(state.block.panel_member, expected_arm).run_identity
+    ):
+        raise PairedHarborPairStateError("paired Harbor arm evidence differs from its frozen route")
+    qualification = next(
+        task for task in protocol.opened_selection.tasks if task.task_id == state.block.task_id
+    )
+    trial = evidence.trial
+    if (
+        trial.task_identity != state.block.task_id
+        or trial.cell.task_key != qualification.task_key
+        or trial.cell.attempt != 1
+        or trial.task_checksum != qualification.content_digest
+        or trial.task_environment_digest != qualification.task_environment_digest
+        or trial.runner_environment_digest != protocol.execution_plan.runner_environment_digest
+    ):
+        raise PairedHarborPairStateError(
+            "paired Harbor arm evidence differs from its qualified task"
+        )
+    _validate_backend_trial_evidence(
+        trial,
+        plan=protocol.execution_plan,
+        qualification=qualification,
+    )
+    verifier_reward, score = harbor_trial_analysis_values(
+        trial,
+        reward_key=protocol.execution_plan.reward_key,
+    )
+    if evidence.verifier_reward != verifier_reward or evidence.analysis_score != score:
+        raise PairedHarborPairStateError(
+            "paired Harbor arm evidence differs from typed task attribution"
+        )
+    route = next(
+        item for item in protocol.panel_routes if item.panel_member == state.block.panel_member
+    )
+    for receipt in evidence.provider_receipts:
+        _validate_provider_receipt_for_route(
+            receipt,
+            route=route,
+            max_output_tokens=protocol.execution_plan.compute_envelope.max_output_tokens,
+            temperature=protocol.execution_plan.compute_envelope.temperature,
+        )
+
+
+def _arm_completion_witness(
+    *,
+    protocol: PairedHarborProtocol,
+    state: PairedHarborPairGenerationState,
+    evidence: PairedHarborArmEvidence,
+    arm_evidence_path: Path,
+    job_path: Path,
+) -> PairedHarborArmCompletionWitness:
+    """Create an opaque completion commitment after exact arm admission."""
+    _validate_arm_evidence_for_state(
+        protocol,
+        state,
+        evidence,
+        expected_arm=evidence.arm,
+    )
+    trial = evidence.trial
+    if trial.task_environment_digest is None or trial.runner_environment_digest is None:
+        raise PairedHarborPairStateError(
+            "paired Harbor admitted arm lacks exact environment identity"
+        )
+    payload = {
+        "witness_version": "1",
+        "pair_generation_id": state.pair_generation_id,
+        "protocol_digest": protocol.digest,
+        "arm": evidence.arm,
+        "job_name": evidence.job_name,
+        "harness_execution_hash": evidence.harness_execution_hash,
+        "harness_execution_digest": evidence.harness_execution_digest,
+        "run_identity_digest": _canonical_digest(evidence.run_identity.model_dump(mode="json")),
+        "task_identity": trial.task_identity,
+        "task_key": trial.cell.task_key,
+        "attempt": trial.cell.attempt,
+        "task_checksum": trial.task_checksum,
+        "task_environment_digest": trial.task_environment_digest,
+        "runner_environment_digest": trial.runner_environment_digest,
+        "admission_status": "admitted",
+        "arm_evidence_digest": evidence.admission_digest,
+        "arm_evidence_record_digest": _sha256_regular_file(arm_evidence_path),
+        "terminal_artifacts_digest": _opaque_terminal_artifacts_digest(job_path),
+    }
+    return PairedHarborArmCompletionWitness.model_validate(
+        {**payload, "witness_digest": _canonical_digest(payload)}
+    )
+
+
+def _validate_arm_completion_witness_for_state(
+    protocol: PairedHarborProtocol,
+    state: PairedHarborPairGenerationState,
+    witness: PairedHarborArmCompletionWitness,
+    *,
+    expected_arm: PairedArm,
+) -> None:
+    """Validate a score-blind arm-completion witness against an exact generation."""
+    expected_job_name = {
+        PairedArm.BASELINE: state.baseline_job_name,
+        PairedArm.CANDIDATE: state.candidate_job_name,
+    }[expected_arm]
+    if (
+        state.protocol_digest != protocol.digest
+        or state.block not in protocol.design.blocks
+        or witness.pair_generation_id != state.pair_generation_id
+        or witness.protocol_digest != protocol.digest
+        or witness.arm is not expected_arm
+        or witness.job_name != expected_job_name
+    ):
+        raise PairedHarborPairStateError(
+            "paired Harbor arm completion witness differs from its pair generation"
+        )
+    expected_hash, expected_digest = protocol.harness_identity(expected_arm)
+    expected_run_identity = protocol.route_expectation(
+        state.block.panel_member,
+        expected_arm,
+    ).run_identity
+    if (
+        witness.harness_execution_hash != expected_hash
+        or witness.harness_execution_digest != expected_digest
+        or witness.run_identity_digest
+        != _canonical_digest(expected_run_identity.model_dump(mode="json"))
+    ):
+        raise PairedHarborPairStateError(
+            "paired Harbor arm completion witness differs from its frozen route"
+        )
+    qualification = next(
+        task for task in protocol.opened_selection.tasks if task.task_id == state.block.task_id
+    )
+    if (
+        witness.task_identity != state.block.task_id
+        or witness.task_key != qualification.task_key
+        or witness.attempt != 1
+        or witness.task_checksum != qualification.content_digest
+        or witness.task_environment_digest != qualification.task_environment_digest
+        or witness.runner_environment_digest != protocol.execution_plan.runner_environment_digest
+    ):
+        raise PairedHarborPairStateError(
+            "paired Harbor arm completion witness differs from its qualified task"
+        )
+
+
+def _sha256_regular_file(path: Path) -> str:
+    """Hash one regular, non-symlink file without interpreting its contents."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor completion artifact is unsafe or unreadable: {path}"
+        ) from exc
+    return _sha256_open_regular_file(descriptor, display_path=path)
+
+
+def _sha256_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    display_path: Path,
+) -> str:
+    """Hash a regular file relative to a held directory descriptor."""
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor completion artifact is unsafe or unreadable: {display_path}"
+        ) from exc
+    return _sha256_open_regular_file(descriptor, display_path=display_path)
+
+
+def _sha256_open_regular_file(descriptor: int, *, display_path: Path) -> str:
+    """Hash an already-open descriptor after proving it names a regular file."""
+    digest = hashlib.sha256()
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise PairedHarborPairStateError(
+                f"paired Harbor completion artifact must be a regular file: {display_path}"
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor completion artifact is unreadable: {display_path}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return "sha256:" + digest.hexdigest()
+
+
+def _opaque_terminal_artifacts_digest(job_path: Path) -> str:
+    """Hash terminal admission inputs without parsing score-bearing contents."""
+    try:
+        job_descriptor = os.open(
+            job_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except OSError as exc:
+        raise PairedHarborPairStateError(
+            f"paired Harbor arm job path is unsafe during reconciliation: {job_path}"
+        ) from exc
+    root_names = ("wmh-manifest.json", "config.json", "lock.json", "result.json")
+    trial_names = ("config.json", "lock.json", "result.json", "wmh-events.jsonl")
+    artifacts: dict[str, str] = {}
+    child_directories: list[str] = []
+
+    def record(directory_descriptor: int, name: str, *, relative: Path) -> None:
+        try:
+            artifacts[relative.as_posix()] = _sha256_regular_file_at(
+                directory_descriptor,
+                name,
+                display_path=job_path / relative,
+            )
+        except FileNotFoundError:
+            artifacts[relative.as_posix()] = "missing"
+
+    try:
+        for name in root_names:
+            record(job_descriptor, name, relative=Path(name))
+        for child_name in sorted(os.listdir(job_descriptor)):
+            try:
+                child_descriptor = os.open(
+                    child_name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                    dir_fd=job_descriptor,
+                )
+            except NotADirectoryError:
+                continue
+            except OSError as exc:
+                raise PairedHarborPairStateError(
+                    f"paired Harbor arm job contains an unsafe entry: {job_path / child_name}"
+                ) from exc
+            try:
+                if not stat.S_ISDIR(os.fstat(child_descriptor).st_mode):
+                    raise PairedHarborPairStateError(
+                        "paired Harbor arm job contains a non-directory trial entry: "
+                        f"{job_path / child_name}"
+                    )
+                child_directories.append(child_name)
+                for name in trial_names:
+                    record(
+                        child_descriptor,
+                        name,
+                        relative=Path(child_name) / name,
+                    )
+            finally:
+                os.close(child_descriptor)
+        if not any(
+            relative.endswith("/result.json") and digest != "missing"
+            for relative, digest in artifacts.items()
+        ):
+            raise PairedHarborPairStateError(
+                f"paired Harbor arm job lacks a terminal trial result: {job_path}"
+            )
+        return _canonical_digest(
+            {
+                "job_name": job_path.name,
+                "child_directories": child_directories,
+                "artifacts": artifacts,
+            }
+        )
+    finally:
+        os.close(job_descriptor)
 
 
 def _validate_operation_id(value: str) -> str:

@@ -12,6 +12,7 @@ import tempfile
 from collections import defaultdict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from datetime import datetime
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Literal, Protocol, override
@@ -41,7 +42,7 @@ from harbor.registry.client.factory import RegistryClientFactory
 from harbor.registry.client.package import PackageDatasetClient
 from harbor.tasks.client import TaskIdType
 from harbor.trial.network_policy import resolve_trial_network_plan
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, ValidationError
 
 from wmh.core.text import normalize_durable_text
 from wmh.core.types import JsonObject
@@ -129,6 +130,26 @@ class StaleHarborJobError(RuntimeError):
     """A pre-existing Harbor job directory cannot be proved to match this evaluation."""
 
 
+class _HarborJobCompletionStats(BaseModel):
+    """Score-blind subset of root Harbor progress needed to prove completion."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    n_completed_trials: StrictInt
+    n_running_trials: StrictInt
+    n_pending_trials: StrictInt
+
+
+class _HarborJobTerminalMarker(BaseModel):
+    """Score-blind root result projection used by recovery control flow."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    finished_at: datetime | None = None
+    n_total_trials: StrictInt
+    stats: _HarborJobCompletionStats
+
+
 class ConcurrentHarborJobError(RuntimeError):
     """Another process already holds the exclusive execution lease for this Harbor job."""
 
@@ -139,6 +160,68 @@ class UnsupportedHarborTaskError(ValueError):
 
 class UnsupportedHarborMetricError(ValueError):
     """A Harbor metric could execute untrusted code on the credential-bearing host."""
+
+
+def harbor_job_has_terminal_result(
+    job_dir: Path,
+    *,
+    expected_trials: int,
+) -> bool:
+    """Return whether a safe root Harbor result proves exact job completion."""
+    requested = job_dir.expanduser()
+    try:
+        job_descriptor = os.open(
+            requested,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise StaleHarborJobError(f"Harbor job directory is unsafe: {requested}") from exc
+    result_descriptor = -1
+    try:
+        try:
+            result_descriptor = os.open(
+                "result.json",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=job_descriptor,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise StaleHarborJobError(
+                f"Harbor root result is unsafe or unreadable: {requested}"
+            ) from exc
+        if not stat.S_ISREG(os.fstat(result_descriptor).st_mode):
+            raise StaleHarborJobError(f"Harbor root result is not a regular file: {requested}")
+        with os.fdopen(result_descriptor, "rb") as handle:
+            result_descriptor = -1
+            payload = handle.read()
+        try:
+            marker = _HarborJobTerminalMarker.model_validate_json(payload)
+        except ValidationError as exc:
+            raise StaleHarborJobError(
+                f"Harbor root result completion marker is invalid: {requested}"
+            ) from exc
+        if marker.n_total_trials != expected_trials:
+            raise StaleHarborJobError(
+                f"Harbor root result has an unexpected trial count: {requested}"
+            )
+        if marker.finished_at is None:
+            return False
+        if (
+            marker.stats.n_completed_trials != expected_trials
+            or marker.stats.n_running_trials != 0
+            or marker.stats.n_pending_trials != 0
+        ):
+            raise StaleHarborJobError(
+                f"Harbor finished root result has inconsistent progress: {requested}"
+            )
+        return True
+    finally:
+        if result_descriptor >= 0:
+            os.close(result_descriptor)
+        os.close(job_descriptor)
 
 
 class HarborRunExpectation(BaseModel):
@@ -556,6 +639,58 @@ class HarborEvaluator:
             )
         with _exclusive_job_run_lock(self._spec.jobs_dir, self._spec.job_name):
             return await self._evaluate_locked(candidate)
+
+    async def load_existing(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
+        """Read one already-terminal exact job without dispatching or rerunning a trial."""
+        if candidate.runtime_kind() != "pi-node":
+            raise ValueError(
+                "Harbor WMH evaluation requires a pi-node candidate, got "
+                f"{candidate.runtime_kind()!r}"
+            )
+        with _exclusive_job_run_lock(self._spec.jobs_dir, self._spec.job_name):
+            return await self._load_existing_locked(candidate)
+
+    async def _load_existing_locked(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
+        """Validate and ingest terminal evidence while holding the exact job lease."""
+        agent = self._build_agent(candidate)
+        agent_digest = harbor_agent_config_digest(agent)
+        run_config_digest = harbor_run_config_digest(self._spec, agent_digest)
+        identity = self._run_identity(candidate, run_config_digest=run_config_digest)
+        job_config = build_harbor_job_config(
+            self._spec,
+            agent=agent,
+            task_resource_budget_bindings=self._task_resource_budget_bindings,
+            create_rate_binding=(
+                self._create_rate_binding
+                if self._spec.environment_backend is HarborEnvironmentBackend.E2B
+                else None
+            ),
+        )
+        job_config = _snapshot_local_datasets(job_config)
+        job_dir = job_config.jobs_dir / job_config.job_name
+        manifest = _inspect_existing_job(
+            job_dir,
+            expected_identity=identity,
+            expected_agent_digest=agent_digest,
+            expected_job_config=job_config,
+        )
+        if manifest is None:
+            raise StaleHarborJobError(
+                f"Harbor job directory does not contain terminal evidence: {job_dir}"
+            )
+        if not harbor_job_has_terminal_result(
+            job_dir,
+            expected_trials=len(manifest.entries),
+        ):
+            raise StaleHarborJobError(
+                f"Harbor job directory does not contain a finished root result: {job_dir}"
+            )
+        loaded = load_harbor_job_result(job_dir, manifest)
+        if any(locator.result_path is None for locator in loaded.locators):
+            raise StaleHarborJobError(
+                f"Harbor job directory contains an incomplete trial: {job_dir}"
+            )
+        return loaded
 
     async def _evaluate_locked(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
         """Evaluate while holding this job name's interprocess execution lease."""
