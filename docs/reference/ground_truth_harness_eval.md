@@ -271,12 +271,13 @@ and bound to the attested launch configuration.
 A task `storage_mb` value is a launch-time minimum, not an E2B template-build input. The E2B SDK
 does not accept disk size when building the exact template, so different task minima reuse the same
 content, CPU, and memory keyed build. The requested minimum is instead bound into the launch digest.
-After create, WMH reads E2B's provider metrics, interprets `disk_total` as bytes, retries only an
-initially empty metric series across a fixed ten-second polling window with bounded requests, and
-requires the conservative observed total to cover the requested MiB before accepting the sandbox.
-The stable evidence labels this quantity as `provider_reported_total`; it is root-disk allocation,
-not a claim about currently free bytes. Missing or malformed metrics fail
-closed and use the ordinary owner-bound sandbox cleanup path.
+After create, WMH reads E2B's provider metrics and interprets `disk_total` as bytes. For at most 60
+monotonic seconds, it retries empty, non-list, or strictly invalid whole metric batches with bounded
+requests. It accepts no subset and performs no type coercion. The first wholly valid batch must
+conservatively cover the requested MiB; a valid but insufficient batch fails immediately. The
+stable evidence labels this quantity as `provider_reported_total`; it is root-disk allocation, not
+a claim about currently free bytes. Readiness exhaustion fails closed with a fixed category and
+uses the ordinary owner-bound sandbox cleanup path.
 
 The exact E2B adapter preserves Harbor's full-day sandbox lease because one environment spans
 setup, agent execution, and shared verification. Its timed-resource account reserves that complete

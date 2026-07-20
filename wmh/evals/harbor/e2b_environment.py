@@ -16,9 +16,11 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Annotated, Literal, Self, cast
 
 from harbor.environments.base import environment_content_hash
@@ -98,7 +100,8 @@ _SPEND_LIMIT_SIGNATURE_DOMAIN = b"wmh-e2b-spend-limit-v1\0"
 _E2B_CREDENTIAL_FINGERPRINT_DOMAIN = b"wmh-e2b-credential-v1\0"
 _E2B_API_KEY_ENV = "E2B_API_KEY"
 _E2B_BUILD_STATUS_POLL_INTERVAL_S = 2.0
-_E2B_STORAGE_METRIC_ATTEMPTS = 6
+_E2B_STORAGE_METRIC_READINESS_TIMEOUT_S = 60.0
+_E2B_STORAGE_METRIC_MAX_ATTEMPTS = 31
 _E2B_STORAGE_METRIC_POLL_INTERVAL_S = 2.0
 _E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S = 5
 _E2B_RECONCILIATION_REQUEST_TIMEOUT_S = 30
@@ -108,6 +111,19 @@ _ASYNC_KILL_DELAYS_S = (0.0, 0.1, 0.5)
 _COMPONENT_IDENTITY = re.compile(r"[A-Za-z0-9_.-]{1,512}\Z")
 _RESOURCE_IDENTITY = re.compile(r"[A-Za-z0-9_.:-]{1,512}\Z")
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
+
+
+class _E2BStorageMetricFailure(StrEnum):
+    """Fixed categories for untrusted E2B storage metric snapshots."""
+
+    SERIES_TYPE = "series_type"
+    EMPTY = "empty"
+    DEADLINE = "deadline"
+    DISK_TOTAL_TYPE = "disk_total_type"
+    DISK_TOTAL_NONPOSITIVE = "disk_total_nonpositive"
+    DISK_USED_TYPE = "disk_used_type"
+    DISK_USED_NEGATIVE = "disk_used_negative"
+    DISK_USED_EXCEEDS_TOTAL = "disk_used_exceeds_total"
 
 
 def _digest(value: JsonObject) -> str:
@@ -1060,6 +1076,32 @@ class ExactE2BEnvironment(E2BEnvironment):
             self._wmh_resource_reservation = None
 
 
+def _validated_e2b_storage_totals(
+    reported: object,
+) -> tuple[list[int] | None, _E2BStorageMetricFailure | None]:
+    """Validate one provider snapshot without coercing or partially accepting it."""
+    if not isinstance(reported, list):
+        return None, _E2BStorageMetricFailure.SERIES_TYPE
+    if not reported:
+        return None, _E2BStorageMetricFailure.EMPTY
+    observed_totals: list[int] = []
+    for metric in reported:
+        disk_total = getattr(metric, "disk_total", None)
+        disk_used = getattr(metric, "disk_used", None)
+        if isinstance(disk_total, bool) or not isinstance(disk_total, int):
+            return None, _E2BStorageMetricFailure.DISK_TOTAL_TYPE
+        if disk_total < 1:
+            return None, _E2BStorageMetricFailure.DISK_TOTAL_NONPOSITIVE
+        if isinstance(disk_used, bool) or not isinstance(disk_used, int):
+            return None, _E2BStorageMetricFailure.DISK_USED_TYPE
+        if disk_used < 0:
+            return None, _E2BStorageMetricFailure.DISK_USED_NEGATIVE
+        if disk_used > disk_total:
+            return None, _E2BStorageMetricFailure.DISK_USED_EXCEEDS_TOTAL
+        observed_totals.append(disk_total)
+    return observed_totals, None
+
+
 async def _observe_e2b_storage_capacity_mb(
     sandbox: AsyncSandbox,
     *,
@@ -1075,40 +1117,46 @@ async def _observe_e2b_storage_capacity_mb(
     ):
         raise RuntimeError("E2B task sandbox requested invalid storage capacity")
 
-    metrics: list[object] = []
-    for attempt in range(_E2B_STORAGE_METRIC_ATTEMPTS):
-        reported = await sandbox.get_metrics(request_timeout=_E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S)
-        if not isinstance(reported, list):
-            raise RuntimeError("E2B task sandbox storage metrics were malformed")
-        if reported:
-            metrics = list(reported)
+    deadline = monotonic() + _E2B_STORAGE_METRIC_READINESS_TIMEOUT_S
+    last_failure = _E2BStorageMetricFailure.EMPTY
+    for attempt in range(_E2B_STORAGE_METRIC_MAX_ATTEMPTS):
+        remaining_s = deadline - monotonic()
+        if remaining_s <= 0:
             break
-        if attempt + 1 < _E2B_STORAGE_METRIC_ATTEMPTS:
-            await asyncio.sleep(_E2B_STORAGE_METRIC_POLL_INTERVAL_S)
-    if not metrics:
-        raise RuntimeError("E2B task sandbox storage capacity was not proved")
+        request_timeout_s = min(_E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S, remaining_s)
+        try:
+            reported = await asyncio.wait_for(
+                sandbox.get_metrics(request_timeout=request_timeout_s),
+                timeout=remaining_s,
+            )
+        except TimeoutError:
+            last_failure = _E2BStorageMetricFailure.DEADLINE
+            break
+        if monotonic() >= deadline:
+            last_failure = _E2BStorageMetricFailure.DEADLINE
+            break
+        observed_totals, failure = _validated_e2b_storage_totals(reported)
+        if observed_totals is not None:
+            observed_storage_bytes = min(observed_totals)
+            requested_storage_bytes = requested_storage_mb * 1024 * 1024
+            if observed_storage_bytes < requested_storage_bytes:
+                raise RuntimeError(
+                    "E2B task sandbox storage capacity is below the requested minimum"
+                )
+            return observed_storage_bytes // (1024 * 1024)
+        if failure is None:
+            raise AssertionError("unready E2B storage metrics require a failure category")
+        last_failure = failure
+        if attempt + 1 >= _E2B_STORAGE_METRIC_MAX_ATTEMPTS:
+            break
+        remaining_s = deadline - monotonic()
+        if remaining_s <= 0:
+            break
+        await asyncio.sleep(min(_E2B_STORAGE_METRIC_POLL_INTERVAL_S, remaining_s))
 
-    observed_totals: list[int] = []
-    for metric in metrics:
-        disk_total = getattr(metric, "disk_total", None)
-        disk_used = getattr(metric, "disk_used", None)
-        if (
-            isinstance(disk_total, bool)
-            or not isinstance(disk_total, int)
-            or disk_total < 1
-            or isinstance(disk_used, bool)
-            or not isinstance(disk_used, int)
-            or disk_used < 0
-            or disk_used > disk_total
-        ):
-            raise RuntimeError("E2B task sandbox storage metrics were malformed")
-        observed_totals.append(disk_total)
-
-    observed_storage_bytes = min(observed_totals)
-    requested_storage_bytes = requested_storage_mb * 1024 * 1024
-    if observed_storage_bytes < requested_storage_bytes:
-        raise RuntimeError("E2B task sandbox storage capacity is below the requested minimum")
-    return observed_storage_bytes // (1024 * 1024)
+    raise RuntimeError(
+        f"E2B task sandbox storage metrics readiness exhausted ({last_failure.value})"
+    )
 
 
 def exact_e2b_build_resource_class(*, cpu_count: int, memory_mb: int) -> TimedResourceClass:

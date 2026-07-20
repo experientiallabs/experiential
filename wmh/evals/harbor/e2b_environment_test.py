@@ -433,6 +433,20 @@ class _Sandbox:
         return True
 
 
+class _StorageMetricProbe:
+    def __init__(self, reports: list[object]) -> None:
+        self._reports = reports
+        self.calls = 0
+        self.request_timeouts: list[float] = []
+
+    async def get_metrics(self, *, request_timeout: float) -> object:
+        self.calls += 1
+        self.request_timeouts.append(request_timeout)
+        if len(self._reports) > 1:
+            return self._reports.pop(0)
+        return self._reports[0]
+
+
 def _sandbox_for_create(
     kwargs: dict[str, object],
     *,
@@ -474,6 +488,23 @@ def _sandbox_for_create(
                 timestamp=started_at,
             )
         ],
+    )
+
+
+def _storage_metric(
+    *,
+    disk_total: object = 10_240 * 1024 * 1024,
+    disk_used: object = 1024 * 1024,
+) -> SandboxMetrics:
+    return SandboxMetrics(
+        cpu_count=2,
+        cpu_used_pct=0.0,
+        disk_total=cast("int", disk_total),
+        disk_used=cast("int", disk_used),
+        mem_total=1024 * 1024 * 1024,
+        mem_used=128 * 1024 * 1024,
+        mem_cache=64 * 1024 * 1024,
+        timestamp=datetime.now(UTC),
     )
 
 
@@ -1860,6 +1891,194 @@ def test_exact_create_retries_initially_empty_provider_storage_metrics(
     asyncio.run(environment.stop(delete=True))
 
 
+def test_exact_create_waits_past_old_empty_storage_metrics_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+    created: list[_Sandbox] = []
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs)
+        valid = sandbox._metric_reports[0]
+        sandbox._metric_reports = [*([[]] * 7), valid]
+        created.append(sandbox)
+        return sandbox
+
+    delays: list[float] = []
+
+    async def no_sleep(delay: float) -> None:
+        delays.append(delay)
+        return None
+
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+
+    assert created[0].metric_calls == 8
+    assert delays == [mod._E2B_STORAGE_METRIC_POLL_INTERVAL_S] * 7
+    assert environment.wmh_environment_attestation is not None
+    asyncio.run(environment.stop(delete=True))
+
+
+def test_exact_create_retries_transient_malformed_storage_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+    created: list[_Sandbox] = []
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs)
+        valid = sandbox._metric_reports[0]
+        sandbox._metric_reports = [[_storage_metric(disk_total=0)], valid]
+        created.append(sandbox)
+        return sandbox
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+
+    assert created[0].metric_calls == 2
+    assert environment.wmh_environment_attestation is not None
+    asyncio.run(environment.stop(delete=True))
+
+
+def test_storage_observer_retries_non_list_series(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+    probe = _StorageMetricProbe([object(), [_storage_metric()]])
+
+    async def no_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+
+    observed = asyncio.run(
+        mod._observe_e2b_storage_capacity_mb(
+            cast("AsyncSandbox", probe),
+            requested_storage_mb=10_240,
+        )
+    )
+
+    assert observed == 10_240
+    assert probe.calls == 2
+    assert delays == [mod._E2B_STORAGE_METRIC_POLL_INTERVAL_S]
+
+
+def test_storage_observer_rejects_valid_batch_returned_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _StorageMetricProbe([[_storage_metric()]])
+    ticks = iter((0.0, 0.0, 61.0))
+    monkeypatch.setattr(mod, "monotonic", lambda: next(ticks))
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"storage metrics readiness exhausted \(deadline\)$",
+    ):
+        asyncio.run(
+            mod._observe_e2b_storage_capacity_mb(
+                cast("AsyncSandbox", probe),
+                requested_storage_mb=10_240,
+            )
+        )
+
+    assert probe.calls == 1
+
+
+def test_storage_observer_cancels_hung_request_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_metrics(self, *, request_timeout: float) -> object:
+            del request_timeout
+            self.calls += 1
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    probe = BlockingProbe()
+    monkeypatch.setattr(mod, "_E2B_STORAGE_METRIC_READINESS_TIMEOUT_S", 0.01)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"storage metrics readiness exhausted \(deadline\)$",
+    ):
+        asyncio.run(
+            mod._observe_e2b_storage_capacity_mb(
+                cast("AsyncSandbox", probe),
+                requested_storage_mb=10_240,
+            )
+        )
+
+    assert probe.calls == 1
+
+
+def test_exact_create_rejects_whole_mixed_storage_batch_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build = _build()
+    launch_digest = environment._launch_config_digest(build)
+    created: list[_Sandbox] = []
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs, observed_storage_mb=20_480)
+        valid = sandbox._metric_reports[0]
+        sandbox._metric_reports = [
+            [_storage_metric(), _storage_metric(disk_used=-1)],
+            valid,
+        ]
+        created.append(sandbox)
+        return sandbox
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+    environment._wmh_ledger.begin(
+        backend="e2b",
+        lease_id=environment._wmh_lease_id,
+        owner_id=environment._wmh_owner_id,
+        config_digest=launch_digest,
+    )
+
+    asyncio.run(environment._create_exact_sandbox(build, launch_digest=launch_digest))
+
+    assert created[0].metric_calls == 2
+    attestation = environment.wmh_environment_attestation
+    assert attestation is not None
+    assert attestation["observed_storage_mb"] == 20_480
+    asyncio.run(environment.stop(delete=True))
+
+
 def test_exact_create_does_not_claim_storage_without_a_task_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1916,12 +2135,111 @@ def test_empty_provider_storage_metrics_fail_closed_and_clean_up(
     monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
     monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
 
-    with pytest.raises(RuntimeError, match="storage capacity was not proved"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"storage metrics readiness exhausted \(empty\)$",
+    ):
         asyncio.run(environment.start(force_build=False))
 
-    assert created[0].metric_calls == mod._E2B_STORAGE_METRIC_ATTEMPTS
+    assert created[0].metric_calls == mod._E2B_STORAGE_METRIC_MAX_ATTEMPTS
     assert created[0].kills == 1
     assert environment.wmh_environment_attestation is None
+
+
+def test_malformed_provider_storage_metrics_exhaust_window_and_clean_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _resource_account(tmp_path)
+    environment = _environment(tmp_path, resource_budget_account=account)
+    build = _build()
+    created: list[_Sandbox] = []
+
+    async def load_build() -> mod.ExactE2BBuildRecord:
+        return build
+
+    async def create(**kwargs: object) -> _Sandbox:
+        sandbox = _sandbox_for_create(kwargs)
+        sandbox._metric_reports = [[_storage_metric(disk_used=-123_456_789)]]
+        created.append(sandbox)
+        return sandbox
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(environment, "_load_or_build_exact_template", load_build)
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(RuntimeError) as captured:
+        asyncio.run(environment.start(force_build=False))
+
+    assert str(captured.value) == (
+        "E2B task sandbox storage metrics readiness exhausted (disk_used_negative)"
+    )
+    assert "123456789" not in str(captured.value)
+    assert created[0].metric_calls == mod._E2B_STORAGE_METRIC_MAX_ATTEMPTS
+    assert created[0].kills == 1
+    assert environment.wmh_environment_attestation is None
+    receipt = RunnerLeaseRecord.model_validate_json(
+        (environment.trial_paths.trial_dir / mod.TASK_E2B_LEASE_FILE).read_bytes()
+    )
+    assert receipt.state == "retired"
+    [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert environment._wmh_resource_reservation is None
+    assert not any(
+        record.status is ReservationStatus.RESERVED
+        for record in SpendLedger(account.ledger_path, account.policy).reservations()
+    )
+    asyncio.run(environment.stop(delete=True))
+    assert created[0].kills == 1
+
+
+@pytest.mark.parametrize(
+    ("disk_total", "disk_used", "category"),
+    [
+        (True, 0, "disk_total_type"),
+        (10_240.0, 0, "disk_total_type"),
+        ("10737418240", 0, "disk_total_type"),
+        (0, 0, "disk_total_nonpositive"),
+        (10_240, True, "disk_used_type"),
+        (10_240, 1.0, "disk_used_type"),
+        (10_240, "1", "disk_used_type"),
+        (10_240, -1, "disk_used_negative"),
+        (10_240, 10_241, "disk_used_exceeds_total"),
+    ],
+)
+def test_storage_metric_batch_preserves_strict_predicates(
+    disk_total: object,
+    disk_used: object,
+    category: str,
+) -> None:
+    totals, failure = mod._validated_e2b_storage_totals(
+        [_storage_metric(disk_total=disk_total, disk_used=disk_used)]
+    )
+
+    assert totals is None
+    assert failure is not None
+    assert failure.value == category
+
+
+@pytest.mark.parametrize(
+    ("reported", "category"),
+    [
+        (object(), "series_type"),
+        ([], "empty"),
+    ],
+)
+def test_storage_metric_batch_rejects_unready_series(
+    reported: object,
+    category: str,
+) -> None:
+    totals, failure = mod._validated_e2b_storage_totals(reported)
+
+    assert totals is None
+    assert failure is not None
+    assert failure.value == category
 
 
 def test_exact_create_rejects_insufficient_observed_storage_and_cleans_up(
@@ -1947,6 +2265,7 @@ def test_exact_create_rejects_insufficient_observed_storage_and_cleans_up(
         asyncio.run(environment.start(force_build=False))
 
     assert len(created) == 1
+    assert created[0].metric_calls == 1
     assert created[0].kills == 1
     assert environment.wmh_environment_attestation is None
     receipt = RunnerLeaseRecord.model_validate_json(
