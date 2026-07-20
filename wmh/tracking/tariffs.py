@@ -1875,7 +1875,7 @@ def azure_provider_cost_meter_from_evidence(
         provider_config=config,
         billing_region=billing_region,
         billing_mode=billing_mode,
-        billing_meters=tuple(meters),
+        billing_meters=(meters[0], meters[1]),
     )
     provenance = ProviderTariffProvenance(
         source_snapshots=frozen_sources,
