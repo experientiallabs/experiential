@@ -1485,6 +1485,29 @@ def test_append_only_evidence_rejects_a_malformed_same_inode_staging_alias(
     assert os.lstat(final).st_nlink == 2
 
 
+def test_append_only_evidence_rejects_a_unicode_pid_staging_alias(tmp_path: Path) -> None:
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="unicode-pid-alias-study",
+    )
+    content = {"kind": "protocol", "value": 9}
+    digest = _canonical_digest(content)
+    publication = store.publish_artifact(
+        kind="protocol",
+        artifact_digest=digest,
+        content=content,
+    )
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    malformed = final.parent / f".publish-{final.name}-pid-١٢٣-{'2' * 32}"
+    os.link(final, malformed)
+
+    with pytest.raises(ValueError, match="exactly one link"):
+        store.verify_artifact(publication)
+
+    assert malformed.exists()
+    assert os.lstat(final).st_nlink == 2
+
+
 def test_append_only_evidence_rejects_an_unexplained_hardlink_beside_a_valid_alias(
     tmp_path: Path,
 ) -> None:
