@@ -263,10 +263,25 @@ class _Scorer:
         )
 
 
+class _FailOnceScorer(_Scorer):
+    def __init__(self, task_ids: tuple[str, ...]) -> None:
+        super().__init__(task_ids)
+        self.score_attempts = 0
+
+    def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+        self.score_attempts += 1
+        if self.score_attempts == 1:
+            raise RuntimeError("provider failed before checkpoint zero")
+        return super().score(candidate, request=request)
+
+
 class _CodeProposer:
     configuration_id = "proposer-config"
     durable_state_required = False
     score_archive_required = False
+
+    def __init__(self) -> None:
+        self.proposal_calls = 0
 
     def propose_batch(
         self,
@@ -278,6 +293,7 @@ class _CodeProposer:
         count: int,
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[HarnessDelta | ProposalFailure | None]:
+        self.proposal_calls += 1
         del evidence, history, should_cancel
         target = parent.code_files()[0]
         op = SurfaceOp(
@@ -741,6 +757,150 @@ def test_search_slice_checkpoint_callback_crash_resumes_from_captured_state(
     assert scorer.score_calls == 2
 
 
+def test_search_slice_reenters_after_provider_failure_before_checkpoint_zero(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _FailOnceScorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    persisted: list[SearchCheckpoint] = []
+
+    with pytest.raises(RuntimeError, match="provider failed before checkpoint zero"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=proposer,
+            lifecycle=lifecycle,
+            authorization=authorization,
+            on_checkpoint=persisted.append,
+        )
+
+    recovered = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=persisted.append,
+    )
+
+    assert recovered.checkpoint.completed_iteration == 0
+    assert recovered.result is None
+    assert scorer.score_attempts == 2
+    assert scorer.score_calls == 1
+    assert proposer.proposal_calls == 0
+
+
+def test_search_slice_recovers_final_checkpoint_callback_crash_without_paid_work(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    persisted: list[SearchCheckpoint] = []
+    first = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=persisted.append,
+    )
+
+    def _persist_final_then_crash(checkpoint: SearchCheckpoint) -> None:
+        persisted.append(checkpoint)
+        raise RuntimeError("simulated crash after final checkpoint persistence")
+
+    with pytest.raises(RuntimeError, match="after final checkpoint persistence"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=proposer,
+            lifecycle=lifecycle,
+            authorization=authorization,
+            resume_from=first.checkpoint,
+            on_checkpoint=_persist_final_then_crash,
+            on_proposal_batch_prepare=lambda _witness: None,
+            on_proposal_batch_witness=lambda _witness: None,
+        )
+
+    completed = persisted[-1]
+    assert completed.completed_iteration == protocol.search.iterations
+    score_calls = scorer.score_calls
+    proposal_calls = proposer.proposal_calls
+    persisted_count = len(persisted)
+
+    recovered = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=authorization,
+        resume_from=completed,
+        on_checkpoint=persisted.append,
+    )
+
+    assert recovered.checkpoint == completed
+    assert recovered.result is not None
+    assert recovered.result.best.execution_digest != baseline.execution_digest
+    assert scorer.score_calls == score_calls
+    assert proposer.proposal_calls == proposal_calls
+    assert len(persisted) == persisted_count
+
+
+def test_search_slice_completion_wins_cancellation_after_final_checkpoint(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    persisted: list[SearchCheckpoint] = []
+    cancelled = False
+
+    def _persist_and_cancel_final(checkpoint: SearchCheckpoint) -> None:
+        nonlocal cancelled
+        persisted.append(checkpoint)
+        if checkpoint.completed_iteration == protocol.search.iterations:
+            cancelled = True
+
+    first = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=authorization,
+        on_checkpoint=_persist_and_cancel_final,
+        should_cancel=lambda: cancelled,
+    )
+    completed = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=proposer,
+        lifecycle=lifecycle,
+        authorization=authorization,
+        resume_from=first.checkpoint,
+        on_checkpoint=_persist_and_cancel_final,
+        on_proposal_batch_prepare=lambda _witness: None,
+        on_proposal_batch_witness=lambda _witness: None,
+        should_cancel=lambda: cancelled,
+    )
+
+    assert cancelled
+    assert completed.checkpoint == persisted[-1]
+    assert completed.result is not None
+    assert scorer.score_calls == 2
+    assert proposer.proposal_calls == 1
+
+
 def test_search_slice_rejects_fresh_replay_without_new_paid_work(tmp_path: Path) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
@@ -848,17 +1008,17 @@ def test_search_slice_rejects_stale_checkpoint_replay_without_paid_work(
 
     assert scorer.score_calls == paid_calls
 
-    with pytest.raises(ValueError, match="already complete"):
-        run_harness_optimization_search_slice(
-            prepared.discovery_contract(),
-            scorer=scorer,
-            proposer=_CodeProposer(),
-            lifecycle=lifecycle,
-            authorization=authorization,
-            resume_from=second.checkpoint,
-            on_checkpoint=lambda _checkpoint: None,
-        )
+    repeated = run_harness_optimization_search_slice(
+        prepared.discovery_contract(),
+        scorer=scorer,
+        proposer=_CodeProposer(),
+        lifecycle=lifecycle,
+        authorization=authorization,
+        resume_from=second.checkpoint,
+        on_checkpoint=lambda _checkpoint: None,
+    )
 
+    assert repeated.result == second.result
     assert scorer.score_calls == paid_calls
 
 

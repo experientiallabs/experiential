@@ -205,6 +205,7 @@ class StudyRunClaim(BaseModel):
     phase: StudyPhase
     authorization_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     run_id: str = Field(min_length=1, max_length=512)
+    configuration_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
 
     @model_validator(mode="after")
     def _validate_claim(self) -> Self:
@@ -221,7 +222,7 @@ class StudyRunCheckpointIdentity(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    sequence: StrictInt = Field(ge=0)
+    sequence: StrictInt = Field(ge=0, le=99_999_999)
     checkpoint_digest: str = Field(pattern=_DIGEST_PATTERN)
 
     @model_validator(mode="after")
@@ -615,52 +616,15 @@ def call_in_study_slice(
     Raises:
         ValueError: If phase, run, configuration, sequence, or checkpoint identity drifts.
     """
-    requested_phase = StudyPhase(phase)
-    proposed = StudyRunClaim(
-        journal_genesis_digest=store.genesis.digest,
-        study_id=store.genesis.study_id,
-        phase=requested_phase,
+    with _locked_study_slice(
+        store,
+        phase=phase,
         authorization_payload_digest=authorization_payload_digest,
         run_id=run_id,
-    )
-    if not _is_digest(configuration_digest):
-        raise ValueError("study slice configuration_digest must be a canonical SHA-256 digest")
-    resumed = (
-        StudyRunCheckpointIdentity.model_validate(resume_from.model_dump(mode="json"))
-        if resume_from is not None
-        else None
-    )
-    with store.locked() as directory_descriptor:
-        records = _load_records_locked(store, directory_descriptor)
-        pending = _load_pending_locked(store, directory_descriptor, records)
-        _verify_external_chain_locked(
-            store,
-            directory_descriptor,
-            publisher,
-            records,
-            pending,
-        )
-        _require_current_phase_locked(
-            records,
-            requested_phase,
-            payload_digest=authorization_payload_digest,
-        )
-        claim = _claim_study_run_locked(
-            store,
-            directory_descriptor,
-            proposed=proposed,
-            resume=resumed is not None,
-        )
-        checkpoints_by_phase = _load_run_checkpoints_locked(store, directory_descriptor)
-        checkpoints = checkpoints_by_phase.get(requested_phase, ())
-        checkpoints = _reconcile_resume_checkpoint_locked(
-            store,
-            directory_descriptor,
-            claim=claim,
-            configuration_digest=configuration_digest,
-            checkpoints=checkpoints,
-            resume_from=resumed,
-        )
+        configuration_digest=configuration_digest,
+        resume_from=resume_from,
+        publisher=publisher,
+    ) as (directory_descriptor, claim, checkpoints):
         result, checkpoint = operation()
         frozen_checkpoint = StudyRunCheckpointIdentity.model_validate(
             checkpoint.model_dump(mode="json")
@@ -684,6 +648,114 @@ def call_in_study_slice(
             previous=checkpoints[-1] if checkpoints else None,
         )
         return result
+
+
+def reconcile_study_slice(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    authorization_payload_digest: str,
+    run_id: str,
+    configuration_digest: str,
+    resume_from: StudyRunCheckpointIdentity,
+    publisher: ExternalCommitmentPublisher,
+    operation: Callable[[], _ResultT],
+) -> _ResultT:
+    """Reconcile one completed caller checkpoint and reconstruct its result.
+
+    This path appends no checkpoint beyond ``resume_from``. It accepts either a checkpoint that
+    survived a crash before its journal append or the exact latest journaled checkpoint, then runs
+    only the caller's result reconstruction under the lifecycle lease.
+
+    Args:
+        store: Host-private journal that owns the phase and run claim.
+        phase: Active phase authorized to reconcile the completed run.
+        authorization_payload_digest: Exact current phase payload identity.
+        run_id: Caller-issued identity shared by every resume.
+        configuration_digest: Frozen path-free slice configuration identity.
+        resume_from: Completed caller-persisted checkpoint to reconcile.
+        publisher: External phase-chain verifier.
+        operation: Side-effect-free reconstruction of the completed result.
+
+    Returns:
+        The reconstructed result after the completed checkpoint is journaled.
+
+    Raises:
+        ValueError: If phase, run, configuration, sequence, or checkpoint identity drifts.
+    """
+    with _locked_study_slice(
+        store,
+        phase=phase,
+        authorization_payload_digest=authorization_payload_digest,
+        run_id=run_id,
+        configuration_digest=configuration_digest,
+        resume_from=resume_from,
+        publisher=publisher,
+    ):
+        return operation()
+
+
+@contextmanager
+def _locked_study_slice(
+    store: StudyJournalStore,
+    *,
+    phase: StudyPhase,
+    authorization_payload_digest: str,
+    run_id: str,
+    configuration_digest: str,
+    resume_from: StudyRunCheckpointIdentity | None,
+    publisher: ExternalCommitmentPublisher,
+) -> Iterator[tuple[int, StudyRunClaim, tuple[StudyRunCheckpointRecord, ...]]]:
+    """Admit one exact fresh, resumed, or completed-reconciliation slice."""
+    requested_phase = StudyPhase(phase)
+    if not _is_digest(configuration_digest):
+        raise ValueError("study slice configuration_digest must be a canonical SHA-256 digest")
+    proposed = StudyRunClaim(
+        journal_genesis_digest=store.genesis.digest,
+        study_id=store.genesis.study_id,
+        phase=requested_phase,
+        authorization_payload_digest=authorization_payload_digest,
+        run_id=run_id,
+        configuration_digest=configuration_digest,
+    )
+    resumed = (
+        StudyRunCheckpointIdentity.model_validate(resume_from.model_dump(mode="json"))
+        if resume_from is not None
+        else None
+    )
+    with store.locked() as directory_descriptor:
+        records = _load_records_locked(store, directory_descriptor)
+        pending = _load_pending_locked(store, directory_descriptor, records)
+        _verify_external_chain_locked(
+            store,
+            directory_descriptor,
+            publisher,
+            records,
+            pending,
+        )
+        _require_current_phase_locked(
+            records,
+            requested_phase,
+            payload_digest=authorization_payload_digest,
+        )
+        checkpoints_by_phase = _load_run_checkpoints_locked(store, directory_descriptor)
+        checkpoints = checkpoints_by_phase.get(requested_phase, ())
+        claim = _claim_study_run_locked(
+            store,
+            directory_descriptor,
+            proposed=proposed,
+            resume=resumed is not None,
+            allow_uncheckpointed_reentry=resumed is None and not checkpoints,
+        )
+        reconciled = _reconcile_resume_checkpoint_locked(
+            store,
+            directory_descriptor,
+            claim=claim,
+            configuration_digest=configuration_digest,
+            checkpoints=checkpoints,
+            resume_from=resumed,
+        )
+        yield directory_descriptor, claim, reconciled
 
 
 def call_in_study_phase(
@@ -841,6 +913,7 @@ def _claim_study_run_locked(
     *,
     proposed: StudyRunClaim,
     resume: bool,
+    allow_uncheckpointed_reentry: bool = False,
 ) -> StudyRunClaim:
     """Create or verify the sole phase run claim while its journal lease is held."""
     claim_name = _run_claim_name(proposed.phase)
@@ -859,8 +932,10 @@ def _claim_study_run_locked(
         return proposed
     existing = _validate_run_claim_payload(store, claim_name, existing_payload)
     if existing != proposed:
-        raise ValueError("study phase is already claimed by a different run authorization")
-    if not resume:
+        raise ValueError(
+            "study phase is already claimed by a different run identity or configuration"
+        )
+    if not resume and not allow_uncheckpointed_reentry:
         raise ValueError("study run already started; supply its exact durable checkpoint")
     return existing
 
@@ -906,6 +981,10 @@ def _load_run_checkpoints_locked(
                 or record.previous_record_digest != previous_digest
                 or record.authorization_payload_digest != claim.authorization_payload_digest
                 or record.run_id != claim.run_id
+                or (
+                    claim.configuration_digest is not None
+                    and record.configuration_digest != claim.configuration_digest
+                )
             ):
                 raise ValueError("study run checkpoint differs from its chain position")
             if configuration_digest is None:

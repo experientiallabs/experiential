@@ -35,6 +35,7 @@ from wmh.evals.study_journal import (
     call_in_study_slice,
     claim_study_run,
     load_study_journal,
+    reconcile_study_slice,
 )
 from wmh.harness.create import SearchCheckpoint
 from wmh.harness.doc import HarnessDoc
@@ -777,6 +778,44 @@ class StudyLifecycleController:
             resume_from=resume_from,
             publisher=self._publisher,
             operation=_run,
+        )
+
+    def reconcile_slice(
+        self,
+        expected: StudyPhase,
+        run_id: str,
+        operation: Callable[[], StudySliceResult[_CheckpointT, _CompletedResultT]],
+        *,
+        payload_digest: str,
+        configuration_digest: str,
+        resume_from: StudyRunCheckpointIdentity,
+    ) -> StudySliceResult[_CheckpointT, _CompletedResultT]:
+        """Reconcile a completed checkpoint and reconstruct its result without another slice.
+
+        Args:
+            expected: Active phase authorized to reconcile the run.
+            run_id: Stable identity shared by the fresh invocation and every resume.
+            operation: Side-effect-free reconstruction of the completed result.
+            payload_digest: Exact typed phase authorization digest.
+            configuration_digest: Frozen path-free slice configuration identity.
+            resume_from: Completed caller-persisted checkpoint identity.
+
+        Returns:
+            The detached completed checkpoint and its reconstructed result.
+        """
+
+        def _reconstruct() -> StudySliceResult[_CheckpointT, _CompletedResultT]:
+            return operation().model_copy(deep=True)
+
+        return reconcile_study_slice(
+            self._store,
+            phase=expected,
+            authorization_payload_digest=payload_digest,
+            run_id=run_id,
+            configuration_digest=configuration_digest,
+            resume_from=resume_from,
+            publisher=self._publisher,
+            operation=_reconstruct,
         )
 
     def call_in_phase(
