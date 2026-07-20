@@ -1414,7 +1414,11 @@ def validate_consumed_search_proposal_batch_witness(
     _validate_consumed_proposal_batch_witness(frozen_witness, frozen_checkpoint)
 
 
-def search_result_from_completed_checkpoint(checkpoint: SearchCheckpoint) -> SearchResult:
+def search_result_from_completed_checkpoint(
+    checkpoint: SearchCheckpoint,
+    *,
+    cost_binding: SearchCostBinding | None = None,
+) -> SearchResult:
     """Reconstruct a complete search result from its exact terminal checkpoint.
 
     This performs no scoring, proposal, progress, or checkpoint callback work. It is intended for
@@ -1422,6 +1426,7 @@ def search_result_from_completed_checkpoint(checkpoint: SearchCheckpoint) -> Sea
 
     Args:
         checkpoint: Checksummed checkpoint at the configured terminal iteration.
+        cost_binding: Exact path-free cost contract retained by a budgeted checkpoint.
 
     Returns:
         The detached result represented by the terminal checkpoint.
@@ -1433,6 +1438,14 @@ def search_result_from_completed_checkpoint(checkpoint: SearchCheckpoint) -> Sea
     configuration = resumed.configuration
     if resumed.completed_iteration != configuration.iterations:
         raise ValueError("search result requires a terminal checkpoint")
+    frozen_cost_binding = (
+        SearchCostBinding.model_validate(cost_binding.model_dump())
+        if cost_binding is not None
+        else None
+    )
+    recovered_cost_digest = frozen_cost_binding.digest if frozen_cost_binding is not None else None
+    if recovered_cost_digest != configuration.search_cost_binding_digest:
+        raise ValueError("search result cost binding differs from its terminal checkpoint")
     champion_hash = resumed.champion_doc_hash
     best = resumed.docs[champion_hash].model_copy(
         update={"name": configuration.name, "version": 0},
@@ -1442,6 +1455,7 @@ def search_result_from_completed_checkpoint(checkpoint: SearchCheckpoint) -> Sea
         best=best,
         best_score=resumed.reports[champion_hash].score,
         archive=resumed.archive.model_copy(deep=True),
+        search_cost_binding=frozen_cost_binding,
         reports={
             doc_hash: report.model_copy(deep=True) for doc_hash, report in resumed.reports.items()
         },
