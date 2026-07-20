@@ -1187,7 +1187,7 @@ def _azure_billing_mode(deployment_sku: str) -> str:
 
 def _azure_source_by_shape(
     *,
-    tariff: ProviderTokenTariff,
+    source_snapshots: tuple[ProviderTariffSourceSnapshot, ...],
     source_bytes: dict[str, bytes],
 ) -> tuple[
     tuple[ProviderTariffSourceSnapshot, dict[str, object]],
@@ -1197,7 +1197,7 @@ def _azure_source_by_shape(
     account_sources: list[tuple[ProviderTariffSourceSnapshot, dict[str, object]]] = []
     deployment_sources: list[tuple[ProviderTariffSourceSnapshot, dict[str, object]]] = []
     retail_sources: list[tuple[ProviderTariffSourceSnapshot, dict[str, object]]] = []
-    for snapshot in tariff.provenance.source_snapshots:
+    for snapshot in source_snapshots:
         if snapshot.media_type != "application/json":
             raise ProviderTariffEvidenceIntegrityError(
                 "Azure tariff evidence must be retained as exact JSON"
@@ -1508,7 +1508,7 @@ def _verify_azure_tariff_records(
     source_bytes: dict[str, bytes],
 ) -> None:
     account_source, deployment_source, retail_source = _azure_source_by_shape(
-        tariff=tariff,
+        source_snapshots=tariff.provenance.source_snapshots,
         source_bytes=source_bytes,
     )
     for snapshot, _ in (account_source, deployment_source, retail_source):
@@ -1589,17 +1589,14 @@ def _artifact_bytes_for_snapshot(
     return artifact_bytes
 
 
-def verify_provider_tariff_evidence(
-    tariff: ProviderTokenTariff,
+def _verified_tariff_source_bytes(
+    source_snapshots: tuple[ProviderTariffSourceSnapshot, ...],
     *,
-    evidence_artifacts: Mapping[str, bytes] | None = None,
-) -> ProviderTariffEvidenceReceipt:
-    """Offline-verify injected retained bytes and return a deterministic policy receipt."""
-    snapshot = ProviderTokenTariff.model_validate(tariff.model_dump())
-    snapshots = {source.source_id: source for source in snapshot.provenance.source_snapshots}
+    evidence_artifacts: Mapping[str, bytes] | None,
+) -> tuple[dict[str, bytes], tuple[ProviderTariffVerifiedSource, ...]]:
     external_source_ids = {
         source.source_id
-        for source in snapshot.provenance.source_snapshots
+        for source in source_snapshots
         if source.retained_artifact.storage_kind == "https"
     }
     provided_source_ids = set(evidence_artifacts or {})
@@ -1609,8 +1606,7 @@ def verify_provider_tariff_evidence(
         )
     source_bytes: dict[str, bytes] = {}
     verified_sources: list[ProviderTariffVerifiedSource] = []
-    for source_id in sorted(snapshots):
-        source = snapshots[source_id]
+    for source in source_snapshots:
         artifact_bytes = _artifact_bytes_for_snapshot(source, evidence_artifacts)
         decoded = _decode_verified_artifact(
             locator=source.retained_artifact.locator,
@@ -1619,16 +1615,291 @@ def verify_provider_tariff_evidence(
             artifact_encoding=source.retained_artifact.content_encoding,
             source_digest=source.source_snapshot_digest,
         )
-        source_bytes[source_id] = decoded
+        source_bytes[source.source_id] = decoded
         verified_sources.append(
             ProviderTariffVerifiedSource(
-                source_id=source_id,
+                source_id=source.source_id,
                 artifact_digest=source.retained_artifact.artifact_digest,
                 source_snapshot_digest=source.source_snapshot_digest,
                 artifact_size_bytes=len(artifact_bytes),
                 decoded_size_bytes=len(decoded),
             )
         )
+    return source_bytes, tuple(verified_sources)
+
+
+def _azure_price_unit(value: object) -> Literal["per_1k_tokens", "per_1m_tokens"]:
+    unit = _text(value, label="Azure retail unit")
+    if unit in {"1K", "1K Tokens", "1K tokens"}:
+        return "per_1k_tokens"
+    if unit in {"1M", "1M Tokens", "1M tokens"}:
+        return "per_1m_tokens"
+    raise ProviderTariffEvidenceIntegrityError("Azure retail unit is not token based")
+
+
+def _azure_effective_date(record: dict[str, object]) -> date:
+    effective = _text(
+        record.get("effectiveStartDate"),
+        label="Azure retail effective date",
+    )
+    try:
+        return date.fromisoformat(effective.split("T", 1)[0])
+    except ValueError as exc:
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure retail effective date is not an ISO date"
+        ) from exc
+
+
+def _azure_route_bindings_from_document(
+    *,
+    source: ProviderTariffSourceSnapshot,
+    document: dict[str, object],
+    paths: tuple[str, ...],
+    canonical_model: str,
+) -> list[ProviderTariffSourceBinding]:
+    return [
+        ProviderTariffSourceBinding(
+            claim="route_identity",
+            source_id=source.source_id,
+            source_record_path=path,
+            source_value=_text(
+                _json_pointer(document, path),
+                label=f"Azure route value at {path}",
+            ),
+            canonical_value=canonical_model,
+        )
+        for path in paths
+    ]
+
+
+def azure_provider_cost_meter_from_evidence(
+    *,
+    provider_config: ProviderConfig,
+    source_snapshots: tuple[ProviderTariffSourceSnapshot, ...],
+    evidence_artifacts: Mapping[str, bytes],
+    verified_on: date,
+    input_overhead_tokens: int = 8192,
+    price_ceiling: TokenPriceCeiling | None = None,
+) -> ProviderCostMeter:
+    """Derive and verify one Azure provider meter from exact retained responses.
+
+    This boundary is pure and offline. It derives billing coordinates, meters, prices, and source
+    bindings from one account response, one deployment response, and one bounded Retail Prices
+    response. The resulting claim still passes through the registered evidence verifier before it
+    can become a paid provider meter.
+    """
+    config = ProviderConfig.model_validate(provider_config.model_dump())
+    if config.kind is not ProviderKind.AZURE_OPENAI:
+        raise ValueError("Azure tariff evidence requires an Azure OpenAI provider route")
+
+    frozen_sources = tuple(
+        sorted(
+            (
+                ProviderTariffSourceSnapshot.model_validate(source.model_dump())
+                for source in source_snapshots
+            ),
+            key=lambda source: source.source_id,
+        )
+    )
+    source_ids = tuple(source.source_id for source in frozen_sources)
+    if len(frozen_sources) != 3 or len(set(source_ids)) != 3:
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure tariff requires exactly three unique retained sources"
+        )
+    if any(source.retained_artifact.storage_kind != "https" for source in frozen_sources):
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure tariff factory requires explicitly supplied retained artifacts"
+        )
+    source_bytes, _ = _verified_tariff_source_bytes(
+        frozen_sources,
+        evidence_artifacts=evidence_artifacts,
+    )
+    account_source, deployment_source, retail_source = _azure_source_by_shape(
+        source_snapshots=frozen_sources,
+        source_bytes=source_bytes,
+    )
+    account_snapshot, account = account_source
+    deployment_snapshot, deployment = deployment_source
+    retail_snapshot, retail = retail_source
+
+    billing_region = _text(account.get("location"), label="Azure account location")
+    deployment_sku = _text(
+        _mapping(deployment.get("sku"), label="Azure deployment SKU").get("name"),
+        label="Azure deployment SKU name",
+    )
+    billing_mode = _azure_billing_mode(deployment_sku)
+    try:
+        _, _, input_meter_name, output_meter_name = _AZURE_RETAIL_EXACT_LABELS[
+            (config.model, billing_mode)
+        ]
+    except KeyError as exc:
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure route has no registered exact retail label profile"
+        ) from exc
+
+    raw_items = retail.get("Items")
+    if not isinstance(raw_items, list) or len(raw_items) != 2:
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure retail evidence must contain exactly two token meters"
+        )
+    expected_names = {
+        "input_tokens": input_meter_name,
+        "output_tokens": output_meter_name,
+    }
+    indexed_records: dict[str, tuple[int, dict[str, object]]] = {}
+    for index, raw_item in enumerate(cast("list[object]", raw_items)):
+        record = _mapping(raw_item, label="Azure retail meter")
+        meter_name = _text(record.get("meterName"), label="Azure retail meter name")
+        matching_dimensions = [
+            dimension
+            for dimension, expected_name in expected_names.items()
+            if meter_name == expected_name
+        ]
+        if len(matching_dimensions) != 1 or matching_dimensions[0] in indexed_records:
+            raise ProviderTariffEvidenceIntegrityError(
+                "Azure retail evidence lacks one exact input and one exact output meter"
+            )
+        indexed_records[matching_dimensions[0]] = (index, record)
+    if set(indexed_records) != set(expected_names):
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure retail evidence lacks one exact input and one exact output meter"
+        )
+
+    meters: list[ProviderTariffBillingMeter] = []
+    bindings = _azure_route_bindings_from_document(
+        source=account_snapshot,
+        document=account,
+        paths=("/location", "/name", "/properties/endpoint"),
+        canonical_model=config.model,
+    )
+    bindings.extend(
+        _azure_route_bindings_from_document(
+            source=deployment_snapshot,
+            document=deployment,
+            paths=(
+                "/etag",
+                "/name",
+                "/properties/model/format",
+                "/properties/model/name",
+                "/properties/model/version",
+                "/properties/versionUpgradeOption",
+                "/sku/name",
+            ),
+            canonical_model=config.model,
+        )
+    )
+    for dimension in ("input_tokens", "output_tokens"):
+        index, record = indexed_records[dimension]
+        record_path = f"/Items/{index}"
+        meters.append(
+            ProviderTariffBillingMeter(
+                usage_dimension=dimension,
+                source_id=retail_snapshot.source_id,
+                source_record_path=record_path,
+                sku_id=_text(record.get("skuId"), label="Azure retail SKU ID"),
+                rate_id=_text(record.get("meterId"), label="Azure retail meter ID"),
+                billing_region=billing_region,
+                billing_mode=billing_mode,
+                effective_on=_azure_effective_date(record),
+                source_price_usd=_decimal(
+                    record.get("retailPrice"),
+                    label="Azure retail price",
+                ),
+                source_price_unit=_azure_price_unit(record.get("unitOfMeasure")),
+            )
+        )
+        bindings.extend(
+            (
+                ProviderTariffSourceBinding(
+                    claim="route_identity",
+                    source_id=retail_snapshot.source_id,
+                    source_record_path=f"{record_path}/productName",
+                    source_value=_text(
+                        record.get("productName"),
+                        label="Azure retail productName",
+                    ),
+                    canonical_value=config.model,
+                    target_meter_source_id=retail_snapshot.source_id,
+                    target_meter_record_path=record_path,
+                ),
+                ProviderTariffSourceBinding(
+                    claim="usage_dimension",
+                    source_id=retail_snapshot.source_id,
+                    source_record_path=f"{record_path}/meterName",
+                    source_value=_text(
+                        record.get("meterName"),
+                        label="Azure retail meterName",
+                    ),
+                    canonical_value=dimension,
+                    target_meter_source_id=retail_snapshot.source_id,
+                    target_meter_record_path=record_path,
+                ),
+            )
+        )
+
+    effective_dates = {meter.effective_on for meter in meters}
+    if len(effective_dates) != 1:
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure input and output meters have different effective dates"
+        )
+    sorted_bindings = tuple(
+        sorted(
+            bindings,
+            key=lambda binding: (
+                binding.claim,
+                binding.canonical_value,
+                binding.source_id,
+                binding.source_record_path,
+                binding.source_value,
+                binding.target_meter_source_id or "",
+                binding.target_meter_record_path or "",
+            ),
+        )
+    )
+    route = ProviderTariffRoute(
+        provider_config=config,
+        billing_region=billing_region,
+        billing_mode=billing_mode,
+        billing_meters=tuple(meters),
+    )
+    provenance = ProviderTariffProvenance(
+        source_snapshots=frozen_sources,
+        source_bindings=sorted_bindings,
+        verified_on=verified_on,
+        effective_on=meters[0].effective_on,
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=route,
+    )
+    resolved_price = (
+        provenance.token_price_floor()
+        if price_ceiling is None
+        else TokenPriceCeiling.model_validate(price_ceiling.model_dump())
+    )
+    tariff = ProviderTokenTariff(
+        provider_config=config,
+        price=resolved_price,
+        provenance=provenance,
+    )
+    return provider_cost_meter(
+        tariff,
+        input_overhead_tokens=input_overhead_tokens,
+        evidence_artifacts=evidence_artifacts,
+    )
+
+
+def verify_provider_tariff_evidence(
+    tariff: ProviderTokenTariff,
+    *,
+    evidence_artifacts: Mapping[str, bytes] | None = None,
+) -> ProviderTariffEvidenceReceipt:
+    """Offline-verify injected retained bytes and return a deterministic policy receipt."""
+    snapshot = ProviderTokenTariff.model_validate(tariff.model_dump())
+    snapshots = {source.source_id: source for source in snapshot.provenance.source_snapshots}
+    source_bytes, verified_sources = _verified_tariff_source_bytes(
+        snapshot.provenance.source_snapshots,
+        evidence_artifacts=evidence_artifacts,
+    )
     if snapshot.provider_config.kind is ProviderKind.BEDROCK:
         route_matches = [
             catalog_tariff
@@ -1661,7 +1932,7 @@ def verify_provider_tariff_evidence(
         verifier_profile=profile,
         verifier_digest=provider_tariff_evidence_verifier_digest(profile),
         tariff_claim_digest=snapshot.digest,
-        verified_sources=tuple(verified_sources),
+        verified_sources=verified_sources,
         validated_records=provider_tariff_validated_records(snapshot.provenance),
     )
 

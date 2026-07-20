@@ -32,7 +32,10 @@ Azure routes are caller-supplied because their deployment identity is account-sp
 retain exactly three JSON responses: the Azure resource account, its deployment, and the bounded
 Azure Retail Prices response. The ARM reads may use normal request-header authentication, but
 credentials must not enter the retained URL, query, response, or receipt. Pass the evidence bytes
-by source ID through `evidence_artifacts`.
+by source ID through `evidence_artifacts`. Use
+`azure_provider_cost_meter_from_evidence()` to derive the route bindings, billing meters, exact
+price floor, and verified meter directly from those responses. A caller may supply a higher
+conservative price ceiling, but cannot lower the evidence-derived price floor.
 The offline verifier joins the endpoint, account location, deployment name and ETag, immutable model
 version, no-auto-upgrade setting, deployment SKU, retail service, region, meter and SKU IDs, token
 dimensions, units, effective date, and prices. Missing, extra, paginated, non-USD, discounted, or

@@ -63,6 +63,7 @@ from wmh.tracking.store import load_runs, save_run
 from wmh.tracking.tariffs import (
     ProviderTariffEvidenceIntegrityError,
     ProviderTokenTariff,
+    azure_provider_cost_meter_from_evidence,
     catalog_provider_token_tariff,
     catalog_provider_token_tariffs,
     provider_cost_meter,
@@ -108,6 +109,7 @@ __all__ = [
     "ProviderTariffValidatedRecord",
     "ProviderTariffVerifiedSource",
     "ProviderTokenTariff",
+    "azure_provider_cost_meter_from_evidence",
     "classify_build_call",
     "ModelPrice",
     "cost_usd",

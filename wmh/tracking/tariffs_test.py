@@ -32,6 +32,7 @@ from wmh.tracking.budget import (
 from wmh.tracking.pricing import price_for
 from wmh.tracking.tariffs import (
     ProviderTokenTariff,
+    azure_provider_cost_meter_from_evidence,
     catalog_provider_token_tariff,
     catalog_provider_token_tariffs,
     provider_cost_meter,
@@ -1327,6 +1328,115 @@ def test_caller_supplied_tariff_freezes_an_exact_azure_responses_route() -> None
         "azure-retail-price",
     )
     assert meter.model_dump(mode="json")["provider_config"] == config.model_dump(mode="json")
+
+
+def test_azure_evidence_factory_derives_the_complete_paid_meter() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example-resource.openai.azure.com",
+        deployment="audited-gpt-55-deployment",
+        api_version="2026-06-01",
+        reasoning_effort="high",
+        responses_api_version="v1",
+    )
+    declared, artifacts = _azure_tariff_fixture(config)
+
+    meter = azure_provider_cost_meter_from_evidence(
+        provider_config=config,
+        source_snapshots=tuple(reversed(declared.provenance.source_snapshots)),
+        evidence_artifacts=artifacts,
+        verified_on=date(2026, 7, 19),
+        input_overhead_tokens=16_384,
+    )
+
+    assert meter.provider_config == config
+    assert meter.price == declared.price
+    assert meter.tariff_provenance == declared.provenance
+    assert meter.input_overhead_tokens == 16_384
+    assert meter.tariff_evidence_receipt == verify_provider_tariff_evidence(
+        declared,
+        evidence_artifacts=artifacts,
+    )
+
+
+def test_azure_evidence_factory_derives_usage_from_reordered_retail_rows() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example-resource.openai.azure.com",
+        deployment="audited-gpt-55-deployment",
+        api_version="2026-06-01",
+    )
+    declared, artifacts = _azure_tariff_fixture(config)
+    retail = json.loads(artifacts["azure-retail-price"])
+    retail["Items"].reverse()
+    mutated, retained = _replace_azure_retail_document(declared, retail)
+
+    meter = azure_provider_cost_meter_from_evidence(
+        provider_config=config,
+        source_snapshots=mutated.provenance.source_snapshots,
+        evidence_artifacts={**artifacts, "azure-retail-price": retained},
+        verified_on=date(2026, 7, 19),
+    )
+
+    input_meter, output_meter = meter.tariff_provenance.route.billing_meters
+    assert input_meter.source_record_path == "/Items/1"
+    assert output_meter.source_record_path == "/Items/0"
+    assert meter.price == declared.price
+
+
+def test_azure_evidence_factory_accepts_only_a_conservative_explicit_ceiling() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example-resource.openai.azure.com",
+        deployment="audited-gpt-55-deployment",
+        api_version="2026-06-01",
+    )
+    declared, artifacts = _azure_tariff_fixture(config)
+    ceiling = TokenPriceCeiling(
+        input_nano_usd_per_token=1_100,
+        output_nano_usd_per_token=2_200,
+    )
+
+    meter = azure_provider_cost_meter_from_evidence(
+        provider_config=config,
+        source_snapshots=declared.provenance.source_snapshots,
+        evidence_artifacts=artifacts,
+        verified_on=date(2026, 7, 19),
+        price_ceiling=ceiling,
+    )
+    assert meter.price == ceiling
+
+    with pytest.raises(ValueError, match="understates retained billing meter rates"):
+        azure_provider_cost_meter_from_evidence(
+            provider_config=config,
+            source_snapshots=declared.provenance.source_snapshots,
+            evidence_artifacts=artifacts,
+            verified_on=date(2026, 7, 19),
+            price_ceiling=TokenPriceCeiling(
+                input_nano_usd_per_token=999,
+                output_nano_usd_per_token=2_000,
+            ),
+        )
+
+
+def test_azure_evidence_factory_rejects_a_non_azure_route_before_evidence() -> None:
+    with pytest.raises(ValueError, match="requires an Azure OpenAI provider route"):
+        azure_provider_cost_meter_from_evidence(
+            provider_config=ProviderConfig(
+                kind=ProviderKind.BEDROCK,
+                model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                region="us-east-1",
+            ),
+            source_snapshots=(),
+            evidence_artifacts={},
+            verified_on=date(2026, 7, 19),
+        )
 
 
 def test_external_tariff_evidence_requires_the_exact_complete_artifact_set() -> None:
