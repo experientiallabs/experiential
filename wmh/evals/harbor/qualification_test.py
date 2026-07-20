@@ -270,6 +270,7 @@ def _local_qualifier(
     dataset: Path,
     *,
     operation_id: str = "full-roster",
+    task_names: tuple[str, ...] | None = None,
 ) -> mod.HarborRosterQualifier:
     plan = HarborExecutionPlan.freeze(
         reference_harness=pi_node_baseline("reference"),
@@ -278,6 +279,7 @@ def _local_qualifier(
     runtime = mod.HarborRosterQualificationRuntime(
         jobs_dir=(tmp_path / "jobs").resolve(),
         dataset_paths_by_id={"terminalbench": dataset.resolve()},
+        task_names_by_dataset_id=(None if task_names is None else {"terminalbench": task_names}),
     )
     return mod.HarborRosterQualifier(
         execution_plan=plan,
@@ -318,6 +320,64 @@ def test_local_qualification_walks_complete_roster_without_execution(
     assert asyncio.run(qualifier.qualify()) == roster
     assert starts == []
     assert stops == []
+
+
+def test_local_qualification_walks_only_the_declared_task_subset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "excluded-task")
+    _write_task(dataset, "task-a")
+    _write_task(dataset, "task-b")
+    starts: list[str] = []
+    stops: list[str] = []
+    _forbid_agent_provider_and_verifier(monkeypatch)
+    _install_fake_environments(
+        monkeypatch,
+        backend=HarborEnvironmentBackend.LOCAL,
+        starts=starts,
+        stops=stops,
+    )
+
+    qualifier = _local_qualifier(
+        tmp_path,
+        dataset,
+        operation_id="declared-subset",
+        task_names=("task-a", "task-b"),
+    )
+    roster = asyncio.run(qualifier.qualify())
+
+    assert tuple(task.task_id for task in roster.tasks) == (
+        "task-a",
+        "task-b",
+    )
+    assert starts == ["task-a", "task-b"]
+    assert stops == starts
+
+
+@pytest.mark.parametrize(
+    ("task_names_by_dataset_id", "message"),
+    [
+        ({"unknown": ("task-a",)}, "undeclared dataset"),
+        ({}, "omits a declared dataset"),
+        ({"terminalbench": ()}, "at least one task"),
+        ({"terminalbench": ("task-b", "task-a")}, "canonical"),
+        ({"terminalbench": ("task-a", "task-a")}, "canonical"),
+        ({"terminalbench": (" task-a",)}, "canonical"),
+    ],
+)
+def test_qualification_task_subset_must_be_explicit_and_canonical(
+    tmp_path: Path,
+    task_names_by_dataset_id: dict[str, tuple[str, ...]],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        mod.HarborRosterQualificationRuntime(
+            jobs_dir=(tmp_path / "jobs").resolve(),
+            dataset_paths_by_id={"terminalbench": (tmp_path / "dataset").resolve()},
+            task_names_by_dataset_id=task_names_by_dataset_id,
+        )
 
 
 def test_partial_failure_reuses_completed_evidence_without_relaunch(

@@ -308,12 +308,13 @@ class HarborRosterQualificationBudgetRuntime(BaseModel):
 
 
 class HarborRosterQualificationRuntime(BaseModel):
-    """Host-owned dataset, journal, timeout, and optional E2B budget coordinates."""
+    """Host-owned declared roster, journal, timeout, and optional E2B coordinates."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     jobs_dir: Path
     dataset_paths_by_id: dict[str, Path] = Field(min_length=1)
+    task_names_by_dataset_id: dict[str, tuple[str, ...]] | None = None
     budget: HarborRosterQualificationBudgetRuntime | None = None
     create_rate_ledger_path: Path | None = None
     environment_start_timeout_s: float = Field(default=1800.0, gt=0.0, allow_inf_nan=False)
@@ -344,6 +345,42 @@ class HarborRosterQualificationRuntime(BaseModel):
             paths.append(resolved)
         if len(paths) != len(set(paths)):
             raise ValueError("qualification dataset IDs must map to distinct roots")
+        selected = self.task_names_by_dataset_id
+        if selected is not None:
+            declared_ids = set(self.dataset_paths_by_id)
+            selected_ids = set(selected)
+            if selected_ids != declared_ids:
+                unknown = sorted(selected_ids - declared_ids)
+                if unknown:
+                    raise ValueError(
+                        "qualification task subset references an undeclared dataset: "
+                        + ", ".join(unknown)
+                        + "; provide only keys from dataset_paths_by_id"
+                    )
+                missing = sorted(declared_ids - selected_ids)
+                raise ValueError(
+                    "qualification task subset omits a declared dataset: "
+                    + ", ".join(missing)
+                    + "; provide task names for every declared dataset"
+                )
+            for dataset_id, task_names in selected.items():
+                if not task_names:
+                    raise ValueError(
+                        f"qualification task subset for {dataset_id!r} is empty; provide at least "
+                        "one task name"
+                    )
+                if task_names != tuple(sorted(set(task_names))):
+                    raise ValueError(
+                        "qualification task names must be sorted, unique, and canonical; provide "
+                        "a sorted tuple of unique names"
+                    )
+                for task_name in task_names:
+                    if task_name != task_name.strip():
+                        raise ValueError(
+                            "qualification task names must be canonical; remove surrounding "
+                            "whitespace"
+                        )
+                    validate_durable_text(task_name, field="qualification task name")
         return self
 
 
@@ -540,7 +577,7 @@ class _ResolvedQualificationTask:
 
 
 class HarborRosterQualifier:
-    """Qualify every declared Harbor task without accepting a selection or executing an agent."""
+    """Qualify the exact declared Harbor roster without executing an agent."""
 
     def __init__(
         self,
@@ -586,7 +623,7 @@ class HarborRosterQualifier:
         return self._root / "roster.json"
 
     async def qualify(self) -> PrequalifiedHarborRoster:
-        """Prepare, build, start, attest, stop, and atomically publish the full roster."""
+        """Prepare, build, start, attest, stop, and atomically publish the declared roster."""
         self._prepare_private_root()
         with self._operation_lease():
             try:
@@ -668,8 +705,15 @@ class HarborRosterQualifier:
             + hashlib.sha256(self._operation_id.encode()).hexdigest()[:20],
             jobs_dir=self._runtime.jobs_dir,
             datasets=[
-                DatasetConfig(path=path)
-                for _dataset_id, path in sorted(self._runtime.dataset_paths_by_id.items())
+                DatasetConfig(
+                    path=path,
+                    task_names=(
+                        None
+                        if self._runtime.task_names_by_dataset_id is None
+                        else list(self._runtime.task_names_by_dataset_id[dataset_id])
+                    ),
+                )
+                for dataset_id, path in sorted(self._runtime.dataset_paths_by_id.items())
             ],
             n_attempts=1,
             n_concurrent_trials=1,
