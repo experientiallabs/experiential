@@ -65,8 +65,8 @@ def test_doc_hash_is_content_and_order_independent() -> None:
     assert doc3.doc_hash != doc1.doc_hash
 
 
-def test_execution_hash_includes_code_materialization_path() -> None:
-    prompt = Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p")
+def test_document_identity_includes_materialization_path_and_budget() -> None:
+    prompt = Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p", budget=10)
     code = Surface(
         id="code:agent",
         kind=SurfaceKind.CODE,
@@ -74,13 +74,20 @@ def test_execution_hash_includes_code_materialization_path() -> None:
         path="src/agent.ts",
     )
     original = HarnessDoc(name="candidate", surfaces=[prompt, code])
-    renamed = HarnessDoc(
+    moved = HarnessDoc(
         name="candidate",
         surfaces=[prompt, code.model_copy(update={"path": "src/not-agent.ts"})],
     )
+    rebudgeted = HarnessDoc(
+        name="candidate",
+        surfaces=[prompt.model_copy(update={"budget": 20}), code],
+    )
 
-    assert original.doc_hash == renamed.doc_hash
-    assert original.execution_hash != renamed.execution_hash
+    assert original.doc_hash == original.execution_hash
+    assert moved.doc_hash == moved.execution_hash
+    assert rebudgeted.doc_hash == rebudgeted.execution_hash
+    assert original.doc_hash != moved.doc_hash
+    assert original.doc_hash != rebudgeted.doc_hash
 
 
 def test_duplicate_surface_ids_rejected() -> None:

@@ -20,6 +20,7 @@ The default is `NullGrounder` — no network, tests and evals stay hermetic. Rea
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -34,7 +35,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field, ValidationError
 
-from wmh.core.types import Action
+from wmh.core.types import Action, JsonObject
 
 GROUNDER_KINDS = ("none", "brave", "fetch")
 _BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -62,6 +63,10 @@ class NullGrounder:
 
     def ground(self, query: str) -> list[GroundingResult]:
         return []
+
+    def evaluation_context(self) -> JsonObject:
+        """Return the exact disabled-grounding configuration."""
+        return {"kind": "none"}
 
 
 # Injectable HTTP GET (url, headers) -> response body; lets tests exercise BraveGrounder offline.
@@ -154,6 +159,15 @@ class BraveGrounder:
                 f"Brave search response for {query!r} did not match the expected shape: {exc}"
             ) from exc
 
+    def evaluation_context(self) -> JsonObject:
+        """Return non-secret configuration that identifies this search evaluator."""
+        return {
+            "kind": "brave",
+            "api_key_sha256": hashlib.sha256(self._api_key.encode()).hexdigest(),
+            "count": self._count,
+            "fetch": _callable_identity(self._fetch),
+        }
+
 
 class FetchGrounder:
     """Keyless grounder for URL-shaped queries: GET the URL, return its (capped) body.
@@ -185,6 +199,26 @@ class FetchGrounder:
             results = [GroundingResult(title=url, url=url, snippet=body)]
         self._memo[url] = results
         return results
+
+    def evaluation_context(self) -> JsonObject:
+        """Return configuration and cached observations that affect fetch grounding."""
+        return {
+            "kind": "fetch",
+            "max_chars": self._max_chars,
+            "fetch": _callable_identity(self._fetch),
+            "memo": {
+                query: [result.model_dump(mode="json") for result in results]
+                for query, results in self._memo.items()
+            },
+        }
+
+
+def _callable_identity(value: FetchFn) -> JsonObject:
+    """Return a stable code identity for an injected fetch implementation."""
+    return {
+        "module": getattr(value, "__module__", ""),
+        "qualname": getattr(value, "__qualname__", type(value).__qualname__),
+    }
 
 
 # curl flags that mean the request mutates state (or uploads); those commands are never fetched.

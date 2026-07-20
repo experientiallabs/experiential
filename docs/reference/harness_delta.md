@@ -63,8 +63,8 @@ class HarnessDoc(BaseModel):
     name: str
     version: int                 # immutable, assigned by the store on save; 0 = unsaved
     surfaces: list[Surface]      # unique ids; canonical order
-    # doc_hash: computed over sorted (id, content_hash) pairs. "The score of harness X" is
-    # well-defined because X is this hash.
+    # doc_hash / execution_hash: computed over every sorted surface field that affects execution
+    # or materialization. Display-only document name and version are excluded.
 ```
 
 A document validates as a whole at construction — tools resolve, `submit` present, params in
@@ -106,7 +106,7 @@ class GateRecord(BaseModel):
 
 class HarnessDelta(BaseModel):
     delta_id: str                  # content-addressed: blake2b(parent hash + ops)
-    parent_doc_hash: str           # lineage by content, not name
+    parent_doc_hash: str           # lineage by execution-affecting content, not display name
     trigger: FailureSignature      # built by deterministic clustering, never free-typed
     preconditions: dict[str, str]  # surface_id -> expected content_hash of the PARENT surface the
                                    # meta-agent actually read. ANY mismatch rejects the WHOLE delta
@@ -129,8 +129,17 @@ method. The world-model adapter uses that callback to retire idle sandbox resour
 Every `TaskScore` carries a normalized primary score and an explicit positive
 `aggregate_weight`. `HarnessScoreReport.score` must equal the aggregate-weighted task mean. This
 keeps subset and full-split gates consistent while allowing benchmark-defined weighting rather
-than assuming every task contributes equally. Missing suite tasks, aggregate mismatches, or
-weight changes fail closed.
+than assuming every task contributes equally. Empty reports, missing suite tasks, nonfinite or
+nonpositive weights, aggregate mismatches, and weight changes fail closed. A frozen
+`PassCriterion` states the primary-score threshold for `TaskScore.passed`; report validation and
+search reject a boolean verdict that disagrees with the rule or a rule that changes mid-search.
+
+Each report carries structured `ScoreProvenance` for the exact task set, evaluator, and execution
+backend. It also carries the issued `ScoreRequest`, candidate `execution_hash`, and any
+evaluation-specific identity evidence. `evaluation_id` is constructed centrally as canonical
+SHA-256 over those fields plus the scores and proposer evidence. Callers cannot choose it. Display
+fields such as report label and harness name/version are excluded. Search rejects a report for a
+different request or candidate and freezes provenance independently for discovery and holdout.
 
 The secondary objective is optional. A scorer that has one declares a stable `ScoreObjective` in
 `ScoreCapabilities`, repeats that identity on every report, and supplies a secondary score for

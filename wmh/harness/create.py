@@ -23,7 +23,7 @@ real models at temperature.
 
 from __future__ import annotations
 
-import hashlib
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isclose
@@ -37,7 +37,7 @@ from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage
 from wmh.harness.mutate import render_task_attempt_evidence
 from wmh.harness.proposer import DeltaProposer, ProposalFailure
 from wmh.harness.runtime import (
@@ -51,8 +51,10 @@ from wmh.harness.scoring import (
     MAX_TASK_EVIDENCE_CHARS,
     HarnessScorer,
     HarnessScoreReport,
+    PassCriterion,
     ScoreCapabilities,
     ScoreObjective,
+    ScoreProvenance,
     ScoreRequest,
     TaskScore,
     cluster_score_failures,
@@ -209,6 +211,8 @@ class _ScoreSchema:
     """Frozen objective and task weights for one scorer role."""
 
     secondary_objective: ScoreObjective | None
+    pass_criterion: PassCriterion
+    provenance: ScoreProvenance
     task_weights: tuple[tuple[str, float], ...]
 
 
@@ -413,6 +417,10 @@ def _validate_compatible_score_reports(
     context: str,
 ) -> None:
     """Reject a gate comparison when task or objective schemas differ."""
+    if child.pass_criterion != champion.pass_criterion:
+        raise ValueError(f"{context} reports declare different pass criteria")
+    if child.provenance != champion.provenance:
+        raise ValueError(f"{context} reports carry different evaluation provenance")
     if set(child.per_task) != set(champion.per_task):
         raise ValueError(f"{context} reports contain different task identities")
     for task_id in child.per_task:
@@ -443,17 +451,13 @@ def _optional_score_delta(
 
 def _snapshot_score_report(report: HarnessScoreReport) -> HarnessScoreReport:
     """Revalidate and detach a scorer-owned report before it enters search state."""
-    snapshot = HarnessScoreReport.model_validate(report.model_dump(mode="json"))
+    snapshot = HarnessScoreReport.model_validate(
+        report.model_dump(mode="json", exclude={"evaluation_id"})
+    )
     return snapshot.model_copy(
         update={"per_task": dict(sorted(snapshot.per_task.items()))},
         deep=True,
     )
-
-
-def _score_report_fingerprint(report: HarnessScoreReport) -> str:
-    """Canonical content identity used to detect evaluation-id collisions."""
-    content = report.model_dump_json(exclude={"evaluation_id"})
-    return hashlib.blake2b(content.encode("utf-8"), digest_size=32).hexdigest()
 
 
 def search_harness(
@@ -510,7 +514,7 @@ def search_harness(
     if screen_proposals and not discovery_capabilities.task_subsets:
         raise ValueError(
             "scorer cannot evaluate task subsets; pass screen_proposals=False to avoid "
-            "unsupported paid screens"
+            "unsupported screening evaluations"
         )
     if confirm_narrow_vetoes and not discovery_capabilities.attempt_overrides:
         raise ValueError("scorer cannot override attempt counts; pass confirm_narrow_vetoes=False")
@@ -551,7 +555,6 @@ def search_harness(
         if holdout_seed_error is not None:
             raise ValueError(f"holdout seed is not eligible for scoring: {holdout_seed_error}")
 
-    evaluations_by_id: dict[str, tuple[str, str, str]] = {}
     schemas_by_role: dict[Literal["discovery", "holdout"], _ScoreSchema] = {}
 
     def _check_cancelled() -> None:
@@ -579,6 +582,16 @@ def search_harness(
             attempts=attempts,
         )
         report = _snapshot_score_report(active_scorer.score(doc, request=request))
+        if report.candidate_execution_hash != doc.execution_hash:
+            raise ValueError(
+                f"{role} scorer returned candidate execution identity "
+                f"{report.candidate_execution_hash!r}; expected {doc.execution_hash!r}"
+            )
+        if report.request != request:
+            raise ValueError(
+                f"{role} scorer returned score request {report.request.model_dump(mode='json')!r}; "
+                f"expected {request.model_dump(mode='json')!r}"
+            )
         expected_scorer = scorer if role == "discovery" else holdout_scorer
         if active_scorer is not expected_scorer:
             raise ValueError(f"search received a report from an unknown {role} scorer")
@@ -626,9 +639,16 @@ def search_harness(
         if schema is None:
             schemas_by_role[role] = _ScoreSchema(
                 secondary_objective=report.secondary_objective,
+                pass_criterion=report.pass_criterion,
+                provenance=report.provenance,
                 task_weights=task_weights,
             )
         else:
+            if report.pass_criterion != schema.pass_criterion:
+                raise ValueError(f"{role} scorer changed its pass criterion")
+            for field in ("task_set", "evaluator", "backend"):
+                if getattr(report.provenance, field) != getattr(schema.provenance, field):
+                    raise ValueError(f"{role} scorer changed evaluation provenance field {field!r}")
             expected_weights = dict(schema.task_weights)
             for task_id, weight in task_weights:
                 expected_weight = expected_weights.get(task_id)
@@ -639,17 +659,6 @@ def search_harness(
                         f"{role} aggregate weight for task {task_id!r} changed from "
                         f"{expected_weight!r} to {weight!r}"
                     )
-        evaluation_record = (
-            doc.execution_hash,
-            request.model_dump_json(),
-            _score_report_fingerprint(report),
-        )
-        prior_record = evaluations_by_id.get(report.evaluation_id)
-        if prior_record is not None and prior_record != evaluation_record:
-            raise ValueError(
-                f"evaluation_id {report.evaluation_id!r} identifies a different report"
-            )
-        evaluations_by_id[report.evaluation_id] = evaluation_record
         _check_cancelled()
         return report
 
@@ -1261,6 +1270,7 @@ def search_harness(
 
 ClosedLoopScoreFn = Callable[[HarnessDoc, list[TaskSpec], int], ClosedLoopReport]
 _ASSERTION_FRACTION_OBJECTIVE = ScoreObjective(objective_id="assertion_fraction")
+_ALL_ATTEMPTS_PASS_CRITERION = PassCriterion(score_at_least=1.0)
 
 
 class _ClosedLoopHarnessScorer:
@@ -1280,6 +1290,7 @@ class _ClosedLoopHarnessScorer:
         default_attempts: int,
         evaluate: ClosedLoopScoreFn,
         validate_candidate: Callable[[HarnessDoc], str | None],
+        provenance: ScoreProvenance,
     ) -> None:
         self._tasks = list(tasks)
         self._by_id = {task.task_id: task for task in tasks}
@@ -1288,6 +1299,7 @@ class _ClosedLoopHarnessScorer:
         self.default_attempts = default_attempts
         self._evaluate = evaluate
         self._validate = validate_candidate
+        self._provenance = provenance
         self.raw_reports: dict[str, ClosedLoopReport] = {}
 
     def validate_candidate(self, candidate: HarnessDoc) -> str | None:
@@ -1309,7 +1321,7 @@ class _ClosedLoopHarnessScorer:
         _validate_closed_loop_report(tasks, raw, attempts=attempts)
         if request.purpose in ("seed", "full", "holdout"):
             self.raw_reports[candidate.doc_hash] = raw
-        return _closed_loop_score(candidate, tasks, raw, request)
+        return _closed_loop_score(candidate, tasks, raw, request, self._provenance)
 
 
 def _validate_closed_loop_report(
@@ -1385,6 +1397,7 @@ def _closed_loop_score(
     tasks: list[TaskSpec],
     report: ClosedLoopReport,
     request: ScoreRequest,
+    provenance: ScoreProvenance,
 ) -> HarnessScoreReport:
     """Project a gold-judged report onto the benchmark-neutral search contract."""
     task_scores: dict[str, TaskScore] = {}
@@ -1413,29 +1426,25 @@ def _closed_loop_score(
             task_id=task.task_id,
             score=outcome.success_rate,
             secondary_score=outcome.mean_fraction,
-            passed=outcome.success_rate >= 1.0 - _TIE_EPS,
+            passed=_ALL_ATTEMPTS_PASS_CRITERION.is_met(outcome.success_rate),
             description=description,
             mechanisms=tuple(mechanisms),
             evidence=evidence,
         )
-    identity_input = "\x00".join(
-        (
-            candidate.execution_hash,
-            request.purpose,
-            str(report.k),
-            *(task.task_id for task in tasks),
-            report.model_dump_json(),
-        )
-    )
-    digest = hashlib.blake2b(identity_input.encode("utf-8"), digest_size=16).hexdigest()
     return HarnessScoreReport(
-        evaluation_id=f"closed-loop:{digest}",
+        candidate_execution_hash=candidate.execution_hash,
+        request=request,
+        provenance=provenance,
+        pass_criterion=_ALL_ATTEMPTS_PASS_CRITERION,
         label=report.label,
         score=report.success_rate,
         secondary_objective=_ASSERTION_FRACTION_OBJECTIVE,
         secondary_score=report.mean_fraction,
         attempts=report.k,
         per_task=task_scores,
+        evaluation_evidence={
+            "closed_loop_report": report.model_dump(mode="json", exclude={"label"})
+        },
     )
 
 
@@ -1445,6 +1454,48 @@ def _bounded_score_text(value: str, *, limit: int, label: str) -> str:
         return value
     marker = f"\n...[{label} truncated; original_chars={len(value)}]"
     return value[: limit - len(marker)] + marker
+
+
+def _closed_loop_score_provenance(
+    tasks: list[TaskSpec],
+    *,
+    world_model: WorldModel,
+    agent_provider: Provider,
+    judge: GoldJudge,
+    harness_backend: Literal["local", "e2b"],
+    eval_concurrency: int | None,
+    e2b_template: str | None,
+    e2b_metadata: dict[str, str] | None,
+) -> ScoreProvenance:
+    """Build exact task, evaluator, and backend context for closed-loop scores."""
+    provider_type = type(agent_provider)
+    if harness_backend == "local":
+        resolved_concurrency = eval_concurrency if eval_concurrency is not None else 1
+        resolved_e2b_template = None
+    else:
+        resolved_concurrency = eval_concurrency if eval_concurrency is not None else 0
+        resolved_e2b_template = e2b_template or os.environ.get(E2B_TEMPLATE_ENV)
+    return ScoreProvenance(
+        task_set={"tasks": [task.model_dump(mode="json") for task in tasks]},
+        evaluator={
+            "kind": "closed_loop_gold",
+            "contract_version": 1,
+            "world_model": world_model.evaluation_context(),
+            "agent_provider": {
+                "type": f"{provider_type.__module__}.{provider_type.__qualname__}",
+                "config": agent_provider.config.model_dump(mode="json"),
+            },
+            "judge": judge.evaluation_context(),
+            "primary_score": "mean_binary_pass",
+            "secondary_score": _ASSERTION_FRACTION_OBJECTIVE.objective_id,
+        },
+        backend={
+            "kind": harness_backend,
+            "concurrency": resolved_concurrency,
+            "e2b_template": resolved_e2b_template,
+            "e2b_metadata": dict(sorted((e2b_metadata or {}).items())),
+        },
+    )
 
 
 def create_harness(
@@ -1481,6 +1532,31 @@ def create_harness(
             f"runtime kind is {seed_doc.runtime_kind()!r}, which already runs in-process; "
             "use harness_backend='local'"
         )
+
+    discovery_provenance = _closed_loop_score_provenance(
+        tasks,
+        world_model=world_model,
+        agent_provider=agent_provider,
+        judge=judge,
+        harness_backend=harness_backend,
+        eval_concurrency=eval_concurrency,
+        e2b_template=e2b_template,
+        e2b_metadata=e2b_metadata,
+    )
+    holdout_provenance = (
+        _closed_loop_score_provenance(
+            holdout,
+            world_model=world_model,
+            agent_provider=agent_provider,
+            judge=judge,
+            harness_backend=harness_backend,
+            eval_concurrency=eval_concurrency,
+            e2b_template=e2b_template,
+            e2b_metadata=e2b_metadata,
+        )
+        if holdout
+        else None
+    )
 
     sandbox_pool: E2BSandboxPool | None = None
     if harness_backend == "e2b":
@@ -1557,17 +1633,19 @@ def create_harness(
             default_attempts=k,
             evaluate=_evaluate,
             validate_candidate=_validate_candidate,
+            provenance=discovery_provenance,
         )
-        holdout_scorer = (
-            _ClosedLoopHarnessScorer(
+        if holdout:
+            assert holdout_provenance is not None
+            holdout_scorer = _ClosedLoopHarnessScorer(
                 holdout,
                 default_attempts=k,
                 evaluate=_evaluate,
                 validate_candidate=_validate_candidate,
+                provenance=holdout_provenance,
             )
-            if holdout
-            else None
-        )
+        else:
+            holdout_scorer = None
         search_result = search_harness(
             name,
             seed_doc,

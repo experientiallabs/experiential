@@ -325,7 +325,7 @@ def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_key
     assert result is sentinel
     manifest = cast("HarborTrialManifest", captured["manifest_at_run"])
     assert captured["loaded_manifest"] == manifest
-    assert candidate.doc_hash != candidate.execution_hash
+    assert candidate.doc_hash == candidate.execution_hash
     assert manifest.identity.candidate_hash == candidate.execution_hash
     assert manifest.identity.task_environment is BenchmarkTaskEnvironment.DOCKER
     assert len(manifest.entries) == 4

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from math import isclose
 from typing import Annotated, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from wmh.core.text import normalize_durable_text
+from wmh.core.types import JsonObject
 from wmh.harness.delta import FailureSignature
 from wmh.harness.doc import HarnessDoc
 
@@ -39,6 +42,36 @@ class ScoreObjective(BaseModel):
         max_length=128,
         pattern=r"^[a-z0-9][a-z0-9._-]*$",
     )
+
+
+class PassCriterion(BaseModel):
+    """Immutable task pass rule over the normalized primary score."""
+
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+
+    score_at_least: float = Field(ge=0.0, le=1.0)
+
+    def is_met(self, score: float) -> bool:
+        """Return whether one normalized primary task score passes this rule."""
+        return score >= self.score_at_least
+
+
+class ScoreProvenance(BaseModel):
+    """Frozen benchmark-neutral context that gives an evaluation its meaning."""
+
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False, extra="forbid")
+
+    task_set: JsonObject
+    evaluator: JsonObject
+    backend: JsonObject
+
+    @model_validator(mode="after")
+    def _validate_contexts(self) -> ScoreProvenance:
+        for field in ("task_set", "evaluator", "backend"):
+            if not getattr(self, field):
+                raise ValueError(f"{field} provenance must be nonempty")
+        _canonical_json(self.model_dump(mode="json"))
+        return self
 
 
 class ScoreCapabilities(BaseModel):
@@ -93,18 +126,49 @@ class HarnessScoreReport(BaseModel):
 
     ``score`` is the aggregate-weighted mean of the primary per-task scores. A secondary score is
     valid only when ``secondary_objective`` identifies it, and it uses the same frozen task
-    weights. Search checks that objective identity and weights stay fixed across evaluations.
+    weights. ``pass_criterion`` makes task verdicts derivable from primary scores. Canonical
+    identity binds the candidate execution hash, request, provenance, scores, and evidence while
+    excluding the display label. Search freezes this schema across evaluations.
     """
 
-    model_config = ConfigDict(allow_inf_nan=False)
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
 
-    evaluation_id: str = Field(min_length=1, max_length=512, frozen=True)
+    candidate_execution_hash: str = Field(pattern=r"^[0-9a-f]{32}$", frozen=True)
+    request: ScoreRequest
+    provenance: ScoreProvenance
+    pass_criterion: PassCriterion
     label: str = Field(default="", max_length=512)
     score: float = Field(default=0.0, ge=0.0, le=1.0)
     secondary_objective: ScoreObjective | None = None
     secondary_score: float | None = Field(default=None, ge=0.0, le=1.0)
     attempts: int = Field(ge=1)
-    per_task: dict[str, TaskScore] = Field(default_factory=dict)
+    per_task: dict[str, TaskScore] = Field(min_length=1)
+    evaluation_evidence: JsonObject = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_supplied_evaluation_id(cls, value: object) -> object:
+        """Keep identity centrally derived while allowing serialized reports to round-trip."""
+        if isinstance(value, dict) and "evaluation_id" in value:
+            return {key: item for key, item in value.items() if key != "evaluation_id"}
+        return value
+
+    @computed_field
+    @property
+    def evaluation_id(self) -> str:
+        """Canonical identity of context, request, candidate execution, scores, and evidence."""
+        return canonical_evaluation_id(
+            candidate_execution_hash=self.candidate_execution_hash,
+            request=self.request,
+            provenance=self.provenance,
+            pass_criterion=self.pass_criterion,
+            score=self.score,
+            secondary_objective=self.secondary_objective,
+            secondary_score=self.secondary_score,
+            attempts=self.attempts,
+            per_task=self.per_task,
+            evaluation_evidence=self.evaluation_evidence,
+        )
 
     @model_validator(mode="after")
     def _validate_task_keys(self) -> HarnessScoreReport:
@@ -113,14 +177,18 @@ class HarnessScoreReport(BaseModel):
                 raise ValueError(
                     f"per_task key {task_id!r} does not match task_id {task.task_id!r}"
                 )
-        if not self.per_task:
-            return self
-
         aggregate = _weighted_task_score(tuple(self.per_task.values()), secondary=False)
         if not isclose(self.score, aggregate, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError(
                 f"score={self.score!r} is inconsistent with weighted task aggregate={aggregate!r}"
             )
+        for task_id, task in self.per_task.items():
+            expected_passed = self.pass_criterion.is_met(task.score)
+            if task.passed != expected_passed:
+                raise ValueError(
+                    f"task {task_id!r} passed={task.passed!r} conflicts with pass criterion "
+                    f"score >= {self.pass_criterion.score_at_least!r}"
+                )
 
         task_secondary = [task.secondary_score for task in self.per_task.values()]
         if self.secondary_objective is None:
@@ -149,6 +217,53 @@ class HarnessScoreReport(BaseModel):
                 f"aggregate={secondary_aggregate!r}"
             )
         return self
+
+
+def canonical_evaluation_id(
+    *,
+    candidate_execution_hash: str,
+    request: ScoreRequest,
+    provenance: ScoreProvenance,
+    pass_criterion: PassCriterion,
+    score: float,
+    secondary_objective: ScoreObjective | None,
+    secondary_score: float | None,
+    attempts: int,
+    per_task: dict[str, TaskScore],
+    evaluation_evidence: JsonObject,
+) -> str:
+    """Build the shared content identity for one score report."""
+    payload = {
+        "schema_version": 1,
+        "candidate_execution_hash": candidate_execution_hash,
+        "request": request.model_dump(mode="json"),
+        "provenance": provenance.model_dump(mode="json"),
+        "pass_criterion": pass_criterion.model_dump(mode="json"),
+        "score": score,
+        "secondary_objective": (
+            secondary_objective.model_dump(mode="json") if secondary_objective is not None else None
+        ),
+        "secondary_score": secondary_score,
+        "attempts": attempts,
+        "per_task": {task_id: task.model_dump(mode="json") for task_id, task in per_task.items()},
+        "evaluation_evidence": evaluation_evidence,
+    }
+    canonical = _canonical_json(payload)
+    return "score-sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(value: JsonObject) -> str:
+    """Serialize a JSON object canonically and reject nonfinite numeric values."""
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"evaluation identity context is not canonical JSON: {error}") from error
 
 
 class HarnessScorer(Protocol):

@@ -9,9 +9,9 @@ Why surfaces instead of files:
 - **Identity.** Every surface has a stable id (`prompt:core`, `skill:count-words`). An update names
   its target; nothing is ever addressed by position or filename, so "which thing changed" is never
   inferred.
-- **Content addressing.** Each surface has a content hash, and the document has a hash over its
-  surfaces. "The score of harness X" is well-defined because X is a hash; an update can assert
-  exactly what it believes it is editing.
+- **Content addressing.** Each surface has a content hash, and the document has a hash over every
+  surface field that affects execution or materialization. "The score of harness X" is
+  well-defined because X is this identity; an update can assert exactly what it is editing.
 - **Typed validation.** A document validates as a whole (tools resolve, `submit` present, params in
   range, budgets respected) the moment it is constructed — an invalid harness cannot exist as a
   value, so nothing downstream re-checks.
@@ -183,13 +183,12 @@ class HarnessDoc(BaseModel):
 
     @property
     def doc_hash(self) -> str:
-        """Content identity of the whole document (order-independent via canonical sort)."""
-        joined = "\n".join(f"{s.id}\x00{s.content_hash}" for s in self.surfaces)
-        return _digest(joined)
+        """Canonical identity of every surface field that affects execution or materialization."""
+        return self.execution_hash
 
     @property
     def execution_hash(self) -> str:
-        """Identity of every surface field that can change materialization or execution."""
+        """Execution-affecting identity, excluding display-only document name and version."""
         payload = [surface.model_dump(mode="json") for surface in self.surfaces]
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return _digest(canonical)

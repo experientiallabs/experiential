@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from wmh.core.types import JsonObject
 from wmh.providers.base import EmbedderKind
 
 if TYPE_CHECKING:
@@ -44,6 +45,10 @@ class HashingEmbedder:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._embed_one(text) for text in texts]
+
+    def evaluation_context(self) -> JsonObject:
+        """Return the exact deterministic embedder configuration."""
+        return {"kind": "hashing_character_trigrams", "dimension": self._dim, "ngram": _NGRAM}
 
     def _embed_one(self, text: str) -> list[float]:
         vec = np.zeros(self._dim, dtype=np.float64)

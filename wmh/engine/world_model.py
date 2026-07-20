@@ -12,10 +12,11 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from wmh.config import ArtifactPaths, load_config
 from wmh.core.parsing import dumps_observation_contract, parse_observation
-from wmh.core.types import Action, EnvState, Observation, Session, Step
+from wmh.core.types import Action, EnvState, JsonObject, Observation, Session, Step
 from wmh.engine.autoconfig import AutoFidelityReport
 from wmh.engine.grounding import Grounder, extract_get_url, get_grounder, render_grounding
 from wmh.engine.knowledge import KnowledgeBase
@@ -30,6 +31,22 @@ from wmh.tracking import MeteredProvider, Phase, RunRecord, RunTracker
 
 # Live web searches allowed per session (cache hits are free); keeps grounding cost bounded.
 DEFAULT_GROUND_BUDGET = 5
+
+
+@runtime_checkable
+class _EvaluationContextProvider(Protocol):
+    """Component that can expose exact non-secret evaluation configuration."""
+
+    def evaluation_context(self) -> JsonObject: ...
+
+
+def _provider_evaluation_context(provider: Provider) -> JsonObject:
+    """Return provider implementation and non-secret route configuration."""
+    provider_type = type(provider)
+    return {
+        "type": f"{provider_type.__module__}.{provider_type.__qualname__}",
+        "config": provider.config.model_dump(mode="json"),
+    }
 
 
 class _StepUsage:
@@ -214,6 +231,33 @@ class WorldModel:
     def knowledge(self) -> KnowledgeBase | None:
         """The cross-session knowledge base, or None when the artifact ships none."""
         return self._knowledge
+
+    def evaluation_context(self) -> JsonObject:
+        """Return the frozen non-secret state that determines evaluation observations."""
+        if not isinstance(self._retriever, _EvaluationContextProvider):
+            raise ValueError("world-model retriever does not expose exact evaluation context")
+        if self._grounder is None:
+            grounder: JsonObject = {"kind": "disabled"}
+        elif isinstance(self._grounder, _EvaluationContextProvider):
+            grounder = self._grounder.evaluation_context()
+        else:
+            raise ValueError("world-model grounder does not expose exact evaluation context")
+        return {
+            "kind": "world_model",
+            "provider": _provider_evaluation_context(self._provider),
+            "reward_provider": _provider_evaluation_context(self._reward_provider),
+            "retriever": self._retriever.evaluation_context(),
+            "env_prompt": self._env_prompt,
+            "top_k": self._top_k,
+            "max_retrieved_observation_chars": self._demo_obs_cap,
+            "knowledge": self._knowledge.files() if self._knowledge is not None else {},
+            "reasoning": self._reasoning,
+            "grounder": grounder,
+            "ground_budget": self._ground_budget,
+            "verify": self._verify,
+            "confidence": self._confidence,
+            "confidence_why": self._confidence_why,
+        }
 
     def end_session(self, session_id: str) -> RunRecord:
         """End `session_id`: stop its metering, drop it from the model, return the final usage.

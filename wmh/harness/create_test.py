@@ -39,8 +39,10 @@ from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runtime import Runtime, StopReason
 from wmh.harness.scoring import (
     HarnessScoreReport,
+    PassCriterion,
     ScoreCapabilities,
     ScoreObjective,
+    ScoreProvenance,
     ScoreRequest,
     TaskScore,
 )
@@ -49,6 +51,12 @@ from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
 _CAREFUL_PROMPT = "You are a careful agent. Verify the state of the system before submitting."
 _DENSE_OBJECTIVE = ScoreObjective(objective_id="assertion_fraction")
+_PASS_CRITERION = PassCriterion(score_at_least=1.0)
+_NEUTRAL_PROVENANCE = ScoreProvenance(
+    task_set={"tasks": [{"task_id": "ground-truth-task"}]},
+    evaluator={"kind": "test-neutral", "version": 1},
+    backend={"kind": "in_process", "config": {}},
+)
 
 
 def _meta_reply(parent: HarnessDoc, new_prompt: str) -> str:
@@ -200,7 +208,10 @@ class _NeutralScorer:
         passed = prompt is not None and "careful agent" in prompt.content
         score = 1.0 if passed else 0.0
         return HarnessScoreReport(
-            evaluation_id=f"fake:{candidate.doc_hash}:{request.purpose}",
+            candidate_execution_hash=candidate.execution_hash,
+            request=request,
+            provenance=_NEUTRAL_PROVENANCE,
+            pass_criterion=_PASS_CRITERION,
             label=candidate.name,
             score=score,
             attempts=self.default_attempts,
@@ -283,7 +294,65 @@ def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:
     assert result.suite == ["ground-truth-task"]
 
 
-def test_search_harness_rejects_unsupported_paid_stages_before_scoring() -> None:
+def test_search_harness_keeps_path_or_budget_only_children_distinct() -> None:
+    seed = HarnessDoc.baseline("seed")
+    core = seed.surface("prompt:core")
+    assert core is not None
+
+    class RebudgetingProposer:
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            del evidence, history, should_cancel
+            assert count == 1
+            proposal = parse_delta(
+                parent,
+                trigger,
+                json.dumps(
+                    {
+                        "expected_effect": "freeze a larger prompt budget",
+                        "preconditions": {"prompt:core": core.content_hash},
+                        "ops": [
+                            {
+                                "op": "replace",
+                                "surface_id": "prompt:core",
+                                "content": core.content,
+                                "budget": len(core.content) + 100,
+                                "rationale": "bind the materialized candidate budget",
+                            }
+                        ],
+                    }
+                ),
+            )
+            assert proposal is not None
+            return [proposal]
+
+    result = search_harness(
+        "winner",
+        seed,
+        _NeutralScorer(),
+        RebudgetingProposer(),
+        iterations=1,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+    )
+
+    [delta] = result.archive.deltas
+    assert delta.child_doc_hash is not None
+    assert delta.child_doc_hash != seed.doc_hash
+    assert set(result.reports) == {seed.doc_hash, delta.child_doc_hash}
+    winner_core = result.best.surface("prompt:core")
+    assert winner_core is not None and winner_core.budget == len(core.content) + 100
+
+
+def test_search_harness_rejects_unsupported_screening_before_scoring() -> None:
     scorer = _NeutralScorer()
 
     with pytest.raises(ValueError, match="screen_proposals=False"):
@@ -531,17 +600,166 @@ def test_search_harness_rejects_candidate_that_omits_a_holdout_task() -> None:
         )
 
 
-def test_search_harness_rejects_evaluation_identity_collision() -> None:
-    class CollidingScorer(_NeutralScorer):
+@pytest.mark.parametrize("mismatch", ["candidate", "request"])
+def test_search_harness_rejects_report_identity_mismatch(mismatch: str) -> None:
+    class MismatchedScorer(_NeutralScorer):
         def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
             report = super().score(candidate, request=request)
-            return report.model_copy(update={"evaluation_id": "reused-id"})
+            update = (
+                {"candidate_execution_hash": "f" * 32}
+                if mismatch == "candidate"
+                else {"request": ScoreRequest(purpose="confirmation")}
+            )
+            return report.model_copy(update=update)
 
-    with pytest.raises(ValueError, match="evaluation_id 'reused-id'.*different report"):
+    with pytest.raises(ValueError, match="candidate execution identity|score request"):
         search_harness(
             "winner",
             HarnessDoc.baseline("seed"),
-            CollidingScorer(),
+            MismatchedScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_closed_loop_provenance_binds_task_evaluator_and_backend_configuration() -> None:
+    provider = RoleProvider()
+    world_model = _wm(provider)
+    judge = GoldJudge(provider)
+    base = create_module._closed_loop_score_provenance(
+        _tasks(),
+        world_model=world_model,
+        agent_provider=provider,
+        judge=judge,
+        harness_backend="local",
+        eval_concurrency=None,
+        e2b_template=None,
+        e2b_metadata=None,
+    )
+
+    changed_task = create_module._closed_loop_score_provenance(
+        [TaskSpec(task_id="other", instruction="different", gold=["done"])],
+        world_model=world_model,
+        agent_provider=provider,
+        judge=judge,
+        harness_backend="local",
+        eval_concurrency=None,
+        e2b_template=None,
+        e2b_metadata=None,
+    )
+    changed_world_model = create_module._closed_loop_score_provenance(
+        _tasks(),
+        world_model=WorldModel(provider, EmbeddingRetriever(HashingEmbedder(dim=32))),
+        agent_provider=provider,
+        judge=judge,
+        harness_backend="local",
+        eval_concurrency=None,
+        e2b_template=None,
+        e2b_metadata=None,
+    )
+    alternate_provider = RoleProvider()
+    alternate_provider.config = alternate_provider.config.model_copy(update={"model": "other"})
+    changed_agent = create_module._closed_loop_score_provenance(
+        _tasks(),
+        world_model=world_model,
+        agent_provider=alternate_provider,
+        judge=judge,
+        harness_backend="local",
+        eval_concurrency=None,
+        e2b_template=None,
+        e2b_metadata=None,
+    )
+    changed_judge = create_module._closed_loop_score_provenance(
+        _tasks(),
+        world_model=world_model,
+        agent_provider=provider,
+        judge=GoldJudge(alternate_provider),
+        harness_backend="local",
+        eval_concurrency=None,
+        e2b_template=None,
+        e2b_metadata=None,
+    )
+    changed_backend = create_module._closed_loop_score_provenance(
+        _tasks(),
+        world_model=world_model,
+        agent_provider=provider,
+        judge=judge,
+        harness_backend="e2b",
+        eval_concurrency=4,
+        e2b_template="template-v2",
+        e2b_metadata={"run": "comparison"},
+    )
+
+    assert base.task_set == {"tasks": [task.model_dump(mode="json") for task in _tasks()]}
+    assert base.backend == {
+        "kind": "local",
+        "concurrency": 1,
+        "e2b_template": None,
+        "e2b_metadata": {},
+    }
+    assert (
+        len(
+            {
+                base.model_dump_json(),
+                changed_task.model_dump_json(),
+                changed_world_model.model_dump_json(),
+                changed_agent.model_dump_json(),
+                changed_judge.model_dump_json(),
+                changed_backend.model_dump_json(),
+            }
+        )
+        == 6
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_set", {"tasks": [{"task_id": "changed"}]}),
+        ("evaluator", {"kind": "changed", "version": 1}),
+        ("backend", {"kind": "changed", "config": {}}),
+    ],
+)
+def test_search_harness_rejects_evaluation_provenance_drift(
+    field: str,
+    value: JsonObject,
+) -> None:
+    class DriftingProvenanceScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            if request.purpose != "full":
+                return report
+            return report.model_copy(
+                update={"provenance": report.provenance.model_copy(update={field: value})}
+            )
+
+    with pytest.raises(ValueError, match=f"evaluation provenance.*{field}"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            DriftingProvenanceScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_rejects_pass_criterion_drift() -> None:
+    class DriftingPassCriterionScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            if request.purpose != "full":
+                return report
+            return report.model_copy(update={"pass_criterion": PassCriterion(score_at_least=0.5)})
+
+    with pytest.raises(ValueError, match="pass criterion"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            DriftingPassCriterionScorer(),
             _EvidenceRecordingProposer(),
             iterations=1,
             screen_proposals=False,
@@ -602,13 +820,13 @@ def test_search_harness_snapshots_and_canonicalizes_scorer_owned_reports() -> No
     assert "late-task" not in audited.per_task
 
 
-def test_search_harness_rejects_empty_seed_and_holdout_matrices() -> None:
+def test_search_harness_revalidates_empty_seed_and_holdout_matrices() -> None:
     class EmptyScorer(_NeutralScorer):
         def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
             report = super().score(candidate, request=request)
             return report.model_copy(update={"score": 0.0, "per_task": {}})
 
-    with pytest.raises(ValueError, match="seed score report contains no tasks"):
+    with pytest.raises(ValueError, match="at least 1 item"):
         search_harness(
             "winner",
             HarnessDoc.baseline("seed"),
@@ -618,7 +836,7 @@ def test_search_harness_rejects_empty_seed_and_holdout_matrices() -> None:
             screen_proposals=False,
             confirm_narrow_vetoes=False,
         )
-    with pytest.raises(ValueError, match="holdout seed score report contains no tasks"):
+    with pytest.raises(ValueError, match="at least 1 item"):
         search_harness(
             "winner",
             HarnessDoc.baseline("seed"),
@@ -1126,7 +1344,10 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
         trigger=FailureSignature(mechanism="target", task_ids=["target"])
     )
     champion = HarnessScoreReport(
-        evaluation_id="champion",
+        candidate_execution_hash="a" * 32,
+        request=ScoreRequest(purpose="full"),
+        provenance=_NEUTRAL_PROVENANCE,
+        pass_criterion=_PASS_CRITERION,
         score=0.0,
         secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.45,
@@ -1137,7 +1358,10 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
         },
     )
     child = HarnessScoreReport(
-        evaluation_id="child",
+        candidate_execution_hash="b" * 32,
+        request=ScoreRequest(purpose="full"),
+        provenance=_NEUTRAL_PROVENANCE,
+        pass_criterion=_PASS_CRITERION,
         score=0.0,
         secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.25,
@@ -1167,7 +1391,10 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
         trigger=FailureSignature(mechanism="target", task_ids=["target"])
     )
     champion = HarnessScoreReport(
-        evaluation_id="champion",
+        candidate_execution_hash="a" * 32,
+        request=ScoreRequest(purpose="full"),
+        provenance=_NEUTRAL_PROVENANCE,
+        pass_criterion=_PASS_CRITERION,
         score=0.0,
         secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.1,
@@ -1178,7 +1405,10 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
         },
     )
     child = HarnessScoreReport(
-        evaluation_id="child",
+        candidate_execution_hash="b" * 32,
+        request=ScoreRequest(purpose="full"),
+        provenance=_NEUTRAL_PROVENANCE,
+        pass_criterion=_PASS_CRITERION,
         score=0.0,
         secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.35,
@@ -1206,13 +1436,19 @@ def test_gate_uses_only_primary_scores_when_no_secondary_objective_exists() -> N
         trigger=FailureSignature(mechanism="target", task_ids=["target"])
     )
     champion = HarnessScoreReport(
-        evaluation_id="champion-primary-only",
+        candidate_execution_hash="a" * 32,
+        request=ScoreRequest(purpose="full"),
+        provenance=_NEUTRAL_PROVENANCE,
+        pass_criterion=_PASS_CRITERION,
         score=0.0,
         attempts=1,
         per_task={"target": TaskScore(task_id="target", score=0.0, passed=False)},
     )
     child = HarnessScoreReport(
-        evaluation_id="child-primary-only",
+        candidate_execution_hash="b" * 32,
+        request=ScoreRequest(purpose="full"),
+        provenance=_NEUTRAL_PROVENANCE,
+        pass_criterion=_PASS_CRITERION,
         score=0.0,
         attempts=1,
         per_task={"target": TaskScore(task_id="target", score=0.0, passed=False)},
@@ -1490,7 +1726,10 @@ def test_narrow_failing_tiers_eligibility() -> None:
 
 def test_confirmation_attempt_impact_uses_frozen_aggregate_weights() -> None:
     report = HarnessScoreReport(
-        evaluation_id="weighted-confirmation",
+        candidate_execution_hash="a" * 32,
+        request=ScoreRequest(purpose="confirmation", attempts=5),
+        provenance=_NEUTRAL_PROVENANCE,
+        pass_criterion=_PASS_CRITERION,
         score=0.75,
         attempts=5,
         per_task={

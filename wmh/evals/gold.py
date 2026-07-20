@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wmh.core.parsing import extract_json_object
 from wmh.core.text import normalize_durable_text
+from wmh.core.types import JsonObject
 from wmh.providers.base import Message, Provider
 
 GOLD_JUDGE_MARKER = "grade whether an agent completed a task"
@@ -69,6 +70,20 @@ class GoldJudge:
 
     def __init__(self, provider: Provider) -> None:
         self._provider = provider
+
+    def evaluation_context(self) -> JsonObject:
+        """Return the exact non-secret judge configuration used by score provenance."""
+        provider_type = type(self._provider)
+        return {
+            "kind": "gold_assertions",
+            "system_prompt": GOLD_JUDGE_SYSTEM,
+            "provider": {
+                "type": f"{provider_type.__module__}.{provider_type.__qualname__}",
+                "config": self._provider.config.model_dump(mode="json"),
+            },
+            "temperature": 0.0,
+            "max_tokens": 1024,
+        }
 
     def score(self, instruction: str, answer: str, transcript: str, gold: list[str]) -> GoldVerdict:
         if not gold:

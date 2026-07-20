@@ -11,6 +11,7 @@ steps (`add`).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
@@ -19,8 +20,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from wmh.core.render import encode_action, encode_state_action
-from wmh.core.types import Action, EnvState, Observation, Step, Trace
-from wmh.providers.base import Embedder
+from wmh.core.types import Action, EnvState, JsonObject, Observation, Step, Trace
+from wmh.providers.base import Embedder, ProviderConfig
 
 # What text phi embeds per step: the full (state, action) summary, or the command-only action.
 RetrievalKey = Literal["state_action", "action"]
@@ -46,6 +47,13 @@ class Retriever(Protocol):
     def sample(self, n: int) -> list[Step]:
         """Return up to `n` steps from the buffer (e.g. to seed the demo agent)."""
         ...
+
+
+@runtime_checkable
+class _EvaluationContextProvider(Protocol):
+    """Optional exact configuration surface for evaluation provenance."""
+
+    def evaluation_context(self) -> JsonObject: ...
 
 
 class EmbeddingRetriever:
@@ -120,6 +128,40 @@ class EmbeddingRetriever:
     def sample(self, n: int) -> list[Step]:
         """Return the first up-to-`n` steps from the buffer (deterministic; no RNG needed)."""
         return self._steps[: max(0, n)]
+
+    def evaluation_context(self) -> JsonObject:
+        """Return embedder, corpus, and matrix identities that determine retrieval."""
+        if isinstance(self._provider, _EvaluationContextProvider):
+            embedder = self._provider.evaluation_context()
+        else:
+            config = getattr(self._provider, "config", None)
+            if not isinstance(config, ProviderConfig):
+                raise ValueError(
+                    "retriever embedder must expose evaluation_context() or ProviderConfig"
+                )
+            provider_type = type(self._provider)
+            embedder = {
+                "kind": "provider",
+                "type": f"{provider_type.__module__}.{provider_type.__qualname__}",
+                "config": config.model_dump(mode="json"),
+            }
+        matrix = self._matrix
+        matrix_identity: JsonObject
+        if matrix is None:
+            matrix_identity = {"shape": None, "sha256": None}
+        else:
+            canonical_matrix = np.ascontiguousarray(matrix, dtype="<f8")
+            matrix_identity = {
+                "shape": list(canonical_matrix.shape),
+                "sha256": hashlib.sha256(canonical_matrix.tobytes(order="C")).hexdigest(),
+            }
+        return {
+            "kind": "embedding_retriever",
+            "key_mode": self._key_mode,
+            "embedder": embedder,
+            "steps": [step.model_dump(mode="json") for step in self._steps],
+            "matrix": matrix_identity,
+        }
 
     def save(self, index_dir: str | Path) -> None:
         """Persist the buffer (embedding matrix + parallel steps) under `index_dir`.
