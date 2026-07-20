@@ -11,8 +11,6 @@ import os
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Iterator
 from contextlib import ExitStack, asynccontextmanager, contextmanager
-from datetime import date
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -64,16 +62,13 @@ from wmh.harness.pi_runner_backend import (
     e2b_runner_resource_class,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.tracking._testing import synthetic_provider_cost_meter
+from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
+    synthetic_tariff_provenance,
+)
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
-    ProviderTariffBillingMeter,
-    ProviderTariffProvenance,
-    ProviderTariffRetainedArtifact,
-    ProviderTariffRoute,
-    ProviderTariffSourceBinding,
-    ProviderTariffSourceSnapshot,
     SpendLedger,
     TimedResourceClass,
     TimedResourceCostMeter,
@@ -100,106 +95,6 @@ _ENVIRONMENT_DIGESTS = {
 _CONFIG_DIGEST = "sha256:" + "1" * 64
 _RETRY_POLICY_DIGEST = "sha256:" + "5" * 64
 _BUDGET_POLICY_DIGEST = "sha256:" + "6" * 64
-
-
-def _tariff_source_bindings(
-    provider_config: ProviderConfig,
-) -> tuple[ProviderTariffSourceBinding, ...]:
-    return (
-        ProviderTariffSourceBinding(
-            claim="route_identity",
-            source_id="test-rate-catalog",
-            source_record_path="/input/model",
-            source_value=provider_config.model,
-            canonical_value=provider_config.model,
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/input",
-        ),
-        ProviderTariffSourceBinding(
-            claim="route_identity",
-            source_id="test-rate-catalog",
-            source_record_path="/output/model",
-            source_value=provider_config.model,
-            canonical_value=provider_config.model,
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/output",
-        ),
-        ProviderTariffSourceBinding(
-            claim="usage_dimension",
-            source_id="test-rate-catalog",
-            source_record_path="/input/dimension",
-            source_value="Input tokens",
-            canonical_value="input_tokens",
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/input",
-        ),
-        ProviderTariffSourceBinding(
-            claim="usage_dimension",
-            source_id="test-rate-catalog",
-            source_record_path="/output/dimension",
-            source_value="Output tokens",
-            canonical_value="output_tokens",
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/output",
-        ),
-    )
-
-
-def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
-    return ProviderTariffProvenance(
-        source_snapshots=(
-            ProviderTariffSourceSnapshot(
-                source_id="test-rate-catalog",
-                role="rate_catalog",
-                source_locator="https://example.test/provider-pricing",
-                source_snapshot_digest="sha256:" + "f" * 64,
-                media_type="application/json",
-                content_encoding="identity",
-                retained_artifact=ProviderTariffRetainedArtifact(
-                    storage_kind="https",
-                    locator="https://example.test/evidence/test-rate-catalog.json.gz",
-                    artifact_digest="sha256:" + "e" * 64,
-                    content_encoding="gzip",
-                ),
-            ),
-        ),
-        source_bindings=_tariff_source_bindings(provider_config),
-        verified_on=date(2026, 7, 19),
-        effective_on=date(2026, 7, 1),
-        currency="USD",
-        price_unit="per_1m_tokens",
-        route=ProviderTariffRoute(
-            provider_config=provider_config,
-            billing_region=provider_config.region or "test-region",
-            billing_mode="test-mode",
-            billing_meters=(
-                ProviderTariffBillingMeter(
-                    usage_dimension="input_tokens",
-                    source_id="test-rate-catalog",
-                    source_record_path="/input",
-                    sku_id="test-input-sku",
-                    rate_id="test-input-rate",
-                    billing_region=provider_config.region or "test-region",
-                    billing_mode="test-mode",
-                    effective_on=date(2026, 7, 1),
-                    source_price_usd=Decimal("0.001"),
-                    source_price_unit="per_1m_tokens",
-                ),
-                ProviderTariffBillingMeter(
-                    usage_dimension="output_tokens",
-                    source_id="test-rate-catalog",
-                    source_record_path="/output",
-                    sku_id="test-output-sku",
-                    rate_id="test-output-rate",
-                    billing_region=provider_config.region or "test-region",
-                    billing_mode="test-mode",
-                    effective_on=date(2026, 7, 1),
-                    source_price_usd=Decimal("0.001"),
-                    source_price_unit="per_1m_tokens",
-                ),
-            ),
-        ),
-    )
 
 
 class _ProcessEvent(Protocol):
@@ -875,7 +770,7 @@ def _budget_runtime(
         meters={
             meter_by_member[route.panel_member]: synthetic_provider_cost_meter(
                 provider_config=route.provider_config,
-                provenance=_tariff_provenance(route.provider_config),
+                provenance=synthetic_tariff_provenance(route.provider_config),
                 input_nano_usd_per_token=1,
                 output_nano_usd_per_token=5,
             )
@@ -1003,7 +898,7 @@ def _e2b_budget_runtime(
             **{
                 provider_meters[route.panel_member]: synthetic_provider_cost_meter(
                     provider_config=route.provider_config,
-                    provenance=_tariff_provenance(route.provider_config),
+                    provenance=synthetic_tariff_provenance(route.provider_config),
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
                 )

@@ -7,8 +7,7 @@ import hashlib
 import json
 import os
 import stat
-from datetime import UTC, date, datetime
-from decimal import Decimal
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
@@ -56,18 +55,15 @@ from wmh.harness.pi_runner_backend import (
     runner_owner_id,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.tracking._testing import synthetic_provider_cost_meter
+from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
+    synthetic_tariff_provenance,
+)
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     BudgetScope,
     ProviderCostMeter,
-    ProviderTariffBillingMeter,
-    ProviderTariffProvenance,
-    ProviderTariffRetainedArtifact,
-    ProviderTariffRoute,
-    ProviderTariffSourceBinding,
-    ProviderTariffSourceSnapshot,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     bootstrap_budget_ledger,
@@ -77,107 +73,6 @@ from wmh.tracking.rate_limit import (
     ExternalDispatchRatePolicy,
     bind_external_dispatch_rate_authority,
 )
-
-
-def _tariff_source_bindings(
-    provider_config: ProviderConfig,
-) -> tuple[ProviderTariffSourceBinding, ...]:
-    return (
-        ProviderTariffSourceBinding(
-            claim="route_identity",
-            source_id="test-rate-catalog",
-            source_record_path="/input/model",
-            source_value=provider_config.model,
-            canonical_value=provider_config.model,
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/input",
-        ),
-        ProviderTariffSourceBinding(
-            claim="route_identity",
-            source_id="test-rate-catalog",
-            source_record_path="/output/model",
-            source_value=provider_config.model,
-            canonical_value=provider_config.model,
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/output",
-        ),
-        ProviderTariffSourceBinding(
-            claim="usage_dimension",
-            source_id="test-rate-catalog",
-            source_record_path="/input/dimension",
-            source_value="Input tokens",
-            canonical_value="input_tokens",
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/input",
-        ),
-        ProviderTariffSourceBinding(
-            claim="usage_dimension",
-            source_id="test-rate-catalog",
-            source_record_path="/output/dimension",
-            source_value="Output tokens",
-            canonical_value="output_tokens",
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/output",
-        ),
-    )
-
-
-def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
-    return ProviderTariffProvenance(
-        source_snapshots=(
-            ProviderTariffSourceSnapshot(
-                source_id="test-rate-catalog",
-                role="rate_catalog",
-                source_locator="https://example.test/provider-pricing",
-                source_snapshot_digest="sha256:" + "f" * 64,
-                media_type="application/json",
-                content_encoding="identity",
-                retained_artifact=ProviderTariffRetainedArtifact(
-                    storage_kind="https",
-                    locator="https://example.test/evidence/test-rate-catalog.json.gz",
-                    artifact_digest="sha256:" + "e" * 64,
-                    content_encoding="gzip",
-                ),
-            ),
-        ),
-        source_bindings=_tariff_source_bindings(provider_config),
-        verified_on=date(2026, 7, 19),
-        effective_on=date(2026, 7, 1),
-        currency="USD",
-        price_unit="per_1m_tokens",
-        route=ProviderTariffRoute(
-            provider_config=provider_config,
-            billing_region=provider_config.region or "test-region",
-            billing_mode="test-mode",
-            billing_meters=(
-                ProviderTariffBillingMeter(
-                    usage_dimension="input_tokens",
-                    source_id="test-rate-catalog",
-                    source_record_path="/input",
-                    sku_id="test-input-sku",
-                    rate_id="test-input-rate",
-                    billing_region=provider_config.region or "test-region",
-                    billing_mode="test-mode",
-                    effective_on=date(2026, 7, 1),
-                    source_price_usd=Decimal("0.001"),
-                    source_price_unit="per_1m_tokens",
-                ),
-                ProviderTariffBillingMeter(
-                    usage_dimension="output_tokens",
-                    source_id="test-rate-catalog",
-                    source_record_path="/output",
-                    sku_id="test-output-sku",
-                    rate_id="test-output-rate",
-                    billing_region=provider_config.region or "test-region",
-                    billing_mode="test-mode",
-                    effective_on=date(2026, 7, 1),
-                    source_price_usd=Decimal("0.001"),
-                    source_price_unit="per_1m_tokens",
-                ),
-            ),
-        ),
-    )
-
 
 _TASK_ENVIRONMENT_ATTESTATION = {
     "schema_version": 2,
@@ -315,7 +210,7 @@ def _e2b_budget_kwargs(
     meters: dict[str, ProviderCostMeter | TimedResourceCostMeter] = {
         "worker": synthetic_provider_cost_meter(
             provider_config=provider,
-            provenance=_tariff_provenance(provider),
+            provenance=synthetic_tariff_provenance(provider),
             input_nano_usd_per_token=1,
             output_nano_usd_per_token=1,
         )
@@ -1300,7 +1195,7 @@ def test_evaluator_binds_path_free_budget_policy_into_agent_identity(tmp_path: P
         meters={
             "worker": synthetic_provider_cost_meter(
                 provider_config=provider_config,
-                provenance=_tariff_provenance(provider_config),
+                provenance=synthetic_tariff_provenance(provider_config),
                 input_nano_usd_per_token=1,
                 output_nano_usd_per_token=5,
             )

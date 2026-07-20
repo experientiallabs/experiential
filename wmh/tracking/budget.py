@@ -532,7 +532,7 @@ class ProviderTariffRoute(BaseModel):
     provider_config: ProviderConfig
     billing_region: str = Field(min_length=1, max_length=128)
     billing_mode: str = Field(min_length=1, max_length=128)
-    billing_meters: tuple[ProviderTariffBillingMeter, ...] = Field(min_length=2, max_length=2)
+    billing_meters: tuple[ProviderTariffBillingMeter, ProviderTariffBillingMeter]
 
     @field_validator("provider_config", mode="after")
     @classmethod

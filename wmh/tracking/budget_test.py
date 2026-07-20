@@ -11,8 +11,6 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date
-from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -35,7 +33,10 @@ from wmh.providers.base import (
     TokenUsage,
     VerifyResult,
 )
-from wmh.tracking._testing import synthetic_tariff_provenance
+from wmh.tracking._testing import (
+    synthetic_tariff_evidence_receipt,
+    synthetic_tariff_provenance,
+)
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
@@ -50,14 +51,6 @@ from wmh.tracking.budget import (
     BudgetTerminalProvenance,
     ExternalSpendAuthority,
     ProviderCostMeter,
-    ProviderTariffBillingMeter,
-    ProviderTariffEvidenceReceipt,
-    ProviderTariffProvenance,
-    ProviderTariffRetainedArtifact,
-    ProviderTariffRoute,
-    ProviderTariffSourceBinding,
-    ProviderTariffSourceSnapshot,
-    ProviderTariffVerifiedSource,
     ReservationStatus,
     SpendLedger,
     TimedResourceBudget,
@@ -73,143 +66,11 @@ from wmh.tracking.budget import (
     nano_usd_from_usd,
     open_shared_spend_ledger,
     orphaned_timed_resource_requires_reap,
-    provider_tariff_claim_digest,
-    provider_tariff_evidence_verifier_digest,
-    provider_tariff_validated_records,
     reconcile_orphaned_timed_resource,
     resolve_budget_account,
     resolve_timed_resource_account,
     validate_timed_resource_class,
 )
-
-
-def _test_tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
-    return ProviderTariffProvenance(
-        source_snapshots=(
-            ProviderTariffSourceSnapshot(
-                source_id="test-rate-catalog",
-                role="rate_catalog",
-                source_locator="https://example.test/provider-pricing",
-                source_snapshot_digest="sha256:" + "f" * 64,
-                media_type="application/json",
-                content_encoding="identity",
-                retained_artifact=ProviderTariffRetainedArtifact(
-                    storage_kind="https",
-                    locator="https://example.test/evidence/test-rate-catalog.json.gz",
-                    artifact_digest="sha256:" + "e" * 64,
-                    content_encoding="gzip",
-                ),
-            ),
-        ),
-        source_bindings=_test_tariff_source_bindings(provider_config),
-        verified_on=date(2026, 7, 19),
-        effective_on=date(2026, 7, 1),
-        currency="USD",
-        price_unit="per_1m_tokens",
-        route=ProviderTariffRoute(
-            provider_config=provider_config,
-            billing_region=provider_config.region or "test-region",
-            billing_mode="test-mode",
-            billing_meters=(
-                ProviderTariffBillingMeter(
-                    usage_dimension="input_tokens",
-                    source_id="test-rate-catalog",
-                    source_record_path="/input",
-                    sku_id="test-input-sku",
-                    rate_id="test-input-rate",
-                    billing_region=provider_config.region or "test-region",
-                    billing_mode="test-mode",
-                    effective_on=date(2026, 7, 1),
-                    source_price_usd=Decimal("0.001"),
-                    source_price_unit="per_1m_tokens",
-                ),
-                ProviderTariffBillingMeter(
-                    usage_dimension="output_tokens",
-                    source_id="test-rate-catalog",
-                    source_record_path="/output",
-                    sku_id="test-output-sku",
-                    rate_id="test-output-rate",
-                    billing_region=provider_config.region or "test-region",
-                    billing_mode="test-mode",
-                    effective_on=date(2026, 7, 1),
-                    source_price_usd=Decimal("0.001"),
-                    source_price_unit="per_1m_tokens",
-                ),
-            ),
-        ),
-    )
-
-
-def _test_tariff_source_bindings(
-    provider_config: ProviderConfig,
-) -> tuple[ProviderTariffSourceBinding, ...]:
-    return (
-        ProviderTariffSourceBinding(
-            claim="route_identity",
-            source_id="test-rate-catalog",
-            source_record_path="/input/model",
-            source_value=provider_config.model,
-            canonical_value=provider_config.model,
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/input",
-        ),
-        ProviderTariffSourceBinding(
-            claim="route_identity",
-            source_id="test-rate-catalog",
-            source_record_path="/output/model",
-            source_value=provider_config.model,
-            canonical_value=provider_config.model,
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/output",
-        ),
-        ProviderTariffSourceBinding(
-            claim="usage_dimension",
-            source_id="test-rate-catalog",
-            source_record_path="/input/dimension",
-            source_value="Input tokens",
-            canonical_value="input_tokens",
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/input",
-        ),
-        ProviderTariffSourceBinding(
-            claim="usage_dimension",
-            source_id="test-rate-catalog",
-            source_record_path="/output/dimension",
-            source_value="Output tokens",
-            canonical_value="output_tokens",
-            target_meter_source_id="test-rate-catalog",
-            target_meter_record_path="/output",
-        ),
-    )
-
-
-def _test_tariff_receipt(
-    *,
-    provider_config: ProviderConfig,
-    price: TokenPriceCeiling,
-    provenance: ProviderTariffProvenance,
-) -> ProviderTariffEvidenceReceipt:
-    profile = "aws_bedrock_public_catalog_v1"
-    return ProviderTariffEvidenceReceipt(
-        verifier_profile=profile,
-        verifier_digest=provider_tariff_evidence_verifier_digest(profile),
-        tariff_claim_digest=provider_tariff_claim_digest(
-            provider_config=provider_config,
-            price=price,
-            provenance=provenance,
-        ),
-        verified_sources=tuple(
-            ProviderTariffVerifiedSource(
-                source_id=source.source_id,
-                artifact_digest=source.retained_artifact.artifact_digest,
-                source_snapshot_digest=source.source_snapshot_digest,
-                artifact_size_bytes=1,
-                decoded_size_bytes=1,
-            )
-            for source in provenance.source_snapshots
-        ),
-        validated_records=provider_tariff_validated_records(provenance),
-    )
 
 
 def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPolicy:
@@ -222,7 +83,7 @@ def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPoli
         input_nano_usd_per_token=2,
         output_nano_usd_per_token=5,
     )
-    provenance = _test_tariff_provenance(provider_config)
+    provenance = synthetic_tariff_provenance(provider_config)
     return BudgetPolicy(
         study_id="study-1",
         manifest_digest="sha256:" + "a" * 64,
@@ -233,7 +94,7 @@ def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPoli
                 provider_config=provider_config,
                 price=price,
                 tariff_provenance=provenance,
-                tariff_evidence_receipt=_test_tariff_receipt(
+                tariff_evidence_receipt=synthetic_tariff_evidence_receipt(
                     provider_config=provider_config,
                     price=price,
                     provenance=provenance,
