@@ -65,6 +65,40 @@ def test_doc_hash_is_content_and_order_independent() -> None:
     assert doc3.doc_hash != doc1.doc_hash
 
 
+def test_execution_hash_includes_materialized_paths_and_ignores_display_metadata() -> None:
+    first = HarnessDoc(
+        name="first",
+        version=1,
+        surfaces=[
+            Surface(id="prompt:main", kind=SurfaceKind.PROMPT, content="prompt"),
+            Surface(
+                id="code:worker",
+                kind=SurfaceKind.CODE,
+                content="export const value = 1;",
+                path="src/worker.ts",
+            ),
+        ],
+    )
+    renamed = first.model_copy(update={"name": "renamed", "version": 99})
+    moved = HarnessDoc(
+        name="moved",
+        surfaces=[
+            Surface(id="prompt:main", kind=SurfaceKind.PROMPT, content="prompt"),
+            Surface(
+                id="code:worker",
+                kind=SurfaceKind.CODE,
+                content="export const value = 1;",
+                path="src/moved.ts",
+            ),
+        ],
+    )
+
+    assert renamed.execution_hash == first.execution_hash
+    assert renamed.doc_hash == first.doc_hash
+    assert moved.doc_hash != first.doc_hash
+    assert moved.execution_hash != first.execution_hash
+
+
 def test_duplicate_surface_ids_rejected() -> None:
     a = Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="A")
     with pytest.raises(ValidationError, match="duplicate surface id"):

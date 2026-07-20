@@ -83,6 +83,35 @@ def test_apply_replaces_content_and_records_child_hash() -> None:
     assert child.surface(TOOL_POLICY_ID) == parent.surface(TOOL_POLICY_ID)
 
 
+def test_apply_treats_a_code_path_change_as_a_distinct_child() -> None:
+    base = HarnessDoc.baseline("parent")
+    code = Surface(
+        id="code:worker",
+        kind=SurfaceKind.CODE,
+        content="export const value = 1;",
+        path="src/worker.ts",
+    )
+    parent = HarnessDoc(name="parent", surfaces=[*base.surfaces, code])
+    ops = [
+        SurfaceOp(
+            op="replace",
+            surface_id=code.id,
+            content=code.content,
+            path="src/renamed-worker.ts",
+            rationale="move the executable module",
+        )
+    ]
+    delta = _delta(ops, parent=parent, preconditions={code.id: code.content_hash})
+
+    child = apply_delta(parent, delta, "child")
+
+    child_code = child.surface(code.id)
+    assert child_code is not None
+    assert child_code.path == "src/renamed-worker.ts"
+    assert child.doc_hash != parent.doc_hash
+    assert delta.child_doc_hash == child.doc_hash
+
+
 def test_apply_add_and_remove() -> None:
     parent = _parent()
     old = parent.surface("skill:old-skill")
