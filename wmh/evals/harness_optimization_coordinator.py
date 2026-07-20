@@ -1863,7 +1863,9 @@ def _atomic_publish_private_json(path: Path, value: JsonValue) -> bool:
     if path.exists():
         return False
     payload = _canonical_json_bytes(value)
-    temporary: Path | None = path.parent / f".publish-{path.name}-{uuid.uuid4().hex}"
+    temporary: Path | None = path.parent / (
+        f".publish-{path.name}-pid-{os.getpid()}-{uuid.uuid4().hex}"
+    )
     descriptor = os.open(
         temporary,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -1886,6 +1888,11 @@ def _atomic_publish_private_json(path: Path, value: JsonValue) -> bool:
         except FileNotFoundError:
             pass
         temporary = None
+        # Another publisher can complete its link while this call loses the no-replace race, then
+        # remain paused before removing its staging alias. Recover aliases before enforcing the
+        # single-link invariant so identical concurrent publication remains idempotent for every
+        # valid interleaving. Removing an alias after its final link is safe for the paused winner.
+        _recover_atomic_publication_aliases(path)
         directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(directory_descriptor)
@@ -1904,12 +1911,14 @@ def _atomic_publish_private_json(path: Path, value: JsonValue) -> bool:
 
 
 def _recover_atomic_publication_aliases(path: Path) -> None:
-    """Remove a staging hard link left by a crash after immutable publication."""
+    """Remove recoverable staging files without disturbing a live pre-link publisher."""
     try:
         published = os.lstat(path)
     except FileNotFoundError:
-        return
-    if not stat.S_ISREG(published.st_mode) or stat.S_ISLNK(published.st_mode):
+        published = None
+    if published is not None and (
+        not stat.S_ISREG(published.st_mode) or stat.S_ISLNK(published.st_mode)
+    ):
         raise ValueError(f"study evidence file must be a regular file: {path}")
     prefix = f".publish-{path.name}-"
     changed = False
@@ -1918,9 +1927,23 @@ def _recover_atomic_publication_aliases(path: Path) -> None:
             staged = os.lstat(candidate)
         except FileNotFoundError:
             continue
-        if (staged.st_dev, staged.st_ino) != (published.st_dev, published.st_ino):
+        published_alias = published is not None and (staged.st_dev, staged.st_ino) == (
+            published.st_dev,
+            published.st_ino,
+        )
+        if not published_alias:
+            owner_pid = _publication_staging_owner_pid(path, candidate)
+            if owner_pid is None or _process_is_alive(owner_pid):
+                continue
+            # A dead pre-link publisher cannot run its finally block. Only remove the exact private
+            # regular file shape created above; malformed or hard-linked staging evidence remains a
+            # fail-closed integrity error rather than becoming a cleanup primitive.
+            _require_private_regular_file(candidate)
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            # Concurrent recovery of the same post-link alias is already the desired state.
             continue
-        candidate.unlink()
         changed = True
     if changed:
         directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -1928,6 +1951,38 @@ def _recover_atomic_publication_aliases(path: Path) -> None:
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)
+
+
+def _publication_staging_owner_pid(path: Path, candidate: Path) -> int | None:
+    """Return the canonical owner PID embedded in a publication staging filename."""
+    prefix = f".publish-{path.name}-pid-"
+    if not candidate.name.startswith(prefix):
+        return None
+    suffix = candidate.name.removeprefix(prefix)
+    pid_text, separator, nonce = suffix.partition("-")
+    if (
+        not separator
+        or not pid_text.isdecimal()
+        or pid_text.startswith("0")
+        or len(nonce) != 32
+        or any(character not in "0123456789abcdef" for character in nonce)
+    ):
+        return None
+    pid = int(pid_text)
+    return pid if 0 < pid <= 2_147_483_647 else None
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Conservatively report whether a staging owner may still publish its file."""
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)

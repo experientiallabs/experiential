@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -1001,6 +1004,112 @@ def test_append_only_evidence_crash_before_link_leaves_no_poisoned_final_path(
     store.verify_artifact(publication)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="SIGKILL recovery requires POSIX")
+def test_append_only_evidence_recovers_staging_from_sigkill_before_link(
+    tmp_path: Path,
+) -> None:
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="pre-link-sigkill-study",
+        clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=UTC),
+    )
+    content = {"kind": "protocol", "value": 4}
+    digest = _canonical_digest(content)
+    child_code = """
+import os
+import signal
+import sys
+from pathlib import Path
+
+from wmh.evals.harness_optimization_coordinator import LocalStudyEvidenceStore
+
+store = LocalStudyEvidenceStore(Path(sys.argv[1]), study_id="pre-link-sigkill-study")
+os.link = lambda *args, **kwargs: os.kill(os.getpid(), signal.SIGKILL)
+store.publish_artifact(
+    kind="protocol",
+    artifact_digest=sys.argv[2],
+    content={"kind": "protocol", "value": 4},
+)
+"""
+
+    child = subprocess.run(  # noqa: S603 - exact test interpreter and fixed local script
+        [sys.executable, "-c", child_code, str(tmp_path / "evidence"), digest],
+        check=False,
+    )
+
+    assert child.returncode == -signal.SIGKILL
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    staging = tuple(final.parent.glob(f".publish-{final.name}-*"))
+    assert len(staging) == 1
+    assert os.lstat(staging[0]).st_nlink == 1
+
+    publication = store.publish_artifact(
+        kind="protocol",
+        artifact_digest=digest,
+        content=content,
+    )
+
+    store.verify_artifact(publication)
+    assert not tuple(final.parent.glob(f".publish-{final.name}-*"))
+
+
+def test_append_only_evidence_preserves_a_live_pre_link_staging_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="live-pre-link-study",
+        clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=UTC),
+    )
+    content = {"kind": "protocol", "value": 5}
+    digest = _canonical_digest(content)
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    link_started = threading.Event()
+    allow_link = threading.Event()
+    real_link = os.link
+
+    def blocked_link(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if Path(os.fsdecode(destination)) == final:
+            link_started.set()
+            assert allow_link.wait(timeout=5)
+        real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(os, "link", blocked_link)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            store.publish_artifact,
+            kind="protocol",
+            artifact_digest=digest,
+            content=content,
+        )
+        assert link_started.wait(timeout=5)
+        try:
+            staging = tuple(final.parent.glob(f".publish-{final.name}-*"))
+            assert len(staging) == 1
+            coordinator_module._recover_atomic_publication_aliases(final)
+            assert staging[0].exists()
+        finally:
+            allow_link.set()
+        publication = future.result(timeout=5)
+
+    store.verify_artifact(publication)
+    assert not tuple(final.parent.glob(f".publish-{final.name}-*"))
+
+
 def test_append_only_evidence_recovers_post_link_crash_alias(tmp_path: Path) -> None:
     store = LocalStudyEvidenceStore(
         tmp_path / "evidence",
@@ -1047,7 +1156,10 @@ def test_concurrent_identical_artifact_publication_returns_one_persisted_receipt
     digest = _canonical_digest(content)
     final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
     barrier = threading.Barrier(2)
+    loser_reached_validation = threading.Event()
+    loser_threads: set[int] = set()
     real_link = os.link
+    real_require = coordinator_module._require_private_regular_file
 
     def racing_link(
         source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
@@ -1059,15 +1171,31 @@ def test_concurrent_identical_artifact_publication_returns_one_persisted_receipt
     ) -> None:
         if Path(os.fsdecode(destination)) == final:
             barrier.wait(timeout=5)
-        real_link(
-            source,
-            destination,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-            follow_symlinks=follow_symlinks,
-        )
+        try:
+            real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+        except FileExistsError:
+            loser_threads.add(threading.get_ident())
+            raise
+        if Path(os.fsdecode(destination)) == final:
+            assert loser_reached_validation.wait(timeout=5)
+
+    def racing_require(path: Path) -> None:
+        if path == final and threading.get_ident() in loser_threads:
+            try:
+                real_require(path)
+            finally:
+                loser_reached_validation.set()
+            return
+        real_require(path)
 
     monkeypatch.setattr(os, "link", racing_link)
+    monkeypatch.setattr(coordinator_module, "_require_private_regular_file", racing_require)
 
     def publish() -> StudyArtifactPublication:
         return store.publish_artifact(
