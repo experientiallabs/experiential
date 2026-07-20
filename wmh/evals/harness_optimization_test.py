@@ -589,9 +589,9 @@ def _protocol(
         retry_policy_digest=_digest("no-retries"),
         search_cost_binding=search_cost_binding,
         confirmation_budget=budget,
-        create_rate_policy_digest=_digest("create-rate-policy"),
         confirmation_slice_policy=slice_policy,
     )
+    assert protocol.create_rate_policy_digest == protocol.execution_plan.create_rate_policy_digest
     return protocol, qualification_roster, budget, search_cost_binding, slice_policy
 
 
@@ -1601,6 +1601,20 @@ def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
             checkpoint=checkpoints[-1],
             lifecycle=lifecycle,
             authorization=discovery_authorization,
+        )
+
+
+def test_protocol_rejects_create_rate_policy_digest_drift(tmp_path: Path) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    prepared, protocol = _prepare(tmp_path, manifest, default_agent("baseline"))
+
+    assert protocol.create_rate_policy_digest == protocol.execution_plan.create_rate_policy_digest
+    with pytest.raises(ValueError, match="create-rate policy"):
+        HarnessOptimizationProtocol.model_validate(
+            {
+                **prepared.protocol.model_dump(mode="json"),
+                "create_rate_policy_digest": _digest("caller-asserted-policy"),
+            }
         )
 
 

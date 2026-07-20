@@ -28,6 +28,12 @@ from wmh.config.store import validate_name
 from wmh.engine import load_world_model
 from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge
+from wmh.evals.harness_optimization_coordinator import (
+    DeterministicHarnessOptimizationRehearsalFactory,
+    HarnessOptimizationRehearsalFactory,
+    HarnessOptimizationStudyCoordinator,
+    HarnessOptimizationStudySpec,
+)
 from wmh.evals.tasks import TaskSpec, load_tasks
 from wmh.harness.create import ProposalRecord, create_harness
 from wmh.harness.doc import HarnessDoc
@@ -42,6 +48,70 @@ harness_app = typer.Typer(
 )
 register_harness_eval(harness_app)
 _console = Console()
+_OPTIMIZATION_REHEARSAL_FACTORY: HarnessOptimizationRehearsalFactory = (
+    DeterministicHarnessOptimizationRehearsalFactory()
+)
+_OPTIMIZE_SPEC_OPTION = typer.Option(
+    ...,
+    "--spec",
+    exists=True,
+    dir_okay=False,
+    readable=True,
+    help="Sealed HarnessOptimizationStudySpec JSON file.",
+)
+_OPTIMIZE_STATE_DIR_OPTION = typer.Option(
+    ...,
+    "--state-dir",
+    file_okay=False,
+    help="Private directory for durable coordinator, journal, and evidence state.",
+)
+
+
+@harness_app.command("optimize")
+def optimize_study(
+    spec_file: Path = _OPTIMIZE_SPEC_OPTION,
+    state_dir: Path = _OPTIMIZE_STATE_DIR_OPTION,
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Resume the exact study already present in --state-dir.",
+    ),
+    one_slice: bool = typer.Option(
+        False,
+        "--one-slice",
+        help="Advance exactly one phase or bounded execution slice, then exit.",
+    ),
+    rehearse: bool = typer.Option(
+        False,
+        "--rehearse",
+        help="Validate the frozen plan without state, credentials, providers, or sandboxes.",
+    ),
+) -> None:
+    """Run or resume a sealed ground-truth harness optimization study."""
+    try:
+        study_spec = HarnessOptimizationStudySpec.model_validate_json(spec_file.read_bytes())
+        if rehearse:
+            rehearsal = _OPTIMIZATION_REHEARSAL_FACTORY.build(study_spec)
+            _console.print_json(rehearsal.model_dump_json(indent=2))
+            return
+        coordinator = HarnessOptimizationStudyCoordinator.local(
+            study_spec,
+            state_dir=state_dir,
+            resume=resume,
+        )
+        while True:
+            advanced = coordinator.advance()
+            phase = advanced.current_phase.value if advanced.current_phase is not None else "none"
+            checkpoint = (
+                ""
+                if advanced.checkpoint_sequence is None
+                else f" checkpoint={advanced.checkpoint_sequence}"
+            )
+            _console.print(f"{advanced.kind.value}: phase={phase}{checkpoint}")
+            if one_slice or advanced.terminal:
+                return
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 @harness_app.command("list")
