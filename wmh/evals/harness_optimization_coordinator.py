@@ -909,6 +909,7 @@ def run_harness_optimization_confirmation_slice(
             runner,
             baseline=opened.baseline,
             candidate=opened.candidate,
+            previous=previous,
         )
         result.progress.require_protocol(protocol)
         if previous is not None:
@@ -1685,20 +1686,51 @@ def _run_async_confirmation_slice(
     *,
     baseline: HarnessDoc,
     candidate: HarnessDoc,
+    previous: PairedHarborSliceResult | None,
 ) -> PairedHarborSliceResult:
-    async def _resume_or_run() -> PairedHarborSliceResult:
+    async def _resume_recover_or_run() -> PairedHarborSliceResult:
         try:
             return await runner.resume_persisted_slice(
                 baseline=baseline,
                 candidate=candidate,
             )
         except PairedHarborNoActiveSliceIntentError:
+            recovered = await runner.recover_persisted_slice(
+                baseline=baseline,
+                candidate=candidate,
+            )
+            if recovered is None:
+                if previous is not None:
+                    raise ValueError(
+                        "paired runner progress is missing the persisted confirmation checkpoint"
+                    ) from None
+            elif previous is None:
+                if (
+                    recovered.progress.slice_index != 1
+                    or recovered.progress.previous_progress_digest is not None
+                    or recovered.progress.completed_before
+                ):
+                    raise ValueError(
+                        "paired runner progress is ahead of the uncheckpointed confirmation genesis"
+                    ) from None
+                return recovered
+            elif recovered == previous:
+                pass
+            elif (
+                recovered.progress.slice_index == previous.progress.slice_index + 1
+                and recovered.progress.previous_progress_digest == previous.progress.progress_digest
+            ):
+                return recovered
+            else:
+                raise ValueError(
+                    "paired runner progress differs from the persisted confirmation checkpoint"
+                ) from None
             return await runner.run_slice(baseline=baseline, candidate=candidate)
 
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_resume_or_run())
+        return asyncio.run(_resume_recover_or_run())
     raise RuntimeError(
         "synchronous study coordination cannot run inside an active event loop; invoke it from "
         "a worker thread or process"
