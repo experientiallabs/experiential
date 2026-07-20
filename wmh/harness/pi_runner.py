@@ -251,8 +251,16 @@ class PiInfrastructureError(RuntimeError):
             if (provider_failure_stage is None) != (provider_failure_reason is None):
                 raise ValueError("provider failure stage and reason must be supplied together")
             default_stage, default_reason = provider_defaults[kind]
-            self.provider_failure_stage = provider_failure_stage or default_stage
-            self.provider_failure_reason = provider_failure_reason or default_reason
+            self.provider_failure_stage = (
+                provider_failure_stage
+                if provider_failure_stage is not None
+                else default_stage
+            )
+            self.provider_failure_reason = (
+                provider_failure_reason
+                if provider_failure_reason is not None
+                else default_reason
+            )
         else:
             if provider_failure_stage is not None or provider_failure_reason is not None:
                 raise ValueError("task-environment failures cannot carry provider attribution")

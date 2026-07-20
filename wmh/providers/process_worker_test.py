@@ -300,6 +300,7 @@ def test_worker_child_forfeits_response_identity_mismatch(
         mod._send_frame(client, mod._CompletionRequestFrame(request=_REQUEST))
         failure = mod._TerminalFailureFrame.model_validate(mod._receive_frame(client))
         assert failure.reason is mod._TerminalFailureReason.RESPONSE_IDENTITY
+        assert failure.stage is ProviderFailureStage.RECEIPT
         worker_thread.join(timeout=5)
         assert worker_thread.is_alive() is False
     finally:
@@ -353,28 +354,58 @@ def test_worker_child_preserves_only_bounded_failure_stage(
     assert exit_codes == [0]
 
 
+def test_terminal_failure_frame_rejects_stage_reason_drift() -> None:
+    with pytest.raises(ValueError, match="stage differs from its reason"):
+        mod._TerminalFailureFrame(
+            reason=mod._TerminalFailureReason.BUDGET_EXCEEDED,
+            stage=ProviderFailureStage.RECEIPT,
+        )
+
+
 @pytest.mark.parametrize(
-    ("reason", "error_type"),
+    ("reason", "stage", "error_type"),
     [
-        (mod._TerminalFailureReason.BUDGET_BREACH, BudgetBreachError),
-        (mod._TerminalFailureReason.BUDGET_EXCEEDED, BudgetExceededError),
-        (mod._TerminalFailureReason.BUDGET_INTEGRITY, BudgetIntegrityError),
-        (mod._TerminalFailureReason.UNPRICED_USAGE, UnpricedProviderUsageError),
-        (mod._TerminalFailureReason.RESPONSE_IDENTITY, ProviderResponseIdentityError),
+        (
+            mod._TerminalFailureReason.BUDGET_BREACH,
+            ProviderFailureStage.BUDGET,
+            BudgetBreachError,
+        ),
+        (
+            mod._TerminalFailureReason.BUDGET_EXCEEDED,
+            ProviderFailureStage.BUDGET,
+            BudgetExceededError,
+        ),
+        (
+            mod._TerminalFailureReason.BUDGET_INTEGRITY,
+            ProviderFailureStage.BUDGET,
+            BudgetIntegrityError,
+        ),
+        (
+            mod._TerminalFailureReason.UNPRICED_USAGE,
+            ProviderFailureStage.BUDGET,
+            UnpricedProviderUsageError,
+        ),
+        (
+            mod._TerminalFailureReason.RESPONSE_IDENTITY,
+            ProviderFailureStage.RECEIPT,
+            ProviderResponseIdentityError,
+        ),
     ],
 )
 def test_terminal_safety_frame_reaps_worker_and_blocks_a_second_request(
     monkeypatch: pytest.MonkeyPatch,
     reason: mod._TerminalFailureReason,
+    stage: ProviderFailureStage,
     error_type: type[RuntimeError],
 ) -> None:
     classified = mod._terminal_failure_frame(error_type("private provider detail"))
     assert classified is not None
     assert classified.reason is reason
+    assert classified.stage is stage
 
     _scripted_worker_command(
         monkeypatch,
-        {"kind": "terminal_failure", "reason": reason.value},
+        {"kind": "terminal_failure", "reason": reason.value, "stage": stage.value},
     )
     worker = mod.ProviderProcessWorker(_CONFIG)
     worker.start(TurnDeadline.after(2))

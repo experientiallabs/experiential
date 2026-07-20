@@ -151,6 +151,18 @@ class _TerminalFailureReason(StrEnum):
 class _TerminalFailureFrame(_StrictFrame):
     kind: Literal["terminal_failure"] = "terminal_failure"
     reason: _TerminalFailureReason
+    stage: ProviderFailureStage
+
+    @model_validator(mode="after")
+    def _bind_stage_to_reason(self) -> _TerminalFailureFrame:
+        expected = (
+            ProviderFailureStage.RECEIPT
+            if self.reason is _TerminalFailureReason.RESPONSE_IDENTITY
+            else ProviderFailureStage.BUDGET
+        )
+        if self.stage is not expected:
+            raise ValueError("provider terminal failure stage differs from its reason")
+        return self
 
 
 _StartupResponse = Annotated[
@@ -619,7 +631,12 @@ def _terminal_failure_frame(error: Exception) -> _TerminalFailureFrame | None:
         reason = _TerminalFailureReason.RESPONSE_IDENTITY
     else:
         return None
-    return _TerminalFailureFrame(reason=reason)
+    stage = (
+        ProviderFailureStage.RECEIPT
+        if reason is _TerminalFailureReason.RESPONSE_IDENTITY
+        else ProviderFailureStage.BUDGET
+    )
+    return _TerminalFailureFrame(reason=reason, stage=stage)
 
 
 def _terminal_failure_error(reason: _TerminalFailureReason) -> RuntimeError:
