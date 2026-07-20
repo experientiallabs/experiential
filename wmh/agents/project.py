@@ -34,9 +34,13 @@ from wmh.harness.tools import resolve_tools
 from wmh.providers.base import ToolCallingProvider
 
 PROJECT_WORKSPACE = "/home/user/project"
+PROJECT_SCRATCH_DIR = ".scratch"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
+_BASH_TIMEOUT_S = 60.0
+_BASH_PROCESS_TIMEOUT_S = 50
+_BASH_STREAM_CAP = 7_000
 _OUTPUT_CAP = 16_000
-_PROJECT_TOOLS = frozenset({"read_file", "write_file", "submit"})
+_PROJECT_TOOLS = frozenset({"bash", "read_file", "write_file", "submit"})
 _RECOVERABLE_SESSION_MARKERS = (
     "server disconnected",
     "connection reset",
@@ -53,6 +57,40 @@ _RECOVERABLE_SESSION_MARKERS = (
     "live session runner did not become ready",
     "channel send failed",
 )
+
+_BASH_FILTER_SCRIPT = f"""\
+const cap = {_BASH_STREAM_CAP};
+const half = Math.floor(cap / 2);
+let small = Buffer.alloc(0);
+let head = Buffer.alloc(0);
+let tail = Buffer.alloc(0);
+let total = 0;
+let truncated = false;
+process.stdin.on("data", (chunk) => {{
+  total += chunk.length;
+  if (!truncated) {{
+    small = Buffer.concat([small, chunk]);
+    if (small.length > cap) {{
+      truncated = true;
+      head = small.subarray(0, half);
+      tail = small.subarray(small.length - half);
+      small = Buffer.alloc(0);
+    }}
+  }} else {{
+    tail = Buffer.concat([tail, chunk]);
+    if (tail.length > half) tail = tail.subarray(tail.length - half);
+  }}
+}});
+process.stdin.on("end", () => {{
+  if (truncated) {{
+    process.stdout.write(head);
+    process.stdout.write(`\\n... ${{total - cap}} bytes truncated in sandbox ...\\n`);
+    process.stdout.write(tail);
+  }} else {{
+    process.stdout.write(small);
+  }}
+}});
+"""
 
 
 class ChannelFactory(Protocol):
@@ -118,6 +156,7 @@ class AgentProject:
         self._session_agent_hash: str | None = None
         self._session_provider: ToolCallingProvider | None = None
         self._network_locked_sandbox_id: int | None = None
+        self._shell_ready_sandbox_id: int | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
         # ``None`` preserves the historical unrestricted project-tool behavior. A concrete set is
         # one logical run's exact, project-relative write grant; it is cleared even when the turn
@@ -158,6 +197,7 @@ class AgentProject:
         if self._closing:
             raise RuntimeError("cannot write to a closed project")
         absolute = self._absolute_path(path)
+        self._reject_reserved_scratch(absolute)
         try:
             self._write_sandbox_file(self._sandbox, absolute, content)
         except Exception as error:
@@ -176,19 +216,18 @@ class AgentProject:
         self._file_contents[self._relative_path(absolute)] = content
 
     def read_text(self, path: str) -> str:
-        """Read one project-relative file."""
+        """Read one authoritative host or mediated-write project file."""
         if self._closing:
             raise RuntimeError("cannot read from a closed project")
         absolute = self._absolute_path(path)
+        self._reject_reserved_scratch(absolute)
         relative = self._relative_path(absolute)
-        try:
-            content = self._sandbox.files.read(absolute)
-        except Exception:
-            if relative in self._file_contents:
-                return self._file_contents[relative]
-            raise
-        self._file_contents[relative] = content
-        return content
+        if relative not in self._file_contents:
+            raise FileNotFoundError(
+                f"{relative!r} is not an authoritative project file; "
+                "publish agent output through write_file"
+            )
+        return self._file_contents[relative]
 
     def run(
         self,
@@ -363,6 +402,8 @@ class AgentProject:
             # Runner bootstrap has completed in channel_factory, but no agent-controlled source
             # has been imported yet. Remove egress before session_start materializes that code.
             self._lock_project_network()
+            if "bash" in agent.tools():
+                self._prepare_shell_workspace()
             skills = agent.skills()
             session = LiveSession(
                 channel,
@@ -409,6 +450,15 @@ class AgentProject:
             raise RuntimeError("owned project sandbox cannot disable internet access")
         update_network({"allow_internet_access": False})
         self._network_locked_sandbox_id = id(self._sandbox)
+
+    def _prepare_shell_workspace(self) -> None:
+        """Create the only project directory writable by unprivileged shell commands."""
+        if self._shell_ready_sandbox_id == id(self._sandbox):
+            return
+        scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
+        command = f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
+        self._sandbox.commands.run(command, timeout=30)
+        self._shell_ready_sandbox_id = id(self._sandbox)
 
     def _emit_session_event(self, event: SessionEvent) -> None:
         """Route session events to the currently active project turn."""
@@ -554,6 +604,7 @@ class AgentProject:
         self._active_sandbox_started_at = replacement_started_at
         self._sandbox = replacement
         self._network_locked_sandbox_id = None
+        self._shell_ready_sandbox_id = None
         if self._owns_sandbox:
             self._retire_sandbox(previous)
 
@@ -567,28 +618,74 @@ class AgentProject:
         _handle, started_at = self._live_sandboxes.pop(id(sandbox))
         self._retired_sandbox_seconds += max(0.0, retired_at - started_at)
 
+    def _run_bash(self, command: str, emit: Callable[[str, str], None]) -> ToolOutcome:
+        """Run one bounded command as an unprivileged user in disposable scratch space.
+
+        The project tree is owned by the ordinary sandbox user and is readable but not writable
+        by ``nobody``. Shell commands start in a sticky scratch directory and receive an empty
+        environment, no network, no privilege escalation, and bounded process and output streams.
+        Durable candidate outputs must cross the separate exact-file ``write_file`` grant.
+        """
+        filter_command = f"node -e {shlex.quote(_BASH_FILTER_SCRIPT)}"
+        script = (
+            "set -o pipefail\n"
+            f"timeout --kill-after=3s {_BASH_PROCESS_TIMEOUT_S}s "
+            f"bash --noprofile --norc -c {shlex.quote(command)} "
+            f"2> >({filter_command} >&2) | {filter_command}\n"
+            "status=${PIPESTATUS[0]}\n"
+            'exit "$status"'
+        )
+        scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
+        wrapped = (
+            "env -i PATH=/usr/local/bin:/usr/bin:/bin "
+            f"HOME={shlex.quote(scratch)} TMPDIR={shlex.quote(scratch)} "
+            "USER=nobody LOGNAME=nobody "
+            "setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all "
+            f"--bounding-set=-all bash --noprofile --norc -c {shlex.quote(script)}"
+        )
+        try:
+            result = self._sandbox.commands.run(
+                wrapped,
+                user="nobody",
+                cwd=scratch,
+                timeout=_BASH_TIMEOUT_S,
+            )
+            stdout = _bounded_bash_stream(str(getattr(result, "stdout", "") or ""))
+            stderr = _bounded_bash_stream(str(getattr(result, "stderr", "") or ""))
+            exit_code = int(getattr(result, "exit_code", 0) or 0)
+        except Exception as error:  # noqa: BLE001 - E2B reports non-zero exits as exceptions
+            stdout = _bounded_bash_stream(str(getattr(error, "stdout", "") or ""))
+            stderr = _bounded_bash_stream(str(getattr(error, "stderr", "") or str(error)))
+            exit_code = int(getattr(error, "exit_code", 1) or 1)
+
+        if stdout:
+            emit("stdout", stdout)
+        if stderr:
+            emit("stderr", stderr)
+        body = stdout + stderr
+        if exit_code != 0:
+            body = f"{body}\n[exit {exit_code}]"
+        return _capped(body, is_error=exit_code != 0)
+
     def _execute_tool(
         self,
         name: str,
         arguments: JsonObject,
         emit: Callable[[str, str], None],
     ) -> ToolOutcome:
-        del emit  # Project file tools return one bounded observation; they do not stream output.
         try:
+            if name == "bash":
+                return self._run_bash(str(arguments.get("command", "")), emit)
             if name == "read_file":
                 path = self._tool_path(str(arguments.get("path", "")))
                 relative = self._relative_path(path)
-                try:
+                content = self._file_contents.get(relative)
+                if content is None:
                     content = self._sandbox.files.read(path)
-                except Exception:
-                    if relative not in self._file_contents:
-                        raise
-                    content = self._file_contents[relative]
-                else:
-                    self._file_contents[relative] = content
                 return _capped(content)
             if name == "write_file":
                 path = self._tool_path(str(arguments.get("path", "")))
+                self._reject_reserved_scratch(path)
                 relative = self._relative_path(path)
                 if (
                     self._active_writable_files is not None
@@ -604,6 +701,12 @@ class AgentProject:
         except Exception as error:  # noqa: BLE001 - tool errors are agent observations
             return ToolOutcome(content=f"{name} failed: {error}", is_error=True)
         return ToolOutcome(content=f"tool {name!r} not available", is_error=True)
+
+    def _reject_reserved_scratch(self, absolute: str) -> None:
+        """Keep Bash scratch outside the authoritative host-mediated file namespace."""
+        relative = PurePosixPath(self._relative_path(absolute))
+        if relative.parts[0] == PROJECT_SCRATCH_DIR:
+            raise ValueError(f"{PROJECT_SCRATCH_DIR!r} is reserved for bash scratch files")
 
     def _tool_path(self, path: str) -> str:
         """Resolve an agent-supplied path while containing it to the project."""
@@ -670,6 +773,20 @@ def _usage_delta(after: TokenUsage, before: TokenUsage) -> TokenUsage:
         input_tokens=after.input_tokens - before.input_tokens,
         output_tokens=after.output_tokens - before.output_tokens,
         calls=after.calls - before.calls,
+    )
+
+
+def _bounded_bash_stream(content: str) -> str:
+    """Keep both ends of one shell stream within the live-session event budget."""
+    if len(content) <= _BASH_STREAM_CAP or (
+        len(content) <= _BASH_STREAM_CAP + 512 and "bytes truncated in sandbox" in content
+    ):
+        return content
+    half = _BASH_STREAM_CAP // 2
+    omitted = len(content) - _BASH_STREAM_CAP
+    return (
+        f"{content[:half]}\n... {omitted} characters truncated by Bash boundary ...\n"
+        f"{content[-half:]}"
     )
 
 

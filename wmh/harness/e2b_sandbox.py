@@ -104,9 +104,14 @@ class SandboxCommands(Protocol):
         cmd: str,
         background: bool | None = None,
         *,
+        cwd: str | None = None,
         envs: dict[str, str] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        request_timeout: float | None = None,
         stdin: bool | None = None,
         timeout: float | None = None,
+        user: str | None = None,
     ) -> CommandOutput | CommandHandle: ...
 
     def connect(

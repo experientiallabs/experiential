@@ -1235,14 +1235,182 @@ def test_agent_file_tools_reject_paths_outside_the_project() -> None:
         assert "escapes project workspace" in outcome.content
 
 
-@pytest.mark.parametrize("tool", ["bash", "read_skill"])
-def test_project_rejects_agents_with_uncontained_tools(tool: str) -> None:
+def test_project_bash_runs_as_an_unprivileged_bounded_scratch_process() -> None:
+    """Shell exploration cannot run as the owner of authoritative project files."""
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    class _BashCommands(_Commands):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[dict[str, object]] = []
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del background
+            self.runs.append(cmd)
+            self.calls.append(dict(kwargs))
+            return _Output(stdout="inspected\n", stderr="warning\n")
+
+    commands = _BashCommands()
+    sandbox.commands = commands
+    emitted: list[tuple[str, str]] = []
+
+    outcome = project._execute_tool(
+        "bash",
+        {"command": "pwd && rg TODO ../candidates"},
+        lambda stream, data: emitted.append((stream, data)),
+    )
+
+    assert outcome.is_error is False
+    assert outcome.content == "inspected\nwarning\n"
+    assert emitted == [("stdout", "inspected\n"), ("stderr", "warning\n")]
+    [call] = commands.calls
+    assert call == {
+        "user": "nobody",
+        "cwd": "/home/user/project/.scratch",
+        "timeout": 60.0,
+    }
+    [command] = commands.runs
+    assert command.startswith("env -i ")
+    assert "setpriv --no-new-privs" in command
+    assert "timeout --kill-after=3s 50s" in command
+    assert "pwd && rg TODO ../candidates" in command
+
+
+def test_project_bash_bounds_streams_before_live_session_publication() -> None:
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    class _NoisyCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del cmd, background, kwargs
+            return _Output(stdout="x" * 20_000, stderr="warning")
+
+    sandbox.commands = _NoisyCommands()
+    emitted: list[tuple[str, str]] = []
+
+    outcome = project._execute_tool(
+        "bash", {"command": "generate-output"}, lambda stream, data: emitted.append((stream, data))
+    )
+
+    assert outcome.is_error is False
+    assert outcome.truncated is False
+    assert "13000 characters truncated by Bash boundary" in outcome.content
+    assert emitted[0][0] == "stdout"
+    assert len(emitted[0][1]) < 7_100
+    assert emitted[1] == ("stderr", "warning")
+
+
+def test_project_bash_surfaces_nonzero_exit_with_bounded_streams() -> None:
+    class _CommandError(RuntimeError):
+        stdout = "partial output"
+        stderr = "command failed"
+        exit_code = 7
+
+    class _FailingCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del cmd, background, kwargs
+            raise _CommandError("non-zero")
+
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    sandbox.commands = _FailingCommands()
+    emitted: list[tuple[str, str]] = []
+
+    outcome = project._execute_tool(
+        "bash", {"command": "fail"}, lambda stream, data: emitted.append((stream, data))
+    )
+
+    assert outcome.is_error is True
+    assert outcome.content == "partial outputcommand failed\n[exit 7]"
+    assert emitted == [("stdout", "partial output"), ("stderr", "command failed")]
+
+
+def test_project_bash_cannot_publish_or_mutate_authoritative_files() -> None:
+    """Only host and granted write_file calls cross the scratch authority boundary."""
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    project.write_text("evidence/input.txt", "trusted")
+
+    class _MutatingCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del cmd, background, kwargs
+            sandbox.files.values["/home/user/project/evidence/input.txt"] = "tampered"
+            sandbox.files.values["/home/user/project/candidate.json"] = "unmediated"
+            return _Output()
+
+    sandbox.commands = _MutatingCommands()
+
+    outcome = project._execute_tool("bash", {"command": "attack"}, lambda stream, data: None)
+
+    assert outcome.is_error is False
+    assert project.read_text("evidence/input.txt") == "trusted"
+    read = project._execute_tool(
+        "read_file", {"path": "evidence/input.txt"}, lambda stream, data: None
+    )
+    assert read.content == "trusted"
+    with pytest.raises(FileNotFoundError, match="authoritative project file"):
+        project.read_text("candidate.json")
+
+
+def test_project_rejects_mediated_writes_into_reserved_scratch() -> None:
+    project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
+
+    outcome = project._execute_tool(
+        "write_file",
+        {"path": ".scratch/candidate.json", "content": "not authoritative"},
+        lambda stream, data: None,
+    )
+
+    assert outcome.is_error is True
+    assert "reserved for bash" in outcome.content
+
+
+def test_project_accepts_bash_as_a_contained_agent_tool() -> None:
+    base = meta_agent()
+    shell_agent = HarnessDoc(
+        name="shell-agent",
+        surfaces=[
+            surface.model_copy(update={"content": "bash\nsubmit"})
+            if surface.id == TOOL_POLICY_ID
+            else surface
+            for surface in base.surfaces
+        ],
+    )
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "submit",
+            "arguments": {"answer": "done"},
+        },
+        {"type": "state", "status": "idle", "reason": "completed"},
+    ]
+    sandbox = _Sandbox()
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+
+    assert project.run(shell_agent, _Provider(), "inspect", timeout=1).answer == "done"
+    assert any(
+        command
+        == "mkdir -p /home/user/project/.scratch && chmod 1777 /home/user/project/.scratch"
+        for command in sandbox.commands.runs
+    )
+
+
+def test_project_rejects_agents_with_uncontained_tools() -> None:
     """The project still rejects capabilities outside its isolated tool allowlist."""
     base = meta_agent()
     uncontained = HarnessDoc(
         name="uncontained",
         surfaces=[
-            surface.model_copy(update={"content": f"{tool}\nsubmit"})
+            surface.model_copy(update={"content": "read_skill\nsubmit"})
             if surface.id == TOOL_POLICY_ID
             else surface
             for surface in base.surfaces
@@ -1250,5 +1418,5 @@ def test_project_rejects_agents_with_uncontained_tools(tool: str) -> None:
     )
     project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
 
-    with pytest.raises(ValueError, match=f"uncontained tools: {tool}"):
+    with pytest.raises(ValueError, match="uncontained tools: read_skill"):
         project.run(uncontained, _Provider(), "escape", timeout=1)
