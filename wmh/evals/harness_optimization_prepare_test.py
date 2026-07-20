@@ -43,6 +43,7 @@ from wmh.evals.harness_optimization_prepare import (
     HarnessOptimizationCanaryManifest,
     PreparedHarnessOptimizationCanary,
     _publish_and_reopen,
+    _verify_clean_git_checkout,
     prepare_e2b_harness_optimization_canary,
 )
 from wmh.evals.study_provenance import HarnessOptimizationCodeProvenance
@@ -435,6 +436,42 @@ def test_atomic_publication_recovers_after_sigkill_in_hard_link_window(
     assert reopened == runner
     assert not staging.exists()
     assert destination.stat().st_nlink == 1
+
+
+def test_atomic_publication_preserves_the_original_descriptor_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = E2BPiRunnerArtifact.from_json_bytes(_RUNNER_BYTES)
+    destination = tmp_path / "sealed.json"
+
+    def fail_fchmod(descriptor: int, mode: int) -> None:
+        del descriptor, mode
+        raise OSError("synthetic fchmod failure")
+
+    monkeypatch.setattr(
+        "wmh.evals.harness_optimization_prepare.os.fchmod",
+        fail_fchmod,
+    )
+
+    with pytest.raises(OSError, match="synthetic fchmod failure"):
+        _publish_and_reopen(destination, runner, E2BPiRunnerArtifact)
+
+    assert not destination.exists()
+    assert not tuple(tmp_path.glob(".sealed.json.staging-*"))
+
+
+def test_checkout_failure_includes_bounded_git_diagnostics(tmp_path: Path) -> None:
+    repository = tmp_path / "not-a-repository"
+    repository.mkdir()
+
+    with pytest.raises(ValueError, match=r"Git checkout verification failed: .+"):
+        _verify_clean_git_checkout(
+            repository,
+            _LAUNCH_COMMIT,
+            None,
+            _BASELINE_COMMIT,
+        )
 
 
 def test_authoritative_split_commitment_rejects_non_discovery_task_before_qualification(

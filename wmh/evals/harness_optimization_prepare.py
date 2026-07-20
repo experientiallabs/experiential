@@ -1331,7 +1331,9 @@ def _publish_and_reopen(
                 os.fsync(handle.fileno())
         finally:
             if staging_descriptor >= 0:
-                os.close(staging_descriptor)
+                descriptor_to_close = staging_descriptor
+                staging_descriptor = -1
+                os.close(descriptor_to_close)
         try:
             os.link(staging_path, path, follow_symlinks=False)
         except (FileExistsError, FileNotFoundError):
@@ -1452,7 +1454,11 @@ def _verify_clean_git_checkout(
             timeout=30,
         )
         if check and result.returncode != 0:
-            raise ValueError("Git checkout verification failed")
+            detail = " ".join(result.stderr.split())
+            message = "Git checkout verification failed"
+            if detail:
+                message = f"{message}: {detail[:512]}"
+            raise ValueError(message)
         return result.stdout.strip()
 
     if git("rev-parse", "--show-toplevel") != str(repository):
