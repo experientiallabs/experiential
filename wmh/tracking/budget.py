@@ -45,6 +45,7 @@ from wmh.providers.base import (
     VerifyResult,
     verify_via_ping,
 )
+from wmh.providers.models import resolve_provider_model
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _ZERO_DIGEST = "sha256:" + "0" * 64
@@ -215,8 +216,6 @@ class ProviderTariffRoute(BaseModel):
                     "query, or fragment"
                 )
         if config.model_type is not None:
-            from wmh.providers.models import resolve_provider_model
-
             resolved = resolve_provider_model(config.kind, config.model)
             if resolved.model_type != config.model_type:
                 raise ValueError("tariff route model_type differs from its runtime model")
@@ -2089,6 +2088,7 @@ class BudgetedProvider:
         # object as ``None``. A null container reports no usage dimension, so it is safe to drop.
         # Keep every populated detail object and every unknown field, including unknown nulls,
         # so a new or semantically present billing dimension still fails closed.
+        # SDK upgrades that add null placeholder fields require explicit review before allowlisting.
         extras = {
             name: value
             for name, value in (usage.model_extra or {}).items()
