@@ -1,0 +1,14 @@
+{
+  "suite": "tau-bench",
+  "executor": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+  "probed_steps": 25,
+  "failures": 3,
+  "failure_classes": {
+    "derivable": 0,
+    "session": 0,
+    "unknowable": 3
+  },
+  "headroom": 0.0,
+  "probe_fidelity": 0.9656,
+  "cost_usd": 0.352472
+}

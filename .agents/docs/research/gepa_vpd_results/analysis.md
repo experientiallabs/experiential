@@ -64,6 +64,22 @@ essentially confirmed (+0.029). H4 (b=16) not run.
 - T3 strong-reflect arm wasn't in the driver (OpenAI executor + Bedrock reflector is
   supported by the code; it just wasn't bought). Finding 3 rests on the two Haiku cells.
 
+## Round 2 / E4: headroom probe v1 FAILS validation (2026-07-20)
+
+All 5 cells probed ($3.64 total, `probe_*.json`). The probe does NOT rank-order the measured
+lifts: it returns headroom 0.00 on Haiku x tau (measured +0.029, the parity cell) and an
+identical 0.07 on Mini x terminal (+0.051) and Haiku x terminal (+0.010). Failure
+classifications are ~all "unknowable" everywhere, including cells GEPA demonstrably lifted.
+
+Why it fails, and what it teaches: GEPA's real gains on the winning cells must come from
+graded improvements on steps ABOVE the 0.8 failure threshold (convention polish moving 0.85
+to 0.95), which a binary fail-then-classify probe cannot see. Also tau's valid band is
+near-saturated under RAG for both executors (probe fidelity 0.966/0.971), so a
+failure-counting probe has almost nothing to count there. A v2 would classify all imperfect
+steps (< 0.95), weight by score deficit, and persist per-step data - deferred until E1-E3
+settle whether the gate is even needed. Until then there is NO validated cheap predictor of
+executor x corpus headroom; the honest gate remains "run the $3-6 RAG anchor, then decide".
+
 ## Build-ladder consequences (proposed)
 
 - Frontier serve models: search-only build (GEPA off) as #163 recommended; #97's +0.02 at

@@ -1,0 +1,14 @@
+{
+  "suite": "terminal-tasks",
+  "executor": "us.anthropic.claude-opus-4-7",
+  "probed_steps": 28,
+  "failures": 14,
+  "failure_classes": {
+    "derivable": 1,
+    "session": 1,
+    "unknowable": 12
+  },
+  "headroom": 0.07142857142857142,
+  "probe_fidelity": 0.6730714285714287,
+  "cost_usd": 1.4611149999999997
+}

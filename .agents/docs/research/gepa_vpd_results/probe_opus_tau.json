@@ -1,0 +1,14 @@
+{
+  "suite": "tau-bench",
+  "executor": "us.anthropic.claude-opus-4-7",
+  "probed_steps": 25,
+  "failures": 2,
+  "failure_classes": {
+    "derivable": 0,
+    "session": 0,
+    "unknowable": 2
+  },
+  "headroom": 0.0,
+  "probe_fidelity": 0.9706,
+  "cost_usd": 0.7826549999999999
+}

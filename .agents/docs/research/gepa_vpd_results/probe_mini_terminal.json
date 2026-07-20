@@ -1,0 +1,14 @@
+{
+  "suite": "terminal-tasks",
+  "executor": "openai/gpt-5.4-mini",
+  "probed_steps": 28,
+  "failures": 14,
+  "failure_classes": {
+    "derivable": 1,
+    "session": 1,
+    "unknowable": 12
+  },
+  "headroom": 0.07142857142857142,
+  "probe_fidelity": 0.5796428571428571,
+  "cost_usd": 0.466405
+}
