@@ -380,6 +380,11 @@ class HarborRosterQualificationRuntime(BaseModel):
                             "qualification task names must be canonical; remove surrounding "
                             "whitespace"
                         )
+                    if any(marker in task_name for marker in ("*", "?", "[", "]")):
+                        raise ValueError(
+                            "qualification task names cannot contain Harbor glob patterns; "
+                            "provide literal task directory names"
+                        )
                     validate_durable_text(task_name, field="qualification task name")
         return self
 
@@ -757,15 +762,42 @@ class HarborRosterQualifier:
                 path.resolve().name: dataset_id
                 for dataset_id, path in self._runtime.dataset_paths_by_id.items()
             }
-            resolved: list[_ResolvedQualificationTask] = []
+            prepared_by_dataset: list[tuple[str, PreparedHarborTask]] = []
             for item in prepared:
-                identity = item.identity
                 try:
                     dataset_id = source_to_dataset[item.task.task_dir.parent.name]
                 except KeyError:
                     raise RuntimeError(
                         "prepared Harbor task source does not match a declared dataset"
                     ) from None
+                prepared_by_dataset.append((dataset_id, item))
+            selected = self._runtime.task_names_by_dataset_id
+            if selected is not None:
+                actual = {
+                    dataset_id: tuple(
+                        sorted(
+                            item.identity.task_name
+                            for prepared_dataset_id, item in prepared_by_dataset
+                            if prepared_dataset_id == dataset_id
+                        )
+                    )
+                    for dataset_id in selected
+                }
+                if actual != selected:
+                    changed = sorted(
+                        dataset_id
+                        for dataset_id, task_names in selected.items()
+                        if actual[dataset_id] != task_names
+                    )
+                    raise ValueError(
+                        "prepared Harbor tasks differ from the declared exact task names for "
+                        "dataset(s): "
+                        + ", ".join(changed)
+                        + "; provide existing literal task directory names"
+                    )
+            resolved: list[_ResolvedQualificationTask] = []
+            for dataset_id, item in prepared_by_dataset:
+                identity = item.identity
                 commitment = _PreparedTaskCommitment(
                     dataset_id=dataset_id,
                     task_id=identity.task_identity,

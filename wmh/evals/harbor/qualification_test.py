@@ -365,6 +365,9 @@ def test_local_qualification_walks_only_the_declared_task_subset(
         ({"terminalbench": ("task-b", "task-a")}, "canonical"),
         ({"terminalbench": ("task-a", "task-a")}, "canonical"),
         ({"terminalbench": (" task-a",)}, "canonical"),
+        ({"terminalbench": ("*",)}, "glob"),
+        ({"terminalbench": ("task-?",)}, "glob"),
+        ({"terminalbench": ("task-[ab]",)}, "glob"),
     ],
 )
 def test_qualification_task_subset_must_be_explicit_and_canonical(
@@ -378,6 +381,38 @@ def test_qualification_task_subset_must_be_explicit_and_canonical(
             dataset_paths_by_id={"terminalbench": (tmp_path / "dataset").resolve()},
             task_names_by_dataset_id=task_names_by_dataset_id,
         )
+
+
+def test_qualification_rejects_a_partially_resolved_declared_subset_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset, "task-a")
+    _write_task(dataset, "excluded-task")
+    starts: list[str] = []
+    stops: list[str] = []
+    _forbid_agent_provider_and_verifier(monkeypatch)
+    _install_fake_environments(
+        monkeypatch,
+        backend=HarborEnvironmentBackend.LOCAL,
+        starts=starts,
+        stops=stops,
+    )
+    qualifier = _local_qualifier(
+        tmp_path,
+        dataset,
+        operation_id="partially-resolved-subset",
+        task_names=("missing-task", "task-a"),
+    )
+
+    with pytest.raises(mod.HarborRosterQualificationError) as caught:
+        asyncio.run(qualifier.qualify())
+
+    assert "differ from the declared exact task names" in str(caught.value.__cause__)
+    assert starts == []
+    assert stops == []
+    assert not qualifier.roster_path.exists()
 
 
 def test_partial_failure_reuses_completed_evidence_without_relaunch(
