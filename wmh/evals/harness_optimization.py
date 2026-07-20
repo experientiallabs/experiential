@@ -24,6 +24,7 @@ from wmh.evals.harbor.paired_runner import (
     PairedHarborPanelRoute,
     PairedHarborProtocol,
     PairedHarborRunReport,
+    PairedHarborSlicePolicy,
     PrequalifiedHarborRoster,
 )
 from wmh.evals.paired import (
@@ -54,6 +55,7 @@ from wmh.evals.study_lifecycle import (
     StudyLifecycleController,
     StudySliceResult,
 )
+from wmh.harness.cost import SearchCostBinding, validate_search_cost_components
 from wmh.harness.create import (
     CreateProgress,
     ProposalRecord,
@@ -264,10 +266,10 @@ class HarnessOptimizationProtocol(BaseModel):
         qualification_roster: PrequalifiedHarborRoster,
         max_concurrent_blocks: int,
         retry_policy_digest: str,
-        search_cost_binding_digest: str,
+        search_cost_binding: SearchCostBinding,
         confirmation_budget: PairedHarborBudgetRuntime,
         create_rate_policy_digest: str,
-        confirmation_slice_policy_digest: str,
+        confirmation_slice_policy: PairedHarborSlicePolicy,
     ) -> HarnessOptimizationProtocol:
         """Freeze the public contract from a still-private benchmark partition."""
         expected_roster_digest = _partition_roster_digest(partition)
@@ -282,13 +284,19 @@ class HarnessOptimizationProtocol(BaseModel):
         frozen_budget = PairedHarborBudgetRuntime.model_validate(
             confirmation_budget.model_dump(mode="json")
         )
+        frozen_search_cost_binding = SearchCostBinding.model_validate(
+            search_cost_binding.model_dump(mode="json")
+        )
+        frozen_slice_policy = PairedHarborSlicePolicy.model_validate(
+            confirmation_slice_policy.model_dump(mode="json")
+        )
         if frozen_roster.execution_plan_digest != frozen_plan.digest:
             raise ValueError("qualified roster differs from the optimization execution plan")
         expected_tasks = {task.task_id: task.content_digest for task in partition.tasks}
         qualified_tasks = {task.task_id: task.content_digest for task in frozen_roster.tasks}
         if qualified_tasks != expected_tasks:
             raise ValueError("qualified roster differs from the optimization benchmark roster")
-        return cls(
+        protocol = cls(
             experiment_id=experiment_id,
             protocol_id=protocol_id,
             provenance=provenance,
@@ -304,13 +312,15 @@ class HarnessOptimizationProtocol(BaseModel):
             qualification_roster_digest=frozen_roster.digest,
             max_concurrent_blocks=max_concurrent_blocks,
             retry_policy_digest=retry_policy_digest,
-            search_cost_binding_digest=search_cost_binding_digest,
+            search_cost_binding_digest=frozen_search_cost_binding.digest,
             confirmation_budget_policy_digest=frozen_budget.policy.policy_digest,
             confirmation_budget_ledger_identity=frozen_budget.ledger_identity,
             confirmation_budget_binding_digest=frozen_budget.binding_digest,
             create_rate_policy_digest=create_rate_policy_digest,
-            confirmation_slice_policy_digest=confirmation_slice_policy_digest,
+            confirmation_slice_policy_digest=frozen_slice_policy.digest,
         )
+        _validate_search_cost_binding(protocol, frozen_search_cost_binding)
+        return protocol
 
     @property
     def digest(self) -> str:
@@ -346,6 +356,12 @@ class HarnessOptimizationDiscoveryContract(BaseModel):
 
     protocol: HarnessOptimizationProtocol
     baseline: HarnessDoc
+    search_cost_binding: SearchCostBinding
+
+    @model_validator(mode="after")
+    def _validate_discovery_contract(self) -> Self:
+        _validate_search_cost_binding(self.protocol, self.search_cost_binding)
+        return self
 
 
 class PreparedHarnessOptimizationStudy(BaseModel):
@@ -356,8 +372,10 @@ class PreparedHarnessOptimizationStudy(BaseModel):
     protocol: HarnessOptimizationProtocol
     partition: BenchmarkPartitionManifest
     baseline: HarnessDoc
+    search_cost_binding: SearchCostBinding
     qualification_roster: PrequalifiedHarborRoster
     confirmation_budget: PairedHarborBudgetRuntime
+    confirmation_slice_policy: PairedHarborSlicePolicy
 
     @model_validator(mode="after")
     def _validate_prepared_state(self) -> Self:
@@ -376,6 +394,7 @@ class PreparedHarnessOptimizationStudy(BaseModel):
             raise ValueError("baseline differs from the optimization protocol")
         if self.baseline.runtime_kind() != "pi-node":
             raise ValueError("harness optimization currently requires a pi-node baseline")
+        _validate_search_cost_binding(self.protocol, self.search_cost_binding)
         if self.qualification_roster.digest != self.protocol.qualification_roster_digest:
             raise ValueError("qualified roster differs from the optimization protocol")
         if self.qualification_roster.execution_plan_digest != self.protocol.execution_plan.digest:
@@ -389,6 +408,13 @@ class PreparedHarnessOptimizationStudy(BaseModel):
             != self.protocol.confirmation_budget_binding_digest
         ):
             raise ValueError("confirmation budget differs from the optimization protocol")
+        if (
+            self.search_cost_binding.policy != self.confirmation_budget.policy
+            or self.search_cost_binding.ledger_identity != self.confirmation_budget.ledger_identity
+        ):
+            raise ValueError("search and confirmation must share one budget authority")
+        if self.confirmation_slice_policy.digest != self.protocol.confirmation_slice_policy_digest:
+            raise ValueError("confirmation slice policy differs from the optimization protocol")
         return self
 
     def discovery_contract(self) -> HarnessOptimizationDiscoveryContract:
@@ -396,6 +422,7 @@ class PreparedHarnessOptimizationStudy(BaseModel):
         return HarnessOptimizationDiscoveryContract(
             protocol=self.protocol.model_copy(deep=True),
             baseline=self.baseline.model_copy(deep=True),
+            search_cost_binding=self.search_cost_binding.model_copy(deep=True),
         )
 
 
@@ -509,19 +536,27 @@ def prepare_harness_optimization_study(
     protocol: HarnessOptimizationProtocol,
     partition: BenchmarkPartitionManifest,
     baseline: HarnessDoc,
+    search_cost_binding: SearchCostBinding,
     qualification_roster: PrequalifiedHarborRoster,
     confirmation_budget: PairedHarborBudgetRuntime,
+    confirmation_slice_policy: PairedHarborSlicePolicy,
 ) -> PreparedHarnessOptimizationStudy:
     """Validate and detach private study inputs before discovery can spend budget."""
     return PreparedHarnessOptimizationStudy(
         protocol=HarnessOptimizationProtocol.model_validate(protocol.model_dump(mode="json")),
         partition=BenchmarkPartitionManifest.model_validate(partition.model_dump(mode="json")),
         baseline=HarnessDoc.model_validate(baseline.model_dump(mode="json")),
+        search_cost_binding=SearchCostBinding.model_validate(
+            search_cost_binding.model_dump(mode="json")
+        ),
         qualification_roster=PrequalifiedHarborRoster.model_validate(
             qualification_roster.model_dump(mode="json")
         ),
         confirmation_budget=PairedHarborBudgetRuntime.model_validate(
             confirmation_budget.model_dump(mode="json")
+        ),
+        confirmation_slice_policy=PairedHarborSlicePolicy.model_validate(
+            confirmation_slice_policy.model_dump(mode="json")
         ),
     )
 
@@ -546,12 +581,7 @@ def run_harness_optimization_search(
 ) -> SearchResult:
     """Run discovery as sequential crash-fenced slices until its terminal checkpoint."""
     study = HarnessOptimizationDiscoveryContract.model_validate(discovery.model_dump(mode="json"))
-    if (
-        authorization.protocol_digest != study.protocol.digest
-        or authorization.search_configuration_digest
-        != _canonical_digest(study.protocol.search.model_dump(mode="json"))
-    ):
-        raise ValueError("discovery authorization differs from the optimization protocol")
+    _validate_discovery_authorization(study, authorization)
     _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
     current = (
         SearchCheckpoint.model_validate(resume_from.model_dump(mode="json"))
@@ -659,12 +689,7 @@ def run_harness_optimization_search_slice(
         HarnessSearchCancelled: If cancellation arrives before a new checkpoint is durable.
     """
     study = HarnessOptimizationDiscoveryContract.model_validate(discovery.model_dump(mode="json"))
-    if (
-        authorization.protocol_digest != study.protocol.digest
-        or authorization.search_configuration_digest
-        != _canonical_digest(study.protocol.search.model_dump(mode="json"))
-    ):
-        raise ValueError("discovery authorization differs from the optimization protocol")
+    _validate_discovery_authorization(study, authorization)
     _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
     plan = study.protocol.search
     runtime_configuration = freeze_search_configuration(
@@ -678,6 +703,7 @@ def run_harness_optimization_search_slice(
         screen_proposals=plan.screen_proposals,
         holdout_scorer=None,
         confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
+        search_cost_binding_digest=study.search_cost_binding.digest,
     )
     runtime_configuration_digest = _canonical_digest(runtime_configuration.model_dump(mode="json"))
     resumed = (
@@ -714,7 +740,10 @@ def run_harness_optimization_search_slice(
                 authorization.search_run_id,
                 lambda: StudySliceResult[SearchCheckpoint, SearchResult](
                     checkpoint=resumed,
-                    result=search_result_from_completed_checkpoint(resumed),
+                    result=search_result_from_completed_checkpoint(
+                        resumed,
+                        cost_binding=study.search_cost_binding,
+                    ),
                 ),
                 payload_digest=authorization.digest,
                 configuration_digest=runtime_configuration_digest,
@@ -770,6 +799,7 @@ def run_harness_optimization_search_slice(
                 screen_proposals=plan.screen_proposals,
                 holdout_scorer=None,
                 confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
+                cost_binding=study.search_cost_binding,
                 resume_from=resumed,
                 resume_proposal_batch_witness=resume_proposal_batch_witness,
                 on_progress=on_progress,
@@ -785,7 +815,10 @@ def run_harness_optimization_search_slice(
             if committed is None:
                 raise
             if committed.completed_iteration == plan.iterations:
-                final = search_result_from_completed_checkpoint(committed)
+                final = search_result_from_completed_checkpoint(
+                    committed,
+                    cost_binding=study.search_cost_binding,
+                )
             elif not stop_after_checkpoint:
                 raise
         if committed is None:
@@ -822,6 +855,7 @@ def freeze_harness_optimization_candidate(
         authorization.protocol_digest != study.protocol.digest
         or authorization.search_configuration_digest
         != _canonical_digest(study.protocol.search.model_dump(mode="json"))
+        or authorization.search_run_id != study.search_cost_binding.run_id
     ):
         raise ValueError("discovery authorization differs from the optimization protocol")
     state = SearchCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
@@ -849,6 +883,7 @@ def freeze_harness_optimization_candidate(
         panel_routes=study.protocol.panel_routes,
         qualification_roster=study.qualification_roster,
         max_concurrent_blocks=study.protocol.max_concurrent_blocks,
+        slice_policy=study.confirmation_slice_policy,
         retry_policy_digest=study.protocol.retry_policy_digest,
         budget_runtime=study.confirmation_budget,
     )
@@ -1036,6 +1071,48 @@ def _validate_search_component_bindings(
         raise ValueError("runtime scorer configuration differs from the discovery search plan")
     if _configuration_id(proposer, role="proposer") != plan.proposer_configuration_id:
         raise ValueError("runtime proposer configuration differs from the discovery search plan")
+    validate_search_cost_components(
+        prepared.search_cost_binding,
+        proposer=proposer,
+        scorer=scorer,
+        holdout_scorer=None,
+    )
+
+
+def _validate_search_cost_binding(
+    protocol: HarnessOptimizationProtocol,
+    binding: SearchCostBinding,
+) -> None:
+    """Bind the complete discovery cost contract to the public protocol."""
+    frozen = SearchCostBinding.model_validate(binding.model_dump(mode="json"))
+    if frozen.digest != protocol.search_cost_binding_digest:
+        raise ValueError("search cost binding differs from the optimization protocol")
+    if (
+        frozen.policy.policy_digest != protocol.confirmation_budget_policy_digest
+        or frozen.ledger_identity != protocol.confirmation_budget_ledger_identity
+    ):
+        raise ValueError("search cost binding differs from the shared study budget authority")
+    if frozen.proposer.configuration_id != protocol.search.proposer_configuration_id:
+        raise ValueError("search cost proposer differs from the discovery search plan")
+    if frozen.scorer.configuration_id != protocol.search.scorer_configuration_id:
+        raise ValueError("search cost scorer differs from the discovery search plan")
+    if frozen.holdout_scorer is not None:
+        raise ValueError("optimization discovery cannot bind a holdout scorer cost account")
+
+
+def _validate_discovery_authorization(
+    prepared: HarnessOptimizationDiscoveryContract,
+    authorization: DiscoveryRunningPayload,
+) -> None:
+    """Bind journal admission to both the public plan and exact paid run accounts."""
+    if (
+        authorization.protocol_digest != prepared.protocol.digest
+        or authorization.search_configuration_digest
+        != _canonical_digest(prepared.protocol.search.model_dump(mode="json"))
+    ):
+        raise ValueError("discovery authorization differs from the optimization protocol")
+    if authorization.search_run_id != prepared.search_cost_binding.run_id:
+        raise ValueError("discovery authorization differs from search cost binding run_id")
 
 
 def _validate_search_slice_checkpoint(
@@ -1054,6 +1131,7 @@ def _validate_search_slice_checkpoint(
         raise ValueError("search slice checkpoint configuration differs from the exact runtime")
     if (
         config.search_run_id != search_run_id
+        or config.search_cost_binding_digest != prepared.search_cost_binding.digest
         or config.name != plan.candidate_name
         or config.seed_doc_hash != prepared.baseline.doc_hash
         or config.seed_execution_hash != prepared.baseline.execution_hash
@@ -1096,6 +1174,8 @@ def _validate_completed_search_checkpoint(
         raise ValueError("cannot freeze a candidate before every planned search iteration commits")
     if (
         config.search_run_id != search_run_id
+        or search_run_id != prepared.search_cost_binding.run_id
+        or config.search_cost_binding_digest != prepared.search_cost_binding.digest
         or config.name != plan.candidate_name
         or config.iterations != plan.iterations
         or config.proposal_batch_size != plan.proposal_batch_size
@@ -1135,6 +1215,7 @@ def _validate_confirmation_commitment(
         or commitment.execution_plan != protocol.execution_plan
         or commitment.qualification_roster_digest != protocol.qualification_roster_digest
         or commitment.max_concurrent_blocks != protocol.max_concurrent_blocks
+        or commitment.slice_policy_digest != protocol.confirmation_slice_policy_digest
         or commitment.retry_policy_digest != protocol.retry_policy_digest
         or commitment.budget_policy_digest != protocol.confirmation_budget_policy_digest
         or commitment.budget_ledger_identity != protocol.confirmation_budget_ledger_identity

@@ -16,6 +16,7 @@ from wmh.evals.harbor.paired_runner import (
     HarborExecutionPlan,
     PairedHarborBudgetRuntime,
     PairedHarborPanelRoute,
+    PairedHarborSlicePolicy,
     PrequalifiedHarborRoster,
     QualifiedHarborTask,
 )
@@ -60,6 +61,12 @@ from wmh.evals.study_lifecycle import (
     StudyBudgetReport,
     StudyLifecycleController,
 )
+from wmh.harness.cost import (
+    ProviderCostBinding,
+    SearchComponentCostBinding,
+    SearchComponentRole,
+    SearchCostBinding,
+)
 from wmh.harness.create import SearchCheckpoint, SearchProposalBatchWitness
 from wmh.harness.delta import (
     FailureSignature,
@@ -78,11 +85,17 @@ from wmh.harness.scoring import (
     TaskScore,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.receipt import freeze_provider_response_identity
+from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
+    synthetic_tariff_provenance,
+)
 from wmh.tracking.budget import (
     BudgetLedgerAuthority,
     BudgetPolicy,
+    BudgetScope,
     ProviderCostMeter,
-    TokenPriceCeiling,
+    bind_budget_account,
     bootstrap_budget_ledger,
 )
 
@@ -229,6 +242,7 @@ class _Scorer:
     def __init__(self, task_ids: tuple[str, ...]) -> None:
         self.task_ids = task_ids
         self.score_calls = 0
+        self.search_cost_binding: SearchComponentCostBinding | None = None
 
     def validate_candidate(self, candidate: HarnessDoc) -> str | None:
         return None
@@ -287,6 +301,7 @@ class _CodeProposer:
 
     def __init__(self) -> None:
         self.proposal_calls = 0
+        self.search_cost_binding: SearchComponentCostBinding | None = None
 
     def propose_batch(
         self,
@@ -350,6 +365,81 @@ class _PromptProposer(_CodeProposer):
         return [delta.model_copy(deep=True) for _ in range(count)]
 
 
+def _provider_cost_binding(
+    authority: BudgetLedgerAuthority,
+    *,
+    configuration_id: str,
+    category: str,
+    meter_id: str,
+) -> ProviderCostBinding:
+    account = authority.provider_account(
+        scope=BudgetScope(
+            phase="discovery",
+            category=category,
+            run_id="discovery-run",
+        ),
+        meter_id=meter_id,
+    )
+    meter = authority.policy.meters[meter_id]
+    assert isinstance(meter, ProviderCostMeter)
+    return ProviderCostBinding(
+        component_configuration_id=configuration_id,
+        provider_config=meter.provider_config,
+        response_identity=freeze_provider_response_identity(meter.provider_config, None),
+        account=bind_budget_account(account),
+    )
+
+
+def _search_cost_binding(
+    authority: BudgetLedgerAuthority,
+    *,
+    proposer_configuration_id: str,
+) -> SearchCostBinding:
+    return SearchCostBinding(
+        declared_hard_limit_nano_usd=authority.policy.hard_limit_nano_usd,
+        policy=authority.policy,
+        ledger_identity=authority.ledger_identity,
+        phase="discovery",
+        run_id="discovery-run",
+        proposer=SearchComponentCostBinding(
+            role=SearchComponentRole.PROPOSER,
+            configuration_id=proposer_configuration_id,
+            scope_category="proposer",
+            providers=(
+                _provider_cost_binding(
+                    authority,
+                    configuration_id=proposer_configuration_id,
+                    category="proposer",
+                    meter_id="proposer-provider",
+                ),
+            ),
+        ),
+        scorer=SearchComponentCostBinding(
+            role=SearchComponentRole.SCORER,
+            configuration_id="scorer-config",
+            scope_category="scorer",
+            providers=(
+                _provider_cost_binding(
+                    authority,
+                    configuration_id="scorer-config",
+                    category="scorer",
+                    meter_id="scorer-provider",
+                ),
+            ),
+        ),
+    )
+
+
+def _bind_discovery_components(
+    prepared: PreparedHarnessOptimizationStudy,
+    *,
+    scorer: _Scorer,
+    proposer: _CodeProposer,
+) -> None:
+    scorer.search_cost_binding = prepared.search_cost_binding.scorer.model_copy(deep=True)
+    proposer.search_cost_binding = prepared.search_cost_binding.proposer.model_copy(deep=True)
+
+
 def _protocol(
     tmp_path: Path,
     manifest: BenchmarkPartitionManifest,
@@ -357,7 +447,13 @@ def _protocol(
     *,
     proposer_configuration_id: str = "proposer-config",
     roster_digest: str | None = None,
-) -> tuple[HarnessOptimizationProtocol, PrequalifiedHarborRoster, PairedHarborBudgetRuntime]:
+) -> tuple[
+    HarnessOptimizationProtocol,
+    PrequalifiedHarborRoster,
+    PairedHarborBudgetRuntime,
+    SearchCostBinding,
+    PairedHarborSlicePolicy,
+]:
     panel = tuple(
         PairedPanelPlan(panel_member=member, attempts=15) for member in ("glm", "haiku", "opus")
     )
@@ -393,20 +489,46 @@ def _protocol(
     meter_by_member: dict[str, str] = {
         member: f"worker-{member}" for member in ("glm", "haiku", "opus")
     }
+    proposer_provider = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="proposer-model",
+        region="us-east-1",
+    )
+    scorer_provider = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="scorer-model",
+        region="us-west-2",
+    )
     budget_policy = BudgetPolicy(
         study_id="optimizer-study",
         manifest_digest=manifest.digest,
         hard_limit_nano_usd=15_000_000_000_000,
-        phase_limits_nano_usd={"confirmation": 15_000_000_000_000},
+        phase_limits_nano_usd={
+            "confirmation": 10_000_000_000_000,
+            "discovery": 5_000_000_000_000,
+        },
         meters={
-            meter_by_member[route.panel_member]: ProviderCostMeter(
-                provider_config=route.provider_config,
-                price=TokenPriceCeiling(
+            **{
+                meter_by_member[route.panel_member]: synthetic_provider_cost_meter(
+                    provider_config=route.provider_config,
+                    provenance=synthetic_tariff_provenance(route.provider_config),
                     input_nano_usd_per_token=1,
                     output_nano_usd_per_token=5,
-                ),
-            )
-            for route in routes
+                )
+                for route in routes
+            },
+            "proposer-provider": synthetic_provider_cost_meter(
+                provider_config=proposer_provider,
+                provenance=synthetic_tariff_provenance(proposer_provider),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=5,
+            ),
+            "scorer-provider": synthetic_provider_cost_meter(
+                provider_config=scorer_provider,
+                provenance=synthetic_tariff_provenance(scorer_provider),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=5,
+            ),
         },
     )
     ledger = bootstrap_budget_ledger(
@@ -419,6 +541,16 @@ def _protocol(
         policy=budget_policy,
         phase="confirmation",
         provider_meter_by_panel_member=meter_by_member,
+    )
+    slice_policy = PairedHarborSlicePolicy(
+        max_new_blocks=3,
+        max_waves_per_invocation=1,
+        max_block_runtime_s=900,
+        max_invocation_runtime_s=7_200,
+    )
+    search_cost_binding = _search_cost_binding(
+        ledger,
+        proposer_configuration_id=proposer_configuration_id,
     )
     protocol = HarnessOptimizationProtocol.create(
         experiment_id="optimizer-study",
@@ -455,12 +587,12 @@ def _protocol(
         qualification_roster=qualification_roster,
         max_concurrent_blocks=3,
         retry_policy_digest=_digest("no-retries"),
-        search_cost_binding_digest=_digest("search-cost-binding"),
+        search_cost_binding=search_cost_binding,
         confirmation_budget=budget,
         create_rate_policy_digest=_digest("create-rate-policy"),
-        confirmation_slice_policy_digest=_digest("slice-policy"),
+        confirmation_slice_policy=slice_policy,
     )
-    return protocol, qualification_roster, budget
+    return protocol, qualification_roster, budget, search_cost_binding, slice_policy
 
 
 def _prepare(
@@ -469,8 +601,12 @@ def _prepare(
     baseline: HarnessDoc,
     *,
     proposer_configuration_id: str = "proposer-config",
+    scorer: _Scorer | None = None,
+    proposer: _CodeProposer | None = None,
 ) -> tuple[PreparedHarnessOptimizationStudy, HarnessOptimizationProtocol]:
-    protocol, roster, budget = _protocol(
+    if (scorer is None) != (proposer is None):
+        raise ValueError("test discovery scorer and proposer must be supplied together")
+    protocol, roster, budget, search_cost_binding, slice_policy = _protocol(
         tmp_path,
         manifest,
         baseline,
@@ -482,7 +618,11 @@ def _prepare(
         baseline=baseline,
         qualification_roster=roster,
         confirmation_budget=budget,
+        search_cost_binding=search_cost_binding,
+        confirmation_slice_policy=slice_policy,
     )
+    if scorer is not None and proposer is not None:
+        _bind_discovery_components(prepared, scorer=scorer, proposer=proposer)
     return prepared, protocol
 
 
@@ -558,13 +698,21 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
     baseline = default_agent("baseline")
     scorer = _Scorer(manifest.discovery_task_ids)
     proposer = _CodeProposer()
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
     lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
 
     public_json = prepared.discovery_contract().model_dump_json()
     assert all(task_id in public_json for task_id in manifest.discovery_task_ids)
     assert all(task_id not in public_json for task_id in manifest.confirmation_task_ids)
     assert manifest.seal_nonce not in public_json
+    assert str(prepared.confirmation_budget.ledger_path) not in public_json
+    assert "ledger_path" not in public_json
 
     checkpoints: list[SearchCheckpoint] = []
     result = run_harness_optimization_search(
@@ -580,6 +728,10 @@ def test_search_freeze_and_open_confirmation_without_exposing_heldout_ids(
     assert result.best.execution_digest != baseline.execution_digest
     assert checkpoints[-1].completed_iteration == protocol.search.iterations
     assert checkpoints[-1].configuration.search_run_id == discovery_authorization.search_run_id
+    assert (
+        checkpoints[-1].configuration.search_cost_binding_digest
+        == prepared.search_cost_binding.digest
+    )
 
     with pytest.raises(ValueError, match="search run"):
         freeze_harness_optimization_candidate(
@@ -653,7 +805,13 @@ def test_search_slice_returns_after_one_durable_checkpoint_and_resumes(
     baseline = default_agent("baseline")
     scorer = _Scorer(manifest.discovery_task_ids)
     proposer = _CodeProposer()
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
     lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     persisted: list[SearchCheckpoint] = []
 
@@ -695,24 +853,37 @@ def test_search_slice_rejects_identity_drift_before_paid_resume_work(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     first_scorer = _Scorer(manifest.discovery_task_ids)
+    first_proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=first_scorer,
+        proposer=first_proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     first = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=first_scorer,
-        proposer=_CodeProposer(),
+        proposer=first_proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         on_checkpoint=lambda _checkpoint: None,
     )
     drifted_scorer = _Scorer(tuple(reversed(manifest.discovery_task_ids)))
+    drifted_proposer = _CodeProposer()
+    _bind_discovery_components(
+        prepared,
+        scorer=drifted_scorer,
+        proposer=drifted_proposer,
+    )
 
     with pytest.raises(ValueError, match="task matrix"):
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=drifted_scorer,
-            proposer=_CodeProposer(),
+            proposer=drifted_proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             resume_from=first.checkpoint,
@@ -727,9 +898,16 @@ def test_search_slice_checkpoint_callback_crash_resumes_from_captured_state(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     persisted: list[SearchCheckpoint] = []
 
     def _persist_then_crash(checkpoint: SearchCheckpoint) -> None:
@@ -740,7 +918,7 @@ def test_search_slice_checkpoint_callback_crash_resumes_from_captured_state(
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=_persist_then_crash,
@@ -750,7 +928,7 @@ def test_search_slice_checkpoint_callback_crash_resumes_from_captured_state(
     resumed = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         resume_from=persisted[-1],
@@ -769,10 +947,16 @@ def test_search_slice_fails_closed_after_provider_failure_before_checkpoint_zero
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _FailOnceScorer(manifest.discovery_task_ids)
     proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     persisted: list[SearchCheckpoint] = []
 
     with pytest.raises(RuntimeError, match="provider failed before checkpoint zero"):
@@ -804,15 +988,22 @@ def test_search_slice_fails_closed_after_provider_failure_before_checkpoint_zero
 def test_full_search_uses_the_same_prepaid_slice_fence(tmp_path: Path) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _FailOnceScorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
 
     with pytest.raises(RuntimeError, match="provider failed before checkpoint zero"):
         run_harness_optimization_search(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=lambda _checkpoint: None,
@@ -824,7 +1015,7 @@ def test_full_search_uses_the_same_prepaid_slice_fence(tmp_path: Path) -> None:
         run_harness_optimization_search(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=lambda _checkpoint: None,
@@ -840,15 +1031,22 @@ def test_full_search_preflights_durable_proposal_callbacks_before_scoring(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
 
     with pytest.raises(ValueError, match="durable proposal prepare and witness"):
         run_harness_optimization_search(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=lambda _checkpoint: None,
@@ -858,7 +1056,7 @@ def test_full_search_preflights_durable_proposal_callbacks_before_scoring(
     recovered = run_harness_optimization_search(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         on_checkpoint=lambda _checkpoint: None,
@@ -874,21 +1072,29 @@ def test_search_slice_rejects_witness_without_resume_before_creating_an_intent(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    source_scorer = _Scorer(manifest.discovery_task_ids)
+    source_proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=source_scorer,
+        proposer=source_proposer,
+    )
     source_lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     prepared_witnesses: list[SearchProposalBatchWitness] = []
     first = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
-        scorer=_Scorer(manifest.discovery_task_ids),
-        proposer=_CodeProposer(),
+        scorer=source_scorer,
+        proposer=source_proposer,
         lifecycle=source_lifecycle,
         authorization=authorization,
         on_checkpoint=lambda _checkpoint: None,
     )
     run_harness_optimization_search_slice(
         prepared.discovery_contract(),
-        scorer=_Scorer(manifest.discovery_task_ids),
-        proposer=_CodeProposer(),
+        scorer=source_scorer,
+        proposer=source_proposer,
         lifecycle=source_lifecycle,
         authorization=authorization,
         resume_from=first.checkpoint,
@@ -900,12 +1106,18 @@ def test_search_slice_rejects_witness_without_resume_before_creating_an_intent(
     target_root.mkdir()
     target_lifecycle, target_authorization = _discovery_lifecycle(target_root, protocol)
     target_scorer = _Scorer(manifest.discovery_task_ids)
+    target_proposer = _CodeProposer()
+    _bind_discovery_components(
+        prepared,
+        scorer=target_scorer,
+        proposer=target_proposer,
+    )
 
     with pytest.raises(ValueError, match="requires resume_from"):
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=target_scorer,
-            proposer=_CodeProposer(),
+            proposer=target_proposer,
             lifecycle=target_lifecycle,
             authorization=target_authorization,
             resume_proposal_batch_witness=prepared_witnesses[-1],
@@ -915,7 +1127,7 @@ def test_search_slice_rejects_witness_without_resume_before_creating_an_intent(
     recovered = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=target_scorer,
-        proposer=_CodeProposer(),
+        proposer=target_proposer,
         lifecycle=target_lifecycle,
         authorization=target_authorization,
         on_checkpoint=lambda _checkpoint: None,
@@ -929,26 +1141,39 @@ def test_search_slice_binds_runtime_implementation_before_first_paid_call(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     failed_scorer = _FailOnceScorer(manifest.discovery_task_ids)
+    failed_proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=failed_scorer,
+        proposer=failed_proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
 
     with pytest.raises(RuntimeError, match="provider failed before checkpoint zero"):
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=failed_scorer,
-            proposer=_CodeProposer(),
+            proposer=failed_proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=lambda _checkpoint: None,
         )
 
     drifted_scorer = _AlternateScorer(manifest.discovery_task_ids)
+    drifted_proposer = _CodeProposer()
+    _bind_discovery_components(
+        prepared,
+        scorer=drifted_scorer,
+        proposer=drifted_proposer,
+    )
     with pytest.raises(ValueError, match="different run identity or configuration"):
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=drifted_scorer,
-            proposer=_CodeProposer(),
+            proposer=drifted_proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=lambda _checkpoint: None,
@@ -963,10 +1188,16 @@ def test_search_slice_recovers_final_checkpoint_callback_crash_without_paid_work
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
     proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     persisted: list[SearchCheckpoint] = []
     prepared_witnesses: list[SearchProposalBatchWitness] = []
     completed_witnesses: list[SearchProposalBatchWitness] = []
@@ -1048,10 +1279,16 @@ def test_search_slice_completion_wins_cancellation_after_final_checkpoint(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
     proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     persisted: list[SearchCheckpoint] = []
     cancelled = False
 
@@ -1093,13 +1330,20 @@ def test_search_slice_completion_wins_cancellation_after_final_checkpoint(
 def test_search_slice_rejects_fresh_replay_without_new_paid_work(tmp_path: Path) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     first = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         on_checkpoint=lambda _checkpoint: None,
@@ -1111,7 +1355,7 @@ def test_search_slice_rejects_fresh_replay_without_new_paid_work(tmp_path: Path)
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=lambda _checkpoint: None,
@@ -1125,13 +1369,20 @@ def test_search_slice_requires_durable_proposal_witnesses_before_paid_work(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     first = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         on_checkpoint=lambda _checkpoint: None,
@@ -1142,7 +1393,7 @@ def test_search_slice_requires_durable_proposal_witnesses_before_paid_work(
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             resume_from=first.checkpoint,
@@ -1157,13 +1408,20 @@ def test_search_slice_rejects_stale_checkpoint_replay_without_paid_work(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     first = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         on_checkpoint=lambda _checkpoint: None,
@@ -1171,7 +1429,7 @@ def test_search_slice_rejects_stale_checkpoint_replay_without_paid_work(
     second = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         resume_from=first.checkpoint,
@@ -1186,7 +1444,7 @@ def test_search_slice_rejects_stale_checkpoint_replay_without_paid_work(
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             resume_from=first.checkpoint,
@@ -1200,7 +1458,7 @@ def test_search_slice_rejects_stale_checkpoint_replay_without_paid_work(
     repeated = run_harness_optimization_search_slice(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         resume_from=second.checkpoint,
@@ -1216,16 +1474,23 @@ def test_search_slice_never_returns_without_a_new_durable_checkpoint(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     persisted: list[SearchCheckpoint] = []
 
     with pytest.raises(HarnessSearchCancelled, match="cancelled"):
         run_harness_optimization_search_slice(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=authorization,
             on_checkpoint=persisted.append,
@@ -1241,13 +1506,21 @@ def test_heldout_open_rejects_a_candidate_publication_for_different_source(
 ) -> None:
     control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
     lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
     checkpoints: list[SearchCheckpoint] = []
     run_harness_optimization_search(
         prepared.discovery_contract(),
-        scorer=_Scorer(manifest.discovery_task_ids),
-        proposer=_CodeProposer(),
+        scorer=scorer,
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=authorization,
         on_checkpoint=checkpoints.append,
@@ -1305,6 +1578,8 @@ def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
         manifest,
         baseline,
         proposer_configuration_id=proposer.configuration_id,
+        scorer=scorer,
+        proposer=proposer,
     )
     lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
     checkpoints: list[SearchCheckpoint] = []
@@ -1332,15 +1607,22 @@ def test_freeze_rejects_a_prompt_only_champion_when_code_change_is_required(
 def test_search_rejects_runtime_component_drift_before_scoring(tmp_path: Path) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(tuple(reversed(manifest.discovery_task_ids)))
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
 
     with pytest.raises(ValueError, match="task matrix"):
         run_harness_optimization_search(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=discovery_authorization,
             on_checkpoint=lambda _checkpoint: None,
@@ -1349,24 +1631,140 @@ def test_search_rejects_runtime_component_drift_before_scoring(tmp_path: Path) -
         )
 
 
+def test_prepare_rejects_search_cost_binding_digest_drift(tmp_path: Path) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    protocol, roster, confirmation_budget, _binding, slice_policy = _protocol(
+        tmp_path,
+        manifest,
+        baseline,
+    )
+    drifted_policy = BudgetPolicy(
+        study_id="different-study",
+        manifest_digest=confirmation_budget.policy.manifest_digest,
+        hard_limit_nano_usd=confirmation_budget.policy.hard_limit_nano_usd,
+        phase_limits_nano_usd=confirmation_budget.policy.phase_limits_nano_usd,
+        meters=confirmation_budget.policy.meters,
+    )
+    drifted_authority = bootstrap_budget_ledger(
+        (tmp_path / "drifted-budget.sqlite3").resolve(),
+        drifted_policy,
+    )
+    drifted_binding = _search_cost_binding(
+        drifted_authority,
+        proposer_configuration_id=protocol.search.proposer_configuration_id,
+    )
+
+    with pytest.raises(ValueError, match="search cost binding differs"):
+        prepare_harness_optimization_study(
+            protocol=protocol,
+            partition=manifest,
+            baseline=baseline,
+            qualification_roster=roster,
+            confirmation_budget=confirmation_budget,
+            search_cost_binding=drifted_binding,
+            confirmation_slice_policy=slice_policy,
+        )
+
+    drifted_protocol = protocol.model_copy(
+        update={"search_cost_binding_digest": drifted_binding.digest}
+    )
+    with pytest.raises(ValueError, match="shared study budget authority"):
+        prepare_harness_optimization_study(
+            protocol=drifted_protocol,
+            partition=manifest,
+            baseline=baseline,
+            qualification_roster=roster,
+            confirmation_budget=confirmation_budget,
+            search_cost_binding=drifted_binding,
+            confirmation_slice_policy=slice_policy,
+        )
+
+
+def test_search_rejects_cost_run_drift_before_paid_work(tmp_path: Path) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    drifted_authorization = authorization.model_copy(update={"search_run_id": "different-run"})
+
+    with pytest.raises(ValueError, match="search cost binding run_id"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=proposer,
+            lifecycle=lifecycle,
+            authorization=drifted_authorization,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert scorer.score_calls == 0
+    assert proposer.proposal_calls == 0
+
+
+def test_search_rejects_component_cost_binding_drift_before_paid_work(
+    tmp_path: Path,
+) -> None:
+    _control_store, manifest = _partition(tmp_path)
+    baseline = default_agent("baseline")
+    scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, authorization = _discovery_lifecycle(tmp_path, protocol)
+    scorer.search_cost_binding = prepared.search_cost_binding.proposer.model_copy(deep=True)
+
+    with pytest.raises(ValueError, match="scorer cost binding differs"):
+        run_harness_optimization_search_slice(
+            prepared.discovery_contract(),
+            scorer=scorer,
+            proposer=proposer,
+            lifecycle=lifecycle,
+            authorization=authorization,
+            on_checkpoint=lambda _checkpoint: None,
+        )
+
+    assert scorer.score_calls == 0
+    assert proposer.proposal_calls == 0
+
+
 def test_search_phase_guard_rejects_before_the_scorer_or_proposer_can_run(
     tmp_path: Path,
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
+    scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
     lifecycle, discovery_authorization = _discovery_lifecycle(
         tmp_path,
         protocol,
         start_discovery=False,
     )
-    scorer = _Scorer(manifest.discovery_task_ids)
-
     with pytest.raises(ValueError, match="current study phase"):
         run_harness_optimization_search(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=discovery_authorization,
             on_checkpoint=lambda _checkpoint: None,
@@ -1380,15 +1778,22 @@ def test_discovery_authorization_cannot_start_a_second_fresh_search(
 ) -> None:
     _control_store, manifest = _partition(tmp_path)
     baseline = default_agent("baseline")
-    prepared, protocol = _prepare(tmp_path, manifest, baseline)
-    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
     scorer = _Scorer(manifest.discovery_task_ids)
+    proposer = _CodeProposer()
+    prepared, protocol = _prepare(
+        tmp_path,
+        manifest,
+        baseline,
+        scorer=scorer,
+        proposer=proposer,
+    )
+    lifecycle, discovery_authorization = _discovery_lifecycle(tmp_path, protocol)
     checkpoints: list[SearchCheckpoint] = []
 
     run_harness_optimization_search(
         prepared.discovery_contract(),
         scorer=scorer,
-        proposer=_CodeProposer(),
+        proposer=proposer,
         lifecycle=lifecycle,
         authorization=discovery_authorization,
         on_checkpoint=checkpoints.append,
@@ -1401,7 +1806,7 @@ def test_discovery_authorization_cannot_start_a_second_fresh_search(
         run_harness_optimization_search(
             prepared.discovery_contract(),
             scorer=scorer,
-            proposer=_CodeProposer(),
+            proposer=proposer,
             lifecycle=lifecycle,
             authorization=discovery_authorization,
             on_checkpoint=lambda _checkpoint: None,

@@ -31,12 +31,14 @@ from wmh.evals.study_lifecycle import (
     StudyStopReason,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
+    synthetic_tariff_provenance,
+)
 from wmh.tracking.budget import (
     BudgetLedgerAuthority,
     BudgetPolicy,
     BudgetScope,
-    ProviderCostMeter,
-    TokenPriceCeiling,
     bootstrap_budget_ledger,
     open_shared_spend_ledger,
 )
@@ -124,22 +126,22 @@ def _preparation() -> PreparationPlannedPayload:
 
 
 def _budget_authority(tmp_path: Path) -> BudgetLedgerAuthority:
+    provider_config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="test-model",
+        region="us-east-1",
+    )
     policy = BudgetPolicy(
         study_id="study-1",
         manifest_digest=_digest("study-manifest"),
         hard_limit_nano_usd=15_000_000_000_000,
         phase_limits_nano_usd={"discovery": 5_000_000_000_000},
         meters={
-            "worker": ProviderCostMeter(
-                provider_config=ProviderConfig(
-                    kind=ProviderKind.BEDROCK,
-                    model="test-model",
-                    region="us-east-1",
-                ),
-                price=TokenPriceCeiling(
-                    input_nano_usd_per_token=1,
-                    output_nano_usd_per_token=5,
-                ),
+            "worker": synthetic_provider_cost_meter(
+                provider_config=provider_config,
+                provenance=synthetic_tariff_provenance(provider_config),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=5,
             )
         },
     )
