@@ -40,6 +40,7 @@ from wmh.harness.runtime import Runtime, StopReason
 from wmh.harness.scoring import (
     HarnessScoreReport,
     ScoreCapabilities,
+    ScoreObjective,
     ScoreRequest,
     TaskScore,
 )
@@ -47,6 +48,7 @@ from wmh.providers.base import Completion, Message, Provider, ProviderConfig, Pr
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
 _CAREFUL_PROMPT = "You are a careful agent. Verify the state of the system before submitting."
+_DENSE_OBJECTIVE = ScoreObjective(objective_id="assertion_fraction")
 
 
 def _meta_reply(parent: HarnessDoc, new_prompt: str) -> str:
@@ -188,13 +190,9 @@ class _NeutralScorer:
 
     def __init__(self) -> None:
         self.requests: list[tuple[str, ScoreRequest]] = []
-        self.before_proposal_calls = 0
 
     def validate_candidate(self, candidate: HarnessDoc) -> str | None:
         return None
-
-    def before_proposal_batch(self) -> None:
-        self.before_proposal_calls += 1
 
     def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
         self.requests.append((candidate.doc_hash, request))
@@ -205,13 +203,11 @@ class _NeutralScorer:
             evaluation_id=f"fake:{candidate.doc_hash}:{request.purpose}",
             label=candidate.name,
             score=score,
-            secondary_score=score,
             attempts=self.default_attempts,
             per_task={
                 "ground-truth-task": TaskScore(
                     task_id="ground-truth-task",
                     score=score,
-                    secondary_score=score,
                     passed=passed,
                     description="repair the repository",
                     mechanisms=() if passed else ("missing verification",),
@@ -245,10 +241,28 @@ class _EvidenceRecordingProposer:
         return [proposal]
 
 
+def _declare_secondary(
+    report: HarnessScoreReport,
+    objective: ScoreObjective,
+) -> HarnessScoreReport:
+    """Attach a real scorer-declared objective to a neutral test report."""
+    return report.model_copy(
+        update={
+            "secondary_objective": objective,
+            "secondary_score": report.score,
+            "per_task": {
+                task_id: task.model_copy(update={"secondary_score": task.score})
+                for task_id, task in report.per_task.items()
+            },
+        }
+    )
+
+
 def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:
     seed = HarnessDoc.baseline("seed")
     scorer = _NeutralScorer()
     proposer = _EvidenceRecordingProposer()
+    proposal_boundaries: list[str] = []
 
     result = search_harness(
         "winner",
@@ -258,12 +272,13 @@ def test_search_harness_scores_with_no_world_model_or_gold_judge() -> None:
         iterations=1,
         screen_proposals=False,
         confirm_narrow_vetoes=False,
+        before_proposal_batch=lambda: proposal_boundaries.append("released"),
     )
 
     assert result.best_score == 1.0
     assert result.best.name == "winner"
     assert [request.purpose for _, request in scorer.requests] == ["seed", "full"]
-    assert scorer.before_proposal_calls == 1
+    assert proposal_boundaries == ["released"]
     assert "verifier reward and execution trace" in proposer.evidence[0]
     assert result.suite == ["ground-truth-task"]
 
@@ -281,6 +296,22 @@ def test_search_harness_rejects_unsupported_paid_stages_before_scoring() -> None
         )
 
     assert scorer.requests == []
+
+
+def test_search_harness_requires_declared_attempt_mean_for_confirmation() -> None:
+    class OverrideOnlyScorer(_NeutralScorer):
+        capabilities = ScoreCapabilities(attempt_overrides=True)
+
+    with pytest.raises(ValueError, match="mean_over_attempts"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            OverrideOnlyScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=True,
+        )
 
 
 def test_search_harness_rejects_negative_iterations() -> None:
@@ -316,6 +347,135 @@ def test_search_harness_rejects_default_attempt_count_drift() -> None:
         )
 
 
+def test_search_harness_rejects_an_undeclared_secondary_objective() -> None:
+    class UndeclaredSecondaryScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            return _declare_secondary(super().score(candidate, request=request), _DENSE_OBJECTIVE)
+
+    with pytest.raises(ValueError, match="secondary objective.*not declared"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            UndeclaredSecondaryScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_rejects_candidate_secondary_objective_drift() -> None:
+    other_objective = ScoreObjective(objective_id="different_dense_progress")
+
+    class DriftingSecondaryScorer(_NeutralScorer):
+        capabilities = ScoreCapabilities(secondary_objective=_DENSE_OBJECTIVE)
+
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            objective = other_objective if request.purpose == "full" else _DENSE_OBJECTIVE
+            return _declare_secondary(super().score(candidate, request=request), objective)
+
+    with pytest.raises(ValueError, match="secondary objective.*different_dense_progress"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            DriftingSecondaryScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_rejects_holdout_secondary_objective_drift() -> None:
+    other_objective = ScoreObjective(objective_id="different_holdout_progress")
+
+    class DriftingHoldoutScorer(_NeutralScorer):
+        capabilities = ScoreCapabilities(secondary_objective=_DENSE_OBJECTIVE)
+
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            objective = other_objective if report.score == 1.0 else _DENSE_OBJECTIVE
+            return _declare_secondary(report, objective)
+
+    with pytest.raises(ValueError, match="secondary objective.*different_holdout_progress"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            holdout_scorer=DriftingHoldoutScorer(),
+            confirm_narrow_vetoes=False,
+        )
+
+
+def test_search_harness_rejects_confirmation_secondary_objective_drift() -> None:
+    other_objective = ScoreObjective(objective_id="different_confirmation_progress")
+
+    class DiscoveryScorer(_NeutralScorer):
+        capabilities = ScoreCapabilities(attempt_overrides=True, mean_over_attempts=True)
+        default_attempts = 5
+
+    class ConfirmationDriftScorer(_NeutralScorer):
+        capabilities = ScoreCapabilities(
+            attempt_overrides=True,
+            mean_over_attempts=True,
+            secondary_objective=_DENSE_OBJECTIVE,
+        )
+        default_attempts = 5
+
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            score = 0.8 if report.score == 1.0 else 1.0
+            task = report.per_task["ground-truth-task"].model_copy(
+                update={"score": score, "secondary_score": score, "passed": score == 1.0}
+            )
+            objective = other_objective if request.purpose == "confirmation" else _DENSE_OBJECTIVE
+            return report.model_copy(
+                update={
+                    "score": score,
+                    "secondary_objective": objective,
+                    "secondary_score": score,
+                    "attempts": request.attempts or self.default_attempts,
+                    "per_task": {task.task_id: task},
+                }
+            )
+
+    with pytest.raises(ValueError, match="secondary objective.*different_confirmation_progress"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            DiscoveryScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            holdout_scorer=ConfirmationDriftScorer(),
+            confirm_narrow_vetoes=True,
+        )
+
+
+def test_search_harness_rejects_candidate_aggregate_weight_drift() -> None:
+    class DriftingWeightScorer(_NeutralScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            report = super().score(candidate, request=request)
+            if request.purpose != "full":
+                return report
+            task = report.per_task["ground-truth-task"].model_copy(update={"aggregate_weight": 2.0})
+            return report.model_copy(update={"per_task": {task.task_id: task}})
+
+    with pytest.raises(ValueError, match="aggregate weight.*ground-truth-task"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            DriftingWeightScorer(),
+            _EvidenceRecordingProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+
 def test_search_harness_rejects_candidate_that_omits_a_discovery_task() -> None:
     class OmittingScorer(_NeutralScorer):
         def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
@@ -325,7 +485,6 @@ def test_search_harness_rejects_candidate_that_omits_a_discovery_task() -> None:
             required = TaskScore(
                 task_id="required-task",
                 score=0.0,
-                secondary_score=0.0,
                 passed=False,
             )
             return report.model_copy(
@@ -353,7 +512,6 @@ def test_search_harness_rejects_candidate_that_omits_a_holdout_task() -> None:
             required = TaskScore(
                 task_id="held-out-required",
                 score=0.0,
-                secondary_score=0.0,
                 passed=False,
             )
             return report.model_copy(
@@ -400,7 +558,6 @@ def test_search_harness_snapshots_and_canonicalizes_scorer_owned_reports() -> No
             extra = TaskScore(
                 task_id="another-task",
                 score=0.0,
-                secondary_score=0.0,
                 passed=False,
                 evidence="another immutable trace",
             )
@@ -436,7 +593,6 @@ def test_search_harness_snapshots_and_canonicalizes_scorer_owned_reports() -> No
     source.per_task["late-task"] = TaskScore(
         task_id="late-task",
         score=1.0,
-        secondary_score=1.0,
         passed=True,
     )
 
@@ -450,7 +606,7 @@ def test_search_harness_rejects_empty_seed_and_holdout_matrices() -> None:
     class EmptyScorer(_NeutralScorer):
         def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
             report = super().score(candidate, request=request)
-            return report.model_copy(update={"score": 0.0, "secondary_score": 0.0, "per_task": {}})
+            return report.model_copy(update={"score": 0.0, "per_task": {}})
 
     with pytest.raises(ValueError, match="seed score report contains no tasks"):
         search_harness(
@@ -475,7 +631,7 @@ def test_search_harness_rejects_empty_seed_and_holdout_matrices() -> None:
         )
 
 
-def test_search_harness_validates_and_retires_both_scorers() -> None:
+def test_search_harness_validates_both_scorers_and_runs_injected_batch_boundary() -> None:
     class RejectingHoldoutScorer(_NeutralScorer):
         def validate_candidate(self, candidate: HarnessDoc) -> str | None:
             prompt = candidate.surface("prompt:core")
@@ -487,6 +643,7 @@ def test_search_harness_validates_and_retires_both_scorers() -> None:
 
     discovery = _NeutralScorer()
     holdout = RejectingHoldoutScorer()
+    proposal_boundaries: list[str] = []
     result = search_harness(
         "winner",
         HarnessDoc.baseline("seed"),
@@ -496,11 +653,12 @@ def test_search_harness_validates_and_retires_both_scorers() -> None:
         screen_proposals=False,
         holdout_scorer=holdout,
         confirm_narrow_vetoes=False,
+        before_proposal_batch=lambda: proposal_boundaries.append("released"),
     )
 
     assert [request.purpose for _, request in discovery.requests] == ["seed"]
     assert [request.purpose for _, request in holdout.requests] == ["holdout"]
-    assert discovery.before_proposal_calls == holdout.before_proposal_calls == 1
+    assert proposal_boundaries == ["released"]
     assert result.proposal_records[0].outcome == "invalid"
     assert "holdout runtime rejected candidate" in (result.proposal_records[0].reason or "")
 
@@ -970,6 +1128,7 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
     champion = HarnessScoreReport(
         evaluation_id="champion",
         score=0.0,
+        secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.45,
         attempts=1,
         per_task={
@@ -980,6 +1139,7 @@ def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regress
     child = HarnessScoreReport(
         evaluation_id="child",
         score=0.0,
+        secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.25,
         attempts=1,
         per_task={
@@ -1009,6 +1169,7 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
     champion = HarnessScoreReport(
         evaluation_id="champion",
         score=0.0,
+        secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.1,
         attempts=1,
         per_task={
@@ -1019,6 +1180,7 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
     child = HarnessScoreReport(
         evaluation_id="child",
         score=0.0,
+        secondary_objective=_DENSE_OBJECTIVE,
         secondary_score=0.35,
         attempts=1,
         per_task={
@@ -1037,6 +1199,37 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
 
     assert verdict.accepted is True
     assert verdict.full_secondary_delta == pytest.approx(0.25)
+
+
+def test_gate_uses_only_primary_scores_when_no_secondary_objective_exists() -> None:
+    delta = HarnessDelta.model_construct(
+        trigger=FailureSignature(mechanism="target", task_ids=["target"])
+    )
+    champion = HarnessScoreReport(
+        evaluation_id="champion-primary-only",
+        score=0.0,
+        attempts=1,
+        per_task={"target": TaskScore(task_id="target", score=0.0, passed=False)},
+    )
+    child = HarnessScoreReport(
+        evaluation_id="child-primary-only",
+        score=0.0,
+        attempts=1,
+        per_task={"target": TaskScore(task_id="target", score=0.0, passed=False)},
+    )
+
+    verdict = create_module.gate_score_delta(
+        delta,
+        child=child,
+        champion=champion,
+        best_full=0.0,
+        suite=["target"],
+    )
+
+    assert verdict.accepted is True
+    assert verdict.suite_secondary_delta is None
+    assert verdict.full_secondary_delta is None
+    assert "secondary" not in verdict.reason
 
 
 def test_search_records_screen_and_full_trace_feedback_for_project_proposers() -> None:
@@ -1236,16 +1429,38 @@ def test_narrow_failing_tiers_eligibility() -> None:
 
     # Narrow holdout veto on a full-split win -> retry that tier.
     narrow = record(full_delta=0.05, holdout_delta=-0.1)
-    assert narrow_failing_tiers(narrow, k=5, n_suite=4, n_holdout=4) == ["holdout"]
+    assert narrow_failing_tiers(
+        narrow,
+        suite_attempt_impact=0.05,
+        holdout_attempt_impact=0.05,
+    ) == ["holdout"]
     # A wide veto is a real regression, not noise: ineligible.
     wide = record(full_delta=0.05, holdout_delta=-1.0)
-    assert narrow_failing_tiers(wide, k=5, n_suite=4, n_holdout=4) is None
+    assert (
+        narrow_failing_tiers(
+            wide,
+            suite_attempt_impact=0.05,
+            holdout_attempt_impact=0.05,
+        )
+        is None
+    )
     # No full-split win: nothing to confirm.
     no_win = record(full_delta=0.0, holdout_delta=-0.1)
-    assert narrow_failing_tiers(no_win, k=5, n_suite=4, n_holdout=4) is None
+    assert (
+        narrow_failing_tiers(
+            no_win,
+            suite_attempt_impact=0.05,
+            holdout_attempt_impact=0.05,
+        )
+        is None
+    )
     # Both tiers narrowly failing -> both retried.
     both = record(full_delta=0.05, suite_delta=-0.05, holdout_delta=-0.1)
-    assert narrow_failing_tiers(both, k=5, n_suite=8, n_holdout=4) == ["suite", "holdout"]
+    assert narrow_failing_tiers(
+        both,
+        suite_attempt_impact=0.025,
+        holdout_attempt_impact=0.05,
+    ) == ["suite", "holdout"]
     # Confirmation of one binary veto cannot erase a separate dense-signal veto.
     dense_veto = record(
         full_delta=0.05,
@@ -1253,10 +1468,49 @@ def test_narrow_failing_tiers_eligibility() -> None:
         holdout_delta=0.0,
         holdout_secondary_delta=-0.2,
     )
-    assert narrow_failing_tiers(dense_veto, k=5, n_suite=8, n_holdout=4) is None
+    assert (
+        narrow_failing_tiers(
+            dense_veto,
+            suite_attempt_impact=0.025,
+            holdout_attempt_impact=0.05,
+        )
+        is None
+    )
     # Accepted verdicts are never retried.
     ok = GateRecord(accepted=True, reason="r", full_delta=0.05)
-    assert narrow_failing_tiers(ok, k=5, n_suite=4, n_holdout=4) is None
+    assert (
+        narrow_failing_tiers(
+            ok,
+            suite_attempt_impact=0.05,
+            holdout_attempt_impact=0.05,
+        )
+        is None
+    )
+
+
+def test_confirmation_attempt_impact_uses_frozen_aggregate_weights() -> None:
+    report = HarnessScoreReport(
+        evaluation_id="weighted-confirmation",
+        score=0.75,
+        attempts=5,
+        per_task={
+            "light": TaskScore(
+                task_id="light",
+                score=0.0,
+                aggregate_weight=1.0,
+                passed=False,
+            ),
+            "heavy": TaskScore(
+                task_id="heavy",
+                score=1.0,
+                aggregate_weight=3.0,
+                passed=True,
+            ),
+        },
+    )
+
+    assert create_module._max_primary_attempt_impact(report, ["light", "heavy"]) == 0.15
+    assert create_module._max_primary_attempt_impact(report, ["light"]) == 0.2
 
 
 def test_flaky_holdout_veto_is_overturned_by_confirmation() -> None:

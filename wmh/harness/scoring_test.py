@@ -11,6 +11,7 @@ from wmh.harness.scoring import (
     MAX_TASK_DESCRIPTION_CHARS,
     MAX_TASK_EVIDENCE_CHARS,
     HarnessScoreReport,
+    ScoreObjective,
     ScoreRequest,
     TaskScore,
     cluster_score_failures,
@@ -25,13 +26,15 @@ def _task(
     *,
     score: float,
     secondary: float | None = None,
+    aggregate_weight: float = 1.0,
     mechanisms: tuple[str, ...] = (),
     evidence: str = "",
 ) -> TaskScore:
     return TaskScore(
         task_id=task_id,
         score=score,
-        secondary_score=score if secondary is None else secondary,
+        secondary_score=secondary,
+        aggregate_weight=aggregate_weight,
         passed=score == 1.0,
         description=f"instruction for {task_id}",
         mechanisms=mechanisms,
@@ -41,11 +44,26 @@ def _task(
 
 def _report(*tasks: TaskScore) -> HarnessScoreReport:
     per_task = {task.task_id: task for task in tasks}
+    total_weight = sum(task.aggregate_weight for task in tasks)
+    secondary_values = [task.secondary_score for task in tasks]
+    has_secondary = any(value is not None for value in secondary_values)
     return HarnessScoreReport(
         evaluation_id="eval-1",
         label="candidate",
-        score=sum(task.score for task in tasks) / len(tasks),
-        secondary_score=sum(task.secondary_score for task in tasks) / len(tasks),
+        score=sum(task.score * task.aggregate_weight for task in tasks) / total_weight,
+        secondary_objective=(
+            ScoreObjective(objective_id="dense_progress") if has_secondary else None
+        ),
+        secondary_score=(
+            sum(
+                value * task.aggregate_weight
+                for task, value in zip(tasks, secondary_values, strict=True)
+                if value is not None
+            )
+            / total_weight
+            if has_secondary
+            else None
+        ),
         attempts=2,
         per_task=per_task,
     )
@@ -56,9 +74,44 @@ def test_score_report_rejects_mismatched_task_key() -> None:
         HarnessScoreReport(
             evaluation_id="eval-1",
             score=0.0,
-            secondary_score=0.0,
             attempts=1,
             per_task={"wrong": _task("task", score=0.0)},
+        )
+
+
+def test_score_report_requires_an_explicit_consistent_secondary_objective() -> None:
+    with pytest.raises(ValidationError, match="secondary objective"):
+        HarnessScoreReport(
+            evaluation_id="eval-1",
+            score=0.0,
+            secondary_score=0.0,
+            attempts=1,
+            per_task={"task": _task("task", score=0.0)},
+        )
+    with pytest.raises(ValidationError, match="every task"):
+        HarnessScoreReport(
+            evaluation_id="eval-1",
+            score=0.0,
+            secondary_objective=ScoreObjective(objective_id="dense_progress"),
+            secondary_score=0.0,
+            attempts=1,
+            per_task={"task": _task("task", score=0.0)},
+        )
+
+
+def test_score_report_enforces_declared_weighted_aggregate() -> None:
+    light = _task("light", score=0.0, aggregate_weight=1.0)
+    heavy = _task("heavy", score=1.0, aggregate_weight=3.0)
+
+    report = _report(light, heavy)
+
+    assert report.score == 0.75
+    with pytest.raises(ValidationError, match="weighted task aggregate"):
+        HarnessScoreReport(
+            evaluation_id="eval-bad",
+            score=0.5,
+            attempts=1,
+            per_task={"light": light, "heavy": heavy},
         )
 
 
@@ -71,7 +124,7 @@ def test_score_request_rejects_empty_or_duplicate_subset(task_ids: tuple[str, ..
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
 def test_score_report_rejects_non_normalized_scores(value: float) -> None:
     with pytest.raises(ValidationError):
-        HarnessScoreReport(evaluation_id="eval-1", score=value, secondary_score=0.0, attempts=1)
+        HarnessScoreReport(evaluation_id="eval-1", score=value, attempts=1)
 
 
 def test_score_report_requires_identity_and_bounds_proposer_evidence() -> None:
@@ -104,7 +157,7 @@ def test_cluster_score_failures_uses_shared_mechanisms_and_singletons() -> None:
 
 def test_render_score_evidence_is_benchmark_neutral() -> None:
     report = _report(
-        _task("pass", score=1.0, evidence="pass evidence"),
+        _task("pass", score=1.0, secondary=1.0, evidence="pass evidence"),
         _task(
             "fail",
             score=0.0,
@@ -155,6 +208,7 @@ def test_render_score_evidence_is_invariant_to_task_and_label_insertion_order() 
     reverse = HarnessScoreReport(
         evaluation_id="eval-2",
         score=forward.score,
+        secondary_objective=forward.secondary_objective,
         secondary_score=forward.secondary_score,
         attempts=forward.attempts,
         per_task={"second": second, "first": first},
@@ -210,13 +264,22 @@ def test_render_score_evidence_bounds_a_maximal_connected_cluster() -> None:
         assert f"### Task {task.task_id}" in rendered
 
 
-def test_suite_scores_count_tasks_absent_from_a_subset_report_as_zero() -> None:
+def test_suite_scores_use_weights_and_reject_missing_tasks() -> None:
     report = _report(
-        _task("t1", score=0.25, secondary=0.5),
-        _task("t2", score=0.75, secondary=1.0),
+        _task("t1", score=0.25, secondary=0.5, aggregate_weight=1.0),
+        _task("t2", score=0.75, secondary=1.0, aggregate_weight=3.0),
     )
 
-    assert suite_score(report, ["t1", "t2", "missing"]) == pytest.approx(1 / 3)
-    assert suite_secondary_score(report, ["t1", "t2", "missing"]) == 0.5
+    assert suite_score(report, ["t1", "t2"]) == pytest.approx(0.625)
+    assert suite_secondary_score(report, ["t1", "t2"]) == pytest.approx(0.875)
     assert suite_score(report, []) == 1.0
     assert suite_secondary_score(report, []) == 1.0
+    with pytest.raises(ValueError, match="missing task"):
+        suite_score(report, ["t1", "missing"])
+
+
+def test_suite_secondary_score_is_absent_without_a_declared_objective() -> None:
+    report = _report(_task("task", score=0.5))
+
+    assert suite_secondary_score(report, ["task"]) is None
+    assert suite_secondary_score(report, []) is None

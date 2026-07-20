@@ -13,11 +13,12 @@ iteration's champion:
 - **Tier 3 — held-out (optional)**: with a holdout task file, the child must also be no worse than
   the champion on tasks the proposer never saw evidence from.
 
-Ties pass every gate tier: with k passes per task, scores are coarse, and "no worse" is the
-eligibility contract. When multiple siblings are eligible, full success wins, then secondary
-score, then lower proposal index. Every proposed delta, whether selected, rejected, or invalid
-before eval, is recorded in the archive with its verdict. The run as a whole is only as
-reproducible as its providers because proposals and rollouts sample real models at temperature.
+Ties pass every gate tier: with repeated attempts per task, scores can be coarse, and "no worse"
+is the eligibility contract. When multiple siblings are eligible, the full primary score wins,
+then an available declared secondary score, then lower proposal index. Every proposed delta,
+whether selected, rejected, or invalid before eval, is recorded in the archive with its verdict.
+The run as a whole is only as reproducible as its providers because proposals and rollouts sample
+real models at temperature.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from wmh.harness.scoring import (
     HarnessScorer,
     HarnessScoreReport,
     ScoreCapabilities,
+    ScoreObjective,
     ScoreRequest,
     TaskScore,
     cluster_score_failures,
@@ -126,10 +128,10 @@ class ProposalRecord(BaseModel):
     ops: list[str] = Field(default_factory=list)  # "replace prompt:main" style summaries
     rationales: list[str] = Field(default_factory=list)
     reason: str | None = None
-    score: float | None = None  # full-suite success rate; scored proposals only
+    score: float | None = None  # full-split primary aggregate; scored proposals only
     gate_eligible: bool | None = None  # frozen non-regression gate; scored proposals only
     selected: bool = False  # true only for the iteration winner
-    screen_child: float | None = None  # trigger-cluster means; screened attempts only
+    screen_child: float | None = None  # trigger-cluster aggregates; screened attempts only
     screen_parent: float | None = None
     screen_child_secondary: float | None = None  # denser secondary screen signal
     screen_parent_secondary: float | None = None
@@ -202,6 +204,22 @@ class _ScoredProposal:
     record: ProposalRecord
 
 
+@dataclass(frozen=True)
+class _ScoreSchema:
+    """Frozen objective and task weights for one scorer role."""
+
+    secondary_objective: ScoreObjective | None
+    task_weights: tuple[tuple[str, float], ...]
+
+
+def _secondary_candidate_rank(candidate: _ScoredProposal) -> tuple[float, float, int]:
+    """Rank a candidate when its scorer declared the secondary objective."""
+    secondary_score = candidate.report.secondary_score
+    if secondary_score is None:
+        raise ValueError("declared secondary objective produced no candidate score")
+    return candidate.report.score, secondary_score, -candidate.proposal_index
+
+
 def select_failure_cluster(
     clusters: list[FailureSignature],
     expansion_counts: dict[FailureClusterKey, int],
@@ -237,24 +255,27 @@ def _failure_cluster_key(parent_doc_hash: str, cluster: FailureSignature) -> Fai
 def narrow_failing_tiers(
     verdict: GateRecord,
     *,
-    k: int,
-    n_suite: int,
-    n_holdout: int,
+    suite_attempt_impact: float | None,
+    holdout_attempt_impact: float | None,
     margin_attempts: int = 2,
 ) -> list[str] | None:
     """Which tiers vetoed this delta narrowly enough to deserve a re-measurement.
 
     Eligible only when the delta strictly won the full split: the question a confirmation
     answers is "was this win vetoed by measurement noise?", not "can a loser get lucky?".
-    A tier's veto is narrow when its regression is at most `margin_attempts` single-attempt
-    flips wide (one flip changes a tier mean by 1/(k*n)). Returns the narrowly-failing tier
-    names, or None when the delta is ineligible (no win, a wide veto, or no veto at all).
+    A tier's veto is narrow when its regression is at most ``margin_attempts`` maximum
+    single-attempt changes wide under the scorer's declared mean-over-attempts contract. Returns
+    the narrowly failing tier names, or None when the delta is ineligible.
     """
     if verdict.accepted or verdict.full_delta <= _TIE_EPS:
         return None
     # A confirmation may only revisit the explicitly returned binary vetoes. Do not let it erase
     # a separate tied-success dense veto on another tier.
-    if abs(verdict.suite_delta) <= _TIE_EPS and verdict.suite_secondary_delta < -_TIE_EPS:
+    if (
+        abs(verdict.suite_delta) <= _TIE_EPS
+        and verdict.suite_secondary_delta is not None
+        and verdict.suite_secondary_delta < -_TIE_EPS
+    ):
         return None
     if (
         verdict.holdout_delta is not None
@@ -265,17 +286,32 @@ def narrow_failing_tiers(
         return None
     tiers: list[str] = []
     if verdict.suite_delta < -_TIE_EPS:
-        if n_suite == 0 or verdict.suite_delta < -(margin_attempts / (k * n_suite)) - _TIE_EPS:
+        if (
+            suite_attempt_impact is None
+            or verdict.suite_delta < -(margin_attempts * suite_attempt_impact) - _TIE_EPS
+        ):
             return None
         tiers.append("suite")
     if verdict.holdout_delta is not None and verdict.holdout_delta < -_TIE_EPS:
         if (
-            n_holdout == 0
-            or verdict.holdout_delta < -(margin_attempts / (k * n_holdout)) - _TIE_EPS
+            holdout_attempt_impact is None
+            or verdict.holdout_delta < -(margin_attempts * holdout_attempt_impact) - _TIE_EPS
         ):
             return None
         tiers.append("holdout")
     return tiers or None
+
+
+def _max_primary_attempt_impact(
+    report: HarnessScoreReport,
+    task_ids: list[str],
+) -> float | None:
+    """Return the largest weighted aggregate change one normalized attempt can cause."""
+    if not task_ids:
+        return None
+    tasks = [report.per_task[task_id] for task_id in task_ids]
+    total_weight = sum(task.aggregate_weight for task in tasks)
+    return max(task.aggregate_weight / total_weight for task in tasks) / report.attempts
 
 
 def gate_score_delta(
@@ -289,30 +325,53 @@ def gate_score_delta(
     champion_holdout: HarnessScoreReport | None = None,
 ) -> GateRecord:
     """Apply the search's lexicographic non-regression gate to neutral scores."""
+    _validate_compatible_score_reports(child, champion, context="discovery")
     suite_delta = suite_score(child, suite) - suite_score(champion, suite)
-    suite_secondary_delta = suite_secondary_score(child, suite) - suite_secondary_score(
-        champion, suite
+    suite_secondary_delta = _optional_score_delta(
+        suite_secondary_score(child, suite),
+        suite_secondary_score(champion, suite),
+        context="discovery suite",
     )
     full_delta = child.score - best_full
-    full_secondary_delta = child.secondary_score - champion.secondary_score
+    full_secondary_delta = _optional_score_delta(
+        child.secondary_score,
+        champion.secondary_score,
+        context="discovery full split",
+    )
+    if (child_holdout is None) != (champion_holdout is None):
+        raise ValueError("holdout gate requires both child and champion reports")
+    if child_holdout is not None and champion_holdout is not None:
+        _validate_compatible_score_reports(child_holdout, champion_holdout, context="holdout")
     holdout_delta = (
         child_holdout.score - champion_holdout.score
         if child_holdout is not None and champion_holdout is not None
         else None
     )
     holdout_secondary_delta = (
-        child_holdout.secondary_score - champion_holdout.secondary_score
+        _optional_score_delta(
+            child_holdout.secondary_score,
+            champion_holdout.secondary_score,
+            context="holdout",
+        )
         if child_holdout is not None and champion_holdout is not None
         else None
     )
     failures: list[str] = []
     if suite_delta < -_TIE_EPS:
         failures.append(f"suite regressed by {-suite_delta:.3f}")
-    elif abs(suite_delta) <= _TIE_EPS and suite_secondary_delta < -_TIE_EPS:
+    elif (
+        abs(suite_delta) <= _TIE_EPS
+        and suite_secondary_delta is not None
+        and suite_secondary_delta < -_TIE_EPS
+    ):
         failures.append(f"suite secondary score regressed by {-suite_secondary_delta:.3f}")
     if full_delta < -_TIE_EPS:
         failures.append(f"full split {child.score:.3f} below best {best_full:.3f}")
-    elif abs(full_delta) <= _TIE_EPS and full_secondary_delta < -_TIE_EPS:
+    elif (
+        abs(full_delta) <= _TIE_EPS
+        and full_secondary_delta is not None
+        and full_secondary_delta < -_TIE_EPS
+    ):
         failures.append(f"full-split secondary score regressed by {-full_secondary_delta:.3f}")
     if holdout_delta is not None and holdout_delta < -_TIE_EPS:
         failures.append(f"held-out regressed by {-holdout_delta:.3f}")
@@ -347,6 +406,41 @@ def gate_score_delta(
     )
 
 
+def _validate_compatible_score_reports(
+    child: HarnessScoreReport,
+    champion: HarnessScoreReport,
+    *,
+    context: str,
+) -> None:
+    """Reject a gate comparison when task or objective schemas differ."""
+    if set(child.per_task) != set(champion.per_task):
+        raise ValueError(f"{context} reports contain different task identities")
+    for task_id in child.per_task:
+        child_weight = child.per_task[task_id].aggregate_weight
+        champion_weight = champion.per_task[task_id].aggregate_weight
+        if child_weight != champion_weight:
+            raise ValueError(
+                f"{context} aggregate weight for task {task_id!r} changed from "
+                f"{champion_weight!r} to {child_weight!r}"
+            )
+    if child.secondary_objective != champion.secondary_objective:
+        raise ValueError(f"{context} reports declare different secondary objectives")
+
+
+def _optional_score_delta(
+    child: float | None,
+    champion: float | None,
+    *,
+    context: str,
+) -> float | None:
+    """Subtract optional objective values only when both are genuinely available."""
+    if child is None and champion is None:
+        return None
+    if child is None or champion is None:
+        raise ValueError(f"{context} secondary score availability changed")
+    return child - champion
+
+
 def _snapshot_score_report(report: HarnessScoreReport) -> HarnessScoreReport:
     """Revalidate and detach a scorer-owned report before it enters search state."""
     snapshot = HarnessScoreReport.model_validate(report.model_dump(mode="json"))
@@ -378,6 +472,7 @@ def search_harness(
     on_proposal: Callable[[ProposalRecord], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    before_proposal_batch: Callable[[], None] | None = None,
 ) -> SearchResult:
     """Search over harness deltas using normalized scores from an injected evaluator.
 
@@ -395,6 +490,7 @@ def search_harness(
         screen_proposals: Whether to prefilter each child on its trigger task subset.
         holdout_scorer: Optional independent evaluator used as a third gate tier.
         confirm_narrow_vetoes: Whether capable scorers remeasure narrow gate vetoes.
+        before_proposal_batch: Optional lifecycle callback run before each proposer batch.
 
     Returns:
         The champion, normalized reports, and complete delta audit record.
@@ -407,24 +503,40 @@ def search_harness(
         raise ValueError(f"iterations must be non-negative, got {iterations}")
     if proposal_batch_size < 1:
         raise ValueError(f"proposal_batch_size must be positive, got {proposal_batch_size}")
+    discovery_capabilities = ScoreCapabilities.model_validate(scorer.capabilities)
     discovery_attempts = scorer.default_attempts
     if discovery_attempts < 1:
         raise ValueError("scorer.default_attempts must be positive")
-    if screen_proposals and not scorer.capabilities.task_subsets:
+    if screen_proposals and not discovery_capabilities.task_subsets:
         raise ValueError(
             "scorer cannot evaluate task subsets; pass screen_proposals=False to avoid "
             "unsupported paid screens"
         )
-    if confirm_narrow_vetoes and not scorer.capabilities.attempt_overrides:
+    if confirm_narrow_vetoes and not discovery_capabilities.attempt_overrides:
         raise ValueError("scorer cannot override attempt counts; pass confirm_narrow_vetoes=False")
+    if confirm_narrow_vetoes and not discovery_capabilities.mean_over_attempts:
+        raise ValueError(
+            "scorer does not declare mean_over_attempts; pass confirm_narrow_vetoes=False"
+        )
+    holdout_capabilities = (
+        ScoreCapabilities.model_validate(holdout_scorer.capabilities)
+        if holdout_scorer is not None
+        else None
+    )
     holdout_attempts = holdout_scorer.default_attempts if holdout_scorer is not None else None
     if holdout_scorer is not None:
         assert holdout_attempts is not None
         if holdout_attempts < 1:
             raise ValueError("holdout_scorer.default_attempts must be positive")
-        if confirm_narrow_vetoes and not holdout_scorer.capabilities.attempt_overrides:
+        assert holdout_capabilities is not None
+        if confirm_narrow_vetoes and not holdout_capabilities.attempt_overrides:
             raise ValueError(
                 "holdout scorer cannot override attempt counts; pass confirm_narrow_vetoes=False"
+            )
+        if confirm_narrow_vetoes and not holdout_capabilities.mean_over_attempts:
+            raise ValueError(
+                "holdout scorer does not declare mean_over_attempts; pass "
+                "confirm_narrow_vetoes=False"
             )
         if confirm_narrow_vetoes and holdout_attempts != discovery_attempts:
             raise ValueError(
@@ -440,6 +552,7 @@ def search_harness(
             raise ValueError(f"holdout seed is not eligible for scoring: {holdout_seed_error}")
 
     evaluations_by_id: dict[str, tuple[str, str, str]] = {}
+    schemas_by_role: dict[Literal["discovery", "holdout"], _ScoreSchema] = {}
 
     def _check_cancelled() -> None:
         if should_cancel is not None and should_cancel():
@@ -453,6 +566,7 @@ def search_harness(
         active_scorer: HarnessScorer,
         doc: HarnessDoc,
         *,
+        role: Literal["discovery", "holdout"],
         purpose: Literal["seed", "screen", "full", "holdout", "confirmation"],
         task_ids: list[str] | None = None,
         attempts: int | None = None,
@@ -465,13 +579,10 @@ def search_harness(
             attempts=attempts,
         )
         report = _snapshot_score_report(active_scorer.score(doc, request=request))
-        scorer_attempts = (
-            discovery_attempts
-            if active_scorer is scorer
-            else holdout_attempts
-            if active_scorer is holdout_scorer
-            else None
-        )
+        expected_scorer = scorer if role == "discovery" else holdout_scorer
+        if active_scorer is not expected_scorer:
+            raise ValueError(f"search received a report from an unknown {role} scorer")
+        scorer_attempts = discovery_attempts if role == "discovery" else holdout_attempts
         if scorer_attempts is None:
             raise ValueError("search received a report from an unknown scorer")
         expected_attempts = attempts or scorer_attempts
@@ -486,6 +597,48 @@ def search_harness(
             raise ValueError(
                 f"scorer returned the wrong task set; missing={missing}, extra={extra}"
             )
+        capabilities = discovery_capabilities if role == "discovery" else holdout_capabilities
+        assert capabilities is not None
+        if report.secondary_objective != capabilities.secondary_objective:
+            actual = (
+                report.secondary_objective.objective_id
+                if report.secondary_objective is not None
+                else None
+            )
+            declared = (
+                capabilities.secondary_objective.objective_id
+                if capabilities.secondary_objective is not None
+                else None
+            )
+            if declared is None:
+                raise ValueError(
+                    f"{role} scorer returned secondary objective {actual!r}, but it was not "
+                    "declared in capabilities"
+                )
+            raise ValueError(
+                f"{role} scorer returned secondary objective {actual!r}; capabilities declare "
+                f"{declared!r}"
+            )
+        task_weights = tuple(
+            sorted((task_id, task.aggregate_weight) for task_id, task in report.per_task.items())
+        )
+        schema = schemas_by_role.get(role)
+        if schema is None:
+            schemas_by_role[role] = _ScoreSchema(
+                secondary_objective=report.secondary_objective,
+                task_weights=task_weights,
+            )
+        else:
+            expected_weights = dict(schema.task_weights)
+            for task_id, weight in task_weights:
+                expected_weight = expected_weights.get(task_id)
+                if expected_weight is None:
+                    raise ValueError(f"{role} scorer introduced unknown task {task_id!r}")
+                if weight != expected_weight:
+                    raise ValueError(
+                        f"{role} aggregate weight for task {task_id!r} changed from "
+                        f"{expected_weight!r} to {weight!r}"
+                    )
         evaluation_record = (
             doc.execution_hash,
             request.model_dump_json(),
@@ -509,14 +662,19 @@ def search_harness(
     screened = 0
     confirmations = 0
 
-    seed_report = _score(scorer, seed_doc, purpose="seed")
+    seed_report = _score(scorer, seed_doc, role="discovery", purpose="seed")
     if not seed_report.per_task:
         raise ValueError("seed score report contains no tasks")
     discovery_task_ids = frozenset(seed_report.per_task)
     reports[seed_doc.doc_hash] = seed_report
     holdout_task_ids: frozenset[str] | None = None
     if holdout_scorer is not None:
-        seed_holdout = _score(holdout_scorer, seed_doc, purpose="holdout")
+        seed_holdout = _score(
+            holdout_scorer,
+            seed_doc,
+            role="holdout",
+            purpose="holdout",
+        )
         if not seed_holdout.per_task:
             raise ValueError("holdout seed score report contains no tasks")
         holdout_task_ids = frozenset(seed_holdout.per_task)
@@ -541,9 +699,8 @@ def search_harness(
 
     for iteration_index in range(1, iterations + 1):
         _check_cancelled()
-        scorer.before_proposal_batch()
-        if holdout_scorer is not None and holdout_scorer is not scorer:
-            holdout_scorer.before_proposal_batch()
+        if before_proposal_batch is not None:
+            before_proposal_batch()
         parent = docs[champion_hash]
         parent_report = reports[champion_hash]
         frozen_champion_hash = champion_hash
@@ -747,6 +904,7 @@ def search_harness(
                 screen_report = _score(
                     scorer,
                     child,
+                    role="discovery",
                     purpose="screen",
                     task_ids=screen_task_ids,
                 )
@@ -758,14 +916,19 @@ def search_harness(
                 screen_parent_value = parent_mean
                 screen_child_secondary = child_secondary
                 screen_parent_secondary = parent_secondary
+                secondary_summary = (
+                    f"; secondary score {child_secondary:.3f} vs parent {parent_secondary:.3f}"
+                    if child_secondary is not None and parent_secondary is not None
+                    else ""
+                )
                 feedback_error = _record_score_evaluation(
                     proposer,
                     delta,
                     stage="screen",
                     report=screen_report,
                     summary=(
-                        f"trigger score {child_mean:.3f} vs parent {parent_mean:.3f}; "
-                        f"secondary score {child_secondary:.3f} vs parent {parent_secondary:.3f}"
+                        f"trigger score {child_mean:.3f} vs parent {parent_mean:.3f}"
+                        f"{secondary_summary}"
                     ),
                 )
                 if feedback_error is not None:
@@ -775,14 +938,22 @@ def search_harness(
                     )
                 success_regressed = child_mean < parent_mean - _TIE_EPS
                 success_tied = abs(child_mean - parent_mean) <= _TIE_EPS
-                secondary_did_not_improve = child_secondary <= parent_secondary + _TIE_EPS
+                secondary_did_not_improve = (
+                    child_secondary is None
+                    or parent_secondary is None
+                    or child_secondary <= parent_secondary + _TIE_EPS
+                )
                 if success_regressed or (success_tied and secondary_did_not_improve):
+                    secondary_reason = (
+                        f"; secondary score {child_secondary:.2f} vs parent {parent_secondary:.2f}"
+                        if child_secondary is not None and parent_secondary is not None
+                        else ""
+                    )
                     delta.verdict = GateRecord(
                         accepted=False,
                         reason=(
                             f"screened out: trigger score {child_mean:.2f} vs parent "
-                            f"{parent_mean:.2f}; secondary score {child_secondary:.2f} vs "
-                            f"parent {parent_secondary:.2f} over {len(screen_task_ids)} "
+                            f"{parent_mean:.2f}{secondary_reason} over {len(screen_task_ids)} "
                             f"task(s), attempts={discovery_attempts}; the delta did not "
                             "improve its own target"
                         ),
@@ -814,6 +985,7 @@ def search_harness(
             child_report = _score(
                 scorer,
                 child,
+                role="discovery",
                 purpose="full",
                 expected_task_ids=discovery_task_ids,
             )
@@ -828,9 +1000,11 @@ def search_harness(
                 confirm_narrow_vetoes
                 and narrow_failing_tiers(
                     pre_verdict,
-                    k=discovery_attempts,
-                    n_suite=len(frozen_suite),
-                    n_holdout=0,
+                    suite_attempt_impact=_max_primary_attempt_impact(
+                        parent_report,
+                        frozen_suite,
+                    ),
+                    holdout_attempt_impact=None,
                 )
                 is not None
             )
@@ -838,6 +1012,7 @@ def search_harness(
                 child_holdout = _score(
                     holdout_scorer,
                     child,
+                    role="holdout",
                     purpose="holdout",
                     expected_task_ids=holdout_task_ids,
                 )
@@ -846,6 +1021,7 @@ def search_harness(
                     frozen_champion_holdout = _score(
                         holdout_scorer,
                         parent,
+                        role="holdout",
                         purpose="holdout",
                         expected_task_ids=holdout_task_ids,
                     )
@@ -864,12 +1040,17 @@ def search_harness(
             tiers = (
                 narrow_failing_tiers(
                     verdict,
-                    k=discovery_attempts,
-                    n_suite=len(frozen_suite),
-                    n_holdout=(
-                        len(frozen_champion_holdout.per_task)
+                    suite_attempt_impact=_max_primary_attempt_impact(
+                        parent_report,
+                        frozen_suite,
+                    ),
+                    holdout_attempt_impact=(
+                        _max_primary_attempt_impact(
+                            frozen_champion_holdout,
+                            sorted(frozen_champion_holdout.per_task),
+                        )
                         if frozen_champion_holdout is not None
-                        else 0
+                        else None
                     ),
                 )
                 if confirm_narrow_vetoes
@@ -889,6 +1070,7 @@ def search_harness(
                     child_re = _score(
                         active_scorer,
                         child,
+                        role="discovery" if tier == "suite" else "holdout",
                         purpose="confirmation",
                         task_ids=task_ids,
                         attempts=attempts,
@@ -899,6 +1081,7 @@ def search_harness(
                     champion_re = _score(
                         active_scorer,
                         parent,
+                        role="discovery" if tier == "suite" else "holdout",
                         purpose="confirmation",
                         task_ids=task_ids,
                         attempts=attempts,
@@ -907,13 +1090,24 @@ def search_harness(
                         ),
                     )
                     score_delta = child_re.score - champion_re.score
-                    secondary_delta = child_re.secondary_score - champion_re.secondary_score
+                    secondary_delta = _optional_score_delta(
+                        child_re.secondary_score,
+                        champion_re.secondary_score,
+                        context=f"{tier} confirmation",
+                    )
+                    secondary_note = (
+                        f", secondary score {secondary_delta:+.3f}"
+                        if secondary_delta is not None
+                        else ""
+                    )
                     notes.append(
                         f"{tier} re-measured at attempts={attempts}: score "
-                        f"{score_delta:+.3f}, secondary score {secondary_delta:+.3f}"
+                        f"{score_delta:+.3f}{secondary_note}"
                     )
                     if score_delta < -_TIE_EPS or (
-                        abs(score_delta) <= _TIE_EPS and secondary_delta < -_TIE_EPS
+                        abs(score_delta) <= _TIE_EPS
+                        and secondary_delta is not None
+                        and secondary_delta < -_TIE_EPS
                     ):
                         confirmed_ok = False
                 outcome = "veto overturned" if confirmed_ok else "regression confirmed"
@@ -967,17 +1161,19 @@ def search_harness(
 
         _check_cancelled()
         eligible = [candidate for candidate in scored_proposals if candidate.gate.accepted]
-        winner = (
-            max(
+        if not eligible:
+            winner = None
+        elif discovery_capabilities.secondary_objective is not None:
+            winner = max(eligible, key=_secondary_candidate_rank)
+        else:
+            winner = max(
                 eligible,
-                key=lambda candidate: (
-                    candidate.report.score,
-                    candidate.report.secondary_score,
-                    -candidate.proposal_index,
-                ),
+                key=lambda candidate: (candidate.report.score, -candidate.proposal_index),
             )
-            if eligible
-            else None
+        ranking = (
+            "full score, secondary score, then proposal order"
+            if discovery_capabilities.secondary_objective is not None
+            else "full score, then proposal order"
         )
         for candidate in scored_proposals:
             gate_eligible = candidate.gate.accepted
@@ -990,8 +1186,8 @@ def search_harness(
                         "accepted": False,
                         "reason": (
                             "gate eligible but not selected: "
-                            f"proposal {winner.proposal_index} ranked higher by full score, "
-                            "secondary score, then proposal order | " + candidate.gate.reason
+                            f"proposal {winner.proposal_index} ranked higher by {ranking} | "
+                            + candidate.gate.reason
                         ),
                     }
                 )
@@ -1064,12 +1260,18 @@ def search_harness(
 
 
 ClosedLoopScoreFn = Callable[[HarnessDoc, list[TaskSpec], int], ClosedLoopReport]
+_ASSERTION_FRACTION_OBJECTIVE = ScoreObjective(objective_id="assertion_fraction")
 
 
 class _ClosedLoopHarnessScorer:
     """Adapt the existing world-model evaluation into normalized search scores."""
 
-    capabilities = ScoreCapabilities(task_subsets=True, attempt_overrides=True)
+    capabilities = ScoreCapabilities(
+        task_subsets=True,
+        attempt_overrides=True,
+        mean_over_attempts=True,
+        secondary_objective=_ASSERTION_FRACTION_OBJECTIVE,
+    )
 
     def __init__(
         self,
@@ -1078,7 +1280,6 @@ class _ClosedLoopHarnessScorer:
         default_attempts: int,
         evaluate: ClosedLoopScoreFn,
         validate_candidate: Callable[[HarnessDoc], str | None],
-        before_proposal_batch: Callable[[], None],
     ) -> None:
         self._tasks = list(tasks)
         self._by_id = {task.task_id: task for task in tasks}
@@ -1087,14 +1288,10 @@ class _ClosedLoopHarnessScorer:
         self.default_attempts = default_attempts
         self._evaluate = evaluate
         self._validate = validate_candidate
-        self._before_proposal = before_proposal_batch
         self.raw_reports: dict[str, ClosedLoopReport] = {}
 
     def validate_candidate(self, candidate: HarnessDoc) -> str | None:
         return self._validate(candidate)
-
-    def before_proposal_batch(self) -> None:
-        self._before_proposal()
 
     def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
         if request.task_ids is None:
@@ -1235,6 +1432,7 @@ def _closed_loop_score(
         evaluation_id=f"closed-loop:{digest}",
         label=report.label,
         score=report.success_rate,
+        secondary_objective=_ASSERTION_FRACTION_OBJECTIVE,
         secondary_score=report.mean_fraction,
         attempts=report.k,
         per_task=task_scores,
@@ -1359,7 +1557,6 @@ def create_harness(
             default_attempts=k,
             evaluate=_evaluate,
             validate_candidate=_validate_candidate,
-            before_proposal_batch=_before_proposal_batch,
         )
         holdout_scorer = (
             _ClosedLoopHarnessScorer(
@@ -1367,7 +1564,6 @@ def create_harness(
                 default_attempts=k,
                 evaluate=_evaluate,
                 validate_candidate=_validate_candidate,
-                before_proposal_batch=lambda: None,
             )
             if holdout
             else None
@@ -1387,6 +1583,7 @@ def create_harness(
             on_proposal=on_proposal,
             on_accept=on_accept,
             should_cancel=should_cancel,
+            before_proposal_batch=_before_proposal_batch,
         )
         result = CreateResult(
             best=search_result.best,

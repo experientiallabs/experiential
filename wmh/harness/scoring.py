@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import isclose
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -28,6 +29,18 @@ _MAX_MECHANISM_SUMMARY_CHARS = 16_000
 MechanismLabel = Annotated[str, Field(min_length=1, max_length=4_000)]
 
 
+class ScoreObjective(BaseModel):
+    """Stable identity for an optional normalized objective where higher is better."""
+
+    model_config = ConfigDict(frozen=True)
+
+    objective_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+    )
+
+
 class ScoreCapabilities(BaseModel):
     """Optional score requests a scorer can execute."""
 
@@ -35,6 +48,9 @@ class ScoreCapabilities(BaseModel):
 
     task_subsets: bool = False
     attempt_overrides: bool = False
+    # Primary TaskScore.score is the arithmetic mean of normalized per-attempt scores.
+    mean_over_attempts: bool = False
+    secondary_objective: ScoreObjective | None = None
 
 
 class ScoreRequest(BaseModel):
@@ -58,13 +74,14 @@ class ScoreRequest(BaseModel):
 
 
 class TaskScore(BaseModel):
-    """One task's normalized score and proposer-facing evidence."""
+    """One task's normalized scores, aggregate weight, and proposer-facing evidence."""
 
     model_config = ConfigDict(allow_inf_nan=False)
 
     task_id: str = Field(min_length=1, max_length=512)
     score: float = Field(ge=0.0, le=1.0)
-    secondary_score: float = Field(ge=0.0, le=1.0)
+    secondary_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    aggregate_weight: float = Field(default=1.0, gt=0.0)
     passed: bool
     description: str = Field(default="", max_length=MAX_TASK_DESCRIPTION_CHARS)
     mechanisms: tuple[MechanismLabel, ...] = Field(default=(), max_length=MAX_MECHANISMS_PER_TASK)
@@ -72,14 +89,20 @@ class TaskScore(BaseModel):
 
 
 class HarnessScoreReport(BaseModel):
-    """A normalized scorecard over one candidate and one task split."""
+    """A normalized weighted scorecard over one candidate and one task split.
+
+    ``score`` is the aggregate-weighted mean of the primary per-task scores. A secondary score is
+    valid only when ``secondary_objective`` identifies it, and it uses the same frozen task
+    weights. Search checks that objective identity and weights stay fixed across evaluations.
+    """
 
     model_config = ConfigDict(allow_inf_nan=False)
 
     evaluation_id: str = Field(min_length=1, max_length=512, frozen=True)
     label: str = Field(default="", max_length=512)
     score: float = Field(default=0.0, ge=0.0, le=1.0)
-    secondary_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    secondary_objective: ScoreObjective | None = None
+    secondary_score: float | None = Field(default=None, ge=0.0, le=1.0)
     attempts: int = Field(ge=1)
     per_task: dict[str, TaskScore] = Field(default_factory=dict)
 
@@ -90,6 +113,41 @@ class HarnessScoreReport(BaseModel):
                 raise ValueError(
                     f"per_task key {task_id!r} does not match task_id {task.task_id!r}"
                 )
+        if not self.per_task:
+            return self
+
+        aggregate = _weighted_task_score(tuple(self.per_task.values()), secondary=False)
+        if not isclose(self.score, aggregate, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                f"score={self.score!r} is inconsistent with weighted task aggregate={aggregate!r}"
+            )
+
+        task_secondary = [task.secondary_score for task in self.per_task.values()]
+        if self.secondary_objective is None:
+            if self.secondary_score is not None or any(
+                value is not None for value in task_secondary
+            ):
+                raise ValueError("secondary scores require an explicit secondary objective")
+            return self
+        if self.secondary_score is None or any(value is None for value in task_secondary):
+            raise ValueError(
+                "a declared secondary objective requires a secondary score on the report and "
+                "every task"
+            )
+        secondary_aggregate = _weighted_task_score(
+            tuple(self.per_task.values()),
+            secondary=True,
+        )
+        if not isclose(
+            self.secondary_score,
+            secondary_aggregate,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"secondary_score={self.secondary_score!r} is inconsistent with weighted task "
+                f"aggregate={secondary_aggregate!r}"
+            )
         return self
 
 
@@ -102,11 +160,26 @@ class HarnessScorer(Protocol):
     def validate_candidate(self, candidate: HarnessDoc) -> str | None:
         """Return a rejection reason, or None when the candidate is eligible."""
 
-    def before_proposal_batch(self) -> None:
-        """Release idle evaluation resources before a potentially long proposal call."""
-
     def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
         """Evaluate one candidate under the requested task and attempt selection."""
+
+
+def _weighted_task_score(tasks: tuple[TaskScore, ...], *, secondary: bool) -> float:
+    """Aggregate task scores using their explicit positive weights."""
+    total_weight = sum(task.aggregate_weight for task in tasks)
+    if secondary:
+        values = [task.secondary_score for task in tasks]
+        if any(value is None for value in values):
+            raise ValueError("secondary aggregation requires a score on every task")
+        return (
+            sum(
+                value * task.aggregate_weight
+                for task, value in zip(tasks, values, strict=True)
+                if value is not None
+            )
+            / total_weight
+        )
+    return sum(task.score * task.aggregate_weight for task in tasks) / total_weight
 
 
 def cluster_score_failures(report: HarnessScoreReport) -> list[FailureSignature]:
@@ -169,10 +242,10 @@ def render_score_evidence(trigger: FailureSignature, report: HarnessScoreReport)
         if len(description) > 240:
             description = f"{description[:237]}..."
         marker = "TARGET" if task_id in selected else "other"
-        scorecard.append(
-            f"- [{marker}] {task_id}: score={task.score:.2f}, "
-            f"secondary_score={task.secondary_score:.2f}: {description}"
-        )
+        score_summary = f"score={task.score:.2f}"
+        if task.secondary_score is not None:
+            score_summary += f", secondary_score={task.secondary_score:.2f}"
+        scorecard.append(f"- [{marker}] {task_id}: {score_summary}: {description}")
 
     scorecard_text = _bound_score_text(
         "\n".join(scorecard),
@@ -216,9 +289,11 @@ def render_score_evidence(trigger: FailureSignature, report: HarnessScoreReport)
                 f"### Task {task_id}\n\nInstruction: (unknown task)\n\nNo evidence recorded."
             )
         else:
+            score_summary = f"score={task.score:.2f}"
+            if task.secondary_score is not None:
+                score_summary += f", secondary_score={task.secondary_score:.2f}"
             section = [
-                f"### Task {task_id} (score={task.score:.2f}, "
-                f"secondary_score={task.secondary_score:.2f})",
+                f"### Task {task_id} ({score_summary})",
                 f"Instruction: {normalize_durable_text(task.description) or '(none)'}",
                 normalize_durable_text(task.evidence) if task.evidence else "No evidence recorded.",
             ]
@@ -251,20 +326,25 @@ def _bound_score_text(value: str, *, limit: int, label: str) -> str:
 
 
 def suite_score(report: HarnessScoreReport, suite: Sequence[str]) -> float:
-    """Return the mean primary score over a task subset, with missing tasks scored zero."""
-    if not suite:
-        return 1.0
-    scores = [task.score for task_id in suite if (task := report.per_task.get(task_id)) is not None]
-    return sum(scores) / len(suite)
+    """Return the explicit weighted primary aggregate over a task subset."""
+    tasks = _suite_tasks(report, suite)
+    return _weighted_task_score(tasks, secondary=False) if tasks else 1.0
 
 
-def suite_secondary_score(report: HarnessScoreReport, suite: Sequence[str]) -> float:
-    """Return the mean secondary score over a subset, with missing tasks scored zero."""
-    if not suite:
-        return 1.0
-    scores = [
-        task.secondary_score
-        for task_id in suite
-        if (task := report.per_task.get(task_id)) is not None
-    ]
-    return sum(scores) / len(suite)
+def suite_secondary_score(report: HarnessScoreReport, suite: Sequence[str]) -> float | None:
+    """Return the weighted secondary aggregate, or None when no objective is declared."""
+    if report.secondary_objective is None:
+        return None
+    tasks = _suite_tasks(report, suite)
+    return _weighted_task_score(tasks, secondary=True) if tasks else 1.0
+
+
+def _suite_tasks(report: HarnessScoreReport, suite: Sequence[str]) -> tuple[TaskScore, ...]:
+    """Resolve a unique subset and reject missing task identities."""
+    task_ids = tuple(suite)
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError("score suite task ids must be unique")
+    missing = sorted(set(task_ids) - set(report.per_task))
+    if missing:
+        raise ValueError(f"score suite contains missing task ids: {missing}")
+    return tuple(report.per_task[task_id] for task_id in task_ids)

@@ -90,9 +90,9 @@ class GateRecord(BaseModel):
     """The acceptance verdict, filled at evaluation time and persisted on the delta."""
 
     suite_delta: float = 0.0  # regression suite: child - champion (tier 1; >= 0 to pass)
-    suite_secondary_delta: float = 0.0  # secondary score; vetoes only when suite score ties
+    suite_secondary_delta: float | None = None  # present only for a declared secondary objective
     full_delta: float = 0.0  # full split: child - best seen (tier 2; >= 0 to pass)
-    full_secondary_delta: float = 0.0  # secondary score; vetoes only when full score ties
+    full_secondary_delta: float | None = None  # present only for a declared secondary objective
     holdout_delta: float | None = None  # held-out split (tier 3; None when no holdout given)
     holdout_secondary_delta: float | None = None  # secondary held-out signal when score ties
     accepted: bool

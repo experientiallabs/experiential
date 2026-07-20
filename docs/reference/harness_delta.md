@@ -8,7 +8,8 @@ improve harnesses* is bounded by what the update object can express.
 
 Implementation: `wmh/harness/doc.py` (the document), `wmh/harness/delta.py` (the delta),
 `wmh/harness/mutate.py` (delta parsing), `wmh/harness/proposer.py` (proposal runtimes), and
-`wmh/harness/create.py` (clustering, gate, archive).
+`wmh/harness/scoring.py` plus `wmh/harness/create.py` (scoring contract, clustering, gate,
+archive).
 
 ---
 
@@ -95,11 +96,11 @@ class SurfaceOp(BaseModel):
 class GateRecord(BaseModel):
     """Filled at evaluation time; the delta carries its own verdict."""
     suite_delta: float           # regression suite: child − champion   (tier 1)
-    suite_secondary_delta: float  # secondary score when suite score ties
+    suite_secondary_delta: float | None  # present only for a declared secondary objective
     full_delta: float            # full split: child − best-seen        (tier 2)
-    full_secondary_delta: float   # secondary score when full score ties
+    full_secondary_delta: float | None  # present only for a declared secondary objective
     holdout_delta: float | None  # held-out split: child − champion     (tier 3; None = no holdout)
-    holdout_secondary_delta: float | None  # secondary score when held-out score ties
+    holdout_secondary_delta: float | None  # present only for a declared secondary objective
     accepted: bool
     reason: str                  # accept/reject reasoning, incl. the expected-effect audit
 
@@ -117,7 +118,31 @@ class HarnessDelta(BaseModel):
     verdict: GateRecord | None     # None until evaluated; the archive stores deltas, not snapshots
 ```
 
-### 2.3 Semantics
+### 2.3 Scoring contract
+
+`search_harness` owns proposal, gate, and acceptance policy. An injected `HarnessScorer` owns
+candidate eligibility and evaluation. The core scorer protocol has only `capabilities`,
+`default_attempts`, `validate_candidate`, and `score`. Resource cleanup at the proposal boundary
+is a separate optional `before_proposal_batch` callback, so a pure scorer does not need a lifecycle
+method. The world-model adapter uses that callback to retire idle sandbox resources.
+
+Every `TaskScore` carries a normalized primary score and an explicit positive
+`aggregate_weight`. `HarnessScoreReport.score` must equal the aggregate-weighted task mean. This
+keeps subset and full-split gates consistent while allowing benchmark-defined weighting rather
+than assuming every task contributes equally. Missing suite tasks, aggregate mismatches, or
+weight changes fail closed.
+
+The secondary objective is optional. A scorer that has one declares a stable `ScoreObjective` in
+`ScoreCapabilities`, repeats that identity on every report, and supplies a secondary score for
+the report and every task. A scorer without one supplies `None` throughout. The seed freezes the
+task identities, weights, and secondary-objective schema for its scorer role. Candidate, holdout,
+and confirmation reports must match the corresponding frozen schema. Lexicographic gates and
+sibling ranking consult the secondary score only when that objective was genuinely declared.
+Confirmation also requires the scorer to declare both attempt overrides and
+`mean_over_attempts`. Its narrow-veto threshold then uses the largest weighted aggregate impact
+that one normalized attempt can have, rather than assuming equal task weights.
+
+### 2.4 Semantics
 
 - **Application is atomic** (`apply_delta`): lineage hash, every precondition, and every op are
   validated against the parent doc — and the child re-validates as a whole `HarnessDoc` — before a
@@ -132,10 +157,11 @@ class HarnessDelta(BaseModel):
   fails the episode, not the eval).
 - **Verification is staged by cost**: before a full-split eval, a child is screened on its own
   trigger cluster — the failing tasks its delta claims to fix. The screen compares full-task
-  primary score first and secondary score second, so a partial fix is not flattened into
-  a binary tie. A delta that improves neither signal is rejected (and archived) for a fraction of
-  the price. The authoritative full gate repeats the same lexicographic contract across the whole
-  split: the primary score leads, and the secondary score cannot regress when the primary ties.
+  primary score first and, when declared, secondary score second, so a measured partial fix is
+  not flattened into a binary tie. A delta that improves no available signal is rejected and
+  archived for a fraction of the price. The authoritative full gate repeats the same contract
+  across the whole split: the primary score leads, and an available secondary score cannot regress
+  when the primary ties.
   Every judged delta is fed back to the proposer as trace-level history, so the search iterates
   instead of re-proposing rejected ideas.
 - **Search breadth is independent from evaluation depth**: `proposal_batch_size` asks the
@@ -145,7 +171,7 @@ class HarnessDelta(BaseModel):
   project while every turn runs through the same ordinary agent-session runtime.
 - **Acceptance is the gate, not "applied cleanly"** (`gate_delta`): regression-suite
   non-regression vs the champion → full-split never-worse-than-best → held-out non-regression vs
-  the champion (when a holdout split is given). Primary ties consult the secondary score;
+  the champion (when a holdout split is given). Primary ties consult a declared secondary score;
   a stepping stone may advance on dense signal but cannot hide a global dense regression. On
   accept, newly-passing tasks promote into the regression suite, so wins are locked in and later
   deltas cannot quietly trade them away. The verdict is written onto the delta.
@@ -165,7 +191,7 @@ class HarnessDelta(BaseModel):
   re-checked ("trigger cluster: 2/3 tasks now pass") and the result lands in `verdict.reason`.
   Over time this measures the proposer's *calibration*, not just its win rate.
 
-### 2.4 What the meta-agent emits
+### 2.5 What the meta-agent emits
 
 The proposal prompt (`MUTATE_SYSTEM`) asks for exactly `{expected_effect, preconditions, ops}` as
 JSON — trigger, lineage, and identity are filled by the caller from ground truth, never trusted
@@ -183,7 +209,7 @@ that fails atomic application is a counted skip that is still archived with its 
 2. **Merge.** Identity-keyed surfaces + content lineage make a surface-keyed three-way merge of
    two accepted lineages nearly free. Deferred to a follow-up.
 3. **Gate resolution.** With k=3 and small suites, binary per-task deltas are coarse (0, ⅓, ⅔, 1).
-   Secondary scores break otherwise-flat ties; if flappy accepts show up in practice,
+   A declared secondary score breaks otherwise-flat ties; if flappy accepts show up in practice,
    raise k on gate evals rather than adding arbitrary thresholds.
 4. **Suite demotion.** Newly-passing tasks promote into the regression suite; nothing ever leaves
    it. A permanently-flaky task could wedge the gate. Punted until observed.
