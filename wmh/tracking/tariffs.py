@@ -97,6 +97,42 @@ _BEDROCK_CATALOG_RECORDS = (
     ),
 )
 
+_BEDROCK_CATALOG_RECORD_DIGESTS = {
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0": (
+        "sha256:827e06ceb43f1f5618a9e8aba2dbc8f93a61ff289b67d7b73bb7f56baa942de6"
+    ),
+    "zai.glm-5": "sha256:2140ffa2bd76676ce9e64cb8ee7b053a8f18c56fad7b417e44aeacdf596e3678",
+    "us.anthropic.claude-opus-4-8": (
+        "sha256:24bfec158bbdb7910c31184c110a575b88cbc38c83b153473072d138bf10d5bc"
+    ),
+}
+
+
+def _bedrock_catalog_record_digest(record: _BedrockCatalogRecord) -> str:
+    payload = json.dumps(
+        record.model_dump(mode="json"),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _verify_bedrock_catalog_integrity(
+    records: tuple[_BedrockCatalogRecord, ...],
+) -> None:
+    """Fail closed if embedded prices drift without an independently pinned digest edit."""
+    coordinates = tuple(record.model for record in records)
+    if coordinates != tuple(_BEDROCK_CATALOG_RECORD_DIGESTS):
+        raise RuntimeError("embedded Bedrock tariff record set changed")
+    for record in records:
+        if _bedrock_catalog_record_digest(record) != _BEDROCK_CATALOG_RECORD_DIGESTS[record.model]:
+            raise RuntimeError(f"embedded Bedrock tariff record changed: {record.model}")
+
+
+_verify_bedrock_catalog_integrity(_BEDROCK_CATALOG_RECORDS)
+
 
 class ProviderTokenTariff(BaseModel):
     """One immutable tariff tied to the full nonsecret provider execution route."""

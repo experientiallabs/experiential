@@ -7,6 +7,7 @@ from datetime import date
 import pytest
 from pydantic import ValidationError
 
+import wmh.tracking.tariffs as tariffs_module
 from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
     ProviderCostMeter,
@@ -22,6 +23,25 @@ from wmh.tracking.tariffs import (
     catalog_provider_token_tariffs,
     provider_cost_meter,
 )
+
+
+def test_bedrock_catalog_integrity_guard_rejects_embedded_price_drift() -> None:
+    records = tariffs_module._BEDROCK_CATALOG_RECORDS
+    tariffs_module._verify_bedrock_catalog_integrity(records)
+    mutated = (
+        records[0].model_copy(update={"input_usd": "0.000001"}),
+        *records[1:],
+    )
+
+    with pytest.raises(RuntimeError, match="embedded Bedrock tariff record changed"):
+        tariffs_module._verify_bedrock_catalog_integrity(mutated)
+
+
+def test_bedrock_catalog_integrity_guard_rejects_record_set_drift() -> None:
+    with pytest.raises(RuntimeError, match="record set changed"):
+        tariffs_module._verify_bedrock_catalog_integrity(
+            tariffs_module._BEDROCK_CATALOG_RECORDS[:-1]
+        )
 
 
 @pytest.mark.parametrize(
