@@ -26,6 +26,7 @@ from wmh.evals.harbor.paired_runner import (
     HarborExecutionRuntime,
     PairedHarborBudgetRuntime,
     PairedHarborCompletedBlock,
+    PairedHarborNoActiveSliceIntentError,
     PairedHarborProtocol,
     PairedHarborSliceIntent,
     PairedHarborSlicePolicy,
@@ -608,6 +609,7 @@ class _OneSliceRunner:
     def __init__(self, result: PairedHarborSliceResult) -> None:
         self.result = result
         self.calls = 0
+        self.resume_calls = 0
 
     async def run_slice(
         self,
@@ -619,6 +621,16 @@ class _OneSliceRunner:
         del baseline, candidate, max_new_blocks
         self.calls += 1
         return self.result
+
+    async def resume_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult:
+        del baseline, candidate
+        self.resume_calls += 1
+        raise PairedHarborNoActiveSliceIntentError
 
     async def recover_persisted_slice(
         self,
@@ -649,6 +661,15 @@ class _RecoveringRunner:
         self.run_calls += 1
         raise AssertionError("recovery must not dispatch another confirmation slice")
 
+    async def resume_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult:
+        del baseline, candidate
+        raise AssertionError("recovery must reconcile before resuming confirmation work")
+
     async def recover_persisted_slice(
         self,
         *,
@@ -657,6 +678,54 @@ class _RecoveringRunner:
     ) -> PairedHarborSliceResult | None:
         del baseline, candidate
         self.recovery_calls += 1
+        return self.result
+
+
+class _CrashBeforePairedIntentRunner(_OneSliceRunner):
+    """Crash once after the outer intent but before any paired intent exists."""
+
+    async def resume_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult:
+        del baseline, candidate
+        self.resume_calls += 1
+        if self.resume_calls == 1:
+            raise RuntimeError("synthetic crash before paired intent")
+        raise PairedHarborNoActiveSliceIntentError
+
+
+class _CrashAfterPairedIntentRunner(_OneSliceRunner):
+    """Crash one fresh paired slice, then resume its exact durable intent."""
+
+    def __init__(self, result: PairedHarborSliceResult) -> None:
+        super().__init__(result)
+        self.has_active_intent = False
+
+    async def run_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+        max_new_blocks: int | None = None,
+    ) -> PairedHarborSliceResult:
+        del baseline, candidate, max_new_blocks
+        self.calls += 1
+        self.has_active_intent = True
+        raise RuntimeError("synthetic crash after paired intent")
+
+    async def resume_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult:
+        del baseline, candidate
+        self.resume_calls += 1
+        if not self.has_active_intent:
+            raise PairedHarborNoActiveSliceIntentError
         return self.result
 
 
@@ -898,8 +967,111 @@ def test_confirmation_adapter_checkpoints_and_reconciles_without_a_second_run(
 
     assert persisted == [first]
     assert reconciled == first
+    assert runner.resume_calls == 1
     assert runner.calls == 1
     assert lifecycle.current_phase is StudyPhase.CONFIRMATION_RUNNING
+
+
+def test_confirmation_adapter_reenters_outer_intent_before_creating_paired_intent(
+    tmp_path: Path,
+) -> None:
+    lifecycle, opened, protocol, running = _confirmation_context(tmp_path)
+    expected = _first_slice(protocol)
+    runner = _CrashBeforePairedIntentRunner(expected)
+    persisted: list[PairedHarborSliceResult] = []
+
+    with pytest.raises(RuntimeError, match="before paired intent"):
+        run_harness_optimization_confirmation_slice(
+            opened=opened,
+            protocol=protocol,
+            runner=runner,
+            lifecycle=lifecycle,
+            authorization=running,
+            operation_id="confirmation-run",
+            generation_id=1,
+            resume_from=None,
+            on_checkpoint=persisted.append,
+        )
+
+    resumed = run_harness_optimization_confirmation_slice(
+        opened=opened,
+        protocol=protocol,
+        runner=runner,
+        lifecycle=lifecycle,
+        authorization=running,
+        operation_id="confirmation-run",
+        generation_id=1,
+        resume_from=None,
+        on_checkpoint=persisted.append,
+    )
+
+    assert resumed == expected
+    assert persisted == [expected]
+    assert runner.resume_calls == 2
+    assert runner.calls == 1
+
+
+def test_confirmation_adapter_resumes_inner_intent_without_fresh_slice_dispatch(
+    tmp_path: Path,
+) -> None:
+    lifecycle, opened, protocol, running = _confirmation_context(tmp_path)
+    expected = _first_slice(protocol)
+    runner = _CrashAfterPairedIntentRunner(expected)
+    persisted: list[PairedHarborSliceResult] = []
+
+    with pytest.raises(RuntimeError, match="after paired intent"):
+        run_harness_optimization_confirmation_slice(
+            opened=opened,
+            protocol=protocol,
+            runner=runner,
+            lifecycle=lifecycle,
+            authorization=running,
+            operation_id="confirmation-run",
+            generation_id=1,
+            resume_from=None,
+            on_checkpoint=persisted.append,
+        )
+
+    resumed = run_harness_optimization_confirmation_slice(
+        opened=opened,
+        protocol=protocol,
+        runner=runner,
+        lifecycle=lifecycle,
+        authorization=running,
+        operation_id="confirmation-run",
+        generation_id=1,
+        resume_from=None,
+        on_checkpoint=persisted.append,
+    )
+
+    assert resumed == expected
+    assert persisted == [expected]
+    assert runner.resume_calls == 2
+    assert runner.calls == 1
+
+
+def test_confirmation_authorization_drift_fails_before_resume_or_dispatch(
+    tmp_path: Path,
+) -> None:
+    lifecycle, opened, protocol, running = _confirmation_context(tmp_path)
+    runner = _OneSliceRunner(_first_slice(protocol))
+    drifted = running.model_copy(update={"confirmation_run_id": "different-run"})
+
+    with pytest.raises(ValueError, match="authorization differs"):
+        run_harness_optimization_confirmation_slice(
+            opened=opened,
+            protocol=protocol,
+            runner=runner,
+            lifecycle=lifecycle,
+            authorization=drifted,
+            operation_id="confirmation-run",
+            generation_id=1,
+            resume_from=None,
+            on_checkpoint=lambda _result: None,
+        )
+
+    assert runner.resume_calls == 0
+    assert runner.calls == 0
 
 
 def test_coordinator_recovers_runner_progress_after_crash_before_state_checkpoint(
