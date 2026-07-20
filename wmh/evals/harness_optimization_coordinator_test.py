@@ -74,6 +74,7 @@ from wmh.evals.harness_optimization_test import (
     _prepare,
     _Scorer,
 )
+from wmh.evals.paired import PairedBlock
 from wmh.evals.study_journal import (
     ExternalPublicationReceipt,
     StudyJournalStore,
@@ -806,6 +807,41 @@ class _CrashAfterPairedIntentRunner(_OneSliceRunner):
         return self.result
 
 
+class _CompletedInnerProgressRunner(_OneSliceRunner):
+    """Persist one complete inner slice before its outer checkpoint is allowed to land."""
+
+    def __init__(self, result: PairedHarborSliceResult) -> None:
+        super().__init__(result)
+        self.persisted: PairedHarborSliceResult | None = None
+        self.recovery_calls = 0
+        self.dispatched_blocks: list[PairedBlock] = []
+
+    async def run_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+        max_new_blocks: int | None = None,
+    ) -> PairedHarborSliceResult:
+        del baseline, candidate, max_new_blocks
+        if self.persisted is not None:
+            raise AssertionError("completed inner progress must be recovered before fresh dispatch")
+        self.calls += 1
+        self.dispatched_blocks.extend(self.result.progress.selected_blocks)
+        self.persisted = self.result
+        return self.result
+
+    async def recover_persisted_slice(
+        self,
+        *,
+        baseline: HarnessDoc,
+        candidate: HarnessDoc,
+    ) -> PairedHarborSliceResult | None:
+        del baseline, candidate
+        self.recovery_calls += 1
+        return self.persisted
+
+
 class _SyntheticRuntimeFactory:
     """Run discovery in memory and expose a controllable confirmation runner."""
 
@@ -1125,6 +1161,50 @@ def test_confirmation_adapter_resumes_inner_intent_without_fresh_slice_dispatch(
     assert persisted == [expected]
     assert runner.resume_calls == 2
     assert runner.calls == 1
+
+
+def test_confirmation_adapter_recovers_completed_inner_progress_before_fresh_dispatch(
+    tmp_path: Path,
+) -> None:
+    lifecycle, opened, protocol, running = _confirmation_context(tmp_path)
+    expected = _first_slice(protocol)
+    runner = _CompletedInnerProgressRunner(expected)
+    persisted: list[PairedHarborSliceResult] = []
+
+    def crash_before_outer_checkpoint(_result: PairedHarborSliceResult) -> None:
+        raise RuntimeError("synthetic crash after inner progress")
+
+    with pytest.raises(RuntimeError, match="after inner progress"):
+        run_harness_optimization_confirmation_slice(
+            opened=opened,
+            protocol=protocol,
+            runner=runner,
+            lifecycle=lifecycle,
+            authorization=running,
+            operation_id="confirmation-run",
+            generation_id=1,
+            resume_from=None,
+            on_checkpoint=crash_before_outer_checkpoint,
+        )
+
+    resumed = run_harness_optimization_confirmation_slice(
+        opened=opened,
+        protocol=protocol,
+        runner=runner,
+        lifecycle=lifecycle,
+        authorization=running,
+        operation_id="confirmation-run",
+        generation_id=1,
+        resume_from=None,
+        on_checkpoint=persisted.append,
+    )
+
+    assert resumed == expected
+    assert persisted == [expected]
+    assert runner.recovery_calls == 2
+    assert runner.resume_calls == 2
+    assert runner.calls == 1
+    assert tuple(runner.dispatched_blocks) == expected.progress.selected_blocks
 
 
 def test_confirmation_authorization_drift_fails_before_resume_or_dispatch(
