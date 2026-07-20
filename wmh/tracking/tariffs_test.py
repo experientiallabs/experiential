@@ -1425,6 +1425,97 @@ def test_azure_evidence_factory_accepts_only_a_conservative_explicit_ceiling() -
         )
 
 
+@pytest.mark.parametrize(
+    "effective_start",
+    [
+        "2026-07-01",
+        "2026-07-01Tnot-an-iso-time",
+        "2026-07-01T00:30:00+14:00",
+        "2026-07-01T12:00:00Z",
+        "2026-07-01T00:00:00.0000001Z",
+        "2026-02-30T00:00:00Z",
+    ],
+)
+def test_azure_evidence_factory_requires_complete_utc_effective_timestamps(
+    effective_start: str,
+) -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example-resource.openai.azure.com",
+        deployment="audited-gpt-55-deployment",
+        api_version="2026-06-01",
+    )
+    declared, artifacts = _azure_tariff_fixture(config)
+    retail = json.loads(artifacts["azure-retail-price"])
+    for record in retail["Items"]:
+        record["effectiveStartDate"] = effective_start
+    mutated, retained = _replace_azure_retail_document(declared, retail)
+
+    with pytest.raises(
+        tariffs_module.ProviderTariffEvidenceIntegrityError,
+        match="complete UTC timestamp",
+    ):
+        azure_provider_cost_meter_from_evidence(
+            provider_config=config,
+            source_snapshots=mutated.provenance.source_snapshots,
+            evidence_artifacts={**artifacts, "azure-retail-price": retained},
+            verified_on=date(2026, 7, 19),
+        )
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    ["azure-account-route", "azure-deployment-route", "azure-retail-price"],
+)
+@pytest.mark.parametrize("api_version", ["not-a-version", "2026-02-30", "2026-01-01-beta"])
+def test_azure_evidence_factory_rejects_invalid_public_api_versions(
+    source_id: str,
+    api_version: str,
+) -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example-resource.openai.azure.com",
+        deployment="audited-gpt-55-deployment",
+        api_version="2026-06-01",
+    )
+    declared, artifacts = _azure_tariff_fixture(config)
+    sources: list[ProviderTariffSourceSnapshot] = []
+    for source in declared.provenance.source_snapshots:
+        query = list(source.public_request_query)
+        if source.source_id == source_id:
+            query = [parameter for parameter in query if parameter.name != "api-version"]
+            query.append(
+                ProviderTariffPublicQueryParameter(
+                    name="api-version",
+                    value=api_version,
+                )
+            )
+        sources.append(
+            source.model_copy(
+                update={
+                    "public_request_query": tuple(
+                        sorted(query, key=lambda parameter: (parameter.name, parameter.value))
+                    )
+                }
+            )
+        )
+
+    with pytest.raises(
+        tariffs_module.ProviderTariffEvidenceIntegrityError,
+        match="API version",
+    ):
+        azure_provider_cost_meter_from_evidence(
+            provider_config=config,
+            source_snapshots=tuple(sources),
+            evidence_artifacts=artifacts,
+            verified_on=date(2026, 7, 19),
+        )
+
+
 def test_azure_evidence_factory_rejects_a_non_azure_route_before_evidence() -> None:
     with pytest.raises(ValueError, match="requires an Azure OpenAI provider route"):
         azure_provider_cost_meter_from_evidence(
@@ -1500,6 +1591,16 @@ def test_digest_correct_fake_azure_bytes_fail_semantic_verification() -> None:
     [
         ("armRegionName", "westus", "region differs"),
         ("effectiveStartDate", "2026-07-02T00:00:00Z", "effective date differs"),
+        (
+            "effectiveStartDate",
+            "2026-07-01Tnot-an-iso-time",
+            "complete UTC timestamp",
+        ),
+        (
+            "effectiveStartDate",
+            "2026-07-01T00:30:00+14:00",
+            "complete UTC timestamp",
+        ),
         ("retailPrice", "0.01", "price differs"),
         ("unitOfMeasure", "1 Hour", "unit differs"),
         ("type", "Reservation", "not standard consumption"),

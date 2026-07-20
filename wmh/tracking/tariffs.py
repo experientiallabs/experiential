@@ -9,7 +9,7 @@ import io
 import json
 import re
 from collections.abc import Mapping
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from functools import lru_cache
 from importlib import resources
@@ -57,6 +57,10 @@ _EVIDENCE_PACKAGE = "wmh.tracking"
 _EVIDENCE_ROOT = "evidence/aws-bedrock"
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _MAX_DECODED_SOURCE_BYTES = 256 * 1024 * 1024
+_AZURE_API_VERSION_PATTERN = re.compile(r"^(?P<released_on>\d{4}-\d{2}-\d{2})(?:-preview)?$")
+_AZURE_EFFECTIVE_TIMESTAMP_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.0{1,9})?Z$"
+)
 _AZURE_RETAIL_EXACT_LABELS: dict[
     tuple[str, str],
     tuple[str, str, str, str],
@@ -1258,6 +1262,17 @@ def _azure_exact_public_api_query(
 ) -> None:
     query = {parameter.name: parameter.value for parameter in snapshot.public_request_query}
     query_names = set(query)
+    api_version = query.get("api-version")
+    if api_version is not None:
+        match = _AZURE_API_VERSION_PATTERN.fullmatch(api_version)
+        try:
+            if match is None:
+                raise ValueError
+            date.fromisoformat(match.group("released_on"))
+        except ValueError as exc:
+            raise ProviderTariffEvidenceIntegrityError(
+                "Azure public API version is not an exact ISO date version"
+            ) from exc
     if snapshot.role == "route_definition":
         if query_names != {"api-version"}:
             raise ProviderTariffEvidenceIntegrityError(
@@ -1444,16 +1459,7 @@ def _verify_azure_retail_meter(
     }
     if unit not in accepted_units[meter.source_price_unit]:
         raise ProviderTariffEvidenceIntegrityError("Azure retail unit differs from tariff")
-    effective = _text(
-        record.get("effectiveStartDate"),
-        label="Azure retail effective date",
-    )
-    try:
-        effective_on = date.fromisoformat(effective.split("T", 1)[0])
-    except ValueError as exc:
-        raise ProviderTariffEvidenceIntegrityError(
-            "Azure retail effective date is not an ISO date"
-        ) from exc
+    effective_on = _azure_effective_date(record)
     if effective_on != meter.effective_on:
         raise ProviderTariffEvidenceIntegrityError(
             "Azure retail effective date differs from tariff"
@@ -1642,12 +1648,21 @@ def _azure_effective_date(record: dict[str, object]) -> date:
         record.get("effectiveStartDate"),
         label="Azure retail effective date",
     )
+    if _AZURE_EFFECTIVE_TIMESTAMP_PATTERN.fullmatch(effective) is None:
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure retail effective date must be a complete UTC timestamp"
+        )
     try:
-        return date.fromisoformat(effective.split("T", 1)[0])
+        parsed = datetime.fromisoformat(effective.removesuffix("Z") + "+00:00")
     except ValueError as exc:
         raise ProviderTariffEvidenceIntegrityError(
-            "Azure retail effective date is not an ISO date"
+            "Azure retail effective date must be a complete UTC timestamp"
         ) from exc
+    if any((parsed.hour, parsed.minute, parsed.second, parsed.microsecond)):
+        raise ProviderTariffEvidenceIntegrityError(
+            "Azure retail effective date must be a complete UTC timestamp at midnight"
+        )
+    return parsed.date()
 
 
 def _azure_route_bindings_from_document(
