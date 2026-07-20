@@ -16,7 +16,7 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import MCPServerConfig
 
-from wmh.core.types import Action, ActionKind, Observation
+from wmh.core.types import Action, ActionKind, JsonObject, Observation
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.environment import is_env_action
 from wmh.harness.runtime import RunResult
@@ -117,8 +117,8 @@ class WmhHarborAgent(BaseAgent):
         *,
         command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         extra_env: dict[str, str] | None = None,
-        harness: dict[str, object],
-        provider_config: dict[str, object],
+        harness: JsonObject,
+        provider_config: JsonObject,
         harness_backend: Literal["local", "e2b"] = "local",
         e2b_template: str | None = None,
     ) -> None:
