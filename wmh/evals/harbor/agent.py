@@ -109,7 +109,6 @@ class WmhHarborAgent(BaseAgent):
         provider_config: dict[str, object],
         harness_backend: Literal["local", "e2b"] = "local",
         e2b_template: str | None = None,
-        pi_transport: Literal["ssh"] | None = None,
     ) -> None:
         if extra_env:
             raise ValueError("WMH Harbor evaluation does not inject agent environment variables")
@@ -125,10 +124,6 @@ class WmhHarborAgent(BaseAgent):
             raise ValueError("harness_backend must be local or e2b")
         if harness_backend == "local" and e2b_template is not None:
             raise ValueError("e2b_template requires harness_backend='e2b'")
-        if harness_backend == "local" and pi_transport not in (None, "ssh"):
-            raise ValueError("local Harbor harness execution requires pi_transport='ssh'")
-        if harness_backend == "e2b" and pi_transport is not None:
-            raise ValueError("pi_transport applies only to local harness execution")
         self._harness = HarnessDoc.model_validate(harness)
         self._provider_config = ProviderConfig.model_validate(provider_config)
         expected_model_name = f"{self._provider_config.kind.value}/{self._provider_config.model}"

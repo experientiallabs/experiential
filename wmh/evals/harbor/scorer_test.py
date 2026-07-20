@@ -165,7 +165,6 @@ def _executed_agent(
                 "provider_config": provider.model_dump(mode="json"),
                 "harness_backend": harness_backend,
                 "e2b_template": e2b_template,
-                "pi_transport": "ssh" if harness_backend == "local" else None,
             },
         },
         deep=True,

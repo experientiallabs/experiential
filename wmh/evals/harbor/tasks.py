@@ -239,6 +239,11 @@ def _task_identity(
     download: TaskDownloadResult,
 ) -> HarborTaskIdentity:
     _validate_download_provenance(config, download)
+    # Harbor 0.20 still writes this deprecated property into TrialResult.task_checksum. Its
+    # suggested replacement, TrialLock.task.digest, is a distinct identity that we also retain
+    # below. Preflight must compute both values to bind the request to exactly what the official
+    # trial result and lock will later report; Harbor exposes no non-deprecated accessor for the
+    # former in this pinned release.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         trial_checksum = Task(download.path).checksum

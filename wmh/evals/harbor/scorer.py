@@ -39,6 +39,7 @@ from wmh.evals.harbor.tasks import (
 )
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import resolve_e2b_template
+from wmh.harness.pi_runtime import PI_RUNNER_DIR, PI_RUNNER_HOST
 from wmh.harness.scoring import (
     ArtifactReader,
     EvaluationArtifact,
@@ -166,12 +167,9 @@ class HarborScorer:
         )
         self._reward_key = reward_key
         self._harness_backend = harness_backend
-        self._pi_transport = "ssh" if harness_backend == "local" else None
         if harness_backend == "local":
-            from wmh.harness.pi_runtime import PI_RUNNER_DIR, PI_RUNNER_HOST
-
             self._local_runner_identity = {
-                "transport": self._pi_transport,
+                "transport": "ssh",
                 "host": PI_RUNNER_HOST,
                 "runner_dir": PI_RUNNER_DIR,
             }
@@ -357,7 +355,6 @@ class HarborScorer:
                     "provider_config": self._provider_config.model_dump(mode="json"),
                     "harness_backend": self._harness_backend,
                     "e2b_template": self._e2b_template,
-                    "pi_transport": self._pi_transport,
                 },
             },
             deep=True,
@@ -422,7 +419,6 @@ class HarborScorer:
                 provider_config=self._provider_config,
                 harness_backend=self._harness_backend,
                 e2b_template=self._e2b_template,
-                pi_transport=self._pi_transport,
                 expected_config=expected_config,
                 job_id=result.id,
                 job_dir=run.job_dir,
@@ -761,7 +757,6 @@ def _validate_candidate_trial(
     provider_config: ProviderConfig,
     harness_backend: str,
     e2b_template: str | None,
-    pi_transport: str | None,
     expected_config: JobConfig,
     job_id: UUID,
     job_dir: Path,
@@ -787,7 +782,6 @@ def _validate_candidate_trial(
         configured_provider != provider_config
         or config.kwargs.get("harness_backend") != harness_backend
         or config.kwargs.get("e2b_template") != e2b_template
-        or config.kwargs.get("pi_transport") != pi_transport
     ):
         raise ValueError(f"Harbor trial {trial.trial_name!r} ran a different execution config")
     expected_agent = expected_config.agents[0]
