@@ -1809,6 +1809,88 @@ def test_load_existing_reingests_terminal_job_without_dispatch_or_runner_probe(
     assert loaded.locators == first.locators
 
 
+def test_terminal_result_probe_distinguishes_missing_running_and_complete_jobs(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "job"
+    assert not mod.harbor_job_has_terminal_result(job_dir, expected_trials=2)
+    job_dir.mkdir()
+    assert not mod.harbor_job_has_terminal_result(job_dir, expected_trials=2)
+    result = {
+        "finished_at": None,
+        "n_total_trials": 2,
+        "stats": {
+            "n_completed_trials": 1,
+            "n_running_trials": 1,
+            "n_pending_trials": 0,
+        },
+    }
+    (job_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    assert not mod.harbor_job_has_terminal_result(job_dir, expected_trials=2)
+
+    result["finished_at"] = "2026-07-19T12:00:00Z"
+    result["stats"] = {
+        "n_completed_trials": 2,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+    }
+    (job_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    assert mod.harbor_job_has_terminal_result(job_dir, expected_trials=2)
+
+
+def test_terminal_result_probe_rejects_an_unexpected_trial_count(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "finished_at": "2026-07-19T12:00:00Z",
+                "n_total_trials": 1,
+                "stats": {
+                    "n_completed_trials": 1,
+                    "n_running_trials": 0,
+                    "n_pending_trials": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(mod.StaleHarborJobError, match="unexpected trial count"):
+        mod.harbor_job_has_terminal_result(job_dir, expected_trials=2)
+
+
+def test_terminal_result_probe_rejects_inconsistent_finished_progress(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "finished_at": "2026-07-19T12:00:00Z",
+                "n_total_trials": 2,
+                "stats": {
+                    "n_completed_trials": 1,
+                    "n_running_trials": 0,
+                    "n_pending_trials": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(mod.StaleHarborJobError, match="inconsistent progress"):
+        mod.harbor_job_has_terminal_result(job_dir, expected_trials=2)
+
+
+def test_terminal_result_probe_rejects_a_nonregular_result(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "result.json").mkdir()
+
+    with pytest.raises(mod.StaleHarborJobError, match="not a regular file"):
+        mod.harbor_job_has_terminal_result(job_dir, expected_trials=1)
+
+
 def test_load_existing_rejects_interrupted_root_with_cancelled_child_without_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

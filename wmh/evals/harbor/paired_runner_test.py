@@ -18,6 +18,7 @@ import pytest
 from harbor.models.job.config import DatasetConfig
 
 import wmh.evals.harbor.paired_runner as mod
+from wmh.core.types import JsonObject
 from wmh.evals.benchmark import (
     BenchmarkCandidateFailureReason,
     BenchmarkCandidateOutcome,
@@ -72,6 +73,7 @@ from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     SpendLedger,
+    TimedResourceBudgetAccount,
     TimedResourceClass,
     TimedResourceCostMeter,
     bootstrap_budget_ledger,
@@ -1487,9 +1489,9 @@ def _install_fake_evaluator(
     return calls, maximum
 
 
-def _refresh_arm_admission_digest(arm: dict[str, Any]) -> None:
+def _refresh_arm_admission_digest(arm: JsonObject) -> None:
     arm["admission_digest"] = mod._canonical_digest(
-        cast("Any", {key: value for key, value in arm.items() if key != "admission_digest"})
+        {key: value for key, value in arm.items() if key != "admission_digest"}
     )
 
 
@@ -2887,10 +2889,13 @@ def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
     spec = cast("HarborJobSpec", wiring["spec"])
     provider_account = cast("BudgetAccount", wiring["budget_account"])
     task_accounts = cast(
-        "tuple[object, ...]",
+        "tuple[TimedResourceBudgetAccount, ...]",
         wiring["task_resource_budget_accounts"],
     )
-    runner_account = wiring["runner_resource_budget_account"]
+    runner_account = cast(
+        "TimedResourceBudgetAccount | None",
+        wiring["runner_resource_budget_account"],
+    )
     assert spec.environment_backend is HarborEnvironmentBackend.E2B
     assert spec.create_rate_policy == runner._protocol.execution_plan.create_rate_policy
     assert spec.allow_preexisting_e2b_builds is False
@@ -2901,12 +2906,12 @@ def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
     assert len(task_accounts) == 1
     assert runner_account is not None
     accounts = (provider_account, task_accounts[0], runner_account)
-    assert len({cast("Any", account).ledger_path for account in accounts}) == 1
-    assert len({cast("Any", account).ledger_identity for account in accounts}) == 1
-    assert len({cast("Any", account).policy.policy_digest for account in accounts}) == 1
-    assert len({cast("Any", account).scope.run_id for account in accounts}) == 1
-    assert len({cast("Any", account).scope.lane for account in accounts}) == 1
-    assert len({cast("Any", account).scope.arm for account in accounts}) == 1
+    assert len({account.ledger_path for account in accounts}) == 1
+    assert len({account.ledger_identity for account in accounts}) == 1
+    assert len({account.policy.policy_digest for account in accounts}) == 1
+    assert len({account.scope.run_id for account in accounts}) == 1
+    assert len({account.scope.lane for account in accounts}) == 1
+    assert len({account.scope.arm for account in accounts}) == 1
 
 
 def test_protocol_rejects_opened_e2b_build_drift_on_reload(tmp_path: Path) -> None:
