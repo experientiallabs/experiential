@@ -9,6 +9,7 @@ import os
 import shutil
 import stat
 import tempfile
+import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -123,7 +124,7 @@ _TASK_SNAPSHOT_ROOT = ".wmh-task-snapshots"
 _JOB_ROOT_FILES = frozenset(
     {_MANIFEST_FILENAME, "config.json", "job.log", "lock.json", "result.json"}
 )
-HARBOR_EVALUATOR_VERSION = "4"
+HARBOR_EVALUATOR_VERSION = "5"
 
 
 class StaleHarborJobError(RuntimeError):
@@ -446,17 +447,19 @@ class PreparedHarborTrialIdentity:
     task_key: str
     task_name: str
     task_identity: str
+    runtime_task_checksum: str
     task_checksum: str
     task_source: str | None
     task_instruction: str
     trial_lock_digest: str
 
     @property
-    def immutable_key(self) -> tuple[str, str, str, str, str | None, str, str]:
+    def immutable_key(self) -> tuple[str, str, str, str, str, str | None, str, str]:
         return (
             self.task_key,
             self.task_name,
             self.task_identity,
+            self.runtime_task_checksum,
             self.task_checksum,
             self.task_source,
             self.task_instruction,
@@ -2153,6 +2156,7 @@ def _prepare_trials(
     agent_config_digest: str,
 ) -> list[PreparedHarborTrialIdentity]:
     prepared_trials: list[PreparedHarborTrialIdentity] = []
+    task_checksums: dict[TaskIdType, tuple[str, str]] = {}
     for trial_config, trial_lock in zip(
         job._trial_configs,
         job_lock.trials,
@@ -2162,6 +2166,20 @@ def _prepare_trials(
         task_id = trial_config.task.get_task_id()
         task = tasks[task_id]
         task_identity = task_id.get_name()
+        if (
+            trial_lock.task.name != task_identity
+            or trial_lock.task.source != trial_config.task.source
+        ):
+            raise ValueError(
+                "Harbor trial lock task identity/source differs from the snapshotted task"
+            )
+        frozen_checksums = task_checksums.get(task_id)
+        if frozen_checksums is None:
+            frozen_checksums = _freeze_task_checksum_domains(task)
+            task_checksums[task_id] = frozen_checksums
+        runtime_task_checksum, canonical_task_checksum = frozen_checksums
+        if trial_lock.task.digest != canonical_task_checksum:
+            raise ValueError("Harbor trial lock task digest differs from the snapshotted task tree")
         task_key = _dataset_qualified_task_key(
             source=trial_lock.task.source,
             task_identity=task_identity,
@@ -2173,13 +2191,36 @@ def _prepare_trials(
                 task_key=task_key,
                 task_name=task.name,
                 task_identity=task_identity,
-                task_checksum=trial_lock.task.digest,
+                runtime_task_checksum=runtime_task_checksum,
+                task_checksum=canonical_task_checksum,
                 task_source=trial_lock.task.source,
                 task_instruction=_bound_task_instruction(task.instruction),
                 trial_lock_digest=harbor_trial_lock_digest(trial_lock),
             )
         )
     return prepared_trials
+
+
+def _freeze_task_checksum_domains(task: Task) -> tuple[str, str]:
+    """Freeze both checksum domains from the same snapshotted Harbor task tree.
+
+    Harbor deliberately deprecated this checksum in favor of the trial-lock digest,
+    but its 0.18 runtime still serializes the legacy value. Suppress only that pinned
+    deprecation warning, while independently deriving the canonical lock digest from
+    the exact same task directory.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Task\.checksum will be deprecated soon\.",
+            category=DeprecationWarning,
+        )
+        runtime_checksum = task.checksum
+    if not runtime_checksum or runtime_checksum != runtime_checksum.strip():
+        raise ValueError("Harbor runtime task checksum must be non-empty and canonical")
+    content_hash, _files = Packager.compute_content_hash(task.task_dir)
+    canonical_checksum = f"sha256:{content_hash}"
+    return runtime_checksum, canonical_checksum
 
 
 def _bound_task_instruction(instruction: str) -> str:
@@ -2218,6 +2259,7 @@ def _build_manifest(
                 ),
                 trial_name=prepared.config.trial_name,
                 task_identity=prepared.task_identity,
+                runtime_task_checksum=prepared.runtime_task_checksum,
                 task_checksum=prepared.task_checksum,
                 task_source=prepared.task_source,
                 task_instruction=prepared.task_instruction,
@@ -2225,6 +2267,7 @@ def _build_manifest(
             )
         )
     return HarborTrialManifest(
+        schema_version=2,
         job_name=job_name,
         identity=identity,
         agent_config_digest=agent_config_digest,
@@ -2263,10 +2306,12 @@ def _restore_manifest_trial_names(
         entry for entry in manifest.entries if entry.trial_name not in completed_names
     ]
     prepared_by_key: defaultdict[
-        tuple[str, str, str, str, str | None, str, str], list[PreparedHarborTrialIdentity]
+        tuple[str, str, str, str, str, str | None, str, str],
+        list[PreparedHarborTrialIdentity],
     ] = defaultdict(list)
     entries_by_key: defaultdict[
-        tuple[str, str, str, str, str | None, str, str], list[HarborTrialManifestEntry]
+        tuple[str, str, str, str, str, str | None, str, str],
+        list[HarborTrialManifestEntry],
     ] = defaultdict(list)
     for prepared in remaining_prepared:
         prepared_by_key[prepared.immutable_key].append(prepared)
@@ -2274,7 +2319,9 @@ def _restore_manifest_trial_names(
         entries_by_key[_manifest_entry_immutable_key(entry)].append(entry)
 
     if set(prepared_by_key) != set(entries_by_key):
-        raise StaleHarborJobError("Harbor resume task identities or resolved trial locks changed")
+        raise StaleHarborJobError(
+            "Harbor resume manifest task identities or resolved trial locks changed"
+        )
 
     assignments: list[tuple[PreparedHarborTrialIdentity, HarborTrialManifestEntry]] = []
     for immutable_key, prepared_group in prepared_by_key.items():
@@ -2301,11 +2348,12 @@ def _restore_manifest_trial_names(
 
 def _manifest_entry_immutable_key(
     entry: HarborTrialManifestEntry,
-) -> tuple[str, str, str, str, str | None, str, str]:
+) -> tuple[str, str, str, str, str, str | None, str, str]:
     return (
         entry.cell.task_key,
         entry.cell.task_name,
         entry.task_identity,
+        entry.runtime_task_checksum,
         entry.task_checksum,
         entry.task_source,
         entry.task_instruction,
@@ -2496,6 +2544,7 @@ def _validate_incomplete_trial_evidence(
         ) from exc
     if (
         harbor_trial_lock_digest(lock) != entry.trial_lock_digest
+        or lock.task.name != entry.task_identity
         or lock.task.digest != entry.task_checksum
         or lock.task.source != entry.task_source
         or harbor_agent_config_digest(lock.agent) != expected_agent_digest

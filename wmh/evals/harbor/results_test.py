@@ -44,6 +44,7 @@ from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, runner_owner_id
 
 _NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 _TASK_CHECKSUM = "sha256:" + "b" * 64
+_RUNTIME_TASK_CHECKSUM = "a" * 64
 _TASK_SOURCE = "example-benchmark"
 _HARNESS = pi_node_baseline("candidate")
 _TASK_ENVIRONMENT_ATTESTATION = {
@@ -223,7 +224,7 @@ def _trial(
         trial_uri=f"file://{tmp_path}/{config.trial_name}",
         task_id=task.get_task_id(),
         source=task.source,
-        task_checksum=_TASK_CHECKSUM,
+        task_checksum=_RUNTIME_TASK_CHECKSUM,
         config=config,
         agent_info=AgentInfo(
             name="wmh-pi",
@@ -289,6 +290,7 @@ def _manifest(
     trial_lock_digest: str | None = None,
 ) -> HarborTrialManifest:
     return HarborTrialManifest(
+        schema_version=2,
         job_name=job_name,
         identity=_RUN_IDENTITY.model_copy(update={"run_config_digest": agent_config_digest}),
         agent_config_digest=agent_config_digest,
@@ -330,6 +332,7 @@ def _manifest_entry(
         ),
         trial_name=trial_name,
         task_identity=task_name,
+        runtime_task_checksum=_RUNTIME_TASK_CHECKSUM,
         task_checksum=_TASK_CHECKSUM,
         task_source=_TASK_SOURCE,
         task_instruction=f"Instruction for {task_name}.",
@@ -367,6 +370,9 @@ def test_load_uses_exact_manifest_and_preserves_rewards_usage_and_missing_cells(
     assert result.n_infrastructure_errors == 1
     assert result.n_incomplete == 1
     trials = {trial.cell.task_name: trial for trial in result.trials}
+    assert scored.task_checksum == _RUNTIME_TASK_CHECKSUM
+    assert trials["scored"].task_checksum == _TASK_CHECKSUM
+    assert trials["scored"].task_checksum != scored.task_checksum
     assert trials["scored"].task_instruction == "Score this task."
     assert trials["scored"].task_environment_digest == _TASK_ENVIRONMENT_DIGEST
     assert trials["scored"].runner_environment_attestation == _RUNNER.attestation.evidence
@@ -1302,6 +1308,38 @@ def test_wrong_task_for_manifest_cell_is_rejected(tmp_path: Path) -> None:
         load_harbor_job_result(job_dir, _manifest("job", ("planned", 1, "planned__harbor")))
 
 
+@pytest.mark.parametrize("tamper", ["name", "digest", "source"])
+def test_completed_trial_lock_must_match_canonical_task_domain(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    trial = _trial(tmp_path, "task", rewards={"reward": 1})
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+    lock_path = job_dir / trial.trial_name / "lock.json"
+    lock = TrialLock.model_validate_json(lock_path.read_text(encoding="utf-8"))
+    if tamper == "name":
+        lock.task.name = "different-task"
+    elif tamper == "digest":
+        lock.task.digest = "sha256:" + "c" * 64
+    else:
+        lock.task.source = "different-source"
+    lock_path.write_text(lock.model_dump_json(indent=2), encoding="utf-8")
+    manifest = _manifest("job", ("task", 1, trial.trial_name))
+    manifest.entries[0].trial_lock_digest = harbor_trial_lock_digest(lock)
+    manifest.entries[0].cell = manifest.entries[0].cell.model_copy(
+        update={"config_digest": manifest.entries[0].trial_lock_digest}
+    )
+
+    expected = {
+        "name": "expected task identity",
+        "digest": "canonical task checksum",
+        "source": "expected task source",
+    }[tamper]
+    with pytest.raises(ValueError, match=expected):
+        load_harbor_job_result(job_dir, manifest)
+
+
 @pytest.mark.parametrize("completed", [True, False], ids=["completed", "incomplete"])
 @pytest.mark.parametrize(
     ("mismatch", "message"),
@@ -1343,7 +1381,7 @@ def test_trial_config_cannot_be_grafted_from_another_job(
 @pytest.mark.parametrize(
     ("mismatch", "message"),
     [
-        ("task_checksum", "expected task checksum"),
+        ("task_checksum", "expected Harbor runtime task checksum"),
         ("agent_name", "expected agent"),
         ("agent_version", "expected agent"),
         ("provider", "expected provider/model"),
@@ -1363,7 +1401,7 @@ def test_run_identity_mismatch_is_rejected(
 ) -> None:
     trial = _trial(tmp_path, "task", rewards={"reward": 1})
     if mismatch == "task_checksum":
-        trial.task_checksum = "sha256:" + "c" * 64
+        trial.task_checksum = "c" * 64
     elif mismatch == "agent_name":
         trial.agent_info.name = "wrong-agent"
     elif mismatch == "agent_version":
@@ -1527,6 +1565,7 @@ def test_manifest_rejects_duplicate_and_traversing_cells() -> None:
         ),
         trial_name="task__harbor",
         task_identity="task",
+        runtime_task_checksum=_RUNTIME_TASK_CHECKSUM,
         task_checksum=_TASK_CHECKSUM,
         task_source=_TASK_SOURCE,
         task_instruction="Instruction for task.",
@@ -1534,6 +1573,7 @@ def test_manifest_rejects_duplicate_and_traversing_cells() -> None:
     )
     with pytest.raises(ValidationError, match="duplicate manifest benchmark cell"):
         HarborTrialManifest(
+            schema_version=2,
             job_name="job",
             identity=_RUN_IDENTITY,
             agent_config_digest=_AGENT_CONFIG_DIGEST,
@@ -1550,11 +1590,34 @@ def test_manifest_rejects_duplicate_and_traversing_cells() -> None:
             ),
             trial_name="../escape",
             task_identity="task",
+            runtime_task_checksum=_RUNTIME_TASK_CHECKSUM,
             task_checksum=_TASK_CHECKSUM,
             task_source=_TASK_SOURCE,
             task_instruction="Instruction for task.",
             trial_lock_digest=trial_config_digest,
         )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing-version", "wrong-version", "top-level-extra", "entry-extra"],
+)
+def test_manifest_schema_is_explicit_and_strict(tamper: str) -> None:
+    payload = _manifest("job", ("task", 1, "task__harbor")).model_dump(mode="json")
+    if tamper == "missing-version":
+        payload.pop("schema_version")
+    elif tamper == "wrong-version":
+        payload["schema_version"] = 1
+    elif tamper == "top-level-extra":
+        payload["unexpected"] = True
+    else:
+        entries = payload["entries"]
+        assert isinstance(entries, list)
+        assert isinstance(entries[0], dict)
+        entries[0]["unexpected"] = True
+
+    with pytest.raises(ValidationError):
+        HarborTrialManifest.model_validate(payload)
 
 
 def test_symlinked_trial_directory_cannot_escape_job_root(tmp_path: Path) -> None:

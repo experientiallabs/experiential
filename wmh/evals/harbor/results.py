@@ -7,7 +7,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, cast
+from typing import Literal, Self, cast
 from uuid import UUID
 
 from harbor.models.job.lock import TrialLock
@@ -16,6 +16,7 @@ from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import ExceptionInfo, TrialResult
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     TypeAdapter,
     ValidationError,
@@ -188,10 +189,17 @@ class _ParsedTaskEnvironmentEvidence:
 class HarborTrialManifestEntry(BaseModel):
     """One trusted mapping from a stable benchmark cell to Harbor's trial directory."""
 
+    model_config = ConfigDict(extra="forbid")
+
     cell: BenchmarkCell
     trial_name: str = Field(min_length=1)
     task_identity: str = Field(min_length=1)
-    task_checksum: str = Field(min_length=1)
+    # Harbor 0.18 writes ``Task.checksum`` into ``TrialResult``. That legacy runtime
+    # checksum is a different hash domain from the durable ``TrialLock.task.digest``
+    # retained below as ``task_checksum``. Keep both exact values so neither domain
+    # can be substituted for the other during result ingestion.
+    runtime_task_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_checksum: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     task_source: str | None
     task_instruction: str = Field(max_length=MAX_BENCHMARK_TASK_INSTRUCTION_CHARS)
     trial_lock_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -213,6 +221,9 @@ class HarborTrialManifestEntry(BaseModel):
 class HarborTrialManifest(BaseModel):
     """Exact trusted set of benchmark cells Harbor planned for one job."""
 
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2]
     job_name: str = Field(min_length=1)
     identity: BenchmarkRunIdentity
     agent_config_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -508,9 +519,10 @@ def _validate_trial_identity(
             f"{entry.trial_name!r}, "
             f"found {found_label!r}"
         )
-    if result.task_checksum != entry.task_checksum:
+    if result.task_checksum != entry.runtime_task_checksum:
         raise ValueError(
-            f"manifest expected task checksum {entry.task_checksum!r}, "
+            "manifest expected Harbor runtime task checksum "
+            f"{entry.runtime_task_checksum!r}, "
             f"found {result.task_checksum!r}"
         )
     if result.source != entry.task_source or result.config.task.source != entry.task_source:
@@ -1210,6 +1222,21 @@ def _load_and_validate_trial_lock(
     if actual != entry.trial_lock_digest:
         raise ValueError(
             f"manifest expected trial lock digest {entry.trial_lock_digest!r}, found {actual!r}"
+        )
+    if lock.task.name != entry.task_identity:
+        raise ValueError(
+            f"manifest expected task identity {entry.task_identity!r}, "
+            f"found {lock.task.name!r} in the completed trial lock"
+        )
+    if lock.task.digest != entry.task_checksum:
+        raise ValueError(
+            f"manifest expected canonical task checksum {entry.task_checksum!r}, "
+            f"found {lock.task.digest!r} in the completed trial lock"
+        )
+    if lock.task.source != entry.task_source:
+        raise ValueError(
+            f"manifest expected task source {entry.task_source!r}, "
+            f"found {lock.task.source!r} in the completed trial lock"
         )
     return lock
 

@@ -1668,7 +1668,7 @@ def _materialize_job(
             trial_uri=trial_dir.resolve().as_uri(),
             task_id=trial_config.task.get_task_id(),
             source=entry.task_source,
-            task_checksum=entry.task_checksum,
+            task_checksum=entry.runtime_task_checksum,
             config=trial_config,
             agent_info=AgentInfo(
                 name="wmh-pi",
@@ -1732,6 +1732,71 @@ def _materialize_completed_job(job: Job, candidate_hash: str) -> None:
         candidate_hash,
         complete_names={config.trial_name for config in job._trial_configs},
     )
+
+
+def test_evaluator_binds_both_real_harbor_checksum_domains_from_one_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    candidate = pi_node_baseline("candidate")
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+    captured: dict[str, str] = {}
+
+    async def materialize(job: Job) -> None:
+        manifest = _materialize_job(
+            job,
+            candidate.execution_hash,
+            complete_names={config.trial_name for config in job._trial_configs},
+        )
+        task_path = job._trial_configs[0].task.path
+        assert task_path is not None
+        task = mod.Task(task_path)
+        with pytest.warns(DeprecationWarning, match=r"Task\.checksum"):
+            reported = task.checksum
+        content_hash, _files = Packager.compute_content_hash(task.task_dir)
+        canonical = f"sha256:{content_hash}"
+        assert reported != content_hash
+        assert reported != canonical
+        assert {entry.runtime_task_checksum for entry in manifest.entries} == {reported}
+        assert {entry.task_checksum for entry in manifest.entries} == {canonical}
+        captured.update(reported=reported, canonical=canonical)
+
+    monkeypatch.setattr(Job, "run", materialize)
+    evaluated = asyncio.run(evaluator.evaluate(candidate))
+
+    assert captured["reported"] != captured["canonical"]
+    assert {trial.task_checksum for trial in evaluated.result.trials} == {captured["canonical"]}
+
+
+@pytest.mark.parametrize("tamper", ["name", "source"])
+def test_preparation_rejects_trial_lock_task_identity_drift_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    original = mod._build_prepared_job_lock
+
+    def drifted_lock(job: Job) -> JobLock:
+        lock = original(job)
+        if tamper == "name":
+            lock.trials[0].task.name = "different-task"
+        else:
+            lock.trials[0].task.source = "different-source"
+        return lock
+
+    async def unexpected_run(_job: Job) -> None:
+        raise AssertionError("task identity drift must fail before Harbor dispatch")
+
+    monkeypatch.setattr(mod, "_build_prepared_job_lock", drifted_lock)
+    monkeypatch.setattr(Job, "run", unexpected_run)
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+
+    with pytest.raises(ValueError, match="task identity/source"):
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
 
 
 def test_complete_matching_job_is_reused_without_rerunning_completed_trials(
@@ -2075,6 +2140,42 @@ def test_interrupted_job_resumes_only_missing_cell_with_original_manifest_name(
     assert resumed.result.n_scored == resumed.result.expected_trials == 2
     assert manifest_path.read_bytes() == manifest_before
     assert completed_result_path.read_bytes() == completed_result_before
+
+
+def test_interrupted_job_rejects_reported_checksum_manifest_drift_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    _write_task(dataset)
+    candidate = pi_node_baseline("candidate")
+    evaluator = mod.HarborEvaluator(_spec(tmp_path, dataset), _provider())
+    planned: dict[str, str] = {}
+
+    async def first_run(job: Job) -> None:
+        complete_name, incomplete_name = sorted(config.trial_name for config in job._trial_configs)
+        planned["incomplete"] = incomplete_name
+        _materialize_job(
+            job,
+            candidate.execution_hash,
+            complete_names={complete_name},
+            incomplete_names={incomplete_name},
+        )
+
+    monkeypatch.setattr(Job, "run", first_run)
+    first = asyncio.run(evaluator.evaluate(candidate))
+    manifest_path = first.job_dir / mod._MANIFEST_FILENAME
+    manifest = HarborTrialManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    entry = next(item for item in manifest.entries if item.trial_name == planned["incomplete"])
+    entry.runtime_task_checksum = "f" * 64
+    manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+
+    async def unexpected_run(_job: Job) -> None:
+        raise AssertionError("checksum drift must fail before Harbor dispatch")
+
+    monkeypatch.setattr(Job, "run", unexpected_run)
+    with pytest.raises(mod.StaleHarborJobError, match="manifest"):
+        asyncio.run(evaluator.evaluate(candidate))
 
 
 def test_interrupted_job_rejects_tampered_incomplete_trial_lock(
@@ -2602,12 +2703,14 @@ def test_existing_trial_evidence_must_be_regular_files(
         ),
         trial_name="task__trial",
         task_identity="task",
+        runtime_task_checksum="f" * 64,
         task_checksum="sha256:" + "a" * 64,
         task_source="dataset",
         task_instruction="Instruction for task.",
         trial_lock_digest=trial_config_digest,
     )
     manifest = HarborTrialManifest(
+        schema_version=2,
         job_name="evaluation",
         identity=identity,
         agent_config_digest=agent_digest,
