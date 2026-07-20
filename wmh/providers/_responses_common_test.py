@@ -1,6 +1,7 @@
 """Tests for provider-neutral structured Responses API translation."""
 
 import json
+from typing import Literal
 
 import pytest
 from llm_waterfall import ChatRequest
@@ -356,6 +357,49 @@ def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> No
         {"type": "function_call_output", "call_id": "call-b", "output": "B"},
     ]
     assert payload["include"] == ["reasoning.encrypted_content"]
+
+
+@pytest.mark.parametrize(
+    ("origin_provider", "replay_provider"),
+    [("azure", "openai_responses"), ("openai_responses", "azure")],
+)
+def test_encrypted_reasoning_cannot_replay_across_response_providers(
+    origin_provider: Literal["azure", "openai_responses"],
+    replay_provider: Literal["azure", "openai_responses"],
+) -> None:
+    first = responses_response(
+        {
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [],
+                    "encrypted_content": "provider-bound-ciphertext",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                    "status": "completed",
+                },
+            ],
+        },
+        "gpt-5.5",
+        snapshot_provider=origin_provider,
+    )
+    assistant = first.choices[0].message.model_dump(mode="json", exclude_none=True)
+    request = ChatRequest.model_validate({"messages": [assistant]})
+
+    with pytest.raises(ValueError, match="invalid or foreign Responses reasoning envelope"):
+        responses_request(
+            request,
+            "gpt-5.5",
+            reasoning_effort="high",
+            snapshot_provider=replay_provider,
+        )
 
 
 def test_duplicate_parallel_reasoning_details_fail_closed() -> None:

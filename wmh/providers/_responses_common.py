@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from llm_waterfall import ChatReasoningDetail, ChatRequest, ChatResponse
 from pydantic import JsonValue
@@ -19,6 +19,7 @@ from pydantic import JsonValue
 from wmh.providers.receipt import ProviderRequestPayload, build_chat_provider_receipt
 
 _RESPONSES_REASONING_ENVELOPE_FORMAT = "openai.responses.output.v1"
+ResponsesSnapshotProvider = Literal["openai_responses", "azure"]
 
 
 def responses_request(
@@ -28,6 +29,7 @@ def responses_request(
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
     allow_sampling: bool = True,
+    snapshot_provider: ResponsesSnapshotProvider = "openai_responses",
 ) -> dict[str, object]:
     """Translate one structured chat request into a native Responses API payload.
 
@@ -49,7 +51,7 @@ def responses_request(
     """
     payload: dict[str, object] = {
         "model": model,
-        "input": _responses_input(request, model),
+        "input": _responses_input(request, model, snapshot_provider=snapshot_provider),
         # pi asks its OpenAI-compatible endpoint for a stream. The Python runtime needs one
         # complete Response object, so the provider boundary deliberately terminates streaming.
         "stream": False,
@@ -105,6 +107,8 @@ def responses_request(
 def responses_response(
     raw: dict[str, object],
     requested_model: str | None = None,
+    *,
+    snapshot_provider: ResponsesSnapshotProvider = "openai_responses",
 ) -> ChatResponse:
     """Translate one native Responses object into the structured chat response contract.
 
@@ -176,7 +180,11 @@ def responses_response(
             {
                 "type": "reasoning.encrypted",
                 "id": first_call_id,
-                "data": _encode_responses_snapshot(native_items, origin_model),
+                "data": _encode_responses_snapshot(
+                    native_items,
+                    origin_model,
+                    snapshot_provider=snapshot_provider,
+                ),
             }
         ]
 
@@ -222,6 +230,7 @@ def complete_chat(
     allow_sampling: bool = True,
     receipt_provider: str | None = None,
     provider_request_id_headers: tuple[str, ...] = (),
+    snapshot_provider: ResponsesSnapshotProvider = "openai_responses",
 ) -> ChatResponse:
     """Run a structured chat turn against an OpenAI SDK Responses resource.
 
@@ -250,11 +259,12 @@ def complete_chat(
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
         allow_sampling=allow_sampling,
+        snapshot_provider=snapshot_provider,
     )
     if receipt_provider is None:
         sdk_response = resource.create(**payload)
         raw = cast("dict[str, object]", sdk_response.model_dump(mode="json"))
-        return responses_response(raw, model)
+        return responses_response(raw, model, snapshot_provider=snapshot_provider)
     if not provider_request_id_headers:
         raise ValueError("Responses receipt requires at least one provider request id header")
 
@@ -263,7 +273,11 @@ def complete_chat(
     sdk_response = raw_api_response.parse()
     finished_at = time.time()
     raw = cast("dict[str, object]", sdk_response.model_dump(mode="json"))
-    response = responses_response(raw, model).model_copy(update={"provider_receipt": None})
+    response = responses_response(
+        raw,
+        model,
+        snapshot_provider=snapshot_provider,
+    ).model_copy(update={"provider_receipt": None})
     provider_request_id = next(
         (
             value
@@ -310,7 +324,12 @@ def complete_chat(
     return response.model_copy(update={"provider_receipt": receipt})
 
 
-def _responses_input(request: ChatRequest, model: str) -> list[dict[str, object]]:
+def _responses_input(
+    request: ChatRequest,
+    model: str,
+    *,
+    snapshot_provider: ResponsesSnapshotProvider,
+) -> list[dict[str, object]]:
     """Translate ordered chat history into stateless Responses input items."""
     items: list[dict[str, object]] = []
     for message in request.messages:
@@ -329,7 +348,13 @@ def _responses_input(request: ChatRequest, model: str) -> list[dict[str, object]
         if message.reasoning_details:
             if message.role != "assistant":
                 raise ValueError("Responses reasoning details must belong to an assistant message")
-            items.extend(_signed_responses_snapshot(message, model))
+            items.extend(
+                _signed_responses_snapshot(
+                    message,
+                    model,
+                    snapshot_provider=snapshot_provider,
+                )
+            )
             continue
 
         text = _chat_text(message.content)
@@ -352,7 +377,12 @@ def _responses_input(request: ChatRequest, model: str) -> list[dict[str, object]
     return items
 
 
-def _signed_responses_snapshot(message: object, model: str) -> list[dict[str, object]]:
+def _signed_responses_snapshot(
+    message: object,
+    model: str,
+    *,
+    snapshot_provider: ResponsesSnapshotProvider,
+) -> list[dict[str, object]]:
     """Decode and validate one exact provider-output snapshot before stateless replay."""
     details = getattr(message, "reasoning_details", None)
     if not isinstance(details, list) or len(details) != 1:
@@ -372,7 +402,7 @@ def _signed_responses_snapshot(message: object, model: str) -> list[dict[str, ob
         raise ValueError("invalid or foreign Responses reasoning envelope")
     if (
         envelope.get("format") != _RESPONSES_REASONING_ENVELOPE_FORMAT
-        or envelope.get("provider") != "openai_responses"
+        or envelope.get("provider") != snapshot_provider
     ):
         raise ValueError("invalid or foreign Responses reasoning envelope")
     origin_model = envelope.get("model")
@@ -430,13 +460,18 @@ def _signed_responses_snapshot(message: object, model: str) -> list[dict[str, ob
     return native_items
 
 
-def _encode_responses_snapshot(items: list[dict[str, object]], model: str) -> str:
+def _encode_responses_snapshot(
+    items: list[dict[str, object]],
+    model: str,
+    *,
+    snapshot_provider: ResponsesSnapshotProvider,
+) -> str:
     """Encode ordered Responses output items into Pi's opaque reasoning-detail field."""
     try:
         return json.dumps(
             {
                 "format": _RESPONSES_REASONING_ENVELOPE_FORMAT,
-                "provider": "openai_responses",
+                "provider": snapshot_provider,
                 "model": _openai_model_family(model),
                 "output": items,
             },

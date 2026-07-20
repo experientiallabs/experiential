@@ -162,6 +162,7 @@ class AzureOpenAIProvider:
                 allow_sampling=False,
                 receipt_provider=self.config.kind.value,
                 provider_request_id_headers=("apim-request-id", "x-request-id"),
+                snapshot_provider="azure",
             )
         return _openai_common.complete_chat(
             self._get_client().chat.completions,

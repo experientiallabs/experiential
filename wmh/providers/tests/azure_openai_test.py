@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import cast
 
@@ -394,6 +395,11 @@ def test_structured_gpt55_reasoning_uses_azure_v1_responses(
     )
 
     assistant = response.choices[0].message.model_dump(mode="json", exclude_none=True)
+    reasoning_details = assistant["reasoning_details"]
+    assert isinstance(reasoning_details, list)
+    reasoning_data = reasoning_details[0]["data"]
+    assert isinstance(reasoning_data, str)
+    assert json.loads(reasoning_data)["provider"] == "azure"
     provider.complete_chat(
         ChatRequest.model_validate(
             {
