@@ -196,6 +196,8 @@ def test_responses_response_preserves_text_multiple_tools_usage_and_tier() -> No
                 "input_tokens": 321,
                 "output_tokens": 45,
                 "total_tokens": 366,
+                "input_tokens_details": {"cached_tokens": 12},
+                "output_tokens_details": {"reasoning_tokens": 20},
             },
         }
     )
@@ -204,6 +206,11 @@ def test_responses_response_preserves_text_multiple_tools_usage_and_tier() -> No
     assert response.usage is not None
     assert response.usage.prompt_tokens == 321
     assert response.usage.completion_tokens == 45
+    assert response.usage.model_extra == {
+        "total_tokens": 366,
+        "input_tokens_details": {"cached_tokens": 12},
+        "output_tokens_details": {"reasoning_tokens": 20},
+    }
     assert response.wire_payload()["service_tier"] == "priority"
     choice = response.choices[0]
     assert choice.finish_reason == "tool_calls"
@@ -256,6 +263,29 @@ def test_responses_response_preserves_text_multiple_tools_usage_and_tier() -> No
             "status": "completed",
         },
     ]
+
+
+@pytest.mark.parametrize("reserved_name", ["prompt_tokens", "completion_tokens"])
+def test_responses_response_rejects_reserved_usage_aliases(reserved_name: str) -> None:
+    """Native usage aliases cannot overwrite translated canonical counters."""
+    with pytest.raises(ValueError, match="reserved ChatUsage field"):
+        responses_response(
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    reserved_name: 0,
+                },
+            }
+        )
 
 
 def test_ordered_encrypted_reasoning_round_trips_through_pi_chat_history() -> None:

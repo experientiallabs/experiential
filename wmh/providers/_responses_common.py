@@ -19,6 +19,7 @@ from pydantic import JsonValue
 from wmh.providers.receipt import ProviderRequestPayload, build_chat_provider_receipt
 
 _RESPONSES_REASONING_ENVELOPE_FORMAT = "openai.responses.output.v1"
+_CHAT_USAGE_RESERVED_FIELDS = frozenset({"prompt_tokens", "completion_tokens"})
 ResponsesSnapshotProvider = Literal["openai_responses", "azure"]
 
 
@@ -209,6 +210,10 @@ def responses_response(
 
     usage = _object_dict(raw.get("usage"))
     if usage is not None:
+        reserved_fields = _CHAT_USAGE_RESERVED_FIELDS.intersection(usage)
+        if reserved_fields:
+            names = ", ".join(sorted(reserved_fields))
+            raise ValueError(f"Responses API usage contains reserved ChatUsage field(s): {names}")
         translated_usage: dict[str, object] = {
             "prompt_tokens": _usage_count(usage.get("input_tokens")),
             "completion_tokens": _usage_count(usage.get("output_tokens")),
