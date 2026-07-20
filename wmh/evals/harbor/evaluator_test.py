@@ -9,7 +9,7 @@ import os
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
 import pytest
 from harbor.job import Job
@@ -25,9 +25,11 @@ from harbor.models.registry import DatasetMetadata
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TrialConfig
 from harbor.models.trial.result import AgentInfo, ExceptionInfo, ModelInfo, TrialResult
 from harbor.models.verifier.result import VerifierResult
+from harbor.publisher.packager import Packager
 from harbor.utils.logger import logger as harbor_logger
 
 import wmh.evals.harbor.evaluator as mod
+from wmh.core.types import JsonObject
 from wmh.evals.benchmark import BenchmarkCell, BenchmarkTaskEnvironment
 from wmh.evals.harbor import _file_lease
 from wmh.evals.harbor.config import (
@@ -36,11 +38,15 @@ from wmh.evals.harbor.config import (
     build_harbor_job_config,
 )
 from wmh.evals.harbor.e2b_environment import (
+    ExactE2BBuildRecord,
     ExactE2BEnvironment,
     freeze_exact_e2b_build_spec,
     register_exact_e2b_build_record,
 )
-from wmh.evals.harbor.qualification_types import QualifiedHarborTask
+from wmh.evals.harbor.qualification_types import (
+    QualifiedE2BBuildIdentity,
+    QualifiedHarborTask,
+)
 from wmh.evals.harbor.results import (
     HarborTrialManifest,
     HarborTrialManifestEntry,
@@ -53,9 +59,11 @@ from wmh.harness.pi_runner import pi_node_baseline
 from wmh.harness.pi_runner_backend import (
     E2BPiRunnerSpec,
     LocalPiRunnerSpec,
+    PiRunnerBackendSpec,
     runner_owner_id,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.receipt import ProviderResponseIdentity
 from wmh.tracking._testing import (
     synthetic_provider_cost_meter,
     synthetic_tariff_provenance,
@@ -103,6 +111,7 @@ _TASK_ENVIRONMENT_DIGEST = (
     ).hexdigest()
 )
 _LOCAL_RUNNER = LocalPiRunnerSpec()
+_PUBLIC_HARBOR_EVALUATOR = mod.HarborEvaluator
 
 
 class _E2BBudgetKwargs(TypedDict):
@@ -110,6 +119,22 @@ class _E2BBudgetKwargs(TypedDict):
     task_resource_budget_accounts: NotRequired[tuple[TimedResourceBudgetAccount, ...]]
     runner_resource_budget_account: NotRequired[TimedResourceBudgetAccount]
     create_rate_authority: NotRequired[ExternalDispatchRateAuthority]
+
+
+class _EvaluatorKwargs(TypedDict, total=False):
+    """Exact keyword surface accepted by the evaluator test adapter."""
+
+    runner_image: str | None
+    runner_spec: PiRunnerBackendSpec | JsonObject | None
+    turn_timeout_s: float
+    require_provider_receipts: Literal[True]
+    response_identity: ProviderResponseIdentity | None
+    session: mod.HarborEvaluatorSession | None
+    budget_account: BudgetAccount | None
+    task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...]
+    runner_resource_budget_account: TimedResourceBudgetAccount | None
+    create_rate_authority: ExternalDispatchRateAuthority | None
+    qualified_tasks: tuple[QualifiedHarborTask, ...] | None
 
 
 def _runner_lease_receipt(trial_name: str) -> dict[str, object]:
@@ -199,6 +224,11 @@ def _provider() -> ProviderConfig:
     )
 
 
+def test_evaluator_rejects_unbudgeted_builtin_provider(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires a frozen provider budget account"):
+        _PUBLIC_HARBOR_EVALUATOR(_spec(tmp_path, tmp_path / "dataset"), _provider())
+
+
 def _e2b_budget_kwargs(
     tmp_path: Path,
     *,
@@ -279,14 +309,14 @@ def _e2b_budget_kwargs(
     return kwargs
 
 
-def _register_e2b_task_build(tmp_path: Path, task_dir: Path) -> None:
+def _register_e2b_task_build(tmp_path: Path, task_dir: Path) -> ExactE2BBuildRecord:
     spec = freeze_exact_e2b_build_spec(
         environment_dir=task_dir / "environment",
         docker_image=f"example.invalid/{task_dir.name}:frozen",
         cpu_count=2,
         memory_mb=1024,
     )
-    register_exact_e2b_build_record(
+    return register_exact_e2b_build_record(
         jobs_dir=tmp_path / "jobs",
         environment_id=spec.environment_id,
         build_context_digest=spec.build_context_digest,
@@ -300,7 +330,55 @@ def _register_e2b_task_build(tmp_path: Path, task_dir: Path) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _stub_runner_readiness_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_runner_readiness_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts: dict[str, BudgetAccount] = {}
+
+    def budgeted_evaluator(
+        spec: HarborJobSpec,
+        provider_config: ProviderConfig,
+        **kwargs: Unpack[_EvaluatorKwargs],
+    ) -> mod.HarborEvaluator:
+        if kwargs.get("budget_account") is None:
+            provider_digest = hashlib.sha256(provider_config.model_dump_json().encode()).hexdigest()
+            account = accounts.get(provider_digest)
+            if account is None:
+                manifest_digest = hashlib.sha256(
+                    f"{tmp_path.resolve()}\0{provider_config.model_dump_json()}".encode()
+                ).hexdigest()
+                policy = BudgetPolicy(
+                    study_id="evaluator-test",
+                    manifest_digest="sha256:" + manifest_digest,
+                    hard_limit_nano_usd=10_000_000,
+                    phase_limits_nano_usd={"test": 10_000_000},
+                    meters={
+                        "worker": synthetic_provider_cost_meter(
+                            provider_config=provider_config,
+                            provenance=synthetic_tariff_provenance(provider_config),
+                            input_nano_usd_per_token=1,
+                            output_nano_usd_per_token=5,
+                        )
+                    },
+                )
+                ledger_path = (tmp_path / f"provider-{provider_digest}.sqlite3").resolve()
+                account = BudgetAccount(
+                    ledger_path=ledger_path,
+                    ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
+                    policy=policy,
+                    scope=BudgetScope(
+                        phase="test",
+                        category="worker",
+                        run_id="evaluator-test",
+                    ),
+                    meter_id="worker",
+                )
+                accounts[provider_digest] = account
+            kwargs["budget_account"] = account
+        return _PUBLIC_HARBOR_EVALUATOR(spec, provider_config, **kwargs)
+
+    monkeypatch.setattr(mod, "HarborEvaluator", budgeted_evaluator)
     monkeypatch.setattr(mod, "verify_container_pi_runner_ready", lambda **_kwargs: None)
     monkeypatch.setattr(mod, "find_spec", lambda _name: object())
     monkeypatch.setattr(mod.EnvironmentFactory, "run_preflight", lambda **_kwargs: None)
@@ -329,6 +407,37 @@ def test_evaluator_rejects_non_finite_turn_timeout(
             _spec(tmp_path, tmp_path / "dataset"),
             _provider(),
             turn_timeout_s=turn_timeout_s,
+        )
+
+
+def test_evaluator_and_expectation_reject_disabling_provider_receipts(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path, tmp_path / "dataset")
+    provider = _provider()
+
+    with pytest.raises(ValueError, match="always requires provider receipts"):
+        mod.HarborEvaluator(
+            spec,
+            provider,
+            require_provider_receipts=False,  # ty: ignore[invalid-argument-type]
+        )
+    with pytest.raises(ValueError, match="always require provider receipts"):
+        mod.harbor_run_expectation(
+            candidate=pi_node_baseline("candidate"),
+            spec=spec,
+            provider_config=provider,
+            turn_timeout_s=300.0,
+            require_provider_receipts=False,  # ty: ignore[invalid-argument-type]
+        )
+    with pytest.raises(ValueError, match="always require provider receipts"):
+        mod._build_harbor_agent_config(
+            candidate=pi_node_baseline("candidate"),
+            provider_config=provider,
+            runner_spec=LocalPiRunnerSpec(),
+            turn_timeout_s=300.0,
+            agent_n_concurrent=1,
+            require_provider_receipts=False,  # ty: ignore[invalid-argument-type]
         )
 
 
@@ -405,7 +514,7 @@ def test_e2b_runner_missing_host_credential_fails_before_job_creation(
         asyncio.run(evaluator._ensure_runner_ready())
 
 
-def test_e2b_task_and_runner_backends_reject_unbudgeted_programmatic_entry(
+def test_e2b_task_and_runner_backends_require_matching_resource_budgets(
     tmp_path: Path,
 ) -> None:
     task_spec = _spec(tmp_path, tmp_path / "dataset").model_copy(
@@ -415,10 +524,10 @@ def test_e2b_task_and_runner_backends_reject_unbudgeted_programmatic_entry(
         },
         deep=True,
     )
-    with pytest.raises(ValueError, match="E2B task environments require"):
+    with pytest.raises(ValueError, match="timed resource budget"):
         mod.HarborEvaluator(task_spec, _provider())
 
-    with pytest.raises(ValueError, match="E2B Pi runners require"):
+    with pytest.raises(ValueError, match="timed resource budget"):
         mod.HarborEvaluator(
             _spec(tmp_path, tmp_path / "dataset"),
             _provider(),
@@ -458,6 +567,91 @@ def test_exact_e2b_build_preflight_fails_before_atomic_job_creation(
 
     assert creates == 0
     assert not (tmp_path / "jobs" / "evaluation").exists()
+
+
+def test_qualified_e2b_launch_drift_fails_before_job_create_or_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "dataset"
+    task_dir = _write_task(dataset)
+    record = _register_e2b_task_build(tmp_path, task_dir)
+    build_spec = freeze_exact_e2b_build_spec(
+        environment_dir=task_dir / "environment",
+        docker_image="example.invalid/shared-task:frozen",
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    resource_class = ExactE2BEnvironment._task_resource_class(
+        cpu_count=2,
+        memory_mb=1024,
+    )
+    content_hash, _files = Packager.compute_content_hash(task_dir)
+    content_digest = "sha256:" + content_hash
+    task_key = mod._dataset_qualified_task_key(
+        source=dataset.name,
+        task_identity="shared-task",
+        task_checksum=content_digest,
+    )
+    qualification = QualifiedHarborTask(
+        task_id="shared-task",
+        dataset_id="terminalbench2",
+        content_digest=content_digest,
+        task_key=task_key,
+        task_environment_digest="sha256:" + "8" * 64,
+        environment_backend=HarborEnvironmentBackend.E2B,
+        e2b_launch_config_digest="sha256:" + "9" * 64,
+        e2b_build_config_digest=record.build_config_digest,
+        e2b_build_record_digest=record.digest,
+        task_resource_class_digest=resource_class.digest,
+        e2b_build_identity=QualifiedE2BBuildIdentity(
+            build_config_digest=record.build_config_digest,
+            build_record_digest=record.digest,
+            environment_id=record.environment_id,
+            build_context_digest=record.build_context_digest,
+            docker_image=build_spec.docker_image,
+            cpu_count=record.cpu_count,
+            memory_mb=record.memory_mb,
+            template_id=record.template_id,
+            build_id=record.build_id,
+        ),
+        task_resource_class=resource_class,
+    )
+    creates = 0
+    runs = 0
+
+    async def unexpected_create(_cls: type[Job], _config: JobConfig) -> Job:
+        nonlocal creates
+        creates += 1
+        raise AssertionError("qualified launch drift must precede Harbor job creation")
+
+    async def unexpected_run(_job: Job) -> None:
+        nonlocal runs
+        runs += 1
+        raise AssertionError("qualified launch drift must precede Harbor job execution")
+
+    monkeypatch.setattr(mod._AtomicHarborJob, "create", classmethod(unexpected_create))
+    monkeypatch.setattr(Job, "run", unexpected_run)
+    spec = _spec(tmp_path, dataset).model_copy(
+        update={
+            "environment_backend": HarborEnvironmentBackend.E2B,
+            "create_rate_policy": _rate_policy(),
+            "allow_preexisting_e2b_builds": True,
+        },
+        deep=True,
+    )
+    evaluator = mod.HarborEvaluator(
+        spec,
+        _provider(),
+        qualified_tasks=(qualification,),
+        **_e2b_budget_kwargs(tmp_path, task_environment=True),
+    )
+
+    with pytest.raises(ValueError, match="prepared E2B launch"):
+        asyncio.run(evaluator.evaluate(pi_node_baseline("candidate")))
+
+    assert creates == 0
+    assert runs == 0
 
 
 @pytest.mark.parametrize(
@@ -776,13 +970,26 @@ def test_evaluate_pins_agent_persists_exact_lock_manifest_and_qualifies_task_key
     assert agent.import_path == "wmh.evals.harbor.agent:WmhPiAgent"
     assert agent.model_name == "bedrock/model"
     assert agent.env == {}
-    assert agent.kwargs == {
+    expected_agent_kwargs = {
         "harness": candidate.model_dump(mode="json"),
         "provider_config": _provider().model_dump(mode="json"),
         "runner_spec": _LOCAL_RUNNER.model_dump(mode="json"),
         "turn_timeout_s": 300.0,
         "require_provider_receipts": True,
+        "response_identity": {
+            "provider": "bedrock",
+            "response_model": None,
+            "system_fingerprint": None,
+        },
     }
+    assert {
+        key: value
+        for key, value in agent.kwargs.items()
+        if key not in {"budget_policy_digest", "budget_binding"}
+    } == expected_agent_kwargs
+    assert agent.kwargs["budget_policy_digest"] == evaluator._budget_policy_digest
+    assert evaluator._budget_binding is not None
+    assert agent.kwargs["budget_binding"] == evaluator._budget_binding.model_dump(mode="json")
 
 
 def test_qualified_task_content_drift_is_rejected_before_trial_dispatch(
@@ -1158,6 +1365,7 @@ def test_reasoning_effort_is_explicit_in_agent_config_and_run_identity(tmp_path:
         kind=ProviderKind.BEDROCK,
         model_type="claude-opus-4-6",
         model="us.anthropic.claude-opus-4-6-v1",
+        region="test-region",
         reasoning_effort="max",
     )
     spec = _spec(tmp_path, tmp_path / "dataset")
@@ -1196,6 +1404,73 @@ def test_reasoning_effort_is_explicit_in_agent_config_and_run_identity(tmp_path:
     assert serialized_unconfigured["reasoning_effort"] is None
     assert unconfigured_identity.reasoning_effort is None
     assert harbor_agent_config_digest(unconfigured_agent) != agent_digest
+
+
+def test_azure_response_identity_is_frozen_into_agent_and_run_identity(tmp_path: Path) -> None:
+    provider = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        deployment="worker-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-model",
+        system_fingerprint=None,
+    )
+    spec = _spec(tmp_path, tmp_path / "dataset")
+    evaluator = mod.HarborEvaluator(
+        spec,
+        provider,
+        response_identity=response_identity,
+    )
+    candidate = pi_node_baseline("candidate")
+    agent = evaluator._build_agent(candidate)
+    expectation = mod.harbor_run_expectation(
+        candidate=candidate,
+        spec=spec,
+        provider_config=provider,
+        response_identity=response_identity,
+        turn_timeout_s=300.0,
+    )
+
+    assert agent.kwargs["response_identity"] == {
+        "provider": "azure",
+        "response_model": "served-model",
+        "system_fingerprint": None,
+    }
+    assert (
+        evaluator._run_identity(
+            candidate,
+            run_config_digest=expectation.identity.run_config_digest,
+        )
+        == expectation.identity
+    )
+
+    drifted = mod.harbor_run_expectation(
+        candidate=candidate,
+        spec=spec,
+        provider_config=provider,
+        response_identity=response_identity.model_copy(update={"system_fingerprint": "fp-drifted"}),
+        turn_timeout_s=300.0,
+    )
+    assert drifted.identity.run_config_digest != expectation.identity.run_config_digest
+
+
+def test_azure_evaluator_requires_exact_response_identity(tmp_path: Path) -> None:
+    provider = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        deployment="worker-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+
+    with pytest.raises(ValueError, match="exact provider response identity"):
+        mod.HarborEvaluator(_spec(tmp_path, tmp_path / "dataset"), provider)
 
 
 def test_evaluator_builds_and_hashes_the_final_agent_concurrency(tmp_path: Path) -> None:

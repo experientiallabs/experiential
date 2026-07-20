@@ -87,12 +87,18 @@ def complete(
         # rather than letting choices[0] raise a bare IndexError.
         raise ValueError(f"{model} returned no choices")
     text = response.choices[0].message.content or ""
+    response_model = getattr(response, "model", None)
+    system_fingerprint = getattr(response, "system_fingerprint", None)
     usage = response.usage
     if usage is None:
         # Preserve provenance: hard-budget callers distinguish missing metering from a genuine
         # provider-reported zero. Supplying a default TokenUsage here would incorrectly settle a
         # paid request at $0 instead of forfeiting its conservative reservation.
-        return Completion(text=text)
+        return Completion(
+            text=text,
+            model=response_model,
+            system_fingerprint=system_fingerprint,
+        )
     usage_payload = cast("dict[str, object]", usage.model_dump(mode="json"))
     usage_payload.pop("prompt_tokens", None)
     usage_payload.pop("completion_tokens", None)
@@ -109,6 +115,8 @@ def complete(
                 **usage_payload,
             }
         ),
+        model=response_model,
+        system_fingerprint=system_fingerprint,
     )
 
 

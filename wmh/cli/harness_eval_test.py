@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from harbor.models.job.config import DatasetConfig
 from typer.testing import CliRunner, Result
 
 from wmh.cli import app
@@ -38,6 +39,7 @@ from wmh.harness.pi_runner import pi_node_baseline
 from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.receipt import ProviderResponseIdentity
 from wmh.tracking._testing import (
     synthetic_provider_cost_meter,
     synthetic_tariff_provenance,
@@ -46,6 +48,7 @@ from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     BudgetScope,
+    ProviderCostMeter,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
     bootstrap_budget_ledger,
@@ -351,6 +354,7 @@ def _patch_evaluator(
             *,
             runner_spec: PiRunnerBackendSpec,
             turn_timeout_s: float,
+            response_identity: ProviderResponseIdentity,
             budget_account: BudgetAccount | None = None,
             task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
             runner_resource_budget_account: TimedResourceBudgetAccount | None = None,
@@ -361,6 +365,7 @@ def _patch_evaluator(
                 "provider_config": provider_config,
                 "runner_spec": runner_spec,
                 "turn_timeout_s": turn_timeout_s,
+                "response_identity": response_identity,
                 "budget_account": budget_account,
                 "task_resource_budget_accounts": task_resource_budget_accounts,
                 "runner_resource_budget_account": runner_resource_budget_account,
@@ -382,6 +387,15 @@ def _base_args(
     *,
     bedrock_region: str = "us-east-1",
 ) -> list[str]:
+    account_path = root.parent / "base-budget-account.json"
+    _write_budget_account(
+        account_path,
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model="model",
+            region=bedrock_region,
+        ),
+    )
     return [
         "harness",
         "eval",
@@ -396,11 +410,18 @@ def _base_args(
         str(root),
         "--out",
         str(out),
-        "--allow-unbudgeted-development",
+        "--budget-account",
+        str(account_path),
     ]
 
 
 def _write_budget_account(path: Path, provider_config: ProviderConfig) -> BudgetAccount:
+    if path.is_file():
+        existing = BudgetAccount.model_validate_json(path.read_text(encoding="utf-8"))
+        meter = existing.policy.meters[existing.meter_id]
+        assert isinstance(meter, ProviderCostMeter)
+        assert meter.provider_config == provider_config
+        return existing
     policy = BudgetPolicy(
         study_id="cli-study",
         manifest_digest="sha256:" + "c" * 64,
@@ -418,7 +439,7 @@ def _write_budget_account(path: Path, provider_config: ProviderConfig) -> Budget
             )
         },
     )
-    ledger_path = (path.parent / "spend.sqlite3").resolve()
+    ledger_path = path.with_suffix(".sqlite3").resolve()
     account = BudgetAccount(
         ledger_path=ledger_path,
         ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
@@ -492,14 +513,15 @@ def _write_e2b_task_budget_accounts(
     return provider_account, resource_account
 
 
-def test_paid_eval_requires_budget_or_explicit_development_bypass(tmp_path: Path) -> None:
+def test_provider_backed_eval_requires_budget(tmp_path: Path) -> None:
     root = tmp_path / ".wmh"
     _save_harness(root)
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     out = tmp_path / "result.json"
     args = _base_args(root, out)
-    args.remove("--allow-unbudgeted-development")
+    budget_index = args.index("--budget-account")
+    del args[budget_index : budget_index + 2]
 
     result = runner.invoke(
         app,
@@ -507,7 +529,7 @@ def test_paid_eval_requires_budget_or_explicit_development_bypass(tmp_path: Path
     )
 
     assert result.exit_code == 2
-    assert "paid harness evaluation requires --budget-account" in result.output
+    assert "requires --budget-account" in " ".join(result.output.split())
 
 
 def test_budget_account_is_loaded_and_wired_into_the_evaluator(
@@ -528,7 +550,7 @@ def test_budget_account_is_loaded_and_wired_into_the_evaluator(
     account = _write_budget_account(account_path, provider_config)
     calls = _patch_evaluator(monkeypatch, _all_scored_result(tmp_path))
     args = _base_args(root, out)
-    args.remove("--allow-unbudgeted-development")
+    args[args.index("--budget-account") + 1] = str(account_path)
 
     result = runner.invoke(
         app,
@@ -536,8 +558,6 @@ def test_budget_account_is_loaded_and_wired_into_the_evaluator(
             *args,
             "--dataset-path",
             str(dataset),
-            "--budget-account",
-            str(account_path),
             "--yes",
         ],
     )
@@ -686,6 +706,8 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
             "deployment-a",
             "--azure-api-version",
             "2026-01-01-preview",
+            "--expected-response-model",
+            "gpt-model-2026-01-01",
             "--task-backend",
             "e2b",
             "--root",
@@ -710,16 +732,117 @@ def test_registry_azure_eval_wires_ref_endpoint_deployment_and_e2b(
     assert spec.environment_backend is HarborEnvironmentBackend.E2B
     provider = cast("ProviderConfig", call["provider_config"])
     assert provider.kind is ProviderKind.AZURE_OPENAI
+    assert provider.model_type == "gpt-model"
     assert provider.model == "gpt-model"
     assert provider.endpoint == "https://example.openai.azure.com"
     assert provider.deployment == "deployment-a"
     assert provider.api_version == "2026-01-01-preview"
     assert call["budget_account"] == provider_account
     assert call["task_resource_budget_accounts"] == (task_account,)
+    response_identity = cast("ProviderResponseIdentity", call["response_identity"])
+    assert response_identity == ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="gpt-model-2026-01-01",
+        system_fingerprint=None,
+    )
     rate_authority = cast("ExternalDispatchRateAuthority", call["create_rate_authority"])
     assert rate_authority.policy == spec.create_rate_policy
     assert str(tmp_path) not in rate_authority.binding.model_dump_json()
     assert provider.region is None
+
+
+def test_azure_cli_config_matches_tariff_at_real_evaluator_constructor(
+    tmp_path: Path,
+) -> None:
+    canonical_provider = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.4-mini",
+        model="gpt-5.4-mini",
+        endpoint="https://example.openai.azure.com",
+        deployment="deployment-a",
+        api_version="2026-01-01-preview",
+    )
+    account = _write_budget_account(tmp_path / "provider-budget.json", canonical_provider)
+    cli_provider = harness_eval_module._build_provider_config(
+        "azure",
+        "gpt-5.4-mini",
+        azure_endpoint="https://example.openai.azure.com",
+        azure_deployment="deployment-a",
+        azure_api_version="2026-01-01-preview",
+        bedrock_region=None,
+    )
+    spec = HarborJobSpec(
+        job_name="azure-constructor-regression",
+        jobs_dir=tmp_path / "jobs",
+        datasets=[DatasetConfig(path=tmp_path / "dataset")],
+    )
+
+    evaluator = harness_eval_module.HarborEvaluator(
+        spec,
+        cli_provider,
+        response_identity=ProviderResponseIdentity(
+            provider=ProviderKind.AZURE_OPENAI,
+            response_model="gpt-5.4-mini-2026-01-01",
+            system_fingerprint=None,
+        ),
+        budget_account=account,
+    )
+
+    assert cli_provider == canonical_provider
+    assert evaluator._provider_config == canonical_provider
+
+
+def test_azure_eval_rejects_missing_response_identity_before_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / ".wmh"
+    _save_harness(root)
+    out = tmp_path / "result.json"
+    (tmp_path / "dataset").mkdir()
+    calls = _patch_evaluator(monkeypatch, _all_scored_result(tmp_path))
+    provider = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-model",
+        model="gpt-model",
+        endpoint="https://example.openai.azure.com",
+        deployment="deployment-a",
+        api_version="2026-01-01-preview",
+    )
+    account_path = tmp_path / "provider-budget.json"
+    _write_budget_account(account_path, provider)
+
+    result = runner.invoke(
+        app,
+        [
+            "harness",
+            "eval",
+            "agent@champion",
+            "--dataset-path",
+            str(tmp_path / "dataset"),
+            "--provider",
+            "azure",
+            "--model",
+            "gpt-model",
+            "--azure-endpoint",
+            "https://example.openai.azure.com",
+            "--azure-deployment",
+            "deployment-a",
+            "--azure-api-version",
+            "2026-01-01-preview",
+            "--root",
+            str(root),
+            "--out",
+            str(out),
+            "--budget-account",
+            str(account_path),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--expected-response-model" in result.output
+    assert calls == []
 
 
 def test_cost_confirmation_is_required_without_yes(

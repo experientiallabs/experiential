@@ -26,11 +26,12 @@ from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
 from time import monotonic as _system_monotonic
-from typing import Annotated, Literal, Self, cast
+from typing import Annotated, Literal, Never, Self, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall.types import ChatUsage
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from wmh.providers.base import (
@@ -41,11 +42,19 @@ from wmh.providers.base import (
     ProviderConfig,
     ProviderKind,
     SingleDispatchProvider,
+    TokenUsage,
     ToolCallingProvider,
     VerifyResult,
     verify_via_ping,
 )
 from wmh.providers.models import resolve_provider_model
+from wmh.providers.receipt import (
+    ProviderResponseIdentity,
+    ProviderResponseIdentityError,
+    freeze_provider_response_identity,
+    validate_chat_provider_response_identity,
+    validate_completion_provider_response_identity,
+)
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _SOURCE_ID_PATTERN = r"^[a-z0-9][a-z0-9.-]{0,127}$"
@@ -78,6 +87,13 @@ _KNOWN_NULL_USAGE_DETAIL_PLACEHOLDERS = frozenset(
         "output_tokens_details",
         "prompt_tokens_details",
     }
+)
+# Responses reports these exact nested counts as subsets of the already-priced primary totals.
+# Keep the schema closed: an added container, child field, invalid count, or count larger than its
+# parent remains unpriced usage and forfeits the reservation.
+_INCLUSIVE_USAGE_BREAKDOWNS = (
+    ("input_tokens_details", "cached_tokens", "input"),
+    ("output_tokens_details", "reasoning_tokens", "output"),
 )
 _PROVIDER_TARIFF_EVIDENCE_CONTRACTS = {
     "aws_bedrock_public_catalog_v1": (
@@ -2487,6 +2503,7 @@ class BudgetedProvider:
         provider: Provider,
         account: BudgetAccount,
         *,
+        response_identity: ProviderResponseIdentity | None = None,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         if isinstance(provider, BudgetedProvider):
@@ -2506,6 +2523,7 @@ class BudgetedProvider:
         if provider.config != meter.provider_config:
             raise ValueError("budget account provider config differs from the wrapped provider")
         self._provider = cast("SingleDispatchProvider", provider)
+        self._provider_config = ProviderConfig.model_validate(provider.config.model_dump())
         self._account = validated_account
         self._budget_binding = BudgetAccountBinding(
             policy_digest=validated_account.policy.policy_digest,
@@ -2514,6 +2532,11 @@ class BudgetedProvider:
             meter_id=validated_account.meter_id,
         )
         self._meter = meter
+        self._response_identity = (
+            None
+            if response_identity is None
+            else freeze_provider_response_identity(provider.config, response_identity)
+        )
         self._ledger = open_shared_spend_ledger(
             self._account.ledger_path,
             self._account.policy,
@@ -2523,7 +2546,7 @@ class BudgetedProvider:
 
     @property
     def config(self) -> ProviderConfig:
-        return self._provider.config
+        return ProviderConfig.model_validate(self._provider_config.model_dump())
 
     @property
     def budget_ledger_identity(self) -> str:
@@ -2540,6 +2563,13 @@ class BudgetedProvider:
         """Return the underlying dispatch implementation without wrapper identity churn."""
         provider_type = type(self._provider)
         return f"{provider_type.__module__}.{provider_type.__qualname__}"
+
+    @property
+    def response_identity(self) -> ProviderResponseIdentity | None:
+        """Return the precommitted served identity enforced on every response."""
+        if self._response_identity is None:
+            return None
+        return ProviderResponseIdentity.model_validate(self._response_identity.model_dump())
 
     @property
     def budget_policy_digest(self) -> str:
@@ -2561,6 +2591,7 @@ class BudgetedProvider:
     ) -> Completion:
         if max_tokens < 1:
             raise ValueError("provider output-token limit must be positive")
+        self._audit_provider_config()
         payload = {
             "system": system,
             "messages": [message.model_dump(mode="json") for message in messages],
@@ -2581,29 +2612,68 @@ class BudgetedProvider:
         except Exception as error:
             self._forfeit_after_error(reservation_id, error)
             raise
+        if not isinstance(completion, Completion):
+            self._raise_forfeited_error(
+                reservation_id,
+                BudgetIntegrityError("provider returned an invalid completion object"),
+                failure_type="ProviderResponseInvalid",
+            )
+        if self._response_identity is not None:
+            try:
+                validate_completion_provider_response_identity(
+                    completion,
+                    provider_config=self.config,
+                    response_identity=self._response_identity,
+                )
+            except ProviderResponseIdentityError as error:
+                self._raise_forfeited_error(
+                    reservation_id,
+                    error,
+                    failure_type="ProviderIdentityInvalid",
+                )
+        usage = completion.usage
+        if not isinstance(usage, TokenUsage):
+            self._raise_forfeited_error(
+                reservation_id,
+                BudgetIntegrityError("provider returned an invalid completion usage object"),
+                failure_type="UsageInvalid",
+            )
         if "usage" not in completion.model_fields_set or not {
             "input_tokens",
             "output_tokens",
-        }.issubset(completion.usage.model_fields_set):
+        }.issubset(usage.model_fields_set):
             self._ledger.forfeit(reservation_id, failure_type="UsageUnavailable")
             return completion
+        try:
+            charged_nano_usd = self._validated_usage_charge(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+            )
+        except BudgetIntegrityError as error:
+            self._raise_forfeited_error(
+                reservation_id,
+                error,
+                failure_type="UsageInvalid",
+            )
         self._reject_unpriced_usage(
             reservation_id,
-            completion.usage,
+            usage,
             input_field="input_tokens",
             output_field="output_tokens",
         )
         self._settle_usage(
             reservation_id,
-            input_tokens=completion.usage.input_tokens,
-            output_tokens=completion.usage.output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
             input_ceiling=input_ceiling,
             output_ceiling=max_tokens,
+            charged_nano_usd=charged_nano_usd,
         )
         return completion
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Budget one structured call using its provider-routed output limit."""
+        self._audit_provider_config()
         if request.model_extra:
             extras = ", ".join(sorted(request.model_extra))
             raise ValueError("budgeted chat requests reject unquoted provider fields: " + extras)
@@ -2618,24 +2688,64 @@ class BudgetedProvider:
         except Exception as error:
             self._forfeit_after_error(reservation_id, error)
             raise
-        if response.usage is None or not {
+        if not isinstance(response, ChatResponse):
+            self._raise_forfeited_error(
+                reservation_id,
+                BudgetIntegrityError("provider returned an invalid structured response"),
+                failure_type="ProviderResponseInvalid",
+            )
+        if self._response_identity is not None:
+            try:
+                validate_chat_provider_response_identity(
+                    response,
+                    provider_config=self.config,
+                    requested_temperature=request.temperature,
+                    max_tokens=output_ceiling,
+                    response_identity=self._response_identity,
+                )
+            except ProviderResponseIdentityError as error:
+                self._raise_forfeited_error(
+                    reservation_id,
+                    error,
+                    failure_type="ProviderIdentityInvalid",
+                )
+        usage = response.usage
+        if usage is not None and not isinstance(usage, ChatUsage):
+            self._raise_forfeited_error(
+                reservation_id,
+                BudgetIntegrityError("provider returned an invalid structured usage object"),
+                failure_type="UsageInvalid",
+            )
+        if usage is None or not {
             "prompt_tokens",
             "completion_tokens",
-        }.issubset(response.usage.model_fields_set):
+        }.issubset(usage.model_fields_set):
             self._ledger.forfeit(reservation_id, failure_type="UsageUnavailable")
             return response
+        try:
+            charged_nano_usd = self._validated_usage_charge(
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+            )
+        except BudgetIntegrityError as error:
+            self._raise_forfeited_error(
+                reservation_id,
+                error,
+                failure_type="UsageInvalid",
+            )
         self._reject_unpriced_usage(
             reservation_id,
-            response.usage,
+            usage,
             input_field="prompt_tokens",
             output_field="completion_tokens",
         )
         self._settle_usage(
             reservation_id,
-            input_tokens=response.usage.prompt_tokens,
-            output_tokens=response.usage.completion_tokens,
+            input_tokens=usage.prompt_tokens,
+            output_tokens=usage.completion_tokens,
             input_ceiling=input_ceiling,
             output_ceiling=output_ceiling,
+            charged_nano_usd=charged_nano_usd,
         )
         return response
 
@@ -2672,6 +2782,12 @@ class BudgetedProvider:
         )
         return reservation_id, input_ceiling
 
+    def _audit_provider_config(self) -> None:
+        if self._provider.config != self._provider_config:
+            raise BudgetIntegrityError(
+                "wrapped provider config changed after the budget account was bound"
+            )
+
     def _settle_usage(
         self,
         reservation_id: str,
@@ -2680,19 +2796,16 @@ class BudgetedProvider:
         output_tokens: int,
         input_ceiling: int,
         output_ceiling: int,
+        charged_nano_usd: int,
     ) -> None:
         breach_kind = None
         if input_tokens > input_ceiling:
             breach_kind = BudgetBreachKind.INPUT_TOKEN_CEILING
         elif output_tokens > output_ceiling:
             breach_kind = BudgetBreachKind.OUTPUT_TOKEN_CEILING
-        charged = self._meter.price.charge(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
         self._ledger.settle(
             reservation_id,
-            charged_nano_usd=charged,
+            charged_nano_usd=charged_nano_usd,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             breach_kind=breach_kind,
@@ -2727,6 +2840,14 @@ class BudgetedProvider:
             or total != input_tokens + output_tokens
         ):
             extras["total_tokens"] = total
+        for container, detail, parent in _INCLUSIVE_USAGE_BREAKDOWNS:
+            value = extras.get(container)
+            if not isinstance(value, Mapping) or set(value) != {detail}:
+                continue
+            count = value[detail]
+            parent_count = input_tokens if parent == "input" else output_tokens
+            if type(count) is int and 0 <= count <= parent_count:
+                extras.pop(container)
         if not extras:
             return
         dimensions = ", ".join(sorted(extras))
@@ -2734,6 +2855,37 @@ class BudgetedProvider:
         raise UnpricedProviderUsageError(
             f"provider usage exposes unpriced dimension(s): {dimensions}"
         )
+
+    def _validated_usage_charge(self, *, input_tokens: object, output_tokens: object) -> int:
+        if (
+            type(input_tokens) is not int
+            or type(output_tokens) is not int
+            or input_tokens < 0
+            or output_tokens < 0
+        ):
+            raise BudgetIntegrityError(
+                "provider token usage must contain nonnegative integer counts"
+            )
+        try:
+            return self._meter.price.charge(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        except (ValueError, OverflowError) as error:
+            raise BudgetIntegrityError("provider token usage cannot be priced safely") from error
+
+    def _raise_forfeited_error(
+        self,
+        reservation_id: str,
+        error: Exception,
+        *,
+        failure_type: str,
+    ) -> Never:
+        try:
+            self._ledger.forfeit(reservation_id, failure_type=failure_type)
+        except Exception as ledger_error:
+            raise ledger_error from error
+        raise error
 
     def _forfeit_after_error(self, reservation_id: str, error: Exception) -> None:
         failure_type = type(error).__name__

@@ -375,6 +375,32 @@ def _build() -> mod.ExactE2BBuildRecord:
     )
 
 
+def test_exact_task_launch_digest_projects_secure_mode_and_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    def capture(payload: dict[str, object]) -> str:
+        captured.append(payload)
+        return "sha256:" + "f" * 64
+
+    monkeypatch.setattr(mod, "_digest", capture)
+    result = mod.exact_e2b_task_launch_config_digest(
+        build=_build(),
+        requested_storage_mb=10_240,
+        network_policy=NetworkPolicy(
+            network_mode=NetworkMode.ALLOWLIST,
+            allowed_hosts=["api.example.com"],
+        ),
+    )
+
+    assert result == "sha256:" + "f" * 64
+    [payload] = captured
+    assert payload["schema_version"] == 3
+    assert payload["secure"] is True
+    assert payload["create_request_timeout_s"] == mod.E2B_CREATE_REQUEST_TIMEOUT_S
+
+
 class _Commands:
     async def run(self, command: str, *, timeout: int) -> SimpleNamespace:
         assert command == "uname -sm"

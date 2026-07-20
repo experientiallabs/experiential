@@ -33,6 +33,7 @@ from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxHandle, SandboxU
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.runtime import HarnessSearchCancelled
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.receipt import ProviderResponseIdentity
 from wmh.tracking.budget import (
     BudgetBreachError,
     BudgetExceededError,
@@ -1582,6 +1583,69 @@ def _project_rate_authority(
 _PROJECT_CONFIGURATION_ID = "project-proposer-v1"
 
 
+def test_project_execution_commitment_binds_exact_path_free_launch_semantics(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_rate_authority = _rate_authority(first_dir)
+    second_rate_authority = _rate_authority(second_dir)
+    base = AgentProject.execution_commitment_for(
+        timeout=60,
+        template="template-immutable:build-one",
+        cpu_count=2,
+        memory_mb=2048,
+        create_rate_authority=first_rate_authority,
+    )
+
+    variants = (
+        AgentProject.execution_commitment_for(
+            timeout=61,
+            template="template-immutable:build-one",
+            cpu_count=2,
+            memory_mb=2048,
+            create_rate_authority=first_rate_authority,
+        ),
+        AgentProject.execution_commitment_for(
+            timeout=60,
+            template="template-immutable:build-two",
+            cpu_count=2,
+            memory_mb=2048,
+            create_rate_authority=first_rate_authority,
+        ),
+        AgentProject.execution_commitment_for(
+            timeout=60,
+            template="template-immutable:build-one",
+            cpu_count=4,
+            memory_mb=2048,
+            create_rate_authority=first_rate_authority,
+        ),
+        AgentProject.execution_commitment_for(
+            timeout=60,
+            template="template-immutable:build-one",
+            cpu_count=2,
+            memory_mb=2048,
+            create_rate_authority=second_rate_authority,
+        ),
+    )
+
+    assert all(variant.digest != base.digest for variant in variants)
+    assert base.secure is True
+    assert base.internet_access_at_create is False
+    assert base.timeout_action == "kill"
+    assert base.auto_resume is False
+    assert base.volume_mounts is False
+    assert base.create_request_timeout_s == project_module.E2B_CREATE_REQUEST_TIMEOUT_S
+    assert (
+        base.resource_class.create_request_timeout_seconds
+        == project_module._PROJECT_CREATE_HORIZON_S
+    )
+    assert base.resource_class.create_request_timeout_seconds > base.create_request_timeout_s
+    assert str(tmp_path) not in base.model_dump_json()
+
+
 def _project_cost_runtime(
     tmp_path: Path,
     *,
@@ -1646,6 +1710,7 @@ def _project_cost_runtime(
         ledger_identity=authority.ledger_identity,
         phase="search",
         run_id="test-run",
+        external_dispatch_rate_binding=_project_rate_authority(tmp_path).binding,
         proposer=SearchComponentCostBinding(
             role=SearchComponentRole.PROPOSER,
             configuration_id=component_configuration_id,
@@ -1654,6 +1719,7 @@ def _project_cost_runtime(
                 ProviderCostBinding(
                     component_configuration_id=component_configuration_id,
                     provider_config=provider_config,
+                    response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
                     account=bind_budget_account(proposer_provider),
                 ),
             ),
@@ -1674,6 +1740,7 @@ def _project_cost_runtime(
                 ProviderCostBinding(
                     component_configuration_id="unused-scorer",
                     provider_config=provider_config,
+                    response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
                     account=bind_budget_account(scorer_provider),
                 ),
             ),
@@ -1714,7 +1781,7 @@ def test_cost_bound_project_rejects_binding_drift_before_external_or_filesystem_
             cost_runtime=runtime,
             component_configuration_id="drifted-proposer",
             lease_ledger_dir=lease_dir,
-            create_rate_authority=_rate_authority(tmp_path),
+            create_rate_authority=_project_rate_authority(tmp_path),
         )
 
     assert factory_calls == 0
@@ -1755,6 +1822,58 @@ def test_cost_bound_project_requires_create_rate_authority_before_external_effec
     assert not lease_dir.exists()
 
 
+def test_cost_bound_project_defers_create_until_complete_search_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
+    creates = 0
+
+    def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        frozen = dict(kwargs)
+
+        def create() -> _AttestedProjectSandbox:
+            nonlocal creates
+            creates += 1
+            return _AttestedProjectSandbox(frozen, sandbox_id="deferred-project")
+
+        return create
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
+    rate_authority = _project_rate_authority(tmp_path)
+    execution_commitment = AgentProject.execution_commitment_for(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        create_rate_authority=rate_authority,
+    )
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=rate_authority,
+    )
+
+    assert creates == 0
+    assert project.execution_configuration_id == execution_commitment.digest
+    with pytest.raises(RuntimeError, match="complete search cost preflight"):
+        project.write_text("context/input.json", "{}")
+    assert creates == 0
+
+    project.authorize_search_dispatch(runtime.search_binding)
+    project.write_text("context/input.json", "{}")
+    assert creates == 1
+    project.close()
+
+
 def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_metered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1765,7 +1884,7 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     )
     create_calls: list[dict[str, object]] = []
     sandboxes: list[_AttestedProjectSandbox] = []
-    rate_authority = _rate_authority(tmp_path)
+    rate_authority = _project_rate_authority(tmp_path)
     acquired_sequences: list[int] = []
     acquire = rate_authority.acquire
 
@@ -1803,6 +1922,7 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
         api_key="explicit-secret-key",
     )
 
+    project.authorize_search_dispatch(runtime.search_binding)
     project._replace_sandbox()  # noqa: SLF001 - verify the owned replacement contract
     project.close()
 
@@ -1810,6 +1930,8 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     assert acquired_sequences == [1, 2]
     assert project.create_rate_binding == rate_authority.binding
     assert all(call["allow_internet_access"] is False for call in create_calls)
+    assert all(call["secure"] is True for call in create_calls)
+    assert all(call["volume_mounts"] is None for call in create_calls)
     assert all(
         call["lifecycle"] == {"on_timeout": "kill", "auto_resume": False} for call in create_calls
     )
@@ -1822,6 +1944,74 @@ def test_budgeted_project_initial_and_replacement_sandboxes_are_offline_and_mete
     reservations = SpendLedger(account.ledger_path, account.policy).reservations()
     assert len(reservations) == 2
     assert all(item.status is ReservationStatus.SETTLED for item in reservations)
+
+
+def test_budgeted_project_reused_handle_cannot_inherit_prior_retirement_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _account = _project_cost_runtime(
+        tmp_path,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+    )
+    shared: _AttestedProjectSandbox | None = None
+    create_count = 0
+
+    def default_factory(**kwargs: object) -> Callable[[], _AttestedProjectSandbox]:
+        frozen = dict(kwargs)
+
+        def create() -> _AttestedProjectSandbox:
+            nonlocal shared, create_count
+            create_count += 1
+            replacement = _AttestedProjectSandbox(
+                frozen,
+                sandbox_id=f"reused-handle-{create_count}",
+            )
+            if shared is None:
+                shared = replacement
+            else:
+                shared.sandbox_id = replacement.sandbox_id
+                shared.info = replacement.info
+                shared.killed = False
+            return shared
+
+        return create
+
+    fail_retirement = False
+
+    def retire(sandbox: SandboxHandle) -> None:
+        if fail_retirement:
+            raise SandboxCleanupError("second lease cleanup unproved")
+        cast("_AttestedProjectSandbox", sandbox).killed = True
+
+    monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
+    monkeypatch.setattr(project_module, "kill_sandbox", retire)
+    factory = project_module._BudgetedProjectSandboxFactory(  # noqa: SLF001
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        ledger_dir=(tmp_path / "leases").resolve(),
+        timeout=60,
+        template="template-immutable:build-immutable",
+        api_key=None,
+        cpu_count=2,
+        memory_mb=2048,
+        create_rate_authority=_project_rate_authority(tmp_path),
+    )
+
+    first = factory()
+    factory.retire(first)
+    assert factory.retirement_proved(first)
+
+    second = factory()
+    assert second is first
+    assert not factory.retirement_proved(second)
+
+    fail_retirement = True
+    with pytest.raises(SandboxCleanupError, match="second lease cleanup unproved"):
+        factory.retire(second)
+
+    assert not factory.retirement_proved(second)
+    assert id(second) in factory._live  # noqa: SLF001
 
 
 def test_cost_bound_project_forgets_killed_lease_after_terminal_settlement_breach(
@@ -1848,8 +2038,10 @@ def test_cost_bound_project_forgets_killed_lease_after_terminal_settlement_breac
         cost_runtime=runtime,
         component_configuration_id=_PROJECT_CONFIGURATION_ID,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
-        create_rate_authority=_rate_authority(tmp_path),
+        create_rate_authority=_project_rate_authority(tmp_path),
     )
+    project.authorize_search_dispatch(runtime.search_binding)
+    project.write_text("context/materialize.json", "{}")
     factory = cast("project_module._BudgetedProjectSandboxFactory", project._sandbox_factory)  # noqa: SLF001
     [lease] = factory._live.values()  # noqa: SLF001 - force a terminal horizon breach
     assert lease.reservation is not None
@@ -1890,8 +2082,10 @@ def test_cost_bound_project_forgets_killed_lease_after_accounting_integrity_erro
         cost_runtime=runtime,
         component_configuration_id=_PROJECT_CONFIGURATION_ID,
         lease_ledger_dir=(tmp_path / "leases").resolve(),
-        create_rate_authority=_rate_authority(tmp_path),
+        create_rate_authority=_project_rate_authority(tmp_path),
     )
+    project.authorize_search_dispatch(runtime.search_binding)
+    project.write_text("context/materialize.json", "{}")
     factory = cast("project_module._BudgetedProjectSandboxFactory", project._sandbox_factory)  # noqa: SLF001
     [lease] = factory._live.values()  # noqa: SLF001 - inject post-kill accounting failure
     assert lease.reservation is not None
@@ -1938,6 +2132,8 @@ def test_budgeted_project_accepts_sdk_lifecycle_mapping(
         api_key="explicit-secret-key",
     )
 
+    project.authorize_search_dispatch(runtime.search_binding)
+    project.write_text("context/materialize.json", "{}")
     project.close()
 
 
@@ -2043,7 +2239,11 @@ def test_agent_project_rejects_wrong_rate_policy_before_effects(
         maximum_dispatches=5,
         period_milliseconds=1000,
     )
-    authority = _project_rate_authority(tmp_path, policy=wrong_policy)
+    authority = _project_rate_authority(
+        tmp_path,
+        policy=wrong_policy,
+        name="wrong-project-create-rate.json",
+    )
     factories = 0
 
     def unexpected_factory(**_kwargs: object) -> Callable[[], _Sandbox]:
@@ -2128,18 +2328,21 @@ def test_project_budget_denial_never_dispatches_or_reaps(
         lambda lease_id, *, api_key=None: (reaped.append((lease_id, api_key)), ())[1],
     )
 
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_project_rate_authority(tmp_path),
+        api_key="explicit-key",
+    )
+    project.authorize_search_dispatch(runtime.search_binding)
+
     with pytest.raises(BudgetExceededError, match="hard budget"):
-        AgentProject.create(
-            timeout=60,
-            template="template-immutable:build-immutable",
-            cpu_count=2,
-            memory_mb=2048,
-            cost_runtime=runtime,
-            component_configuration_id=_PROJECT_CONFIGURATION_ID,
-            lease_ledger_dir=(tmp_path / "leases").resolve(),
-            create_rate_authority=_project_rate_authority(tmp_path),
-            api_key="explicit-key",
-        )
+        project.write_text("context/materialize.json", "{}")
 
     assert creates == 0
     assert reaped == []
@@ -2171,18 +2374,21 @@ def test_project_ambiguous_create_uses_explicit_key_and_forfeits_full_ceiling(
         lambda lease_id, *, api_key=None: (reaped.append((lease_id, api_key)), ())[1],
     )
 
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_project_rate_authority(tmp_path),
+        api_key="explicit-key",
+    )
+    project.authorize_search_dispatch(runtime.search_binding)
+
     with pytest.raises(RuntimeError, match="ambiguous create"):
-        AgentProject.create(
-            timeout=60,
-            template="template-immutable:build-immutable",
-            cpu_count=2,
-            memory_mb=2048,
-            cost_runtime=runtime,
-            component_configuration_id=_PROJECT_CONFIGURATION_ID,
-            lease_ledger_dir=(tmp_path / "leases").resolve(),
-            create_rate_authority=_project_rate_authority(tmp_path),
-            api_key="explicit-key",
-        )
+        project.write_text("context/materialize.json", "{}")
 
     [reservation] = SpendLedger(account.ledger_path, account.policy).reservations()
     assert reservation.status is ReservationStatus.FORFEITED
@@ -2247,6 +2453,8 @@ def test_budgeted_project_retries_definitive_e2b_rate_refusal_under_one_lease(
         lease_ledger_dir=(tmp_path / "leases").resolve(),
         create_rate_authority=authority,
     )
+    project.authorize_search_dispatch(runtime.search_binding)
+    project.write_text("context/materialize.json", "{}")
     project.close()
 
     assert create_calls == 3
@@ -2308,17 +2516,20 @@ def test_budgeted_project_exhausts_rate_refusals_without_orphan_reconciliation(
         lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
     )
 
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=authority,
+    )
+    project.authorize_search_dispatch(runtime.search_binding)
+
     with pytest.raises(RateLimitException, match="Rate limit exceeded"):
-        AgentProject.create(
-            timeout=60,
-            template="template-immutable:build-immutable",
-            cpu_count=2,
-            memory_mb=2048,
-            cost_runtime=runtime,
-            component_configuration_id=_PROJECT_CONFIGURATION_ID,
-            lease_ledger_dir=(tmp_path / "leases").resolve(),
-            create_rate_authority=authority,
-        )
+        project.write_text("context/materialize.json", "{}")
 
     assert create_calls == 4
     assert sleeps == [1.0, 3.0, 9.0]
@@ -2380,17 +2591,20 @@ def test_budgeted_project_never_dispatches_a_retry_past_the_absolute_create_hori
         lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
     )
 
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=authority,
+    )
+    project.authorize_search_dispatch(runtime.search_binding)
+
     with pytest.raises(TimeoutError, match="create horizon"):
-        AgentProject.create(
-            timeout=60,
-            template="template-immutable:build-immutable",
-            cpu_count=2,
-            memory_mb=2048,
-            cost_runtime=runtime,
-            component_configuration_id=_PROJECT_CONFIGURATION_ID,
-            lease_ledger_dir=(tmp_path / "leases").resolve(),
-            create_rate_authority=authority,
-        )
+        project.write_text("context/materialize.json", "{}")
 
     assert gate_calls == create_calls == 1
     assert reaped == []
@@ -2449,17 +2663,20 @@ def test_budgeted_project_never_retries_unproven_create_errors(
         lambda lease_id, *, api_key=None: (reaped.append(lease_id), (lease_id,))[1],
     )
 
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_project_rate_authority(tmp_path),
+    )
+    project.authorize_search_dispatch(runtime.search_binding)
+
     with pytest.raises(type(error), match=re.escape(str(error))):
-        AgentProject.create(
-            timeout=60,
-            template="template-immutable:build-immutable",
-            cpu_count=2,
-            memory_mb=2048,
-            cost_runtime=runtime,
-            component_configuration_id=_PROJECT_CONFIGURATION_ID,
-            lease_ledger_dir=(tmp_path / "leases").resolve(),
-            create_rate_authority=_project_rate_authority(tmp_path),
-        )
+        project.write_text("context/materialize.json", "{}")
 
     assert create_calls == 1
     assert sleeps == []
@@ -2508,17 +2725,20 @@ def test_project_activation_failure_kills_and_terminates_budget_and_lease(
     monkeypatch.setattr(project_module.RunnerLeaseLedger, "activate", injected_activate)
     monkeypatch.setattr(project_module, "default_sandbox_factory", default_factory)
 
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_project_rate_authority(tmp_path),
+    )
+    project.authorize_search_dispatch(runtime.search_binding)
+
     with pytest.raises(RuntimeError, match="activation persistence"):
-        AgentProject.create(
-            timeout=60,
-            template="template-immutable:build-immutable",
-            cpu_count=2,
-            memory_mb=2048,
-            cost_runtime=runtime,
-            component_configuration_id=_PROJECT_CONFIGURATION_ID,
-            lease_ledger_dir=(tmp_path / "leases").resolve(),
-            create_rate_authority=_project_rate_authority(tmp_path),
-        )
+        project.write_text("context/materialize.json", "{}")
 
     assert len(created) == 1
     assert created[0].killed is True
@@ -2558,17 +2778,20 @@ def test_project_creation_fails_closed_on_network_or_volume_attestation_drift(
 
     monkeypatch.setattr(project_module, "default_sandbox_factory", drifted_factory)
 
+    project = AgentProject.create(
+        timeout=60,
+        template="template-immutable:build-immutable",
+        cpu_count=2,
+        memory_mb=2048,
+        cost_runtime=runtime,
+        component_configuration_id=_PROJECT_CONFIGURATION_ID,
+        lease_ledger_dir=(tmp_path / "leases").resolve(),
+        create_rate_authority=_project_rate_authority(tmp_path),
+    )
+    project.authorize_search_dispatch(runtime.search_binding)
+
     with pytest.raises(RuntimeError, match="isolation differs"):
-        AgentProject.create(
-            timeout=60,
-            template="template-immutable:build-immutable",
-            cpu_count=2,
-            memory_mb=2048,
-            cost_runtime=runtime,
-            component_configuration_id=_PROJECT_CONFIGURATION_ID,
-            lease_ledger_dir=(tmp_path / "leases").resolve(),
-            create_rate_authority=_project_rate_authority(tmp_path),
-        )
+        project.write_text("context/materialize.json", "{}")
 
     assert len(created) == 1
     assert created[0].killed is True

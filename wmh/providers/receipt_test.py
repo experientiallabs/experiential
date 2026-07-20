@@ -36,6 +36,19 @@ def test_response_identity_contract_distinguishes_bedrock_and_openai_routes() ->
     assert identity.response_model == "glm-served-model"
     assert identity.system_fingerprint == "fp-123"
 
+    for field, value in (
+        ("response_model", "m" * 2_049),
+        ("system_fingerprint", "f" * 513),
+    ):
+        payload = {
+            "provider": ProviderKind.AZURE_OPENAI,
+            "response_model": "served-model",
+            "system_fingerprint": None,
+        }
+        payload[field] = value
+        with pytest.raises(ValidationError, match="at most"):
+            mod.ProviderResponseIdentity.model_validate(payload)
+
 
 def test_receipt_validation_requires_frozen_served_model_and_fingerprint() -> None:
     provider = ProviderConfig(

@@ -36,17 +36,25 @@ from wmh.harness.create import (
     HarnessSearchCancelled,
     ProposalRecord,
     SearchCheckpoint,
-    create_harness,
+    _create_harness_nonpaid,
     load_search_checkpoint,
     search_harness,
     select_failure_cluster,
     write_search_checkpoint,
 )
+from wmh.harness.create import (
+    create_harness as _production_create_harness,
+)
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
 from wmh.harness.mutate import parse_delta
-from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
+from wmh.harness.proposer import (
+    ProposalFailure,
+)
+from wmh.harness.proposer import (
+    ProviderDeltaProposer as _ProductionProviderDeltaProposer,
+)
 from wmh.harness.runtime import Runtime, StopReason
 from wmh.harness.scoring import (
     HarnessScoreArchive,
@@ -60,19 +68,37 @@ from wmh.harness.scoring import (
     TaskScore,
 )
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
+from wmh.providers.process_worker import ProviderWorkerCleanupError
+from wmh.providers.receipt import ProviderResponseIdentity
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 from wmh.tracking._testing import (
     synthetic_provider_cost_meter,
     synthetic_tariff_provenance,
 )
 from wmh.tracking.budget import (
+    BudgetBreachError,
+    BudgetExceededError,
+    BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
+    UnpricedProviderUsageError,
     bind_budget_account,
     bootstrap_budget_ledger,
 )
+from wmh.tracking.rate_limit import ExternalDispatchRateIntegrityError
 
 _CAREFUL_PROMPT = "You are a careful agent. Verify the state of the system before submitting."
+
+
+# Every provider in this module is a deterministic in-memory fake. Keep the production surfaces
+# fail closed while making that nonpaid declaration explicit at this test boundary.
+class ProviderDeltaProposer(_ProductionProviderDeltaProposer):
+    """Direct proposer over the deterministic in-memory provider used in this module."""
+
+    requires_search_cost_binding = False
+
+
+create_harness = _create_harness_nonpaid
 
 
 def _meta_reply(parent: HarnessDoc, new_prompt: str) -> str:
@@ -404,6 +430,7 @@ def _search_cost_binding(tmp_path: Path, *, label: str) -> SearchCostBinding:
                 ProviderCostBinding(
                     component_configuration_id=configuration_id,
                     provider_config=provider_config,
+                    response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
                     account=bind_budget_account(account),
                 ),
             ),
@@ -434,6 +461,17 @@ class _CostBoundProposer(_HistoryProposer):
     def __init__(self, binding: SearchComponentCostBinding) -> None:
         super().__init__()
         self.search_cost_binding = binding
+
+
+class _AuthorizingCostBoundProposer(_CostBoundProposer):
+    """Record the complete search contract admitted before any external score call."""
+
+    def __init__(self, binding: SearchComponentCostBinding) -> None:
+        super().__init__(binding)
+        self.authorizations: list[SearchCostBinding] = []
+
+    def authorize_search_dispatch(self, binding: SearchCostBinding) -> None:
+        self.authorizations.append(SearchCostBinding.model_validate(binding.model_dump()))
 
 
 class _NeverCalledCostBoundScorer(_CostBoundScorer):
@@ -558,6 +596,121 @@ def test_paid_dispatch_marker_requires_top_level_binding_before_component_calls(
     assert scorer.requests == []
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        BudgetIntegrityError("ledger drift"),
+        BudgetBreachError("accounting breach"),
+        BudgetExceededError("hard budget exhausted"),
+        UnpricedProviderUsageError("tariff missing a billable dimension"),
+        ExternalDispatchRateIntegrityError("rate authority drift"),
+        SandboxCleanupError("sandbox cleanup unproved"),
+        ProviderWorkerCleanupError("provider cleanup unproved"),
+    ],
+)
+def test_search_harness_propagates_safety_terminal_proposal_errors(error: Exception) -> None:
+    class _SafetyTerminalProposer(_HistoryProposer):
+        def propose_batch(
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            del parent, trigger, evidence, history, count, should_cancel
+            raise error
+
+    scorer = _NeutralScorer()
+
+    with pytest.raises(type(error), match=str(error)):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            _SafetyTerminalProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+    assert len(scorer.requests) == 1
+
+
+def test_search_harness_restores_nested_safety_type_from_score_archive_write() -> None:
+    terminal = BudgetIntegrityError("wrapped archive ledger drift")
+    wrapped = RuntimeError("fresh project sandbox recovery failed")
+    wrapped.__cause__ = terminal
+
+    class _TerminalArchiveProposer(_HistoryProposer):
+        def record_harness_evaluation(
+            self,
+            harness: HarnessDoc,
+            *,
+            archive: HarnessScoreArchive,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> None:
+            del harness, archive, should_cancel
+            raise wrapped
+
+    with pytest.raises(BudgetIntegrityError, match="wrapped archive ledger drift") as raised:
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _TerminalArchiveProposer(),
+            iterations=0,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+    assert raised.value is terminal
+
+
+def test_search_harness_restores_nested_budget_exhaustion_from_feedback_write() -> None:
+    terminal = BudgetExceededError("wrapped feedback budget exhausted")
+    wrapped = RuntimeError("fresh project sandbox recovery failed")
+    wrapped.__cause__ = terminal
+
+    class _TerminalFeedbackProposer(_EvidenceRecordingProposer):
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            del delta, stage, content
+            raise wrapped
+
+    with pytest.raises(BudgetExceededError, match="wrapped feedback budget exhausted") as raised:
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _NeutralScorer(),
+            _TerminalFeedbackProposer(),
+            iterations=1,
+            screen_proposals=False,
+            confirm_narrow_vetoes=False,
+        )
+
+    assert raised.value is terminal
+
+
+def test_create_harness_rejects_raw_unbudgeted_paid_path_before_dispatch() -> None:
+    provider = RoleProvider()
+    proposer = _ProductionProviderDeltaProposer(provider)
+
+    with pytest.raises(ValueError, match="cannot dispatch raw paid providers"):
+        _production_create_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            _tasks(),
+            _wm(provider),
+            provider,
+            proposer,
+            GoldJudge(provider),
+        )
+
+    assert provider.meta_users == []
+
+
 def test_budgeted_search_rejects_unbound_components_before_scoring(tmp_path: Path) -> None:
     scorer = _NeutralScorer()
     with pytest.raises(ValueError, match="proposer.search_cost_binding"):
@@ -573,6 +726,52 @@ def test_budgeted_search_rejects_unbound_components_before_scoring(tmp_path: Pat
         )
 
     assert scorer.requests == []
+
+
+def test_search_authorizes_deferred_resources_only_after_all_pure_validation(
+    tmp_path: Path,
+) -> None:
+    binding = _search_cost_binding(tmp_path, label="deferred-authorization-invalid")
+    proposer = _AuthorizingCostBoundProposer(binding.proposer)
+    scorer = _CostBoundScorer(binding.scorer)
+
+    with pytest.raises(ValueError, match="cannot evaluate task subsets"):
+        search_harness(
+            "winner",
+            HarnessDoc.baseline("seed"),
+            scorer,
+            proposer,
+            iterations=0,
+            cost_binding=binding,
+        )
+
+    assert proposer.authorizations == []
+    assert scorer.requests == []
+
+
+def test_search_authorizes_deferred_resources_before_first_score(tmp_path: Path) -> None:
+    binding = _search_cost_binding(tmp_path, label="deferred-authorization-valid")
+    proposer = _AuthorizingCostBoundProposer(binding.proposer)
+
+    class _AuthorizationCheckingScorer(_CostBoundScorer):
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScoreReport:
+            assert proposer.authorizations == [binding]
+            return super().score(candidate, request=request)
+
+    scorer = _AuthorizationCheckingScorer(binding.scorer)
+    search_harness(
+        "winner",
+        HarnessDoc.baseline("seed"),
+        scorer,
+        proposer,
+        iterations=0,
+        screen_proposals=False,
+        confirm_narrow_vetoes=False,
+        cost_binding=binding,
+    )
+
+    assert proposer.authorizations == [binding]
+    assert len(scorer.requests) == 1
 
 
 def test_search_result_retains_full_path_free_cost_contract_without_checkpointing(

@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatResponse
+from llm_waterfall import ChatRequest, ChatResponse
+from llm_waterfall.types import ChatMessage, ChatUsage
 
 from wmh.agents.default import default_agent
 from wmh.agents.meta import meta_agent
@@ -28,6 +29,7 @@ from wmh.harness.cost import (
 )
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
+from wmh.harness.e2b_sandbox import SandboxCleanupError
 from wmh.harness.mutate import parse_delta
 from wmh.harness.proposer import (
     ProjectDeltaProposer as _ProductionProjectDeltaProposer,
@@ -52,16 +54,29 @@ from wmh.providers.base import (
     ToolCallingProvider,
     VerifyResult,
 )
+from wmh.providers.base import TokenUsage as ProviderTokenUsage
+from wmh.providers.process_worker import ProviderWorkerCleanupError
+from wmh.providers.receipt import (
+    ProviderResponseIdentity,
+    ProviderResponseIdentityError,
+    build_chat_provider_receipt,
+    freeze_provider_response_identity,
+)
 from wmh.tracking._testing import (
     synthetic_provider_cost_meter,
     synthetic_tariff_provenance,
 )
 from wmh.tracking.budget import (
+    BudgetBreachError,
     BudgetedProvider,
+    BudgetExceededError,
     BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
+    ReservationStatus,
+    SpendLedger,
     TimedResourceCostMeter,
+    UnpricedProviderUsageError,
     bind_budget_account,
     bind_timed_resource_account,
     bootstrap_budget_ledger,
@@ -69,6 +84,7 @@ from wmh.tracking.budget import (
 from wmh.tracking.rate_limit import (
     E2B_SANDBOX_CREATE_RATE_POLICY,
     ExternalDispatchRateAuthority,
+    ExternalDispatchRateIntegrityError,
 )
 
 
@@ -148,6 +164,12 @@ class ProjectDeltaProposer(_ProductionProjectDeltaProposer):
     requires_search_cost_binding = False
 
 
+class _NonpaidProviderDeltaProposer(ProviderDeltaProposer):
+    """Exercise direct proposal parsing with deterministic in-memory providers."""
+
+    requires_search_cost_binding = False
+
+
 class _FlakyProvider(_Provider):
     def __init__(self, replies: list[str | Exception]) -> None:
         super().__init__("")
@@ -162,8 +184,81 @@ class _FlakyProvider(_Provider):
         return Completion(text=reply)
 
 
+class _IdentityProvider(_Provider):
+    """Return controlled direct and chat response identities for proposer regressions."""
+
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        completions: list[Completion] | None = None,
+        chat_responses: list[ChatResponse] | None = None,
+    ) -> None:
+        super().__init__("")
+        self.config = config
+        self.completions = completions or []
+        self.chat_responses = chat_responses or []
+        self.chat_calls = 0
+
+    def complete(self, system: str, messages: list[Message], **kwargs: object) -> Completion:
+        del system, messages, kwargs
+        completion = self.completions[self.calls]
+        self.calls += 1
+        return completion
+
+    def complete_chat(self, request: object) -> ChatResponse:
+        del request
+        response = self.chat_responses[self.chat_calls]
+        self.chat_calls += 1
+        return response
+
+    def verify(self) -> VerifyResult:
+        return VerifyResult(ok=True, kind=self.config.kind, model=self.config.model)
+
+
+def _chat_response(
+    config: ProviderConfig,
+    *,
+    index: int,
+    response_model: str,
+    system_fingerprint: str | None,
+) -> ChatResponse:
+    requested_model = (
+        config.deployment if config.kind is ProviderKind.AZURE_OPENAI else config.model
+    )
+    assert requested_model is not None
+    receipt = build_chat_provider_receipt(
+        provider=config.kind.value,
+        provider_request_id=f"request-{index}",
+        response_id=f"response-{index}",
+        requested_model=requested_model,
+        response_model=response_model,
+        system_fingerprint=system_fingerprint,
+        request_payload={"messages": [], "max_completion_tokens": 16},
+        temperature=None,
+        max_tokens=16,
+        max_tokens_field=config.resolved_chat_max_tokens_field(),
+        started_at_unix_s=1.0,
+        finished_at_unix_s=2.0,
+    )
+    return ChatResponse.model_validate(
+        {
+            "id": f"response-{index}",
+            "model": response_model,
+            "system_fingerprint": system_fingerprint,
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "provider_receipt": receipt,
+        }
+    )
+
+
+_PROJECT_EXECUTION_CONFIGURATION_ID = "sha256:" + "e" * 64
+
+
 class _Project:
     workspace = "/home/user/project"
+    execution_configuration_id = _PROJECT_EXECUTION_CONFIGURATION_ID
 
     def __init__(self, outputs: list[str]) -> None:
         self.files: dict[str, str] = {}
@@ -227,6 +322,10 @@ class _CostBoundProject(_Project):
         self.budget_policy_digest = runtime.authority.policy.policy_digest
         self.budget_ledger_path = runtime.authority.ledger_path
         self.observed_provider: ToolCallingProvider | None = None
+        self.authorizations: list[SearchCostBinding] = []
+
+    def authorize_search_dispatch(self, binding: SearchCostBinding) -> None:
+        self.authorizations.append(SearchCostBinding.model_validate(binding.model_dump()))
 
     def run(
         self,
@@ -256,8 +355,11 @@ def _proposer_cost_runtime(
     *,
     configuration_id: str,
     provider_config: ProviderConfig | None = None,
+    response_identity: ProviderResponseIdentity | None = None,
+    include_project_resource: bool = True,
 ) -> SearchComponentCostRuntime:
     proposer_provider = provider_config or _Provider.config
+    proposer_identity = freeze_provider_response_identity(proposer_provider, response_identity)
     policy = BudgetPolicy(
         study_id="project-proposer-cost-wiring",
         manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
@@ -313,16 +415,21 @@ def _proposer_cost_runtime(
                 ProviderCostBinding(
                     component_configuration_id=configuration_id,
                     provider_config=proposer_provider,
+                    response_identity=proposer_identity,
                     account=bind_budget_account(proposer_account),
                 ),
             ),
             timed_resources=(
-                TimedResourceCostBinding(
-                    component_configuration_id=configuration_id,
-                    resource_type="proposer_project",
-                    resource_class_digest=_cost_digest("b"),
-                    account=bind_timed_resource_account(project_account),
-                ),
+                (
+                    TimedResourceCostBinding(
+                        component_configuration_id=configuration_id,
+                        resource_type="proposer_project",
+                        resource_class_digest=_cost_digest("b"),
+                        account=bind_timed_resource_account(project_account),
+                    ),
+                )
+                if include_project_resource
+                else ()
             ),
         ),
         scorer=SearchComponentCostBinding(
@@ -333,6 +440,7 @@ def _proposer_cost_runtime(
                 ProviderCostBinding(
                     component_configuration_id="unused-scorer",
                     provider_config=_Provider.config,
+                    response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
                     account=bind_budget_account(scorer_account),
                 ),
             ),
@@ -352,6 +460,7 @@ def test_project_proposer_binds_exact_runtime_and_reaudits_before_project_dispat
     configuration_id = ProjectDeltaProposer.configuration_id_for(
         project_type=_CostBoundProject,
         project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
         agent=agent,
         provider=raw_provider,
     )
@@ -373,6 +482,34 @@ def test_project_proposer_binds_exact_runtime_and_reaudits_before_project_dispat
     assert raw_provider.calls == 0
 
 
+def test_project_proposer_forwards_only_its_exact_complete_search_binding(tmp_path: Path) -> None:
+    provider = _Provider("unused")
+    agent = meta_agent()
+    configuration_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
+        agent=agent,
+        provider=provider,
+    )
+    runtime = _proposer_cost_runtime(tmp_path, configuration_id=configuration_id)
+    project = _CostBoundProject([], runtime)
+    proposer = ProjectDeltaProposer(project, agent, provider, cost_runtime=runtime)
+
+    proposer.authorize_search_dispatch(runtime.search_binding)
+
+    assert project.authorizations == [runtime.search_binding]
+
+    other_runtime = _proposer_cost_runtime(
+        tmp_path / "other-runtime",
+        configuration_id=configuration_id,
+    )
+    with pytest.raises(ValueError, match="differs from the proposer cost runtime"):
+        proposer.authorize_search_dispatch(other_runtime.search_binding)
+
+    assert project.authorizations == [runtime.search_binding]
+
+
 def test_project_proposer_configuration_binds_create_rate_authority(tmp_path: Path) -> None:
     provider = _Provider("unused")
     agent = meta_agent()
@@ -388,6 +525,7 @@ def test_project_proposer_configuration_binds_create_rate_authority(tmp_path: Pa
     first_id = ProjectDeltaProposer.configuration_id_for(
         project_type=_CostBoundProject,
         project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
         agent=agent,
         provider=provider,
         project_create_rate_binding=first.binding,
@@ -395,12 +533,59 @@ def test_project_proposer_configuration_binds_create_rate_authority(tmp_path: Pa
     second_id = ProjectDeltaProposer.configuration_id_for(
         project_type=_CostBoundProject,
         project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
         agent=agent,
         provider=provider,
         project_create_rate_binding=second.binding,
     )
 
     assert first_id != second_id
+
+
+def test_project_proposer_configuration_binds_project_execution_commitment() -> None:
+    provider = _Provider("unused")
+    agent = meta_agent()
+
+    first_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id="sha256:" + "1" * 64,
+        agent=agent,
+        provider=provider,
+    )
+    second_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id="sha256:" + "2" * 64,
+        agent=agent,
+        provider=provider,
+    )
+
+    assert first_id != second_id
+
+
+def test_project_execution_drift_stops_before_replayed_project_dispatch(tmp_path: Path) -> None:
+    parent = HarnessDoc.baseline("parent")
+    provider = _Provider(_payload(parent, "must-not-dispatch"))
+    agent = meta_agent()
+    configuration_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
+        agent=agent,
+        provider=provider,
+    )
+    runtime = _proposer_cost_runtime(tmp_path, configuration_id=configuration_id)
+    project = _CostBoundProject([_payload(parent, "must-not-dispatch")], runtime)
+    proposer = ProjectDeltaProposer(project, agent, provider, cost_runtime=runtime)
+    project.execution_configuration_id = "sha256:" + "f" * 64
+
+    with pytest.raises(ValueError, match="configuration_id differs"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=1)
+
+    assert project.runs == 0
+    assert project.files == {}
+    assert provider.calls == 0
 
 
 @dataclass(frozen=True)
@@ -525,6 +710,541 @@ def test_production_project_proposer_rejects_missing_cost_runtime_before_effects
     assert project.runs == 0
     assert project.files == {}
     assert provider.calls == 0
+
+
+@pytest.mark.parametrize("kind", [ProviderKind.AZURE_OPENAI, ProviderKind.BEDROCK])
+def test_production_provider_proposer_rejects_missing_cost_runtime_before_effects(
+    kind: ProviderKind,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    provider = _Provider("unused")
+    provider.config = ProviderConfig(kind=kind, model="paid-model")
+    response_identity = (
+        ProviderResponseIdentity(
+            provider=kind,
+            response_model="served-model",
+            system_fingerprint=None,
+        )
+        if kind is ProviderKind.AZURE_OPENAI
+        else None
+    )
+    proposer = ProviderDeltaProposer(provider, response_identity=response_identity)
+
+    with pytest.raises(ValueError, match="complete search cost runtime"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=1)
+
+    assert provider.calls == 0
+
+
+def test_provider_proposer_binds_exact_runtime_and_reaudits_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    raw_provider = _Provider(_payload(parent, "cost-bound"))
+    configuration_id = ProviderDeltaProposer.configuration_id_for(raw_provider)
+    runtime = _proposer_cost_runtime(
+        tmp_path,
+        configuration_id=configuration_id,
+        include_project_resource=False,
+    )
+    proposer = ProviderDeltaProposer(raw_provider, cost_runtime=runtime)
+
+    with sqlite3.connect(runtime.authority.ledger_path) as connection:
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute("UPDATE budget_metadata SET schema_version = 1 WHERE id = 1")
+
+    with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=1)
+
+    assert proposer.search_cost_binding == runtime.binding
+    assert isinstance(proposer.provider, BudgetedProvider)
+    assert raw_provider.calls == 0
+
+
+def test_direct_proposer_response_identity_drift_stops_before_next_sibling(
+    tmp_path: Path,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        deployment="proposer-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-stable",
+        system_fingerprint=None,
+    )
+    raw_provider = _IdentityProvider(
+        config,
+        completions=[
+            Completion(
+                text=_payload(parent, "drifted"),
+                usage=ProviderTokenUsage(input_tokens=1, output_tokens=1),
+                model="served-drifted",
+                system_fingerprint=None,
+            ),
+            Completion(
+                text=_payload(parent, "must-not-dispatch"),
+                usage=ProviderTokenUsage(input_tokens=1, output_tokens=1),
+                model="served-stable",
+                system_fingerprint=None,
+            ),
+        ],
+    )
+    configuration_id = ProviderDeltaProposer.configuration_id_for(
+        raw_provider,
+        response_identity=response_identity,
+    )
+    runtime = _proposer_cost_runtime(
+        tmp_path,
+        configuration_id=configuration_id,
+        provider_config=config,
+        response_identity=response_identity,
+        include_project_resource=False,
+    )
+    proposer = ProviderDeltaProposer(
+        raw_provider,
+        cost_runtime=runtime,
+        response_identity=response_identity,
+    )
+
+    with pytest.raises(ProviderResponseIdentityError, match="frozen response identity"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=2)
+
+    assert raw_provider.calls == 1
+    [reservation] = SpendLedger(
+        runtime.authority.ledger_path,
+        runtime.authority.policy,
+    ).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "ProviderIdentityInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+def test_direct_proposer_invalid_usage_forfeits_and_stops_before_next_sibling(
+    tmp_path: Path,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        deployment="proposer-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-stable",
+        system_fingerprint=None,
+    )
+    raw_provider = _IdentityProvider(
+        config,
+        completions=[
+            Completion(
+                text=_payload(parent, "invalid-usage"),
+                usage=ProviderTokenUsage(input_tokens=-1, output_tokens=1),
+                model="served-stable",
+                system_fingerprint=None,
+            ),
+            Completion(
+                text=_payload(parent, "must-not-dispatch"),
+                usage=ProviderTokenUsage(input_tokens=1, output_tokens=1),
+                model="served-stable",
+                system_fingerprint=None,
+            ),
+        ],
+    )
+    configuration_id = ProviderDeltaProposer.configuration_id_for(
+        raw_provider,
+        response_identity=response_identity,
+    )
+    runtime = _proposer_cost_runtime(
+        tmp_path,
+        configuration_id=configuration_id,
+        provider_config=config,
+        response_identity=response_identity,
+        include_project_resource=False,
+    )
+    proposer = ProviderDeltaProposer(
+        raw_provider,
+        cost_runtime=runtime,
+        response_identity=response_identity,
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="nonnegative integer counts"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=2)
+
+    assert raw_provider.calls == 1
+    [reservation] = SpendLedger(
+        runtime.authority.ledger_path,
+        runtime.authority.policy,
+    ).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UsageInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+def test_direct_proposer_accepts_exact_response_identity_for_every_sibling(
+    tmp_path: Path,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        deployment="proposer-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-stable",
+        system_fingerprint="fp-stable",
+    )
+    raw_provider = _IdentityProvider(
+        config,
+        completions=[
+            Completion(
+                text=_payload(parent, "first"),
+                usage=ProviderTokenUsage(input_tokens=1, output_tokens=1),
+                model="served-stable",
+                system_fingerprint="fp-stable",
+            ),
+            Completion(
+                text=_payload(parent, "second"),
+                usage=ProviderTokenUsage(input_tokens=1, output_tokens=1),
+                model="served-stable",
+                system_fingerprint="fp-stable",
+            ),
+        ],
+    )
+    configuration_id = ProviderDeltaProposer.configuration_id_for(
+        raw_provider,
+        response_identity=response_identity,
+    )
+    runtime = _proposer_cost_runtime(
+        tmp_path,
+        configuration_id=configuration_id,
+        provider_config=config,
+        response_identity=response_identity,
+        include_project_resource=False,
+    )
+    proposer = ProviderDeltaProposer(
+        raw_provider,
+        cost_runtime=runtime,
+        response_identity=response_identity,
+    )
+
+    proposals = proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=2)
+
+    assert raw_provider.calls == 2
+    assert all(isinstance(proposal, HarnessDelta) for proposal in proposals)
+
+
+def test_proposer_configuration_ids_bind_served_response_identity() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        deployment="proposer-deployment",
+    )
+    provider = _IdentityProvider(config)
+    first = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-first",
+        system_fingerprint=None,
+    )
+    second = first.model_copy(update={"response_model": "served-second"})
+
+    assert ProviderDeltaProposer.configuration_id_for(
+        provider,
+        response_identity=first,
+    ) != ProviderDeltaProposer.configuration_id_for(
+        provider,
+        response_identity=second,
+    )
+    assert ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
+        agent=meta_agent(),
+        provider=provider,
+        response_identity=first,
+    ) != ProjectDeltaProposer.configuration_id_for(
+        project_type=_CostBoundProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
+        agent=meta_agent(),
+        provider=provider,
+        response_identity=second,
+    )
+
+
+def test_project_proposer_response_identity_drift_stops_live_session_dispatch(
+    tmp_path: Path,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        deployment="project-proposer-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-stable",
+        system_fingerprint=None,
+    )
+    raw_provider = _IdentityProvider(
+        config,
+        chat_responses=[
+            _chat_response(
+                config,
+                index=1,
+                response_model="served-drifted",
+                system_fingerprint=None,
+            ),
+            _chat_response(
+                config,
+                index=2,
+                response_model="served-stable",
+                system_fingerprint=None,
+            ),
+        ],
+    )
+    agent = meta_agent()
+
+    class _DispatchingProject(_CostBoundProject):
+        def run(
+            self,
+            agent: HarnessDoc,
+            provider: ToolCallingProvider,
+            instruction: str,
+            *,
+            should_cancel: Callable[[], bool] | None = None,
+            writable_files: Collection[str] | None = None,
+        ) -> AgentProjectRun:
+            del agent, instruction, should_cancel, writable_files
+            self.runs += 1
+            request = ChatRequest(
+                messages=[ChatMessage(role="user", content="propose")],
+                max_completion_tokens=16,
+            )
+            provider.complete_chat(request)
+            provider.complete_chat(request)
+            raise AssertionError("identity drift must stop before the second provider dispatch")
+
+    configuration_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_DispatchingProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
+        agent=agent,
+        provider=raw_provider,
+        response_identity=response_identity,
+    )
+    runtime = _proposer_cost_runtime(
+        tmp_path,
+        configuration_id=configuration_id,
+        provider_config=config,
+        response_identity=response_identity,
+    )
+    project = _DispatchingProject([], runtime)
+    proposer = ProjectDeltaProposer(
+        project,
+        agent,
+        raw_provider,
+        cost_runtime=runtime,
+        response_identity=response_identity,
+    )
+
+    with pytest.raises(ProviderResponseIdentityError, match="frozen response identity"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=1)
+
+    assert project.runs == 1
+    assert raw_provider.chat_calls == 1
+    [reservation] = SpendLedger(
+        runtime.authority.ledger_path,
+        runtime.authority.policy,
+    ).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "ProviderIdentityInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+def test_project_proposer_invalid_chat_usage_forfeits_and_stops_next_dispatch(
+    tmp_path: Path,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        deployment="project-proposer-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-stable",
+        system_fingerprint=None,
+    )
+    first_response = _chat_response(
+        config,
+        index=1,
+        response_model="served-stable",
+        system_fingerprint=None,
+    ).model_copy(update={"usage": ChatUsage(prompt_tokens=1, completion_tokens=-1)})
+    raw_provider = _IdentityProvider(
+        config,
+        chat_responses=[
+            first_response,
+            _chat_response(
+                config,
+                index=2,
+                response_model="served-stable",
+                system_fingerprint=None,
+            ),
+        ],
+    )
+    agent = meta_agent()
+
+    class _DispatchingProject(_CostBoundProject):
+        def run(
+            self,
+            agent: HarnessDoc,
+            provider: ToolCallingProvider,
+            instruction: str,
+            *,
+            should_cancel: Callable[[], bool] | None = None,
+            writable_files: Collection[str] | None = None,
+        ) -> AgentProjectRun:
+            del agent, instruction, should_cancel, writable_files
+            self.runs += 1
+            request = ChatRequest(
+                messages=[ChatMessage(role="user", content="propose")],
+                max_completion_tokens=16,
+            )
+            provider.complete_chat(request)
+            provider.complete_chat(request)
+            raise AssertionError("invalid usage must stop before the second provider dispatch")
+
+    configuration_id = ProjectDeltaProposer.configuration_id_for(
+        project_type=_DispatchingProject,
+        project_workspace=_Project.workspace,
+        project_execution_configuration_id=_PROJECT_EXECUTION_CONFIGURATION_ID,
+        agent=agent,
+        provider=raw_provider,
+        response_identity=response_identity,
+    )
+    runtime = _proposer_cost_runtime(
+        tmp_path,
+        configuration_id=configuration_id,
+        provider_config=config,
+        response_identity=response_identity,
+    )
+    project = _DispatchingProject([], runtime)
+    proposer = ProjectDeltaProposer(
+        project,
+        agent,
+        raw_provider,
+        cost_runtime=runtime,
+        response_identity=response_identity,
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="nonnegative integer counts"):
+        proposer.propose_batch(parent, _trigger(), "evidence", history=[], count=1)
+
+    assert project.runs == 1
+    assert raw_provider.chat_calls == 1
+    [reservation] = SpendLedger(
+        runtime.authority.ledger_path,
+        runtime.authority.policy,
+    ).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UsageInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BudgetIntegrityError("ledger drift"),
+        BudgetBreachError("accounting breach"),
+        BudgetExceededError("hard budget exhausted"),
+        UnpricedProviderUsageError("tariff missing a billable dimension"),
+        ExternalDispatchRateIntegrityError("rate authority drift"),
+        SandboxCleanupError("sandbox cleanup unproved"),
+        ProviderWorkerCleanupError("provider cleanup unproved"),
+    ],
+)
+def test_provider_proposer_propagates_search_safety_terminal_errors(error: Exception) -> None:
+    parent = HarnessDoc.baseline("parent")
+    provider = _FlakyProvider([error])
+
+    with pytest.raises(type(error), match=str(error)):
+        _NonpaidProviderDeltaProposer(provider).propose_batch(
+            parent,
+            _trigger(),
+            "evidence",
+            history=[],
+            count=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BudgetIntegrityError("ledger drift"),
+        BudgetBreachError("accounting breach"),
+        BudgetExceededError("hard budget exhausted"),
+        UnpricedProviderUsageError("tariff missing a billable dimension"),
+        ExternalDispatchRateIntegrityError("rate authority drift"),
+        SandboxCleanupError("sandbox cleanup unproved"),
+        ProviderWorkerCleanupError("provider cleanup unproved"),
+    ],
+)
+def test_project_proposer_cannot_salvage_durable_output_after_safety_error(
+    error: Exception,
+) -> None:
+    parent = HarnessDoc.baseline("parent")
+
+    class _SafetyTerminalProject(_Project):
+        def run(
+            self,
+            agent: HarnessDoc,
+            provider: ToolCallingProvider,
+            instruction: str,
+            *,
+            should_cancel: Callable[[], bool] | None = None,
+            writable_files: Collection[str] | None = None,
+        ) -> AgentProjectRun:
+            super().run(
+                agent,
+                provider,
+                instruction,
+                should_cancel=should_cancel,
+                writable_files=writable_files,
+            )
+            raise error
+
+    project = _SafetyTerminalProject([_payload(parent, "durable-but-terminal")])
+
+    with pytest.raises(type(error), match=str(error)):
+        ProjectDeltaProposer(project, meta_agent(), _Provider("unused")).propose_batch(
+            parent,
+            _trigger(),
+            "evidence",
+            history=[],
+            count=1,
+        )
+
+    assert project.runs == 1
 
 
 @pytest.mark.parametrize(
@@ -663,7 +1383,7 @@ def test_provider_proposer_produces_requested_sibling_count() -> None:
     parent = HarnessDoc.baseline("parent")
     provider = _Provider(_payload(parent, "careful"))
 
-    proposals = ProviderDeltaProposer(provider).propose_batch(
+    proposals = _NonpaidProviderDeltaProposer(provider).propose_batch(
         parent, _trigger(), "evidence", history=[], count=3
     )
 
@@ -678,7 +1398,7 @@ def test_provider_proposer_isolates_one_failed_sibling_call() -> None:
         [_payload(parent, "first"), RuntimeError("rate limited"), _payload(parent, "third")]
     )
 
-    proposals = ProviderDeltaProposer(provider).propose_batch(
+    proposals = _NonpaidProviderDeltaProposer(provider).propose_batch(
         parent, _trigger(), "evidence", history=[], count=3
     )
 
@@ -693,7 +1413,7 @@ def test_provider_proposer_checks_cancellation_between_sibling_calls() -> None:
     provider = _Provider(_payload(parent, "careful"))
 
     with pytest.raises(HarnessSearchCancelled, match="cancelled"):
-        ProviderDeltaProposer(provider).propose_batch(
+        _NonpaidProviderDeltaProposer(provider).propose_batch(
             parent,
             _trigger(),
             "evidence",

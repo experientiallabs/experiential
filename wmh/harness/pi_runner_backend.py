@@ -65,6 +65,7 @@ _PLATFORM_PROBE_TIMEOUT_S = 10.0
 _PROVIDER_CLOCK_SKEW_S = 30.0
 _LEASE_LABEL = "wmh.runner.lease"
 _OWNER_LABEL = "wmh.runner.owner"
+_E2B_RUNNER_SECURE = True
 E2B_RUNNER_TURN_CLEANUP_MARGIN_S = 60
 
 
@@ -193,7 +194,21 @@ class E2BPiRunnerSpec(BaseModel):
     @property
     def config_digest(self) -> str:
         """Return the canonical replay identity of this runner configuration."""
-        return _canonical_digest(cast("JsonObject", self.model_dump(mode="json")))
+        return _canonical_digest(
+            cast(
+                "JsonObject",
+                {
+                    "schema_version": 2,
+                    "runner": self.model_dump(mode="json"),
+                    "secure": _E2B_RUNNER_SECURE,
+                    "internet_access": False,
+                    "timeout_action": "kill",
+                    "auto_resume": False,
+                    "volume_mounts": False,
+                    "create_request_timeout_s": E2B_CREATE_REQUEST_TIMEOUT_S,
+                },
+            )
+        )
 
     @property
     def attestation(self) -> PiRunnerAttestation:
@@ -202,7 +217,7 @@ class E2BPiRunnerSpec(BaseModel):
             cast(
                 "JsonObject",
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "backend": "e2b",
                     "template_id": self.template_id,
                     "build_id": self.build_id,
@@ -210,11 +225,13 @@ class E2BPiRunnerSpec(BaseModel):
                     "memory_mb": self.memory_mb,
                     "platform": self.platform,
                     "envd_version": self.envd_version,
+                    "secure": _E2B_RUNNER_SECURE,
                     "internet_access": False,
                     "lease_timeout_s": self.lease_timeout_s,
                     "timeout_action": "kill",
                     "auto_resume": False,
                     "volume_mounts": False,
+                    "create_request_timeout_s": E2B_CREATE_REQUEST_TIMEOUT_S,
                     "runner_bundle_digest": session_entry_bundle_digest(),
                 },
             )
@@ -760,8 +777,10 @@ class E2BOneShotRunnerFactory:
                 "wmh_runner_lease": self._lease_id,
                 "wmh_runner_owner": self._owner_id,
             },
+            secure=_E2B_RUNNER_SECURE,
             allow_internet_access=False,
             lifecycle=lifecycle,
+            volume_mounts=None,
             request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
         )
         self._runner_starter = runner_starter

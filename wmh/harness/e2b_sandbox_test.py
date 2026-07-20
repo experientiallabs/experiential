@@ -279,6 +279,8 @@ def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
             "timeout": 61,
             "api_key": "key",
             "metadata": metadata,
+            "secure": True,
+            "volume_mounts": None,
             "request_timeout": None,
         }
     ]

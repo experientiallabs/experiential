@@ -22,16 +22,21 @@ from wmh.providers.failure_attribution import (
     ProviderFailureOwner,
     ProviderFailureReason,
 )
+from wmh.providers.receipt import ProviderResponseIdentity, ProviderResponseIdentityError
 from wmh.tracking._testing import (
     synthetic_provider_cost_meter,
     synthetic_tariff_provenance,
 )
 from wmh.tracking.budget import (
     BudgetAccount,
+    BudgetBreachError,
+    BudgetExceededError,
+    BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
     ReservationStatus,
     SpendLedger,
+    UnpricedProviderUsageError,
     bootstrap_budget_ledger,
 )
 
@@ -53,6 +58,9 @@ _REQUEST = ChatRequest.model_validate(
     }
 )
 _COMPLETION = {
+    "id": None,
+    "model": _CONFIG.model,
+    "system_fingerprint": None,
     "choices": [
         {
             "message": {"role": "assistant", "content": "done"},
@@ -68,7 +76,7 @@ _COMPLETION = {
         "response_model": None,
         "system_fingerprint": None,
         "request_digest": "sha256:" + "a" * 64,
-        "temperature": 0.7,
+        "temperature": None,
         "max_tokens": 32,
         "max_tokens_field": "inferenceConfig.maxTokens",
         "seed_supplied": False,
@@ -203,7 +211,11 @@ def test_worker_child_wraps_provider_with_registered_crash_safe_budget(
     try:
         mod._send_frame(
             client,
-            mod._InitializeFrame(provider_config=_CONFIG, budget_account=account),
+            mod._InitializeFrame(
+                provider_config=_CONFIG,
+                budget_account=account,
+                response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
+            ),
         )
         assert mod._receive_frame(client) == {"kind": "ready"}
         mod._send_frame(client, mod._CompletionRequestFrame(request=_REQUEST))
@@ -220,6 +232,121 @@ def test_worker_child_wraps_provider_with_registered_crash_safe_budget(
     assert reservations[0].status is ReservationStatus.SETTLED
     assert reservations[0].input_tokens == 3
     assert reservations[0].output_tokens == 2
+
+
+def test_worker_child_forfeits_response_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProvider:
+        config = _CONFIG
+        paid_request_attempts = 1
+        calls = 0
+
+        def complete_chat(self, _request: ChatRequest) -> ChatResponse:
+            self.calls += 1
+            return ChatResponse.model_validate(
+                {
+                    **_COMPLETION,
+                    "id": "unexpected-response-id",
+                }
+            )
+
+    policy = BudgetPolicy(
+        study_id="worker-identity-drift-test",
+        manifest_digest="sha256:" + "c" * 64,
+        hard_limit_nano_usd=1_000_000,
+        phase_limits_nano_usd={"confirmation": 1_000_000},
+        meters={
+            "worker": synthetic_provider_cost_meter(
+                provider_config=_CONFIG,
+                provenance=_TARIFF_PROVENANCE,
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=5,
+            )
+        },
+    )
+    ledger_path = (tmp_path / "identity-budget.sqlite3").resolve()
+    account = BudgetAccount(
+        ledger_path=ledger_path,
+        ledger_identity=bootstrap_budget_ledger(ledger_path, policy).ledger_identity,
+        policy=policy,
+        scope=BudgetScope(
+            phase="confirmation",
+            category="worker",
+            run_id="arm-identity-drift",
+        ),
+        meter_id="worker",
+    )
+    provider = FakeProvider()
+    monkeypatch.setattr(mod, "get_provider", lambda _config: provider)
+    server, client = socket.socketpair()
+    server_fd = server.detach()
+    exit_codes: list[int] = []
+    worker_thread = threading.Thread(target=lambda: exit_codes.append(mod._serve_worker(server_fd)))
+    worker_thread.start()
+    try:
+        mod._send_frame(
+            client,
+            mod._InitializeFrame(
+                provider_config=_CONFIG,
+                budget_account=account,
+                response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
+            ),
+        )
+        assert mod._receive_frame(client) == {"kind": "ready"}
+        mod._send_frame(client, mod._CompletionRequestFrame(request=_REQUEST))
+        failure = mod._TerminalFailureFrame.model_validate(mod._receive_frame(client))
+        assert failure.reason is mod._TerminalFailureReason.RESPONSE_IDENTITY
+        worker_thread.join(timeout=5)
+        assert worker_thread.is_alive() is False
+    finally:
+        client.close()
+        worker_thread.join(timeout=5)
+
+    assert worker_thread.is_alive() is False
+    assert exit_codes == [1]
+    assert provider.calls == 1
+    [reservation] = SpendLedger(ledger_path, policy).reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "ProviderIdentityInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+@pytest.mark.parametrize(
+    ("reason", "error_type"),
+    [
+        (mod._TerminalFailureReason.BUDGET_BREACH, BudgetBreachError),
+        (mod._TerminalFailureReason.BUDGET_EXCEEDED, BudgetExceededError),
+        (mod._TerminalFailureReason.BUDGET_INTEGRITY, BudgetIntegrityError),
+        (mod._TerminalFailureReason.UNPRICED_USAGE, UnpricedProviderUsageError),
+        (mod._TerminalFailureReason.RESPONSE_IDENTITY, ProviderResponseIdentityError),
+    ],
+)
+def test_terminal_safety_frame_reaps_worker_and_blocks_a_second_request(
+    monkeypatch: pytest.MonkeyPatch,
+    reason: mod._TerminalFailureReason,
+    error_type: type[RuntimeError],
+) -> None:
+    classified = mod._terminal_failure_frame(error_type("private provider detail"))
+    assert classified is not None
+    assert classified.reason is reason
+
+    _scripted_worker_command(
+        monkeypatch,
+        {"kind": "terminal_failure", "reason": reason.value},
+    )
+    worker = mod.ProviderProcessWorker(_CONFIG)
+    worker.start(TurnDeadline.after(2))
+    process = _active_process(worker)
+
+    with pytest.raises(error_type, match="search-safety violation"):
+        worker.complete_chat(_REQUEST, TurnDeadline.after(2))
+
+    assert worker.wait_closed(0)
+    _assert_reaped(process)
+    with pytest.raises(mod.ProviderWorkerUnavailable):
+        worker.complete_chat(_REQUEST, TurnDeadline.after(2))
 
 
 def test_socketpair_start_failure_is_sanitized_and_closed(

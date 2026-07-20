@@ -496,6 +496,19 @@ def test_local_attestation_binds_exact_platform_manifest_and_bundle() -> None:
     assert evidence["internet_access"] is False
 
 
+def test_e2b_runner_config_binds_secure_mode_and_create_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _e2b_spec()
+    baseline = spec.config_digest
+
+    monkeypatch.setattr(backend_mod, "_E2B_RUNNER_SECURE", False)
+    assert spec.config_digest != baseline
+    monkeypatch.setattr(backend_mod, "_E2B_RUNNER_SECURE", True)
+    monkeypatch.setattr(backend_mod, "E2B_CREATE_REQUEST_TIMEOUT_S", 31)
+    assert spec.config_digest != baseline
+
+
 def test_e2b_runner_is_one_shot_fixed_lifetime_and_attested(tmp_path: Path) -> None:
     spec = _e2b_spec()
     sandbox = _sandbox(spec)
@@ -541,7 +554,7 @@ def test_e2b_runner_is_one_shot_fixed_lifetime_and_attested(tmp_path: Path) -> N
         attestation = factory.attestation
         assert attestation is not None
         assert attestation.evidence == {
-            "schema_version": 2,
+            "schema_version": 3,
             "backend": "e2b",
             "template_id": spec.template_id,
             "build_id": spec.build_id,
@@ -549,11 +562,13 @@ def test_e2b_runner_is_one_shot_fixed_lifetime_and_attested(tmp_path: Path) -> N
             "memory_mb": 2048,
             "platform": "linux/x86_64",
             "envd_version": "0.2.1",
+            "secure": True,
             "internet_access": False,
             "lease_timeout_s": 420,
             "timeout_action": "kill",
             "auto_resume": False,
             "volume_mounts": False,
+            "create_request_timeout_s": 30,
             "runner_bundle_digest": spec.attestation.evidence["runner_bundle_digest"],
         }
 
@@ -783,6 +798,8 @@ def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
         metadata: dict[str, str] | None,
         allow_internet_access: bool,
         lifecycle: dict[str, object] | None,
+        secure: bool,
+        volume_mounts: object | None,
         request_timeout: int,
     ) -> Callable[[], SandboxHandle]:
         captured.update(
@@ -791,6 +808,8 @@ def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
             metadata=metadata,
             allow_internet_access=allow_internet_access,
             lifecycle=lifecycle,
+            secure=secure,
+            volume_mounts=volume_mounts,
             request_timeout=request_timeout,
         )
         return lambda: _sandbox(spec)
@@ -814,6 +833,8 @@ def test_default_e2b_creation_disables_internet_and_binds_fixed_lease(
         },
         "allow_internet_access": False,
         "lifecycle": {"on_timeout": "kill", "auto_resume": False},
+        "secure": True,
+        "volume_mounts": None,
         "request_timeout": 30,
     }
 

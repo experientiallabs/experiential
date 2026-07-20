@@ -23,6 +23,7 @@ from wmh.harness.cost import (
     SearchComponentCostBinding,
     SearchComponentCostRuntime,
     SearchComponentRole,
+    SearchCostBinding,
     TimedResourceCostBinding,
 )
 from wmh.harness.doc import HarnessDoc
@@ -88,6 +89,7 @@ _RECOVERABLE_SESSION_MARKERS = (
     "channel send failed",
 )
 _EXACT_E2B_TEMPLATE = re.compile(r"[A-Za-z0-9_.-]{1,512}:[A-Za-z0-9_.-]{1,512}\Z")
+_CONFIGURATION_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _PROJECT_LEASE_FILE = re.compile(r"[0-9a-f]{32}\.json\Z")
 _MAX_PROJECT_LEASE_FILES = 4096
 _PROJECT_CREATE_RETRY_DELAYS_S = (1.0, 3.0, 9.0)
@@ -143,6 +145,45 @@ class AgentProjectState(BaseModel):
         return self
 
 
+class AgentProjectExecutionCommitment(BaseModel):
+    """Path-free identity of every provider-visible project sandbox create semantic."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["wmh.agent-project-execution.v1"] = "wmh.agent-project-execution.v1"
+    provider: Literal["e2b"] = "e2b"
+    template: str
+    resource_class: TimedResourceClass
+    secure: Literal[True] = True
+    internet_access_at_create: Literal[False] = False
+    timeout_action: Literal["kill"] = "kill"
+    auto_resume: Literal[False] = False
+    volume_mounts: Literal[False] = False
+    create_request_timeout_s: int = E2B_CREATE_REQUEST_TIMEOUT_S
+    create_rate_binding: ExternalDispatchRateBinding
+
+    @model_validator(mode="after")
+    def _validate_exact_launch(self) -> AgentProjectExecutionCommitment:
+        if _EXACT_E2B_TEMPLATE.fullmatch(self.template) is None:
+            raise ValueError("project sandbox template must pin an exact template and build ID")
+        if self.resource_class.role is not TimedResourceRole.PROPOSER_PROJECT:
+            raise ValueError("project execution resource class must use the proposer-project role")
+        if self.create_request_timeout_s != E2B_CREATE_REQUEST_TIMEOUT_S:
+            raise ValueError("project execution SDK request timeout differs from the fixed bound")
+        if self.resource_class.create_request_timeout_seconds != _PROJECT_CREATE_HORIZON_S:
+            raise ValueError("project execution create horizon differs from the fixed retry bound")
+        return self
+
+    @property
+    def digest(self) -> str:
+        payload = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 class _ProjectAgentTurnError(RuntimeError):
     """A worker/provider error reported by a live agent turn, not its transport."""
 
@@ -188,6 +229,32 @@ def _project_rate_gate_timeout(create_deadline_s: float) -> float:
     return min(_PROJECT_RATE_GATE_TIMEOUT_S, admission_s)
 
 
+def _agent_project_execution_commitment(
+    *,
+    timeout: float,
+    template: str,
+    cpu_count: int,
+    memory_mb: int,
+    create_rate_binding: ExternalDispatchRateBinding,
+) -> AgentProjectExecutionCommitment:
+    if not math.isfinite(timeout) or timeout <= 0 or not float(timeout).is_integer():
+        raise ValueError("project sandbox timeout must be a positive whole number of seconds")
+    if timeout > E2B_MAX_SANDBOX_TIMEOUT_S:
+        raise ValueError("project sandbox timeout exceeds the E2B provider maximum")
+    return AgentProjectExecutionCommitment(
+        template=template,
+        resource_class=TimedResourceClass(
+            role=TimedResourceRole.PROPOSER_PROJECT,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            provider_ttl_seconds=int(timeout),
+            create_request_timeout_seconds=_PROJECT_CREATE_HORIZON_S,
+            cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
+        ),
+        create_rate_binding=create_rate_binding,
+    )
+
+
 class _BudgetedProjectSandboxFactory:
     """Create each proposer-project lease once under the shared experiment hard cap."""
 
@@ -206,12 +273,6 @@ class _BudgetedProjectSandboxFactory:
         orphan_reaper: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
         self._create_rate_authority = _validate_project_create_rate_authority(create_rate_authority)
-        if not math.isfinite(timeout) or timeout <= 0 or not float(timeout).is_integer():
-            raise ValueError("project sandbox timeout must be a positive whole number of seconds")
-        if timeout > E2B_MAX_SANDBOX_TIMEOUT_S:
-            raise ValueError("project sandbox timeout exceeds the E2B provider maximum")
-        if _EXACT_E2B_TEMPLATE.fullmatch(template) is None:
-            raise ValueError("project sandbox template must pin an exact template and build ID")
         if not ledger_dir.is_absolute():
             raise ValueError("project resource lease ledger directory must be absolute")
         self._create_rate_binding = bind_external_dispatch_rate_authority(
@@ -220,28 +281,28 @@ class _BudgetedProjectSandboxFactory:
         self._cost_runtime = cost_runtime
         self._component_configuration_id = component_configuration_id
         self._ledger_dir = ledger_dir
-        self._provider_ttl_seconds = int(timeout)
         self._template = template
         self._template_id = template.split(":", 1)[0]
         self._api_key = api_key
         self._orphan_reaper = orphan_reaper or (
             lambda lease_id: reap_e2b_runner_lease(lease_id, api_key=self._api_key)
         )
-        self._resource_class = TimedResourceClass(
-            role=TimedResourceRole.PROPOSER_PROJECT,
+        self._execution_commitment = _agent_project_execution_commitment(
+            timeout=timeout,
+            template=template,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
-            provider_ttl_seconds=self._provider_ttl_seconds,
-            create_request_timeout_seconds=_PROJECT_CREATE_HORIZON_S,
-            cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
+            create_rate_binding=self._create_rate_binding,
         )
+        self._provider_ttl_seconds = self._execution_commitment.resource_class.provider_ttl_seconds
+        self._resource_class = self._execution_commitment.resource_class
         # Resolve the exact path-free account before any filesystem or provider side effect.
         self._resource_binding, _account = _project_resource_account(
             cost_runtime,
             configuration_id=component_configuration_id,
             resource_class=self._resource_class,
         )
-        self._config_digest = self._digest_config()
+        self._config_digest = self._execution_commitment.digest
         self._owner_id = runner_owner_id(uuid.uuid4().hex)
         self._live: dict[int, _ProjectResourceLease] = {}
         self._proved_retired: set[int] = set()
@@ -294,9 +355,11 @@ class _BudgetedProjectSandboxFactory:
                     "wmh_runner_owner": self._owner_id,
                     "wmh_resource_kind": TimedResourceRole.PROPOSER_PROJECT.value,
                 },
+                secure=self._execution_commitment.secure,
                 allow_internet_access=False,
                 lifecycle={"on_timeout": "kill", "auto_resume": False},
-                request_timeout=E2B_CREATE_REQUEST_TIMEOUT_S,
+                volume_mounts=None,
+                request_timeout=self._execution_commitment.create_request_timeout_s,
             )
             for attempt in range(_PROJECT_CREATE_ATTEMPTS):
                 gate_timeout_s = _project_rate_gate_timeout(create_deadline_s)
@@ -330,7 +393,17 @@ class _BudgetedProjectSandboxFactory:
             lease_id=lease_id,
             reservation=reservation,
         )
-        self._live[id(sandbox)] = lease
+        sandbox_identity = id(sandbox)
+        if sandbox_identity in self._live:
+            self._retire_failed_creation(
+                ledger,
+                lease_id=lease_id,
+                reservation=reservation,
+                create_outcome="unknown",
+            )
+            raise RuntimeError("project sandbox factory reused a still-live handle")
+        self._proved_retired.discard(sandbox_identity)
+        self._live[sandbox_identity] = lease
         try:
             if not isinstance(resource_id, str) or not re.fullmatch(
                 r"[A-Za-z0-9_.:-]{1,512}", resource_id
@@ -369,6 +442,13 @@ class _BudgetedProjectSandboxFactory:
     def retirement_proved(self, sandbox: SandboxHandle) -> bool:
         """Return whether this factory already proved provider-side sandbox absence."""
         return id(sandbox) in self._proved_retired
+
+    @property
+    def execution_commitment(self) -> AgentProjectExecutionCommitment:
+        """Return the exact path-free launch commitment attested by every lease."""
+        return AgentProjectExecutionCommitment.model_validate(
+            self._execution_commitment.model_dump()
+        )
 
     def _finish_proved_retirement(
         self,
@@ -508,20 +588,6 @@ class _BudgetedProjectSandboxFactory:
         finally:
             lease.reservation = None
 
-    def _digest_config(self) -> str:
-        payload = {
-            "schema_version": 1,
-            "template": self._template,
-            "resource_class": self._resource_class.model_dump(mode="json"),
-            "internet_access_at_create": False,
-            "timeout_action": "kill",
-            "auto_resume": False,
-            "volume_mounts": False,
-            "create_rate_binding": self._create_rate_binding.model_dump(mode="json"),
-        }
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        return "sha256:" + hashlib.sha256(canonical).hexdigest()
-
 
 def _project_resource_account(
     runtime: SearchComponentCostRuntime,
@@ -562,7 +628,7 @@ class AgentProject:
 
     def __init__(
         self,
-        sandbox: SandboxHandle,
+        sandbox: SandboxHandle | None,
         *,
         workspace: str = PROJECT_WORKSPACE,
         channel_factory: ChannelFactory | None = None,
@@ -573,10 +639,20 @@ class AgentProject:
         budget_policy_digest: str | None = None,
         budget_ledger_path: Path | None = None,
         search_cost_binding: SearchComponentCostBinding | None = None,
+        expected_search_binding: SearchCostBinding | None = None,
         timed_resource_binding: TimedResourceCostBinding | None = None,
         create_rate_binding: ExternalDispatchRateBinding | None = None,
+        execution_configuration_id: str | None = None,
         owns_sandbox: bool = True,
     ) -> None:
+        if sandbox is None and sandbox_factory is None:
+            raise ValueError("a deferred project requires a sandbox factory")
+        if sandbox is None and expected_search_binding is None:
+            raise ValueError("search dispatch authorization requires an expected search binding")
+        if execution_configuration_id is not None and (
+            _CONFIGURATION_DIGEST.fullmatch(execution_configuration_id) is None
+        ):
+            raise ValueError("project execution configuration ID must be a sha256 digest")
         self._sandbox = sandbox
         self.workspace = workspace.rstrip("/")
         # Optimizer audit records live beside the agent-visible workspace. Project tools are
@@ -593,17 +669,20 @@ class AgentProject:
         self._budget_policy_digest = budget_policy_digest
         self._budget_ledger_path = budget_ledger_path
         self._search_cost_binding = search_cost_binding
+        self._expected_search_binding = expected_search_binding
         self._timed_resource_binding = timed_resource_binding
         self._create_rate_binding = create_rate_binding
+        self._execution_configuration_id = execution_configuration_id
         self._owns_sandbox = owns_sandbox
+        self._search_dispatch_authorized = sandbox is not None
         self._active_sandbox_started_at = time.monotonic()
         self._retired_sandbox_seconds = 0.0
-        self._sandbox_count = 1
+        self._sandbox_count = 0 if sandbox is None else 1
         # A lease remains live until E2B confirms its kill. Replacement failures retain both
         # handles here so usage keeps accruing and close() can retry every unproven teardown.
-        self._live_sandboxes: dict[int, tuple[SandboxHandle, float]] = {
-            id(sandbox): (sandbox, self._active_sandbox_started_at)
-        }
+        self._live_sandboxes: dict[int, tuple[SandboxHandle, float]] = (
+            {} if sandbox is None else {id(sandbox): (sandbox, self._active_sandbox_started_at)}
+        )
         self._closing = False
         self._finished_at: float | None = None
         # Keep an in-process mirror of mediated writes so a dead E2B transport can be replaced
@@ -622,15 +701,35 @@ class AgentProject:
         self._active_writable_files: frozenset[str] | None = None
         self._retired_worker_usage = TokenUsage()
         self._pending_accounting_failures: list[BaseException] = []
-        try:
-            self._initialize_sandbox(self._sandbox)
-        except Exception as error:
-            if self._owns_sandbox:
-                try:
-                    self._retire_sandbox(self._sandbox)
-                except SandboxCleanupError as cleanup_error:
-                    raise cleanup_error from error
-            raise
+        if sandbox is not None:
+            try:
+                self._initialize_sandbox(sandbox)
+            except Exception as error:
+                if self._owns_sandbox:
+                    try:
+                        self._retire_sandbox(sandbox)
+                    except SandboxCleanupError as cleanup_error:
+                        raise cleanup_error from error
+                raise
+
+    @staticmethod
+    def execution_commitment_for(
+        *,
+        timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
+        template: str,
+        cpu_count: int,
+        memory_mb: int,
+        create_rate_authority: ExternalDispatchRateAuthority,
+    ) -> AgentProjectExecutionCommitment:
+        """Freeze the exact path-free sandbox launch before binding optimizer cost state."""
+        validated_rate_authority = _validate_project_create_rate_authority(create_rate_authority)
+        return _agent_project_execution_commitment(
+            timeout=timeout,
+            template=template,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            create_rate_binding=bind_external_dispatch_rate_authority(validated_rate_authority),
+        )
 
     @classmethod
     def create(
@@ -647,23 +746,19 @@ class AgentProject:
         api_key: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> AgentProject:
-        """Create one hard-budgeted owned E2B project from an immutable template build."""
+        """Prepare one hard-budgeted owned E2B project without dispatching its create."""
         validated_rate_authority = _validate_project_create_rate_authority(create_rate_authority)
         if metadata:
             raise ValueError("project sandbox provider metadata is controlled by WMH")
-        if not math.isfinite(timeout) or timeout <= 0 or not float(timeout).is_integer():
-            raise ValueError("project sandbox timeout must be a positive whole number of seconds")
-        if timeout > E2B_MAX_SANDBOX_TIMEOUT_S:
-            raise ValueError("project sandbox timeout exceeds the E2B provider maximum")
-        create_rate_binding = bind_external_dispatch_rate_authority(validated_rate_authority)
-        resource_class = TimedResourceClass(
-            role=TimedResourceRole.PROPOSER_PROJECT,
+        execution_commitment = cls.execution_commitment_for(
+            timeout=timeout,
+            template=template,
             cpu_count=cpu_count,
             memory_mb=memory_mb,
-            provider_ttl_seconds=int(timeout),
-            create_request_timeout_seconds=_PROJECT_CREATE_HORIZON_S,
-            cleanup_horizon_seconds=E2B_CLEANUP_HORIZON_S,
+            create_rate_authority=validated_rate_authority,
         )
+        create_rate_binding = execution_commitment.create_rate_binding
+        resource_class = execution_commitment.resource_class
         resource_binding, resource_account = _project_resource_account(
             cost_runtime,
             configuration_id=component_configuration_id,
@@ -680,9 +775,10 @@ class AgentProject:
             memory_mb=memory_mb,
             create_rate_authority=validated_rate_authority,
         )
-        sandbox = factory()
+        if factory.execution_commitment != execution_commitment:
+            raise RuntimeError("project sandbox factory differs from its execution commitment")
         return cls(
-            sandbox,
+            None,
             sandbox_factory=factory,
             sandbox_opener=lambda opener: opener(),
             sandbox_retirer=factory.retire,
@@ -690,9 +786,28 @@ class AgentProject:
             budget_policy_digest=resource_account.policy.policy_digest,
             budget_ledger_path=resource_account.ledger_path.expanduser().resolve(),
             search_cost_binding=cost_runtime.binding,
+            expected_search_binding=cost_runtime.search_binding,
             timed_resource_binding=resource_binding,
             create_rate_binding=create_rate_binding,
+            execution_configuration_id=factory.execution_commitment.digest,
         )
+
+    def authorize_search_dispatch(self, binding: SearchCostBinding) -> None:
+        """Admit deferred sandbox creates only after the complete search preflight succeeds."""
+        if self._closing:
+            raise RuntimeError("cannot authorize a closed project")
+        expected = self._expected_search_binding
+        if expected is None:
+            return
+        validated = SearchCostBinding.model_validate(binding.model_dump())
+        frozen_expected = SearchCostBinding.model_validate(expected.model_dump())
+        if validated != frozen_expected:
+            raise ValueError("complete search cost binding differs from the project runtime")
+        if validated.proposer != self._search_cost_binding:
+            raise ValueError("complete search proposer binding differs from the project runtime")
+        if validated.external_dispatch_rate_binding != self._create_rate_binding:
+            raise ValueError("complete search E2B create-rate binding differs from the project")
+        self._search_dispatch_authorized = True
 
     @property
     def budget_policy_digest(self) -> str | None:
@@ -725,13 +840,21 @@ class AgentProject:
             return None
         return ExternalDispatchRateBinding.model_validate(self._create_rate_binding.model_dump())
 
+    @property
+    def execution_configuration_id(self) -> str:
+        """Return the path-free sandbox launch identity used by optimizer checkpoints."""
+        if self._execution_configuration_id is None:
+            raise ValueError("project execution configuration ID is unavailable")
+        return self._execution_configuration_id
+
     def write_text(self, path: str, content: str) -> None:
         """Write one project-relative file without allowing path traversal."""
         if self._closing:
             raise RuntimeError("cannot write to a closed project")
         absolute = self._absolute_path(path)
+        sandbox = self._ensure_sandbox()
         try:
-            self._write_sandbox_file(self._sandbox, absolute, content)
+            self._write_sandbox_file(sandbox, absolute, content)
         except Exception as error:
             # Proposer context is written before ``run()``, so its recovery loop cannot own an
             # exhausted control-plane retry. Replace an owned, transport-poisoned sandbox once,
@@ -740,7 +863,7 @@ class AgentProject:
                 raise
             try:
                 self._replace_sandbox()
-                self._write_sandbox_file(self._sandbox, absolute, content)
+                self._write_sandbox_file(self._current_sandbox(), absolute, content)
             except Exception as recovery_error:
                 raise RuntimeError(
                     f"{error}; fresh project sandbox recovery failed: {recovery_error}"
@@ -753,8 +876,9 @@ class AgentProject:
             raise RuntimeError("cannot read from a closed project")
         absolute = self._absolute_path(path)
         relative = self._relative_path(absolute)
+        sandbox = self._ensure_sandbox()
         try:
-            content = self._sandbox.files.read(absolute)
+            content = sandbox.files.read(absolute)
         except Exception:
             if relative in self._file_contents:
                 return self._file_contents[relative]
@@ -767,14 +891,15 @@ class AgentProject:
         if self._closing:
             raise RuntimeError("cannot write to a closed project")
         absolute = self._private_absolute_path(path)
+        sandbox = self._ensure_sandbox()
         try:
-            self._write_sandbox_file(self._sandbox, absolute, content)
+            self._write_sandbox_file(sandbox, absolute, content)
         except Exception as error:
             if self._sandbox_factory is None or not _is_recoverable_transport_error(error):
                 raise
             try:
                 self._replace_sandbox()
-                self._write_sandbox_file(self._sandbox, absolute, content)
+                self._write_sandbox_file(self._current_sandbox(), absolute, content)
             except Exception as recovery_error:
                 raise RuntimeError(
                     f"{error}; fresh project sandbox recovery failed: {recovery_error}"
@@ -787,8 +912,9 @@ class AgentProject:
             raise RuntimeError("cannot read from a closed project")
         absolute = self._private_absolute_path(path)
         relative = self._private_relative_path(absolute)
+        sandbox = self._ensure_sandbox()
         try:
-            content = self._sandbox.files.read(absolute)
+            content = sandbox.files.read(absolute)
         except Exception:
             if relative in self._private_file_contents:
                 return self._private_file_contents[relative]
@@ -820,10 +946,11 @@ class AgentProject:
         if self._file_contents or self._private_file_contents:
             raise ValueError("cannot restore search state over an initialized project")
         self._close_agent_session()
-        self._initialize_sandbox(self._sandbox, require_empty=True)
+        sandbox = self._ensure_sandbox()
+        self._initialize_sandbox(sandbox, require_empty=True)
         self._file_contents = dict(state.visible_files)
         self._private_file_contents = dict(state.private_files)
-        self._initialize_sandbox(self._sandbox)
+        self._initialize_sandbox(sandbox)
 
     def run(
         self,
@@ -857,6 +984,7 @@ class AgentProject:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"project agents cannot use uncontained tools: {names}")
         write_grant = self._normalize_writable_files(writable_files)
+        self._ensure_sandbox()
         usage_before = self._total_worker_usage()
         self._active_writable_files = write_grant
         try:
@@ -993,7 +1121,7 @@ class AgentProject:
         ):
             return self._session
         self._close_agent_session()
-        channel = self._channel_factory(self._sandbox, self.workspace)
+        channel = self._channel_factory(self._current_sandbox(), self.workspace)
         try:
             # Runner bootstrap has completed in channel_factory, but no agent-controlled source
             # has been imported yet. Remove egress before session_start materializes that code.
@@ -1037,13 +1165,14 @@ class AgentProject:
 
     def _lock_project_network(self) -> None:
         """Remove internet egress before untrusted project evidence can drive tools."""
-        if not self._owns_sandbox or self._network_locked_sandbox_id == id(self._sandbox):
+        sandbox = self._current_sandbox()
+        if not self._owns_sandbox or self._network_locked_sandbox_id == id(sandbox):
             return
-        update_network = getattr(self._sandbox, "update_network", None)
+        update_network = getattr(sandbox, "update_network", None)
         if not callable(update_network):
             raise RuntimeError("owned project sandbox cannot disable internet access")
         update_network({"allow_internet_access": False})
-        self._network_locked_sandbox_id = id(self._sandbox)
+        self._network_locked_sandbox_id = id(sandbox)
 
     def _emit_session_event(self, event: SessionEvent) -> None:
         """Route session events to the currently active project turn."""
@@ -1211,8 +1340,53 @@ class AgentProject:
                 if attempt > 0 or not _is_recoverable_transport_error(error):
                     raise
 
+    def _current_sandbox(self) -> SandboxHandle:
+        """Return the materialized sandbox without creating an external resource."""
+        sandbox = self._sandbox
+        if sandbox is None:
+            raise RuntimeError("project sandbox is not initialized")
+        return sandbox
+
+    def _ensure_sandbox(self) -> SandboxHandle:
+        """Materialize the deferred project only after complete search authorization."""
+        sandbox = self._sandbox
+        if sandbox is not None:
+            return sandbox
+        if self._closing:
+            raise RuntimeError("cannot materialize a closed project")
+        if not self._search_dispatch_authorized:
+            raise RuntimeError(
+                "project sandbox creation requires complete search cost preflight authorization"
+            )
+        factory = self._sandbox_factory
+        if factory is None:
+            raise RuntimeError("project sandbox creation is unavailable")
+        sandbox = self._sandbox_opener(factory)
+        started_at = time.monotonic()
+        sandbox_identity = id(sandbox)
+        if sandbox_identity in self._live_sandboxes:
+            self._sandbox_retirer(sandbox)
+            raise RuntimeError("project sandbox factory returned an already-live handle")
+        self._sandbox = sandbox
+        self._active_sandbox_started_at = started_at
+        self._sandbox_count += 1
+        self._live_sandboxes[sandbox_identity] = (sandbox, started_at)
+        try:
+            self._initialize_sandbox(sandbox)
+        except Exception as error:
+            try:
+                self._retire_sandbox(sandbox)
+            except SandboxCleanupError as cleanup_error:
+                raise cleanup_error from error
+            finally:
+                self._sandbox = None
+                self._network_locked_sandbox_id = None
+            raise
+        return sandbox
+
     def _replace_sandbox(self) -> None:
         """Replace a transport-poisoned sandbox while retaining every project file."""
+        previous = self._ensure_sandbox()
         factory = self._sandbox_factory
         if factory is None:
             raise RuntimeError("project sandbox replacement is unavailable")
@@ -1232,7 +1406,6 @@ class AgentProject:
                 raise cleanup_error from error
             raise
 
-        previous = self._sandbox
         self._close_agent_session()
         self._active_sandbox_started_at = replacement_started_at
         self._sandbox = replacement
@@ -1272,7 +1445,7 @@ class AgentProject:
                 path = self._tool_path(str(arguments.get("path", "")))
                 relative = self._relative_path(path)
                 try:
-                    content = self._sandbox.files.read(path)
+                    content = self._current_sandbox().files.read(path)
                 except Exception:
                     if relative not in self._file_contents:
                         raise
@@ -1291,7 +1464,7 @@ class AgentProject:
                         f"path is not writable in this project turn: {relative!r}"
                     )
                 content = str(arguments.get("content", ""))
-                self._write_sandbox_file(self._sandbox, path, content)
+                self._write_sandbox_file(self._current_sandbox(), path, content)
                 self._file_contents[relative] = content
                 return ToolOutcome(content=f"wrote {path}")
         except Exception as error:  # noqa: BLE001 - tool errors are agent observations

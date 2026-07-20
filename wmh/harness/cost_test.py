@@ -19,6 +19,7 @@ from wmh.harness.cost import (
     validate_search_cost_components,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.receipt import freeze_provider_response_identity
 from wmh.tracking._testing import (
     synthetic_provider_cost_meter,
     synthetic_tariff_provenance,
@@ -104,6 +105,7 @@ def _provider_binding(
     return ProviderCostBinding(
         component_configuration_id=configuration_id,
         provider_config=meter.provider_config,
+        response_identity=freeze_provider_response_identity(meter.provider_config, None),
         account=bind_budget_account(account),
     )
 

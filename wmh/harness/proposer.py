@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,12 +19,13 @@ from wmh.harness.cost import (
     SearchComponentCostBinding,
     SearchComponentCostRuntime,
     SearchComponentRole,
+    SearchCostBinding,
     TimedResourceCostBinding,
 )
 from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta, apply_delta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.mutate import parse_delta, propose_delta
-from wmh.harness.runtime import HarnessSearchCancelled
+from wmh.harness.runtime import HarnessSearchCancelled, search_safety_terminal_error
 from wmh.harness.scoring import (
     HarnessScoreArchive,
     ScoreArchiveVisibility,
@@ -31,6 +33,10 @@ from wmh.harness.scoring import (
     render_task_score_archive,
 )
 from wmh.providers.base import Provider, ProviderConfig, ToolCallingProvider
+from wmh.providers.receipt import (
+    ProviderResponseIdentity,
+    freeze_provider_response_identity,
+)
 from wmh.tracking.budget import BudgetedProvider, bind_budget_account
 from wmh.tracking.rate_limit import ExternalDispatchRateBinding
 
@@ -38,6 +44,7 @@ _CONTEXT_CONTENT_CHUNK_CHARS = 12_000
 _MAX_PROJECT_REPAIR_TURNS = 2
 _SUPPORTED_RUNTIME_KINDS = frozenset({"kit-python", "pi-node"})
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
+_CONFIGURATION_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,7 @@ class AgentProject(Protocol):
     """Project operations required by the optimizer wiring."""
 
     workspace: str
+    execution_configuration_id: str
 
     def write_text(self, path: str, content: str) -> None: ...
 
@@ -122,9 +130,26 @@ class ProviderDeltaProposer:
     """Adapt the original single-completion proposer to the batched search contract."""
 
     score_archive_required = False
+    requires_search_cost_binding = True
 
-    def __init__(self, provider: Provider) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        *,
+        cost_runtime: SearchComponentCostRuntime | None = None,
+        response_identity: ProviderResponseIdentity | None = None,
+    ) -> None:
         self._provider = provider
+        provider_config = getattr(provider, "config", None)
+        if not isinstance(provider_config, ProviderConfig):
+            raise ValueError("direct proposal search requires a provider with ProviderConfig")
+        self._response_identity = freeze_provider_response_identity(
+            provider_config,
+            response_identity,
+        )
+        self._cost_runtime = cost_runtime
+        if cost_runtime is not None:
+            self._provider = self._bind_cost_runtime(cost_runtime)
 
     @property
     def provider(self) -> Provider:
@@ -134,13 +159,34 @@ class ProviderDeltaProposer:
     @property
     def configuration_id(self) -> str:
         """Return an opaque identity for the direct proposal model configuration."""
+        return type(self).configuration_id_for(
+            self._provider,
+            response_identity=self._response_identity,
+        )
+
+    @classmethod
+    def configuration_id_for(
+        cls,
+        provider: Provider,
+        *,
+        response_identity: ProviderResponseIdentity | None = None,
+    ) -> str:
+        """Compute direct proposer identity before attaching its paid account."""
+        provider_config = getattr(provider, "config", None)
+        if not isinstance(provider_config, ProviderConfig):
+            raise ValueError("direct proposal search requires a provider with ProviderConfig")
+        frozen_response_identity = freeze_provider_response_identity(
+            provider_config,
+            response_identity,
+        )
         payload = {
-            "schema_version": 1,
-            "implementation": f"{type(self).__module__}.{type(self).__qualname__}",
-            "provider_implementation": (
-                f"{type(self._provider).__module__}.{type(self._provider).__qualname__}"
+            "schema_version": 2,
+            "implementation": f"{cls.__module__}.{cls.__qualname__}",
+            "provider_implementation": _provider_implementation(
+                cast("ToolCallingProvider", provider)
             ),
-            "provider_config": self._provider.config.model_dump(mode="json"),
+            "provider_config": provider_config.model_dump(mode="json"),
+            "response_identity": frozen_response_identity.model_dump(mode="json"),
         }
         return _content_digest(_canonical_json(payload))
 
@@ -155,6 +201,7 @@ class ProviderDeltaProposer:
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[HarnessDelta | ProposalFailure | None]:
         """Make ``count`` independent proposal calls against the same parent."""
+        self._revalidate_cost_runtime()
         if count < 1:
             raise ValueError(f"proposal count must be positive, got {count}")
         proposals: list[HarnessDelta | ProposalFailure | None] = []
@@ -171,9 +218,77 @@ class ProviderDeltaProposer:
             except HarnessSearchCancelled:
                 raise
             except Exception as error:  # noqa: BLE001 - isolate one flaky sibling call
+                terminal = search_safety_terminal_error(error)
+                if terminal is not None:
+                    raise terminal from None
                 proposal = ProposalFailure(reason=str(error))
             proposals.append(proposal)
         return proposals
+
+    def _bind_cost_runtime(
+        self,
+        runtime: SearchComponentCostRuntime,
+    ) -> BudgetedProvider:
+        """Validate and attach the one direct proposer provider account."""
+        binding = self._validate_component_cost_runtime(runtime)
+        provider_binding = binding.providers[0]
+        provider_config = getattr(self._provider, "config", None)
+        if provider_config != provider_binding.provider_config:
+            raise ValueError("direct proposer provider config differs from its cost binding")
+        if provider_binding.response_identity != self._response_identity:
+            raise ValueError("direct proposer response identity differs from its cost binding")
+        if isinstance(self._provider, BudgetedProvider):
+            if self._provider.budget_binding != provider_binding.account:
+                raise ValueError("direct proposer provider account differs from its cost binding")
+            if self._provider.response_identity != self._response_identity:
+                raise ValueError("direct proposer provider lost its response identity")
+            wrapped = self._provider
+        else:
+            wrapped = BudgetedProvider(
+                cast("Provider", self._provider),
+                runtime.provider_account(provider_binding),
+                response_identity=self._response_identity,
+            )
+        self.search_cost_binding = binding
+        return wrapped
+
+    def _revalidate_cost_runtime(self) -> None:
+        """Reaudit the direct proposer account before every provider dispatch batch."""
+        runtime = self._cost_runtime
+        if runtime is None:
+            if self.requires_search_cost_binding:
+                raise ValueError("ProviderDeltaProposer requires a complete search cost runtime")
+            return
+        binding = self._validate_component_cost_runtime(runtime)
+        provider_binding = binding.providers[0]
+        if not isinstance(self._provider, BudgetedProvider):
+            raise RuntimeError("cost-bound direct proposer lost its budgeted provider")
+        if self._provider.budget_binding != provider_binding.account:
+            raise ValueError("direct proposer provider account differs from its cost binding")
+        if self._provider.response_identity != provider_binding.response_identity:
+            raise ValueError("direct proposer response identity changed after construction")
+        account = runtime.provider_account(provider_binding)
+        if self._provider.budget_binding != bind_budget_account(account):
+            raise ValueError("direct proposer provider account changed after construction")
+
+    def _validate_component_cost_runtime(
+        self,
+        runtime: SearchComponentCostRuntime,
+    ) -> SearchComponentCostBinding:
+        if not isinstance(runtime, SearchComponentCostRuntime):
+            raise TypeError(
+                "ProviderDeltaProposer cost_runtime must be a SearchComponentCostRuntime"
+            )
+        binding = SearchComponentCostBinding.model_validate(runtime.binding.model_dump())
+        if binding.role is not SearchComponentRole.PROPOSER:
+            raise ValueError("ProviderDeltaProposer cost runtime must use the proposer role")
+        if binding.configuration_id != self.configuration_id:
+            raise ValueError("ProviderDeltaProposer configuration_id differs from its cost runtime")
+        if len(binding.providers) != 1:
+            raise ValueError("ProviderDeltaProposer cost runtime must bind exactly one provider")
+        if binding.timed_resources:
+            raise ValueError("ProviderDeltaProposer cost runtime cannot bind timed resources")
+        return binding
 
 
 class ProjectDeltaProposer:
@@ -191,10 +306,18 @@ class ProjectDeltaProposer:
         *,
         preserve_runtime_kind: bool = False,
         cost_runtime: SearchComponentCostRuntime | None = None,
+        response_identity: ProviderResponseIdentity | None = None,
     ) -> None:
         self._project = project
         self._agent = agent
         self._provider = provider
+        provider_config = getattr(provider, "config", None)
+        if not isinstance(provider_config, ProviderConfig):
+            raise ValueError("project proposal search requires a provider with ProviderConfig")
+        self._response_identity = freeze_provider_response_identity(
+            provider_config,
+            response_identity,
+        )
         self._cost_runtime = cost_runtime
         self._iteration = 0
         self._evaluation_dirs: dict[str, str] = {}
@@ -231,8 +354,10 @@ class ProjectDeltaProposer:
         project_workspace: str,
         agent: HarnessDoc,
         provider: ToolCallingProvider,
+        project_execution_configuration_id: str,
         preserve_runtime_kind: bool = False,
         project_create_rate_binding: ExternalDispatchRateBinding | None = None,
+        response_identity: ProviderResponseIdentity | None = None,
     ) -> str:
         """Compute the proposer identity before creating its paid project resource."""
         provider_config = getattr(provider, "config", None)
@@ -240,8 +365,17 @@ class ProjectDeltaProposer:
             raise ValueError(
                 "checkpointed project proposal search requires a provider with ProviderConfig"
             )
+        frozen_response_identity = freeze_provider_response_identity(
+            provider_config,
+            response_identity,
+        )
         if not project_workspace or project_workspace != project_workspace.rstrip("/"):
             raise ValueError("project proposer workspace must be non-empty and canonical")
+        if (
+            not isinstance(project_execution_configuration_id, str)
+            or _CONFIGURATION_DIGEST.fullmatch(project_execution_configuration_id) is None
+        ):
+            raise ValueError("project execution configuration ID must be a sha256 digest")
         frozen_rate_binding = (
             None
             if project_create_rate_binding is None
@@ -250,13 +384,15 @@ class ProjectDeltaProposer:
             )
         )
         payload = {
-            "schema_version": 1,
+            "schema_version": 3,
             "implementation": f"{cls.__module__}.{cls.__qualname__}",
             "project_implementation": f"{project_type.__module__}.{project_type.__qualname__}",
             "project_workspace": project_workspace,
+            "project_execution_configuration_id": project_execution_configuration_id,
             "agent": agent.model_dump(mode="json"),
             "provider_implementation": _provider_implementation(provider),
             "provider_config": provider_config.model_dump(mode="json"),
+            "response_identity": frozen_response_identity.model_dump(mode="json"),
             "preserve_runtime_kind": preserve_runtime_kind,
             "project_create_rate_binding": (
                 None if frozen_rate_binding is None else frozen_rate_binding.model_dump(mode="json")
@@ -276,10 +412,12 @@ class ProjectDeltaProposer:
         return type(self).configuration_id_for(
             project_type=type(self._project),
             project_workspace=self._project.workspace,
+            project_execution_configuration_id=self._project.execution_configuration_id,
             agent=self._agent,
             provider=self._provider,
             preserve_runtime_kind=self._preserve_runtime_kind,
             project_create_rate_binding=rate_binding,
+            response_identity=self._response_identity,
         )
 
     @property
@@ -289,6 +427,21 @@ class ProjectDeltaProposer:
         if raw is None:
             return None
         return ExternalDispatchRateBinding.model_validate(raw)
+
+    def authorize_search_dispatch(self, binding: SearchCostBinding) -> None:
+        """Forward the fully validated search contract to the deferred project resource."""
+        self._revalidate_cost_runtime()
+        runtime = self._cost_runtime
+        if runtime is None:
+            raise ValueError("ProjectDeltaProposer requires a complete search cost runtime")
+        validated = SearchCostBinding.model_validate(binding.model_dump())
+        expected = SearchCostBinding.model_validate(runtime.search_binding.model_dump())
+        if validated != expected:
+            raise ValueError("search dispatch binding differs from the proposer cost runtime")
+        authorize_project = getattr(self._project, "authorize_search_dispatch", None)
+        if not callable(authorize_project):
+            raise RuntimeError("cost-bound proposer project cannot authorize deferred dispatch")
+        authorize_project(validated)
 
     def export_search_state(self) -> JsonObject:
         """Export public and host-only project state without crossing their visibility roots."""
@@ -507,6 +660,9 @@ class ProjectDeltaProposer:
         except HarnessSearchCancelled:
             raise
         except Exception as error:  # noqa: BLE001 - durable project files may still be complete
+            terminal = search_safety_terminal_error(error)
+            if terminal is not None:
+                raise terminal from None
             run_error = error
         _check_cancelled(should_cancel)
 
@@ -543,6 +699,9 @@ class ProjectDeltaProposer:
             except HarnessSearchCancelled:
                 raise
             except Exception as error:  # noqa: BLE001 - no report means no safe repair prompt
+                terminal = search_safety_terminal_error(error)
+                if terminal is not None:
+                    raise terminal from None
                 terminal_error = error
                 validation_report_ready = False
 
@@ -588,6 +747,9 @@ class ProjectDeltaProposer:
                     except HarnessSearchCancelled:
                         raise
                     except Exception as error:  # noqa: BLE001 - salvage durable repaired files
+                        terminal = search_safety_terminal_error(error)
+                        if terminal is not None:
+                            raise terminal from None
                         turn_error = error
                     finally:
                         # The agent is asked to rewrite only invalid slots. Restore every
@@ -603,11 +765,17 @@ class ProjectDeltaProposer:
                             except HarnessSearchCancelled:
                                 raise
                             except Exception as error:  # noqa: BLE001 - attempt every restore
+                                terminal = search_safety_terminal_error(error)
+                                if terminal is not None:
+                                    raise terminal from None
                                 if protected_restore_error is None:
                                     protected_restore_error = error
                 except HarnessSearchCancelled:
                     raise
                 except Exception as error:  # noqa: BLE001 - preserve good siblings, fail bad ones
+                    terminal = search_safety_terminal_error(error)
+                    if terminal is not None:
+                        raise terminal from None
                     turn_error = error
                 if protected_restore_error is not None:
                     # The in-memory delta and its durable proposal_file must always name the
@@ -652,6 +820,9 @@ class ProjectDeltaProposer:
                 except HarnessSearchCancelled:
                     raise
                 except Exception as error:  # noqa: BLE001 - preserve validated in-memory output
+                    terminal = search_safety_terminal_error(error)
+                    if terminal is not None:
+                        raise terminal from None
                     if terminal_error is None:
                         terminal_error = error
                 if not validation.errors:
@@ -695,13 +866,21 @@ class ProjectDeltaProposer:
         provider_config = getattr(self._provider, "config", None)
         if provider_config != provider_binding.provider_config:
             raise ValueError("project proposer provider config differs from its cost binding")
+        if provider_binding.response_identity != self._response_identity:
+            raise ValueError("project proposer response identity differs from its cost binding")
         if isinstance(self._provider, BudgetedProvider):
             if self._provider.budget_binding != provider_binding.account:
                 raise ValueError("project proposer provider account differs from its cost binding")
+            if self._provider.response_identity != self._response_identity:
+                raise ValueError("project proposer provider lost its response identity")
             wrapped = self._provider
         else:
             account = runtime.provider_account(provider_binding)
-            wrapped = BudgetedProvider(cast("Provider", self._provider), account)
+            wrapped = BudgetedProvider(
+                cast("Provider", self._provider),
+                account,
+                response_identity=self._response_identity,
+            )
         self.search_cost_binding = binding
         return wrapped
 
@@ -716,6 +895,8 @@ class ProjectDeltaProposer:
             raise RuntimeError("cost-bound project proposer lost its budgeted provider")
         if self._provider.budget_binding != provider_binding.account:
             raise ValueError("project proposer provider account differs from its cost binding")
+        if self._provider.response_identity != provider_binding.response_identity:
+            raise ValueError("project proposer response identity changed after construction")
         account = runtime.provider_account(provider_binding)
         if self._provider.budget_binding != bind_budget_account(account):
             raise ValueError("project proposer provider account changed after construction")
@@ -1505,6 +1686,9 @@ def _validate_project_proposals(
         except HarnessSearchCancelled:
             raise
         except Exception as error:  # noqa: BLE001 - one missing file is one repairable slot
+            terminal = search_safety_terminal_error(error)
+            if terminal is not None:
+                raise terminal from None
             errors[index] = f"proposal file is missing or unreadable: {error}"
             continue
         raw_files[index] = raw

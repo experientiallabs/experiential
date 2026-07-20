@@ -11,6 +11,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wmh.providers.base import ProviderConfig
+from wmh.providers.receipt import ProviderResponseIdentity
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
@@ -45,7 +46,14 @@ class ProviderCostBinding(BaseModel):
 
     component_configuration_id: str = Field(min_length=1, max_length=1_024)
     provider_config: ProviderConfig
+    response_identity: ProviderResponseIdentity
     account: BudgetAccountBinding
+
+    @model_validator(mode="after")
+    def _bind_response_identity(self) -> Self:
+        if self.response_identity.provider is not self.provider_config.kind:
+            raise ValueError("provider response identity differs from its provider config")
+        return self
 
 
 class TimedResourceCostBinding(BaseModel):
@@ -106,7 +114,7 @@ class SearchCostBinding(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["wmh.search-cost-binding.v2"] = "wmh.search-cost-binding.v2"
+    schema_version: Literal["wmh.search-cost-binding.v3"] = "wmh.search-cost-binding.v3"
     declared_hard_limit_nano_usd: int = Field(gt=0)
     policy: BudgetPolicy
     ledger_identity: str = Field(pattern=_DIGEST_PATTERN)
@@ -357,6 +365,10 @@ def search_component_requires_cost_binding(component: object) -> bool:
     missing = object()
     for marker_name in marker_names:
         marker = inspect.getattr_static(component, marker_name, missing)
+        if marker_name == "requires_search_cost_binding":
+            if marker is True:
+                return True
+            continue
         if marker is not missing and marker is not None:
             return True
     account_types = (

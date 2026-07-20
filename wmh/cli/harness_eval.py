@@ -30,6 +30,8 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.models import resolve_provider_model
+from wmh.providers.receipt import ProviderResponseIdentity
 from wmh.tracking.budget import BudgetAccount, TimedResourceBudgetAccount
 from wmh.tracking.rate_limit import (
     E2B_SANDBOX_CREATE_RATE_POLICY,
@@ -199,6 +201,16 @@ def eval_harness(
         "--azure-api-version",
         help="Azure OpenAI API version. Required for --provider azure.",
     ),
+    expected_response_model: str | None = typer.Option(
+        None,
+        "--expected-response-model",
+        help=("Exact provider-reported served model. Required for Azure/OpenAI-shaped routes."),
+    ),
+    expected_system_fingerprint: str | None = typer.Option(
+        None,
+        "--expected-system-fingerprint",
+        help="Exact provider system fingerprint. Omission commits to an explicit null value.",
+    ),
     bedrock_region: str | None = typer.Option(
         None,
         "--bedrock-region",
@@ -250,7 +262,7 @@ def eval_harness(
     budget_account_path: str | None = typer.Option(
         None,
         "--budget-account",
-        help="Frozen BudgetAccount JSON. Required unless development bypass is explicit.",
+        help="Frozen BudgetAccount JSON. Required for every provider-backed evaluation.",
     ),
     task_resource_budget_account_paths: list[str] | None = typer.Option(  # noqa: B008
         None,
@@ -261,11 +273,6 @@ def eval_harness(
         None,
         "--runner-resource-budget-account",
         help="TimedResourceBudgetAccount JSON for the exact E2B Pi runner class.",
-    ),
-    allow_unbudgeted_development: bool = typer.Option(
-        False,
-        "--allow-unbudgeted-development",
-        help="Explicitly permit an unmetered development run. Never use for paid experiments.",
     ),
     yes: bool = typer.Option(
         False,
@@ -290,23 +297,21 @@ def eval_harness(
         azure_api_version=azure_api_version,
         bedrock_region=bedrock_region,
     )
+    try:
+        response_identity = ProviderResponseIdentity(
+            provider=provider_config.kind,
+            response_model=expected_response_model,
+            system_fingerprint=expected_system_fingerprint,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--expected-response-model") from exc
     resource_account_paths = tuple(task_resource_budget_account_paths or ())
-    if allow_unbudgeted_development and (
-        budget_account_path is not None
-        or resource_account_paths
-        or runner_resource_budget_account_path is not None
-    ):
+    if budget_account_path is None:
         raise typer.BadParameter(
-            "budget accounts and --allow-unbudgeted-development are mutually exclusive"
+            "provider-backed harness evaluation requires --budget-account; no caller flag can "
+            "authorize an unmetered built-in provider"
         )
-    if budget_account_path is None and not allow_unbudgeted_development:
-        raise typer.BadParameter(
-            "paid harness evaluation requires --budget-account; use "
-            "--allow-unbudgeted-development only for an explicitly unmetered local check"
-        )
-    budget_account = (
-        _load_budget_account(budget_account_path) if budget_account_path is not None else None
-    )
+    budget_account = _load_budget_account(budget_account_path)
     backend = _parse_task_backend(task_backend)
     if allow_preexisting_e2b_builds and backend is not HarborEnvironmentBackend.E2B:
         raise typer.BadParameter(
@@ -317,12 +322,6 @@ def eval_harness(
         runner_spec = _load_runner_spec(runner_spec_path)
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--runner-spec") from exc
-    if allow_unbudgeted_development and (
-        backend is HarborEnvironmentBackend.E2B or runner_spec.backend == "e2b"
-    ):
-        raise typer.BadParameter(
-            "--allow-unbudgeted-development is restricted to local task and runner backends"
-        )
     task_resource_budget_accounts = tuple(
         _load_timed_resource_budget_account(path, param_hint="--task-resource-budget-account")
         for path in resource_account_paths
@@ -369,6 +368,7 @@ def eval_harness(
             provider_config,
             runner_spec=runner_spec,
             turn_timeout_s=turn_timeout_s,
+            response_identity=response_identity,
             budget_account=budget_account,
             task_resource_budget_accounts=task_resource_budget_accounts,
             runner_resource_budget_account=runner_resource_budget_account,
@@ -638,9 +638,11 @@ def _build_provider_config(
                 "--provider azure requires --azure-api-version",
                 param_hint="--azure-api-version",
             )
+        resolved_model = resolve_provider_model(ProviderKind.AZURE_OPENAI, model)
         return ProviderConfig(
             kind=ProviderKind.AZURE_OPENAI,
-            model=model,
+            model_type=resolved_model.model_type,
+            model=resolved_model.model_id,
             endpoint=azure_endpoint,
             deployment=azure_deployment,
             api_version=azure_api_version,

@@ -182,6 +182,7 @@ def _provider() -> ProviderConfig:
 def _azure_provider() -> ProviderConfig:
     return ProviderConfig(
         kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.4-mini",
         model="gpt-5.4-mini",
         deployment="worker-deployment",
         endpoint="https://example.openai.azure.com",
@@ -293,6 +294,7 @@ def _loaded_result(
     turn_timeout_s: float = 300.0,
     receipt_response_model: str | None = "served-model",
     receipt_system_fingerprint: str | None = None,
+    response_identity: mod.ProviderResponseIdentity | None = None,
 ) -> LoadedHarborJobResult:
     resolved_provider = provider_config or _provider()
     environment_digest_by_task = dict(zip(_TASK_IDS, task_environment_digests, strict=True))
@@ -403,6 +405,7 @@ def _loaded_result(
                 candidate=candidate,
                 spec=spec,
                 provider_config=resolved_provider,
+                response_identity=response_identity,
                 runner_spec=runner_spec,
                 turn_timeout_s=turn_timeout_s,
             ).identity,
@@ -447,6 +450,7 @@ def _install_fake_evaluator(
             *,
             runner_spec: PiRunnerBackendSpec,
             turn_timeout_s: float,
+            response_identity: mod.ProviderResponseIdentity,
             qualified_tasks: tuple[QualifiedHarborTask, ...],
         ) -> None:
             captured.append((spec, provider_config, runner_spec, turn_timeout_s, qualified_tasks))
@@ -454,6 +458,7 @@ def _install_fake_evaluator(
             self._provider_config = provider_config
             self._runner_spec = runner_spec
             self._turn_timeout_s = turn_timeout_s
+            self._response_identity = response_identity
 
         async def evaluate(self, candidate: HarnessDoc) -> LoadedHarborJobResult:
             return _loaded_result(
@@ -477,6 +482,7 @@ def _install_fake_evaluator(
                 turn_timeout_s=self._turn_timeout_s,
                 receipt_response_model=options.receipt_response_model,
                 receipt_system_fingerprint=options.receipt_system_fingerprint,
+                response_identity=self._response_identity,
             )
 
     monkeypatch.setattr(mod, "HarborEvaluator", FakeEvaluator)
@@ -659,7 +665,10 @@ def test_scorer_accepts_exact_served_model_and_fingerprint(
     assert report.run_health is ScoreRunHealth.VALID
 
 
-def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Path) -> None:
+def test_configuration_id_binds_provider_and_qualified_task_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     baseline = _scorer(tmp_path).configuration_id
 
     assert _scorer(tmp_path).configuration_id == baseline
@@ -696,6 +705,8 @@ def test_configuration_id_binds_provider_and_qualified_task_matrix(tmp_path: Pat
             response_identity=second_identity,
         ).configuration_id
     )
+    monkeypatch.setattr(mod, "HARBOR_EVALUATOR_VERSION", "next-evaluator")
+    assert _scorer(tmp_path).configuration_id != baseline
 
 
 def test_openai_shaped_scorer_requires_precommitted_response_identity(tmp_path: Path) -> None:
@@ -788,7 +799,12 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
     build_identity = qualified_tasks[0].e2b_build_identity
     assert build_identity is not None
     runner_class = e2b_runner_resource_class(runner_spec)
-    provider_config = _provider()
+    provider_config = _azure_provider()
+    response_identity = mod.ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-model",
+        system_fingerprint="fp-exact",
+    )
     e2b_spec = _spec(tmp_path, backend=HarborEnvironmentBackend.E2B)
     reference = pi_node_baseline("baseline")
     rate_authority = ExternalDispatchRateAuthority.bootstrap(
@@ -802,6 +818,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
         qualified_tasks=qualified_tasks,
         reward_key="reward",
         runner_spec=runner_spec,
+        response_identity=response_identity,
         create_rate_binding=rate_authority.binding,
     )
     policy = BudgetPolicy(
@@ -870,6 +887,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
                 ProviderCostBinding(
                     component_configuration_id="unused-proposer",
                     provider_config=provider_config,
+                    response_identity=plan.response_identity,
                     account=bind_budget_account(proposer_account),
                 ),
             ),
@@ -882,6 +900,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
                 ProviderCostBinding(
                     component_configuration_id=plan.configuration_id,
                     provider_config=provider_config,
+                    response_identity=plan.response_identity,
                     account=bind_budget_account(provider_account),
                 ),
             ),
@@ -904,6 +923,34 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
     runtime = SearchCostRuntime(authority=authority, binding=binding).for_component(
         SearchComponentRole.SCORER
     )
+    mismatched_identity = response_identity.model_copy(
+        update={"system_fingerprint": "fp-mismatched"}
+    )
+    mismatched_provider_binding = binding.scorer.providers[0].model_copy(
+        update={"response_identity": mismatched_identity}
+    )
+    mismatched_scorer_binding = binding.scorer.model_copy(
+        update={"providers": (mismatched_provider_binding,)}
+    )
+    mismatched_binding = binding.model_copy(update={"scorer": mismatched_scorer_binding})
+    mismatched_runtime = SearchCostRuntime(
+        authority=authority,
+        binding=mismatched_binding,
+    ).for_component(SearchComponentRole.SCORER)
+
+    with pytest.raises(ValueError, match="response identity differs from its cost binding"):
+        mod.HarborHarnessScorer(
+            job_spec=e2b_spec,
+            provider_config=provider_config,
+            response_identity=response_identity,
+            reference_harness=reference,
+            qualified_tasks=qualified_tasks,
+            reward_key="reward",
+            runner_spec=runner_spec,
+            cost_runtime=mismatched_runtime,
+            create_rate_authority=rate_authority,
+        )
+
     captured: dict[str, object] = {}
     current_build_record = [
         _BuildRecordStub(
@@ -934,6 +981,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
     scorer = mod.HarborHarnessScorer(
         job_spec=e2b_spec,
         provider_config=provider_config,
+        response_identity=response_identity,
         reference_harness=reference,
         qualified_tasks=qualified_tasks,
         reward_key="reward",
@@ -949,6 +997,7 @@ def test_scorer_propagates_one_budget_policy_and_ledger_to_e2b_evaluator(
     assert captured["task_resource_budget_accounts"] == (task_account,)
     assert captured["runner_resource_budget_account"] == runner_account
     assert captured["create_rate_authority"] is rate_authority
+    assert captured["response_identity"] == scorer.plan.response_identity
     assert scorer.search_cost_binding == runtime.binding
     assert {
         provider_account.policy.policy_digest,

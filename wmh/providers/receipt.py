@@ -9,11 +9,11 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Self, TypeAlias
 
-from llm_waterfall import ChatProviderReceipt
+from llm_waterfall import ChatProviderReceipt, ChatResponse
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from wmh.core.text import validate_durable_text
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.base import Completion, ProviderConfig, ProviderKind
 
 ProviderRequestScalar: TypeAlias = None | bool | int | float | str | bytes
 ProviderRequestValue: TypeAlias = (
@@ -22,14 +22,18 @@ ProviderRequestValue: TypeAlias = (
 ProviderRequestPayload: TypeAlias = "Mapping[str, ProviderRequestValue]"
 
 
+class ProviderResponseIdentityError(RuntimeError):
+    """A provider response cannot be attributed to its precommitted served route."""
+
+
 class ProviderResponseIdentity(BaseModel):
     """Frozen provider-reported model identity required from every scored receipt."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     provider: ProviderKind
-    response_model: str | None = Field(default=None, min_length=1)
-    system_fingerprint: str | None = Field(default=None, min_length=1)
+    response_model: str | None = Field(default=None, min_length=1, max_length=2_048)
+    system_fingerprint: str | None = Field(default=None, min_length=1, max_length=512)
 
     @field_validator("response_model", "system_fingerprint")
     @classmethod
@@ -56,6 +60,83 @@ class ProviderResponseIdentity(BaseModel):
                 "scored provider receipts currently support Bedrock and OpenAI-shaped routes"
             )
         return self
+
+
+def freeze_provider_response_identity(
+    provider_config: ProviderConfig,
+    response_identity: ProviderResponseIdentity | None,
+) -> ProviderResponseIdentity:
+    """Freeze the exact provider-reported identity required for a scored route."""
+    if response_identity is None:
+        if provider_config.kind is ProviderKind.BEDROCK:
+            return ProviderResponseIdentity(provider=ProviderKind.BEDROCK)
+        raise ValueError("OpenAI-shaped scored routes require an exact provider response identity")
+    frozen = ProviderResponseIdentity.model_validate(response_identity.model_dump())
+    if frozen.provider is not provider_config.kind:
+        raise ValueError("provider response identity disagrees with the frozen provider")
+    return frozen
+
+
+def validate_completion_provider_response_identity(
+    completion: Completion,
+    *,
+    provider_config: ProviderConfig,
+    response_identity: ProviderResponseIdentity,
+) -> None:
+    """Validate direct-completion routing evidence before another paid call can start."""
+    frozen = freeze_provider_response_identity(provider_config, response_identity)
+    if (
+        completion.model != frozen.response_model
+        or completion.system_fingerprint != frozen.system_fingerprint
+    ):
+        raise ProviderResponseIdentityError(
+            "provider completion differs from the frozen response identity"
+        )
+
+
+def validate_chat_provider_response_identity(
+    response: object,
+    *,
+    provider_config: ProviderConfig,
+    requested_temperature: float | None,
+    max_tokens: int,
+    response_identity: ProviderResponseIdentity,
+) -> None:
+    """Validate a structured response, its receipt, and the frozen served route together."""
+    if not isinstance(response, ChatResponse):
+        raise ProviderResponseIdentityError("provider returned an invalid structured response")
+    receipt = response.provider_receipt
+    if receipt is None:
+        raise ProviderResponseIdentityError(
+            "provider response is missing the receipt required by its frozen response identity"
+        )
+    if response.id != receipt.response_id or (
+        response.system_fingerprint != receipt.system_fingerprint
+    ):
+        raise ProviderResponseIdentityError(
+            "provider response metadata differs from its trusted receipt"
+        )
+    if provider_config.kind is ProviderKind.BEDROCK:
+        if response.model != provider_config.model or receipt.response_model is not None:
+            raise ProviderResponseIdentityError(
+                "Bedrock response metadata differs from its requested model receipt"
+            )
+    elif response.model != receipt.response_model:
+        raise ProviderResponseIdentityError(
+            "provider response model differs from its trusted receipt"
+        )
+    try:
+        validate_chat_provider_receipt(
+            receipt,
+            provider_config=provider_config,
+            requested_temperature=requested_temperature,
+            max_tokens=max_tokens,
+            response_identity=response_identity,
+        )
+    except ValueError as error:
+        raise ProviderResponseIdentityError(
+            "provider receipt differs from the frozen response identity"
+        ) from error
 
 
 def build_chat_provider_receipt(
@@ -200,7 +281,7 @@ def validate_chat_provider_receipt(
     receipt: ChatProviderReceipt,
     *,
     provider_config: ProviderConfig,
-    requested_temperature: float,
+    requested_temperature: float | None,
     max_tokens: int,
     response_identity: ProviderResponseIdentity | None = None,
 ) -> None:

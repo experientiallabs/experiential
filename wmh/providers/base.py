@@ -61,7 +61,7 @@ class Completion(BaseModel):
     # The model that actually served, when the provider is a failover chain and a fallback took
     # the call. None (the norm) means "the configured model" — metering falls back to config.
     # min_length=1 keeps "" impossible, so `completion.model or config.model` is exact.
-    model: str | None = Field(default=None, min_length=1)
+    model: str | None = Field(default=None, min_length=1, max_length=2_048)
     # The provider that actually served a failover call. None means the configured provider.
     provider: str | None = Field(
         default=None,

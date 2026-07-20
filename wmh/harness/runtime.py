@@ -18,7 +18,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
-from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
 from wmh.harness.environment import AgentEnvironment, is_env_action
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import (
@@ -32,6 +32,15 @@ from wmh.harness.tools import (
     to_action,
 )
 from wmh.providers.base import Message, Provider
+from wmh.providers.process_worker import ProviderWorkerCleanupError
+from wmh.providers.receipt import ProviderResponseIdentityError
+from wmh.tracking.budget import (
+    BudgetBreachError,
+    BudgetExceededError,
+    BudgetIntegrityError,
+    UnpricedProviderUsageError,
+)
+from wmh.tracking.rate_limit import ExternalDispatchRateIntegrityError
 
 DEFAULT_SYSTEM_PROMPT = """You are a capable command-line agent working inside a Linux environment.
 You are given a task. Accomplish it by taking ONE action at a time.
@@ -56,6 +65,46 @@ _NUDGE = (
     "[ERROR] that reply was not a single valid JSON tool call. Reply with EXACTLY one JSON "
     'object: {"tool": "<tool name>", "arguments": {...}}'
 )
+
+_SEARCH_SAFETY_TERMINAL_ERRORS = (
+    BudgetBreachError,
+    BudgetExceededError,
+    BudgetIntegrityError,
+    UnpricedProviderUsageError,
+    ExternalDispatchRateIntegrityError,
+    SandboxCleanupError,
+    ProviderWorkerCleanupError,
+    ProviderResponseIdentityError,
+)
+
+
+def search_safety_terminal_error(error: BaseException) -> BaseException | None:
+    """Return a terminal spend or cleanup error from an exception chain.
+
+    Exhausting a frozen budget is terminal for the current search. Treating it as a failed
+    sibling would invite another call that the same authority must reject. Integrity, breach,
+    rate-authority, and cleanup failures are also terminal because a normal search result would
+    falsely imply that all paid work and live resources were accounted for.
+
+    Project transport recovery can wrap one of these failures in a generic ``RuntimeError``.
+    Traverse explicit causes and implicit contexts so that an outer salvage boundary restores the
+    original safety type instead of reducing it to proposal feedback.
+    """
+    pending: list[BaseException] = [error]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(current, _SEARCH_SAFETY_TERMINAL_ERRORS):
+            return current
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+    return None
 
 
 class HarnessSearchCancelled(RuntimeError):

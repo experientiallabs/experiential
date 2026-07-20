@@ -56,6 +56,7 @@ from wmh.harness.runtime import (
     RuntimeCancelled,
     TokenUsage,
     combine_usage,
+    search_safety_terminal_error,
 )
 from wmh.harness.scoring import (
     MAX_TASK_DESCRIPTION_CHARS,
@@ -1214,6 +1215,12 @@ def search_harness(
         _check_cancelled()
         return report
 
+    _check_cancelled()
+    authorize_dispatch = getattr(proposer, "authorize_search_dispatch", None)
+    if frozen_cost_binding is not None and callable(authorize_dispatch):
+        authorize_dispatch(SearchCostBinding.model_validate(frozen_cost_binding.model_dump()))
+    _check_cancelled()
+
     if resumed is None:
         docs: dict[str, HarnessDoc] = {seed_doc.doc_hash: seed_doc}
         reports: dict[str, HarnessScoreReport] = {}
@@ -1391,6 +1398,9 @@ def search_harness(
         except HarnessSearchCancelled:
             raise
         except Exception as error:  # noqa: BLE001
+            terminal = search_safety_terminal_error(error)
+            if terminal is not None:
+                raise terminal from None
             batch = [ProposalFailure(reason=str(error))] * proposal_batch_size
         _check_cancelled()
 
@@ -2112,7 +2122,69 @@ def create_harness(
     on_sandbox_usage: Callable[[SandboxUsage], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> CreateResult:
-    """Run the existing world-model search through the benchmark-neutral scorer seam."""
+    """Reject the legacy raw-provider search surface before any external dispatch.
+
+    The legacy evaluator combines agent, world-model, judge, and proposer calls behind one
+    closure, so it cannot prove that each paid route has the account assigned by a complete
+    ``SearchCostBinding``. Paid callers use :func:`search_harness` with exact cost-bound
+    components instead.
+    """
+    del (
+        name,
+        seed_doc,
+        tasks,
+        world_model,
+        agent_provider,
+        proposer,
+        judge,
+        iterations,
+        proposal_batch_size,
+        k,
+        holdout,
+        confirm_narrow_vetoes,
+        harness_backend,
+        eval_concurrency,
+        e2b_template,
+        e2b_metadata,
+        on_progress,
+        on_note,
+        on_proposal,
+        on_accept,
+        on_sandbox_usage,
+        should_cancel,
+    )
+    raise ValueError(
+        "create_harness cannot dispatch raw paid providers; use search_harness with exact "
+        "cost-bound components"
+    )
+
+
+def _create_harness_nonpaid(
+    name: str,
+    seed_doc: HarnessDoc,
+    tasks: list[TaskSpec],
+    world_model: WorldModel,
+    agent_provider: Provider,
+    proposer: DeltaProposer,
+    judge: GoldJudge,
+    *,
+    iterations: int = 5,
+    proposal_batch_size: int = 1,
+    k: int = DEFAULT_K,
+    holdout: list[TaskSpec] | None = None,
+    confirm_narrow_vetoes: bool = True,
+    harness_backend: Literal["local", "e2b"] = "local",
+    eval_concurrency: int | None = None,
+    e2b_template: str | None = None,
+    e2b_metadata: dict[str, str] | None = None,
+    on_progress: CreateProgress | None = None,
+    on_note: Callable[[str], None] | None = None,
+    on_proposal: Callable[[ProposalRecord], None] | None = None,
+    on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
+    on_sandbox_usage: Callable[[SandboxUsage], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> CreateResult:
+    """Run deterministic in-memory tests through the retired world-model search path."""
     if harness_backend not in ("local", "e2b"):
         raise ValueError(f"unknown harness_backend {harness_backend!r}; choose local or e2b")
     if harness_backend == "e2b" and seed_doc.runtime_kind() != "pi-node":
@@ -2282,6 +2354,9 @@ def _record_score_evaluation(
     except HarnessSearchCancelled:
         raise
     except Exception as error:  # noqa: BLE001
+        terminal = search_safety_terminal_error(error)
+        if terminal is not None:
+            raise terminal from None
         return str(error)
     return None
 
@@ -2323,6 +2398,9 @@ def _record_harness_score_evaluation(
     except HarnessSearchCancelled:
         raise
     except Exception as error:  # noqa: BLE001
+        terminal = search_safety_terminal_error(error)
+        if terminal is not None:
+            raise terminal from None
         return str(error)
     return None
 

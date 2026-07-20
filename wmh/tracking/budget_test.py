@@ -33,7 +33,12 @@ from wmh.providers.base import (
     TokenUsage,
     VerifyResult,
 )
+from wmh.providers.receipt import (
+    ProviderResponseIdentity,
+    build_chat_provider_receipt,
+)
 from wmh.tracking._testing import (
+    synthetic_provider_cost_meter,
     synthetic_tariff_evidence_receipt,
     synthetic_tariff_provenance,
 )
@@ -1583,6 +1588,7 @@ class _FakeToolProvider:
         *,
         text_usage: TokenUsage | None = None,
         chat_usage: ChatUsage | None = None,
+        chat_response: ChatResponse | None = None,
         error: Exception | None = None,
     ) -> None:
         self.config = ProviderConfig(
@@ -1592,6 +1598,7 @@ class _FakeToolProvider:
         )
         self._text_usage = text_usage
         self._chat_usage = chat_usage
+        self._chat_response = chat_response
         self._error = error
 
     def complete(
@@ -1613,6 +1620,8 @@ class _FakeToolProvider:
         del request
         if self._error is not None:
             raise self._error
+        if self._chat_response is not None:
+            return self._chat_response
         return ChatResponse(
             choices=[ChatChoice(message=ChatMessage(role="assistant", content="ok"))],
             usage=self._chat_usage,
@@ -1631,6 +1640,7 @@ def _budgeted_provider(
     provider: _FakeToolProvider,
     *,
     ids: Iterator[str],
+    response_identity: ProviderResponseIdentity | None = None,
 ) -> tuple[BudgetedProvider, SpendLedger]:
     policy = _policy(hard=10_000_000, search=10_000_000, final=0)
     path = tmp_path / "provider-budget.sqlite3"
@@ -1642,7 +1652,15 @@ def _budgeted_provider(
         scope=_scope(category="provider-call"),
         meter_id="worker",
     )
-    return BudgetedProvider(provider, account, id_factory=lambda: next(ids)), ledger
+    return (
+        BudgetedProvider(
+            provider,
+            account,
+            response_identity=response_identity,
+            id_factory=lambda: next(ids),
+        ),
+        ledger,
+    )
 
 
 def test_budgeted_provider_exposes_exact_binding_and_rejects_nested_wrapper(
@@ -1664,6 +1682,29 @@ def test_budgeted_provider_exposes_exact_binding_and_rejects_nested_wrapper(
             provider._account,  # noqa: SLF001 - exact nested-wrapper rejection contract
             id_factory=lambda: "outer",
         )
+
+
+def test_budgeted_provider_rejects_wrapped_config_drift_before_reservation(
+    tmp_path: Path,
+) -> None:
+    raw_provider = _FakeToolProvider(chat_usage=ChatUsage(prompt_tokens=1, completion_tokens=1))
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        raw_provider,
+        ids=iter(["must-not-reserve"]),
+    )
+    raw_provider.config = raw_provider.config.model_copy(update={"model": "model-2"})
+
+    with pytest.raises(BudgetIntegrityError, match="provider config changed"):
+        provider.complete_chat(
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hello")],
+                max_completion_tokens=20,
+            )
+        )
+
+    assert provider.config.model == "model-1"
+    assert ledger.reservations() == []
 
 
 def test_budgeted_provider_reserves_before_call_and_settles_exact_usage(tmp_path: Path) -> None:
@@ -1801,6 +1842,77 @@ def test_budgeted_chat_accepts_responses_sdk_null_usage_detail_placeholders(
     assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
 
 
+def test_budgeted_chat_accepts_exact_responses_inclusive_usage_breakdowns(
+    tmp_path: Path,
+) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            chat_usage=ChatUsage.model_validate(
+                {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18,
+                    "input_tokens_details": {"cached_tokens": 3},
+                    "output_tokens_details": {"reasoning_tokens": 5},
+                }
+            )
+        ),
+        ids=iter(["responses-inclusive-breakdowns"]),
+    )
+
+    provider.complete_chat(
+        ChatRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+            max_completion_tokens=20,
+        )
+    )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
+
+
+@pytest.mark.parametrize(
+    "usage_details",
+    [
+        {"input_tokens_details": {"cached_tokens": 3, "future_tokens": 1}},
+        {"input_tokens_details": {"cached_tokens": True}},
+        {"output_tokens_details": {"reasoning_tokens": 8}},
+    ],
+)
+def test_budgeted_chat_rejects_noncanonical_responses_usage_breakdowns(
+    tmp_path: Path,
+    usage_details: dict[str, object],
+) -> None:
+    [dimension] = usage_details
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            chat_usage=ChatUsage.model_validate(
+                {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    **usage_details,
+                }
+            )
+        ),
+        ids=iter(["responses-invalid-breakdown"]),
+    )
+
+    with pytest.raises(UnpricedProviderUsageError, match=dimension):
+        provider.complete_chat(
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hello")],
+                max_completion_tokens=20,
+            )
+        )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UnpricedUsage"
+
+
 def test_budgeted_chat_rejects_a_non_numeric_derived_total_token_field(tmp_path: Path) -> None:
     provider, ledger = _budgeted_provider(
         tmp_path,
@@ -1872,6 +1984,126 @@ def test_budgeted_text_forfeits_before_settlement_on_unpriced_usage_dimensions(
     assert reservation.failure_type == "UnpricedUsage"
 
 
+def test_budgeted_text_accepts_exact_responses_inclusive_usage_breakdowns(
+    tmp_path: Path,
+) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            text_usage=TokenUsage.model_validate(
+                {
+                    "input_tokens": 4,
+                    "output_tokens": 2,
+                    "total_tokens": 6,
+                    "input_tokens_details": {"cached_tokens": 1},
+                    "output_tokens_details": {"reasoning_tokens": 2},
+                }
+            )
+        ),
+        ids=iter(["text-responses-inclusive-breakdowns"]),
+    )
+
+    provider.complete("", [Message(role="user", content="hello")], max_tokens=10)
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 4 * 2 + 2 * 5
+
+
+def test_budgeted_azure_reasoning_completion_identity_and_usage_details_settle_exactly(
+    tmp_path: Path,
+) -> None:
+    provider_config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model_type="gpt-5.5",
+        model="gpt-5.5",
+        endpoint="https://example.openai.azure.com",
+        deployment="gpt55-deploy",
+        api_version="2024-10-21",
+        reasoning_effort="high",
+        responses_api_version="v1",
+    )
+    completion = Completion(
+        text="ok",
+        model="gpt-5.5-2026-06-01",
+        system_fingerprint="fp-azure-responses-1",
+        usage=TokenUsage.model_validate(
+            {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+                "input_tokens_details": {"cached_tokens": 3},
+                "output_tokens_details": {"reasoning_tokens": 5},
+            }
+        ),
+    )
+
+    class AzureReasoningProvider(_FakeToolProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = provider_config
+
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Completion:
+            del system, messages, temperature, max_tokens
+            return completion
+
+    provenance = synthetic_tariff_provenance(provider_config)
+    policy = BudgetPolicy(
+        study_id="azure-reasoning-cost-boundary",
+        manifest_digest="sha256:" + "a" * 64,
+        hard_limit_nano_usd=100_000,
+        phase_limits_nano_usd={"search": 100_000},
+        meters={
+            "worker": synthetic_provider_cost_meter(
+                provider_config=provider_config,
+                provenance=provenance,
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=1,
+            )
+        },
+    )
+    ledger_path = tmp_path / "azure-reasoning-cost-boundary.sqlite3"
+    ledger = SpendLedger(ledger_path, policy)
+    provider = BudgetedProvider(
+        AzureReasoningProvider(),
+        BudgetAccount(
+            ledger_path=ledger_path,
+            ledger_identity=ledger.ledger_identity,
+            policy=policy,
+            scope=BudgetScope(
+                phase="search",
+                category="worker",
+                run_id="azure-reasoning-cost-boundary",
+            ),
+            meter_id="worker",
+        ),
+        response_identity=ProviderResponseIdentity(
+            provider=ProviderKind.AZURE_OPENAI,
+            response_model="gpt-5.5-2026-06-01",
+            system_fingerprint="fp-azure-responses-1",
+        ),
+        id_factory=lambda: "azure-reasoning-cost-boundary-1",
+    )
+
+    returned = provider.complete(
+        "system",
+        [Message(role="user", content="hello")],
+        max_tokens=20,
+    )
+
+    assert returned is completion
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.charged_nano_usd == 18
+
+
 def test_budgeted_text_accepts_openai_sdk_null_usage_detail_placeholders(
     tmp_path: Path,
 ) -> None:
@@ -1898,6 +2130,49 @@ def test_budgeted_text_accepts_openai_sdk_null_usage_detail_placeholders(
     [reservation] = ledger.reservations()
     assert reservation.status is ReservationStatus.SETTLED
     assert reservation.charged_nano_usd == 4 * 2 + 2 * 5
+
+
+def test_budgeted_bedrock_chat_accepts_requested_model_with_null_served_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt = build_chat_provider_receipt(
+        provider="bedrock",
+        provider_request_id="bedrock-request-1",
+        response_id=None,
+        requested_model="model-1",
+        response_model=None,
+        system_fingerprint=None,
+        request_payload={"messages": [], "inferenceConfig": {"maxTokens": 20}},
+        temperature=0.7,
+        max_tokens=20,
+        max_tokens_field="inferenceConfig.maxTokens",
+        started_at_unix_s=1.0,
+        finished_at_unix_s=2.0,
+    )
+    response = ChatResponse(
+        choices=[ChatChoice(message=ChatMessage(role="assistant", content="ok"))],
+        usage=ChatUsage(prompt_tokens=1, completion_tokens=1),
+        model="model-1",
+        provider_receipt=receipt,
+    )
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(chat_response=response),
+        response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
+        ids=iter(["bedrock-chat-identity"]),
+    )
+
+    returned = provider.complete_chat(
+        ChatRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+            temperature=0.7,
+            max_completion_tokens=20,
+        )
+    )
+
+    assert returned is response
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
 
 
 def test_budgeted_chat_ceiling_dominates_both_compatibility_token_fields(
@@ -2028,6 +2303,90 @@ def test_budgeted_provider_forfeits_partial_text_usage(tmp_path: Path) -> None:
     [reservation] = ledger.reservations()
     assert reservation.status is ReservationStatus.FORFEITED
     assert reservation.failure_type == "UsageUnavailable"
+
+
+def test_budgeted_provider_forfeits_negative_text_usage_as_terminal_integrity_error(
+    tmp_path: Path,
+) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(text_usage=TokenUsage(input_tokens=-1, output_tokens=1)),
+        ids=iter(["negative-text-usage"]),
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="nonnegative integer counts"):
+        provider.complete("system", [Message(role="user", content="hello")], max_tokens=10)
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UsageInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+def test_budgeted_provider_validates_primary_counts_before_unpriced_dimensions(
+    tmp_path: Path,
+) -> None:
+    usage = TokenUsage.model_construct(
+        input_tokens=cast("int", None),
+        output_tokens=1,
+        total_tokens=1,
+    )
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(text_usage=usage),
+        ids=iter(["invalid-count-with-extra-usage"]),
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="nonnegative integer counts"):
+        provider.complete("system", [Message(role="user", content="hello")], max_tokens=10)
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UsageInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+def test_budgeted_provider_forfeits_negative_chat_usage_as_terminal_integrity_error(
+    tmp_path: Path,
+) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(chat_usage=ChatUsage(prompt_tokens=1, completion_tokens=-1)),
+        ids=iter(["negative-chat-usage"]),
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="nonnegative integer counts"):
+        provider.complete_chat(
+            ChatRequest(
+                messages=[ChatMessage(role="user", content="hello")],
+                max_completion_tokens=10,
+            )
+        )
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UsageInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
+
+
+def test_budgeted_provider_forfeits_unpriceable_usage_as_terminal_integrity_error(
+    tmp_path: Path,
+) -> None:
+    provider, ledger = _budgeted_provider(
+        tmp_path,
+        _FakeToolProvider(
+            text_usage=TokenUsage(input_tokens=2**63, output_tokens=1),
+        ),
+        ids=iter(["overflow-text-usage"]),
+    )
+
+    with pytest.raises(BudgetIntegrityError, match="cannot be priced safely"):
+        provider.complete("system", [Message(role="user", content="hello")], max_tokens=10)
+
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.FORFEITED
+    assert reservation.failure_type == "UsageInvalid"
+    assert reservation.charged_nano_usd == reservation.max_nano_usd
 
 
 def test_budgeted_provider_canonicalizes_invalid_exception_class_and_reraises_original(

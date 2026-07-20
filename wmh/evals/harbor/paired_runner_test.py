@@ -1249,6 +1249,7 @@ def _loaded_result(
     *,
     reward: float,
     budget_policy_digest: str,
+    response_identity: mod.ProviderResponseIdentity | None = None,
 ) -> LoadedHarborJobResult:
     task_names = spec.datasets[0].task_names
     assert task_names is not None
@@ -1312,6 +1313,7 @@ def _loaded_result(
         candidate=harness,
         spec=spec,
         provider_config=provider,
+        response_identity=response_identity,
         runner_spec=LocalPiRunnerSpec(),
         turn_timeout_s=300.0,
         budget_policy_digest=budget_policy_digest,
@@ -1357,6 +1359,7 @@ def _install_fake_evaluator(
             runner_spec: object,
             turn_timeout_s: float,
             require_provider_receipts: bool,
+            response_identity: mod.ProviderResponseIdentity,
             session: object,
             budget_account: BudgetAccount,
             task_resource_budget_accounts: tuple[object, ...],
@@ -1366,6 +1369,7 @@ def _install_fake_evaluator(
             assert isinstance(runner_spec, LocalPiRunnerSpec)
             assert turn_timeout_s == 300.0
             assert require_provider_receipts is True
+            assert response_identity.provider is provider_config.kind
             assert isinstance(session, mod.HarborEvaluatorSession)
             assert task_resource_budget_accounts == ()
             assert runner_resource_budget_account is None
@@ -1374,6 +1378,7 @@ def _install_fake_evaluator(
             self._spec = spec
             self._provider = provider_config
             self._budget_policy_digest = budget_account.policy.policy_digest
+            self._response_identity = response_identity
 
         async def evaluate(self, harness: HarnessDoc) -> LoadedHarborJobResult:
             task_names = self._spec.datasets[0].task_names
@@ -1393,6 +1398,7 @@ def _install_fake_evaluator(
                     harness,
                     reward=reward,
                     budget_policy_digest=self._budget_policy_digest,
+                    response_identity=self._response_identity,
                 )
             finally:
                 active[task_id] -= 1
@@ -2366,6 +2372,8 @@ def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
     assert spec.create_rate_policy == runner._protocol.execution_plan.create_rate_policy
     assert spec.allow_preexisting_e2b_builds is False
     assert wiring["create_rate_authority"] is runner._create_rate_authority
+    route = runner._protocol.panel_routes[0]
+    assert wiring["response_identity"] == route.response_identity
     assert isinstance(wiring["runner_spec"], E2BPiRunnerSpec)
     assert len(task_accounts) == 1
     assert runner_account is not None
@@ -2411,6 +2419,19 @@ def test_provider_receipt_contract_distinguishes_bedrock_and_openai_evidence() -
         expected_system_fingerprint="fp-123",
     )
     assert route.expected_response_model == "glm-served-model"
+    with pytest.raises(ValueError, match="at most"):
+        mod.PairedHarborPanelRoute(
+            panel_member="azure",
+            provider_config=azure,
+            expected_response_model="m" * 2_049,
+        )
+    with pytest.raises(ValueError, match="at most"):
+        mod.PairedHarborPanelRoute(
+            panel_member="azure",
+            provider_config=azure,
+            expected_response_model="glm-served-model",
+            expected_system_fingerprint="f" * 513,
+        )
 
     invalid_receipt = mod.ChatProviderReceipt(
         provider=ProviderKind.AZURE_OPENAI.value,

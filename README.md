@@ -56,7 +56,7 @@ uv run wmh harness eval pi-baseline@champion \
   --dataset-path ./benchmark-tasks \
   --provider bedrock --model "$BEDROCK_MODEL_ID" --bedrock-region "$AWS_REGION" \
   --attempts 1 --concurrency 1 --out result.json \
-  --allow-unbudgeted-development
+  --budget-account ./frozen-budget-account.json
 ```
 
 Local Docker task environments are the default. Local tasks must name a prebuilt image; WMH keeps
@@ -87,6 +87,7 @@ uv run wmh harness eval pi-baseline@champion \
   --azure-endpoint "$AZURE_OPENAI_ENDPOINT" \
   --azure-deployment "$AZURE_OPENAI_DEPLOYMENT" \
   --azure-api-version "$AZURE_OPENAI_API_VERSION" \
+  --expected-response-model "$AZURE_SERVED_MODEL" \
   --task-backend e2b --concurrency 50 --out result-e2b.json \
   --budget-account ./frozen-budget-account.json
 ```
@@ -96,7 +97,8 @@ estimator, hard cap, phase cap, ledger, and attribution scope. The explicit deve
 for unmetered local checks only. Build paid provider meters with `provider_cost_meter()`: it performs
 offline semantic verification over retained tariff evidence and binds the resulting receipt into
 the serialized budget policy. Azure evidence must be supplied explicitly; the verifier performs no
-ambient network or credential access.
+ambient network or credential access. Azure also requires the exact provider-reported served model;
+omitting its fingerprint commits to an explicit null.
 
 WMH does not inject provider credentials into the task or pi-runner environment. The local
 prebuilt-image policy also rejects run-level environment imports, host mounts, Compose overlays,

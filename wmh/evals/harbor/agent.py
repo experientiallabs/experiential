@@ -18,7 +18,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Final, Protocol, cast
+from typing import Final, Literal, Protocol, cast
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -53,7 +53,8 @@ from wmh.harness.pi_runner_backend import (
     validate_pi_runner_turn_timeout,
 )
 from wmh.harness.runner_link import TokenUsage
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.harness.runtime import search_safety_terminal_error
+from wmh.providers.base import ProviderConfig
 from wmh.providers.process_worker import (
     ProviderProcessWorker,
     ProviderWorkerCleanupError,
@@ -61,7 +62,11 @@ from wmh.providers.process_worker import (
     ProviderWorkerFailure,
     ProviderWorkerUnavailable,
 )
-from wmh.providers.receipt import validate_chat_provider_receipt
+from wmh.providers.receipt import (
+    ProviderResponseIdentity,
+    freeze_provider_response_identity,
+    validate_chat_provider_response_identity,
+)
 from wmh.tracking.budget import (
     BudgetAccountBinding,
     ProviderCostMeter,
@@ -91,7 +96,7 @@ _TRACE_FILE = "wmh-events.jsonl"
 _RUNNER_LEASE_FILE = "wmh-runner-lease.json"
 # Bump whenever trusted host/runtime semantics change. Harbor run identity binds this value, so
 # completed artifacts cannot be reused across evaluator behavior changes.
-WMH_PI_AGENT_VERSION: Final = "0.9.0"
+WMH_PI_AGENT_VERSION: Final = "0.11.0"
 _TRUNCATION_MARKER = "\n... [output truncated] ...\n"
 _TOOL_EXEC_RETAINED_BYTES = _TOOL_OUTPUT_CHARS - len(_TRUNCATION_MARKER.encode())
 _TOOL_EXEC_HEAD_BYTES = _TOOL_EXEC_RETAINED_BYTES // 2
@@ -551,7 +556,8 @@ class WmhPiAgent(BaseAgent):
         create_rate_binding: JsonObject | None = None,
         runner_spec: JsonObject | None = None,
         turn_timeout_s: float = 300.0,
-        require_provider_receipts: bool = False,
+        require_provider_receipts: Literal[True] = True,
+        response_identity: JsonObject | None = None,
     ) -> None:
         if extra_env:
             raise ValueError(
@@ -574,15 +580,14 @@ class WmhPiAgent(BaseAgent):
             if budget_binding is not None
             else None
         )
-        if binding is not None:
-            if binding.policy_digest != budget_policy_digest:
-                raise ValueError("budget binding differs from the frozen policy digest")
-            account = resolve_budget_account(binding)
-            meter = account.policy.meters[account.meter_id]
-            if not isinstance(meter, ProviderCostMeter) or meter.provider_config != config:
-                raise ValueError("budget account provider config must match the Harbor agent")
-        else:
-            account = None
+        if binding is None:
+            raise ValueError("WMH Pi provider dispatch requires a frozen provider budget account")
+        if binding.policy_digest != budget_policy_digest:
+            raise ValueError("budget binding differs from the frozen policy digest")
+        account = resolve_budget_account(binding)
+        meter = account.policy.meters[account.meter_id]
+        if not isinstance(meter, ProviderCostMeter) or meter.provider_config != config:
+            raise ValueError("budget account provider config must match the Harbor agent")
         if self._harness.runtime_kind() != "pi-node":
             raise ValueError(
                 "WMH pi benchmark evaluation requires runtime kind 'pi-node', got "
@@ -623,8 +628,16 @@ class WmhPiAgent(BaseAgent):
         if isinstance(validated_runner, E2BPiRunnerSpec) and binding is not None:
             if runner_budget_account is None:
                 raise ValueError("budgeted E2B runners require a timed resource budget")
-        if not isinstance(require_provider_receipts, bool):
-            raise ValueError("require_provider_receipts must be a boolean")
+        if require_provider_receipts is not True:
+            raise ValueError("WMH Pi scored dispatch always requires provider receipts")
+        frozen_response_identity = freeze_provider_response_identity(
+            config,
+            (
+                None
+                if response_identity is None
+                else ProviderResponseIdentity.model_validate(response_identity)
+            ),
+        )
         self._provider_config = config.model_copy(deep=True)
         self._budget_account = account.model_copy(deep=True) if account is not None else None
         self._runner_budget_account = (
@@ -635,7 +648,7 @@ class WmhPiAgent(BaseAgent):
         self._create_rate_authority = create_rate_authority
         self._runner_spec = validated_runner
         self._turn_timeout_s = turn_timeout_s
-        self._require_provider_receipts = require_provider_receipts
+        self._response_identity = frozen_response_identity
         self._task_environment_attestation: _TaskEnvironmentAttestation | None = None
 
     @staticmethod
@@ -737,6 +750,7 @@ class WmhPiAgent(BaseAgent):
         provider_worker = ProviderProcessWorker(
             self._provider_config,
             budget_account=self._budget_account,
+            response_identity=self._response_identity,
         )
         candidate_error: PiCandidateError | None = None
         result: PiTurnResult | None = None
@@ -750,7 +764,7 @@ class WmhPiAgent(BaseAgent):
                 instruction,
                 self._turn_timeout_s,
                 self._provider_config,
-                self._require_provider_receipts,
+                self._response_identity,
             )
         )
         try:
@@ -787,6 +801,7 @@ class WmhPiAgent(BaseAgent):
             )
             raise
         except Exception as exc:  # noqa: BLE001 - sanitize every infrastructure failure uniformly
+            terminal_safety_failure = search_safety_terminal_error(exc)
             trace_error: WmhPiRunnerError | None = None
             run_health = PiRunHealth.INFRASTRUCTURE_FAILURE
             if isinstance(exc, PiInfrastructureError):
@@ -828,6 +843,8 @@ class WmhPiAgent(BaseAgent):
             )
             if trace_error is not None:
                 raise trace_error from None
+            if terminal_safety_failure is not None:
+                raise terminal_safety_failure from None
             raise _typed_infrastructure_error(exc) from None
 
         if result is not None:
@@ -924,7 +941,7 @@ def _run_isolated_turn(
     instruction: str,
     timeout_s: float,
     provider_config: ProviderConfig,
-    require_provider_receipts: bool,
+    response_identity: ProviderResponseIdentity,
 ) -> PiTurnResult:
     """Own the disposable provider lifecycle for one synchronous pi turn."""
     try:
@@ -942,35 +959,32 @@ def _run_isolated_turn(
                 worker_fn=provider_worker.complete_chat,
                 runner_factory=runner_factory,
                 timeout_s=timeout_s,
-                response_validator=(
-                    partial(
-                        _validate_provider_response_receipt,
-                        provider_config=provider_config,
-                        requested_temperature=harness.temperature(),
-                        max_tokens=harness.max_output_tokens(),
-                    )
-                    if require_provider_receipts
-                    else None
+                response_validator=partial(
+                    _validate_provider_response_receipt,
+                    provider_config=provider_config,
+                    requested_temperature=harness.temperature(),
+                    max_tokens=harness.max_output_tokens(),
+                    response_identity=response_identity,
                 ),
             )
         except (PiCandidateError, PiInfrastructureError) as exc:
-            if require_provider_receipts:
-                _require_complete_provider_receipt_trace(
-                    exc.events,
-                    exc.worker_usage,
-                    provider_config,
-                    requested_temperature=harness.temperature(),
-                    max_tokens=harness.max_output_tokens(),
-                )
-            raise
-        if require_provider_receipts:
             _require_complete_provider_receipt_trace(
-                result.events,
-                result.worker_usage,
+                exc.events,
+                exc.worker_usage,
                 provider_config,
                 requested_temperature=harness.temperature(),
                 max_tokens=harness.max_output_tokens(),
+                response_identity=response_identity,
             )
+            raise
+        _require_complete_provider_receipt_trace(
+            result.events,
+            result.worker_usage,
+            provider_config,
+            requested_temperature=harness.temperature(),
+            max_tokens=harness.max_output_tokens(),
+            response_identity=response_identity,
+        )
         return result
     finally:
         provider_worker.close()
@@ -982,27 +996,16 @@ def _validate_provider_response_receipt(
     *,
     requested_temperature: float,
     max_tokens: int,
+    response_identity: ProviderResponseIdentity,
 ) -> None:
     """Require response evidence to agree with the immutable provider target."""
-    receipt = response.provider_receipt
-    if receipt is None:
-        raise ValueError("provider receipt is missing")
-    validate_chat_provider_receipt(
-        receipt,
+    validate_chat_provider_response_identity(
+        response,
         provider_config=provider_config,
         requested_temperature=requested_temperature,
         max_tokens=max_tokens,
+        response_identity=response_identity,
     )
-    if provider_config.kind is ProviderKind.BEDROCK:
-        if response.model != provider_config.model:
-            raise ValueError("Bedrock response model disagrees with the frozen provider model")
-        return
-    if receipt.response_id != response.id:
-        raise ValueError("provider receipt response id disagrees with the completion")
-    if receipt.response_model != response.model:
-        raise ValueError("provider receipt response model disagrees with the completion")
-    if receipt.system_fingerprint != response.system_fingerprint:
-        raise ValueError("provider receipt fingerprint disagrees with the completion")
 
 
 def _require_complete_provider_receipt_trace(
@@ -1012,6 +1015,7 @@ def _require_complete_provider_receipt_trace(
     *,
     requested_temperature: float,
     max_tokens: int,
+    response_identity: ProviderResponseIdentity | None = None,
 ) -> None:
     """Reconcile one receipt event with every successfully metered provider call."""
     try:
@@ -1021,6 +1025,7 @@ def _require_complete_provider_receipt_trace(
             provider_config=provider_config,
             requested_temperature=requested_temperature,
             max_tokens=max_tokens,
+            response_identity=response_identity,
         )
     except Exception:  # noqa: BLE001 - trace contents never enter the persisted error text
         raise PiInfrastructureError(

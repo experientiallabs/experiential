@@ -8,10 +8,11 @@ import hashlib
 import json
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -37,6 +38,7 @@ from wmh.harness.pi_runner import (
 from wmh.harness.pi_runner_backend import (
     E2BPiRunnerSpec,
     LocalPiRunnerSpec,
+    e2b_runner_resource_class,
     runner_owner_id,
 )
 from wmh.harness.runner_link import TokenUsage
@@ -46,15 +48,24 @@ from wmh.providers.process_worker import (
     ProviderWorkerDeadlineExceeded,
     ProviderWorkerUnavailable,
 )
+from wmh.providers.receipt import ProviderResponseIdentity, ProviderResponseIdentityError
 from wmh.tracking._testing import (
     synthetic_provider_cost_meter,
     synthetic_tariff_provenance,
 )
 from wmh.tracking.budget import (
     BudgetAccount,
+    BudgetBreachError,
+    BudgetExceededError,
+    BudgetIntegrityError,
     BudgetPolicy,
     BudgetScope,
+    ProviderCostMeter,
+    TimedResourceBudgetAccount,
+    TimedResourceCostMeter,
+    UnpricedProviderUsageError,
     bind_budget_account,
+    bind_timed_resource_account,
     bootstrap_budget_ledger,
 )
 from wmh.tracking.rate_limit import (
@@ -124,6 +135,71 @@ _E2B_TASK_ENVIRONMENT_ATTESTATION = cast(
 )
 
 
+class _AgentBudgetKwargs(TypedDict):
+    """Serialized hard-budget bindings accepted by the Harbor agent."""
+
+    budget_policy_digest: str
+    budget_binding: JsonObject
+    runner_budget_binding: NotRequired[JsonObject]
+
+
+def _agent_budget_kwargs(
+    tmp_path: Path,
+    config: ProviderConfig,
+    *,
+    runner_spec: E2BPiRunnerSpec | None = None,
+) -> _AgentBudgetKwargs:
+    meters: dict[str, ProviderCostMeter | TimedResourceCostMeter] = {
+        "worker": synthetic_provider_cost_meter(
+            provider_config=config,
+            provenance=synthetic_tariff_provenance(config),
+            input_nano_usd_per_token=1,
+            output_nano_usd_per_token=5,
+        )
+    }
+    if runner_spec is not None:
+        resource_class = e2b_runner_resource_class(runner_spec)
+        meters["runner"] = TimedResourceCostMeter(
+            resource_type=resource_class.role.value,
+            resource_class_digest=resource_class.digest,
+            nano_usd_per_second=1,
+            max_billing_seconds=resource_class.max_host_observation_seconds,
+        )
+    policy = BudgetPolicy(
+        study_id="agent-test",
+        manifest_digest="sha256:" + hashlib.sha256(str(tmp_path).encode()).hexdigest(),
+        hard_limit_nano_usd=10_000_000,
+        phase_limits_nano_usd={"test": 10_000_000},
+        meters=meters,
+    )
+    ledger_path = (tmp_path / "agent-budget.sqlite3").resolve()
+    ledger_identity = bootstrap_budget_ledger(ledger_path, policy).ledger_identity
+    scope = BudgetScope(phase="test", category="worker", run_id="agent-test")
+    account = BudgetAccount(
+        ledger_path=ledger_path,
+        ledger_identity=ledger_identity,
+        policy=policy,
+        scope=scope,
+        meter_id="worker",
+    )
+    kwargs: _AgentBudgetKwargs = {
+        "budget_policy_digest": policy.policy_digest,
+        "budget_binding": cast("JsonObject", bind_budget_account(account).model_dump(mode="json")),
+    }
+    if runner_spec is not None:
+        runner_account = TimedResourceBudgetAccount(
+            ledger_path=ledger_path,
+            ledger_identity=ledger_identity,
+            policy=policy,
+            scope=scope,
+            meter_id="runner",
+        )
+        kwargs["runner_budget_binding"] = cast(
+            "JsonObject", bind_timed_resource_account(runner_account).model_dump(mode="json")
+        )
+    return kwargs
+
+
 class _ProviderWorker:
     """Disposable worker double whose lifecycle is always proved."""
 
@@ -132,8 +208,10 @@ class _ProviderWorker:
         _config: ProviderConfig,
         *,
         budget_account: BudgetAccount | None = None,
+        response_identity: ProviderResponseIdentity | None = None,
     ) -> None:
         self.budget_account = budget_account
+        self.response_identity = response_identity
         self.closed = threading.Event()
 
     def start(self, _deadline: mod.TurnDeadline) -> None:
@@ -200,7 +278,7 @@ def _agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    require_provider_receipts: bool = False,
+    require_provider_receipts: Literal[True] = True,
 ) -> mod.WmhPiAgent:
     monkeypatch.setattr(mod, "ProviderProcessWorker", _ProviderWorker)
     config = ProviderConfig(
@@ -214,6 +292,7 @@ def _agent(
         harness=cast("JsonObject", pi_node_baseline("candidate").model_dump(mode="json")),
         provider_config=cast("JsonObject", config.model_dump(mode="json")),
         require_provider_receipts=require_provider_receipts,
+        **_agent_budget_kwargs(tmp_path, config),
     )
     agent._task_environment_attestation = mod._TaskEnvironmentAttestation(
         digest=_TASK_ENVIRONMENT_DIGEST,
@@ -321,13 +400,39 @@ def test_agent_preserves_budget_account_for_the_disposable_worker(tmp_path: Path
     assert agent._budget_account == account
 
 
+def test_agent_rejects_unbudgeted_builtin_provider_dispatch(tmp_path: Path) -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+
+    with pytest.raises(ValueError, match="requires a frozen provider budget account"):
+        mod.WmhPiAgent(
+            logs_dir=tmp_path / "agent",
+            model_name="bedrock/model",
+            harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
+            provider_config=cast("JsonObject", config.model_dump(mode="json")),
+        )
+
+
+def test_agent_rejects_disabling_provider_receipts(tmp_path: Path) -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model", region="test-region")
+
+    with pytest.raises(ValueError, match="always requires provider receipts"):
+        mod.WmhPiAgent(
+            logs_dir=tmp_path / "agent",
+            model_name="bedrock/model",
+            harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
+            provider_config=cast("JsonObject", config.model_dump(mode="json")),
+            require_provider_receipts=False,  # ty: ignore[invalid-argument-type]
+            **_agent_budget_kwargs(tmp_path, config),
+        )
+
+
 @pytest.mark.parametrize("turn_timeout_s", [float("nan"), float("inf"), float("-inf")])
 def test_agent_rejects_non_finite_turn_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     turn_timeout_s: float,
 ) -> None:
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model", region="test-region")
 
     with pytest.raises(ValueError, match="finite and positive"):
         mod.WmhPiAgent(
@@ -336,11 +441,12 @@ def test_agent_rejects_non_finite_turn_timeout(
             harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
             provider_config=cast("JsonObject", config.model_dump(mode="json")),
             turn_timeout_s=turn_timeout_s,
+            **_agent_budget_kwargs(tmp_path, config),
         )
 
 
 def test_agent_rejects_e2b_runner_lease_without_turn_cleanup_margin(tmp_path: Path) -> None:
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model", region="test-region")
     runner_spec = E2BPiRunnerSpec(
         template_id="template-immutable",
         build_id="build-immutable",
@@ -359,11 +465,12 @@ def test_agent_rejects_e2b_runner_lease_without_turn_cleanup_margin(tmp_path: Pa
             provider_config=cast("JsonObject", config.model_dump(mode="json")),
             runner_spec=cast("JsonObject", runner_spec.model_dump(mode="json")),
             turn_timeout_s=3_600,
+            **_agent_budget_kwargs(tmp_path, config, runner_spec=runner_spec),
         )
 
 
 def test_agent_admits_e2b_runner_lease_with_turn_cleanup_margin(tmp_path: Path) -> None:
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model", region="test-region")
     runner_spec = E2BPiRunnerSpec(
         template_id="template-immutable",
         build_id="build-immutable",
@@ -389,6 +496,7 @@ def test_agent_admits_e2b_runner_lease_with_turn_cleanup_margin(tmp_path: Path) 
             bind_external_dispatch_rate_authority(rate_authority).model_dump(mode="json"),
         ),
         turn_timeout_s=3_600,
+        **_agent_budget_kwargs(tmp_path, config, runner_spec=runner_spec),
     )
 
     assert agent._runner_spec == runner_spec
@@ -398,7 +506,7 @@ def test_agent_rejects_mutable_runner_spec(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model", region="test-region")
 
     with pytest.raises(ValueError, match="digest-qualified"):
         mod.WmhPiAgent(
@@ -407,13 +515,14 @@ def test_agent_rejects_mutable_runner_spec(
             harness=cast("JsonObject", pi_node_baseline().model_dump(mode="json")),
             provider_config=cast("JsonObject", config.model_dump(mode="json")),
             runner_spec=cast("JsonObject", {"backend": "local", "image": "node:latest"}),
+            **_agent_budget_kwargs(tmp_path, config),
         )
 
 
 def test_agent_rejects_environment_injection_before_task_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model", region="test-region")
     secret = "credential-secret-sentinel"
 
     with pytest.raises(ValueError, match="does not inject agent environment") as caught:
@@ -1243,7 +1352,10 @@ def test_candidate_failure_returns_for_native_verification(
         "candidate failed",
         stage=PiCandidateFailureStage.MATERIALIZATION,
         reason=PiCandidateFailureReason.RESOURCE_LIMIT,
-        events=(SessionEvent(kind="error", payload={"message": "candidate failed"}),),
+        events=(
+            SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload()),
+            SessionEvent(kind="error", payload={"message": "candidate failed"}),
+        ),
         worker_usage=TokenUsage(input_tokens=3, output_tokens=2, calls=1),
         run_health=PiRunHealth.CANDIDATE_DAMAGED,
     )
@@ -1302,7 +1414,10 @@ def test_success_populates_usage_and_backend_identity(
     result = PiTurnResult(
         answer="done",
         terminal_reason="completed",
-        events=(SessionEvent(kind="submit", payload={"answer": "done"}),),
+        events=(
+            SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload()),
+            SessionEvent(kind="submit", payload={"answer": "done"}),
+        ),
         worker_usage=TokenUsage(input_tokens=11, output_tokens=5, calls=1),
     )
     monkeypatch.setattr(mod, "run_pi_turn", lambda *_args, **_kwargs: result)
@@ -1464,13 +1579,165 @@ def test_openai_receipt_response_identity_must_match_completion() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="response id disagrees"):
+    with pytest.raises(ProviderResponseIdentityError, match="metadata differs"):
         mod._validate_provider_response_receipt(
             response,
             config,
             requested_temperature=0.7,
             max_tokens=4_096,
+            response_identity=ProviderResponseIdentity(
+                provider=ProviderKind.OPENAI,
+                response_model="gpt-5.5-served",
+                system_fingerprint="fp-1",
+            ),
         )
+
+
+@pytest.mark.parametrize(
+    ("response_id", "system_fingerprint"),
+    [
+        ("unexpected-response-id", None),
+        (None, "unexpected-fingerprint"),
+    ],
+)
+def test_bedrock_response_metadata_must_match_null_receipt_evidence(
+    response_id: str | None,
+    system_fingerprint: str | None,
+) -> None:
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    payload = _provider_receipt_payload()
+    payload.pop("turn_call_index")
+    response = ChatResponse.model_validate(
+        {
+            "id": response_id,
+            "model": "model",
+            "system_fingerprint": system_fingerprint,
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "provider_receipt": payload,
+        }
+    )
+
+    with pytest.raises(ProviderResponseIdentityError, match="metadata differs"):
+        mod._validate_provider_response_receipt(
+            response,
+            config,
+            requested_temperature=0.7,
+            max_tokens=4_096,
+            response_identity=ProviderResponseIdentity(provider=ProviderKind.BEDROCK),
+        )
+
+
+@pytest.mark.parametrize(
+    ("response_model", "system_fingerprint"),
+    [
+        ("retargeted-model", None),
+        ("served-model", "fp-unexpected"),
+    ],
+)
+def test_azure_response_identity_drift_stops_before_another_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    response_model: str,
+    system_fingerprint: str | None,
+) -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        deployment="worker-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-model",
+        system_fingerprint=None,
+    )
+    payload = _provider_receipt_payload(
+        provider="azure",
+        requested_model="worker-deployment",
+        response_id="completion-1",
+        response_model=response_model,
+        system_fingerprint=system_fingerprint,
+        temperature=None,
+        max_tokens_field="max_completion_tokens",
+    )
+    payload.pop("turn_call_index")
+    response = ChatResponse.model_validate(
+        {
+            "id": "completion-1",
+            "model": response_model,
+            "system_fingerprint": system_fingerprint,
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "provider_receipt": payload,
+        }
+    )
+    dispatches: list[str] = []
+
+    def run_turn(*_args: object, **kwargs: object) -> PiTurnResult:
+        dispatches.append("first")
+        validator = cast("Callable[[ChatResponse], None]", kwargs["response_validator"])
+        validator(response)
+        dispatches.append("second")
+        raise AssertionError("identity drift must stop the turn before another dispatch")
+
+    monkeypatch.setattr(mod, "run_pi_turn", run_turn)
+    worker = _ProviderWorker(config)
+
+    with pytest.raises(ProviderResponseIdentityError, match="frozen response identity"):
+        mod._run_isolated_turn(
+            cast("mod.ProviderProcessWorker", worker),
+            cast("mod.ManagedPiRunnerFactory", object()),
+            cast("mod.HarborToolExecutor", object()),
+            pi_node_baseline("candidate"),
+            "instruction",
+            300.0,
+            config,
+            response_identity,
+        )
+
+    assert dispatches == ["first"]
+    assert worker.closed.is_set()
+
+
+def test_azure_response_identity_accepts_exact_explicit_null_fingerprint() -> None:
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        deployment="worker-deployment",
+        endpoint="https://example.openai.azure.com",
+        api_version="2026-01-01",
+    )
+    response_identity = ProviderResponseIdentity(
+        provider=ProviderKind.AZURE_OPENAI,
+        response_model="served-model",
+        system_fingerprint=None,
+    )
+    payload = _provider_receipt_payload(
+        provider="azure",
+        requested_model="worker-deployment",
+        response_id="completion-1",
+        response_model="served-model",
+        system_fingerprint=None,
+        temperature=None,
+        max_tokens_field="max_completion_tokens",
+    )
+    payload.pop("turn_call_index")
+    response = ChatResponse.model_validate(
+        {
+            "id": "completion-1",
+            "model": "served-model",
+            "system_fingerprint": None,
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "provider_receipt": payload,
+        }
+    )
+
+    mod._validate_provider_response_receipt(
+        response,
+        config,
+        requested_temperature=0.7,
+        max_tokens=4_096,
+        response_identity=response_identity,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1516,7 +1783,7 @@ def test_agent_selects_e2b_runner_and_persists_actual_attestation(
         envd_version="0.2.1",
         lease_timeout_s=420,
     )
-    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model")
+    config = ProviderConfig(kind=ProviderKind.BEDROCK, model="model", region="test-region")
     rate_authority = ExternalDispatchRateAuthority.bootstrap(
         tmp_path / "rate.json",
         ExternalDispatchRatePolicy(
@@ -1536,6 +1803,7 @@ def test_agent_selects_e2b_runner_and_persists_actual_attestation(
             "JsonObject",
             bind_external_dispatch_rate_authority(rate_authority).model_dump(mode="json"),
         ),
+        **_agent_budget_kwargs(tmp_path, config, runner_spec=runner_spec),
     )
     agent._task_environment_attestation = mod._TaskEnvironmentAttestation(
         digest=_TASK_ENVIRONMENT_DIGEST,
@@ -1568,11 +1836,13 @@ def test_agent_selects_e2b_runner_and_persists_actual_attestation(
         *,
         ledger_path: Path,
         owner_id: str,
+        resource_budget_account: TimedResourceBudgetAccount,
         create_rate_authority: object,
     ) -> Factory:
         assert observed == runner_spec
         assert ledger_path == tmp_path / "wmh-runner-lease.json"
         assert owner_id == runner_owner_id(tmp_path.name)
+        assert resource_budget_account.meter_id == "runner"
         assert create_rate_authority is rate_authority
         return factory
 
@@ -1633,6 +1903,7 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
     failure = mod.PiInfrastructureError(
         mod.PiInfrastructureFailureKind.PROVIDER,
         events=(
+            SessionEvent(kind="provider_receipt", payload=_provider_receipt_payload()),
             SessionEvent(kind="assistant_message", payload={"text": "first answer"}),
             SessionEvent(kind="error", payload={"message": "worker provider unavailable"}),
         ),
@@ -1657,6 +1928,38 @@ def test_second_provider_call_failure_persists_partial_usage_and_trace(
     trace = (tmp_path / "wmh-events.jsonl").read_text(encoding="utf-8")
     assert "first answer" in trace
     assert "worker provider unavailable" in trace
+
+
+@pytest.mark.parametrize(
+    "terminal_error",
+    [
+        BudgetBreachError("secret breach detail"),
+        BudgetExceededError("secret budget detail"),
+        BudgetIntegrityError("secret ledger detail"),
+        UnpricedProviderUsageError("secret unpriced usage detail"),
+        ProviderResponseIdentityError("secret identity detail"),
+    ],
+)
+def test_agent_preserves_terminal_provider_safety_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_error: RuntimeError,
+) -> None:
+    agent = _agent(tmp_path, monkeypatch)
+
+    def fail(*_args: object, **_kwargs: object) -> PiTurnResult:
+        raise terminal_error
+
+    monkeypatch.setattr(mod, "run_pi_turn", fail)
+    context = AgentContext()
+
+    with pytest.raises(type(terminal_error)) as caught:
+        asyncio.run(agent.run("task", cast("BaseEnvironment", _Environment()), context))
+
+    assert caught.value is terminal_error
+    assert context.metadata is not None
+    assert context.metadata["infrastructure_failure"] is True
+    assert context.metadata["run_health"] == "infrastructure_failure"
 
 
 def test_provider_start_deadline_is_typed_and_persisted_without_raw_detail(
@@ -1735,8 +2038,13 @@ def test_outer_cancellation_unblocks_and_joins_provider_turn_thread(
             config: ProviderConfig,
             *,
             budget_account: BudgetAccount | None = None,
+            response_identity: ProviderResponseIdentity | None = None,
         ) -> None:
-            super().__init__(config, budget_account=budget_account)
+            super().__init__(
+                config,
+                budget_account=budget_account,
+                response_identity=response_identity,
+            )
             workers.append(self)
 
         def complete_chat(

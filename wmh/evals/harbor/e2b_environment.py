@@ -102,6 +102,7 @@ _E2B_STORAGE_METRIC_ATTEMPTS = 6
 _E2B_STORAGE_METRIC_POLL_INTERVAL_S = 2.0
 _E2B_STORAGE_METRIC_REQUEST_TIMEOUT_S = 5
 _E2B_RECONCILIATION_REQUEST_TIMEOUT_S = 30
+_TASK_SANDBOX_SECURE = True
 _EXACT_BUILD_PROVENANCE_NAMESPACE = "wmh.e2b.exact-build.v1"
 _ASYNC_KILL_DELAYS_S = (0.0, 0.1, 0.5)
 _COMPONENT_IDENTITY = re.compile(r"[A-Za-z0-9_.-]{1,512}\Z")
@@ -118,6 +119,33 @@ def _digest(value: JsonObject) -> str:
         allow_nan=False,
     ).encode()
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def exact_e2b_task_launch_config_digest(
+    *,
+    build: ExactE2BBuildRecord,
+    requested_storage_mb: int | None,
+    network_policy: NetworkPolicy,
+) -> str:
+    """Purely bind one exact task build to its scored E2B launch semantics."""
+    return _digest(
+        cast(
+            "JsonObject",
+            {
+                "schema_version": 3,
+                "build": build.model_dump(mode="json"),
+                "requested_storage_mb": requested_storage_mb,
+                "secure": _TASK_SANDBOX_SECURE,
+                "network_mode": network_policy.network_mode.value,
+                "allowed_hosts": sorted(network_policy.allowed_hosts),
+                "lease_timeout_s": _TASK_LEASE_TIMEOUT_S,
+                "timeout_action": "kill",
+                "auto_resume": False,
+                "volume_mounts": False,
+                "create_request_timeout_s": E2B_CREATE_REQUEST_TIMEOUT_S,
+            },
+        )
+    )
 
 
 def _canonical_json_bytes(value: JsonObject) -> bytes:
@@ -814,7 +842,7 @@ class ExactE2BEnvironment(E2BEnvironment):
             template=build.exact_template_ref,
             metadata=metadata,
             timeout=_TASK_LEASE_TIMEOUT_S,
-            secure=True,
+            secure=_TASK_SANDBOX_SECURE,
             allow_internet_access=allow_internet,
             network=self._sandbox_create_network_options(),
             lifecycle=lifecycle,
@@ -980,21 +1008,10 @@ class ExactE2BEnvironment(E2BEnvironment):
         return actual_allow, actual_deny
 
     def _launch_config_digest(self, build: ExactE2BBuildRecord) -> str:
-        return _digest(
-            cast(
-                "JsonObject",
-                {
-                    "schema_version": 2,
-                    "build": build.model_dump(mode="json"),
-                    "requested_storage_mb": self._effective_storage_mb,
-                    "network_mode": self.network_policy.network_mode.value,
-                    "allowed_hosts": sorted(self.network_policy.allowed_hosts),
-                    "lease_timeout_s": _TASK_LEASE_TIMEOUT_S,
-                    "timeout_action": "kill",
-                    "auto_resume": False,
-                    "volume_mounts": False,
-                },
-            )
+        return exact_e2b_task_launch_config_digest(
+            build=build,
+            requested_storage_mb=self._effective_storage_mb,
+            network_policy=self.network_policy,
         )
 
     @staticmethod

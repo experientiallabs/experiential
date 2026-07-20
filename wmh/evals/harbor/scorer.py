@@ -32,12 +32,20 @@ from wmh.evals.benchmark import (
     Rewards,
 )
 from wmh.evals.harbor.agent import WMH_PI_AGENT_VERSION
-from wmh.evals.harbor.config import HarborEnvironmentBackend, HarborJobSpec
+from wmh.evals.harbor.config import (
+    SUPPORTED_HARBOR_VERSION,
+    HarborEnvironmentBackend,
+    HarborJobSpec,
+)
 from wmh.evals.harbor.e2b_environment import (
     ExactE2BBuildRecord,
     require_exact_e2b_build_record,
 )
-from wmh.evals.harbor.evaluator import HarborEvaluator, harbor_run_expectation
+from wmh.evals.harbor.evaluator import (
+    HARBOR_EVALUATOR_VERSION,
+    HarborEvaluator,
+    harbor_run_expectation,
+)
 from wmh.evals.harbor.qualification_types import (
     QualifiedE2BBuildIdentity,
     QualifiedHarborTask,
@@ -110,7 +118,7 @@ class HarborHarnessScorePlan(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
-    schema_version: Literal["wmh.harbor-harness-score-plan.v3"] = "wmh.harbor-harness-score-plan.v3"
+    schema_version: Literal["wmh.harbor-harness-score-plan.v4"] = "wmh.harbor-harness-score-plan.v4"
     implementation: str = Field(min_length=1)
     job_name: str = Field(min_length=1)
     n_attempts: int = Field(ge=1)
@@ -130,6 +138,8 @@ class HarborHarnessScorePlan(BaseModel):
     runner_spec: PiRunnerBackendSpec
     compute_envelope: HarborAgentComputeEnvelope
     agent_version: str
+    evaluator_version: str
+    harbor_version: str
 
     @property
     def configuration_id(self) -> str:
@@ -426,6 +436,7 @@ class HarborHarnessScorer:
                 provider_config,
                 runner_spec=self._runner_spec,
                 turn_timeout_s=self._compute_envelope.turn_timeout_s,
+                response_identity=self._response_identity,
                 qualified_tasks=self._qualified_tasks,
             )
         else:
@@ -434,6 +445,7 @@ class HarborHarnessScorer:
                 provider_config,
                 runner_spec=self._runner_spec,
                 turn_timeout_s=self._compute_envelope.turn_timeout_s,
+                response_identity=self._response_identity,
                 budget_account=budget_account,
                 task_resource_budget_accounts=task_accounts,
                 runner_resource_budget_account=runner_account,
@@ -503,6 +515,7 @@ class HarborHarnessScorer:
             budget_policy_digest=(
                 budget_account.policy.policy_digest if budget_account is not None else None
             ),
+            response_identity=self._response_identity,
             require_exact_run_config=True,
         )
         ordered = admit_harbor_matrix(
@@ -599,6 +612,8 @@ class HarborHarnessScorer:
             )
         if binding.providers[0].provider_config != self._provider_config:
             raise ValueError("Harbor scorer provider config differs from its cost binding")
+        if binding.providers[0].response_identity != self._response_identity:
+            raise ValueError("Harbor scorer response identity differs from its cost binding")
         return binding
 
     def _resolved_cost_accounts(
@@ -882,6 +897,8 @@ def _score_plan(
         runner_spec=frozen.runner_spec,
         compute_envelope=frozen.compute_envelope,
         agent_version=WMH_PI_AGENT_VERSION,
+        evaluator_version=HARBOR_EVALUATOR_VERSION,
+        harbor_version=SUPPORTED_HARBOR_VERSION,
     )
 
 
@@ -1005,6 +1022,7 @@ def validate_harbor_run_identity(
     turn_timeout_s: float,
     require_exact_run_config: bool = False,
     budget_policy_digest: str | None = None,
+    response_identity: ProviderResponseIdentity | None = None,
 ) -> None:
     """Require loaded evidence to match its frozen harness and execution route."""
     if runner_spec is not None and runner_image is not None:
@@ -1052,6 +1070,7 @@ def validate_harbor_run_identity(
             provider_config=provider_config,
             runner_spec=validated_runner,
             turn_timeout_s=turn_timeout_s,
+            response_identity=response_identity,
             budget_policy_digest=budget_policy_digest,
         )
         if identity != expectation.identity:

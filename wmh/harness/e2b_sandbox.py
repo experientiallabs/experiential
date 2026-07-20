@@ -23,6 +23,7 @@ from pydantic import BaseModel
 if TYPE_CHECKING:
     from e2b import Sandbox as E2BSandbox
     from e2b import SandboxQuery
+    from e2b import Volume as E2BVolume
     from e2b.sandbox.sandbox_api import SandboxLifecycle
 
 
@@ -194,8 +195,10 @@ def default_sandbox_factory(
     template: str | None = None,
     timeout: float = DEFAULT_SANDBOX_TIMEOUT_S,
     metadata: dict[str, str] | None = None,
+    secure: bool = True,
     allow_internet_access: bool = True,
     lifecycle: SandboxLifecyclePolicy | None = None,
+    volume_mounts: dict[str, E2BVolume | str] | None = None,
     request_timeout: int | None = None,
 ) -> SandboxFactory:
     """A factory creating real E2B sandboxes (lazy SDK import; key from arg or $E2B_API_KEY).
@@ -210,6 +213,8 @@ def default_sandbox_factory(
         or not 1 <= timeout <= E2B_MAX_SANDBOX_TIMEOUT_S
     ):
         raise ValueError("E2B sandbox timeout must be between 1 and 86400 seconds")
+    if not isinstance(secure, bool):
+        raise ValueError("E2B sandbox secure mode must be a boolean")
 
     def make() -> SandboxHandle:
         try:
@@ -229,8 +234,10 @@ def default_sandbox_factory(
                 timeout=int(timeout),
                 api_key=key,
                 metadata=metadata,
+                secure=secure,
                 allow_internet_access=allow_internet_access,
                 lifecycle=cast("SandboxLifecycle", dict(lifecycle)),
+                volume_mounts=volume_mounts,
                 request_timeout=request_timeout,
             )
         elif metadata and allow_internet_access:
@@ -239,6 +246,8 @@ def default_sandbox_factory(
                 timeout=int(timeout),
                 api_key=key,
                 metadata=metadata,
+                secure=secure,
+                volume_mounts=volume_mounts,
                 request_timeout=request_timeout,
             )
         elif metadata:
@@ -247,7 +256,9 @@ def default_sandbox_factory(
                 timeout=int(timeout),
                 api_key=key,
                 metadata=metadata,
+                secure=secure,
                 allow_internet_access=allow_internet_access,
+                volume_mounts=volume_mounts,
                 request_timeout=request_timeout,
             )
         elif allow_internet_access:
@@ -255,6 +266,8 @@ def default_sandbox_factory(
                 template=chosen,
                 timeout=int(timeout),
                 api_key=key,
+                secure=secure,
+                volume_mounts=volume_mounts,
                 request_timeout=request_timeout,
             )
         else:
@@ -262,7 +275,9 @@ def default_sandbox_factory(
                 template=chosen,
                 timeout=int(timeout),
                 api_key=key,
+                secure=secure,
                 allow_internet_access=allow_internet_access,
+                volume_mounts=volume_mounts,
                 request_timeout=request_timeout,
             )
         # The SDK object satisfies the protocol slice structurally; cast rather than pin the

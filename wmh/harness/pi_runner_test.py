@@ -35,6 +35,13 @@ from wmh.providers.process_worker import (
     ProviderWorkerDeadlineExceeded,
     RequestDeadlineSource,
 )
+from wmh.providers.receipt import ProviderResponseIdentityError
+from wmh.tracking.budget import (
+    BudgetBreachError,
+    BudgetExceededError,
+    BudgetIntegrityError,
+    UnpricedProviderUsageError,
+)
 
 
 class _ScriptedChannel:
@@ -331,6 +338,56 @@ def test_run_pi_turn_keeps_worker_failures_infrastructure_typed() -> None:
     assert secret not in str(caught.value)
     assert secret not in str(channel.sent)
     assert "worker provider unavailable" in str(channel.sent)
+
+
+@pytest.mark.parametrize(
+    "terminal_error",
+    [
+        BudgetBreachError("secret breach detail"),
+        BudgetExceededError("secret budget detail"),
+        BudgetIntegrityError("secret ledger detail"),
+        UnpricedProviderUsageError("secret unpriced usage detail"),
+        ProviderResponseIdentityError("secret identity detail"),
+    ],
+)
+def test_run_pi_turn_preserves_terminal_worker_safety_errors(
+    terminal_error: RuntimeError,
+) -> None:
+    channel = _ScriptedChannel()
+    channel._inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "llm_request", "req_id": 2, "openai_body": {}},
+    ]
+    calls = 0
+
+    def failing_worker(
+        request: ChatRequest,
+        deadline: TurnDeadline,
+    ) -> ChatResponse:
+        nonlocal calls
+        _ = request, deadline
+        calls += 1
+        raise terminal_error
+
+    @contextmanager
+    def runner_factory() -> Iterator[_ScriptedChannel]:
+        yield channel
+
+    with pytest.raises(type(terminal_error)) as caught:
+        run_pi_turn(
+            pi_node_baseline(),
+            "complete the task",
+            execute_tool=_no_tool,
+            worker_fn=failing_worker,
+            runner_factory=runner_factory,
+        )
+
+    assert caught.value is terminal_error
+    assert calls == 1
+    assert str(terminal_error) not in str(channel.sent)
+    assert "worker provider search-safety violation" in str(channel.sent)
 
 
 def test_run_pi_turn_types_response_evidence_rejection_as_infrastructure() -> None:

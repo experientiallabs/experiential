@@ -34,7 +34,7 @@ from wmh.harness.live_session import (
 )
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
 from wmh.harness.runner_link import Channel, TokenUsage
-from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
+from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS, search_safety_terminal_error
 from wmh.harness.tools import READ_SKILL, ToolSpec, resolve_tools
 from wmh.providers.failure_attribution import (
     ProviderFailureOwner,
@@ -363,6 +363,7 @@ def run_pi_turn(
     infrastructure_failure: PiInfrastructureError | None = None
     candidate_worker_failure = False
     candidate_task_failure: CandidateTaskEnvironmentError | None = None
+    terminal_safety_failure: BaseException | None = None
     turn_deadline_exceeded = False
     turn_deadline: TurnDeadline | None = None
     event_bytes = 0
@@ -397,7 +398,8 @@ def run_pi_turn(
             on_event(event)
 
     def checked_worker(request: ChatRequest) -> ChatResponse:
-        nonlocal candidate_worker_failure, infrastructure_failure, turn_deadline_exceeded
+        nonlocal candidate_worker_failure, infrastructure_failure
+        nonlocal terminal_safety_failure, turn_deadline_exceeded
         if turn_deadline is None:
             infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
             raise RuntimeError("worker provider unavailable")
@@ -422,6 +424,10 @@ def run_pi_turn(
             infrastructure_failure = PiInfrastructureError(PiInfrastructureFailureKind.PROVIDER)
             raise RuntimeError("worker provider unavailable") from None
         except Exception as exc:  # noqa: BLE001 - replace trusted error text before it crosses
+            terminal = search_safety_terminal_error(exc)
+            if terminal is not None:
+                terminal_safety_failure = terminal
+                raise RuntimeError("worker provider search-safety violation") from None
             attribution = classify_provider_failure(exc)
             if attribution.owner is ProviderFailureOwner.CANDIDATE:
                 candidate_worker_failure = True
@@ -431,7 +437,11 @@ def run_pi_turn(
         if response_validator is not None:
             try:
                 response_validator(response)
-            except Exception:  # noqa: BLE001 - receipt detail stays on the trusted host
+            except Exception as exc:  # noqa: BLE001 - receipt detail stays on the trusted host
+                terminal = search_safety_terminal_error(exc)
+                if terminal is not None:
+                    terminal_safety_failure = terminal
+                    raise RuntimeError("worker provider search-safety violation") from None
                 infrastructure_failure = PiInfrastructureError(
                     PiInfrastructureFailureKind.PROVIDER_RECEIPT
                 )
@@ -594,6 +604,8 @@ def run_pi_turn(
                             worker_usage=session.worker_usage.model_copy(),
                         )
                     session.pump(timeout=min(_PUMP_INTERVAL_S, remaining))
+                    if terminal_safety_failure is not None:
+                        raise terminal_safety_failure
                     if infrastructure_failure is not None:
                         raise evidenced_infrastructure(infrastructure_failure)
                     pending_candidate = evidenced_candidate(stage=PiCandidateFailureStage.TURN)
@@ -622,6 +634,8 @@ def run_pi_turn(
                     events=tuple(events),
                     worker_usage=session.worker_usage.model_copy(),
                 ) from exc
+            if terminal_safety_failure is not None:
+                raise terminal_safety_failure
             if session.failure_message is not None:
                 candidate_message = (
                     observed_channel.episode_error_message

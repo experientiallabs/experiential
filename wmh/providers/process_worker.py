@@ -15,7 +15,7 @@ from enum import StrEnum
 from typing import Annotated, Literal, Protocol
 
 from llm_waterfall import ChatRequest, ChatResponse
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from wmh.providers.base import ProviderConfig, ToolCallingProvider
 from wmh.providers.failure_attribution import (
@@ -24,8 +24,21 @@ from wmh.providers.failure_attribution import (
     ProviderFailureReason,
     classify_provider_failure,
 )
+from wmh.providers.receipt import (
+    ProviderResponseIdentity,
+    ProviderResponseIdentityError,
+    freeze_provider_response_identity,
+)
 from wmh.providers.registry import get_provider
-from wmh.tracking.budget import BudgetAccount, BudgetedProvider, ProviderCostMeter
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetBreachError,
+    BudgetedProvider,
+    BudgetExceededError,
+    BudgetIntegrityError,
+    ProviderCostMeter,
+    UnpricedProviderUsageError,
+)
 
 _FRAME_HEADER = struct.Struct("!I")
 _MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -86,6 +99,17 @@ class _InitializeFrame(_StrictFrame):
     kind: Literal["initialize"] = "initialize"
     provider_config: ProviderConfig
     budget_account: BudgetAccount | None = None
+    response_identity: ProviderResponseIdentity | None = None
+
+    @model_validator(mode="after")
+    def _bind_budgeted_response_identity(self) -> _InitializeFrame:
+        if (self.budget_account is None) != (self.response_identity is None):
+            raise ValueError(
+                "provider worker budget account and response identity must be supplied together"
+            )
+        if self.response_identity is not None:
+            freeze_provider_response_identity(self.provider_config, self.response_identity)
+        return self
 
 
 class _ReadyFrame(_StrictFrame):
@@ -112,8 +136,29 @@ class _FailureFrame(_StrictFrame):
         return ProviderFailureAttribution(self.owner, self.reason)
 
 
-_StartupResponse = Annotated[_ReadyFrame | _FailureFrame, Field(discriminator="kind")]
-_CompletionResponse = Annotated[_CompletionFrame | _FailureFrame, Field(discriminator="kind")]
+class _TerminalFailureReason(StrEnum):
+    """Bounded search-safety failures allowed to cross the private worker channel."""
+
+    BUDGET_BREACH = "budget_breach"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    BUDGET_INTEGRITY = "budget_integrity"
+    UNPRICED_USAGE = "unpriced_usage"
+    RESPONSE_IDENTITY = "response_identity"
+
+
+class _TerminalFailureFrame(_StrictFrame):
+    kind: Literal["terminal_failure"] = "terminal_failure"
+    reason: _TerminalFailureReason
+
+
+_StartupResponse = Annotated[
+    _ReadyFrame | _FailureFrame | _TerminalFailureFrame,
+    Field(discriminator="kind"),
+]
+_CompletionResponse = Annotated[
+    _CompletionFrame | _FailureFrame | _TerminalFailureFrame,
+    Field(discriminator="kind"),
+]
 _STARTUP_RESPONSE_ADAPTER = TypeAdapter(_StartupResponse)
 _COMPLETION_RESPONSE_ADAPTER = TypeAdapter(_CompletionResponse)
 
@@ -143,15 +188,25 @@ class ProviderProcessWorker:
         config: ProviderConfig,
         *,
         budget_account: BudgetAccount | None = None,
+        response_identity: ProviderResponseIdentity | None = None,
     ) -> None:
         self._config = config.model_copy(deep=True)
         self._budget_account: BudgetAccount | None = None
+        self._response_identity: ProviderResponseIdentity | None = None
+        if (budget_account is None) != (response_identity is None):
+            raise ValueError(
+                "provider worker budget account and response identity must be supplied together"
+            )
         if budget_account is not None:
             account = BudgetAccount.model_validate(budget_account.model_dump())
             meter = account.policy.meters[account.meter_id]
             if not isinstance(meter, ProviderCostMeter) or meter.provider_config != self._config:
                 raise ValueError("budget account provider config differs from provider worker")
             self._budget_account = account
+            self._response_identity = freeze_provider_response_identity(
+                self._config,
+                response_identity,
+            )
         self._state_lock = threading.Lock()
         self._start_lock = threading.Lock()
         self._io_lock = threading.Lock()
@@ -234,6 +289,7 @@ class ProviderProcessWorker:
                     _InitializeFrame(
                         provider_config=self._config,
                         budget_account=self._budget_account,
+                        response_identity=self._response_identity,
                     ),
                     deadline=deadline,
                     cancelled=self._cancelled_event,
@@ -254,6 +310,9 @@ class ProviderProcessWorker:
                 self._abort(force=True)
                 raise ProviderWorkerUnavailable("provider worker startup failed") from None
 
+            if isinstance(response, _TerminalFailureFrame):
+                self._abort(force=True)
+                raise _terminal_failure_error(response.reason)
             if isinstance(response, _FailureFrame):
                 self._abort(force=True)
                 raise ProviderWorkerFailure(response.attribution)
@@ -322,6 +381,9 @@ class ProviderProcessWorker:
             except (OSError, ValidationError, _FrameProtocolError):
                 self._abort(force=True)
                 raise ProviderWorkerUnavailable("provider worker protocol failed") from None
+            if isinstance(response, _TerminalFailureFrame):
+                self._abort(force=True)
+                raise _terminal_failure_error(response.reason)
             if isinstance(response, _FailureFrame):
                 raise ProviderWorkerFailure(response.attribution)
             return response.response
@@ -540,6 +602,39 @@ def _check_frame_wait(
         raise _FrameDeadlineExceeded
 
 
+def _terminal_failure_frame(error: Exception) -> _TerminalFailureFrame | None:
+    """Classify only terminal safety types without serializing their text."""
+    if isinstance(error, BudgetBreachError):
+        reason = _TerminalFailureReason.BUDGET_BREACH
+    elif isinstance(error, BudgetExceededError):
+        reason = _TerminalFailureReason.BUDGET_EXCEEDED
+    elif isinstance(error, BudgetIntegrityError):
+        reason = _TerminalFailureReason.BUDGET_INTEGRITY
+    elif isinstance(error, UnpricedProviderUsageError):
+        reason = _TerminalFailureReason.UNPRICED_USAGE
+    elif isinstance(error, ProviderResponseIdentityError):
+        reason = _TerminalFailureReason.RESPONSE_IDENTITY
+    else:
+        return None
+    return _TerminalFailureFrame(reason=reason)
+
+
+def _terminal_failure_error(reason: _TerminalFailureReason) -> RuntimeError:
+    """Reconstruct a recognized host-side safety type from a bounded reason."""
+    error_type: type[RuntimeError]
+    if reason is _TerminalFailureReason.BUDGET_BREACH:
+        error_type = BudgetBreachError
+    elif reason is _TerminalFailureReason.BUDGET_EXCEEDED:
+        error_type = BudgetExceededError
+    elif reason is _TerminalFailureReason.BUDGET_INTEGRITY:
+        error_type = BudgetIntegrityError
+    elif reason is _TerminalFailureReason.UNPRICED_USAGE:
+        error_type = UnpricedProviderUsageError
+    else:
+        error_type = ProviderResponseIdentityError
+    return error_type("provider worker terminated after a search-safety violation")
+
+
 def _serve_worker(socket_fd: int) -> int:
     connection = socket.socket(fileno=socket_fd)
     try:
@@ -549,11 +644,17 @@ def _serve_worker(socket_fd: int) -> int:
             if not isinstance(provider, ToolCallingProvider):
                 raise TypeError("configured provider has no structured chat capability")
             if initialization.budget_account is not None:
-                provider = BudgetedProvider(provider, initialization.budget_account)
-        except Exception:  # noqa: BLE001 - provider construction errors never cross the channel
+                provider = BudgetedProvider(
+                    provider,
+                    initialization.budget_account,
+                    response_identity=initialization.response_identity,
+                )
+        except Exception as exc:  # noqa: BLE001 - provider text never crosses the channel
+            terminal_failure = _terminal_failure_frame(exc)
             _send_frame(
                 connection,
-                _FailureFrame(
+                terminal_failure
+                or _FailureFrame(
                     owner=ProviderFailureOwner.INFRASTRUCTURE,
                     reason=ProviderFailureReason.CONFIGURATION,
                 ),
@@ -577,6 +678,10 @@ def _serve_worker(socket_fd: int) -> int:
             try:
                 response = provider.complete_chat(request.request)
             except Exception as exc:  # noqa: BLE001 - classify, never serialize provider text
+                terminal_failure = _terminal_failure_frame(exc)
+                if terminal_failure is not None:
+                    _send_frame(connection, terminal_failure)
+                    return 1
                 attribution = classify_provider_failure(exc)
                 _send_frame(
                     connection,

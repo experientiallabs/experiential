@@ -254,8 +254,8 @@ class PairedHarborPanelRoute(BaseModel):
 
     panel_member: str = Field(min_length=1)
     provider_config: ProviderConfig
-    expected_response_model: str | None = Field(default=None, min_length=1)
-    expected_system_fingerprint: str | None = Field(default=None, min_length=1)
+    expected_response_model: str | None = Field(default=None, min_length=1, max_length=2_048)
+    expected_system_fingerprint: str | None = Field(default=None, min_length=1, max_length=512)
     max_concurrent_blocks: StrictInt = Field(default=1, ge=1)
 
     @field_validator("provider_config", mode="after")
@@ -1389,6 +1389,7 @@ class PairedHarborProtocol(BaseModel):
                     candidate=harness,
                     spec=semantic_spec,
                     provider_config=route.provider_config,
+                    response_identity=route.response_identity,
                     runner_spec=frozen_plan.runner_spec,
                     turn_timeout_s=frozen_plan.turn_timeout_s,
                     budget_policy_digest=frozen_commitment.budget_policy_digest,
@@ -2840,6 +2841,7 @@ class PairedHarborRunner:
             runner_spec=plan.runner_spec,
             turn_timeout_s=plan.turn_timeout_s,
             require_provider_receipts=True,
+            response_identity=route.response_identity,
             session=evaluator_session,
             budget_account=provider_account,
             task_resource_budget_accounts=task_resource_accounts,
@@ -2857,6 +2859,7 @@ class PairedHarborRunner:
             turn_timeout_s=plan.turn_timeout_s,
             require_exact_run_config=True,
             budget_policy_digest=self._protocol.budget_policy_digest,
+            response_identity=route.response_identity,
         )
         admitted = admit_harbor_matrix(
             loaded,

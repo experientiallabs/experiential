@@ -14,7 +14,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Protocol, override
+from typing import Literal, Protocol, override
 from uuid import UUID
 
 from harbor.environments.factory import EnvironmentFactory
@@ -30,12 +30,17 @@ from harbor.models.metric.type import MetricType
 from harbor.models.registry import DatasetMetadata
 from harbor.models.task.config import TaskConfig
 from harbor.models.task.task import Task
-from harbor.models.task.verifier_mode import task_has_any_separate_verifier
+from harbor.models.task.verifier_mode import (
+    resolve_task_verifier_mode,
+    task_has_any_separate_verifier,
+)
 from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import TrialResult
+from harbor.publisher.packager import Packager
 from harbor.registry.client.factory import RegistryClientFactory
 from harbor.registry.client.package import PackageDatasetClient
 from harbor.tasks.client import TaskIdType
+from harbor.trial.network_policy import resolve_trial_network_plan
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from wmh.core.text import normalize_durable_text
@@ -56,7 +61,9 @@ from wmh.evals.harbor.config import (
     validate_controlled_harbor_environment,
 )
 from wmh.evals.harbor.e2b_environment import (
+    ExactE2BBuildRecord,
     ExactE2BEnvironment,
+    exact_e2b_task_launch_config_digest,
     freeze_exact_e2b_build_spec,
     require_exact_e2b_build_record,
     validate_exact_e2b_task_resource_requests,
@@ -86,6 +93,10 @@ from wmh.harness.pi_runner_backend import (
     validate_pi_runner_turn_timeout,
 )
 from wmh.providers.base import ProviderConfig
+from wmh.providers.receipt import (
+    ProviderResponseIdentity,
+    freeze_provider_response_identity,
+)
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetAccountBinding,
@@ -111,7 +122,7 @@ _TASK_SNAPSHOT_ROOT = ".wmh-task-snapshots"
 _JOB_ROOT_FILES = frozenset(
     {_MANIFEST_FILENAME, "config.json", "job.log", "lock.json", "result.json"}
 )
-HARBOR_EVALUATOR_VERSION = "3"
+HARBOR_EVALUATOR_VERSION = "4"
 
 
 class StaleHarborJobError(RuntimeError):
@@ -187,14 +198,21 @@ def harbor_run_expectation(
     runner_image: str | None = None,
     runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
     turn_timeout_s: float,
-    require_provider_receipts: bool = True,
+    require_provider_receipts: Literal[True] = True,
+    response_identity: ProviderResponseIdentity | None = None,
     budget_policy_digest: str | None = None,
 ) -> HarborRunExpectation:
     """Build the path-independent identity expected from one exact Harbor run."""
+    if require_provider_receipts is not True:
+        raise ValueError("scored Harbor runs always require provider receipts")
     validated_runner = _coerce_runner_spec(runner_spec=runner_spec, runner_image=runner_image)
     validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
     frozen_spec = HarborJobSpec.model_validate(spec.model_dump())
     frozen_provider = ProviderConfig.model_validate(provider_config.model_dump())
+    frozen_response_identity = freeze_provider_response_identity(
+        frozen_provider,
+        response_identity,
+    )
     agent = _build_harbor_agent_config(
         candidate=candidate,
         provider_config=frozen_provider,
@@ -202,6 +220,7 @@ def harbor_run_expectation(
         turn_timeout_s=turn_timeout_s,
         agent_n_concurrent=frozen_spec.agent_n_concurrent,
         require_provider_receipts=require_provider_receipts,
+        response_identity=frozen_response_identity,
         budget_policy_digest=budget_policy_digest,
     )
     run_config_digest = harbor_run_config_digest(
@@ -238,12 +257,19 @@ def _build_harbor_agent_config(
     runner_spec: PiRunnerBackendSpec,
     turn_timeout_s: float,
     agent_n_concurrent: int | None,
-    require_provider_receipts: bool,
+    require_provider_receipts: Literal[True],
+    response_identity: ProviderResponseIdentity | None = None,
     budget_policy_digest: str | None = None,
     budget_binding: BudgetAccountBinding | None = None,
     runner_budget_binding: BudgetAccountBinding | None = None,
     create_rate_binding: ExternalDispatchRateBinding | None = None,
 ) -> AgentConfig:
+    if require_provider_receipts is not True:
+        raise ValueError("scored Harbor agent configs always require provider receipts")
+    frozen_response_identity = freeze_provider_response_identity(
+        provider_config,
+        response_identity,
+    )
     if budget_binding is not None and budget_binding.policy_digest != budget_policy_digest:
         raise ValueError("budget binding differs from the frozen policy digest")
     if runner_budget_binding is not None and (
@@ -260,6 +286,8 @@ def _build_harbor_agent_config(
         "turn_timeout_s": turn_timeout_s,
         "require_provider_receipts": require_provider_receipts,
     }
+    if frozen_response_identity is not None:
+        kwargs["response_identity"] = frozen_response_identity.model_dump(mode="json")
     if budget_policy_digest is not None:
         kwargs["budget_policy_digest"] = budget_policy_digest
     if budget_binding is not None:
@@ -383,7 +411,8 @@ class HarborEvaluator:
         runner_image: str | None = None,
         runner_spec: PiRunnerBackendSpec | JsonObject | None = None,
         turn_timeout_s: float = 300.0,
-        require_provider_receipts: bool = True,
+        require_provider_receipts: Literal[True] = True,
+        response_identity: ProviderResponseIdentity | None = None,
         session: HarborEvaluatorSession | None = None,
         budget_account: BudgetAccount | None = None,
         task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = (),
@@ -396,8 +425,8 @@ class HarborEvaluator:
             runner_image=runner_image,
         )
         validate_pi_runner_turn_timeout(validated_runner, turn_timeout_s=turn_timeout_s)
-        if not isinstance(require_provider_receipts, bool):
-            raise ValueError("require_provider_receipts must be a boolean")
+        if require_provider_receipts is not True:
+            raise ValueError("HarborEvaluator always requires provider receipts")
         validated_spec = HarborJobSpec.model_validate(spec.model_dump())
         _validate_job_name(validated_spec.job_name)
         self._spec = validated_spec.model_copy(
@@ -406,7 +435,11 @@ class HarborEvaluator:
         self._provider_config = provider_config.model_copy(deep=True)
         self._runner_spec = validated_runner
         self._turn_timeout_s = turn_timeout_s
-        self._require_provider_receipts = require_provider_receipts
+        self._require_provider_receipts: Literal[True] = True
+        self._response_identity = freeze_provider_response_identity(
+            self._provider_config,
+            response_identity,
+        )
         self._session = session
         self._qualified_tasks = (
             None
@@ -433,18 +466,19 @@ class HarborEvaluator:
         self._create_rate_binding: ExternalDispatchRateBinding | None = None
         self._task_resource_budget_accounts: tuple[TimedResourceBudgetAccount, ...] = ()
         self._runner_resource_budget_account: TimedResourceBudgetAccount | None = None
-        if budget_account is not None:
-            account = BudgetAccount.model_validate(budget_account.model_dump())
-            meter = account.policy.meters[account.meter_id]
-            if (
-                not isinstance(meter, ProviderCostMeter)
-                or meter.provider_config != self._provider_config
-            ):
-                raise ValueError(
-                    "budget account provider config must match the Harbor evaluator provider"
-                )
-            self._budget_binding = bind_budget_account(account)
-            self._budget_policy_digest = account.policy.policy_digest
+        if budget_account is None:
+            raise ValueError("Harbor provider evaluation requires a frozen provider budget account")
+        account = BudgetAccount.model_validate(budget_account.model_dump())
+        meter = account.policy.meters[account.meter_id]
+        if (
+            not isinstance(meter, ProviderCostMeter)
+            or meter.provider_config != self._provider_config
+        ):
+            raise ValueError(
+                "budget account provider config must match the Harbor evaluator provider"
+            )
+        self._budget_binding = bind_budget_account(account)
+        self._budget_policy_digest = account.policy.policy_digest
         resource_accounts = tuple(
             TimedResourceBudgetAccount.model_validate(account.model_dump())
             for account in task_resource_budget_accounts
@@ -455,8 +489,6 @@ class HarborEvaluator:
             )
         else:
             runner_account = None
-        if (resource_accounts or runner_account is not None) and budget_account is None:
-            raise ValueError("resource budgets require a provider budget account")
         all_resource_accounts = resource_accounts + (
             (runner_account,) if runner_account is not None else ()
         )
@@ -467,15 +499,11 @@ class HarborEvaluator:
         if self._spec.environment_backend is HarborEnvironmentBackend.LOCAL:
             if resource_accounts:
                 raise ValueError("local Harbor task environments cannot consume a resource meter")
-        elif budget_account is None:
-            raise ValueError("E2B task environments require a provider hard-budget account")
         elif not resource_accounts:
             raise ValueError("budgeted E2B task environments require a timed resource budget")
         if isinstance(self._runner_spec, LocalPiRunnerSpec):
             if runner_account is not None:
                 raise ValueError("local Pi runners cannot consume an external resource meter")
-        elif budget_account is None:
-            raise ValueError("E2B Pi runners require a provider hard-budget account")
         elif runner_account is None:
             raise ValueError("budgeted E2B runners require a timed resource budget")
         else:
@@ -563,6 +591,13 @@ class HarborEvaluator:
             job_config,
             self._task_resource_budget_accounts,
         )
+        if self._qualified_tasks is not None:
+            await asyncio.to_thread(
+                _preflight_qualified_task_commitments,
+                job_config,
+                self._qualified_tasks,
+                self._task_resource_budget_accounts,
+            )
         await self._ensure_runner_ready()
 
         try:
@@ -636,6 +671,7 @@ class HarborEvaluator:
             turn_timeout_s=self._turn_timeout_s,
             agent_n_concurrent=self._spec.agent_n_concurrent,
             require_provider_receipts=self._require_provider_receipts,
+            response_identity=self._response_identity,
             budget_policy_digest=self._budget_policy_digest,
             budget_binding=self._budget_binding,
             runner_budget_binding=self._runner_resource_budget_binding,
@@ -897,6 +933,157 @@ def _matching_resource_accounts(
         ):
             matches.append((index, account))
     return matches
+
+
+def _preflight_qualified_task_commitments(
+    config: JobConfig,
+    qualified_tasks: tuple[QualifiedHarborTask, ...],
+    resource_accounts: tuple[TimedResourceBudgetAccount, ...],
+) -> None:
+    """Recompute qualified content and launch identities before Harbor creates a job."""
+    if len(config.agents) != 1:
+        raise ValueError("qualified Harbor preflight requires one exact agent configuration")
+    qualified_by_id = {task.task_id: task for task in qualified_tasks}
+    if len(qualified_by_id) != len(qualified_tasks):
+        raise ValueError("qualified task IDs must be unique")
+    found_ids: set[str] = set()
+    for dataset in config.datasets:
+        if not dataset.is_local() or dataset.path is None:
+            raise UnsupportedHarborTaskError(
+                "qualified task preflight requires snapshotted local dataset paths"
+            )
+        root = dataset.path.expanduser()
+        selected_names = (
+            tuple(sorted(path.name for path in root.iterdir() if path.is_dir()))
+            if dataset.task_names is None
+            else tuple(dataset.task_names)
+        )
+        for selected_name in selected_names:
+            task_dir = root / selected_name
+            if not task_dir.is_dir() or not (task_dir / "task.toml").is_file():
+                raise ValueError("prepared Harbor tasks differ from qualification evidence")
+            task = Task(task_dir)
+            task_id = task.name
+            qualification = qualified_by_id.get(task_id)
+            if qualification is None or task_id in found_ids:
+                raise ValueError("prepared Harbor tasks differ from qualification evidence")
+            found_ids.add(task_id)
+            content_hash, _files = Packager.compute_content_hash(task_dir)
+            content_digest = "sha256:" + content_hash
+            task_key = _dataset_qualified_task_key(
+                source=root.name,
+                task_identity=task_id,
+                task_checksum=content_digest,
+            )
+            if qualification.content_digest != content_digest or qualification.task_key != task_key:
+                raise ValueError("prepared Harbor task differs from qualification evidence")
+            _preflight_qualified_task_launch(
+                config,
+                task,
+                qualification=qualification,
+                resource_accounts=resource_accounts,
+            )
+    if found_ids != set(qualified_by_id):
+        raise ValueError("prepared Harbor tasks differ from qualification evidence")
+
+
+def _preflight_qualified_task_launch(
+    config: JobConfig,
+    task: Task,
+    *,
+    qualification: QualifiedHarborTask,
+    resource_accounts: tuple[TimedResourceBudgetAccount, ...],
+) -> None:
+    """Rebind one qualification to current backend, build, resource, storage, and network inputs."""
+    expected_backend = (
+        HarborEnvironmentBackend.E2B
+        if config.environment.type is EnvironmentType.E2B
+        else HarborEnvironmentBackend.LOCAL
+    )
+    if qualification.environment_backend is not expected_backend:
+        raise ValueError("prepared Harbor task backend differs from qualification evidence")
+    requested_storage_mb = (
+        config.environment.override_storage_mb
+        if config.environment.override_storage_mb is not None
+        else task.config.environment.storage_mb
+    )
+    if qualification.requested_storage_mb != requested_storage_mb:
+        raise ValueError("prepared Harbor task storage differs from qualification evidence")
+    if expected_backend is HarborEnvironmentBackend.LOCAL:
+        return
+
+    validate_exact_e2b_task_resource_requests(task.config.environment)
+    cpu_count = task.config.environment.cpus or 2
+    memory_mb = task.config.environment.memory_mb or 1024
+    build_spec = freeze_exact_e2b_build_spec(
+        environment_dir=task.paths.environment_dir,
+        docker_image=task.config.environment.docker_image,
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+    )
+    resource_class = ExactE2BEnvironment._task_resource_class(
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+    )
+    matching_accounts = _matching_resource_accounts(
+        resource_accounts,
+        resource_class=resource_class,
+    )
+    if len(matching_accounts) != 1:
+        raise ValueError("qualified E2B task requires one exact timed resource account")
+    _matched_index, matched_account = matching_accounts[0]
+    build = require_exact_e2b_build_record(
+        jobs_dir=config.jobs_dir,
+        environment_id=build_spec.environment_id,
+        build_context_digest=build_spec.build_context_digest,
+        docker_image=build_spec.docker_image,
+        cpu_count=cpu_count,
+        memory_mb=memory_mb,
+        expected_budget_authority=matched_account,
+        allow_preexisting_outside_study=bool(
+            config.environment.kwargs.get("allow_preexisting_e2b_builds", False)
+        ),
+    )
+    _validate_qualified_e2b_build(qualification, build, resource_class=resource_class)
+    network_plan = resolve_trial_network_plan(
+        task.config,
+        config.agents[0],
+        config.environment,
+        None,
+        verifier_mode=resolve_task_verifier_mode(task.config),
+    )
+    launch_digest = exact_e2b_task_launch_config_digest(
+        build=build,
+        requested_storage_mb=requested_storage_mb,
+        network_policy=network_plan.agent_env_baseline,
+    )
+    if qualification.e2b_launch_config_digest != launch_digest:
+        raise ValueError("prepared E2B launch differs from qualification evidence")
+
+
+def _validate_qualified_e2b_build(
+    qualification: QualifiedHarborTask,
+    build: ExactE2BBuildRecord,
+    *,
+    resource_class: TimedResourceClass,
+) -> None:
+    identity = qualification.e2b_build_identity
+    if (
+        identity is None
+        or qualification.e2b_build_config_digest != build.build_config_digest
+        or qualification.e2b_build_record_digest != build.digest
+        or qualification.task_resource_class_digest != resource_class.digest
+        or qualification.task_resource_class != resource_class
+        or identity.build_config_digest != build.build_config_digest
+        or identity.build_record_digest != build.digest
+        or identity.environment_id != build.environment_id
+        or identity.build_context_digest != build.build_context_digest
+        or identity.cpu_count != build.cpu_count
+        or identity.memory_mb != build.memory_mb
+        or identity.template_id != build.template_id
+        or identity.build_id != build.build_id
+    ):
+        raise ValueError("prepared E2B build differs from qualification evidence")
 
 
 def _build_prepared_job_lock(job: Job) -> JobLock:
@@ -1665,7 +1852,7 @@ def harbor_run_config_digest(spec: HarborJobSpec, agent_config_digest: str) -> s
     per-attempt ledger exists.
     """
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "evaluator": "wmh-harbor",
         "evaluator_version": HARBOR_EVALUATOR_VERSION,
         "harbor_version": SUPPORTED_HARBOR_VERSION,
