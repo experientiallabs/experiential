@@ -65,7 +65,7 @@ def test_doc_hash_is_content_and_order_independent() -> None:
     assert doc3.doc_hash != doc1.doc_hash
 
 
-def test_execution_hash_includes_materialized_paths_and_ignores_display_metadata() -> None:
+def test_doc_hash_includes_materialized_paths_and_ignores_display_metadata() -> None:
     first = HarnessDoc(
         name="first",
         version=1,
@@ -93,10 +93,8 @@ def test_execution_hash_includes_materialized_paths_and_ignores_display_metadata
         ],
     )
 
-    assert renamed.execution_hash == first.execution_hash
     assert renamed.doc_hash == first.doc_hash
     assert moved.doc_hash != first.doc_hash
-    assert moved.execution_hash != first.execution_hash
 
 
 def test_duplicate_surface_ids_rejected() -> None:

@@ -182,11 +182,6 @@ class HarnessDoc(BaseModel):
 
     @property
     def doc_hash(self) -> str:
-        """Execution identity of the whole document (order-independent via canonical sort)."""
-        return self.execution_hash
-
-    @property
-    def execution_hash(self) -> str:
         """Identity of every surface field that can change materialized execution.
 
         Display metadata and validation-only budgets do not affect execution. A code surface's
