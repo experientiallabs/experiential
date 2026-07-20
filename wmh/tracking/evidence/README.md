@@ -21,6 +21,13 @@ Built-in Bedrock routes require the exact source set registered for that route. 
 the retained catalog publication metadata, model route, billing mode, region, SKU, usage dimension,
 unit, effective date, and price. A known but unrelated catalog source is rejected.
 
+The generic HTML binding check proves only that an exact bound value occurs in the digest-pinned
+snapshot; it is not a general DOM-coordinate evaluator. Built-in Bedrock semantic sources also pass
+a profile-specific structural check that requires one model row in the expected pricing table,
+binds its input and output columns to the exact pricing-expression identifiers, and joins those
+identifiers to exact JSON catalog meters. A new HTML evidence profile must add an equivalent
+structural verifier and must not rely on value presence alone.
+
 Azure routes are caller-supplied because their deployment identity is account-specific. Capture and
 retain exactly three JSON responses: the Azure resource account, its deployment, and the bounded
 Azure Retail Prices response. The ARM reads may use normal request-header authentication, but
