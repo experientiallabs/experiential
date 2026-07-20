@@ -273,7 +273,7 @@ class HarnessDoc(BaseModel):
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
         pi_transport: Literal["ssh", "link"] | None = None,
-        transport_retries: int = 1,
+        transport_retries: int | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> Runtime:
         """The configured agent runtime this document describes.
@@ -288,12 +288,14 @@ class HarnessDoc(BaseModel):
         npm deps) is already done; default is $WMH_E2B_TEMPLATE. Under `local`, "pi-node" uses
         the SSH shim (or the RunnerLink frame transport when PI_TRANSPORT=link); otherwise a
         `code:runtime` surface drives episodes with the harness's own in-process program; with
-        neither, the fixed baseline loop runs. All expose the same
+        neither, the fixed baseline loop runs. `transport_retries` controls whole-episode replay
+        only for the E2B pi-node backend; omitting it preserves that runtime's one-retry default.
+        All expose the same
         `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
         if backend not in ("local", "e2b"):
             raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
-        if (
+        if transport_retries is not None and (
             isinstance(transport_retries, bool)
             or not isinstance(transport_retries, int)
             or transport_retries < 0
@@ -304,6 +306,8 @@ class HarnessDoc(BaseModel):
         runtime_kind = self.runtime_kind()
         if pi_transport is not None and (backend != "local" or runtime_kind != "pi-node"):
             raise ValueError("pi_transport applies only to local pi-node execution")
+        if transport_retries is not None and (backend != "e2b" or runtime_kind != "pi-node"):
+            raise ValueError("transport_retries applies only to e2b pi-node execution")
         if runtime_kind == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
@@ -341,7 +345,7 @@ class HarnessDoc(BaseModel):
                     pool=e2b_pool,
                     max_turns=self.max_turns(),
                     max_output_tokens=self.max_output_tokens(),
-                    transport_retries=transport_retries,
+                    transport_retries=(1 if transport_retries is None else transport_retries),
                     should_cancel=should_cancel,
                 )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
