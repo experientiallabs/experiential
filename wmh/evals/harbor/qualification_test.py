@@ -184,7 +184,13 @@ def _install_fake_environments(
         trial_paths: TrialPaths,
         **kwargs: object,
     ) -> _FakeEnvironment:
-        constructor_kwargs.append({"environment_name": environment_name, **kwargs})
+        constructor_kwargs.append(
+            {
+                "environment_name": environment_name,
+                "trial_paths": trial_paths,
+                **kwargs,
+            }
+        )
         task_env_config = cast("Any", kwargs["task_env_config"])
         return _FakeEnvironment(
             environment_name=environment_name,
@@ -1208,6 +1214,15 @@ def test_e2b_qualification_dedupes_builds_and_binds_launch_accounts(
     assert all(
         cast("Any", kwargs["config"]).kwargs["resource_budget_bindings"]
         for kwargs in constructor_kwargs
+    )
+    operation_hash = hashlib.sha256(b"e2b-full-roster").hexdigest()
+    expected_trial_namespace = (
+        tmp_path / "jobs" / f".wmh-roster-qualification-trials-{operation_hash}"
+    ).resolve()
+    trial_paths = tuple(cast("TrialPaths", kwargs["trial_paths"]) for kwargs in constructor_kwargs)
+    assert all(paths.trial_dir.parent == expected_trial_namespace for paths in trial_paths)
+    assert all(
+        paths.trial_dir.parent.parent == (tmp_path / "jobs").resolve() for paths in trial_paths
     )
     create_rate_bindings = [
         cast("Any", kwargs["config"]).kwargs["create_rate_binding"] for kwargs in constructor_kwargs

@@ -567,6 +567,10 @@ def test_prequalification_budget_policy_ledger_and_15k_cap_bind_final_study_spec
     plan = launch.study_spec.prepared.protocol.execution_plan
     assert plan.environment_backend is HarborEnvironmentBackend.E2B
     assert plan.runner_spec == runner.spec
+    shared_jobs_dir = runtime.jobs_dir
+    assert launch.preparation_commitment.qualification_runtime.jobs_dir == shared_jobs_dir
+    assert launch.study_spec.discovery_job_spec.jobs_dir == shared_jobs_dir
+    assert launch.study_spec.confirmation_runtime.jobs_dir == shared_jobs_dir
     assert launch.runner_artifact_digest == _RUNNER_FILE_DIGEST
     assert launch.evidence_use == "plumbing-only"
     assert launch.optimizer_feedback_allowed is False
@@ -631,6 +635,24 @@ def test_prequalification_budget_policy_ledger_and_15k_cap_bind_final_study_spec
     over_cap_study = launch.study_spec.model_copy(update={"prepared": over_cap_prepared})
     with pytest.raises(ValueError, match="budget or runtime differs"):
         PreparedHarnessOptimizationCanary(**launch_fields, study_spec=over_cap_study)
+
+    split_discovery_job = launch.study_spec.discovery_job_spec.model_copy(
+        update={"jobs_dir": (tmp_path / "split-discovery-jobs").resolve()}
+    )
+    split_jobs_study = launch.study_spec.model_copy(
+        update={"discovery_job_spec": split_discovery_job}
+    )
+    with pytest.raises(ValueError, match="jobs root differs"):
+        PreparedHarnessOptimizationCanary(**launch_fields, study_spec=split_jobs_study)
+
+    split_confirmation_runtime = launch.study_spec.confirmation_runtime.model_copy(
+        update={"jobs_dir": (tmp_path / "split-confirmation-jobs").resolve()}
+    )
+    split_jobs_study = launch.study_spec.model_copy(
+        update={"confirmation_runtime": split_confirmation_runtime}
+    )
+    with pytest.raises(ValueError, match="jobs root differs"):
+        PreparedHarnessOptimizationCanary(**launch_fields, study_spec=split_jobs_study)
 
 
 def test_checkout_failure_precedes_qualification_or_e2b_dispatch(tmp_path: Path) -> None:

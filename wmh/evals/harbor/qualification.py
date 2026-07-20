@@ -91,6 +91,7 @@ from wmh.tracking.rate_limit import (
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _QUALIFICATION_ROOT = ".wmh-roster-qualification"
+_QUALIFICATION_TRIAL_PREFIX = ".wmh-roster-qualification-trials-"
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
@@ -621,6 +622,9 @@ class HarborRosterQualifier:
             self._create_rate_authority = authority
         operation_hash = hashlib.sha256(operation_id.encode()).hexdigest()
         self._root = self._runtime.jobs_dir / _QUALIFICATION_ROOT / operation_hash
+        self._trial_namespace = (
+            self._runtime.jobs_dir / f"{_QUALIFICATION_TRIAL_PREFIX}{operation_hash}"
+        )
 
     @property
     def roster_path(self) -> Path:
@@ -681,7 +685,9 @@ class HarborRosterQualifier:
             raise HarborRosterQualificationError("qualification operation root cannot be a link")
         self._root.mkdir(mode=0o700, exist_ok=True)
         (self._root / "evidence").mkdir(mode=0o700, exist_ok=True)
-        (self._root / "environments").mkdir(mode=0o700, exist_ok=True)
+        if self._trial_namespace.is_symlink():
+            raise HarborRosterQualificationError("qualification trial namespace cannot be a link")
+        self._trial_namespace.mkdir(mode=0o700, exist_ok=True)
 
     def _operation_lease(self) -> AbstractContextManager[None]:
         lock_path = self._root / "operation.lock"
@@ -1261,7 +1267,7 @@ class HarborRosterQualifier:
 
     def _environment_root(self, task: _PreparedTaskCommitment) -> Path:
         key = hashlib.sha256(f"{task.dataset_id}\0{task.task_id}".encode()).hexdigest()
-        return self._root / "environments" / key
+        return self._trial_namespace / key
 
     def _load_complete_roster(
         self,

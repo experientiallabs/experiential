@@ -602,6 +602,11 @@ class PreparedHarnessOptimizationCanary(BaseModel):
         confirmation_budget = self.study_spec.prepared.confirmation_budget
         confirmation_runtime = self.study_spec.confirmation_runtime
         if (
+            self.study_spec.discovery_job_spec.jobs_dir != qualification_runtime.jobs_dir
+            or confirmation_runtime.jobs_dir != qualification_runtime.jobs_dir
+        ):
+            raise ValueError("prepared study jobs root differs from qualification authority")
+        if (
             search_budget.policy != qualification_budget.policy
             or search_budget.policy.policy_digest != commitment.qualification_budget_policy_digest
             or search_budget.ledger_identity != qualification_budget.ledger_identity
@@ -867,7 +872,7 @@ def _compose_canary(
     rate_binding = bind_external_dispatch_rate_authority(rate_authority)
     discovery_job = HarborJobSpec(
         job_name=f"{manifest.experiment_id}-discovery",
-        jobs_dir=(private_dir / "discovery-jobs").resolve(),
+        jobs_dir=runtime.jobs_dir,
         datasets=[
             DatasetConfig(
                 path=dataset_path,
@@ -1019,7 +1024,7 @@ def _compose_canary(
         partition_control_dir=control_dir.resolve(),
         discovery_job_spec=discovery_job,
         confirmation_runtime=HarborExecutionRuntime(
-            jobs_dir=(private_dir / "confirmation-jobs").resolve(),
+            jobs_dir=runtime.jobs_dir,
             dataset_paths_by_id={manifest.dataset_id: dataset_path},
             budget=confirmation_budget,
             create_rate_ledger_path=rate_path,
