@@ -280,7 +280,7 @@ def score_harness(
 ) -> HarnessScore:
     """Score once, reject identity drift, and detach immutable trusted metadata."""
     scored = scorer.score(candidate, request=request)
-    if scored.report.candidate_execution_hash != candidate.execution_hash:
+    if scored.report.candidate_execution_hash != candidate.doc_hash:
         raise ValueError(
             "scorer returned a candidate execution hash that does not match the scored harness"
         )

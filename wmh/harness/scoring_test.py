@@ -82,7 +82,7 @@ def _score(candidate: HarnessDoc, *, content: str = "raw trace\n") -> HarnessSco
     artifact = EvaluationArtifact.from_text(path=_RAW_PATH, content=content)
     report = HarnessScoreReport(
         source_run_id="run-1",
-        candidate_execution_hash=candidate.execution_hash,
+        candidate_execution_hash=candidate.doc_hash,
         request=_request(),
         cells=_cells(),
         artifacts=(artifact,),
@@ -182,7 +182,7 @@ def test_score_report_requires_the_exact_task_attempt_matrix(
     with pytest.raises(ValidationError, match=match):
         HarnessScoreReport(
             source_run_id="run-1",
-            candidate_execution_hash=candidate.execution_hash,
+            candidate_execution_hash=candidate.doc_hash,
             request=_request(),
             cells=cells,
             artifacts=(artifact,),
@@ -207,7 +207,7 @@ def test_score_report_requires_raw_evidence_and_unique_artifact_paths() -> None:
     with pytest.raises(ValidationError, match="missing artifact"):
         HarnessScoreReport(
             source_run_id="run-1",
-            candidate_execution_hash=candidate.execution_hash,
+            candidate_execution_hash=candidate.doc_hash,
             request=_request(),
             cells=(unreferenced, *_cells()[1:]),
             artifacts=(artifact,),
@@ -216,7 +216,7 @@ def test_score_report_requires_raw_evidence_and_unique_artifact_paths() -> None:
     with pytest.raises(ValidationError, match="duplicate artifact"):
         HarnessScoreReport(
             source_run_id="run-1",
-            candidate_execution_hash=candidate.execution_hash,
+            candidate_execution_hash=candidate.doc_hash,
             request=_request(),
             cells=_cells(),
             artifacts=(artifact, artifact),
@@ -266,7 +266,7 @@ def test_artifact_manifest_and_reader_preserve_arbitrary_bytes() -> None:
     cells = tuple(cell.model_copy(update={"artifact_paths": (path,)}) for cell in _cells())
     report = HarnessScoreReport(
         source_run_id="run-1",
-        candidate_execution_hash=candidate.execution_hash,
+        candidate_execution_hash=candidate.doc_hash,
         request=_request(),
         cells=cells,
         artifacts=(artifact,),
@@ -371,7 +371,7 @@ def test_score_harness_returns_a_detached_deeply_immutable_snapshot() -> None:
 
     class Scorer:
         def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScore:
-            assert candidate.execution_hash == original.report.candidate_execution_hash
+            assert candidate.doc_hash == original.report.candidate_execution_hash
             assert request == _request()
             return original
 
@@ -401,7 +401,7 @@ def test_score_harness_detects_artifact_mutation_after_snapshot() -> None:
     source = _ArtifactReader({_RAW_PATH: content.encode("utf-8")})
     report = HarnessScoreReport(
         source_run_id="run-1",
-        candidate_execution_hash=candidate.execution_hash,
+        candidate_execution_hash=candidate.doc_hash,
         request=_request(),
         cells=_cells(),
         artifacts=(artifact,),
