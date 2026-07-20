@@ -2916,8 +2916,10 @@ def test_e2b_scored_wiring_uses_exact_accounts_and_never_builds(
 
 def test_protocol_rejects_opened_e2b_build_drift_on_reload(tmp_path: Path) -> None:
     protocol = _e2b_runner(tmp_path, _candidate())._protocol
-    payload = cast("dict[str, Any]", protocol.model_dump(mode="json"))
-    payload["opened_selection"]["tasks"][0]["e2b_build_record_digest"] = "sha256:" + "f" * 64
+    payload = cast("JsonObject", protocol.model_dump(mode="json"))
+    opened_selection = cast("JsonObject", payload["opened_selection"])
+    tasks = cast("list[JsonObject]", opened_selection["tasks"])
+    tasks[0]["e2b_build_record_digest"] = "sha256:" + "f" * 64
 
     with pytest.raises(ValueError, match="qualification identities|opened selection"):
         mod.PairedHarborProtocol.model_validate(payload)
@@ -3094,14 +3096,11 @@ def test_pair_state_rejects_pre_evidence_schema_with_explicit_restart_path(
     block = runner._protocol.design.blocks[0]
     current = runner._pair_state(block, status="failed")
     assert current.state_version == "3"
-    legacy = cast("dict[str, Any]", current.model_dump(mode="json"))
+    legacy = cast("JsonObject", current.model_dump(mode="json"))
     legacy["state_version"] = "2"
     legacy.pop("evidence_digest")
     legacy["state_digest"] = mod._canonical_digest(
-        cast(
-            "Any",
-            {key: value for key, value in legacy.items() if key != "state_digest"},
-        )
+        {key: value for key, value in legacy.items() if key != "state_digest"}
     )
 
     restart_error = "version 2 predates evidence binding.*new operation_id"
@@ -3306,17 +3305,14 @@ def test_restart_reuses_completed_pairs_and_reruns_only_authorized_failed_pair(
         state.pair_generation_id for state in completed_states
     )
 
-    drifted_authorization = cast("dict[str, Any]", authorization.model_dump(mode="json"))
+    drifted_authorization = cast("JsonObject", authorization.model_dump(mode="json"))
     drifted_authorization["failed_state_digest"] = "sha256:" + "f" * 64
     drifted_authorization["authorization_digest"] = mod._canonical_digest(
-        cast(
-            "Any",
-            {
-                key: value
-                for key, value in drifted_authorization.items()
-                if key != "authorization_digest"
-            },
-        )
+        {
+            key: value
+            for key, value in drifted_authorization.items()
+            if key != "authorization_digest"
+        }
     )
     with pytest.raises(ValueError, match="differs from its failed state"):
         mod.PairedHarborPairRetryAuthorization.model_validate(drifted_authorization)
