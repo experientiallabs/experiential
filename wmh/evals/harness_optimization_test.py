@@ -665,6 +665,7 @@ def _discovery_lifecycle(
         RosterQualifiedPayload(
             qualified_roster_digest=protocol.qualification_roster_digest,
             qualification_report_digest=_digest("qualification-report"),
+            qualification_report_publication_digest=_digest("qualification-publication"),
             execution_plan_digest=protocol.execution_plan.digest,
             qualified_task_count=4,
         )

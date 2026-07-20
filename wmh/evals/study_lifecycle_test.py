@@ -197,6 +197,7 @@ def test_controller_publishes_typed_chronology_and_guards_the_active_phase(
     roster = RosterQualifiedPayload(
         qualified_roster_digest=_digest("roster"),
         qualification_report_digest=_digest("qualification"),
+        qualification_report_publication_digest=_digest("qualification-publication"),
         execution_plan_digest=_digest("execution-plan"),
         qualified_task_count=89,
     )
@@ -250,6 +251,7 @@ def test_run_claim_rejects_a_second_fresh_start_but_allows_exact_resume(
     roster = RosterQualifiedPayload(
         qualified_roster_digest=_digest("roster"),
         qualification_report_digest=_digest("qualification"),
+        qualification_report_publication_digest=_digest("qualification-publication"),
         execution_plan_digest=_digest("execution-plan"),
         qualified_task_count=89,
     )
@@ -486,6 +488,7 @@ def test_protected_evidence_phases_reject_unverified_generic_publication(
         RosterQualifiedPayload(
             qualified_roster_digest=_digest("roster"),
             qualification_report_digest=_digest("qualification"),
+            qualification_report_publication_digest=_digest("qualification-publication"),
             execution_plan_digest=_digest("execution-plan"),
             qualified_task_count=89,
         )
@@ -534,6 +537,7 @@ def test_stop_derives_exact_terminal_accounting_from_the_live_ledger(tmp_path: P
             RosterQualifiedPayload(
                 qualified_roster_digest=_digest("roster"),
                 qualification_report_digest=_digest("qualification"),
+                qualification_report_publication_digest=_digest("qualification-publication"),
                 execution_plan_digest=_digest("execution-plan"),
                 qualified_task_count=89,
             )

@@ -56,6 +56,7 @@ from wmh.evals.harness_optimization import (
     summarize_harness_optimization_outcome,
 )
 from wmh.evals.partition import PartitionControlStore
+from wmh.evals.qualification_report import BenchmarkQualificationReport
 from wmh.evals.study_journal import (
     ExternalPublicationReceipt,
     StudyJournalGenesis,
@@ -83,6 +84,7 @@ from wmh.evals.study_lifecycle import (
     StudyPhasePayload,
     StudySliceResult,
 )
+from wmh.evals.study_provenance import HarnessOptimizationCodeProvenance
 from wmh.harness.cost import SearchComponentRole, SearchCostRuntime
 from wmh.harness.create import SearchCheckpoint, SearchProposalBatchWitness
 from wmh.harness.doc import HarnessDoc
@@ -145,6 +147,7 @@ class HarnessOptimizationStudySpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     spec_version: Literal["1"] = "1"
+    code_provenance: HarnessOptimizationCodeProvenance
     prepared: PreparedHarnessOptimizationStudy
     partition_control_dir: Path
     discovery_job_spec: HarborJobSpec
@@ -153,7 +156,7 @@ class HarnessOptimizationStudySpec(BaseModel):
         default_factory=DirectDiscoveryProposerRuntime
     )
     discovery_create_rate_ledger_path: Path | None = None
-    qualification_report_digest: str = Field(pattern=_DIGEST_PATTERN)
+    qualification_report: BenchmarkQualificationReport
     confirmation_operation_id: str = Field(min_length=1, max_length=256)
     confirmation_generation_id: StrictInt = Field(default=1, ge=1)
 
@@ -182,6 +185,11 @@ class HarnessOptimizationStudySpec(BaseModel):
             if not path.is_absolute():
                 raise ValueError(f"{label} must be absolute")
         plan = self.prepared.protocol.execution_plan
+        self.qualification_report.validate_roster(
+            code_provenance=self.code_provenance,
+            execution_plan=plan,
+            roster=self.prepared.qualification_roster,
+        )
         job = self.discovery_job_spec
         if job.environment_backend is not plan.environment_backend:
             raise ValueError("discovery backend differs from the frozen Harbor execution plan")
@@ -262,9 +270,10 @@ class HarnessOptimizationStudyState(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    state_version: Literal["1"] = "1"
+    state_version: Literal["2"] = "2"
     spec_digest: str = Field(pattern=_DIGEST_PATTERN)
     preparation: PreparationPlannedPayload | None = None
+    qualification_report_publication: StudyArtifactPublication | None = None
     roster_qualified: RosterQualifiedPayload | None = None
     protocol_publication: StudyArtifactPublication | None = None
     protocol_published: ProtocolPublishedPayload | None = None
@@ -293,6 +302,8 @@ class HarnessOptimizationStudyState(BaseModel):
 
     @model_validator(mode="after")
     def _validate_dependencies(self) -> Self:
+        if self.roster_qualified is not None and self.qualification_report_publication is None:
+            raise ValueError("roster qualification payload requires its report publication")
         if self.protocol_published is not None and self.protocol_publication is None:
             raise ValueError("protocol payload requires its artifact publication")
         if self.search_checkpoint_journaled_iteration is not None:
@@ -455,6 +466,8 @@ class StudyArtifactPublisher(Protocol):
         artifact_digest: str,
         content: JsonValue,
     ) -> StudyArtifactPublication: ...
+
+    def verify_artifact(self, publication: StudyArtifactPublication) -> None: ...
 
 
 class _LocalCommitmentEntry(BaseModel):
@@ -1104,14 +1117,33 @@ class HarnessOptimizationStudyCoordinator:
         previous: StudyPhase,
     ) -> HarnessOptimizationAdvance:
         prepared = self._spec.prepared
+        report = self._spec.qualification_report
+        publication = (
+            state.qualification_report_publication
+            or self._artifact_publisher.publish_artifact(
+                kind="benchmark-qualification-report",
+                artifact_digest=report.digest,
+                content=report.model_dump(mode="json"),
+            )
+        )
+        self._artifact_publisher.verify_artifact(publication)
         payload = state.roster_qualified or RosterQualifiedPayload(
             qualified_roster_digest=prepared.protocol.qualification_roster_digest,
-            qualification_report_digest=self._spec.qualification_report_digest,
+            qualification_report_digest=report.digest,
+            qualification_report_publication_digest=publication.digest,
             execution_plan_digest=prepared.protocol.execution_plan.digest,
             qualified_task_count=len(prepared.qualification_roster.tasks),
         )
         if state.roster_qualified is None:
-            self._save(state.model_copy(update={"roster_qualified": payload}, deep=True))
+            self._save(
+                state.model_copy(
+                    update={
+                        "qualification_report_publication": publication,
+                        "roster_qualified": payload,
+                    },
+                    deep=True,
+                )
+            )
         self._lifecycle.publish(payload)
         return self._phase_advance(previous, StudyPhase.ROSTER_QUALIFIED)
 
@@ -1608,9 +1640,10 @@ class HarnessOptimizationRehearsal(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    rehearsal_version: Literal["1"] = "1"
+    rehearsal_version: Literal["2"] = "2"
     spec_digest: str = Field(pattern=_DIGEST_PATTERN)
     protocol_digest: str = Field(pattern=_DIGEST_PATTERN)
+    code_provenance: HarnessOptimizationCodeProvenance
     backend: HarborEnvironmentBackend
     phase_order: tuple[StudyPhase, ...]
     confirmation_block_count: StrictInt = Field(ge=1)
@@ -1632,6 +1665,7 @@ class DeterministicHarnessOptimizationRehearsalFactory:
         return HarnessOptimizationRehearsal(
             spec_digest=frozen.digest,
             protocol_digest=frozen.prepared.protocol.digest,
+            code_provenance=frozen.code_provenance,
             backend=frozen.prepared.protocol.execution_plan.environment_backend,
             phase_order=(
                 StudyPhase.PREPARATION_PLANNED,

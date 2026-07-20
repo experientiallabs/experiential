@@ -51,6 +51,7 @@ from wmh.evals.harness_optimization import (
 from wmh.evals.harness_optimization_coordinator import (
     DeterministicHarnessOptimizationRehearsalFactory,
     HarnessOptimizationAdvanceKind,
+    HarnessOptimizationCodeProvenance,
     HarnessOptimizationDiscoveryRuntime,
     HarnessOptimizationStudyCoordinator,
     HarnessOptimizationStudySpec,
@@ -75,6 +76,7 @@ from wmh.evals.harness_optimization_test import (
     _Scorer,
 )
 from wmh.evals.paired import PairedBlock
+from wmh.evals.qualification_report import BenchmarkQualificationReport
 from wmh.evals.study_journal import (
     ExternalPublicationReceipt,
     StudyJournalStore,
@@ -121,6 +123,15 @@ from wmh.tracking.rate_limit import (
 )
 
 runner = CliRunner()
+_BASELINE_SOURCE_COMMIT = "5f0a5b056be7eedea41591dad8b25f836a243cc6"
+_LAUNCH_ORCHESTRATION_COMMIT = "1111111111111111111111111111111111111111"
+
+
+def _code_provenance() -> HarnessOptimizationCodeProvenance:
+    return HarnessOptimizationCodeProvenance(
+        baseline_source_commit=_BASELINE_SOURCE_COMMIT,
+        launch_orchestration_commit=_LAUNCH_ORCHESTRATION_COMMIT,
+    )
 
 
 def _assert_reader_recovers_post_link_alias(
@@ -272,7 +283,9 @@ def _spec(tmp_path: Path) -> HarnessOptimizationStudySpec:
     jobs = (tmp_path / "jobs").resolve()
     confirmation_jobs = (tmp_path / "confirmation-jobs").resolve()
     discovery_ids = [task.task_id for task in prepared.protocol.discovery.tasks]
+    code_provenance = _code_provenance()
     return HarnessOptimizationStudySpec(
+        code_provenance=code_provenance,
         prepared=prepared,
         partition_control_dir=control_store.directory,
         discovery_job_spec=HarborJobSpec(
@@ -289,7 +302,11 @@ def _spec(tmp_path: Path) -> HarnessOptimizationStudySpec:
             dataset_paths_by_id={"synthetic": dataset},
             budget=prepared.confirmation_budget,
         ),
-        qualification_report_digest=_digest("qualified-roster-report"),
+        qualification_report=BenchmarkQualificationReport.capture(
+            code_provenance=code_provenance,
+            execution_plan=prepared.protocol.execution_plan,
+            roster=prepared.qualification_roster,
+        ),
         confirmation_operation_id="confirmation-run",
     )
 
@@ -449,6 +466,7 @@ def _project_spec(
         confirmation_slice_policy=slice_policy,
     )
     spec = HarnessOptimizationStudySpec(
+        code_provenance=base.code_provenance,
         prepared=project_prepared,
         partition_control_dir=base.partition_control_dir,
         discovery_job_spec=base.discovery_job_spec,
@@ -462,7 +480,7 @@ def _project_spec(
             lease_ledger_dir=(tmp_path / "project-leases").resolve(),
         ),
         discovery_create_rate_ledger_path=rate_path,
-        qualification_report_digest=base.qualification_report_digest,
+        qualification_report=base.qualification_report,
         confirmation_operation_id=base.confirmation_operation_id,
     )
     return spec, proposer_provider
@@ -622,9 +640,27 @@ def test_rehearsal_is_pure_and_never_claims_a_complete_publication(tmp_path: Pat
     rehearsal = DeterministicHarnessOptimizationRehearsalFactory().build(spec)
 
     assert rehearsal.backend is HarborEnvironmentBackend.LOCAL
+    assert rehearsal.code_provenance == spec.code_provenance
     assert rehearsal.phase_order[-1] is StudyPhase.CONFIRMATION_RUNNING
     assert rehearsal.would_publish_complete is False
     assert not unused_state_dir.exists()
+
+
+def test_code_provenance_requires_two_distinct_canonical_git_commits() -> None:
+    provenance = _code_provenance()
+
+    assert provenance.baseline_source_commit == _BASELINE_SOURCE_COMMIT
+    assert provenance.launch_orchestration_commit == _LAUNCH_ORCHESTRATION_COMMIT
+    with pytest.raises(ValueError, match="distinct"):
+        HarnessOptimizationCodeProvenance(
+            baseline_source_commit=_BASELINE_SOURCE_COMMIT,
+            launch_orchestration_commit=_BASELINE_SOURCE_COMMIT,
+        )
+    with pytest.raises(ValueError, match="40-character"):
+        HarnessOptimizationCodeProvenance(
+            baseline_source_commit="main",
+            launch_orchestration_commit=_LAUNCH_ORCHESTRATION_COMMIT,
+        )
 
 
 def test_cli_rehearsal_does_not_create_state_or_execution_effects(tmp_path: Path) -> None:
@@ -648,6 +684,8 @@ def test_cli_rehearsal_does_not_create_state_or_execution_effects(tmp_path: Path
 
     assert result.exit_code == 0, result.output
     assert '"backend": "local"' in result.output
+    assert _BASELINE_SOURCE_COMMIT in result.output
+    assert _LAUNCH_ORCHESTRATION_COMMIT in result.output
     assert '"would_publish_complete": false' in result.output
     assert not state_dir.exists()
 

@@ -227,6 +227,7 @@ class RosterQualifiedPayload(_StudyPayload):
     phase: Literal[StudyPhase.ROSTER_QUALIFIED] = StudyPhase.ROSTER_QUALIFIED
     qualified_roster_digest: str = Field(pattern=_DIGEST_PATTERN)
     qualification_report_digest: str = Field(pattern=_DIGEST_PATTERN)
+    qualification_report_publication_digest: str = Field(pattern=_DIGEST_PATTERN)
     execution_plan_digest: str = Field(pattern=_DIGEST_PATTERN)
     qualified_task_count: StrictInt = Field(ge=1)
 
