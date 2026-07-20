@@ -731,6 +731,23 @@ def test_reasoning_verify_probes_one_structured_responses_tool_call(
     assert cast("dict[str, object]", first_tool)["name"] == "health_check"
 
 
+def test_reasoning_verify_rejects_multi_dispatch_provider_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = AzureOpenAIProvider(_reasoning_config())
+    monkeypatch.setattr(provider, "paid_request_attempts", 2)
+    monkeypatch.setattr(
+        provider,
+        "_get_responses_client",
+        lambda: (_ for _ in ()).throw(AssertionError("invalid capability must not dispatch")),
+    )
+
+    result = provider.verify()
+
+    assert result.ok is False
+    assert result.detail == "structured provider verification requires one paid request attempt"
+
+
 @pytest.mark.parametrize(
     "responses",
     [

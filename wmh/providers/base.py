@@ -297,6 +297,8 @@ def verify_via_structured_tool_ping(provider: SingleDispatchProvider) -> VerifyR
     """Verify the operative structured tool route with exactly one bounded dispatch."""
 
     def call() -> object:
+        if provider.paid_request_attempts != 1:
+            raise ValueError("structured provider verification requires one paid request attempt")
         response = provider.complete_chat(_STRUCTURED_TOOL_PING)
         if not response.choices:
             raise ValueError("structured provider verification returned no choices")
