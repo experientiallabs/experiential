@@ -327,7 +327,7 @@ def test_study_slice_reconciles_a_persisted_checkpoint_after_operation_crash(
     )
 
 
-def test_study_slice_reenters_exact_claim_before_checkpoint_zero(tmp_path: Path) -> None:
+def test_study_slice_fails_closed_after_ambiguous_precheckpoint_work(tmp_path: Path) -> None:
     store = _store(tmp_path)
     publisher = _Publisher()
     authorization_digest = _digest("preparation")
@@ -339,6 +339,11 @@ def test_study_slice_reenters_exact_claim_before_checkpoint_zero(tmp_path: Path)
     )
     calls: list[str] = []
 
+    def _fail_after_intent() -> tuple[str, StudyRunCheckpointIdentity]:
+        assert tuple(store.directory.glob("run-slice-intent-*.json"))
+        calls.append("failed")
+        raise RuntimeError("provider failed before checkpoint")
+
     with pytest.raises(RuntimeError, match="provider failed before checkpoint"):
         call_in_study_slice(
             store,
@@ -348,10 +353,7 @@ def test_study_slice_reenters_exact_claim_before_checkpoint_zero(tmp_path: Path)
             configuration_digest=_digest("configuration"),
             resume_from=None,
             publisher=publisher,
-            operation=lambda: (
-                calls.append("failed")
-                or (_ for _ in ()).throw(RuntimeError("provider failed before checkpoint"))
-            ),
+            operation=_fail_after_intent,
         )
 
     with pytest.raises(ValueError, match="different run identity or configuration"):
@@ -372,25 +374,25 @@ def test_study_slice_reenters_exact_claim_before_checkpoint_zero(tmp_path: Path)
             ),
         )
 
-    recovered = call_in_study_slice(
-        store,
-        phase=StudyPhase.PREPARATION_PLANNED,
-        authorization_payload_digest=authorization_digest,
-        run_id="run-1",
-        configuration_digest=_digest("configuration"),
-        resume_from=None,
-        publisher=publisher,
-        operation=lambda: (
-            calls.append("recovered") or "result",
-            StudyRunCheckpointIdentity(
-                sequence=0,
-                checkpoint_digest=_digest("checkpoint-0"),
+    with pytest.raises(ValueError, match="ambiguous durable slice intent"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (
+                calls.append("duplicated") or "result",
+                StudyRunCheckpointIdentity(
+                    sequence=0,
+                    checkpoint_digest=_digest("checkpoint-0"),
+                ),
             ),
-        ),
-    )
+        )
 
-    assert recovered == "result"
-    assert calls == ["failed", "recovered"]
+    assert calls == ["failed"]
 
 
 def test_uncheckpointed_study_slice_cannot_reenter_after_terminal_stop(tmp_path: Path) -> None:
@@ -479,6 +481,20 @@ def test_reconcile_study_slice_returns_completed_resume_without_new_checkpoint(
     )
     reconstructions: list[str] = []
 
+    with pytest.raises(RuntimeError, match="crash after completed checkpoint"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=configuration_digest,
+            resume_from=first_checkpoint,
+            publisher=publisher,
+            operation=lambda: (_ for _ in ()).throw(
+                RuntimeError("crash after completed checkpoint")
+            ),
+        )
+
     recovered = reconcile_study_slice(
         store,
         phase=StudyPhase.PREPARATION_PLANNED,
@@ -524,6 +540,169 @@ def test_study_checkpoint_sequence_fits_its_canonical_filename() -> None:
             sequence=100_000_000,
             checkpoint_digest=_digest("too-large"),
         )
+
+
+def test_recovered_checkpoint_must_advance_the_durable_identity(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    configuration_digest = _digest("configuration")
+    first_checkpoint = StudyRunCheckpointIdentity(
+        sequence=0,
+        checkpoint_digest=_digest("checkpoint"),
+    )
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    call_in_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=configuration_digest,
+        resume_from=None,
+        publisher=publisher,
+        operation=lambda: ("first", first_checkpoint),
+    )
+    with pytest.raises(RuntimeError, match="simulated callback crash"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=configuration_digest,
+            resume_from=first_checkpoint,
+            publisher=publisher,
+            operation=lambda: (_ for _ in ()).throw(RuntimeError("simulated callback crash")),
+        )
+
+    with pytest.raises(ValueError, match="advance the durable checkpoint identity"):
+        reconcile_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=configuration_digest,
+            resume_from=StudyRunCheckpointIdentity(
+                sequence=1,
+                checkpoint_digest=first_checkpoint.checkpoint_digest,
+            ),
+            publisher=publisher,
+            operation=lambda: "unreachable",
+        )
+
+
+def test_recovered_checkpoint_requires_its_preexisting_slice_intent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    configuration_digest = _digest("configuration")
+    first_checkpoint = StudyRunCheckpointIdentity(
+        sequence=0,
+        checkpoint_digest=_digest("checkpoint-0"),
+    )
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    call_in_study_slice(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        authorization_payload_digest=authorization_digest,
+        run_id="run-1",
+        configuration_digest=configuration_digest,
+        resume_from=None,
+        publisher=publisher,
+        operation=lambda: ("first", first_checkpoint),
+    )
+
+    with pytest.raises(ValueError, match="no matching durable slice intent"):
+        reconcile_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=configuration_digest,
+            resume_from=StudyRunCheckpointIdentity(
+                sequence=1,
+                checkpoint_digest=_digest("checkpoint-1"),
+            ),
+            publisher=publisher,
+            operation=lambda: "unreachable",
+        )
+
+
+def test_successful_phase_advance_rejects_an_ambiguous_slice_intent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    with pytest.raises(RuntimeError, match="ambiguous paid work"):
+        call_in_study_slice(
+            store,
+            phase=StudyPhase.PREPARATION_PLANNED,
+            authorization_payload_digest=authorization_digest,
+            run_id="run-1",
+            configuration_digest=_digest("configuration"),
+            resume_from=None,
+            publisher=publisher,
+            operation=lambda: (_ for _ in ()).throw(RuntimeError("ambiguous paid work")),
+        )
+
+    with pytest.raises(ValueError, match="cannot advance with an ambiguous durable slice intent"):
+        append_study_phase(
+            store,
+            phase=StudyPhase.ROSTER_QUALIFIED,
+            payload_digest=_digest("roster"),
+            publisher=publisher,
+        )
+
+
+def test_legacy_v1_run_claim_without_configuration_field_remains_canonical(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    publisher = _Publisher()
+    authorization_digest = _digest("preparation")
+    append_study_phase(
+        store,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=authorization_digest,
+        publisher=publisher,
+    )
+    legacy_claim = {
+        "authorization_payload_digest": authorization_digest,
+        "claim_version": "1",
+        "journal_genesis_digest": store.genesis.digest,
+        "phase": StudyPhase.PREPARATION_PLANNED.value,
+        "run_id": "legacy-run",
+        "study_id": store.genesis.study_id,
+    }
+    claim_path = store.directory / "run-claim-preparation_planned.json"
+    claim_path.write_bytes(
+        json.dumps(
+            legacy_claim,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    )
+    claim_path.chmod(0o600)
+
+    loaded = load_study_journal(store, publisher=publisher)
+
+    assert loaded[-1].commitment.phase is StudyPhase.PREPARATION_PLANNED
 
 
 def test_public_load_requires_an_external_publisher(tmp_path: Path) -> None:

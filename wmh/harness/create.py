@@ -1030,7 +1030,7 @@ def _scorer_configuration(
     )
 
 
-def _search_configuration(
+def freeze_search_configuration(
     *,
     search_run_id: str | None,
     name: str,
@@ -1044,6 +1044,7 @@ def _search_configuration(
     confirm_narrow_vetoes: bool,
     search_cost_binding_digest: str | None,
 ) -> SearchConfiguration:
+    """Freeze the complete path-free runtime identity used by checkpointed search."""
     return SearchConfiguration(
         search_run_id=search_run_id,
         name=name,
@@ -1392,6 +1393,27 @@ def _validate_consumed_proposal_batch_witness(
             raise ValueError("committed proposal output does not match unusable slot")
 
 
+def validate_consumed_search_proposal_batch_witness(
+    witness: SearchProposalBatchWitness,
+    checkpoint: SearchCheckpoint,
+) -> None:
+    """Validate an exact completed proposal witness already committed by a checkpoint."""
+    frozen_witness = SearchProposalBatchWitness.model_validate(witness.model_dump(mode="json"))
+    frozen_checkpoint = _validated_checkpoint_copy(checkpoint)
+    if frozen_witness.phase != "completed":
+        raise ValueError("a committed proposal batch witness must be completed")
+    if frozen_witness.iteration > frozen_checkpoint.completed_iteration:
+        raise ValueError("proposal batch witness is not committed by the checkpoint")
+    committed_digest = frozen_checkpoint.proposal_batch_witness_digests[
+        frozen_witness.iteration - 1
+    ]
+    if not hmac.compare_digest(frozen_witness.payload_sha256, committed_digest):
+        raise ValueError(
+            "already-consumed proposal batch does not match its committed witness digest"
+        )
+    _validate_consumed_proposal_batch_witness(frozen_witness, frozen_checkpoint)
+
+
 def search_result_from_completed_checkpoint(checkpoint: SearchCheckpoint) -> SearchResult:
     """Reconstruct a complete search result from its exact terminal checkpoint.
 
@@ -1583,7 +1605,7 @@ def search_harness(
             resumed.configuration.search_run_id if resumed is not None else uuid.uuid4().hex
         )
     configuration = (
-        _search_configuration(
+        freeze_search_configuration(
             search_run_id=resolved_search_run_id,
             name=name,
             seed_doc=seed_doc,
@@ -1618,14 +1640,7 @@ def search_harness(
     )
     if resumed is not None and recovered_witness is not None:
         if recovered_witness.iteration <= resumed.completed_iteration:
-            committed_digest = resumed.proposal_batch_witness_digests[
-                recovered_witness.iteration - 1
-            ]
-            if not hmac.compare_digest(recovered_witness.payload_sha256, committed_digest):
-                raise ValueError(
-                    "already-consumed proposal batch does not match its committed witness digest"
-                )
-            _validate_consumed_proposal_batch_witness(recovered_witness, resumed)
+            validate_consumed_search_proposal_batch_witness(recovered_witness, resumed)
             recovered_witness = None
         elif recovered_witness.iteration != resumed.completed_iteration + 1:
             raise ValueError("proposal batch witness iteration is not the next resume iteration")

@@ -400,6 +400,60 @@ def test_study_slice_holds_the_lifecycle_lease_across_bounded_work(tmp_path: Pat
     assert "locked" in str(nested_errors[0])
 
 
+def test_completed_slice_reconstruction_must_name_the_reconciled_checkpoint(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    preparation = _preparation()
+    controller.publish(preparation)
+    configuration_digest = _digest("configuration")
+
+    def _checkpoint(sequence: int) -> StudyRunCheckpointIdentity:
+        return StudyRunCheckpointIdentity(
+            sequence=sequence,
+            checkpoint_digest=_digest(f"checkpoint-{sequence}"),
+        )
+
+    first = controller.run_slice(
+        StudyPhase.PREPARATION_PLANNED,
+        "run-1",
+        lambda: StudySliceResult[
+            StudyRunCheckpointIdentity,
+            StudyRunCheckpointIdentity,
+        ](checkpoint=_checkpoint(0)),
+        payload_digest=preparation.digest,
+        configuration_digest=configuration_digest,
+        resume_from=None,
+        checkpoint_identity=lambda checkpoint: checkpoint,
+    )
+    persisted = _checkpoint(1)
+
+    with pytest.raises(RuntimeError, match="crash after persistence"):
+        controller.run_slice(
+            StudyPhase.PREPARATION_PLANNED,
+            "run-1",
+            lambda: (_ for _ in ()).throw(RuntimeError("crash after persistence")),
+            payload_digest=preparation.digest,
+            configuration_digest=configuration_digest,
+            resume_from=first.checkpoint,
+            checkpoint_identity=lambda checkpoint: checkpoint,
+        )
+
+    with pytest.raises(ValueError, match="reconstructed checkpoint identity"):
+        controller.reconcile_slice(
+            StudyPhase.PREPARATION_PLANNED,
+            "run-1",
+            lambda: StudySliceResult[
+                StudyRunCheckpointIdentity,
+                StudyRunCheckpointIdentity,
+            ](checkpoint=_checkpoint(2)),
+            payload_digest=preparation.digest,
+            configuration_digest=configuration_digest,
+            resume_from=persisted,
+            checkpoint_identity=lambda checkpoint: checkpoint,
+        )
+
+
 def test_candidate_freeze_payload_binds_completed_search_and_cost_evidence() -> None:
     payload = CandidateFrozenPayload(
         protocol_digest=_digest("protocol"),

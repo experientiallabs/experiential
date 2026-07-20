@@ -789,6 +789,7 @@ class StudyLifecycleController:
         payload_digest: str,
         configuration_digest: str,
         resume_from: StudyRunCheckpointIdentity,
+        checkpoint_identity: Callable[[_CheckpointT], StudyRunCheckpointIdentity],
     ) -> StudySliceResult[_CheckpointT, _CompletedResultT]:
         """Reconcile a completed checkpoint and reconstruct its result without another slice.
 
@@ -799,13 +800,22 @@ class StudyLifecycleController:
             payload_digest: Exact typed phase authorization digest.
             configuration_digest: Frozen path-free slice configuration identity.
             resume_from: Completed caller-persisted checkpoint identity.
+            checkpoint_identity: Extract the path-free identity from the reconstructed checkpoint.
 
         Returns:
             The detached completed checkpoint and its reconstructed result.
         """
 
         def _reconstruct() -> StudySliceResult[_CheckpointT, _CompletedResultT]:
-            return operation().model_copy(deep=True)
+            frozen = operation().model_copy(deep=True)
+            reconstructed_identity = StudyRunCheckpointIdentity.model_validate(
+                checkpoint_identity(frozen.checkpoint).model_dump(mode="json")
+            )
+            if reconstructed_identity != resume_from:
+                raise ValueError(
+                    "reconstructed checkpoint identity differs from the reconciled checkpoint"
+                )
+            return frozen
 
         return reconcile_study_slice(
             self._store,
