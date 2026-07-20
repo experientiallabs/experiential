@@ -258,16 +258,14 @@ class PiInfrastructureError(RuntimeError):
             self.provider_failure_reason = (
                 provider_failure_reason if provider_failure_reason is not None else default_reason
             )
-            if self.provider_failure_stage is ProviderFailureStage.RESPONSE_TRANSLATION:
-                self.provider_response_translation_failure = (
-                    provider_response_translation_failure or ResponseTranslationFailure.UNKNOWN
+            if (
+                self.provider_failure_stage is not ProviderFailureStage.RESPONSE_TRANSLATION
+                and provider_response_translation_failure is not None
+            ):
+                raise ValueError(
+                    "response translation failure requires the response_translation stage"
                 )
-            else:
-                if provider_response_translation_failure is not None:
-                    raise ValueError(
-                        "response translation failure requires the response_translation stage"
-                    )
-                self.provider_response_translation_failure = None
+            self.provider_response_translation_failure = provider_response_translation_failure
         else:
             if (
                 provider_failure_stage is not None

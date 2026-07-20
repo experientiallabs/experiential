@@ -86,6 +86,18 @@ def test_response_translation_failure_preserves_only_fixed_discriminator() -> No
     assert secret not in str(error)
 
 
+def test_unclassified_response_translation_failure_remains_optional() -> None:
+    error = ProviderBoundaryError(
+        ProviderFailureStage.RESPONSE_TRANSLATION,
+        ValueError("private"),
+    )
+
+    attribution = classify_provider_failure(error)
+
+    assert attribution.stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert attribution.response_translation_failure is None
+
+
 def test_response_translation_failure_cannot_drift_to_another_stage() -> None:
     with pytest.raises(ValueError, match="requires the response_translation stage"):
         ProviderBoundaryError(

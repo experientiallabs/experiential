@@ -588,6 +588,31 @@ def test_response_translation_failure_is_retained_as_fixed_evidence(tmp_path: Pa
     assert result.provider_response_translation_failure is ResponseTranslationFailure.TOOL_USE_SHAPE
 
 
+def test_unclassified_response_translation_failure_remains_valid_legacy_evidence(
+    tmp_path: Path,
+) -> None:
+    trial = _trial(
+        tmp_path,
+        "task",
+        exception_type="WmhPiProviderError",
+        candidate_metadata={
+            "run_health": "infrastructure_failure",
+            "provider_failure_stage": "response_translation",
+            "provider_failure_reason": "unknown",
+        },
+    )
+    job_dir = tmp_path / "job"
+    _write_job(job_dir, [trial], expected=1)
+
+    result = load_harbor_job_result(
+        job_dir,
+        _manifest("job", ("task", 1, trial.trial_name)),
+    ).result.trials[0]
+
+    assert result.provider_failure_stage is ProviderFailureStage.RESPONSE_TRANSLATION
+    assert result.provider_response_translation_failure is None
+
+
 @pytest.mark.parametrize(
     "candidate_metadata",
     [
@@ -595,10 +620,6 @@ def test_response_translation_failure_is_retained_as_fixed_evidence(tmp_path: Pa
         {"provider_failure_reason": "auth"},
         {"provider_failure_stage": "private-stage", "provider_failure_reason": "auth"},
         {"provider_failure_stage": "dispatch", "provider_failure_reason": "private-reason"},
-        {
-            "provider_failure_stage": "response_translation",
-            "provider_failure_reason": "unknown",
-        },
         {
             "provider_failure_stage": "dispatch",
             "provider_failure_reason": "auth",

@@ -344,7 +344,10 @@ class BenchmarkTrialResult(BaseModel):
     run_health: BenchmarkRunHealth = BenchmarkRunHealth.UNKNOWN
     provider_failure_stage: ProviderFailureStage | None = None
     provider_failure_reason: ProviderFailureReason | None = None
-    provider_response_translation_failure: ResponseTranslationFailure | None = None
+    provider_response_translation_failure: ResponseTranslationFailure | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("rewards", mode="before")
     @classmethod
@@ -362,12 +365,10 @@ class BenchmarkTrialResult(BaseModel):
     def _validate_evidence(self) -> Self:
         if (self.provider_failure_stage is None) != (self.provider_failure_reason is None):
             raise ValueError("provider failure stage and reason must be supplied together")
-        if self.provider_failure_stage is ProviderFailureStage.RESPONSE_TRANSLATION:
-            if self.provider_response_translation_failure is None:
-                raise ValueError(
-                    "response translation failure is required at the response_translation stage"
-                )
-        elif self.provider_response_translation_failure is not None:
+        if (
+            self.provider_failure_stage is not ProviderFailureStage.RESPONSE_TRANSLATION
+            and self.provider_response_translation_failure is not None
+        ):
             raise ValueError("response translation failure requires the response_translation stage")
         if self.provider_failure_stage is not None and (
             self.error is None or self.error.kind is not BenchmarkFailureKind.PROVIDER

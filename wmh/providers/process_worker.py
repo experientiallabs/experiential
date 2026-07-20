@@ -136,12 +136,10 @@ class _FailureFrame(_StrictFrame):
 
     @model_validator(mode="after")
     def _bind_response_translation_failure(self) -> _FailureFrame:
-        if self.stage is ProviderFailureStage.RESPONSE_TRANSLATION:
-            if self.response_translation_failure is None:
-                raise ValueError(
-                    "response translation failure is required at the response_translation stage"
-                )
-        elif self.response_translation_failure is not None:
+        if (
+            self.stage is not ProviderFailureStage.RESPONSE_TRANSLATION
+            and self.response_translation_failure is not None
+        ):
             raise ValueError("response translation failure requires the response_translation stage")
         return self
 

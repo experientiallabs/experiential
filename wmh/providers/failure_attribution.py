@@ -59,15 +59,10 @@ class ProviderFailureAttribution:
     response_translation_failure: ResponseTranslationFailure | None = None
 
     def __post_init__(self) -> None:
-        if self.stage is ProviderFailureStage.RESPONSE_TRANSLATION:
-            if self.response_translation_failure is None:
-                object.__setattr__(
-                    self,
-                    "response_translation_failure",
-                    ResponseTranslationFailure.UNKNOWN,
-                )
-            return
-        if self.response_translation_failure is not None:
+        if (
+            self.stage is not ProviderFailureStage.RESPONSE_TRANSLATION
+            and self.response_translation_failure is not None
+        ):
             raise ValueError("response translation failure requires the response_translation stage")
 
 
@@ -83,11 +78,10 @@ class ProviderBoundaryError(RuntimeError):
     ) -> None:
         if not isinstance(stage, ProviderFailureStage):
             raise TypeError("provider failure stage must be a ProviderFailureStage")
-        if stage is ProviderFailureStage.RESPONSE_TRANSLATION:
-            response_translation_failure = (
-                response_translation_failure or ResponseTranslationFailure.UNKNOWN
-            )
-        elif response_translation_failure is not None:
+        if (
+            stage is not ProviderFailureStage.RESPONSE_TRANSLATION
+            and response_translation_failure is not None
+        ):
             raise ValueError("response translation failure requires the response_translation stage")
         super().__init__(f"provider request failed during {stage.value}")
         self.stage = stage

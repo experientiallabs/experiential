@@ -9,6 +9,7 @@ import pytest
 
 from llm_waterfall.bedrock_chat import (
     BedrockResponseTranslationError,
+    bedrock_converse_client_tool_names,
     bedrock_converse_request,
     bedrock_converse_response,
 )
@@ -34,6 +35,19 @@ def _tool_request() -> ChatRequest:
             "max_completion_tokens": 4096,
         }
     )
+
+
+def test_advertised_tool_name_membership_does_not_reject_duplicate_entries() -> None:
+    assert bedrock_converse_client_tool_names(
+        {
+            "toolConfig": {
+                "tools": [
+                    {"toolSpec": {"name": "read_file"}},
+                    {"toolSpec": {"name": "read_file"}},
+                ]
+            }
+        }
+    ) == frozenset({"read_file"})
 
 
 def test_adaptive_reasoning_uses_official_converse_request_fields() -> None:

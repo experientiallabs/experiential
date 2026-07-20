@@ -430,6 +430,16 @@ def test_run_pi_turn_preserves_bounded_response_translation_failure() -> None:
     )
 
 
+def test_pi_infrastructure_error_allows_unclassified_response_translation_failure() -> None:
+    error = PiInfrastructureError(
+        PiInfrastructureFailureKind.PROVIDER,
+        provider_failure_stage=ProviderFailureStage.RESPONSE_TRANSLATION,
+        provider_failure_reason=ProviderFailureReason.UNKNOWN,
+    )
+
+    assert error.provider_response_translation_failure is None
+
+
 @pytest.mark.parametrize(
     "terminal_error",
     [

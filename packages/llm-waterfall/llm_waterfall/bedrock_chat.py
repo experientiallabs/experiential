@@ -165,10 +165,7 @@ def bedrock_converse_client_tool_names(
         if not isinstance(name, str) or not name:
             raise ValueError("Bedrock Converse toolSpec name must be non-empty text")
         names.append(name)
-    frozen_names = frozenset(names)
-    if len(frozen_names) != len(names):
-        raise ValueError("Bedrock Converse client tool names must be unique")
-    return frozen_names
+    return frozenset(names)
 
 
 def bedrock_converse_response(

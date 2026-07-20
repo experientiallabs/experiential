@@ -394,25 +394,26 @@ def test_worker_child_preserves_only_bounded_response_translation_failure(
     assert exit_codes == [0]
 
 
-@pytest.mark.parametrize(
-    "frame",
-    [
+def test_failure_frame_allows_unclassified_response_translation_failure() -> None:
+    failure = mod._FailureFrame.model_validate(
         {
             "owner": ProviderFailureOwner.INFRASTRUCTURE,
             "reason": ProviderFailureReason.UNKNOWN,
             "stage": ProviderFailureStage.RESPONSE_TRANSLATION,
-        },
-        {
-            "owner": ProviderFailureOwner.INFRASTRUCTURE,
-            "reason": ProviderFailureReason.UNKNOWN,
-            "stage": ProviderFailureStage.DISPATCH,
-            "response_translation_failure": ResponseTranslationFailure.TOOL_USE_SHAPE,
-        },
-    ],
-)
-def test_failure_frame_binds_discriminator_to_response_translation_stage(
-    frame: dict[str, object],
-) -> None:
+        }
+    )
+
+    assert failure.response_translation_failure is None
+    assert failure.attribution.response_translation_failure is None
+
+
+def test_failure_frame_binds_discriminator_to_response_translation_stage() -> None:
+    frame = {
+        "owner": ProviderFailureOwner.INFRASTRUCTURE,
+        "reason": ProviderFailureReason.UNKNOWN,
+        "stage": ProviderFailureStage.DISPATCH,
+        "response_translation_failure": ResponseTranslationFailure.TOOL_USE_SHAPE,
+    }
     with pytest.raises(ValueError, match="response translation failure"):
         mod._FailureFrame.model_validate(frame)
 

@@ -723,20 +723,18 @@ def _parse_provider_failure(
     except (TypeError, ValueError):
         raise ValueError("Harbor agent metadata has unknown provider failure attribution") from None
     if stage is ProviderFailureStage.RESPONSE_TRANSLATION:
-        if not translation_present:
-            raise ValueError(
-                "Harbor agent metadata provider failure attribution lacks a response "
-                "translation discriminator"
-            )
-        try:
-            translation_failure = ResponseTranslationFailure(
-                metadata[_PROVIDER_RESPONSE_TRANSLATION_FAILURE_KEY]
-            )
-        except (TypeError, ValueError):
-            raise ValueError(
-                "Harbor agent metadata provider failure attribution has an unknown response "
-                "translation discriminator"
-            ) from None
+        if translation_present:
+            try:
+                translation_failure = ResponseTranslationFailure(
+                    metadata[_PROVIDER_RESPONSE_TRANSLATION_FAILURE_KEY]
+                )
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "Harbor agent metadata provider failure attribution has an unknown response "
+                    "translation discriminator"
+                ) from None
+        else:
+            translation_failure = None
     else:
         if translation_present:
             raise ValueError(

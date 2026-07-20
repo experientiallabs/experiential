@@ -98,6 +98,17 @@ def test_zero_and_arbitrary_reward_keys_are_scored_data() -> None:
     assert trial.rewards == {"reward": 0, "partial_credit": 0.25, "tests_passed": 3}
 
 
+def test_success_json_omits_absent_response_translation_discriminator() -> None:
+    trial = _trial(
+        _cell("task-a"),
+        BenchmarkTrialStatus.SCORED,
+        rewards={"reward": 1},
+    )
+
+    assert "provider_response_translation_failure" not in trial.model_dump(mode="json")
+    assert '"provider_response_translation_failure"' not in trial.model_dump_json()
+
+
 @pytest.mark.parametrize("reward", [float("nan"), float("inf"), float("-inf"), True, False])
 def test_rewards_reject_non_finite_and_boolean_values(reward: float | bool) -> None:
     with pytest.raises(ValidationError, match="reward .* (finite|boolean)"):
