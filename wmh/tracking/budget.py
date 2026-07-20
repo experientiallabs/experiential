@@ -48,14 +48,29 @@ from wmh.providers.base import (
 from wmh.providers.models import resolve_provider_model
 
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_SOURCE_ID_PATTERN = r"^[a-z0-9][a-z0-9.-]{0,127}$"
+_PUBLIC_QUERY_NAME_PATTERN = r"^[A-Za-z$][A-Za-z0-9$_.-]{0,127}$"
+_PACKAGE_RESOURCE_PATTERN = r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z0-9][A-Za-z0-9._/-]*$"
 _ZERO_DIGEST = "sha256:" + "0" * 64
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 5
 _AUTHORITY_SCHEMA_VERSION = 1
 _DEFAULT_BUSY_TIMEOUT_MS = 30_000
 _NANO_USD_PER_USD = 1_000_000_000
 _TOKENS_PER_MILLION = 1_000_000
 _SQLITE_INTEGER_MAX = (1 << 63) - 1
 _FAILURE_CODE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_SENSITIVE_QUERY_NAME = re.compile(
+    r"(?:^|[._-])(?:api[-_]?key|access[-_]?key|subscription[-_]?key|token|secret|"
+    r"signature|sig|credential|"
+    r"password|authorization|auth|code)(?:$|[._-])",
+    re.IGNORECASE,
+)
+_SENSITIVE_QUERY_VALUE = re.compile(
+    r"(?:api[-_ ]?key|access[-_ ]?key|subscription[-_ ]?key|client[-_ ]?secret|"
+    r"password|authorization|signature|(?:^|[ (])sig(?:[ )=]|$)|shared[-_ ]?access[-_ ]?"
+    r"signature|bearer\s+[A-Za-z0-9])",
+    re.IGNORECASE,
+)
 _KNOWN_NULL_USAGE_DETAIL_PLACEHOLDERS = frozenset(
     {
         "completion_tokens_details",
@@ -64,6 +79,30 @@ _KNOWN_NULL_USAGE_DETAIL_PLACEHOLDERS = frozenset(
         "prompt_tokens_details",
     }
 )
+_PROVIDER_TARIFF_EVIDENCE_CONTRACTS = {
+    "aws_bedrock_public_catalog_v1": (
+        "sha256+gzip-bounds;exact-route-source-set;aws-publication-metadata;"
+        "bedrock-route-source-paths;product-to-meter-sku-joins;meter-record-fields;"
+        "geo-standard-table-cells-0-1-2"
+    ),
+    "azure_retail_arm_v1": (
+        "sha256+gzip-bounds;exact-arm-account-deployment-route-records;"
+        "azure-retail-single-page;azure-openai-usd-primary-consumption-tier-zero;"
+        "exact-two-token-meters;sku-meter-region-unit-price-effective-date;"
+        "deployment-etag-model-version-no-auto-upgrade-and-billing-mode-join;"
+        "registered-exact-retail-label-profile"
+    ),
+}
+
+
+def provider_tariff_evidence_verifier_digest(profile: str) -> str:
+    """Return the local registry digest for one supported tariff evidence contract."""
+    try:
+        contract = _PROVIDER_TARIFF_EVIDENCE_CONTRACTS[profile]
+    except KeyError as exc:
+        raise ValueError(f"unknown provider tariff evidence verifier profile: {profile}") from exc
+    payload = f"{profile}\0{contract}".encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 class BudgetExceededError(RuntimeError):
@@ -163,40 +202,330 @@ class TokenPriceCeiling(BaseModel):
         )
 
 
+class ProviderTariffPublicQueryParameter(BaseModel):
+    """One canonical nonsecret parameter used to fetch a pricing or route snapshot."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    name: str = Field(pattern=_PUBLIC_QUERY_NAME_PATTERN)
+    value: str = Field(min_length=1, max_length=4_096)
+
+    @field_validator("name")
+    @classmethod
+    def _reject_credential_parameter_names(cls, value: str) -> str:
+        if _SENSITIVE_QUERY_NAME.search(value):
+            raise ValueError("public tariff query cannot use a credential-bearing parameter")
+        return value
+
+    @field_validator("value")
+    @classmethod
+    def _reject_credential_syntax(cls, value: str) -> str:
+        if value != value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError("public tariff query values must be exact printable text")
+        if _SENSITIVE_QUERY_VALUE.search(value):
+            raise ValueError("public tariff query cannot contain credential-bearing syntax")
+        return value
+
+
+class ProviderTariffRetainedArtifact(BaseModel):
+    """Content-addressed retained bytes from which a source snapshot can be recovered."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    storage_kind: Literal["package_resource", "https"]
+    locator: str = Field(min_length=1, max_length=2_048)
+    artifact_digest: str = Field(pattern=_DIGEST_PATTERN)
+    content_encoding: Literal["identity", "gzip"]
+
+    @model_validator(mode="after")
+    def _require_safe_locator(self) -> Self:
+        if self.locator != self.locator.strip():
+            raise ValueError("retained artifact locator cannot have surrounding whitespace")
+        if self.storage_kind == "package_resource":
+            if re.fullmatch(_PACKAGE_RESOURCE_PATTERN, self.locator) is None:
+                raise ValueError("retained package artifact requires a canonical resource locator")
+            _, resource_path = self.locator.split(":", 1)
+            if ".." in Path(resource_path).parts:
+                raise ValueError("retained package artifact cannot traverse parent directories")
+        else:
+            parsed = urlsplit(self.locator)
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "retained HTTPS artifact must not contain credentials, query, or fragment"
+                )
+        if self.artifact_digest == _ZERO_DIGEST:
+            raise ValueError("retained artifact digest cannot be the zero digest")
+        return self
+
+
+class ProviderTariffSourceSnapshot(BaseModel):
+    """One content-addressed provider source used to prove a provider tariff."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[2] = 2
+    source_id: str = Field(pattern=_SOURCE_ID_PATTERN)
+    role: Literal["rate_catalog", "route_definition", "semantic_mapping"]
+    source_locator: str = Field(min_length=1, max_length=2_048)
+    source_snapshot_digest: str = Field(pattern=_DIGEST_PATTERN)
+    digest_scope: Literal["decoded_http_entity"] = "decoded_http_entity"
+    media_type: Literal["application/json", "text/html"] = Field(
+        description="Semantic media type of the decoded source entity"
+    )
+    content_encoding: Literal["identity", "gzip"] = Field(
+        description="Content-Encoding of the fetched HTTP entity"
+    )
+    public_request_query: tuple[ProviderTariffPublicQueryParameter, ...] = Field(
+        default=(), max_length=16
+    )
+    retained_artifact: ProviderTariffRetainedArtifact
+    publication_id: str | None = Field(default=None, min_length=1, max_length=256)
+    published_on: date | None = None
+
+    @field_validator("source_locator")
+    @classmethod
+    def _require_canonical_source_locator(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("tariff source locator cannot have surrounding whitespace")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "tariff source locator must be HTTPS without credentials, query, or fragment"
+            )
+        return value
+
+    @field_validator("source_snapshot_digest")
+    @classmethod
+    def _reject_placeholder_snapshot_digest(cls, value: str) -> str:
+        if value == _ZERO_DIGEST:
+            raise ValueError("tariff source snapshot digest cannot be the zero digest")
+        return value
+
+    @field_validator("publication_id")
+    @classmethod
+    def _require_exact_publication_id(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value != value.strip() or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("tariff publication identifier must be an exact printable value")
+        return value
+
+    @field_validator("public_request_query")
+    @classmethod
+    def _require_canonical_public_query(
+        cls,
+        value: tuple[ProviderTariffPublicQueryParameter, ...],
+    ) -> tuple[ProviderTariffPublicQueryParameter, ...]:
+        coordinates = tuple((parameter.name, parameter.value) for parameter in value)
+        if coordinates != tuple(sorted(coordinates)) or len(coordinates) != len(set(coordinates)):
+            raise ValueError("public tariff query parameters require canonical ascending order")
+        return value
+
+
+class ProviderTariffVerifiedSource(BaseModel):
+    """One retained artifact whose encoded and decoded bytes passed digest verification."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    source_id: str = Field(pattern=_SOURCE_ID_PATTERN)
+    artifact_digest: str = Field(pattern=_DIGEST_PATTERN)
+    source_snapshot_digest: str = Field(pattern=_DIGEST_PATTERN)
+    artifact_size_bytes: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+    decoded_size_bytes: int = Field(gt=0, le=_SQLITE_INTEGER_MAX)
+
+
+class ProviderTariffValidatedRecord(BaseModel):
+    """One exact source coordinate interpreted by a registered semantic verifier."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    source_id: str = Field(pattern=_SOURCE_ID_PATTERN)
+    source_record_path: str = Field(min_length=1, max_length=2_048)
+    purpose: Literal[
+        "route_identity",
+        "usage_dimension",
+        "input_tokens_billing_meter",
+        "output_tokens_billing_meter",
+    ]
+
+    @field_validator("source_record_path")
+    @classmethod
+    def _require_absolute_record_path(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or value != value.strip()
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("validated tariff record requires an exact absolute path")
+        return value
+
+
+class ProviderTariffEvidenceReceipt(BaseModel):
+    """Deterministic audit result from one locally registered evidence verifier.
+
+    This receipt guards trusted paid-run construction against stale or mismatched evidence. It is
+    not a provider signature and does not defend against hostile Python code fabricating policy.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    verifier_profile: Literal[
+        "aws_bedrock_public_catalog_v1",
+        "azure_retail_arm_v1",
+    ]
+    verifier_digest: str = Field(pattern=_DIGEST_PATTERN)
+    tariff_claim_digest: str = Field(pattern=_DIGEST_PATTERN)
+    verified_sources: tuple[ProviderTariffVerifiedSource, ...] = Field(min_length=1, max_length=8)
+    validated_records: tuple[ProviderTariffValidatedRecord, ...] = Field(
+        min_length=3,
+        max_length=40,
+    )
+
+    @model_validator(mode="after")
+    def _require_registered_canonical_verification(self) -> Self:
+        expected_verifier = provider_tariff_evidence_verifier_digest(self.verifier_profile)
+        if self.verifier_digest != expected_verifier:
+            raise ValueError("tariff evidence verifier digest differs from the local registry")
+        source_ids = tuple(source.source_id for source in self.verified_sources)
+        if source_ids != tuple(sorted(source_ids)) or len(source_ids) != len(set(source_ids)):
+            raise ValueError("verified tariff sources require unique ascending source IDs")
+        record_coordinates = tuple(
+            (record.source_id, record.source_record_path, record.purpose)
+            for record in self.validated_records
+        )
+        if record_coordinates != tuple(sorted(record_coordinates)) or len(
+            record_coordinates
+        ) != len(set(record_coordinates)):
+            raise ValueError("validated tariff records require unique canonical coordinates")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return a stable digest of this complete verification result."""
+        return _digest_json(self.model_dump(mode="json"))
+
+
+class ProviderTariffSourceBinding(BaseModel):
+    """One explicit translation from a retained source record into a tariff claim."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    claim: Literal["route_identity", "usage_dimension"]
+    source_id: str = Field(pattern=_SOURCE_ID_PATTERN)
+    source_record_path: str = Field(min_length=1, max_length=2_048)
+    source_value: str = Field(min_length=1, max_length=2_048)
+    canonical_value: str = Field(min_length=1, max_length=2_048)
+    target_meter_source_id: str | None = Field(default=None, pattern=_SOURCE_ID_PATTERN)
+    target_meter_record_path: str | None = Field(default=None, min_length=1, max_length=2_048)
+
+    @field_validator("source_record_path", "target_meter_record_path")
+    @classmethod
+    def _require_absolute_source_record_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value.startswith("/")
+            or value != value.strip()
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("tariff source binding requires an absolute record path")
+        return value
+
+    @field_validator("source_value", "canonical_value")
+    @classmethod
+    def _require_exact_printable_value(cls, value: str) -> str:
+        if value != value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError("tariff source binding values must be exact printable text")
+        return value
+
+    @model_validator(mode="after")
+    def _require_complete_meter_target(self) -> Self:
+        if (self.target_meter_source_id is None) != (self.target_meter_record_path is None):
+            raise ValueError("tariff source binding meter target must be complete")
+        if self.claim == "usage_dimension" and self.target_meter_source_id is None:
+            raise ValueError("usage-dimension binding requires an exact billing meter target")
+        return self
+
+
 class ProviderTariffBillingMeter(BaseModel):
     """One exact provider billing identifier for a priced usage dimension."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[3] = 3
     usage_dimension: Literal["input_tokens", "output_tokens"]
+    source_id: str = Field(pattern=_SOURCE_ID_PATTERN)
+    source_record_path: str = Field(min_length=1, max_length=2_048)
+    sku_id: str = Field(min_length=1, max_length=256)
     rate_id: str = Field(min_length=1, max_length=256)
+    billing_region: str = Field(min_length=1, max_length=128)
+    billing_mode: str = Field(min_length=1, max_length=128)
+    effective_on: date | None
+    source_price_usd: Decimal = Field(gt=0)
+    source_price_unit: Literal["per_1k_tokens", "per_1m_tokens"]
 
-    @field_validator("rate_id")
+    @field_validator("source_record_path")
     @classmethod
-    def _require_exact_nonblank_rate_id(cls, value: str) -> str:
-        if value != value.strip() or any(ord(character) < 32 for character in value):
-            raise ValueError("tariff billing rate identifier must be an exact printable value")
+    def _require_absolute_source_record_path(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or value != value.strip()
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("tariff source record path must be an exact absolute printable path")
         return value
+
+    @field_validator("sku_id", "rate_id", "billing_region", "billing_mode")
+    @classmethod
+    def _require_exact_nonblank_billing_id(cls, value: str) -> str:
+        if value != value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError("tariff billing identifier must be an exact printable value")
+        return value
+
+    def nano_usd_per_token_ceiling(self) -> int:
+        """Normalize the retained source rate into a conservative nano-USD token floor."""
+        token_unit = 1_000 if self.source_price_unit == "per_1k_tokens" else 1_000_000
+        nano_usd = self.source_price_usd * _NANO_USD_PER_USD / token_unit
+        return int(nano_usd.to_integral_value(rounding=ROUND_CEILING))
 
 
 class ProviderTariffRoute(BaseModel):
     """Exact nonsecret execution and billing coordinates for one price record."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     provider_config: ProviderConfig
     billing_region: str = Field(min_length=1, max_length=128)
-    billing_sku: str = Field(min_length=1, max_length=128)
-    billing_meters: tuple[ProviderTariffBillingMeter, ProviderTariffBillingMeter]
+    billing_mode: str = Field(min_length=1, max_length=128)
+    billing_meters: tuple[ProviderTariffBillingMeter, ...] = Field(min_length=2, max_length=2)
 
     @field_validator("provider_config", mode="after")
     @classmethod
     def _freeze_provider_config(cls, value: ProviderConfig) -> ProviderConfig:
         return ProviderConfig.model_validate(value.model_dump())
 
-    @field_validator("billing_region", "billing_sku")
+    @field_validator("billing_region", "billing_mode")
     @classmethod
     def _require_exact_nonblank_coordinate(cls, value: str) -> str:
         if value != value.strip():
@@ -210,7 +539,13 @@ class ProviderTariffRoute(BaseModel):
             "output_tokens",
         ):
             raise ValueError("tariff billing meters must identify input_tokens then output_tokens")
+        if any(meter.billing_region != self.billing_region for meter in self.billing_meters):
+            raise ValueError("tariff billing meter region must match the route billing region")
+        if any(meter.billing_mode != self.billing_mode for meter in self.billing_meters):
+            raise ValueError("tariff billing meter mode must match the route billing mode")
         config = self.provider_config
+        if config.kind not in {ProviderKind.AZURE_OPENAI, ProviderKind.BEDROCK}:
+            raise ValueError("provider tariff route has no registered paid evidence verifier")
         if config.kind is ProviderKind.BEDROCK:
             if config.region is None:
                 raise ValueError("tariff route requires an explicit Bedrock region")
@@ -248,39 +583,17 @@ class ProviderTariffRoute(BaseModel):
 class ProviderTariffProvenance(BaseModel):
     """Auditable source snapshot, exact route, and usage scope for one frozen tariff."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal[3] = 3
-    source_locator: str = Field(min_length=1, max_length=2_048)
-    source_snapshot_digest: str = Field(pattern=_DIGEST_PATTERN)
+    schema_version: Literal[5] = 5
+    source_snapshots: tuple[ProviderTariffSourceSnapshot, ...] = Field(min_length=1, max_length=8)
+    source_bindings: tuple[ProviderTariffSourceBinding, ...] = Field(min_length=3, max_length=32)
     verified_on: date
-    effective_on: date
+    effective_on: date | None
     currency: Literal["USD"]
     price_unit: Literal["per_1m_tokens"]
     route: ProviderTariffRoute
     priced_usage_dimensions: tuple[str, ...] = ("input_tokens", "output_tokens")
-
-    @field_validator("source_locator")
-    @classmethod
-    def _require_canonical_source_locator(cls, value: str) -> str:
-        if value != value.strip():
-            raise ValueError("tariff source_locator cannot have surrounding whitespace")
-        parsed = urlsplit(value)
-        if (
-            parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("tariff source_locator cannot contain credentials, query, or fragment")
-        return value
-
-    @field_validator("source_snapshot_digest")
-    @classmethod
-    def _reject_placeholder_snapshot_digest(cls, value: str) -> str:
-        if value == _ZERO_DIGEST:
-            raise ValueError("tariff source_snapshot_digest cannot be the zero digest")
-        return value
 
     @field_validator("priced_usage_dimensions")
     @classmethod
@@ -291,16 +604,201 @@ class ProviderTariffProvenance(BaseModel):
             )
         return value
 
+    @model_validator(mode="after")
+    def _require_canonical_source_chain(self) -> Self:
+        source_ids = tuple(snapshot.source_id for snapshot in self.source_snapshots)
+        if source_ids != tuple(sorted(source_ids)) or len(source_ids) != len(set(source_ids)):
+            raise ValueError("tariff source snapshots require unique ascending source IDs")
+        sources_by_id = {snapshot.source_id: snapshot for snapshot in self.source_snapshots}
+        if not any(snapshot.role == "rate_catalog" for snapshot in self.source_snapshots):
+            raise ValueError("tariff source snapshots require a rate catalog")
+        unknown_sources = {
+            meter.source_id
+            for meter in self.route.billing_meters
+            if meter.source_id not in source_ids
+        }
+        if unknown_sources:
+            raise ValueError("tariff billing meters reference an unknown source snapshot")
+        if any(
+            sources_by_id[meter.source_id].role != "rate_catalog"
+            for meter in self.route.billing_meters
+        ):
+            raise ValueError("tariff billing meters require rate_catalog sources")
+        if any(meter.effective_on != self.effective_on for meter in self.route.billing_meters):
+            raise ValueError("tariff billing meter effective date must match provenance")
+        if self.effective_on is not None and self.effective_on > self.verified_on:
+            raise ValueError("tariff rate cannot become effective after its verification date")
+        if any(
+            snapshot.published_on is not None and snapshot.published_on > self.verified_on
+            for snapshot in self.source_snapshots
+        ):
+            raise ValueError("tariff source cannot be published after its verification date")
+
+        binding_coordinates = tuple(
+            (
+                binding.claim,
+                binding.canonical_value,
+                binding.source_id,
+                binding.source_record_path,
+                binding.source_value,
+                binding.target_meter_source_id or "",
+                binding.target_meter_record_path or "",
+            )
+            for binding in self.source_bindings
+        )
+        if binding_coordinates != tuple(sorted(binding_coordinates)) or len(
+            binding_coordinates
+        ) != len(set(binding_coordinates)):
+            raise ValueError("tariff source bindings require unique canonical ascending order")
+        unknown_binding_sources = {
+            binding.source_id
+            for binding in self.source_bindings
+            if binding.source_id not in sources_by_id
+        }
+        if unknown_binding_sources:
+            raise ValueError("tariff source bindings reference an unknown source snapshot")
+        for binding in self.source_bindings:
+            role = sources_by_id[binding.source_id].role
+            allowed_roles = (
+                {"rate_catalog", "route_definition", "semantic_mapping"}
+                if binding.claim == "route_identity"
+                else {"rate_catalog", "semantic_mapping"}
+            )
+            if role not in allowed_roles:
+                raise ValueError("tariff source binding claim is incompatible with its source role")
+        meter_coordinates = {
+            (meter.source_id, meter.source_record_path): meter
+            for meter in self.route.billing_meters
+        }
+        for binding in self.source_bindings:
+            if binding.target_meter_source_id is None:
+                continue
+            target_coordinate = (
+                binding.target_meter_source_id,
+                binding.target_meter_record_path,
+            )
+            target_meter = meter_coordinates.get(target_coordinate)
+            if target_meter is None:
+                raise ValueError("tariff source binding targets an unknown billing meter")
+            if (
+                binding.claim == "usage_dimension"
+                and binding.canonical_value != target_meter.usage_dimension
+            ):
+                raise ValueError("usage-dimension binding targets the wrong billing meter")
+        bound_source_ids = {binding.source_id for binding in self.source_bindings}
+        unbound_non_rate_sources = {
+            snapshot.source_id
+            for snapshot in self.source_snapshots
+            if snapshot.role != "rate_catalog" and snapshot.source_id not in bound_source_ids
+        }
+        if unbound_non_rate_sources:
+            raise ValueError("tariff provenance contains an unbound non-rate source")
+
+        route_values = {
+            binding.canonical_value
+            for binding in self.source_bindings
+            if binding.claim == "route_identity"
+        }
+        if route_values != {self.route.provider_config.model}:
+            raise ValueError("tariff route identity is not bound to its runtime model")
+        usage_dimensions = {
+            binding.canonical_value
+            for binding in self.source_bindings
+            if binding.claim == "usage_dimension"
+        }
+        if usage_dimensions != {"input_tokens", "output_tokens"}:
+            raise ValueError("tariff source bindings require both priced usage dimensions")
+        usage_targets = {
+            (
+                binding.target_meter_source_id,
+                binding.target_meter_record_path,
+            )
+            for binding in self.source_bindings
+            if binding.claim == "usage_dimension"
+        }
+        if usage_targets != set(meter_coordinates):
+            raise ValueError("tariff usage bindings must target every billing meter exactly")
+        if not any(snapshot.role == "route_definition" for snapshot in self.source_snapshots):
+            route_targets = {
+                (
+                    binding.target_meter_source_id,
+                    binding.target_meter_record_path,
+                )
+                for binding in self.source_bindings
+                if binding.claim == "route_identity" and binding.target_meter_source_id is not None
+            }
+            if route_targets != set(meter_coordinates):
+                raise ValueError("rate-catalog route identity must bind every billing meter")
+        return self
+
+    def token_price_floor(self) -> TokenPriceCeiling:
+        """Return the exact conservative token floor normalized from retained meter records."""
+        input_meter, output_meter = self.route.billing_meters
+        return TokenPriceCeiling(
+            input_nano_usd_per_token=input_meter.nano_usd_per_token_ceiling(),
+            output_nano_usd_per_token=output_meter.nano_usd_per_token_ceiling(),
+        )
+
+
+def provider_tariff_claim_digest(
+    *,
+    provider_config: ProviderConfig,
+    price: TokenPriceCeiling,
+    provenance: ProviderTariffProvenance,
+) -> str:
+    """Digest the pre-receipt tariff claim without creating a circular receipt dependency."""
+    return _digest_json(
+        {
+            "schema_version": 1,
+            "provider_config": provider_config.model_dump(mode="json"),
+            "price": price.model_dump(mode="json"),
+            "provenance": provenance.model_dump(mode="json"),
+        }
+    )
+
+
+def provider_tariff_validated_records(
+    provenance: ProviderTariffProvenance,
+) -> tuple[ProviderTariffValidatedRecord, ...]:
+    """Return the canonical semantic coordinates a verifier must attest."""
+    records = [
+        ProviderTariffValidatedRecord(
+            source_id=binding.source_id,
+            source_record_path=binding.source_record_path,
+            purpose=binding.claim,
+        )
+        for binding in provenance.source_bindings
+    ]
+    records.extend(
+        ProviderTariffValidatedRecord(
+            source_id=meter.source_id,
+            source_record_path=meter.source_record_path,
+            purpose=(
+                "input_tokens_billing_meter"
+                if meter.usage_dimension == "input_tokens"
+                else "output_tokens_billing_meter"
+            ),
+        )
+        for meter in provenance.route.billing_meters
+    )
+    return tuple(
+        sorted(
+            records,
+            key=lambda record: (record.source_id, record.source_record_path, record.purpose),
+        )
+    )
+
 
 class ProviderCostMeter(BaseModel):
     """One immutable provider route, tariff ceiling, and input estimator."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     kind: Literal["provider_tokens"] = "provider_tokens"
     provider_config: ProviderConfig
     price: TokenPriceCeiling
     tariff_provenance: ProviderTariffProvenance
+    tariff_evidence_receipt: ProviderTariffEvidenceReceipt
     input_estimator: Literal["canonical-json-utf8-v1"] = "canonical-json-utf8-v1"
     input_overhead_tokens: int = Field(default=8192, ge=1, le=_SQLITE_INTEGER_MAX)
 
@@ -313,6 +811,49 @@ class ProviderCostMeter(BaseModel):
     def _require_tariff_route_match(self) -> Self:
         if self.tariff_provenance.route.provider_config != self.provider_config:
             raise ValueError("tariff route does not match provider config")
+        floor = self.tariff_provenance.token_price_floor()
+        if (
+            self.price.input_nano_usd_per_token < floor.input_nano_usd_per_token
+            or self.price.output_nano_usd_per_token < floor.output_nano_usd_per_token
+        ):
+            raise ValueError(
+                "provider token price ceiling understates retained billing meter rates"
+            )
+        receipt = self.tariff_evidence_receipt
+        expected_profile = (
+            "aws_bedrock_public_catalog_v1"
+            if self.provider_config.kind is ProviderKind.BEDROCK
+            else "azure_retail_arm_v1"
+        )
+        if receipt.verifier_profile != expected_profile:
+            raise ValueError("tariff evidence verifier profile differs from the provider route")
+        claim_digest = provider_tariff_claim_digest(
+            provider_config=self.provider_config,
+            price=self.price,
+            provenance=self.tariff_provenance,
+        )
+        if receipt.tariff_claim_digest != claim_digest:
+            raise ValueError("tariff evidence receipt belongs to a different tariff claim")
+        expected_sources = tuple(
+            (
+                snapshot.source_id,
+                snapshot.retained_artifact.artifact_digest,
+                snapshot.source_snapshot_digest,
+            )
+            for snapshot in self.tariff_provenance.source_snapshots
+        )
+        receipt_sources = tuple(
+            (
+                source.source_id,
+                source.artifact_digest,
+                source.source_snapshot_digest,
+            )
+            for source in receipt.verified_sources
+        )
+        if receipt_sources != expected_sources:
+            raise ValueError("tariff evidence receipt source set differs from provenance")
+        if receipt.validated_records != provider_tariff_validated_records(self.tariff_provenance):
+            raise ValueError("tariff evidence receipt record set differs from provenance")
         return self
 
 

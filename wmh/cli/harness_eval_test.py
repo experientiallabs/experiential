@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import json
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
@@ -38,15 +40,19 @@ from wmh.harness.pi_runner import pi_node_baseline
 from wmh.harness.pi_runner_backend import LocalPiRunnerSpec, PiRunnerBackendSpec
 from wmh.harness.store import HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.tracking._testing import synthetic_tariff_provenance
+from wmh.tracking._testing import synthetic_provider_cost_meter
 from wmh.tracking.budget import (
     BudgetAccount,
     BudgetPolicy,
     BudgetScope,
-    ProviderCostMeter,
+    ProviderTariffBillingMeter,
+    ProviderTariffProvenance,
+    ProviderTariffRetainedArtifact,
+    ProviderTariffRoute,
+    ProviderTariffSourceBinding,
+    ProviderTariffSourceSnapshot,
     TimedResourceBudgetAccount,
     TimedResourceCostMeter,
-    TokenPriceCeiling,
     bootstrap_budget_ledger,
 )
 from wmh.tracking.rate_limit import ExternalDispatchRateAuthority
@@ -57,6 +63,106 @@ _RUN_CONFIG_DIGEST = "sha256:" + "a" * 64
 _CELL_CONFIG_DIGEST = "sha256:" + "b" * 64
 _RUNNER_CONFIG_DIGEST = "sha256:" + "c" * 64
 _RUNNER_ENVIRONMENT_DIGEST = "sha256:" + "d" * 64
+
+
+def _tariff_source_bindings(
+    provider_config: ProviderConfig,
+) -> tuple[ProviderTariffSourceBinding, ...]:
+    return (
+        ProviderTariffSourceBinding(
+            claim="route_identity",
+            source_id="test-rate-catalog",
+            source_record_path="/input/model",
+            source_value=provider_config.model,
+            canonical_value=provider_config.model,
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/input",
+        ),
+        ProviderTariffSourceBinding(
+            claim="route_identity",
+            source_id="test-rate-catalog",
+            source_record_path="/output/model",
+            source_value=provider_config.model,
+            canonical_value=provider_config.model,
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/output",
+        ),
+        ProviderTariffSourceBinding(
+            claim="usage_dimension",
+            source_id="test-rate-catalog",
+            source_record_path="/input/dimension",
+            source_value="Input tokens",
+            canonical_value="input_tokens",
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/input",
+        ),
+        ProviderTariffSourceBinding(
+            claim="usage_dimension",
+            source_id="test-rate-catalog",
+            source_record_path="/output/dimension",
+            source_value="Output tokens",
+            canonical_value="output_tokens",
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/output",
+        ),
+    )
+
+
+def _tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
+    return ProviderTariffProvenance(
+        source_snapshots=(
+            ProviderTariffSourceSnapshot(
+                source_id="test-rate-catalog",
+                role="rate_catalog",
+                source_locator="https://example.test/provider-pricing",
+                source_snapshot_digest="sha256:" + "f" * 64,
+                media_type="application/json",
+                content_encoding="identity",
+                retained_artifact=ProviderTariffRetainedArtifact(
+                    storage_kind="https",
+                    locator="https://example.test/evidence/test-rate-catalog.json.gz",
+                    artifact_digest="sha256:" + "e" * 64,
+                    content_encoding="gzip",
+                ),
+            ),
+        ),
+        source_bindings=_tariff_source_bindings(provider_config),
+        verified_on=date(2026, 7, 19),
+        effective_on=date(2026, 7, 1),
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=ProviderTariffRoute(
+            provider_config=provider_config,
+            billing_region=provider_config.region or "eastus2",
+            billing_mode="test-mode",
+            billing_meters=(
+                ProviderTariffBillingMeter(
+                    usage_dimension="input_tokens",
+                    source_id="test-rate-catalog",
+                    source_record_path="/input",
+                    sku_id="test-input-sku",
+                    rate_id="test-input-rate",
+                    billing_region=provider_config.region or "eastus2",
+                    billing_mode="test-mode",
+                    effective_on=date(2026, 7, 1),
+                    source_price_usd=Decimal("0.001"),
+                    source_price_unit="per_1m_tokens",
+                ),
+                ProviderTariffBillingMeter(
+                    usage_dimension="output_tokens",
+                    source_id="test-rate-catalog",
+                    source_record_path="/output",
+                    sku_id="test-output-sku",
+                    rate_id="test-output-rate",
+                    billing_region=provider_config.region or "eastus2",
+                    billing_mode="test-mode",
+                    effective_on=date(2026, 7, 1),
+                    source_price_usd=Decimal("0.001"),
+                    source_price_unit="per_1m_tokens",
+                ),
+            ),
+        ),
+    )
 
 
 def _save_harness(root: Path) -> HarnessDoc:
@@ -406,16 +512,11 @@ def _write_budget_account(path: Path, provider_config: ProviderConfig) -> Budget
         hard_limit_nano_usd=1_000_000,
         phase_limits_nano_usd={"qualification": 1_000_000},
         meters={
-            "worker": ProviderCostMeter(
+            "worker": synthetic_provider_cost_meter(
                 provider_config=provider_config,
-                price=TokenPriceCeiling(
-                    input_nano_usd_per_token=1,
-                    output_nano_usd_per_token=5,
-                ),
-                tariff_provenance=synthetic_tariff_provenance(
-                    provider_config,
-                    default_billing_region="eastus2",
-                ),
+                provenance=_tariff_provenance(provider_config),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=5,
             )
         },
     )
@@ -450,16 +551,11 @@ def _write_e2b_task_budget_accounts(
         hard_limit_nano_usd=1_000_000,
         phase_limits_nano_usd={"qualification": 1_000_000},
         meters={
-            "worker": ProviderCostMeter(
+            "worker": synthetic_provider_cost_meter(
                 provider_config=provider_config,
-                price=TokenPriceCeiling(
-                    input_nano_usd_per_token=1,
-                    output_nano_usd_per_token=5,
-                ),
-                tariff_provenance=synthetic_tariff_provenance(
-                    provider_config,
-                    default_billing_region="eastus2",
-                ),
+                provenance=_tariff_provenance(provider_config),
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=5,
             ),
             "task": TimedResourceCostMeter(
                 resource_type=resource_class.role.value,

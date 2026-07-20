@@ -963,6 +963,17 @@ replace an inconvenient result. The reserve is not automatically available to se
 may start a paid phase without an explicit operator confirmation, and no job may exceed its
 remaining envelope through automatic retry.
 
+Every paid provider meter must be created through `provider_cost_meter()` before policy freeze. Its
+registered offline verifier binds the exact nonsecret route, conservative price ceiling, retained
+source digests, and interpreted record coordinates into the budget policy. Built-in Bedrock routes
+use only the exact packaged evidence set registered for that route. Account-specific Azure routes
+require explicit retained account, deployment, and bounded retail-price JSON; no verifier performs
+ambient network access. The Azure evidence must bind the endpoint, deployment and ETag, immutable
+model version, deployment SKU, region, retail service, meter IDs, units, effective date, and prices.
+Record the evidence receipt digest in the sealed study manifest. Treat the receipt as a trusted
+builder misconfiguration guard, not as a provider signature, and do not allow experiment input to
+construct it directly.
+
 ## Current WMH readiness and remaining gaps
 
 The reusable evaluation slice provides:

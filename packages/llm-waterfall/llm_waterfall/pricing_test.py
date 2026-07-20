@@ -95,6 +95,31 @@ def test_us_geo_haiku_snapshot_uses_the_audited_route_price() -> None:
     )
 
 
+def test_unaudited_bedrock_routes_do_not_inherit_model_only_prices() -> None:
+    assert (
+        price_for(
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            provider="bedrock",
+        )
+        is None
+    )
+    assert price_for("claude-opus-4-8", provider="bedrock") is None
+    assert price_for("zai.glm-5", provider="bedrock") is None
+    assert price_for("zai.glm-5") is None
+
+
+def test_bedrock_override_cannot_cross_the_normalized_provider_boundary() -> None:
+    direct_override = {"claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0)}
+    assert (
+        price_for(
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            prices=direct_override,
+            provider="bedrock",
+        )
+        is None
+    )
+
+
 def test_no_zero_price_placeholder_rows() -> None:
     # Regression: a $0 row defeats the price_for()->None "cost unavailable" contract.
     from llm_waterfall.pricing import _PRICES

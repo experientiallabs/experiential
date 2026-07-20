@@ -1,41 +1,73 @@
 """Private builders for synthetic tariff evidence used only by unit tests."""
 
-from datetime import date
-
-from wmh.providers.base import ProviderConfig
+from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.tracking.budget import (
-    ProviderTariffBillingMeter,
+    ProviderCostMeter,
+    ProviderTariffEvidenceReceipt,
     ProviderTariffProvenance,
-    ProviderTariffRoute,
+    ProviderTariffVerifiedSource,
+    TokenPriceCeiling,
+    provider_tariff_claim_digest,
+    provider_tariff_evidence_verifier_digest,
+    provider_tariff_validated_records,
 )
 
 
-def synthetic_tariff_provenance(
-    provider_config: ProviderConfig,
+def synthetic_provider_cost_meter(
     *,
-    default_billing_region: str = "test-region",
-) -> ProviderTariffProvenance:
-    """Build minimal synthetic provenance for an isolated no-dispatch unit test."""
-    return ProviderTariffProvenance(
-        source_locator="https://example.test/provider-pricing",
-        source_snapshot_digest="sha256:" + "f" * 64,
-        verified_on=date(2026, 7, 19),
-        effective_on=date(2026, 7, 1),
-        currency="USD",
-        price_unit="per_1m_tokens",
-        route=ProviderTariffRoute(
+    provider_config: ProviderConfig,
+    provenance: ProviderTariffProvenance,
+    input_nano_usd_per_token: int,
+    output_nano_usd_per_token: int,
+    input_overhead_tokens: int = 8192,
+) -> ProviderCostMeter:
+    """Build a fully bound provider meter for an isolated no-dispatch unit test."""
+    price = TokenPriceCeiling(
+        input_nano_usd_per_token=input_nano_usd_per_token,
+        output_nano_usd_per_token=output_nano_usd_per_token,
+    )
+    return ProviderCostMeter(
+        provider_config=provider_config,
+        price=price,
+        tariff_provenance=provenance,
+        tariff_evidence_receipt=synthetic_tariff_evidence_receipt(
             provider_config=provider_config,
-            billing_region=provider_config.region or default_billing_region,
-            billing_sku="test-sku",
-            billing_meters=(
-                ProviderTariffBillingMeter(
-                    usage_dimension="input_tokens",
-                    rate_id="test-input-meter",
-                ),
-                ProviderTariffBillingMeter(
-                    usage_dimension="output_tokens",
-                    rate_id="test-output-meter",
-                ),
-            ),
+            price=price,
+            provenance=provenance,
         ),
+        input_overhead_tokens=input_overhead_tokens,
+    )
+
+
+def synthetic_tariff_evidence_receipt(
+    *,
+    provider_config: ProviderConfig,
+    price: TokenPriceCeiling,
+    provenance: ProviderTariffProvenance,
+) -> ProviderTariffEvidenceReceipt:
+    """Build audit-shaped evidence for tests that never issue a paid provider call."""
+    profile = (
+        "aws_bedrock_public_catalog_v1"
+        if provider_config.kind is ProviderKind.BEDROCK
+        else "azure_retail_arm_v1"
+    )
+    return ProviderTariffEvidenceReceipt(
+        verifier_profile=profile,
+        verifier_digest=provider_tariff_evidence_verifier_digest(profile),
+        tariff_claim_digest=provider_tariff_claim_digest(
+            provider_config=provider_config,
+            price=price,
+            provenance=provenance,
+        ),
+        verified_sources=tuple(
+            ProviderTariffVerifiedSource(
+                source_id=source.source_id,
+                artifact_digest=source.retained_artifact.artifact_digest,
+                source_snapshot_digest=source.source_snapshot_digest,
+                artifact_size_bytes=1,
+                decoded_size_bytes=1,
+            )
+            for source in provenance.source_snapshots
+        ),
+        validated_records=provider_tariff_validated_records(provenance),
     )

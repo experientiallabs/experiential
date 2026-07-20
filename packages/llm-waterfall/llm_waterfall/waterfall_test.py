@@ -152,13 +152,15 @@ def test_primary_serves_when_healthy() -> None:
 
 def test_failover_attributes_cost_to_serving_backend() -> None:
     # Regression: the prototype attributed cost/model to the PRIMARY even when a fallback served.
-    wf, _ = _waterfall({"claude-opus-4-8": [_Throttle()], "claude-sonnet-4-6": []})
+    primary = "us.anthropic.claude-opus-4-8"
+    fallback = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    wf, _ = _waterfall({primary: [_Throttle()], fallback: []})
     r = wf.complete(system="", messages=MSGS)
-    assert r.model_used == "claude-sonnet-4-6"
+    assert r.model_used == fallback
     assert [a.outcome for a in r.attempts] == ["capacity_error", "ok"]
     assert r.attempts[0].error_type == "_Throttle"
-    # 100 in @ $3/M + 10 out @ $15/M — sonnet's rate, not opus's.
-    assert r.cost_usd == pytest.approx((100 * 3.0 + 10 * 15.0) / 1_000_000)
+    # The exact Haiku route served, so its audited geographic rate drives cost.
+    assert r.cost_usd == pytest.approx((100 * 1.1 + 10 * 5.5) / 1_000_000)
 
 
 def test_azure_does_not_reuse_direct_openai_price_for_the_same_model() -> None:

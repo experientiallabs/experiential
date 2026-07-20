@@ -113,21 +113,21 @@ class FakeFailoverProvider(FakeProvider):
         return Completion(
             text="served by fallback",
             usage=TokenUsage(input_tokens=100, output_tokens=20),
-            model="claude-haiku-4-5",  # a fallback served, not the primary opus
+            model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
         )
 
 
 def test_cost_attributed_to_serving_model_not_primary() -> None:
     # Regression: a failed-over call must be priced at the serving model's rate, not the
-    # primary's (opus 5/25 vs haiku 1/5 per Mtok — a 5x over-report).
+    # primary's. The exact Bedrock route also keeps its geographic price coordinate.
     tracker = RunTracker(run_id="r", kind="serve")
     metered = MeteredProvider(FakeFailoverProvider(), tracker, base_phase=Phase.SERVE)
 
     metered.complete("anything", [Message(role="user", content="hi")])
 
     (event,) = tracker._events
-    assert event.model == "claude-haiku-4-5"
-    assert event.cost_usd == (100 * 1.0 + 20 * 5.0) / 1_000_000
+    assert event.model == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    assert event.cost_usd == (100 * 1.1 + 20 * 5.5) / 1_000_000
 
 
 def test_azure_model_name_cannot_inherit_direct_openai_cost() -> None:

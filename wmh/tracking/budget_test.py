@@ -11,6 +11,8 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -48,6 +50,14 @@ from wmh.tracking.budget import (
     BudgetTerminalProvenance,
     ExternalSpendAuthority,
     ProviderCostMeter,
+    ProviderTariffBillingMeter,
+    ProviderTariffEvidenceReceipt,
+    ProviderTariffProvenance,
+    ProviderTariffRetainedArtifact,
+    ProviderTariffRoute,
+    ProviderTariffSourceBinding,
+    ProviderTariffSourceSnapshot,
+    ProviderTariffVerifiedSource,
     ReservationStatus,
     SpendLedger,
     TimedResourceBudget,
@@ -63,11 +73,143 @@ from wmh.tracking.budget import (
     nano_usd_from_usd,
     open_shared_spend_ledger,
     orphaned_timed_resource_requires_reap,
+    provider_tariff_claim_digest,
+    provider_tariff_evidence_verifier_digest,
+    provider_tariff_validated_records,
     reconcile_orphaned_timed_resource,
     resolve_budget_account,
     resolve_timed_resource_account,
     validate_timed_resource_class,
 )
+
+
+def _test_tariff_provenance(provider_config: ProviderConfig) -> ProviderTariffProvenance:
+    return ProviderTariffProvenance(
+        source_snapshots=(
+            ProviderTariffSourceSnapshot(
+                source_id="test-rate-catalog",
+                role="rate_catalog",
+                source_locator="https://example.test/provider-pricing",
+                source_snapshot_digest="sha256:" + "f" * 64,
+                media_type="application/json",
+                content_encoding="identity",
+                retained_artifact=ProviderTariffRetainedArtifact(
+                    storage_kind="https",
+                    locator="https://example.test/evidence/test-rate-catalog.json.gz",
+                    artifact_digest="sha256:" + "e" * 64,
+                    content_encoding="gzip",
+                ),
+            ),
+        ),
+        source_bindings=_test_tariff_source_bindings(provider_config),
+        verified_on=date(2026, 7, 19),
+        effective_on=date(2026, 7, 1),
+        currency="USD",
+        price_unit="per_1m_tokens",
+        route=ProviderTariffRoute(
+            provider_config=provider_config,
+            billing_region=provider_config.region or "test-region",
+            billing_mode="test-mode",
+            billing_meters=(
+                ProviderTariffBillingMeter(
+                    usage_dimension="input_tokens",
+                    source_id="test-rate-catalog",
+                    source_record_path="/input",
+                    sku_id="test-input-sku",
+                    rate_id="test-input-rate",
+                    billing_region=provider_config.region or "test-region",
+                    billing_mode="test-mode",
+                    effective_on=date(2026, 7, 1),
+                    source_price_usd=Decimal("0.001"),
+                    source_price_unit="per_1m_tokens",
+                ),
+                ProviderTariffBillingMeter(
+                    usage_dimension="output_tokens",
+                    source_id="test-rate-catalog",
+                    source_record_path="/output",
+                    sku_id="test-output-sku",
+                    rate_id="test-output-rate",
+                    billing_region=provider_config.region or "test-region",
+                    billing_mode="test-mode",
+                    effective_on=date(2026, 7, 1),
+                    source_price_usd=Decimal("0.001"),
+                    source_price_unit="per_1m_tokens",
+                ),
+            ),
+        ),
+    )
+
+
+def _test_tariff_source_bindings(
+    provider_config: ProviderConfig,
+) -> tuple[ProviderTariffSourceBinding, ...]:
+    return (
+        ProviderTariffSourceBinding(
+            claim="route_identity",
+            source_id="test-rate-catalog",
+            source_record_path="/input/model",
+            source_value=provider_config.model,
+            canonical_value=provider_config.model,
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/input",
+        ),
+        ProviderTariffSourceBinding(
+            claim="route_identity",
+            source_id="test-rate-catalog",
+            source_record_path="/output/model",
+            source_value=provider_config.model,
+            canonical_value=provider_config.model,
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/output",
+        ),
+        ProviderTariffSourceBinding(
+            claim="usage_dimension",
+            source_id="test-rate-catalog",
+            source_record_path="/input/dimension",
+            source_value="Input tokens",
+            canonical_value="input_tokens",
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/input",
+        ),
+        ProviderTariffSourceBinding(
+            claim="usage_dimension",
+            source_id="test-rate-catalog",
+            source_record_path="/output/dimension",
+            source_value="Output tokens",
+            canonical_value="output_tokens",
+            target_meter_source_id="test-rate-catalog",
+            target_meter_record_path="/output",
+        ),
+    )
+
+
+def _test_tariff_receipt(
+    *,
+    provider_config: ProviderConfig,
+    price: TokenPriceCeiling,
+    provenance: ProviderTariffProvenance,
+) -> ProviderTariffEvidenceReceipt:
+    profile = "aws_bedrock_public_catalog_v1"
+    return ProviderTariffEvidenceReceipt(
+        verifier_profile=profile,
+        verifier_digest=provider_tariff_evidence_verifier_digest(profile),
+        tariff_claim_digest=provider_tariff_claim_digest(
+            provider_config=provider_config,
+            price=price,
+            provenance=provenance,
+        ),
+        verified_sources=tuple(
+            ProviderTariffVerifiedSource(
+                source_id=source.source_id,
+                artifact_digest=source.retained_artifact.artifact_digest,
+                source_snapshot_digest=source.source_snapshot_digest,
+                artifact_size_bytes=1,
+                decoded_size_bytes=1,
+            )
+            for source in provenance.source_snapshots
+        ),
+        validated_records=provider_tariff_validated_records(provenance),
+    )
 
 
 def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPolicy:
@@ -76,6 +218,11 @@ def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPoli
         model="model-1",
         region="test-region",
     )
+    price = TokenPriceCeiling(
+        input_nano_usd_per_token=2,
+        output_nano_usd_per_token=5,
+    )
+    provenance = _test_tariff_provenance(provider_config)
     return BudgetPolicy(
         study_id="study-1",
         manifest_digest="sha256:" + "a" * 64,
@@ -84,11 +231,13 @@ def _policy(*, hard: int = 100, search: int = 80, final: int = 20) -> BudgetPoli
         meters={
             "worker": ProviderCostMeter(
                 provider_config=provider_config,
-                price=TokenPriceCeiling(
-                    input_nano_usd_per_token=2,
-                    output_nano_usd_per_token=5,
+                price=price,
+                tariff_provenance=provenance,
+                tariff_evidence_receipt=_test_tariff_receipt(
+                    provider_config=provider_config,
+                    price=price,
+                    provenance=provenance,
                 ),
-                tariff_provenance=synthetic_tariff_provenance(provider_config),
                 input_overhead_tokens=8,
             )
         },
@@ -1459,7 +1608,7 @@ def test_ledger_rejects_policy_drift_and_symlink_paths(tmp_path: Path) -> None:
     assert str(symlink) not in str(error.value)
 
 
-def test_ledger_schema_v1_requires_a_new_v3_ledger(tmp_path: Path) -> None:
+def test_ledger_schema_v1_requires_a_new_v5_ledger(tmp_path: Path) -> None:
     path = tmp_path / "budget.sqlite3"
     SpendLedger(path, _policy())
     with sqlite3.connect(path) as connection:
@@ -1468,6 +1617,72 @@ def test_ledger_schema_v1_requires_a_new_v3_ledger(tmp_path: Path) -> None:
 
     with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version 1"):
         SpendLedger(path, _policy())
+
+
+def test_v3_tariff_policy_ledger_requires_a_new_v5_ledger(tmp_path: Path) -> None:
+    path = tmp_path / "budget.sqlite3"
+    policy = _policy()
+    SpendLedger(path, policy)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("SELECT policy_json FROM budget_metadata WHERE id = 1").fetchone()
+        assert row is not None
+        old_policy = json.loads(row["policy_json"])
+        provenance = old_policy["meters"]["worker"]["tariff_provenance"]
+        del old_policy["meters"]["worker"]["tariff_evidence_receipt"]
+        source = provenance["source_snapshots"][0]
+        provenance["schema_version"] = 3
+        provenance["source_locator"] = source["source_locator"]
+        provenance["source_snapshot_digest"] = source["source_snapshot_digest"]
+        del provenance["source_snapshots"]
+        del provenance["source_bindings"]
+        route = provenance["route"]
+        route["schema_version"] = 2
+        route["billing_sku"] = route.pop("billing_mode")
+        for meter in route["billing_meters"]:
+            meter["schema_version"] = 1
+            del meter["source_id"]
+            del meter["source_record_path"]
+            del meter["sku_id"]
+            del meter["billing_region"]
+            del meter["billing_mode"]
+            del meter["effective_on"]
+            del meter["source_price_usd"]
+            del meter["source_price_unit"]
+        old_policy_json = json.dumps(old_policy, sort_keys=True, separators=(",", ":"))
+        old_policy_digest = "sha256:" + hashlib.sha256(old_policy_json.encode()).hexdigest()
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute(
+            "UPDATE budget_metadata SET schema_version = 3, policy_digest = ?, policy_json = ? "
+            "WHERE id = 1",
+            (old_policy_digest, old_policy_json),
+        )
+
+    with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version 3"):
+        SpendLedger(path, policy)
+
+
+def test_v4_policy_without_tariff_receipt_requires_a_new_v5_ledger(tmp_path: Path) -> None:
+    path = tmp_path / "budget.sqlite3"
+    policy = _policy()
+    SpendLedger(path, policy)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("SELECT policy_json FROM budget_metadata WHERE id = 1").fetchone()
+        assert row is not None
+        old_policy = json.loads(row["policy_json"])
+        del old_policy["meters"]["worker"]["tariff_evidence_receipt"]
+        old_policy_json = json.dumps(old_policy, sort_keys=True, separators=(",", ":"))
+        old_policy_digest = "sha256:" + hashlib.sha256(old_policy_json.encode()).hexdigest()
+        connection.execute("DROP TRIGGER budget_metadata_no_update")
+        connection.execute(
+            "UPDATE budget_metadata SET schema_version = 4, policy_digest = ?, policy_json = ? "
+            "WHERE id = 1",
+            (old_policy_digest, old_policy_json),
+        )
+
+    with pytest.raises(BudgetIntegrityError, match="unsupported budget schema version 4"):
+        SpendLedger(path, policy)
 
 
 def test_exposed_policy_is_a_defensive_deep_copy(tmp_path: Path) -> None:

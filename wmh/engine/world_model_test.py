@@ -126,7 +126,10 @@ class _UsageProvider(FakeProvider):
 
 def test_step_meters_usage_per_session() -> None:
     provider = _UsageProvider('{"output": "ok", "is_error": false}')
-    provider.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="claude-opus-4-8")
+    provider.config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="us.anthropic.claude-opus-4-8",
+    )
     wm = WorldModel(provider, _retriever_with([]), top_k=1)
     session = wm.new_session(task="t")
 
@@ -138,8 +141,8 @@ def test_step_meters_usage_per_session() -> None:
     assert usage.total.calls == 2
     assert usage.total.input_tokens == 240
     assert usage.total.output_tokens == 60
-    # 240*5/1e6 + 60*25/1e6 = 0.0012 + 0.0015 = 0.0027 (float division → approx)
-    assert usage.total.cost_usd == pytest.approx(0.0027)
+    # 240*5.5/1e6 + 60*27.5/1e6 = 0.00132 + 0.00165 = 0.00297.
+    assert usage.total.cost_usd == pytest.approx(0.00297)
 
 
 def test_step_does_not_price_azure_as_direct_openai() -> None:
@@ -462,21 +465,26 @@ class _FailedOverProvider(_UsageProvider):
         completion = super().complete(
             system, messages, temperature=temperature, max_tokens=max_tokens
         )
-        return completion.model_copy(update={"model": "claude-haiku-4-5"})
+        return completion.model_copy(
+            update={"model": "us.anthropic.claude-haiku-4-5-20251001-v1:0"}
+        )
 
 
 def test_step_meters_usage_at_serving_model_rate() -> None:
     # Regression: serve-path metering must price a failed-over call at the SERVING model's
-    # rate (haiku 1/5 per Mtok), not the configured primary's (opus 5/25) — a 5x over-report.
+    # exact route, not the configured primary's route.
     provider = _FailedOverProvider('{"output": "ok", "is_error": false}')
-    provider.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="claude-opus-4-8")
+    provider.config = ProviderConfig(
+        kind=ProviderKind.BEDROCK,
+        model="us.anthropic.claude-opus-4-8",
+    )
     wm = WorldModel(provider, _retriever_with([]), top_k=1)
     session = wm.new_session(task="t")
 
     wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="f", arguments={}))
 
     usage = wm.session_usage(session.id)
-    assert usage.total.cost_usd == pytest.approx((120 * 1.0 + 30 * 5.0) / 1_000_000)
+    assert usage.total.cost_usd == pytest.approx((120 * 1.1 + 30 * 5.5) / 1_000_000)
 
 
 def test_step_telemetry_counts_steps_without_content(

@@ -35,11 +35,9 @@ def test_unaudited_bedrock_geo_route_has_no_descriptive_price() -> None:
     assert price_for("eu.anthropic.claude-opus-4-8") is None
 
 
-def test_bedrock_glm_5_uses_the_verified_nominal_price() -> None:
-    price = price_for("zai.glm-5")
-
-    assert price is not None
-    assert (price.input_per_mtok, price.output_per_mtok) == (1.0, 3.2)
+def test_bedrock_glm_5_requires_a_region_bound_tariff() -> None:
+    assert price_for("zai.glm-5") is None
+    assert price_for("zai.glm-5", provider="bedrock") is None
 
 
 def test_gpt_5_5_output_is_30_per_mtok() -> None:

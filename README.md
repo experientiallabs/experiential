@@ -93,7 +93,10 @@ uv run wmh harness eval pi-baseline@champion \
 
 Paid evaluation fails closed unless `--budget-account` supplies a frozen provider route, tariff,
 estimator, hard cap, phase cap, ledger, and attribution scope. The explicit development bypass is
-for unmetered local checks only.
+for unmetered local checks only. Build paid provider meters with `provider_cost_meter()`: it performs
+offline semantic verification over retained tariff evidence and binds the resulting receipt into
+the serialized budget policy. Azure evidence must be supplied explicitly; the verifier performs no
+ambient network or credential access.
 
 WMH does not inject provider credentials into the task or pi-runner environment. The local
 prebuilt-image policy also rejects run-level environment imports, host mounts, Compose overlays,

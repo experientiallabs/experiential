@@ -47,7 +47,6 @@ _PRICES: dict[str, ModelPrice] = {
     "claude-sonnet-5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-sonnet-4-6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0),
-    "zai.glm-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=3.2),
     # --- OpenAI direct (GPT-5.x Standard tier) ---
     "gpt-5.5": ModelPrice(input_per_mtok=5.0, output_per_mtok=30.0),
     "gpt-5.5-pro": ModelPrice(input_per_mtok=30.0, output_per_mtok=180.0),
@@ -72,7 +71,7 @@ _ROUTE_PRICES: dict[str, ModelPrice] = {
 
 _OPENAI_MODEL_PREFIXES = ("gpt-", "text-embedding-")
 _ANTHROPIC_MODEL_PREFIXES = ("claude-",)
-_BEDROCK_MODEL_PREFIXES = ("claude-", "amazon.", "zai.")
+_BEDROCK_MODEL_PREFIXES = ("amazon.",)
 
 
 def _provider_publishes_static_price(provider: str, key: str) -> bool:
@@ -148,7 +147,11 @@ def price_for(
 
     key = _normalize(route_key)
     if prices is not None:
-        override = prices.get(key) or prices.get(model)
+        override = (
+            prices.get(key) or prices.get(model)
+            if provider is None
+            else prices.get(model) or prices.get(route_key)
+        )
         if override is not None:
             return override
     if provider is not None and not _provider_publishes_static_price(provider, key):
